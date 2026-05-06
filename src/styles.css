@@ -1,0 +1,283 @@
+:root {
+  color: #f7fafc;
+  background: #071015;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    linear-gradient(145deg, rgba(7, 16, 21, 0.98), rgba(16, 19, 24, 0.96) 58%, rgba(18, 16, 12, 0.98)),
+    #071015;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: wait;
+}
+
+.loginScreen {
+  display: grid;
+  width: min(1080px, calc(100% - 48px));
+  min-height: 100vh;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 430px);
+  align-items: center;
+  gap: 56px;
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+.brandPanel {
+  display: grid;
+  min-height: 600px;
+  align-content: space-between;
+  gap: 48px;
+  padding: 20px 0;
+}
+
+.brandMark {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 12px;
+  color: #ffffff;
+  font-size: 17px;
+  text-decoration: none;
+}
+
+.brandMark span {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  color: #101318;
+  background: linear-gradient(135deg, #78f3cf, #8fb7ff);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.introCopy {
+  display: grid;
+  gap: 18px;
+}
+
+.kicker {
+  margin: 0;
+  color: #78f3cf;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 620px;
+  margin: 0;
+  color: #ffffff;
+  font-size: clamp(44px, 6vw, 74px);
+  font-weight: 820;
+  letter-spacing: 0;
+  line-height: 0.98;
+}
+
+.introCopy p:last-child {
+  max-width: 560px;
+  margin: 0;
+  color: #bdc6ce;
+  font-size: 18px;
+  line-height: 1.75;
+}
+
+.apiStatus {
+  display: grid;
+  width: min(100%, 560px);
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 18px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.apiStatus > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  color: #eef4f8;
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.statusDot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #f5bf4f;
+  box-shadow: 0 0 0 5px rgba(245, 191, 79, 0.12);
+}
+
+.apiStatus[data-state="online"] .statusDot {
+  background: #78f3cf;
+  box-shadow: 0 0 0 5px rgba(120, 243, 207, 0.12);
+}
+
+.apiStatus[data-state="offline"] .statusDot {
+  background: #ff6b6b;
+  box-shadow: 0 0 0 5px rgba(255, 107, 107, 0.12);
+}
+
+.statusButton {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid rgba(120, 243, 207, 0.28);
+  border-radius: 8px;
+  color: #eafcf6;
+  background: rgba(120, 243, 207, 0.08);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.statusButton:hover:not(:disabled) {
+  border-color: rgba(120, 243, 207, 0.5);
+  background: rgba(120, 243, 207, 0.13);
+}
+
+#api-base {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #8f9aa5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.loginCard {
+  width: 100%;
+  padding: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.065);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+}
+
+.loginForm {
+  display: grid;
+  gap: 18px;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+  color: #e6ecf2;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.field input {
+  width: 100%;
+  min-height: 50px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  outline: none;
+  color: #ffffff;
+  background: rgba(7, 13, 18, 0.76);
+  font-weight: 650;
+}
+
+.field input::placeholder {
+  color: #67737f;
+}
+
+.field input:focus {
+  border-color: rgba(120, 243, 207, 0.62);
+  box-shadow: 0 0 0 3px rgba(120, 243, 207, 0.12);
+}
+
+.primaryButton {
+  min-height: 50px;
+  border: 0;
+  border-radius: 8px;
+  color: #071015;
+  background: #78f3cf;
+  font-weight: 850;
+}
+
+.primaryButton:hover {
+  background: #9ff8dc;
+}
+
+.formMessage {
+  min-height: 22px;
+  margin: 0;
+  color: #aeb8c2;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.formMessage[data-state="error"] {
+  color: #ffd2d2;
+}
+
+.formMessage[data-state="info"] {
+  color: #bdf7e7;
+}
+
+@media (max-width: 860px) {
+  .loginScreen {
+    width: min(100% - 28px, 620px);
+    grid-template-columns: 1fr;
+    gap: 28px;
+    padding: 28px 0;
+  }
+
+  .brandPanel {
+    min-height: auto;
+    gap: 34px;
+    padding: 0;
+  }
+
+  h1 {
+    font-size: clamp(40px, 13vw, 58px);
+  }
+
+  .apiStatus {
+    grid-template-columns: 1fr;
+  }
+
+  .statusButton {
+    width: 100%;
+  }
+
+  .loginCard {
+    padding: 24px;
+  }
+}
