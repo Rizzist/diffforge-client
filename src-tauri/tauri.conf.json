@@ -39,5 +39,12 @@
         "installerIcon": "icons/icon.ico"
       }
     }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["diffforge"]
+      }
+    }
   }
 }

@@ -17,10 +17,17 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-deep-link": "^2.4.9",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "styled-components": "^6.4.1",
+    "styled-icons": "^10.47.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
     "vite": "^7.0.0"
   }
 }

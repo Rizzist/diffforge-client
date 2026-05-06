@@ -3,5 +3,17 @@
   "identifier": "default",
   "description": "Capability for the main desktop window.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "deep-link:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://diffforge.ai/desktop/login*"
+        }
+      ]
+    }
+  ]
 }

@@ -2,54 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Diffforge Desktop</title>
   </head>
   <body>
-    <div id="app">
-      <main class="loginScreen">
-        <section class="brandPanel" aria-labelledby="desktop-title">
-          <a class="brandMark" href="#" aria-label="Diffforge">
-            <span>DF</span>
-            <strong>Diffforge</strong>
-          </a>
-
-          <div class="introCopy">
-            <p class="kicker">Desktop preview</p>
-            <h1 id="desktop-title">Sign in to Diffforge</h1>
-            <p>Review, ship, and keep your agentic development loop close at hand.</p>
-          </div>
-
-          <div class="apiStatus" data-state="checking">
-            <div>
-              <span class="statusDot" aria-hidden="true"></span>
-              <span id="api-status-label">Checking backend</span>
-            </div>
-            <button id="api-check-button" class="statusButton" type="button">
-              Check API
-            </button>
-            <p id="api-base"></p>
-          </div>
-        </section>
-
-        <section class="loginCard" aria-label="Desktop sign in">
-          <form id="login-form" class="loginForm">
-            <label class="field">
-              <span>Email</span>
-              <input id="email" autocomplete="email" name="email" placeholder="you@company.com" required type="email" />
-            </label>
-
-            <label class="field">
-              <span>Password</span>
-              <input id="password" autocomplete="current-password" minlength="8" name="password" placeholder="Enter password" required type="password" />
-            </label>
-
-            <button class="primaryButton" type="submit">Sign in</button>
-            <p id="form-message" class="formMessage" role="status" aria-live="polite"></p>
-          </form>
-        </section>
-      </main>
-    </div>
+    <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

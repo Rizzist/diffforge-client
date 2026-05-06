@@ -14,4 +14,4 @@ npm run build
 
 During development, Vite runs on `127.0.0.1` as a private hot-reload feed for the native WebView. That URL is not the product surface and is not used by packaged builds.
 
-The placeholder login screen does not authenticate yet. The app currently checks the hosted Next.js API at `https://diffforge.ai/api/hello` through the Rust Tauri host.
+Desktop login opens `https://diffforge.ai/desktop/login` in the system browser, receives a `diffforge://auth/callback` deep link, exchanges the one-time code with `https://diffforge.ai/api/desktop/sessions/exchange`, and validates stored desktop sessions on app launch.
