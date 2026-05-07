@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
 
-const API_BASE_URL: &str = "https://diffforge.ai/api";
+const API_BASE_URL: &str = "http://localhost:3000/api";
 const MIN_AUTH_VALUE_LENGTH: usize = 24;
 const MAX_AUTH_VALUE_LENGTH: usize = 192;
 const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
@@ -32,9 +32,6 @@ const MAX_FORGE_MODEL_LENGTH: usize = 80;
 const MAX_FORGE_IMAGES: usize = 4;
 const MAX_FORGE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_WORKSPACE_TERMINALS: usize = 8;
-const WORKSPACE_BOARD_COLUMNS: i64 = 4;
-const WORKSPACE_BOARD_ROWS: i64 = 2;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
 const TERMINAL_DEFAULT_ROWS: u16 = 24;
 const TERMINAL_MIN_COLS: u16 = 20;
@@ -72,15 +69,6 @@ struct ExchangeDesktopSessionRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct CreateWorkspaceRequest<'a> {
     name: &'a str,
-    terminal_count: u8,
-    terminal_layout: &'a Value,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateWorkspaceLayoutRequest<'a> {
-    workspace_id: &'a str,
-    terminal_layout: &'a Value,
 }
 
 #[derive(Clone, Copy)]
@@ -248,23 +236,6 @@ fn validate_auth_value(label: &str, value: &str) -> Result<(), String> {
     Err(format!("{label} is invalid."))
 }
 
-fn is_safe_workspace_id(value: &str) -> bool {
-    let value_length = value.len();
-
-    value_length == 36
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-}
-
-fn validate_workspace_id(value: &str) -> Result<(), String> {
-    if is_safe_workspace_id(value) {
-        return Ok(());
-    }
-
-    Err("Workspace id is invalid.".to_string())
-}
-
 fn is_safe_terminal_pane_id(value: &str) -> bool {
     let value_length = value.len();
 
@@ -281,69 +252,6 @@ fn validate_terminal_pane_id(value: &str) -> Result<(), String> {
     }
 
     Err("Terminal pane id is invalid.".to_string())
-}
-
-fn layout_number(pane: &Value, key: &str) -> Option<i64> {
-    pane.get(key)?.as_i64()
-}
-
-fn validate_workspace_terminal_layout(terminal_layout: &Value) -> Result<(), String> {
-    let panes = terminal_layout
-        .as_array()
-        .ok_or_else(|| "Terminal layout must be an array.".to_string())?;
-
-    if panes.is_empty() || panes.len() > MAX_WORKSPACE_TERMINALS {
-        return Err("Terminal layout must contain between 1 and 8 terminals.".to_string());
-    }
-
-    let mut occupied_cells = HashSet::new();
-
-    for pane in panes {
-        let Some(pane_object) = pane.as_object() else {
-            return Err("Every terminal layout item must be an object.".to_string());
-        };
-
-        let x = layout_number(pane, "x")
-            .ok_or_else(|| "Terminal x coordinate is invalid.".to_string())?;
-        let y = layout_number(pane, "y")
-            .ok_or_else(|| "Terminal y coordinate is invalid.".to_string())?;
-        let width =
-            layout_number(pane, "width").ok_or_else(|| "Terminal width is invalid.".to_string())?;
-        let height = layout_number(pane, "height")
-            .ok_or_else(|| "Terminal height is invalid.".to_string())?;
-        if !pane_object
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id.len() >= 3 && id.len() <= 64)
-        {
-            return Err("Terminal layout id is invalid.".to_string());
-        }
-        if let Some(model) = pane_object.get("model").and_then(Value::as_str) {
-            normalize_forge_model(Some(model.to_string()))?;
-        }
-
-        if x < 0
-            || y < 0
-            || width < 1
-            || height < 1
-            || x + width > WORKSPACE_BOARD_COLUMNS
-            || y + height > WORKSPACE_BOARD_ROWS
-        {
-            return Err("Terminal layout must fit the 4 by 2 workspace board.".to_string());
-        }
-
-        for row in y..(y + height) {
-            for column in x..(x + width) {
-                let key = format!("{column}:{row}");
-
-                if !occupied_cells.insert(key) {
-                    return Err("Terminal layout panes cannot overlap.".to_string());
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn parse_agent_provider(provider: &str) -> Result<AgentProvider, String> {
@@ -1004,7 +912,6 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
         ("mate-terminal", vec!["--command", command_line.as_str()]),
         ("kitty", vec![binary]),
         ("alacritty", vec!["-e", binary]),
-        ("xterm", vec!["-e", binary]),
     ];
 
     for (terminal, prefix_args) in terminal_attempts {
@@ -1432,7 +1339,7 @@ fn terminal_open(
         }
 
         command.cwd(&working_directory);
-        command.env("TERM", "xterm-256color");
+        command.env("TERM", "ansi");
         command.env("COLORTERM", "truecolor");
 
         let child = match pair.slave.spawn_command(command) {
@@ -1555,6 +1462,18 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|error| format!("Unable to prepare backend request: {error}"))
 }
 
+fn non_json_api_response_message(
+    status: reqwest::StatusCode,
+    fallback_message: &str,
+    parse_error: serde_json::Error,
+) -> String {
+    if status.is_success() {
+        return format!("Diff Forge AI API returned invalid JSON: {parse_error}");
+    }
+
+    format!("{fallback_message} Diff Forge AI API returned {status} with a non-JSON response.")
+}
+
 async fn read_api_response(
     response: reqwest::Response,
     fallback_message: &str,
@@ -1567,8 +1486,16 @@ async fn read_api_response(
     let response_body = if response_text.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str::<Value>(&response_text)
-            .map_err(|error| format!("Diff Forge AI API returned invalid JSON: {error}"))?
+        match serde_json::from_str::<Value>(&response_text) {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(non_json_api_response_message(
+                    status,
+                    fallback_message,
+                    error,
+                ));
+            }
+        }
     };
 
     if status.is_success() {
@@ -1675,14 +1602,8 @@ async fn list_workspaces(token: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn create_workspace(
-    token: String,
-    name: String,
-    terminal_count: u8,
-    terminal_layout: Value,
-) -> Result<Value, String> {
+async fn create_workspace(token: String, name: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
-    validate_workspace_terminal_layout(&terminal_layout)?;
 
     let workspace_name = name
         .replace(|character: char| character.is_control(), "")
@@ -1693,49 +1614,18 @@ async fn create_workspace(
         return Err("Workspace name must be between 1 and 80 characters.".to_string());
     }
 
-    if !(1..=8).contains(&terminal_count) {
-        return Err("Terminal count must be between 1 and 8.".to_string());
-    }
-
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
         .post(format!("{API_BASE_URL}/desktop/workspaces"))
         .bearer_auth(token)
         .json(&CreateWorkspaceRequest {
             name: &workspace_name,
-            terminal_count,
-            terminal_layout: &terminal_layout,
         })
         .send()
         .await
         .map_err(|error| format!("Unable to create workspace: {error}"))?;
 
     read_api_response(response, "Unable to create workspace.").await
-}
-
-#[tauri::command]
-async fn update_workspace_layout(
-    token: String,
-    workspace_id: String,
-    terminal_layout: Value,
-) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
-    validate_workspace_id(&workspace_id)?;
-    validate_workspace_terminal_layout(&terminal_layout)?;
-
-    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let response = client
-        .patch(format!("{API_BASE_URL}/desktop/workspaces"))
-        .bearer_auth(token)
-        .json(&UpdateWorkspaceLayoutRequest {
-            workspace_id: &workspace_id,
-            terminal_layout: &terminal_layout,
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Unable to save workspace layout: {error}"))?;
-
-    read_api_response(response, "Unable to save workspace layout.").await
 }
 
 #[tauri::command]
@@ -1855,7 +1745,6 @@ pub fn run() {
             logout_desktop_session,
             list_workspaces,
             create_workspace,
-            update_workspace_layout,
             agent_statuses,
             start_agent_login,
             disconnect_agent,

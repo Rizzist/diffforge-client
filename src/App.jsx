@@ -25,14 +25,10 @@ import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
+import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "./authStore";
 
-const API_BASE_URL = "https://diffforge.ai/api";
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
 const PRICING_URL = "https://diffforge.ai/pricing";
-const SESSION_TOKEN_KEY = "diffforge.desktop.sessionToken";
-const SESSION_USER_KEY = "diffforge.desktop.user";
-const PENDING_STATE_KEY = "diffforge.desktop.pendingAuthState";
-const AUTH_VALUE_PATTERN = /^[A-Za-z0-9_-]{24,192}$/;
 const BRAND_NAME = "Diff Forge AI";
 const TITLE_BAR_HEIGHT = "34px";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -49,31 +45,11 @@ const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const PLAN_REFRESH_TIMEOUT_MS = 5000;
 const LOGOUT_TIMEOUT_MS = 5000;
 const VIEW_TRANSITION_MS = 170;
-const WORKSPACE_LAYOUT_AUTOSAVE_MS = 450;
-const MAX_WORKSPACE_TERMINALS = 8;
-const DEFAULT_WORKSPACE_TERMINAL_COUNT = 8;
-const WORKSPACE_BOARD_COLUMNS = 4;
-const WORKSPACE_BOARD_ROWS = 2;
-const PANE_BOARD_GAP = 12;
 const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
 const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
 ];
-const AGENT_MODELS = {
-  codex: [
-    { id: "", label: "Default", supportsImages: true },
-    { id: "gpt-5.2", label: "GPT-5.2", supportsImages: true },
-    { id: "gpt-5.2-codex", label: "GPT-5.2 Codex", supportsImages: true },
-    { id: "o3", label: "o3", supportsImages: true },
-  ],
-  claude: [
-    { id: "", label: "Default", supportsImages: false },
-    { id: "sonnet", label: "Sonnet", supportsImages: false },
-    { id: "opus", label: "Opus", supportsImages: false },
-    { id: "haiku", label: "Haiku", supportsImages: false },
-  ],
-};
 const AGENT_INSTALL_GUIDES = {
   codex: {
     nativeInstallUrl: "https://github.com/openai/codex/releases/latest",
@@ -103,10 +79,6 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   recommendNativeInstall: true,
   connectCommand: provider.id === "codex" ? "codex login" : "claude",
 }));
-const HOTKEY_ACTIONS = [
-  { id: "codex", label: "Open Codex", key: "1" },
-  { id: "claude", label: "Open Claude", key: "2" },
-];
 const AUTH_TILE_SIZE = 40;
 const AUTH_TILE_COLUMNS = 64;
 const AUTH_TILE_ROWS = 24;
@@ -149,22 +121,8 @@ function createAuthState() {
     .replace(/=+$/g, "");
 }
 
-function isSafeAuthValue(value) {
-  return typeof value === "string" && AUTH_VALUE_PATTERN.test(value);
-}
-
 function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
-}
-
-function getStoredUser() {
-  try {
-    const user = JSON.parse(localStorage.getItem(SESSION_USER_KEY) || "null");
-
-    return user && typeof user === "object" ? user : null;
-  } catch {
-    return null;
-  }
 }
 
 function parseAuthCallback(urlValue) {
@@ -188,24 +146,6 @@ function parseAuthCallback(urlValue) {
   }
 }
 
-function clearStoredSession() {
-  localStorage.removeItem(SESSION_TOKEN_KEY);
-  localStorage.removeItem(SESSION_USER_KEY);
-}
-
-function clearPendingLogin() {
-  localStorage.removeItem(PENDING_STATE_KEY);
-}
-
-function saveStoredSession(session) {
-  if (!session?.token || !session?.user) {
-    throw new Error("Desktop session is missing.");
-  }
-
-  localStorage.setItem(SESSION_TOKEN_KEY, session.token);
-  localStorage.setItem(SESSION_USER_KEY, JSON.stringify(session.user));
-}
-
 function getErrorMessage(error, fallback) {
   if (typeof error === "string" && error.trim()) {
     return error;
@@ -216,6 +156,18 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function isDesktopSessionExpiredError(error) {
+  const message = getErrorMessage(error, "").toLowerCase();
+
+  return (
+    message.includes("desktop session expired")
+    || message.includes("session expired")
+    || message.includes("invalid desktop session")
+    || message.includes("unauthorized")
+    || message.includes("forbidden")
+  );
 }
 
 function withTimeout(promise, timeoutMs, message) {
@@ -259,10 +211,6 @@ function runWindowAction(action) {
   });
 }
 
-function createPaneId(prefix = "pane") {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
 function getAgentTone(agent) {
   if (!agent?.installed) {
     return "offline";
@@ -271,487 +219,15 @@ function getAgentTone(agent) {
   return agent.authenticated ? "ready" : "needsAuth";
 }
 
-function getPaneTitle(kind) {
-  if (kind === "codex") {
-    return "Forge Codex";
-  }
-
-  if (kind === "claude") {
-    return "Forge Claude";
-  }
-
-  return "Forge Console";
-}
-
-function getPaneProvider(kind, fallbackProvider) {
-  if (kind === "claude") {
-    return "claude";
-  }
-
-  if (kind === "codex") {
-    return "codex";
-  }
-
-  return fallbackProvider;
-}
-
-function formatDirectoryLabel(workingDirectory) {
-  if (!workingDirectory) {
-    return "";
-  }
-
-  const normalized = workingDirectory.replace(/\\/g, "/").replace(/\/+$/g, "");
-  const segments = normalized.split("/").filter(Boolean);
-
-  return segments[segments.length - 1] || workingDirectory;
-}
-
-function getProviderModels(provider) {
-  return AGENT_MODELS[provider] || AGENT_MODELS.codex;
-}
-
-function getPaneModelOption(provider, modelId = "") {
-  const models = getProviderModels(provider);
-
-  return models.find((model) => model.id === (modelId || "")) || models[0];
-}
-
-function buildDefaultTerminalLayout(count = DEFAULT_WORKSPACE_TERMINAL_COUNT) {
-  const paneCount = Math.max(
-    1,
-    Math.min(MAX_WORKSPACE_TERMINALS, Number(count) || DEFAULT_WORKSPACE_TERMINAL_COUNT),
-  );
-
-  return Array.from({ length: paneCount }, (_, index) => ({
-    id: `term-${index + 1}`,
-    kind: "console",
-    title: "Forge Console",
-    x: index % WORKSPACE_BOARD_COLUMNS,
-    y: Math.floor(index / WORKSPACE_BOARD_COLUMNS),
-    width: 1,
-    height: 1,
-  }));
-}
-
-function getPaneLayout(pane, index = 0) {
-  const x = Number.isInteger(pane?.x) ? pane.x : index % WORKSPACE_BOARD_COLUMNS;
-  const y = Number.isInteger(pane?.y) ? pane.y : Math.floor(index / WORKSPACE_BOARD_COLUMNS);
-  const width = Number.isInteger(pane?.width) ? pane.width : 1;
-  const height = Number.isInteger(pane?.height) ? pane.height : 1;
-  const safeWidth = Math.max(1, Math.min(WORKSPACE_BOARD_COLUMNS, width));
-  const safeHeight = Math.max(1, Math.min(WORKSPACE_BOARD_ROWS, height));
-
-  return {
-    x: Math.max(0, Math.min(WORKSPACE_BOARD_COLUMNS - safeWidth, x)),
-    y: Math.max(0, Math.min(WORKSPACE_BOARD_ROWS - safeHeight, y)),
-    width: safeWidth,
-    height: safeHeight,
-  };
-}
-
-function paneCells(pane) {
-  const cells = [];
-
-  for (let row = pane.y; row < pane.y + pane.height; row += 1) {
-    for (let column = pane.x; column < pane.x + pane.width; column += 1) {
-      cells.push(`${column}:${row}`);
-    }
-  }
-
-  return cells;
-}
-
-function occupyLayoutCells(occupiedCells, layout) {
-  paneCells(layout).forEach((cell) => occupiedCells.add(cell));
-}
-
-function layoutCollidesWithCells(layout, occupiedCells) {
-  return paneCells(layout).some((cell) => occupiedCells.has(cell));
-}
-
-function findOpenBoardLayout(occupiedCells, width = 1, height = 1) {
-  for (let row = 0; row <= WORKSPACE_BOARD_ROWS - height; row += 1) {
-    for (let column = 0; column <= WORKSPACE_BOARD_COLUMNS - width; column += 1) {
-      const layout = { x: column, y: row, width, height };
-
-      if (!layoutCollidesWithCells(layout, occupiedCells)) {
-        return layout;
-      }
-    }
-  }
-
-  return null;
-}
-
-function getCandidateLayouts(preferredWidth, preferredHeight, maxArea = WORKSPACE_BOARD_COLUMNS * WORKSPACE_BOARD_ROWS) {
-  const safeMaxArea = Math.max(1, Math.min(WORKSPACE_BOARD_COLUMNS * WORKSPACE_BOARD_ROWS, maxArea));
-  const layouts = [];
-
-  for (let height = 1; height <= WORKSPACE_BOARD_ROWS; height += 1) {
-    for (let width = 1; width <= WORKSPACE_BOARD_COLUMNS; width += 1) {
-      if (width * height <= safeMaxArea) {
-        layouts.push({ width, height });
-      }
-    }
-  }
-
-  return layouts.sort((left, right) => {
-    const leftDistance = Math.abs(left.width - preferredWidth) + Math.abs(left.height - preferredHeight);
-    const rightDistance = Math.abs(right.width - preferredWidth) + Math.abs(right.height - preferredHeight);
-
-    if (leftDistance !== rightDistance) {
-      return leftDistance - rightDistance;
-    }
-
-    return right.width * right.height - left.width * left.height;
-  });
-}
-
-function findClosestPaneLayout(layout, otherPaneCount = 0) {
-  const maxArea = WORKSPACE_BOARD_COLUMNS * WORKSPACE_BOARD_ROWS - otherPaneCount;
-
-  for (const size of getCandidateLayouts(layout.width, layout.height, maxArea)) {
-    const x = Math.max(0, Math.min(WORKSPACE_BOARD_COLUMNS - size.width, layout.x));
-    const y = Math.max(0, Math.min(WORKSPACE_BOARD_ROWS - size.height, layout.y));
-
-    return { x, y, width: size.width, height: size.height };
-  }
-
-  return { x: 0, y: 0, width: 1, height: 1 };
-}
-
-function repackPanesAround(activePaneId, activeLayout, panes) {
-  const activePane = panes.find((pane) => pane.id === activePaneId);
-
-  if (!activePane) {
-    return panes;
-  }
-
-  const activeSafeLayout = findClosestPaneLayout(activeLayout, panes.length - 1);
-  const occupiedCells = new Set();
-  const nextPaneMap = new Map();
-
-  occupyLayoutCells(occupiedCells, activeSafeLayout);
-  nextPaneMap.set(activePaneId, { ...activePane, ...activeSafeLayout });
-
-  for (const pane of panes) {
-    if (pane.id === activePaneId) {
-      continue;
-    }
-
-    const currentLayout = getPaneLayout(pane);
-    let nextLayout = null;
-
-    for (const size of getCandidateLayouts(currentLayout.width, currentLayout.height)) {
-      nextLayout = findOpenBoardLayout(occupiedCells, size.width, size.height);
-
-      if (nextLayout) {
-        break;
-      }
-    }
-
-    if (!nextLayout) {
-      nextLayout = findOpenBoardLayout(occupiedCells, 1, 1);
-    }
-
-    if (!nextLayout) {
-      return panes;
-    }
-
-    occupyLayoutCells(occupiedCells, nextLayout);
-    nextPaneMap.set(pane.id, { ...pane, ...nextLayout });
-  }
-
-  return panes.map((pane) => nextPaneMap.get(pane.id) || pane);
-}
-
-function getMaximizedPaneLayouts(count) {
-  const layoutSets = {
-    1: [{ x: 0, y: 0, width: 4, height: 2 }],
-    2: [
-      { x: 0, y: 0, width: 2, height: 2 },
-      { x: 2, y: 0, width: 2, height: 2 },
-    ],
-    3: [
-      { x: 0, y: 0, width: 2, height: 2 },
-      { x: 2, y: 0, width: 2, height: 1 },
-      { x: 2, y: 1, width: 2, height: 1 },
-    ],
-    4: [
-      { x: 0, y: 0, width: 2, height: 1 },
-      { x: 2, y: 0, width: 2, height: 1 },
-      { x: 0, y: 1, width: 2, height: 1 },
-      { x: 2, y: 1, width: 2, height: 1 },
-    ],
-    5: [
-      { x: 0, y: 0, width: 2, height: 1 },
-      { x: 2, y: 0, width: 2, height: 1 },
-      { x: 0, y: 1, width: 2, height: 1 },
-      { x: 2, y: 1, width: 1, height: 1 },
-      { x: 3, y: 1, width: 1, height: 1 },
-    ],
-    6: [
-      { x: 0, y: 0, width: 2, height: 1 },
-      { x: 2, y: 0, width: 2, height: 1 },
-      { x: 0, y: 1, width: 1, height: 1 },
-      { x: 1, y: 1, width: 1, height: 1 },
-      { x: 2, y: 1, width: 1, height: 1 },
-      { x: 3, y: 1, width: 1, height: 1 },
-    ],
-    7: [
-      { x: 0, y: 0, width: 2, height: 1 },
-      { x: 2, y: 0, width: 1, height: 1 },
-      { x: 3, y: 0, width: 1, height: 1 },
-      { x: 0, y: 1, width: 1, height: 1 },
-      { x: 1, y: 1, width: 1, height: 1 },
-      { x: 2, y: 1, width: 1, height: 1 },
-      { x: 3, y: 1, width: 1, height: 1 },
-    ],
-  };
-
-  return layoutSets[count] || buildDefaultTerminalLayout(count).map(getPaneLayout);
-}
-
-function maximizePaneBoard(panes) {
-  const layouts = getMaximizedPaneLayouts(panes.length);
-
-  return panes.map((pane, index) => ({
-    ...pane,
-    ...(layouts[index] || getPaneLayout(pane, index)),
-  }));
-}
-
-function normalizePaneFromLayout(layoutPane, index = 0) {
-  const kind = ["console", "codex", "claude"].includes(layoutPane?.kind) ? layoutPane.kind : "console";
-  const layout = getPaneLayout(layoutPane, index);
-  const provider = getPaneProvider(kind, "codex");
-  const model = getPaneModelOption(provider, layoutPane?.model).id;
-
-  return {
-    id: typeof layoutPane?.id === "string" && layoutPane.id.trim()
-      ? layoutPane.id
-      : createPaneId(kind),
-    kind,
-    title: typeof layoutPane?.title === "string" && layoutPane.title.trim()
-      ? layoutPane.title.trim()
-      : getPaneTitle(kind),
-    model,
-    ...layout,
-    messages: [],
-    isRunning: false,
-  };
-}
-
-function getWorkspaceTerminalLayout(workspace) {
-  const sourceLayout = Array.isArray(workspace?.terminalLayout) && workspace.terminalLayout.length > 0
-    ? workspace.terminalLayout
-    : buildDefaultTerminalLayout(workspace?.terminalCount || DEFAULT_WORKSPACE_TERMINAL_COUNT);
-
-  return sourceLayout
-    .slice(0, MAX_WORKSPACE_TERMINALS)
-    .map((pane, index) => normalizePaneFromLayout(pane, index));
-}
-
-function serializePaneLayout(panes) {
-  return panes.slice(0, MAX_WORKSPACE_TERMINALS).map((pane, index) => {
-    const kind = ["console", "codex", "claude"].includes(pane.kind) ? pane.kind : "console";
-    const layout = getPaneLayout(pane, index);
-
-    return {
-      id: pane.id,
-      kind,
-      title: pane.title || getPaneTitle(kind),
-      model: getPaneModelOption(getPaneProvider(kind, "codex"), pane.model).id,
-      ...layout,
-    };
-  });
-}
-
-function createWorkspaceLayoutSignature(workspaceId, terminalLayout) {
-  if (!workspaceId || !Array.isArray(terminalLayout) || terminalLayout.length === 0) {
-    return "";
-  }
-
-  return JSON.stringify({
-    workspaceId,
-    terminalLayout,
-  });
-}
-
-function buildEmptyPane(kind = "console", layout = null) {
-  const paneLayout = getPaneLayout(layout);
-  const provider = getPaneProvider(kind, "codex");
-
-  return {
-    id: createPaneId(kind),
-    kind,
-    title: getPaneTitle(kind),
-    model: getPaneModelOption(provider).id,
-    ...paneLayout,
-    messages: [],
-    isRunning: false,
-  };
-}
-
-function ForgeXtermPane({ pane, provider, model, onError, onWorkingDirectory }) {
-  const containerRef = useRef(null);
-  const terminalRef = useRef(null);
-  const fitAddonRef = useRef(null);
-  const openedRef = useRef(false);
-
-  useEffect(() => {
-    const container = containerRef.current;
-
-    if (!container) {
-      return undefined;
-    }
-
-    let isDisposed = false;
-    let resizeFrame = 0;
-    const disposables = [];
-    const terminal = new XTerm({
-      allowProposedApi: false,
-      convertEol: false,
-      cursorBlink: true,
-      cursorStyle: "block",
-      fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
-      fontSize: 12,
-      lineHeight: 1.2,
-      macOptionIsMeta: true,
-      scrollback: 5000,
-      theme: {
-        background: "#020304",
-        foreground: "#e8eef8",
-        cursor: "#ff9a3d",
-        cursorAccent: "#030508",
-        selectionBackground: "#2f80ff55",
-        black: "#030508",
-        brightBlack: "#687386",
-        blue: "#62a0ff",
-        brightBlue: "#8bb9ff",
-        cyan: "#6fd7ff",
-        brightCyan: "#a7e8ff",
-        green: "#7ee787",
-        brightGreen: "#9dffad",
-        magenta: "#d2a8ff",
-        brightMagenta: "#e1c7ff",
-        red: "#ff6b6b",
-        brightRed: "#ff9a9a",
-        white: "#e8eef8",
-        brightWhite: "#ffffff",
-        yellow: "#ffb269",
-        brightYellow: "#ffd08a",
-      },
-    });
-    const fitAddon = new FitAddon();
-
-    terminalRef.current = terminal;
-    fitAddonRef.current = fitAddon;
-    terminal.loadAddon(fitAddon);
-    terminal.open(container);
-
-    const resizeTerminal = () => {
-      if (isDisposed || !openedRef.current) {
-        return;
-      }
-
-      window.cancelAnimationFrame(resizeFrame);
-      resizeFrame = window.requestAnimationFrame(() => {
-        try {
-          fitAddon.fit();
-          invoke("terminal_resize", {
-            paneId: pane.id,
-            cols: terminal.cols,
-            rows: terminal.rows,
-          }).catch(() => {});
-        } catch {
-          // xterm can briefly reject fit calls while the pane is being laid out.
-        }
-      });
-    };
-
-    const resizeObserver = new ResizeObserver(resizeTerminal);
-    resizeObserver.observe(container);
-
-    async function startTerminal() {
-      try {
-        disposables.push(await listen("forge-terminal-data", (event) => {
-          if (event.payload?.paneId === pane.id && typeof event.payload.data === "string") {
-            terminal.write(event.payload.data);
-          }
-        }));
-        disposables.push(await listen("forge-terminal-exit", (event) => {
-          if (event.payload?.paneId === pane.id) {
-            terminal.writeln("");
-            terminal.writeln("\x1b[38;2;104;115;134m[process exited]\x1b[0m");
-          }
-        }));
-        disposables.push(terminal.onData((data) => {
-          invoke("terminal_write", { paneId: pane.id, data }).catch((error) => {
-            onError(getErrorMessage(error, "Unable to write to terminal."));
-          });
-        }));
-
-        fitAddon.fit();
-        const result = await invoke("terminal_open", {
-          request: {
-            paneId: pane.id,
-            kind: pane.kind,
-            provider,
-            model: model.id,
-            cols: terminal.cols,
-            rows: terminal.rows,
-          },
-        });
-
-        if (isDisposed) {
-          return;
-        }
-
-        openedRef.current = true;
-        terminal.focus();
-        if (result?.workingDirectory) {
-          onWorkingDirectory(result.workingDirectory);
-        }
-        resizeTerminal();
-      } catch (error) {
-        const errorText = getErrorMessage(error, "Unable to open terminal.");
-        terminal.writeln(`\x1b[38;2;255;107;107merror: ${errorText}\x1b[0m`);
-        onError(errorText);
-      }
-    }
-
-    startTerminal();
-
-    return () => {
-      isDisposed = true;
-      openedRef.current = false;
-      window.cancelAnimationFrame(resizeFrame);
-      resizeObserver.disconnect();
-      disposables.forEach((dispose) => {
-        if (typeof dispose === "function") {
-          dispose();
-        } else {
-          dispose?.dispose?.();
-        }
-      });
-      invoke("terminal_close", { paneId: pane.id }).catch(() => {});
-      terminal.dispose();
-      terminalRef.current = null;
-      fitAddonRef.current = null;
-    };
-  }, [model.id, onError, onWorkingDirectory, pane.id, pane.kind, provider]);
-
-  return <XtermSurface ref={containerRef} />;
-}
-
 export default function App() {
+  const {
+    status: authState,
+    message: authMessage,
+    error: authError,
+    user,
+  } = useAuthSnapshot();
   const [apiState, setApiState] = useState("checking");
   const [apiMessage, setApiMessage] = useState("Checking connection");
-  const [authState, setAuthState] = useState("signedOut");
-  const [authMessage, setAuthMessage] = useState(`Sign in with your ${BRAND_NAME} web account.`);
-  const [authError, setAuthError] = useState("");
-  const [user, setUser] = useState(() => getStoredUser());
   const [activeView, setActiveView] = useState("dashboard");
   const [visibleView, setVisibleView] = useState("dashboard");
   const [viewMotion, setViewMotion] = useState("entered");
@@ -763,44 +239,39 @@ export default function App() {
   const [agentInstallResults, setAgentInstallResults] = useState({});
   const [agentDisconnectState, setAgentDisconnectState] = useState({});
   const [agentActionResults, setAgentActionResults] = useState({});
-  const [forgeError, setForgeError] = useState("");
   const [workspaces, setWorkspaces] = useState([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceName, setWorkspaceName] = useState("");
-  const [workspaceTerminalCount, setWorkspaceTerminalCount] = useState(DEFAULT_WORKSPACE_TERMINAL_COUNT);
-  const [forgePanes, setForgePanes] = useState([]);
-  const [forgeWorkingDirectory, setForgeWorkingDirectory] = useState("");
   const [authInitialized, setAuthInitialized] = useState(false);
   const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
   const [workspaceState, setWorkspaceState] = useState("idle");
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
   const launchStartedAtRef = useRef(Date.now());
-  const pendingStateRef = useRef(localStorage.getItem(PENDING_STATE_KEY) || "");
   const viewTransitionTimeoutRef = useRef(null);
-  const draggedPaneIdRef = useRef("");
-  const paneBoardRef = useRef(null);
-  const forgePanesRef = useRef([]);
-  const lastSavedWorkspaceLayoutRef = useRef("");
-  const workspaceLayoutAutosaveTimeoutRef = useRef(null);
-  const workspaceLayoutSaveIdRef = useRef(0);
   const agentInitialStatusUserRef = useRef("");
 
-  const setSignedOut = useCallback((message = `Sign in with your ${BRAND_NAME} web account.`) => {
-    setAuthState("signedOut");
-    setAuthMessage(message);
-    setAuthError("");
-    setUser(null);
+  const setSignedOut = useCallback((
+    message = DEFAULT_AUTH_MESSAGE,
+    error = "",
+    options = {},
+  ) => {
+    authStore.setSignedOut({
+      message,
+      error,
+      clearSession: options.clearSession !== false,
+      clearPending: options.clearPending === true,
+    });
     setActiveView("dashboard");
     setVisibleView("dashboard");
     setViewMotion("entered");
     setWorkspaceState("idle");
     setWorkspaces([]);
     setActiveWorkspaceId("");
-    setForgePanes([]);
-    lastSavedWorkspaceLayoutRef.current = "";
+    setWorkspaceSyncState("idle");
+    setWorkspaceName("");
     agentInitialStatusUserRef.current = "";
     setWorkspaceError("");
   }, []);
@@ -808,16 +279,15 @@ export default function App() {
   const setAuthenticated = useCallback((sessionUser) => {
     const isPaid = isPaidUser(sessionUser);
 
-    setAuthState("authenticated");
-    setAuthMessage(isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.");
-    setAuthError("");
-    setUser(sessionUser);
+    authStore.setAuthenticated(
+      sessionUser,
+      isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
+    );
     setActiveView("dashboard");
     setVisibleView("dashboard");
     setViewMotion("entered");
     setWorkspaceState(isPaid ? "initializing" : "billingRequired");
-    setForgePanes([]);
-    lastSavedWorkspaceLayoutRef.current = "";
+    setWorkspaceSyncState("idle");
     agentInitialStatusUserRef.current = "";
     setWorkspaceError("");
   }, []);
@@ -872,20 +342,15 @@ export default function App() {
   }, []);
 
   const validateStoredSession = useCallback(async () => {
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const token = authStore.getToken();
     const validationFlowId = authFlowIdRef.current;
 
     if (!isSafeAuthValue(token)) {
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
-      setSignedOut();
+      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
       return;
     }
 
-    setAuthState("signedOut");
-    setAuthMessage("Checking saved desktop session. You can still sign in with the web app.");
-    setAuthError("");
+    authStore.setChecking("Checking saved desktop session. You can still sign in with the web app.");
 
     try {
       const session = await withTimeout(
@@ -897,24 +362,21 @@ export default function App() {
         return;
       }
 
-      localStorage.setItem(SESSION_USER_KEY, JSON.stringify(session.user));
       setAuthenticated(session.user);
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
       }
 
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
       setSignedOut(
         didTimeout
           ? "Secure session check timed out. Sign in with the web app."
           : "Your desktop session expired. Sign in again with the web app.",
+        restoreError,
+        { clearPending: true },
       );
-      setAuthError(restoreError);
     }
   }, [setAuthenticated, setSignedOut]);
 
@@ -927,19 +389,18 @@ export default function App() {
 
     authFlowIdRef.current += 1;
     const loginFlowId = authFlowIdRef.current;
+    const pendingState = authStore.getPendingState();
 
-    if (!pendingStateRef.current || callback.state !== pendingStateRef.current) {
-      setAuthState("signedOut");
-      setAuthMessage(`Sign in with your ${BRAND_NAME} web account.`);
-      setAuthError("Desktop login state did not match. Start again from this app.");
-      clearPendingLogin();
-      pendingStateRef.current = "";
+    if (!pendingState || callback.state !== pendingState) {
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        "Desktop login state did not match. Start again from this app.",
+        { clearPending: true },
+      );
       return true;
     }
 
-    setAuthState("exchanging");
-    setAuthMessage("Finishing desktop sign in...");
-    setAuthError("");
+    authStore.setExchanging();
 
     try {
       const session = await withTimeout(
@@ -955,34 +416,28 @@ export default function App() {
         return true;
       }
 
-      saveStoredSession(session);
-      clearPendingLogin();
-      pendingStateRef.current = "";
+      authStore.saveAuthenticatedSession(session);
+      authStore.clearPending();
       setAuthenticated(session.user);
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
       }
 
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
-      setAuthState("signedOut");
-      setAuthMessage(`Sign in with your ${BRAND_NAME} web account.`);
-      setAuthError(getErrorMessage(error, "Desktop login expired. Try again."));
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        getErrorMessage(error, "Desktop login expired. Try again."),
+        { clearPending: true },
+      );
     }
 
     return true;
-  }, [setAuthenticated]);
+  }, [setAuthenticated, setSignedOut]);
 
   const startWebLogin = useCallback(async () => {
     authFlowIdRef.current += 1;
     const state = createAuthState();
-    pendingStateRef.current = state;
-    localStorage.setItem(PENDING_STATE_KEY, state);
-    setAuthState("waiting");
-    setAuthMessage("Finish sign in in your browser, then return here.");
-    setAuthError("");
+    authStore.setWaiting(state);
 
     try {
       const loginUrl = `${WEB_LOGIN_URL}?state=${encodeURIComponent(state)}`;
@@ -992,13 +447,13 @@ export default function App() {
         "Unable to open the web login.",
       );
     } catch (error) {
-      pendingStateRef.current = "";
-      clearPendingLogin();
-      setAuthState("signedOut");
-      setAuthMessage(`Sign in with your ${BRAND_NAME} web account.`);
-      setAuthError(getErrorMessage(error, "Unable to open the web login."));
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        getErrorMessage(error, "Unable to open the web login."),
+        { clearSession: false, clearPending: true },
+      );
     }
-  }, []);
+  }, [setSignedOut]);
 
   const openPricing = useCallback(async () => {
     try {
@@ -1008,24 +463,21 @@ export default function App() {
         "Unable to open pricing.",
       );
     } catch (error) {
-      setAuthError(getErrorMessage(error, "Unable to open pricing."));
+      authStore.setError(getErrorMessage(error, "Unable to open pricing."));
     }
   }, []);
 
   const refreshSubscriptionStatus = useCallback(async () => {
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const token = authStore.getToken();
     const refreshFlowId = authFlowIdRef.current;
 
     if (!isSafeAuthValue(token)) {
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
-      setSignedOut();
+      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
       return;
     }
 
-    setAuthMessage("Checking plan status...");
-    setAuthError("");
+    authStore.setMessage("Checking plan status...");
+    authStore.setError("");
 
     try {
       const session = await withTimeout(
@@ -1037,18 +489,17 @@ export default function App() {
         return;
       }
 
-      localStorage.setItem(SESSION_USER_KEY, JSON.stringify(session.user));
       setAuthenticated(session.user);
     } catch (error) {
       if (refreshFlowId !== authFlowIdRef.current) {
         return;
       }
 
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
-      setSignedOut("Your desktop session expired. Sign in again with the web app.");
-      setAuthError(getErrorMessage(error, "Unable to refresh plan status."));
+      setSignedOut(
+        "Your desktop session expired. Sign in again with the web app.",
+        getErrorMessage(error, "Unable to refresh plan status."),
+        { clearPending: true },
+      );
     }
   }, [setAuthenticated, setSignedOut]);
 
@@ -1214,111 +665,19 @@ export default function App() {
     }
   }, []);
 
-  const refreshForgeWorkingDirectory = useCallback(async () => {
-    try {
-      const result = await invoke("forge_working_directory");
-      const workingDirectory = typeof result?.workingDirectory === "string"
-        ? result.workingDirectory
-        : "";
-
-      setForgeWorkingDirectory(workingDirectory);
-    } catch {
-      setForgeWorkingDirectory("");
-    }
-  }, []);
-
-  const updateStoredWorkspaceLayout = useCallback((workspaceId, panes) => {
-    const terminalLayout = serializePaneLayout(panes);
-
-    setWorkspaces((currentWorkspaces) => currentWorkspaces.map((workspace) => (
-      workspace.id === workspaceId
-        ? {
-          ...workspace,
-          terminalCount: terminalLayout.length,
-          terminalLayout,
-        }
-        : workspace
-    )));
-  }, []);
-
-  const updateStoredWorkspaceTerminalLayout = useCallback((workspaceId, terminalLayout) => {
-    if (!workspaceId) {
-      return;
-    }
-
-    setWorkspaces((currentWorkspaces) => currentWorkspaces.map((workspace) => (
-      workspace.id === workspaceId
-        ? {
-          ...workspace,
-          terminalCount: terminalLayout.length,
-          terminalLayout,
-        }
-        : workspace
-    )));
-  }, []);
-
-  const saveWorkspaceTerminalLayout = useCallback(async (workspaceId, terminalLayout, saveId) => {
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
-
-    updateStoredWorkspaceTerminalLayout(workspaceId, terminalLayout);
-
-    if (!isSafeAuthValue(token) || terminalLayout.length === 0) {
-      return false;
-    }
-
-    try {
-      const result = await invoke("update_workspace_layout", {
-        token,
-        workspaceId,
-        terminalLayout,
-      });
-      const workspace = result?.workspace;
-
-      if (workspace && workspaceLayoutSaveIdRef.current === saveId) {
-        setWorkspaces((currentWorkspaces) => currentWorkspaces.map((candidate) => (
-          candidate.id === workspace.id ? workspace : candidate
-        )));
-      }
-
-      if (workspaceLayoutSaveIdRef.current === saveId) {
-        setWorkspaceError("");
-      }
-
-      return true;
-    } catch (error) {
-      if (workspaceLayoutSaveIdRef.current === saveId) {
-        setWorkspaceError(getErrorMessage(error, "Unable to save workspace layout."));
-      }
-
-      return false;
-    }
-  }, [updateStoredWorkspaceTerminalLayout]);
-
-  const commitForgePanes = useCallback((nextPanes, options = {}) => {
-    forgePanesRef.current = nextPanes;
-    setForgePanes(nextPanes);
-
-    if (options.save !== false) {
-      updateStoredWorkspaceLayout(options.workspaceId || activeWorkspaceId, nextPanes);
-    }
-  }, [activeWorkspaceId, updateStoredWorkspaceLayout]);
-
-  const seedPanesFromWorkspace = useCallback((workspace) => {
-    const panes = workspace ? getWorkspaceTerminalLayout(workspace) : [];
-
-    forgePanesRef.current = panes;
-    lastSavedWorkspaceLayoutRef.current = createWorkspaceLayoutSignature(
-      workspace?.id || "",
-      serializePaneLayout(panes),
+  const expireDesktopSession = useCallback((error) => {
+    setSignedOut(
+      "Your desktop session expired. Sign in again with the web app.",
+      getErrorMessage(error, "Desktop session expired."),
+      { clearPending: true },
     );
-    setForgePanes(panes);
-  }, []);
+  }, [setSignedOut]);
 
   const loadWorkspaces = useCallback(async () => {
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const token = authStore.getToken();
 
     if (!isSafeAuthValue(token)) {
-      setWorkspaceError("Desktop session required to load workspaces.");
+      expireDesktopSession("Desktop session required to load workspaces.");
       return;
     }
 
@@ -1332,30 +691,31 @@ export default function App() {
 
       if (nextWorkspaces.length === 0) {
         setActiveWorkspaceId("");
-        setForgePanes([]);
-        lastSavedWorkspaceLayoutRef.current = "";
       } else {
         const nextActive = nextWorkspaces.find((workspace) => workspace.id === activeWorkspaceId) || nextWorkspaces[0];
         setActiveWorkspaceId(nextActive.id);
-        seedPanesFromWorkspace(nextActive);
       }
 
       setWorkspaceSyncState("idle");
     } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+
       setWorkspaceSyncState("error");
       setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
     }
-  }, [activeWorkspaceId, seedPanesFromWorkspace]);
+  }, [activeWorkspaceId, expireDesktopSession]);
 
   const createFirstWorkspace = useCallback(async (event) => {
     event.preventDefault();
 
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const token = authStore.getToken();
     const name = workspaceName.trim();
-    const terminalCount = Number(workspaceTerminalCount);
 
     if (!isSafeAuthValue(token)) {
-      setWorkspaceError("Desktop session required to create a workspace.");
+      expireDesktopSession("Desktop session required to create a workspace.");
       return;
     }
 
@@ -1364,13 +724,6 @@ export default function App() {
       return;
     }
 
-    if (!Number.isInteger(terminalCount) || terminalCount < 1 || terminalCount > MAX_WORKSPACE_TERMINALS) {
-      setWorkspaceError("Choose between 1 and 8 terminals.");
-      return;
-    }
-
-    const terminalLayout = buildDefaultTerminalLayout(terminalCount);
-
     setWorkspaceSyncState("creating");
     setWorkspaceError("");
 
@@ -1378,8 +731,6 @@ export default function App() {
       const result = await invoke("create_workspace", {
         token,
         name,
-        terminalCount,
-        terminalLayout,
       });
       const workspace = result?.workspace;
 
@@ -1390,195 +741,23 @@ export default function App() {
       setWorkspaces([workspace]);
       setActiveWorkspaceId(workspace.id);
       setWorkspaceName("");
-      seedPanesFromWorkspace(workspace);
       setWorkspaceSyncState("idle");
     } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+
       setWorkspaceSyncState("error");
       setWorkspaceError(getErrorMessage(error, "Unable to create workspace."));
     }
-  }, [seedPanesFromWorkspace, workspaceName, workspaceTerminalCount]);
-
-  const openForgePane = useCallback((kind = "console") => {
-    const currentPanes = forgePanesRef.current;
-
-    if (currentPanes.length >= MAX_WORKSPACE_TERMINALS) {
-      setForgeError("A workspace can have up to 8 terminals.");
-      return;
-    }
-
-    setForgeError("");
-    commitForgePanes(maximizePaneBoard([...currentPanes, buildEmptyPane(kind)]));
-  }, [commitForgePanes]);
-
-  const closeForgePane = useCallback((paneId) => {
-    const nextPanes = forgePanesRef.current.filter((pane) => pane.id !== paneId);
-
-    if (nextPanes.length === 0) {
-      setForgeError("Keep at least one terminal in the workspace.");
-      return;
-    }
-
-    setForgeError("");
-    commitForgePanes(maximizePaneBoard(nextPanes));
-  }, [commitForgePanes]);
-
-  const resizeForgePane = useCallback((paneId, nextWidth, nextHeight) => {
-    const currentPanes = forgePanesRef.current;
-    const pane = currentPanes.find((candidate) => candidate.id === paneId);
-
-    if (!pane) {
-      return false;
-    }
-
-    const width = Math.max(1, Math.min(WORKSPACE_BOARD_COLUMNS, Number(nextWidth) || pane.width));
-    const height = Math.max(1, Math.min(WORKSPACE_BOARD_ROWS, Number(nextHeight) || pane.height));
-    const nextLayout = {
-      ...getPaneLayout(pane),
-      width,
-      height,
-    };
-    nextLayout.x = Math.min(nextLayout.x, WORKSPACE_BOARD_COLUMNS - nextLayout.width);
-    nextLayout.y = Math.min(nextLayout.y, WORKSPACE_BOARD_ROWS - nextLayout.height);
-
-    setForgeError("");
-    commitForgePanes(repackPanesAround(paneId, nextLayout, currentPanes));
-    return true;
-  }, [commitForgePanes]);
-
-  const reflowDraggedForgePane = useCallback((event) => {
-    const sourcePaneId = draggedPaneIdRef.current;
-
-    if (!sourcePaneId) {
-      return false;
-    }
-
-    const board = paneBoardRef.current;
-    const currentPanes = forgePanesRef.current;
-    const sourcePane = currentPanes.find((pane) => pane.id === sourcePaneId);
-
-    if (!board || !sourcePane) {
-      return false;
-    }
-
-    event.preventDefault();
-
-    const boardRect = board.getBoundingClientRect();
-    const slotWidth = boardRect.width / WORKSPACE_BOARD_COLUMNS;
-    const slotHeight = boardRect.height / WORKSPACE_BOARD_ROWS;
-    const sourceLayout = getPaneLayout(sourcePane);
-    const nextLayout = {
-      ...sourceLayout,
-      x: Math.max(
-        0,
-        Math.min(WORKSPACE_BOARD_COLUMNS - sourceLayout.width, Math.floor((event.clientX - boardRect.left) / slotWidth)),
-      ),
-      y: Math.max(
-        0,
-        Math.min(WORKSPACE_BOARD_ROWS - sourceLayout.height, Math.floor((event.clientY - boardRect.top) / slotHeight)),
-      ),
-    };
-    const nextPanes = repackPanesAround(sourcePaneId, nextLayout, currentPanes);
-    const currentSignature = JSON.stringify(serializePaneLayout(currentPanes));
-    const nextSignature = JSON.stringify(serializePaneLayout(nextPanes));
-
-    if (currentSignature !== nextSignature) {
-      setForgeError("");
-      commitForgePanes(nextPanes);
-    }
-
-    return true;
-  }, [commitForgePanes]);
-
-  const beginForgePaneResize = useCallback((paneId, direction, event) => {
-    event.preventDefault();
-    event.stopPropagation();
-
-    const board = paneBoardRef.current;
-    const pane = forgePanesRef.current.find((candidate) => candidate.id === paneId);
-
-    if (!board || !pane) {
-      return;
-    }
-
-    const boardRect = board.getBoundingClientRect();
-    const cellWidth = (boardRect.width - PANE_BOARD_GAP * (WORKSPACE_BOARD_COLUMNS - 1)) / WORKSPACE_BOARD_COLUMNS;
-    const cellHeight = (boardRect.height - PANE_BOARD_GAP * (WORKSPACE_BOARD_ROWS - 1)) / WORKSPACE_BOARD_ROWS;
-
-    if (cellWidth <= 0 || cellHeight <= 0) {
-      return;
-    }
-
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const startLayout = getPaneLayout(pane);
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-
-    document.body.style.cursor = direction === "east" ? "ew-resize" : direction === "south" ? "ns-resize" : "nwse-resize";
-    document.body.style.userSelect = "none";
-
-    function handlePointerMove(pointerEvent) {
-      const deltaColumns = direction.includes("east")
-        ? Math.round((pointerEvent.clientX - startX) / cellWidth)
-        : 0;
-      const deltaRows = direction.includes("south")
-        ? Math.round((pointerEvent.clientY - startY) / cellHeight)
-        : 0;
-      const nextWidth = Math.max(1, Math.min(WORKSPACE_BOARD_COLUMNS - startLayout.x, startLayout.width + deltaColumns));
-      const nextHeight = Math.max(1, Math.min(WORKSPACE_BOARD_ROWS - startLayout.y, startLayout.height + deltaRows));
-
-      resizeForgePane(paneId, nextWidth, nextHeight);
-    }
-
-    function stopResize() {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", stopResize);
-    }
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", stopResize);
-  }, [resizeForgePane]);
-
-  const dropForgePane = useCallback((event) => {
-    event?.preventDefault();
-    event?.stopPropagation();
-
-    reflowDraggedForgePane(event);
-    draggedPaneIdRef.current = "";
-  }, [reflowDraggedForgePane]);
-
-  const dropForgePaneOnBoard = useCallback((event) => {
-    reflowDraggedForgePane(event);
-    draggedPaneIdRef.current = "";
-  }, [reflowDraggedForgePane]);
-
-  const updatePaneModel = useCallback((paneId, modelId) => {
-    const currentPanes = forgePanesRef.current;
-    const pane = currentPanes.find((candidate) => candidate.id === paneId);
-
-    if (!pane) {
-      return;
-    }
-
-    const provider = getPaneProvider(pane.kind, activeAgent);
-    const model = getPaneModelOption(provider, modelId);
-
-    setForgeError("");
-    commitForgePanes(currentPanes.map((candidate) => (
-      candidate.id === paneId ? { ...candidate, model: model.id } : candidate
-    )), { save: false });
-  }, [activeAgent, commitForgePanes]);
+  }, [expireDesktopSession, workspaceName]);
 
   const logout = useCallback(async () => {
     authFlowIdRef.current += 1;
-    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const token = authStore.getToken();
 
-    clearStoredSession();
-    clearPendingLogin();
-    pendingStateRef.current = "";
-    setSignedOut();
+    setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
 
     if (isSafeAuthValue(token)) {
       try {
@@ -1621,78 +800,25 @@ export default function App() {
     runWindowAction(() => getCurrentWindow().close());
   }, []);
 
-  const workspaceLayoutSignature = useMemo(() => (
-    createWorkspaceLayoutSignature(activeWorkspaceId, serializePaneLayout(forgePanes))
-  ), [activeWorkspaceId, forgePanes]);
-
   useEffect(() => {
     checkBackend();
   }, [checkBackend]);
 
-  useEffect(() => {
-    refreshForgeWorkingDirectory();
-  }, [refreshForgeWorkingDirectory]);
-
-  useEffect(() => {
-    forgePanesRef.current = forgePanes;
-  }, [forgePanes]);
-
   useEffect(() => () => {
     window.clearTimeout(viewTransitionTimeoutRef.current);
-    window.clearTimeout(workspaceLayoutAutosaveTimeoutRef.current);
   }, []);
 
   useEffect(() => {
-    window.clearTimeout(workspaceLayoutAutosaveTimeoutRef.current);
-
-    if (
-      !workspaceLayoutSignature ||
-      authState !== "authenticated" ||
-      !isPaidUser(user) ||
-      workspaceState !== "ready" ||
-      workspaceSyncState === "loading"
-    ) {
-      return undefined;
+    if (authState === "authenticated") {
+      return;
     }
 
-    if (workspaceLayoutSignature === lastSavedWorkspaceLayoutRef.current) {
-      return undefined;
-    }
-
-    let parsedSignature = null;
-
-    try {
-      parsedSignature = JSON.parse(workspaceLayoutSignature);
-    } catch {
-      return undefined;
-    }
-
-    const saveId = workspaceLayoutSaveIdRef.current + 1;
-    workspaceLayoutSaveIdRef.current = saveId;
-
-    workspaceLayoutAutosaveTimeoutRef.current = window.setTimeout(async () => {
-      const saved = await saveWorkspaceTerminalLayout(
-        parsedSignature.workspaceId,
-        parsedSignature.terminalLayout,
-        saveId,
-      );
-
-      if (saved && workspaceLayoutSaveIdRef.current === saveId) {
-        lastSavedWorkspaceLayoutRef.current = workspaceLayoutSignature;
-      }
-    }, WORKSPACE_LAYOUT_AUTOSAVE_MS);
-
-    return () => {
-      window.clearTimeout(workspaceLayoutAutosaveTimeoutRef.current);
-    };
-  }, [
-    authState,
-    saveWorkspaceTerminalLayout,
-    user,
-    workspaceLayoutSignature,
-    workspaceState,
-    workspaceSyncState,
-  ]);
+    setWorkspaceState("idle");
+    setWorkspaces([]);
+    setActiveWorkspaceId("");
+    setWorkspaceSyncState("idle");
+    agentInitialStatusUserRef.current = "";
+  }, [authState]);
 
   useEffect(() => {
     if (authInitialized) {
@@ -1705,11 +831,11 @@ export default function App() {
       }
 
       authFlowIdRef.current += 1;
-      clearStoredSession();
-      clearPendingLogin();
-      pendingStateRef.current = "";
-      setSignedOut("Secure session check timed out. Sign in with the web app.");
-      setAuthError(SESSION_RESTORE_TIMEOUT_MESSAGE);
+      setSignedOut(
+        "Secure session check timed out. Sign in with the web app.",
+        SESSION_RESTORE_TIMEOUT_MESSAGE,
+        { clearPending: true },
+      );
       completeAuthStartup();
     }, AUTH_STARTUP_TIMEOUT_MS);
 
@@ -1745,7 +871,7 @@ export default function App() {
       })
       .catch((error) => {
         if (isMounted) {
-          setAuthError(getErrorMessage(error, "Desktop login callback listener is unavailable."));
+          authStore.setError(getErrorMessage(error, "Desktop login callback listener is unavailable."));
         }
       });
 
@@ -1785,8 +911,11 @@ export default function App() {
       } catch (error) {
         if (isMounted && !authStartupFinishedRef.current) {
           authFlowIdRef.current += 1;
-          setSignedOut("Unable to restore your desktop session. Sign in with the web app.");
-          setAuthError(getErrorMessage(error, "Desktop sign in is unavailable."));
+          setSignedOut(
+            "Unable to restore your desktop session. Sign in with the web app.",
+            getErrorMessage(error, "Desktop sign in is unavailable."),
+            { clearPending: true },
+          );
         }
       } finally {
         if (isMounted) {
@@ -1829,7 +958,7 @@ export default function App() {
 
     const timeoutId = window.setTimeout(() => {
       setWorkspaceState("ready");
-      setAuthMessage("Workspace ready.");
+      authStore.setMessage("Workspace ready.");
     }, WORKSPACE_INIT_MS);
 
     return () => {
@@ -1849,29 +978,6 @@ export default function App() {
       loadWorkspaces();
     }
   }, [authState, loadWorkspaces, refreshAgentStatuses, user, workspaceState]);
-
-  useEffect(() => {
-    function handleHotkey(event) {
-      if (!(event.ctrlKey || event.metaKey) || event.altKey) {
-        return;
-      }
-
-      const action = HOTKEY_ACTIONS.find((candidate) => candidate.key === event.key);
-
-      if (!action) {
-        return;
-      }
-
-      event.preventDefault();
-      openForgePane(action.id);
-    }
-
-    window.addEventListener("keydown", handleHotkey);
-
-    return () => {
-      window.removeEventListener("keydown", handleHotkey);
-    };
-  }, [openForgePane]);
 
   const isAuthBusy = authState === "waiting" || authState === "exchanging";
   const authPanelTitle = {
@@ -1894,7 +1000,6 @@ export default function App() {
   const planLabel = userIsPaid ? "Pro" : "Free";
   const connectedAgentCount = agentStatuses.filter((agent) => agent.installed && agent.authenticated).length;
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
-  const hotkeyModifier = navigator.platform?.toLowerCase().includes("mac") ? "Cmd" : "Ctrl";
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
   const shouldShowLaunchScreen = isLaunchScreenVisible || isConnectivityBlocked;
   const launchState = isConnectivityBlocked && apiState === "offline"
@@ -2057,7 +1162,7 @@ export default function App() {
                   <PlanDescription>Paid status unlocks the native dashboard shell.</PlanDescription>
                   <PlanFeatureList>
                     <li>Desktop workspace dashboard</li>
-                    <li>Local agent terminal panes</li>
+                    <li>Blank desktop workspace shell</li>
                     <li>Priority native app access</li>
                   </PlanFeatureList>
                 </PricingPlanCard>
@@ -2068,7 +1173,7 @@ export default function App() {
               <AmbientPanel data-position="left">
                 <span>&gt; workspace</span>
                 <p>Syncing session...</p>
-                <p>Preparing terminals...</p>
+                <p>Preparing workspace...</p>
               </AmbientPanel>
               <AmbientPanel data-position="right">
                 <span>{displayName}</span>
@@ -2097,7 +1202,6 @@ export default function App() {
                         key={workspace.id}
                         onClick={() => {
                           setActiveWorkspaceId(workspace.id);
-                          seedPanesFromWorkspace(workspace);
                         }}
                         type="button"
                       >
@@ -2118,7 +1222,7 @@ export default function App() {
                     type="button"
                   >
                       <ButtonForgeIcon aria-hidden="true" />
-                      <span>Forge Console</span>
+                      <span>Workspace</span>
                     </RailActionButton>
                   <RailActionButton
                     data-active={activeView === "settings"}
@@ -2356,7 +1460,7 @@ export default function App() {
                         <SetupHeader>
                           <Kicker>First workspace</Kicker>
                           <DashboardTitle>Create your workspace</DashboardTitle>
-                          <PageSubline>Name it, choose the starting terminal count, then the workspace syncs through the protected API.</PageSubline>
+                          <PageSubline>Name it, then the workspace syncs through the protected API.</PageSubline>
                         </SetupHeader>
                         {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
                         <SetupField>
@@ -2368,143 +1472,20 @@ export default function App() {
                             value={workspaceName}
                           />
                         </SetupField>
-                        <SetupField>
-                          <SettingsLabel>Terminals</SettingsLabel>
-                          <TerminalCountRow>
-                            {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
-                              <TerminalCountButton
-                                data-active={workspaceTerminalCount === count}
-                                key={count}
-                                onClick={() => setWorkspaceTerminalCount(count)}
-                                type="button"
-                              >
-                                {count}
-                              </TerminalCountButton>
-                            ))}
-                          </TerminalCountRow>
-                        </SetupField>
                         <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
                           <ButtonForgeIcon aria-hidden="true" />
                           <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
                         </PrimaryButton>
                       </WorkspaceSetupPanel>
                     ) : (
-                      <TerminalCanvas>
-                        <ForgeHotkeyBar>
-                          <DirectoryPill title={forgeWorkingDirectory || "Working directory unavailable"}>
-                            {formatDirectoryLabel(forgeWorkingDirectory) || "cwd"}
-                          </DirectoryPill>
-                          <HotkeyGroup>
-                            {HOTKEY_ACTIONS.map((action) => (
-                              <HotkeyButton key={action.id} onClick={() => openForgePane(action.id)} type="button">
-                                {action.id === "claude" ? <ButtonBotIcon aria-hidden="true" /> : <ButtonTerminalIcon aria-hidden="true" />}
-                                <span>{action.label}</span>
-                                <kbd>{hotkeyModifier}+{action.key}</kbd>
-                              </HotkeyButton>
-                            ))}
-                          </HotkeyGroup>
-                        </ForgeHotkeyBar>
-
-                        {(workspaceError || agentStatusError || forgeError) && (
-                          <TerminalStatusStack>
+                      <BlankWorkspaceSurface>
+                        {(workspaceError || agentStatusError) && (
+                          <BlankStatusStack>
                             {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
                             {agentStatusError && <FormMessage $state="error">{agentStatusError}</FormMessage>}
-                            {forgeError && <FormMessage $state="error">{forgeError}</FormMessage>}
-                          </TerminalStatusStack>
+                          </BlankStatusStack>
                         )}
-
-                        <PaneBoard
-                          onDragOver={(event) => {
-                            reflowDraggedForgePane(event);
-                          }}
-                          onDrop={dropForgePaneOnBoard}
-                          ref={paneBoardRef}
-                        >
-                          {forgePanes.map((pane, index) => {
-                            const paneProvider = getPaneProvider(pane.kind, activeAgent);
-                            const paneModel = getPaneModelOption(paneProvider, pane.model);
-                            const paneLayout = getPaneLayout(pane, index);
-
-                            return (
-                              <ForgePane
-                                data-forge-pane="true"
-                                key={pane.id}
-                                onDragOver={(event) => {
-                                  reflowDraggedForgePane(event);
-                                }}
-                                onDrop={dropForgePane}
-                                style={{
-                                  gridColumn: `${paneLayout.x + 1} / span ${paneLayout.width}`,
-                                  gridRow: `${paneLayout.y + 1} / span ${paneLayout.height}`,
-                                }}
-                              >
-                                <PaneHeader
-                                  draggable
-                                  onDragEnd={() => {
-                                    draggedPaneIdRef.current = "";
-                                  }}
-                                  onDragStart={(event) => {
-                                    draggedPaneIdRef.current = pane.id;
-                                    event.dataTransfer.effectAllowed = "move";
-                                    event.dataTransfer.setData("text/plain", pane.id);
-                                  }}
-                                >
-                                  <PaneTitle>
-                                    <ButtonTerminalIcon aria-hidden="true" />
-                                    <span>{pane.title}</span>
-                                  </PaneTitle>
-                                  <PaneTopControls>
-                                    <PaneModelSelect
-                                      aria-label={`${pane.title} model`}
-                                      onChange={(event) => updatePaneModel(pane.id, event.target.value)}
-                                      onMouseDown={(event) => event.stopPropagation()}
-                                      title="Model"
-                                      value={paneModel.id}
-                                    >
-                                      {getProviderModels(paneProvider).map((model) => (
-                                        <option key={model.id || "default"} value={model.id}>
-                                          {model.label}
-                                        </option>
-                                      ))}
-                                    </PaneModelSelect>
-                                    <PaneIconButton onClick={() => closeForgePane(pane.id)} title="Close terminal" type="button">
-                                      <PaneCloseIcon aria-hidden="true" />
-                                    </PaneIconButton>
-                                  </PaneTopControls>
-                                </PaneHeader>
-
-                                <PaneTerminalBody>
-                                  <ForgeXtermPane
-                                    model={paneModel}
-                                    onError={setForgeError}
-                                    onWorkingDirectory={setForgeWorkingDirectory}
-                                    pane={pane}
-                                    provider={paneProvider}
-                                  />
-                                </PaneTerminalBody>
-                                <PaneResizeHandle
-                                  aria-label="Resize terminal width"
-                                  data-edge="east"
-                                  onPointerDown={(event) => beginForgePaneResize(pane.id, "east", event)}
-                                  type="button"
-                                />
-                                <PaneResizeHandle
-                                  aria-label="Resize terminal height"
-                                  data-edge="south"
-                                  onPointerDown={(event) => beginForgePaneResize(pane.id, "south", event)}
-                                  type="button"
-                                />
-                                <PaneResizeHandle
-                                  aria-label="Resize terminal"
-                                  data-edge="south-east"
-                                  onPointerDown={(event) => beginForgePaneResize(pane.id, "south-east", event)}
-                                  type="button"
-                                />
-                              </ForgePane>
-                            );
-                          })}
-                        </PaneBoard>
-                      </TerminalCanvas>
+                      </BlankWorkspaceSurface>
                     )}
                   </ForgeWorkspace>
                 </>
@@ -3872,15 +2853,15 @@ const ForgeWorkspace = styled.section`
   }
 `;
 
-const TerminalCanvas = styled.section`
-  position: relative;
+const BlankWorkspaceSurface = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 8px;
+  align-content: start;
   width: 100%;
   height: 100%;
+  padding: 12px;
+  background: rgba(3, 5, 8, 0.14);
 `;
 
 const WorkspaceSetupPanel = styled.form`
@@ -3924,319 +2905,11 @@ const SetupInput = styled.input`
   }
 `;
 
-const TerminalCountRow = styled.div`
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-`;
-
-const TerminalCountButton = styled.button`
-  min-height: 42px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(255, 255, 255, 0.04);
-  font-weight: 900;
-
-  &[data-active="true"],
-  &:hover {
-    border-color: rgba(47, 128, 255, 0.42);
-    color: #ffffff;
-    background: rgba(47, 128, 255, 0.16);
-  }
-`;
-
-const ForgeHotkeyBar = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  min-width: 0;
-  max-width: 100%;
-`;
-
-const DirectoryPill = styled.div`
-  min-width: 0;
-  max-width: 180px;
-  overflow: hidden;
-  padding: 0 9px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  color: #ffb269;
-  background: rgba(6, 9, 16, 0.86);
-  font-family:
-    "Cascadia Mono",
-    "SFMono-Regular",
-    Consolas,
-    monospace;
-  font-size: 11px;
-  font-weight: 780;
-  line-height: 28px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const TerminalStatusStack = styled.div`
+const BlankStatusStack = styled.div`
   display: grid;
   justify-self: end;
   width: min(520px, 100%);
   gap: 8px;
-`;
-
-const HotkeyGroup = styled.div`
-  display: inline-flex;
-  gap: 8px;
-  max-width: 100%;
-  min-width: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  flex-wrap: nowrap;
-  scrollbar-width: none;
-
-  &::-webkit-scrollbar {
-    display: none;
-  }
-`;
-
-const HotkeyButton = styled.button`
-  display: inline-flex;
-  flex: 0 0 auto;
-  min-height: 38px;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  color: #e8eef8;
-  background: rgba(6, 9, 16, 0.84);
-  font-size: 12px;
-  font-weight: 850;
-  white-space: nowrap;
-
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  kbd {
-    padding: 2px 5px;
-    border-radius: 5px;
-    color: #8fa1bd;
-    background: rgba(255, 255, 255, 0.07);
-    font: inherit;
-    font-size: 10px;
-  }
-
-  &:hover {
-    border-color: rgba(47, 128, 255, 0.42);
-    background: rgba(47, 128, 255, 0.14);
-  }
-`;
-
-const PaneBoard = styled.div`
-  display: grid;
-  grid-row: 3;
-  min-height: 0;
-  height: 100%;
-  grid-template-columns: repeat(4, minmax(156px, 1fr));
-  grid-template-rows: repeat(2, minmax(0, 1fr));
-  gap: ${PANE_BOARD_GAP}px;
-  overflow: auto;
-
-  & > * {
-    min-width: 0;
-  }
-
-  @media (max-width: 860px) {
-    grid-template-columns: 1fr;
-    grid-auto-rows: minmax(260px, 1fr);
-    grid-template-rows: none;
-
-    & > * {
-      grid-column: 1 / -1 !important;
-      grid-row: auto !important;
-    }
-  }
-`;
-
-const ForgePane = styled.section`
-  position: relative;
-  display: grid;
-  min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr);
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  background: #020304;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-`;
-
-const PaneHeader = styled.div`
-  display: flex;
-  min-height: 36px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 0 8px 0 11px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  color: #e8eef8;
-  background: #060910;
-  cursor: grab;
-
-  &:active {
-    cursor: grabbing;
-  }
-`;
-
-const PaneTitle = styled.div`
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  font-weight: 850;
-
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-`;
-
-const PaneTopControls = styled.div`
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  min-width: 0;
-  flex-wrap: nowrap;
-`;
-
-const PaneIconButton = styled.button`
-  display: grid;
-  width: 26px;
-  height: 26px;
-  place-items: center;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  color: #a7b2c2;
-  background: transparent;
-  font-size: 14px;
-  font-weight: 900;
-
-  &:hover:not(:disabled) {
-    color: #ffffff;
-    background: rgba(255, 255, 255, 0.08);
-  }
-
-  &[data-active="true"] {
-    border-color: rgba(47, 128, 255, 0.34);
-    color: #ffffff;
-    background: rgba(47, 128, 255, 0.16);
-  }
-
-  &:disabled {
-    opacity: 0.35;
-  }
-`;
-
-const PaneCloseIcon = styled(Close)`
-  width: 15px;
-  height: 15px;
-`;
-
-const PaneModelSelect = styled.select`
-  max-width: 104px;
-  min-height: 26px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 7px;
-  color: #dbe8ff;
-  background: rgba(13, 20, 31, 0.9);
-  font-size: 11px;
-  font-weight: 820;
-
-  &:focus {
-    border-color: rgba(47, 128, 255, 0.5);
-    outline: none;
-  }
-`;
-
-const PaneTerminalBody = styled.div`
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  background: #020304;
-`;
-
-const XtermSurface = styled.div`
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  padding: 8px;
-  background: #020304;
-
-  .xterm {
-    width: 100%;
-    height: 100%;
-  }
-
-  .xterm-viewport {
-    background: #020304 !important;
-  }
-`;
-
-const PaneResizeHandle = styled.button`
-  position: absolute;
-  z-index: 2;
-  border: 0;
-  background: transparent;
-
-  &[data-edge="east"] {
-    top: 40px;
-    right: 0;
-    bottom: 0;
-    width: 8px;
-    cursor: ew-resize;
-  }
-
-  &[data-edge="south"] {
-    right: 44px;
-    bottom: 0;
-    left: 44px;
-    height: 8px;
-    cursor: ns-resize;
-  }
-
-  &[data-edge="south-east"] {
-    right: 0;
-    bottom: 0;
-    width: 18px;
-    height: 18px;
-    cursor: nwse-resize;
-  }
-
-  &[data-edge="south-east"]::after {
-    position: absolute;
-    right: 5px;
-    bottom: 5px;
-    width: 8px;
-    height: 8px;
-    border-right: 2px solid rgba(255, 255, 255, 0.24);
-    border-bottom: 2px solid rgba(255, 255, 255, 0.24);
-    content: "";
-  }
-
-  &:hover::after,
-  &:focus-visible::after {
-    border-color: rgba(47, 128, 255, 0.8);
-  }
 `;
 
 const AgentSettingsPanel = styled.section`
@@ -4542,14 +3215,6 @@ const AgentActionTooltip = styled.span`
   }
 `;
 
-const TerminalWorkspace = styled.section`
-  display: grid;
-  min-width: 0;
-  align-content: start;
-  gap: 18px;
-  padding: 24px;
-`;
-
 const PageHeader = styled.header`
   display: flex;
   min-width: 0;
@@ -4576,161 +3241,6 @@ const DashboardTitle = styled.h1`
   font-size: 28px;
   font-weight: 850;
   letter-spacing: 0;
-`;
-
-const UserPill = styled.div`
-  display: inline-flex;
-  max-width: 260px;
-  min-height: 36px;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-  border: 1px solid rgba(47, 128, 255, 0.36);
-  border-radius: 8px;
-  color: #f7f9ff;
-  background: rgba(47, 128, 255, 0.14);
-  font-size: 13px;
-  font-weight: 780;
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-`;
-
-const DashboardStats = styled.div`
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-
-  @media (max-width: 1120px) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  @media (max-width: 540px) {
-    grid-template-columns: 1fr;
-  }
-`;
-
-const StatTile = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 7px;
-  padding: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  background: rgba(13, 20, 31, 0.86);
-
-  span {
-    color: #687386;
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-  }
-
-  strong {
-    overflow: hidden;
-    color: #f7f9ff;
-    font-size: 20px;
-    font-weight: 920;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  &[data-tone="blue"] {
-    border-color: rgba(47, 128, 255, 0.36);
-    background:
-      linear-gradient(145deg, rgba(47, 128, 255, 0.14), rgba(255, 255, 255, 0.02)),
-      rgba(13, 20, 31, 0.88);
-  }
-
-  &[data-tone="orange"] {
-    border-color: rgba(255, 122, 24, 0.36);
-    background:
-      linear-gradient(145deg, rgba(255, 122, 24, 0.13), rgba(255, 255, 255, 0.02)),
-      rgba(13, 20, 31, 0.88);
-  }
-`;
-
-const TerminalGrid = styled.div`
-  display: grid;
-  min-height: 430px;
-  grid-template-rows: 1fr 1fr;
-  gap: 14px;
-
-  @media (max-width: 760px) {
-    min-height: 520px;
-  }
-`;
-
-const TerminalPane = styled.section`
-  display: grid;
-  min-height: 220px;
-  grid-template-rows: auto 1fr;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  background: #020304;
-`;
-
-const TerminalHeader = styled.div`
-  display: flex;
-  min-height: 36px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  color: #e8eef8;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.018)),
-    #060910;
-  font-size: 13px;
-  font-weight: 760;
-
-  small {
-    color: #62a0ff;
-    font-size: 11px;
-    font-weight: 820;
-    text-transform: uppercase;
-  }
-`;
-
-const TerminalBody = styled.div`
-  display: grid;
-  align-content: start;
-  gap: 9px;
-  padding: 16px;
-  color: #62a0ff;
-  font-family:
-    "Cascadia Mono",
-    "SFMono-Regular",
-    Consolas,
-    monospace;
-  font-size: 13px;
-`;
-
-const TerminalLine = styled.p`
-  margin: 0;
-`;
-
-const TerminalOutput = styled.p`
-  margin: 0;
-  color: #a7b2c2;
-`;
-
-const ReviewPanel = styled.section`
-  display: grid;
-  gap: 16px;
-  padding: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  background:
-    radial-gradient(circle at 88% 12%, rgba(255, 122, 24, 0.11), transparent 11rem),
-    rgba(13, 20, 31, 0.86);
 `;
 
 const PanelHeaderRow = styled.div`
@@ -4760,73 +3270,6 @@ const PanelHeading = styled.h2`
   font-size: 17px;
   font-weight: 900;
   letter-spacing: 0;
-`;
-
-const PanelBadge = styled.span`
-  padding: 5px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(255, 255, 255, 0.045);
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-
-  &[data-tone="orange"] {
-    border-color: rgba(255, 122, 24, 0.36);
-    color: #ff9a3d;
-    background: rgba(255, 122, 24, 0.14);
-  }
-`;
-
-const ReviewRows = styled.div`
-  display: grid;
-  gap: 9px;
-`;
-
-const ReviewRow = styled.div`
-  display: grid;
-  min-height: 42px;
-  grid-template-columns: 9px minmax(0, 1fr);
-  align-items: center;
-  gap: 11px;
-  padding: 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
-
-  span {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: #687386;
-  }
-
-  p {
-    margin: 0;
-    color: #a7b2c2;
-    font-size: 13px;
-    font-weight: 760;
-  }
-
-  &[data-tone="blue"] {
-    border-color: rgba(47, 128, 255, 0.32);
-    background: rgba(47, 128, 255, 0.12);
-
-    span {
-      background: #62a0ff;
-    }
-  }
-
-  &[data-tone="orange"] {
-    border-color: rgba(255, 122, 24, 0.32);
-    background: rgba(255, 122, 24, 0.12);
-
-    span {
-      background: #ff9a3d;
-    }
-  }
 `;
 
 const SettingsPage = styled.section`
