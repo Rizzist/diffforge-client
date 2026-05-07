@@ -1,6 +1,6 @@
-# Diffforge Desktop
+# Diff Forge AI
 
-Tauri desktop shell for Diffforge.
+Tauri desktop shell for Diff Forge AI.
 
 ## Commands
 

@@ -6,12 +6,25 @@
   "permissions": [
     "core:default",
     "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
     "deep-link:default",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
         {
           "url": "https://diffforge.ai/desktop/login*"
+        },
+        {
+          "url": "https://diffforge.ai/pricing*"
+        },
+        {
+          "url": "https://github.com/openai/codex/releases*"
+        },
+        {
+          "url": "https://code.claude.com/docs/en/quickstart*"
         }
       ]
     }
