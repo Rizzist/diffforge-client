@@ -36,10 +36,30 @@ const TERMINAL_PANE_MIN_HEIGHT_PX = 96;
 
 export const GlobalStyle = createGlobalStyle`
   :root {
-    color: #f7f9ff;
-    background: #030508;
+    --forge-bg: #07090d;
+    --forge-bg-deep: #020304;
+    --forge-surface: #0d1117;
+    --forge-surface-raised: #11161d;
+    --forge-surface-control: #151b23;
+    --forge-surface-hover: rgba(230, 236, 245, 0.055);
+    --forge-surface-selected: rgba(125, 160, 205, 0.12);
+    --forge-border: rgba(230, 236, 245, 0.1);
+    --forge-border-strong: rgba(230, 236, 245, 0.16);
+    --forge-text: #f4f7fa;
+    --forge-text-soft: #b6c0cc;
+    --forge-text-muted: #7a8493;
+    --forge-text-disabled: #505966;
+    --forge-blue: #3b82f6;
+    --forge-blue-soft: #7db0ff;
+    --forge-amber: #dfa55a;
+    --forge-ember: #d97935;
+    --forge-green: #3ccb7f;
+    --forge-red: #ef6b6b;
+    color: var(--forge-text);
+    background: var(--forge-bg);
     color-scheme: dark;
     font-family:
+      "Segoe UI Variable",
       Inter,
       ui-sans-serif,
       system-ui,
@@ -53,7 +73,7 @@ export const GlobalStyle = createGlobalStyle`
 
   * {
     box-sizing: border-box;
-    scrollbar-color: rgba(98, 160, 255, 0.72) rgba(6, 9, 16, 0.72);
+    scrollbar-color: rgba(125, 160, 205, 0.52) rgba(10, 14, 20, 0.86);
     scrollbar-width: thin;
   }
 
@@ -64,29 +84,25 @@ export const GlobalStyle = createGlobalStyle`
 
   *::-webkit-scrollbar-track {
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
-      rgba(6, 9, 16, 0.76);
+      linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.012)),
+      rgba(10, 14, 20, 0.86);
   }
 
   *::-webkit-scrollbar-thumb {
     min-height: 42px;
-    border: 2px solid rgba(6, 9, 16, 0.88);
+    border: 2px solid rgba(10, 14, 20, 0.92);
     border-radius: 999px;
-    background:
-      linear-gradient(180deg, rgba(98, 160, 255, 0.9), rgba(47, 128, 255, 0.56) 48%, rgba(255, 122, 24, 0.72)),
-      #2f80ff;
+    background: #2a3442;
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background:
-      linear-gradient(180deg, #8bb9ff, rgba(98, 160, 255, 0.72) 46%, #ff9a3d),
-      #62a0ff;
+    background: #3a4657;
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-corner {
-    background: rgba(6, 9, 16, 0.76);
+    background: rgba(10, 14, 20, 0.86);
   }
 
   html,
@@ -95,15 +111,14 @@ export const GlobalStyle = createGlobalStyle`
     min-width: 320px;
     min-height: 100vh;
     margin: 0;
-    background: #030508;
+    background: var(--forge-bg);
   }
 
   body {
     overflow: hidden;
     background:
-      linear-gradient(180deg, rgba(47, 128, 255, 0.1), rgba(3, 5, 8, 0) 34rem),
-      linear-gradient(135deg, rgba(255, 122, 24, 0.08), rgba(3, 5, 8, 0) 28rem),
-      #030508;
+      linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(7, 9, 13, 0) 36rem),
+      var(--forge-bg);
   }
 
   button {
@@ -133,7 +148,7 @@ export const AppFrame = styled.div`
   min-width: 320px;
   min-height: 100vh;
   grid-template-rows: ${TITLE_BAR_HEIGHT} minmax(0, 1fr);
-  background: #030508;
+  background: var(--forge-bg);
 `;
 
 export const WindowResizeEdges = styled.div`
@@ -935,10 +950,10 @@ export const IntroCopy = styled.div`
 
 export const Kicker = styled.p`
   margin: 0;
-  color: #ff9a3d;
+  color: var(--forge-ember);
   font-size: 13px;
-  font-weight: 900;
-  letter-spacing: 0.12em;
+  font-weight: 760;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 `;
 
@@ -1324,12 +1339,13 @@ export const DashboardShell = styled.main`
   height: calc(100vh - ${TITLE_BAR_HEIGHT});
   min-height: 0;
   grid-template-columns: 192px minmax(280px, 1fr);
-  color: #f7fafc;
+  color: var(--forge-text);
   overflow: hidden;
   background:
-    radial-gradient(circle at 82% 10%, rgba(47, 128, 255, 0.11), transparent 18rem),
-    radial-gradient(circle at 18% 88%, rgba(255, 122, 24, 0.09), transparent 16rem),
-    #030508;
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    var(--forge-bg);
+  background-size: 76px 76px, 76px 76px, auto;
   animation: ${shellReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
   &[data-startup="true"] {
@@ -1354,8 +1370,8 @@ export const WorkspaceRail = styled.aside`
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 12px;
   padding: 12px;
-  border-right: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(3, 5, 8, 0.78);
+  border-right: 1px solid var(--forge-border);
+  background: rgba(7, 9, 13, 0.9);
   backdrop-filter: blur(18px);
   animation: ${railReveal} 300ms cubic-bezier(0.2, 0.8, 0.2, 1) 40ms both;
 
@@ -1363,7 +1379,7 @@ export const WorkspaceRail = styled.aside`
     min-height: auto;
     grid-template-rows: auto auto;
     border-right: 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+    border-bottom: 1px solid var(--forge-border);
   }
 `;
 
@@ -1379,10 +1395,10 @@ export const RailTop = styled.div`
 
 export const RailSectionTitle = styled.p`
   margin: 0;
-  color: #687386;
+  color: var(--forge-text-disabled);
   font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.1em;
+  font-weight: 760;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
 `;
@@ -1431,7 +1447,7 @@ export const WorkspaceButton = styled.button`
   border: 1px solid transparent;
   border-radius: 8px;
   box-sizing: border-box;
-  color: #e8eef8;
+  color: var(--forge-text-soft);
   background: transparent;
   overflow: hidden;
   text-align: left;
@@ -1445,7 +1461,7 @@ export const WorkspaceButton = styled.button`
     min-width: 0;
     overflow: hidden;
     font-size: 12px;
-    font-weight: 800;
+    font-weight: 720;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1454,12 +1470,12 @@ export const WorkspaceButton = styled.button`
   &:hover,
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
-    border-color: rgba(47, 128, 255, 0.36);
-    background: rgba(47, 128, 255, 0.14);
+    border-color: rgba(125, 160, 205, 0.28);
+    background: var(--forge-surface-selected);
   }
 
   &[data-runtime="activated"] {
-    color: #ffffff;
+    color: var(--forge-text);
   }
 `;
 
@@ -1474,9 +1490,9 @@ export const WorkspaceLabel = styled.span`
     display: block;
     min-width: 0;
     overflow: hidden;
-    color: #687386;
+    color: var(--forge-text-muted);
     font-size: 10px;
-    font-weight: 760;
+    font-weight: 650;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1490,10 +1506,10 @@ export const WorkspaceSettingsButton = styled.button`
   width: 30px;
   height: 30px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(6, 9, 16, 0.72);
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-50%) translateX(3px);
@@ -1510,9 +1526,9 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   &:hover {
-    border-color: rgba(255, 122, 24, 0.42);
-    color: #ffb269;
-    background: rgba(255, 122, 24, 0.12);
+    border-color: rgba(125, 160, 205, 0.34);
+    color: var(--forge-text-soft);
+    background: var(--forge-surface-hover);
   }
 
   ${WorkspaceRow}:hover &,
@@ -1527,25 +1543,25 @@ export const WorkspaceAccent = styled.span`
   width: 3px;
   height: 16px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(230, 236, 245, 0.16);
   transition:
     background 180ms ease,
     box-shadow 180ms ease,
     transform 180ms ease;
 
   ${WorkspaceButton}[data-runtime="activating"] & {
-    background: linear-gradient(180deg, #ffcf6a, #ff7a18);
+    background: var(--forge-amber);
     box-shadow:
-      0 0 10px rgba(255, 179, 71, 0.36),
-      0 0 10px rgba(255, 122, 24, 0.2);
+      0 0 10px rgba(223, 165, 90, 0.28),
+      0 0 10px rgba(217, 121, 53, 0.14);
     transform: scaleY(1.12);
   }
 
   ${WorkspaceButton}[data-runtime="activated"] & {
-    background: linear-gradient(180deg, #66f0aa, #1fbf75);
+    background: var(--forge-green);
     box-shadow:
-      0 0 12px rgba(57, 217, 138, 0.42),
-      0 0 14px rgba(31, 191, 117, 0.22);
+      0 0 12px rgba(60, 203, 127, 0.32),
+      0 0 14px rgba(60, 203, 127, 0.14);
     transform: scaleY(1.18);
   }
 `;
@@ -1553,51 +1569,93 @@ export const WorkspaceAccent = styled.span`
 export const WorkspaceMuted = styled.p`
   margin: 0;
   padding: 8px 9px;
-  color: #687386;
+  color: var(--forge-text-muted);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 650;
 `;
 
 export const RailFooter = styled.div`
   display: grid;
-  gap: 6px;
+  gap: 4px;
   min-height: 0;
-  padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(3, 5, 8, 0.88);
+  padding-top: 8px;
+  border-top: 1px solid var(--forge-border);
+  background: rgba(7, 9, 13, 0.7);
   animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
 `;
 
 export const RailActionButton = styled.button`
+  position: relative;
   display: inline-flex;
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 34px;
+  min-height: 32px;
   align-items: center;
-  gap: 9px;
-  padding: 0 8px;
+  gap: 8px;
+  padding: 0 9px 0 11px;
   border: 1px solid transparent;
   border-radius: 8px;
   box-sizing: border-box;
-  color: #c5cdd6;
+  color: var(--forge-text-soft);
   background: transparent;
   overflow: hidden;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 720;
+  text-align: left;
   transition:
+    border-color 160ms ease,
     background 160ms ease,
     color 160ms ease;
 
+  &::before {
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    left: 3px;
+    width: 2px;
+    border-radius: 999px;
+    background: transparent;
+    content: "";
+    transition:
+      background 160ms ease,
+      box-shadow 160ms ease;
+  }
+
   svg {
-    width: 16px;
-    height: 16px;
+    width: 15px;
+    height: 15px;
+    color: var(--forge-text-muted);
+    transition: color 160ms ease;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   &[data-active="true"],
   &:hover {
-    color: #ffffff;
-    background: rgba(47, 128, 255, 0.12);
+    color: var(--forge-text);
+    border-color: var(--forge-border);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(125, 160, 205, 0.28);
+    background: var(--forge-surface-selected);
+  }
+
+  &[data-active="true"]::before {
+    background: var(--forge-blue-soft);
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.22);
+  }
+
+  &[data-active="true"] svg,
+  &:hover svg {
+    color: var(--forge-blue-soft);
   }
 `;
 
@@ -1607,9 +1665,9 @@ export const BlankWorkspace = styled.section`
   min-height: 0;
   overflow: hidden;
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.026) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    rgba(3, 5, 8, 0.18);
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.2);
   background-size: 76px 76px, 76px 76px, auto;
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
@@ -1617,9 +1675,7 @@ export const BlankWorkspace = styled.section`
     position: absolute;
     inset: 0;
     pointer-events: none;
-    background:
-      linear-gradient(90deg, transparent, rgba(98, 160, 255, 0.035), transparent),
-      radial-gradient(circle at 50% 50%, rgba(47, 128, 255, 0.05), transparent 34rem);
+    background: linear-gradient(90deg, transparent, rgba(125, 160, 205, 0.026), transparent);
     content: "";
     opacity: 0.72;
     animation: ${quietSweep} 7s ease-in-out infinite;
@@ -1643,7 +1699,7 @@ export const WorkspaceViewStack = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #030508;
+  background: var(--forge-bg);
 `;
 
 export const WorkspaceViewPane = styled.div`
@@ -1899,6 +1955,7 @@ export const TerminalDevMetric = styled.span`
 `;
 
 export const TerminalFrame = styled.section`
+  position: relative;
   flex: 1 1 auto;
   width: 100%;
   height: 100%;
@@ -1967,6 +2024,61 @@ export const TerminalClosedLabel = styled.span`
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
 `;
 
+export const TerminalClosingOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px;
+  background: rgba(2, 3, 4, 0.74);
+  backdrop-filter: blur(3px);
+  pointer-events: auto;
+
+  > div {
+    display: grid;
+    max-width: min(260px, 100%);
+    min-width: 0;
+    justify-items: center;
+    gap: 7px;
+    border: 1px solid rgba(143, 157, 183, 0.24);
+    border-radius: 8px;
+    padding: 14px 16px;
+    background: rgba(8, 12, 20, 0.82);
+    color: rgba(232, 238, 248, 0.92);
+    text-align: center;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  }
+
+  [data-spinner="true"] {
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(143, 157, 183, 0.24);
+    border-top-color: #ff9d48;
+    border-radius: 999px;
+    animation: ${workspaceCloseSpin} 760ms linear infinite;
+  }
+
+  strong {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    font-weight: 900;
+    line-height: 1.1;
+  }
+
+  span:not([data-spinner]) {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: rgba(154, 165, 181, 0.9);
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1.25;
+  }
+`;
+
 export const TerminalRestartPill = styled.div`
   position: absolute;
   top: 10px;
@@ -2002,6 +2114,7 @@ export const TerminalRestartButton = styled.button`
   background: rgba(47, 128, 255, 0.16);
   font-size: 11px;
   font-weight: 900;
+  cursor: pointer;
   transition:
     border-color 160ms ease,
     background 160ms ease,
@@ -2012,10 +2125,16 @@ export const TerminalRestartButton = styled.button`
     height: 14px;
   }
 
-  &:hover {
+  &:hover:not(:disabled) {
     border-color: rgba(98, 160, 255, 0.58);
     background: rgba(47, 128, 255, 0.26);
     transform: translateY(-1px);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.48;
+    transform: none;
   }
 `;
 
@@ -2030,7 +2149,7 @@ export const TerminalCloseButton = styled(TerminalRestartButton)`
   }
 
   &:disabled {
-    opacity: 0.48;
+    opacity: 0.42;
   }
 `;
 
@@ -2480,8 +2599,9 @@ export const FilePreviewHeader = styled.header`
 
 export const FilePreviewTitle = styled.div`
   display: inline-flex;
-  min-width: 0;
-  max-width: min(520px, 62%);
+  flex: 1 1 auto;
+  min-width: 120px;
+  max-width: none;
   min-height: 35px;
   align-items: center;
   gap: 7px;
@@ -2593,10 +2713,51 @@ export const FilePreviewTitle = styled.div`
 
 export const FilePreviewMeta = styled.div`
   display: inline-flex;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   min-width: 0;
   align-items: center;
   gap: 6px;
+`;
+
+export const FilePreviewModeSwitch = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  padding: 1px;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  background: #1e1e1e;
+`;
+
+export const FilePreviewModeButton = styled.button`
+  min-width: 44px;
+  height: 20px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 3px;
+  color: #8f8f8f;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    color: #cccccc;
+    background: #2d2d2d;
+  }
+
+  &[data-active="true"] {
+    color: #ffffff;
+    background: #094771;
+  }
+
+  &:disabled {
+    color: #5f5f5f;
+    cursor: default;
+  }
 `;
 
 export const FileGitStatusPill = styled.span`
@@ -2691,6 +2852,7 @@ export const FileContentFrame = styled.section`
 `;
 
 export const FilePreviewScroll = styled.div`
+  position: relative;
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -2743,22 +2905,40 @@ export const HighlightedCodeBlock = styled.pre`
   }
 
   .token.property,
+  .token.attr-name,
+  .token.parameter,
+  .token.variable {
+    color: #9cdcfe;
+  }
+
   .token.tag,
+  .token.selector,
+  .token.keyword,
+  .token.atrule {
+    color: #569cd6;
+  }
+
   .token.boolean,
   .token.number,
-  .token.constant,
-  .token.symbol,
-  .token.deleted {
+  .token.constant {
     color: #b5cea8;
   }
 
-  .token.selector,
-  .token.attr-name,
   .token.string,
   .token.char,
+  .token.attr-value,
+  .token.template-string {
+    color: #ce9178;
+  }
+
+  .token.symbol,
   .token.builtin,
   .token.inserted {
-    color: #ce9178;
+    color: #4ec9b0;
+  }
+
+  .token.deleted {
+    color: #f48771;
   }
 
   .token.operator,
@@ -2769,25 +2949,231 @@ export const HighlightedCodeBlock = styled.pre`
     color: #d4d4d4;
   }
 
-  .token.atrule,
-  .token.attr-value,
-  .token.keyword {
-    color: #569cd6;
-  }
-
-  .token.function,
-  .token.class-name {
+  .token.function {
     color: #dcdcaa;
   }
 
+  .token.class-name,
+  .token.maybe-class-name {
+    color: #4ec9b0;
+  }
+
   .token.regex,
-  .token.important,
-  .token.variable {
+  .token.important {
     color: #d16969;
+  }
+
+  .token.title,
+  .token.section {
+    color: #569cd6;
+    font-weight: 600;
   }
 
   .token.namespace {
     opacity: 0.78;
+  }
+`;
+
+export const InlineReviewSurface = styled.div`
+  display: grid;
+  position: relative;
+  min-width: max-content;
+  min-height: 100%;
+  grid-template-columns: minmax(max-content, 1fr) 14px;
+  align-items: start;
+  background: #1e1e1e;
+`;
+
+export const InlineReviewCodeBlock = styled.div`
+  min-width: max-content;
+  min-height: 100%;
+  margin: 0;
+  padding: 8px 0 28px;
+  color: #d4d4d4;
+  background: #1e1e1e;
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  tab-size: 2;
+`;
+
+export const InlineReviewLine = styled.div`
+  display: grid;
+  min-width: max-content;
+  min-height: 19px;
+  grid-template-columns: 54px 18px minmax(max-content, 1fr);
+  align-items: stretch;
+  color: #d4d4d4;
+
+  &[data-tone="added"] {
+    background: rgba(46, 160, 67, 0.18);
+  }
+
+  &[data-tone="removed"] {
+    background: rgba(248, 81, 73, 0.16);
+  }
+`;
+
+export const InlineReviewLineNumber = styled.span`
+  padding: 0 9px 0 12px;
+  color: #6e7681;
+  font-size: 12px;
+  text-align: right;
+  user-select: none;
+
+  ${InlineReviewLine}[data-tone="added"] & {
+    color: #7ee787;
+  }
+
+  ${InlineReviewLine}[data-tone="removed"] & {
+    color: #ff9b93;
+  }
+`;
+
+export const InlineReviewPrefix = styled.span`
+  color: #6e7681;
+  user-select: none;
+
+  ${InlineReviewLine}[data-tone="added"] & {
+    color: #7ee787;
+  }
+
+  ${InlineReviewLine}[data-tone="removed"] & {
+    color: #ff9b93;
+  }
+`;
+
+export const InlineReviewCode = styled.span`
+  min-width: max-content;
+  padding: 0 28px 0 0;
+  white-space: pre;
+
+  ${InlineReviewLine}[data-tone="added"] & {
+    color: #d8ffd8;
+  }
+
+  ${InlineReviewLine}[data-tone="removed"] & {
+    color: #ffd0d0;
+  }
+
+  .token.comment,
+  .token.prolog,
+  .token.doctype,
+  .token.cdata {
+    color: #6a9955;
+    font-style: italic;
+  }
+
+  .token.punctuation {
+    color: #d4d4d4;
+  }
+
+  .token.property,
+  .token.attr-name,
+  .token.parameter,
+  .token.variable {
+    color: #9cdcfe;
+  }
+
+  .token.tag,
+  .token.selector,
+  .token.keyword,
+  .token.atrule {
+    color: #569cd6;
+  }
+
+  .token.boolean,
+  .token.number,
+  .token.constant {
+    color: #b5cea8;
+  }
+
+  .token.string,
+  .token.char,
+  .token.attr-value,
+  .token.template-string {
+    color: #ce9178;
+  }
+
+  .token.symbol,
+  .token.builtin,
+  .token.inserted {
+    color: #4ec9b0;
+  }
+
+  .token.deleted {
+    color: #f48771;
+  }
+
+  .token.operator,
+  .token.entity,
+  .token.url,
+  .language-css .token.string,
+  .style .token.string {
+    color: #d4d4d4;
+  }
+
+  .token.function {
+    color: #dcdcaa;
+  }
+
+  .token.class-name,
+  .token.maybe-class-name {
+    color: #4ec9b0;
+  }
+
+  .token.regex,
+  .token.important {
+    color: #d16969;
+  }
+
+  .token.title,
+  .token.section {
+    color: #569cd6;
+    font-weight: 600;
+  }
+
+  .token.namespace {
+    opacity: 0.78;
+  }
+`;
+
+export const ReviewChangeRuler = styled.div`
+  position: sticky;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  align-self: start;
+  width: 14px;
+  min-height: 80px;
+  max-height: 100%;
+  border-left: 1px solid #2d2d2d;
+  background: #181818;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+
+  &:hover {
+    background: #202020;
+  }
+`;
+
+export const ReviewChangeMarker = styled.span`
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  height: 4px;
+  border-radius: 999px;
+  background: #7ee787;
+  box-shadow: 0 0 0 1px rgba(126, 231, 135, 0.16);
+
+  &[data-tone="removed"] {
+    background: #ff7b72;
+    box-shadow: 0 0 0 1px rgba(255, 123, 114, 0.16);
   }
 `;
 
@@ -2797,6 +3183,11 @@ export const FileDiffPanel = styled.section`
   margin: 0;
   border-bottom: 1px solid #2d2d2d;
   background: #181818;
+
+  &[data-mode="diff"] {
+    min-height: 100%;
+    border-bottom: 0;
+  }
 `;
 
 export const FileDiffHeader = styled.header`
@@ -2852,9 +3243,8 @@ export const FileDiffMessage = styled.p`
 
 export const DiffCodeBlock = styled.pre`
   min-width: max-content;
-  max-height: 42vh;
   margin: 0;
-  overflow: auto;
+  overflow: visible;
   padding: 6px 0 8px;
   color: #d4d4d4;
   background: #1e1e1e;
@@ -2868,17 +3258,8 @@ export const DiffCodeBlock = styled.pre`
   tab-size: 2;
   white-space: pre;
 
-  &::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-  }
-
-  &::-webkit-scrollbar-thumb {
-    background: rgba(121, 121, 121, 0.38);
-  }
-
-  &::-webkit-scrollbar-track {
-    background: transparent;
+  &[data-mode="diff"] {
+    min-height: 100%;
   }
 `;
 
@@ -2960,10 +3341,27 @@ export const VaultWorkspaceSurface = styled.section`
   overflow: auto;
   padding: 24px;
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    rgba(3, 5, 8, 0.14);
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
   background-size: 68px 68px, 68px 68px, auto;
+
+  &[data-layout="operational"] {
+    place-items: stretch;
+    align-content: start;
+    justify-items: center;
+    padding: 16px;
+  }
+
+  &[data-layout="blank"] {
+    place-items: stretch;
+    align-content: stretch;
+    justify-items: stretch;
+    overflow: hidden;
+    padding: 0;
+    background: #000000;
+    background-size: auto;
+  }
 `;
 
 export const VaultPlaceholderPanel = styled.section`
@@ -2972,12 +3370,11 @@ export const VaultPlaceholderPanel = styled.section`
   min-width: 0;
   gap: 16px;
   padding: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    radial-gradient(circle at 86% 12%, rgba(255, 122, 24, 0.12), transparent 16rem),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015)),
-    rgba(13, 20, 31, 0.9);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.035), rgba(244, 247, 250, 0.012)),
+    rgba(17, 22, 29, 0.92);
 `;
 
 export const VaultPlaceholderIcon = styled.span`
@@ -2985,10 +3382,10 @@ export const VaultPlaceholderIcon = styled.span`
   width: 48px;
   height: 48px;
   place-items: center;
-  border: 1px solid rgba(255, 122, 24, 0.34);
+  border: 1px solid rgba(223, 165, 90, 0.32);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.12);
+  color: var(--forge-amber);
+  background: rgba(223, 165, 90, 0.09);
 
   svg {
     width: 22px;
@@ -3007,39 +3404,330 @@ export const VaultStatusGrid = styled.div`
   }
 `;
 
+export const VaultHeaderPanel = styled.section`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.86);
+`;
+
+export const VaultTitleRow = styled.div`
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+
+  > div {
+    min-width: 0;
+  }
+
+  h2 {
+    margin-top: 2px;
+    overflow: hidden;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  p {
+    margin-top: 3px;
+    color: var(--forge-text-muted);
+    font-size: 12px;
+  }
+
+  ${VaultPlaceholderIcon} {
+    width: 36px;
+    height: 36px;
+    border-color: rgba(223, 165, 90, 0.28);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.08);
+
+    svg {
+      width: 18px;
+      height: 18px;
+    }
+  }
+
+  button {
+    min-height: 36px;
+  }
+
+  @media (max-width: 760px) {
+    grid-template-columns: 36px minmax(0, 1fr);
+
+    > button {
+      grid-column: 1 / -1;
+      width: 100%;
+    }
+  }
+`;
+
+export const VaultLayout = styled.div`
+  display: grid;
+  width: min(920px, 100%);
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+`;
+
+export const VaultBodyGrid = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(216px, 260px) minmax(0, 1fr);
+  gap: 10px;
+
+  @media (max-width: 920px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const VaultListPanel = styled.aside`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  align-content: start;
+  gap: 8px;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.72);
+`;
+
+export const VaultPanelTopline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+
+  strong {
+    color: var(--forge-text-soft);
+  }
+`;
+
+export const VaultEntryList = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+`;
+
+export const VaultEntryRow = styled.div`
+  position: relative;
+  display: grid;
+  min-height: 34px;
+  min-width: 0;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 7px 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: transparent;
+
+  &::before {
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    left: 3px;
+    width: 2px;
+    border-radius: 999px;
+    background: transparent;
+    content: "";
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(125, 160, 205, 0.22);
+    background: var(--forge-surface-selected);
+  }
+
+  &[data-active="true"]::before {
+    background: var(--forge-blue-soft);
+  }
+`;
+
+export const VaultEntryIcon = styled.span`
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &[data-state="locked"] {
+    border-color: rgba(223, 165, 90, 0.32);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.08);
+  }
+`;
+
+export const VaultEntryCopy = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 760;
+  }
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 650;
+  }
+`;
+
+export const VaultStatusBadge = styled.span`
+  padding: 3px 6px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
+  font-size: 9px;
+  font-weight: 760;
+  text-transform: uppercase;
+
+  &[data-state="locked"] {
+    border-color: rgba(223, 165, 90, 0.32);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.08);
+  }
+`;
+
+export const VaultDetailPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.78);
+`;
+
+export const VaultDetailHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+`;
+
+export const VaultEmptyNote = styled.p`
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.58);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+`;
+
 export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
   place-items: stretch;
-  align-content: center;
-  justify-items: center;
+  align-content: start;
+  justify-items: stretch;
+  padding: 16px;
 `;
 
 export const AudioSetupPanel = styled.section`
   display: grid;
-  width: min(760px, 100%);
-  align-self: center;
-  gap: 16px;
-  padding: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.13);
+  width: min(920px, 100%);
+  align-self: start;
+  justify-self: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    radial-gradient(circle at 88% 12%, rgba(47, 128, 255, 0.16), transparent 17rem),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.016)),
-    rgba(13, 20, 31, 0.92);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.86);
 
   &[data-installed="true"] {
-    border-color: rgba(47, 128, 255, 0.3);
+    border-color: rgba(60, 203, 127, 0.24);
   }
 `;
 
 export const AudioHeroRow = styled.div`
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) auto;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--forge-border);
+
+  > div {
+    min-width: 0;
+  }
+
+  h2 {
+    margin-top: 2px;
+    overflow: hidden;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  p {
+    margin-top: 3px;
+    color: var(--forge-text-muted);
+    font-size: 12px;
+  }
+
+  ${VaultPlaceholderIcon} {
+    width: 36px;
+    height: 36px;
+    border-color: rgba(125, 160, 205, 0.24);
+    color: var(--forge-blue-soft);
+    background: rgba(125, 160, 205, 0.08);
+
+    svg {
+      width: 18px;
+      height: 18px;
+    }
+  }
 
   @media (max-width: 680px) {
-    grid-template-columns: 48px minmax(0, 1fr);
+    grid-template-columns: 36px minmax(0, 1fr);
 
     > span:last-child {
       grid-column: 1 / -1;
@@ -3050,50 +3738,61 @@ export const AudioHeroRow = styled.div`
 
 export const AudioStatePill = styled.span`
   display: inline-flex;
-  min-height: 30px;
+  min-height: 26px;
   align-items: center;
-  padding: 0 9px;
-  border: 1px solid rgba(255, 122, 24, 0.36);
+  padding: 0 8px;
+  border: 1px solid rgba(223, 165, 90, 0.34);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.12);
-  font-size: 11px;
-  font-weight: 900;
+  color: var(--forge-amber);
+  background: rgba(223, 165, 90, 0.09);
+  font-size: 10px;
+  font-weight: 760;
   text-transform: uppercase;
 
   &[data-installed="true"] {
-    border-color: rgba(47, 128, 255, 0.38);
-    color: #8bb9ff;
-    background: rgba(47, 128, 255, 0.13);
+    border-color: rgba(60, 203, 127, 0.34);
+    color: var(--forge-green);
+    background: rgba(60, 203, 127, 0.09);
   }
 `;
 
 export const AudioStatusGrid = styled(VaultStatusGrid)`
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 export const AudioPathBlock = styled.div`
   display: grid;
-  gap: 6px;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 7px 12px;
   min-width: 0;
-  padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px 12px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(3, 5, 8, 0.52);
+  background: rgba(13, 17, 23, 0.58);
 
   span {
-    color: #687386;
+    color: var(--forge-text-muted);
     font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.08em;
+    font-weight: 760;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+
+  @media (max-width: 640px) {
+    grid-template-columns: 1fr;
   }
 `;
 
 export const AudioCodePath = styled.code`
   min-width: 0;
   overflow: hidden;
-  color: #d7e5ff;
+  color: var(--forge-text-soft);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3106,24 +3805,24 @@ export const AudioCodePath = styled.code`
 
 export const AudioRuntimeHint = styled.p`
   margin: 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(255, 122, 24, 0.34);
+  padding: 9px 10px;
+  border: 1px solid rgba(223, 165, 90, 0.28);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.1);
+  color: #e5bd83;
+  background: rgba(223, 165, 90, 0.08);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 650;
   line-height: 1.45;
   overflow-wrap: anywhere;
 `;
 
 export const AudioProgressPanel = styled.div`
   display: grid;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid rgba(47, 128, 255, 0.24);
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid rgba(125, 160, 205, 0.22);
   border-radius: 8px;
-  background: rgba(47, 128, 255, 0.08);
+  background: rgba(125, 160, 205, 0.07);
 `;
 
 export const AudioProgressTopline = styled.div`
@@ -3132,7 +3831,7 @@ export const AudioProgressTopline = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  color: #e8eef8;
+  color: var(--forge-text-soft);
   font-size: 12px;
 
   strong,
@@ -3148,31 +3847,44 @@ export const AudioProgressTrack = styled.div`
   height: 8px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(230, 236, 245, 0.08);
 `;
 
 export const AudioProgressBar = styled.div`
   width: ${({ $progress }) => `${Math.max(0, Math.min(100, $progress || 0))}%`};
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #2f80ff, #ff7a18);
+  background: var(--forge-blue);
   transition: width 180ms ease;
 `;
 
 export const AudioProgressMeta = styled.p`
   margin: 0;
-  color: #8793a5;
+  color: var(--forge-text-muted);
   font-size: 11px;
-  font-weight: 760;
+  font-weight: 650;
 `;
 
 export const AudioActionRow = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(132px, auto);
-  gap: 10px;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  button {
+    min-height: 36px;
+    min-width: 128px;
+  }
 
   @media (max-width: 620px) {
-    grid-template-columns: 1fr;
+    align-items: stretch;
+    flex-direction: column;
+
+    button {
+      width: 100%;
+    }
   }
 `;
 
@@ -3183,11 +3895,12 @@ export const AudioWidgetShell = styled.main`
   align-content: start;
   gap: 14px;
   padding: 14px;
-  color: #f7f9ff;
+  color: var(--forge-text);
   background:
-    radial-gradient(circle at 84% 8%, rgba(47, 128, 255, 0.18), transparent 12rem),
-    radial-gradient(circle at 12% 92%, rgba(255, 122, 24, 0.12), transparent 10rem),
-    #030508;
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    var(--forge-bg);
+  background-size: 64px 64px, 64px 64px, auto;
 `;
 
 export const AudioWidgetHeader = styled.header`
@@ -3207,17 +3920,17 @@ export const AudioWidgetTitle = styled.div`
   min-width: 0;
   align-items: center;
   gap: 9px;
-  color: #ffffff;
+  color: var(--forge-text);
 
   > span {
     display: grid;
     width: 32px;
     height: 32px;
     place-items: center;
-    border: 1px solid rgba(47, 128, 255, 0.38);
+    border: 1px solid rgba(125, 160, 205, 0.28);
     border-radius: 8px;
-    color: #62a0ff;
-    background: rgba(47, 128, 255, 0.13);
+    color: var(--forge-blue-soft);
+    background: rgba(125, 160, 205, 0.09);
   }
 
   svg {
@@ -3228,7 +3941,7 @@ export const AudioWidgetTitle = styled.div`
   strong {
     overflow: hidden;
     font-size: 14px;
-    font-weight: 900;
+    font-weight: 760;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -3241,18 +3954,18 @@ export const AudioWidgetMeter = styled.div`
   align-items: center;
   gap: 5px;
   padding: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.014)),
-    rgba(8, 13, 20, 0.9);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.035), rgba(244, 247, 250, 0.012)),
+    rgba(17, 22, 29, 0.9);
 
   span {
     display: block;
     height: var(--height);
     min-height: 10px;
     border-radius: 999px;
-    background: rgba(104, 115, 134, 0.48);
+    background: rgba(122, 132, 147, 0.46);
     transform-origin: center;
     transition:
       background 160ms ease,
@@ -3260,7 +3973,7 @@ export const AudioWidgetMeter = styled.div`
   }
 
   &[data-active="true"] span {
-    background: linear-gradient(180deg, #62a0ff, #ff9a3d);
+    background: var(--forge-green);
     animation: ${quietSweep} 900ms ease-in-out infinite alternate;
   }
 `;
@@ -3270,19 +3983,19 @@ export const AudioWidgetStatus = styled.div`
   gap: 4px;
   min-width: 0;
   padding: 10px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(3, 5, 8, 0.52);
+  background: rgba(13, 17, 23, 0.62);
 
   strong {
-    color: #f7f9ff;
+    color: var(--forge-text);
     font-size: 13px;
-    font-weight: 900;
+    font-weight: 760;
   }
 
   span {
     overflow: hidden;
-    color: #8793a5;
+    color: var(--forge-text-muted);
     font-size: 12px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -3291,14 +4004,14 @@ export const AudioWidgetStatus = styled.div`
 
 export const AudioRecordingTimer = styled.p`
   margin: 0;
-  color: #ffb269;
+  color: var(--forge-green);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
     Consolas,
     monospace;
   font-size: 28px;
-  font-weight: 900;
+  font-weight: 760;
   text-align: center;
 `;
 
@@ -3307,10 +4020,10 @@ export const AudioWidgetTranscript = styled.p`
   margin: 0;
   overflow: auto;
   padding: 10px 12px;
-  border: 1px solid rgba(47, 128, 255, 0.22);
+  border: 1px solid rgba(125, 160, 205, 0.2);
   border-radius: 8px;
-  color: #d7e5ff;
-  background: rgba(47, 128, 255, 0.08);
+  color: var(--forge-text-soft);
+  background: rgba(125, 160, 205, 0.07);
   font-size: 12px;
   line-height: 1.5;
 `;
@@ -3323,6 +4036,14 @@ export const AudioWidgetActions = styled.div`
   button {
     min-height: 42px;
   }
+
+  @media (max-width: 460px) {
+    grid-template-columns: 1fr;
+
+    button {
+      width: 100%;
+    }
+  }
 `;
 
 export const McpWorkspaceSurface = styled.section`
@@ -3332,42 +4053,72 @@ export const McpWorkspaceSurface = styled.section`
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
+  gap: 10px;
   overflow: hidden;
-  padding: 14px;
+  padding: 16px;
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    rgba(3, 5, 8, 0.14);
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
   background-size: 68px 68px, 68px 68px, auto;
 `;
 
 export const McpHeaderPanel = styled.section`
   display: grid;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
-  padding: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 12px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(135deg, rgba(47, 128, 255, 0.12), transparent 42%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015)),
-    rgba(13, 20, 31, 0.9);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.86);
 `;
 
 export const McpTitleRow = styled.div`
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) auto;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
 
+  > div {
+    min-width: 0;
+  }
+
+  h2 {
+    margin-top: 2px;
+    overflow: hidden;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  p {
+    margin-top: 3px;
+    color: var(--forge-text-muted);
+    font-size: 12px;
+  }
+
+  ${VaultPlaceholderIcon} {
+    width: 36px;
+    height: 36px;
+    border-color: rgba(125, 160, 205, 0.24);
+    color: var(--forge-blue-soft);
+    background: rgba(125, 160, 205, 0.08);
+
+    svg {
+      width: 18px;
+      height: 18px;
+    }
+  }
+
   button {
-    min-height: 40px;
+    min-height: 36px;
   }
 
   @media (max-width: 760px) {
-    grid-template-columns: 48px minmax(0, 1fr);
+    grid-template-columns: 36px minmax(0, 1fr);
 
     > button {
       grid-column: 1 / -1;
@@ -3379,8 +4130,7 @@ export const McpTitleRow = styled.div`
 export const McpStatsGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 4px;
+  gap: 8px;
 
   @media (max-width: 760px) {
     grid-template-columns: 1fr;
@@ -3391,8 +4141,8 @@ export const McpLayout = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: minmax(216px, 260px) minmax(0, 1fr);
+  gap: 10px;
   overflow: hidden;
 
   @media (max-width: 920px) {
@@ -3406,12 +4156,12 @@ export const McpRegistryPanel = styled.aside`
   min-width: 0;
   min-height: 0;
   align-content: start;
-  gap: 10px;
+  gap: 8px;
   overflow: hidden;
-  padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(6, 9, 16, 0.74);
+  background: rgba(13, 17, 23, 0.72);
 `;
 
 export const McpPanelTopline = styled.div`
@@ -3420,14 +4170,14 @@ export const McpPanelTopline = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  color: #687386;
+  color: var(--forge-text-muted);
   font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
+  font-weight: 760;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 
   strong {
-    color: #8bb9ff;
+    color: var(--forge-text-soft);
   }
 `;
 
@@ -3435,59 +4185,76 @@ export const McpServerList = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  gap: 8px;
+  gap: 4px;
   overflow: auto;
 `;
 
 export const McpServerButton = styled.button`
+  position: relative;
   display: grid;
   width: 100%;
   min-width: 0;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  min-height: 34px;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 9px;
-  padding: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 8px;
+  padding: 6px 7px 6px 9px;
+  border: 1px solid transparent;
   border-radius: 8px;
-  color: #e8eef8;
-  background: rgba(255, 255, 255, 0.035);
+  color: var(--forge-text-soft);
+  background: transparent;
   text-align: left;
   transition:
     background 160ms ease,
     border-color 160ms ease;
 
+  &::before {
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    left: 3px;
+    width: 2px;
+    border-radius: 999px;
+    background: transparent;
+    content: "";
+  }
+
   &[data-active="true"],
   &:hover {
-    border-color: rgba(47, 128, 255, 0.4);
-    background: rgba(47, 128, 255, 0.13);
+    border-color: rgba(125, 160, 205, 0.22);
+    background: var(--forge-surface-selected);
+  }
+
+  &[data-active="true"]::before {
+    background: var(--forge-blue-soft);
   }
 `;
 
 export const McpServerIcon = styled.span`
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(6, 9, 16, 0.72);
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 15px;
+    height: 15px;
   }
 
   &[data-state="enabled"] {
-    border-color: rgba(47, 128, 255, 0.36);
-    color: #62a0ff;
-    background: rgba(47, 128, 255, 0.14);
+    border-color: rgba(59, 130, 246, 0.32);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
   }
 
   &[data-state="planned"] {
-    border-color: rgba(255, 122, 24, 0.36);
-    color: #ff9a3d;
-    background: rgba(255, 122, 24, 0.12);
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: rgba(21, 27, 35, 0.72);
   }
 `;
 
@@ -3505,38 +4272,38 @@ export const McpServerCopy = styled.span`
   }
 
   strong {
-    color: #f7f9ff;
-    font-size: 13px;
-    font-weight: 900;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 760;
   }
 
   span {
-    color: #8793a5;
+    color: var(--forge-text-muted);
     font-size: 11px;
-    font-weight: 760;
+    font-weight: 650;
   }
 `;
 
 export const McpStatusBadge = styled.span`
-  padding: 4px 7px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 3px 6px;
+  border: 1px solid var(--forge-border);
   border-radius: 999px;
-  color: #a7b2c2;
-  background: rgba(6, 9, 16, 0.72);
-  font-size: 10px;
-  font-weight: 900;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
+  font-size: 9px;
+  font-weight: 760;
   text-transform: uppercase;
 
   &[data-state="enabled"] {
-    border-color: rgba(47, 128, 255, 0.34);
-    color: #8bb9ff;
-    background: rgba(47, 128, 255, 0.12);
+    border-color: rgba(59, 130, 246, 0.3);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
   }
 
   &[data-state="planned"] {
-    border-color: rgba(255, 122, 24, 0.34);
-    color: #ffb269;
-    background: rgba(255, 122, 24, 0.1);
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: rgba(21, 27, 35, 0.72);
   }
 `;
 
@@ -3545,14 +4312,14 @@ export const McpEditorPanel = styled.section`
   min-width: 0;
   min-height: 0;
   align-content: start;
-  gap: 14px;
+  gap: 12px;
   overflow: auto;
-  padding: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 14px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.052), rgba(255, 255, 255, 0.016)),
-    rgba(8, 13, 20, 0.9);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.78);
 `;
 
 export const McpEditorHeader = styled.div`
@@ -3574,19 +4341,19 @@ export const McpSwitchButton = styled.button`
   align-items: center;
   gap: 9px;
   padding: 0 10px;
-  border: 1px solid rgba(255, 122, 24, 0.34);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.1);
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.72);
   font-size: 12px;
-  font-weight: 900;
+  font-weight: 760;
 
   > span {
     position: relative;
     width: 28px;
     height: 16px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(230, 236, 245, 0.16);
   }
 
   > span::after {
@@ -3596,19 +4363,19 @@ export const McpSwitchButton = styled.button`
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: #ffb269;
+    background: var(--forge-text-muted);
     content: "";
     transition: transform 160ms ease;
   }
 
   &[aria-pressed="true"] {
-    border-color: rgba(47, 128, 255, 0.38);
-    color: #8bb9ff;
-    background: rgba(47, 128, 255, 0.13);
+    border-color: rgba(59, 130, 246, 0.34);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
   }
 
   &[aria-pressed="true"] > span::after {
-    background: #62a0ff;
+    background: var(--forge-blue-soft);
     transform: translateX(12px);
   }
 
@@ -3638,10 +4405,10 @@ export const McpInput = styled.input`
   width: 100%;
   min-height: 40px;
   padding: 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
-  color: #f7f9ff;
-  background: rgba(6, 9, 16, 0.92);
+  color: var(--forge-text);
+  background: rgba(13, 17, 23, 0.92);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3650,9 +4417,9 @@ export const McpInput = styled.input`
   font-size: 12px;
 
   &:focus {
-    border-color: rgba(47, 128, 255, 0.5);
+    border-color: rgba(125, 160, 205, 0.44);
     outline: none;
-    box-shadow: 0 0 0 3px rgba(47, 128, 255, 0.12);
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
 `;
 
@@ -3661,10 +4428,10 @@ export const McpTextarea = styled.textarea`
   min-height: 86px;
   resize: vertical;
   padding: 11px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #f7f9ff;
-  background: rgba(6, 9, 16, 0.76);
+  color: var(--forge-text);
+  background: rgba(13, 17, 23, 0.76);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3675,8 +4442,8 @@ export const McpTextarea = styled.textarea`
   outline: none;
 
   &:focus {
-    border-color: rgba(47, 128, 255, 0.52);
-    box-shadow: 0 0 0 3px rgba(47, 128, 255, 0.12);
+    border-color: rgba(125, 160, 205, 0.44);
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
 `;
 
@@ -3689,9 +4456,9 @@ export const McpTransportTabs = styled.div`
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(3, 5, 8, 0.46);
+  background: rgba(13, 17, 23, 0.46);
 
   @media (max-width: 620px) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3703,16 +4470,16 @@ export const McpTransportButton = styled.button`
   min-height: 34px;
   border: 1px solid transparent;
   border-radius: 6px;
-  color: #a7b2c2;
+  color: var(--forge-text-soft);
   background: transparent;
   font-size: 12px;
-  font-weight: 900;
+  font-weight: 760;
 
   &[data-active="true"],
   &:hover {
-    border-color: rgba(47, 128, 255, 0.38);
-    color: #ffffff;
-    background: rgba(47, 128, 255, 0.14);
+    border-color: rgba(125, 160, 205, 0.28);
+    color: var(--forge-text);
+    background: var(--forge-surface-selected);
   }
 `;
 
@@ -3733,9 +4500,9 @@ export const McpAccessPanel = styled.section`
   align-content: start;
   gap: 10px;
   padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(21, 27, 35, 0.42);
 `;
 
 export const McpAccessTopline = styled.div`
@@ -3744,9 +4511,9 @@ export const McpAccessTopline = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  color: #f7f9ff;
+  color: var(--forge-text);
   font-size: 12px;
-  font-weight: 900;
+  font-weight: 760;
 
   > span {
     display: inline-flex;
@@ -3758,7 +4525,7 @@ export const McpAccessTopline = styled.div`
   svg {
     width: 16px;
     height: 16px;
-    color: #8bb9ff;
+    color: var(--forge-blue-soft);
   }
 `;
 
@@ -3769,17 +4536,17 @@ export const McpInlineActions = styled.span`
   button {
     min-height: 26px;
     padding: 0 7px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--forge-border);
     border-radius: 6px;
-    color: #a7b2c2;
-    background: rgba(6, 9, 16, 0.72);
+    color: var(--forge-text-soft);
+    background: rgba(21, 27, 35, 0.72);
     font-size: 10px;
     font-weight: 900;
   }
 
   button:hover {
-    border-color: rgba(47, 128, 255, 0.4);
-    color: #ffffff;
+    border-color: rgba(125, 160, 205, 0.34);
+    color: var(--forge-text);
   }
 `;
 
@@ -3796,14 +4563,14 @@ export const McpCheckRow = styled.label`
   align-items: center;
   gap: 9px;
   padding: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(6, 9, 16, 0.52);
+  background: rgba(13, 17, 23, 0.58);
 
   input {
     width: 16px;
     height: 16px;
-    accent-color: #2f80ff;
+    accent-color: var(--forge-blue);
   }
 
   > span {
@@ -3821,27 +4588,27 @@ export const McpCheckRow = styled.label`
   }
 
   strong {
-    color: #f7f9ff;
+    color: var(--forge-text);
     font-size: 12px;
-    font-weight: 900;
+    font-weight: 760;
   }
 
   small {
-    color: #8793a5;
+    color: var(--forge-text-muted);
     font-size: 11px;
-    font-weight: 760;
+    font-weight: 650;
   }
 `;
 
 export const McpEmptyAccess = styled.p`
   margin: 0;
   padding: 10px;
-  border: 1px solid rgba(255, 122, 24, 0.24);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.08);
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.48);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 650;
 `;
 
 export const McpScopePreview = styled.div`
@@ -3885,11 +4652,11 @@ export const WorkspaceSetupPanel = styled.form`
   justify-self: center;
   gap: 16px;
   padding: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    radial-gradient(circle at 85% 10%, rgba(47, 128, 255, 0.14), transparent 14rem),
-    rgba(13, 20, 31, 0.9);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.92);
 `;
 
 export const SetupHeader = styled.div`
@@ -3906,16 +4673,16 @@ export const SetupInput = styled.input`
   width: 100%;
   min-height: 44px;
   padding: 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
-  color: #f7f9ff;
-  background: rgba(6, 9, 16, 0.92);
+  color: var(--forge-text);
+  background: rgba(13, 17, 23, 0.92);
   font: inherit;
 
   &:focus {
-    border-color: rgba(47, 128, 255, 0.5);
+    border-color: rgba(125, 160, 205, 0.44);
     outline: none;
-    box-shadow: 0 0 0 3px rgba(47, 128, 255, 0.12);
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
 `;
 
@@ -3936,7 +4703,7 @@ export const WorkspaceSettingsOverlay = styled.div`
   min-width: 0;
   min-height: 0;
   padding: 18px;
-  background: rgba(3, 5, 8, 0.64);
+  background: rgba(7, 9, 13, 0.68);
   animation: ${panelEnter} 160ms ease both;
 `;
 
@@ -3949,11 +4716,11 @@ export const WorkspaceSettingsDialog = styled.aside`
   min-width: 0;
   overflow: auto;
   padding: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
-    rgba(8, 13, 20, 0.98);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.045), rgba(244, 247, 250, 0.014)),
+    rgba(17, 22, 29, 0.98);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
   animation: ${panelEnter} 190ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
@@ -3977,19 +4744,19 @@ export const WorkspaceModalCloseButton = styled.button`
   height: 34px;
   flex: 0 0 auto;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(6, 9, 16, 0.72);
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.72);
   transition:
     color 160ms ease,
     border-color 160ms ease,
     background 160ms ease;
 
   &:hover {
-    border-color: rgba(255, 140, 140, 0.38);
-    color: #ffd2d2;
-    background: rgba(255, 140, 140, 0.1);
+    border-color: rgba(239, 107, 107, 0.38);
+    color: #ffc8c8;
+    background: rgba(239, 107, 107, 0.1);
   }
 
   svg {
@@ -4039,15 +4806,15 @@ export const WorkspaceRuntimePanel = styled.div`
   gap: 12px;
   min-width: 0;
   padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.11);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(21, 27, 35, 0.42);
 
   &[data-state="activated"] {
-    border-color: rgba(57, 217, 138, 0.28);
+    border-color: rgba(60, 203, 127, 0.26);
     background:
-      linear-gradient(90deg, rgba(57, 217, 138, 0.12), rgba(47, 128, 255, 0.045)),
-      rgba(255, 255, 255, 0.035);
+      linear-gradient(90deg, rgba(60, 203, 127, 0.08), rgba(125, 160, 205, 0.034)),
+      rgba(21, 27, 35, 0.42);
   }
 
   @media (max-width: 640px) {
@@ -4100,26 +4867,21 @@ export const WorkspaceSettingsActions = styled.div`
 export const AgentSettingsPanel = styled.section`
   position: relative;
   display: grid;
-  gap: 16px;
+  gap: 12px;
   align-self: start;
   min-width: 0;
-  min-height: 340px;
+  min-height: 0;
   overflow: hidden;
-  padding: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 14px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(135deg, rgba(47, 128, 255, 0.14), transparent 36%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015)),
-    rgba(13, 20, 31, 0.86);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.8);
+  box-shadow: inset 0 1px 0 rgba(244, 247, 250, 0.04);
 
   &::before {
-    position: absolute;
-    inset: 0 0 auto;
-    height: 2px;
-    background: linear-gradient(90deg, #2f80ff, rgba(255, 122, 24, 0.72), transparent);
-    content: "";
+    display: none;
   }
 `;
 
@@ -4132,7 +4894,7 @@ export const AgentPanelActions = styled.div`
   flex-wrap: wrap;
 
   button {
-    min-height: 40px;
+    min-height: 36px;
   }
 `;
 
@@ -4142,12 +4904,12 @@ export const AgentReadyPill = styled.div`
   align-items: center;
   gap: 8px;
   padding: 0 11px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #e8eef8;
-  background: rgba(6, 9, 16, 0.74);
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.72);
   font-size: 12px;
-  font-weight: 900;
+  font-weight: 760;
 
   svg {
     width: 17px;
@@ -4155,15 +4917,15 @@ export const AgentReadyPill = styled.div`
   }
 
   &[data-tone="blue"] {
-    border-color: rgba(47, 128, 255, 0.38);
-    color: #8bb9ff;
-    background: rgba(47, 128, 255, 0.13);
+    border-color: rgba(59, 130, 246, 0.3);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
   }
 
   &[data-tone="orange"] {
-    border-color: rgba(255, 122, 24, 0.38);
-    color: #ffb16a;
-    background: rgba(255, 122, 24, 0.12);
+    border-color: rgba(223, 165, 90, 0.3);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.08);
   }
 `;
 
@@ -4171,7 +4933,7 @@ export const AgentCardGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
-  gap: 12px;
+  gap: 10px;
   min-height: 0;
 
   @media (max-width: 860px) {
@@ -4183,15 +4945,15 @@ export const AgentCard = styled.section`
   position: relative;
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 10px;
   min-height: 0;
   overflow: hidden;
-  padding: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 12px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
-    rgba(6, 9, 16, 0.78);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(13, 17, 23, 0.78);
   transition:
     border-color 160ms ease,
     background 160ms ease,
@@ -4201,76 +4963,75 @@ export const AgentCard = styled.section`
     position: absolute;
     inset: 0 auto 0 0;
     width: 3px;
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(230, 236, 245, 0.12);
     content: "";
   }
 
   &:hover {
-    border-color: rgba(255, 255, 255, 0.18);
+    border-color: var(--forge-border-strong);
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
-      rgba(8, 13, 20, 0.88);
-    transform: translateY(-1px);
+      linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
+      rgba(17, 22, 29, 0.88);
   }
 
   &[data-tone="ready"] {
-    border-color: rgba(47, 128, 255, 0.32);
+    border-color: rgba(60, 203, 127, 0.28);
   }
 
   &[data-tone="ready"]::before {
-    background: #2f80ff;
+    background: var(--forge-green);
   }
 
   &[data-tone="needsAuth"] {
-    border-color: rgba(255, 122, 24, 0.32);
+    border-color: rgba(223, 165, 90, 0.28);
   }
 
   &[data-tone="needsAuth"]::before {
-    background: #ff7a18;
+    background: var(--forge-amber);
   }
 `;
 
 export const AgentCardHeader = styled.div`
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr);
+  grid-template-columns: 32px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 9px;
 `;
 
 export const AgentIcon = styled.span`
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(255, 255, 255, 0.04);
+  color: var(--forge-text-muted);
+  background: rgba(230, 236, 245, 0.04);
 
   svg {
-    width: 19px;
-    height: 19px;
+    width: 17px;
+    height: 17px;
   }
 
   &[data-tone="ready"] {
-    border-color: rgba(47, 128, 255, 0.36);
-    color: #62a0ff;
-    background: rgba(47, 128, 255, 0.14);
+    border-color: rgba(60, 203, 127, 0.3);
+    color: var(--forge-green);
+    background: rgba(60, 203, 127, 0.09);
   }
 
   &[data-tone="needsAuth"] {
-    border-color: rgba(255, 122, 24, 0.36);
-    color: #ff9a3d;
-    background: rgba(255, 122, 24, 0.14);
+    border-color: rgba(223, 165, 90, 0.3);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.09);
   }
 `;
 
 export const AgentName = styled.h3`
   margin: 0;
   overflow: hidden;
-  color: #f7f9ff;
-  font-size: 15px;
-  font-weight: 900;
+  color: var(--forge-text);
+  font-size: 13px;
+  font-weight: 760;
   text-overflow: ellipsis;
   white-space: nowrap;
 `;
@@ -4278,28 +5039,28 @@ export const AgentName = styled.h3`
 export const AgentMeta = styled.p`
   margin: 3px 0 0;
   overflow: hidden;
-  color: #687386;
-  font-size: 12px;
-  font-weight: 760;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 `;
 
 export const AgentStatusText = styled.p`
   margin: 0;
-  min-height: 38px;
-  color: #a7b2c2;
-  font-size: 13px;
+  min-height: 0;
+  color: var(--forge-text-soft);
+  font-size: 12px;
   line-height: 1.45;
 `;
 
 export const AgentInstallPanel = styled.div`
   display: grid;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(21, 27, 35, 0.42);
 `;
 
 export const AgentInstallTopline = styled.div`
@@ -4308,9 +5069,9 @@ export const AgentInstallTopline = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  color: #f7f9ff;
+  color: var(--forge-text);
   font-size: 12px;
-  font-weight: 860;
+  font-weight: 720;
 
   span {
     min-width: 0;
@@ -4323,27 +5084,31 @@ export const AgentInstallTopline = styled.div`
 export const AgentInstallBadge = styled.span`
   flex: 0 0 auto;
   padding: 4px 7px;
-  border: 1px solid rgba(47, 128, 255, 0.34);
+  border: 1px solid rgba(125, 160, 205, 0.28);
   border-radius: 999px;
-  color: #8bb9ff;
-  background: rgba(47, 128, 255, 0.12);
+  color: var(--forge-text-soft);
+  background: rgba(125, 160, 205, 0.08);
   font-size: 10px;
-  font-weight: 900;
+  font-weight: 760;
   text-transform: uppercase;
 `;
 
 export const AgentInstallHint = styled.p`
   margin: 0;
-  color: #8793a5;
+  color: var(--forge-text-muted);
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 650;
   line-height: 1.45;
 `;
 
 export const AgentInstallActions = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   gap: 8px;
+
+  button {
+    min-height: 36px;
+  }
 `;
 
 export const AgentInstallCommand = styled.code`
@@ -4351,10 +5116,10 @@ export const AgentInstallCommand = styled.code`
   min-width: 0;
   overflow: hidden;
   padding: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(3, 5, 8, 0.54);
+  color: var(--forge-text-soft);
+  background: rgba(7, 9, 13, 0.54);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 11px;
   text-overflow: ellipsis;
@@ -4364,37 +5129,37 @@ export const AgentInstallCommand = styled.code`
 export const AgentPermissionHint = styled.p`
   margin: 0;
   padding: 8px 9px;
-  border: 1px solid rgba(255, 122, 24, 0.34);
+  border: 1px solid rgba(223, 165, 90, 0.28);
   border-radius: 8px;
-  color: #ffb269;
-  background: rgba(255, 122, 24, 0.1);
+  color: #e5bd83;
+  background: rgba(223, 165, 90, 0.08);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 650;
   line-height: 1.45;
 `;
 
 export const AgentInstallMessage = styled.p`
   margin: 0;
   padding: 8px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  color: #a7b2c2;
-  background: rgba(6, 9, 16, 0.58);
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.5);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 650;
   line-height: 1.45;
   overflow-wrap: anywhere;
 
   &[data-tone="success"] {
-    border-color: rgba(47, 128, 255, 0.32);
-    color: #8bb9ff;
-    background: rgba(47, 128, 255, 0.1);
+    border-color: rgba(60, 203, 127, 0.28);
+    color: var(--forge-green);
+    background: rgba(60, 203, 127, 0.08);
   }
 
   &[data-tone="warning"] {
-    border-color: rgba(255, 122, 24, 0.34);
-    color: #ffb269;
-    background: rgba(255, 122, 24, 0.1);
+    border-color: rgba(223, 165, 90, 0.28);
+    color: #e5bd83;
+    background: rgba(223, 165, 90, 0.08);
   }
 `;
 
@@ -4402,6 +5167,10 @@ export const AgentActions = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+
+  button {
+    min-height: 36px;
+  }
 `;
 
 export const AgentActionTooltip = styled.span`
@@ -4428,16 +5197,16 @@ export const PageHeader = styled.header`
 
 export const PageSubline = styled.p`
   margin: 7px 0 0;
-  color: #a7b2c2;
+  color: var(--forge-text-soft);
   font-size: 14px;
   line-height: 1.5;
 `;
 
 export const DashboardTitle = styled.h1`
   margin: 6px 0 0;
-  color: #ffffff;
+  color: var(--forge-text);
   font-size: 28px;
-  font-weight: 850;
+  font-weight: 760;
   letter-spacing: 0;
 `;
 
@@ -4455,18 +5224,18 @@ export const PanelHeaderRow = styled.div`
 
 export const PanelKicker = styled.p`
   margin: 0;
-  color: #ff9a3d;
+  color: var(--forge-text-muted);
   font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0.11em;
+  font-weight: 760;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 `;
 
 export const PanelHeading = styled.h2`
   margin: 4px 0 0;
-  color: #f7f9ff;
+  color: var(--forge-text);
   font-size: 17px;
-  font-weight: 900;
+  font-weight: 760;
   letter-spacing: 0;
 `;
 
@@ -4478,16 +5247,35 @@ export const SettingsPage = styled.section`
   min-width: 0;
   align-content: start;
   grid-auto-rows: max-content;
-  gap: 18px;
+  gap: 12px;
   min-height: 0;
   overflow: auto;
-  padding: 24px;
+  padding: 16px;
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    rgba(3, 5, 8, 0.1);
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
   background-size: 72px 72px, 72px 72px, auto;
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  ${DashboardTitle} {
+    margin-top: 3px;
+    font-size: 20px;
+    line-height: 1.15;
+  }
+
+  ${PageSubline} {
+    margin-top: 4px;
+    color: var(--forge-text-muted);
+    font-size: 13px;
+  }
+
+  ${Kicker} {
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 760;
+    letter-spacing: 0.06em;
+  }
 
   &[data-motion="exiting"] {
     animation: ${panelExit} ${VIEW_TRANSITION_MS}ms ease both;
@@ -4496,26 +5284,33 @@ export const SettingsPage = styled.section`
 
   @media (max-width: 760px) {
     grid-column: 1;
-    padding: 18px;
+    padding: 14px;
   }
 `;
 
 export const AccountSettingsPanel = styled.section`
   display: grid;
-  gap: 14px;
-  padding-top: 8px;
+  gap: 10px;
+  padding-top: 0;
 `;
 
 export const AccountCard = styled.section`
   display: grid;
-  gap: 16px;
-  padding: 18px;
-  border: 1px solid rgba(47, 128, 255, 0.32);
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
-    linear-gradient(135deg, rgba(47, 128, 255, 0.13), transparent 38%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.016)),
-    rgba(13, 20, 31, 0.86);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.78);
+
+  &[data-tone="blue"] {
+    border-color: rgba(125, 160, 205, 0.18);
+  }
+
+  &[data-tone="orange"] {
+    border-color: rgba(223, 165, 90, 0.22);
+  }
 `;
 
 export const AccountCardHeader = styled.div`
@@ -4538,12 +5333,12 @@ export const AccountCardFooter = styled.div`
   min-width: 0;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  padding-top: 2px;
+  gap: 10px;
+  padding-top: 0;
 
   button {
-    min-height: 42px;
-    min-width: 132px;
+    min-height: 36px;
+    min-width: 120px;
   }
 
   @media (max-width: 760px) {
@@ -4554,35 +5349,35 @@ export const AccountCardFooter = styled.div`
 
 export const SettingsLabel = styled.p`
   margin: 0;
-  color: #ff9a3d;
-  font-size: 12px;
-  font-weight: 900;
-  letter-spacing: 0.1em;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 `;
 
 export const SettingsValue = styled.p`
   margin: 0;
   overflow-wrap: anywhere;
-  color: #ffffff;
-  font-size: 19px;
-  font-weight: 820;
+  color: var(--forge-text);
+  font-size: 16px;
+  font-weight: 720;
   line-height: 1.25;
 `;
 
 export const SettingsHint = styled.p`
   margin: 0;
   overflow-wrap: anywhere;
-  color: #a7b2c2;
-  font-size: 13px;
-  line-height: 1.55;
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  line-height: 1.45;
 `;
 
 export const SettingsIdentityGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 4px;
+  gap: 8px;
+  margin-top: 0;
 
   @media (max-width: 760px) {
     grid-template-columns: 1fr;
@@ -4592,26 +5387,26 @@ export const SettingsIdentityGrid = styled.div`
 export const SettingsIdentityItem = styled.div`
   display: grid;
   min-width: 0;
-  gap: 5px;
-  padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(6, 9, 16, 0.58);
+  background: rgba(21, 27, 35, 0.5);
 
   span {
-    color: #687386;
+    color: var(--forge-text-muted);
     font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.08em;
+    font-weight: 760;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
   strong {
     min-width: 0;
     overflow: hidden;
-    color: #f7f9ff;
-    font-size: 13px;
-    font-weight: 860;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 720;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -4779,11 +5574,11 @@ export const PrimaryButton = styled.button`
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(125, 160, 205, 0.22);
   border-radius: 8px;
   color: #ffffff;
-  background: #2f80ff;
-  font-weight: 880;
+  background: var(--forge-blue);
+  font-weight: 760;
   transition:
     background 160ms ease,
     border-color 160ms ease,
@@ -4791,8 +5586,8 @@ export const PrimaryButton = styled.button`
     transform 160ms ease;
 
   &:hover:not(:disabled) {
-    background: #62a0ff;
-    box-shadow: 0 0 18px rgba(47, 128, 255, 0.24);
+    background: var(--forge-blue-soft);
+    box-shadow: 0 0 18px rgba(59, 130, 246, 0.2);
     transform: translateY(-1px);
   }
 
@@ -4809,33 +5604,33 @@ export const PrimaryButton = styled.button`
 `;
 
 export const SecondaryButton = styled(PrimaryButton)`
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  color: #f7f9ff;
-  background: rgba(6, 9, 16, 0.76);
+  border: 1px solid var(--forge-border);
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.76);
 
   &:hover:not(:disabled) {
-    border-color: rgba(47, 128, 255, 0.5);
-    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(125, 160, 205, 0.34);
+    background: var(--forge-surface-hover);
   }
 `;
 
 export const PrimaryDangerButton = styled(SecondaryButton)`
-  border-color: rgba(255, 140, 140, 0.28);
-  color: #ffd2d2;
+  border-color: rgba(239, 107, 107, 0.28);
+  color: #ffc8c8;
 
   &:hover:not(:disabled) {
-    border-color: rgba(255, 140, 140, 0.5);
-    background: rgba(255, 140, 140, 0.1);
+    border-color: rgba(239, 107, 107, 0.48);
+    background: rgba(239, 107, 107, 0.1);
   }
 `;
 
 export const FormMessage = styled.p`
   margin: 0;
   padding: ${({ $state }) => ($state === "error" ? "11px 13px" : 0)};
-  border: ${({ $state }) => ($state === "error" ? "1px solid rgba(255, 107, 107, 0.34)" : 0)};
+  border: ${({ $state }) => ($state === "error" ? "1px solid rgba(239, 107, 107, 0.34)" : 0)};
   border-radius: ${({ $state }) => ($state === "error" ? "8px" : 0)};
-  color: ${({ $state }) => ($state === "error" ? "#ffd0d0" : "#a7b2c2")};
-  background: ${({ $state }) => ($state === "error" ? "rgba(255, 107, 107, 0.12)" : "transparent")};
+  color: ${({ $state }) => ($state === "error" ? "#ffc8c8" : "var(--forge-text-soft)")};
+  background: ${({ $state }) => ($state === "error" ? "rgba(239, 107, 107, 0.12)" : "transparent")};
   font-size: 14px;
   line-height: 1.55;
 `;

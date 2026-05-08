@@ -106,6 +106,7 @@ import {
   XtermSurface,
   TerminalClosedSurface,
   TerminalClosedLabel,
+  TerminalClosingOverlay,
   TerminalRestartPill,
   TerminalRestartButton,
   TerminalCloseButton,
@@ -797,14 +798,18 @@ export default function WorkspaceTerminal({
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupRestartCountRef = useRef(0);
+  const terminalClosingRef = useRef(false);
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
   const [terminalError, setTerminalError] = useState("");
   const [restartKey, setRestartKey] = useState(0);
   const [terminalClosed, setTerminalClosed] = useState(false);
+  const [terminalClosing, setTerminalClosing] = useState(false);
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, agent?.id);
 
   useEffect(() => {
     setTerminalClosed(false);
+    terminalClosingRef.current = false;
+    setTerminalClosing(false);
     lastAgentLaunchEpochRef.current = 0;
     blankStartupRestartCountRef.current = 0;
   }, [agent?.id, terminalIndex, workspace?.id]);
@@ -833,12 +838,16 @@ export default function WorkspaceTerminal({
       startAgentInPrewarmedTerminalRef.current = null;
       setTerminalState("blocked");
       setTerminalError("");
+      terminalClosingRef.current = false;
+      setTerminalClosing(false);
       return undefined;
     }
 
     if (terminalClosed) {
       setTerminalState("closed");
       setTerminalError("");
+      terminalClosingRef.current = false;
+      setTerminalClosing(false);
       return undefined;
     }
 
@@ -2174,7 +2183,14 @@ export default function WorkspaceTerminal({
   }, [agent?.id, agent?.label, onPreparedTerminalChange, paneId, restartKey, terminalClosed, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const closeTerminal = useCallback(async () => {
+    if (terminalClosed || terminalClosingRef.current) {
+      return;
+    }
+
     setTerminalError("");
+    terminalClosingRef.current = true;
+    setTerminalClosing(true);
+    setTerminalState("closing");
 
     try {
       await invoke("terminal_close", {
@@ -2182,10 +2198,14 @@ export default function WorkspaceTerminal({
         instanceId: terminalInstanceIdRef.current || undefined,
       });
     } catch (error) {
+      terminalClosingRef.current = false;
+      setTerminalClosing(false);
       setTerminalError(getErrorMessage(error, "Unable to close terminal."));
       return;
     }
 
+    terminalClosingRef.current = false;
+    setTerminalClosing(false);
     setTerminalClosed(true);
     setTerminalState("closed");
     onCloseTerminal?.({
@@ -2193,7 +2213,7 @@ export default function WorkspaceTerminal({
       terminalIndex,
       workspaceId: workspace?.id || "",
     });
-  }, [onCloseTerminal, paneId, terminalIndex, workspace?.id]);
+  }, [onCloseTerminal, paneId, terminalClosed, terminalIndex, workspace?.id]);
 
   if (!agent) {
     return (
@@ -2241,8 +2261,15 @@ export default function WorkspaceTerminal({
       <TerminalRestartPill>
         <TerminalRestartButton
           aria-label="Restart terminal"
+          disabled={terminalClosing}
           onClick={() => {
+            if (terminalClosing) {
+              return;
+            }
+
             setTerminalClosed(false);
+            terminalClosingRef.current = false;
+            setTerminalClosing(false);
             setTerminalState("starting");
             setTerminalError("");
             setRestartKey((key) => key + 1);
@@ -2254,7 +2281,7 @@ export default function WorkspaceTerminal({
         </TerminalRestartButton>
         <TerminalCloseButton
           aria-label="Close terminal"
-          disabled={terminalClosed}
+          disabled={terminalClosed || terminalClosing}
           onClick={closeTerminal}
           title="Close terminal"
           type="button"
@@ -2271,13 +2298,24 @@ export default function WorkspaceTerminal({
         </BlankStatusStack>
       )}
 
-      <TerminalFrame data-state={terminalState}>
+      <TerminalFrame aria-busy={terminalClosing ? "true" : "false"} data-state={terminalState}>
         {terminalClosed ? (
           <TerminalClosedSurface aria-live="polite" role="status">
             <TerminalClosedLabel>Terminal Closed</TerminalClosedLabel>
           </TerminalClosedSurface>
         ) : (
-          <XtermSurface ref={containerRef} />
+          <>
+            <XtermSurface ref={containerRef} />
+            {terminalClosing && (
+              <TerminalClosingOverlay aria-live="polite" role="status">
+                <div>
+                  <span aria-hidden="true" data-spinner="true" />
+                  <strong>Closing terminal</strong>
+                  <span>Shutting it down...</span>
+                </div>
+              </TerminalClosingOverlay>
+            )}
+          </>
         )}
       </TerminalFrame>
     </TerminalWorkspaceSurface>

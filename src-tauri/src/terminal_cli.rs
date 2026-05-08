@@ -474,6 +474,11 @@ fn is_terminal_prewarm_kind(kind: &str) -> bool {
 
 #[cfg(windows)]
 fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
+    format!("{}\r", terminal_agent_invocation(command_path, args))
+}
+
+#[cfg(windows)]
+fn terminal_agent_invocation(command_path: &str, args: &[String]) -> String {
     let mut invocation = format!("& {}", quote_powershell_literal(command_path));
 
     for arg in args {
@@ -481,7 +486,22 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
         invocation.push_str(&quote_powershell_literal(arg));
     }
 
-    format!("{invocation}\r")
+    invocation
+}
+
+#[cfg(windows)]
+fn terminal_agent_launch_command(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+) -> CommandBuilder {
+    let mut command = terminal_idle_shell_command();
+
+    command.arg("-Command");
+    command.arg(terminal_agent_invocation(command_path, args));
+    command.cwd(working_directory);
+
+    command
 }
 
 #[cfg(windows)]
@@ -520,6 +540,23 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
 }
 
 #[cfg(not(windows))]
+fn terminal_agent_launch_command(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::new(command_path);
+
+    for arg in args {
+        command.arg(arg.as_str());
+    }
+
+    command.cwd(working_directory);
+
+    command
+}
+
+#[cfg(not(windows))]
 fn terminal_set_working_directory_input(working_directory: &Path) -> String {
     let directory = working_directory.to_string_lossy();
 
@@ -551,30 +588,30 @@ fn default_terminal_working_directory() -> PathBuf {
         })
 }
 
-fn create_warm_shell_pty(size: PtySize) -> Result<WarmPty, String> {
+fn spawn_terminal_pty(
+    size: PtySize,
+    mut command: CommandBuilder,
+    context: &str,
+) -> Result<WarmPty, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(size)
-        .map_err(|error| format!("Unable to open warm terminal PTY: {error}"))?;
-    let mut command = terminal_idle_shell_command();
-    let working_directory = workspace_path_for_process(&default_terminal_working_directory());
-
-    command.cwd(&working_directory);
+        .map_err(|error| format!("Unable to open {context} PTY: {error}"))?;
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
     let child = pair
         .slave
         .spawn_command(command)
-        .map_err(|error| format!("Unable to start warm terminal shell: {error}"))?;
+        .map_err(|error| format!("Unable to start {context}: {error}"))?;
     let reader = pair
         .master
         .try_clone_reader()
-        .map_err(|error| format!("Unable to read warm terminal output: {error}"))?;
+        .map_err(|error| format!("Unable to read {context} output: {error}"))?;
     let writer = pair
         .master
         .take_writer()
-        .map_err(|error| format!("Unable to write warm terminal input: {error}"))?;
+        .map_err(|error| format!("Unable to write {context} input: {error}"))?;
 
     Ok(WarmPty {
         child,
@@ -583,6 +620,34 @@ fn create_warm_shell_pty(size: PtySize) -> Result<WarmPty, String> {
         reader,
         size,
     })
+}
+
+fn create_warm_shell_pty_in_directory(
+    size: PtySize,
+    working_directory: &Path,
+) -> Result<WarmPty, String> {
+    let mut command = terminal_idle_shell_command();
+
+    command.cwd(working_directory);
+
+    spawn_terminal_pty(size, command, "warm terminal shell")
+}
+
+fn create_warm_shell_pty(size: PtySize) -> Result<WarmPty, String> {
+    let working_directory = workspace_path_for_process(&default_terminal_working_directory());
+
+    create_warm_shell_pty_in_directory(size, &working_directory)
+}
+
+fn create_agent_terminal_pty(
+    size: PtySize,
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+) -> Result<WarmPty, String> {
+    let command = terminal_agent_launch_command(command_path, args, working_directory);
+
+    spawn_terminal_pty(size, command, "agent terminal")
 }
 
 fn cleanup_warm_pty_with_context(warm_pty: WarmPty, reason: &'static str) {

@@ -148,12 +148,22 @@ import {
   FilePreviewHeader,
   FilePreviewTitle,
   FilePreviewMeta,
+  FilePreviewModeSwitch,
+  FilePreviewModeButton,
   FileGitStatusPill,
   FileMetaPill,
   FilePreviewPath,
   FileContentFrame,
   FilePreviewScroll,
   HighlightedCodeBlock,
+  InlineReviewSurface,
+  InlineReviewCodeBlock,
+  InlineReviewLine,
+  InlineReviewLineNumber,
+  InlineReviewPrefix,
+  InlineReviewCode,
+  ReviewChangeRuler,
+  ReviewChangeMarker,
   FileDiffPanel,
   FileDiffHeader,
   FileDiffBadge,
@@ -320,6 +330,11 @@ const FILE_EXPLORER_MAX_SIZE = 76;
 const FILE_PREVIEW_DEFAULT_SIZE = 72;
 const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
+const FILE_PREVIEW_MODES = [
+  { id: "file", label: "File" },
+  { id: "review", label: "Review" },
+  { id: "diff", label: "Diff" },
+];
 let fileExplorerLayoutFlushFrame = 0;
 let pendingFileExplorerLayout = null;
 
@@ -711,6 +726,10 @@ function getHighlightedFileHtml(content, relativePath) {
   }
 }
 
+function getHighlightedLineHtml(content, relativePath) {
+  return getHighlightedFileHtml(content || " ", relativePath);
+}
+
 function getDiffLineTone(line) {
   if (line.startsWith("+++") || line.startsWith("---")) {
     return "header";
@@ -741,6 +760,145 @@ function getDiffLines(diff) {
     line: line || " ",
     tone: getDiffLineTone(line),
   }));
+}
+
+function getContentLines(content) {
+  const value = String(content || "");
+
+  if (!value) {
+    return [""];
+  }
+
+  return value.split(/\r?\n/);
+}
+
+function clampReviewIndex(index, lineCount) {
+  return Math.max(0, Math.min(lineCount, Number(index) || 0));
+}
+
+function getReviewMarkerTop(lineNumber, lineCount) {
+  const safeLineCount = Math.max(1, lineCount);
+
+  if (safeLineCount === 1) {
+    return 0;
+  }
+
+  const safeLineNumber = Math.max(1, Math.min(safeLineCount, Number(lineNumber) || 1));
+  return Number((((safeLineNumber - 1) / (safeLineCount - 1)) * 100).toFixed(3));
+}
+
+function getInlineReviewModel({ content, diff, relativePath }) {
+  const fileLines = getContentLines(content);
+  const lineCount = fileLines.length;
+  const insertedRows = new Map();
+  const lineTones = new Map();
+  const markers = [];
+  let oldLineNumber = 0;
+  let newLineNumber = 0;
+  let hunkActive = false;
+  let pendingRemovedLines = [];
+
+  const addMarker = (tone, lineNumber) => {
+    markers.push({
+      id: `${tone}-${markers.length}-${lineNumber}`,
+      lineNumber,
+      tone,
+      top: getReviewMarkerTop(lineNumber, lineCount),
+    });
+  };
+
+  const addInsertedRow = (anchorIndex, row) => {
+    const safeAnchorIndex = clampReviewIndex(anchorIndex, lineCount);
+    const rows = insertedRows.get(safeAnchorIndex) || [];
+    rows.push(row);
+    insertedRows.set(safeAnchorIndex, rows);
+  };
+
+  const addRemovedLine = (anchorIndex, removedLine) => {
+    const safeAnchorIndex = clampReviewIndex(anchorIndex, lineCount);
+    const markerLineNumber = Math.max(1, Math.min(lineCount, safeAnchorIndex + 1));
+
+    addInsertedRow(safeAnchorIndex, {
+      html: getHighlightedLineHtml(removedLine.text, relativePath),
+      id: `removed-${removedLine.oldLineNumber}-${safeAnchorIndex}-${removedLine.text.slice(0, 18)}`,
+      kind: "removed",
+      oldLineNumber: removedLine.oldLineNumber,
+      prefix: "-",
+      tone: "removed",
+    });
+    addMarker("removed", markerLineNumber);
+  };
+
+  const flushRemovedLines = (anchorIndex) => {
+    pendingRemovedLines.forEach((removedLine) => addRemovedLine(anchorIndex, removedLine));
+    pendingRemovedLines = [];
+  };
+
+  String(diff || "").split(/\r?\n/).forEach((line) => {
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+
+    if (hunkMatch) {
+      flushRemovedLines(newLineNumber ? newLineNumber - 1 : 0);
+      oldLineNumber = Number(hunkMatch[1]) || 1;
+      newLineNumber = Number(hunkMatch[2]) || 1;
+      hunkActive = true;
+      return;
+    }
+
+    if (!hunkActive || line.startsWith("\\ No newline")) {
+      return;
+    }
+
+    if (line.startsWith(" ")) {
+      flushRemovedLines(newLineNumber - 1);
+      oldLineNumber += 1;
+      newLineNumber += 1;
+      return;
+    }
+
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      pendingRemovedLines.push({
+        oldLineNumber,
+        text: line.slice(1),
+      });
+      oldLineNumber += 1;
+      return;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      const fileLineIndex = clampReviewIndex(newLineNumber - 1, lineCount - 1);
+
+      if (pendingRemovedLines.length > 0) {
+        addRemovedLine(fileLineIndex, pendingRemovedLines.shift());
+      }
+
+      lineTones.set(fileLineIndex, "added");
+      addMarker("added", newLineNumber);
+      newLineNumber += 1;
+    }
+  });
+
+  flushRemovedLines(lineCount);
+
+  const rows = [];
+
+  fileLines.forEach((line, index) => {
+    rows.push(...(insertedRows.get(index) || []));
+    rows.push({
+      html: getHighlightedLineHtml(line, relativePath),
+      id: `line-${index + 1}`,
+      kind: "file",
+      lineNumber: index + 1,
+      prefix: lineTones.get(index) === "added" ? "+" : " ",
+      tone: lineTones.get(index) || "context",
+    });
+  });
+  rows.push(...(insertedRows.get(lineCount) || []));
+
+  return {
+    markers,
+    rows,
+  };
 }
 
 const GIT_STATUS_LABELS = {
@@ -899,6 +1057,7 @@ export default function FilesWorkspaceView({
   workspace,
   workspaceError,
 }) {
+  const filePreviewScrollRef = useRef(null);
   const fileRequestIdRef = useRef(0);
   const [directoryEntries, setDirectoryEntries] = useState({});
   const [directoryStates, setDirectoryStates] = useState({});
@@ -912,6 +1071,8 @@ export default function FilesWorkspaceView({
   const [fileDiffState, setFileDiffState] = useState("idle");
   const [fileDiffError, setFileDiffError] = useState("");
   const [fileDiffTruncated, setFileDiffTruncated] = useState(false);
+  const [filePreviewMode, setFilePreviewMode] = useState("file");
+  const [reviewRulerHeight, setReviewRulerHeight] = useState(0);
   const workspaceRoot = cleanWorkspaceRootDirectory(rootDirectory || defaultWorkingDirectory);
   const fileExplorerLayoutOwner = workspace?.id || workspaceRoot;
   const fileExplorerLayoutKey = useMemo(
@@ -996,6 +1157,7 @@ export default function FilesWorkspaceView({
     setFileDiffState("idle");
     setFileDiffError("");
     setFileDiffTruncated(false);
+    setFilePreviewMode("file");
 
     try {
       const result = await invoke("read_workspace_file", {
@@ -1082,6 +1244,7 @@ export default function FilesWorkspaceView({
     setFileDiffState("idle");
     setFileDiffError("");
     setFileDiffTruncated(false);
+    setFilePreviewMode("file");
     fileRequestIdRef.current += 1;
 
     if (workspaceRoot) {
@@ -1098,8 +1261,130 @@ export default function FilesWorkspaceView({
     () => (fileState === "ready" ? getHighlightedFileHtml(fileContent, selectedFile?.relativePath) : ""),
     [fileContent, fileState, selectedFile?.relativePath],
   );
+  const selectedPrismLanguage = getPrismLanguage(selectedFile?.relativePath || "");
   const diffLines = useMemo(() => getDiffLines(fileDiff), [fileDiff]);
+  const inlineReview = useMemo(
+    () => getInlineReviewModel({
+      content: fileContent,
+      diff: fileDiff,
+      relativePath: selectedFile?.relativePath || "",
+    }),
+    [fileContent, fileDiff, selectedFile?.relativePath],
+  );
   const shouldShowDiff = selectedGitStatus === "modified";
+  const effectivePreviewMode = shouldShowDiff ? filePreviewMode : "file";
+
+  useEffect(() => {
+    if (effectivePreviewMode !== "review") {
+      setReviewRulerHeight(0);
+      return undefined;
+    }
+
+    const scrollElement = filePreviewScrollRef.current;
+
+    if (!scrollElement) {
+      return undefined;
+    }
+
+    const syncRulerHeight = () => {
+      setReviewRulerHeight(Math.max(0, Math.round(scrollElement.clientHeight)));
+    };
+
+    syncRulerHeight();
+
+    if (!window.ResizeObserver) {
+      return undefined;
+    }
+
+    const resizeObserver = new window.ResizeObserver(syncRulerHeight);
+    resizeObserver.observe(scrollElement);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [effectivePreviewMode, selectedFile?.relativePath]);
+
+  const scrollToReviewMarker = useCallback((event, options = {}) => {
+    const markers = inlineReview.markers;
+
+    if (!markers.length) {
+      return;
+    }
+
+    const rulerRect = event.currentTarget.getBoundingClientRect();
+    const rulerHeight = Math.max(1, rulerRect.height);
+    const pointerTop = Math.min(Math.max(event.clientY - rulerRect.top, 0), rulerHeight);
+    const pointerPercent = (pointerTop / rulerHeight) * 100;
+    const marker = markers.reduce((closest, nextMarker) => (
+      Math.abs(nextMarker.top - pointerPercent) < Math.abs(closest.top - pointerPercent)
+        ? nextMarker
+        : closest
+    ), markers[0]);
+    const scrollElement = filePreviewScrollRef.current;
+
+    if (!scrollElement) {
+      return;
+    }
+
+    const targetLine = scrollElement.querySelector(`[data-review-line-number="${marker.lineNumber}"]`);
+
+    if (targetLine) {
+      scrollElement.scrollTo({
+        behavior: options.smooth ? "smooth" : "auto",
+        top: Math.max(0, targetLine.offsetTop - scrollElement.clientHeight * 0.32),
+      });
+      return;
+    }
+
+    const maxScrollTop = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+    scrollElement.scrollTo({
+      behavior: options.smooth ? "smooth" : "auto",
+      top: (marker.top / 100) * maxScrollTop,
+    });
+  }, [inlineReview.markers]);
+
+  const handleReviewRulerPointerDown = useCallback((event) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    scrollToReviewMarker(event, { smooth: true });
+  }, [scrollToReviewMarker]);
+
+  const handleReviewRulerPointerMove = useCallback((event) => {
+    if (event.buttons !== 1) {
+      return;
+    }
+
+    event.preventDefault();
+    scrollToReviewMarker(event);
+  }, [scrollToReviewMarker]);
+
+  const handleReviewRulerPointerRelease = useCallback((event) => {
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  }, []);
+
+  const renderDiffContent = (ariaLabel) => {
+    if (fileDiffState === "loading") {
+      return <FileDiffMessage>Loading diff...</FileDiffMessage>;
+    }
+
+    if (fileDiffState === "error") {
+      return <FileDiffMessage data-tone="error">{fileDiffError}</FileDiffMessage>;
+    }
+
+    if (!fileDiff) {
+      return <FileDiffMessage>No diff available.</FileDiffMessage>;
+    }
+
+    return (
+      <DiffCodeBlock aria-label={ariaLabel} className="language-diff">
+        {diffLines.map((line) => (
+          <DiffLine data-tone={line.tone} key={line.id}>
+            {line.line}
+          </DiffLine>
+        ))}
+      </DiffCodeBlock>
+    );
+  };
 
   return (
     <FilesWorkspaceSurface aria-label="Workspace files">
@@ -1182,6 +1467,24 @@ export default function FilesWorkspaceView({
               </FilePreviewTitle>
               {selectedFile && (
                 <FilePreviewMeta>
+                  <FilePreviewModeSwitch aria-label="File preview mode">
+                    {FILE_PREVIEW_MODES.map((mode) => {
+                      const disabled = mode.id !== "file" && !shouldShowDiff;
+
+                      return (
+                        <FilePreviewModeButton
+                          data-active={effectivePreviewMode === mode.id}
+                          disabled={disabled}
+                          key={mode.id}
+                          onClick={() => setFilePreviewMode(mode.id)}
+                          title={disabled ? "Only modified files have review and diff views" : `${mode.label} view`}
+                          type="button"
+                        >
+                          {mode.label}
+                        </FilePreviewModeButton>
+                      );
+                    })}
+                  </FilePreviewModeSwitch>
                   {selectedGitStatus && (
                     <FileGitStatusPill data-git-status={selectedGitStatus} title={`${selectedGitStatusName} in git`}>
                       {selectedGitStatusName}
@@ -1221,35 +1524,64 @@ export default function FilesWorkspaceView({
                   <FormMessage $state="error">{fileError}</FormMessage>
                 </FileEmptyState>
               ) : (
-                <FilePreviewScroll>
-                  {shouldShowDiff && (
-                    <FileDiffPanel data-state={fileDiffState}>
+                <FilePreviewScroll ref={filePreviewScrollRef}>
+                  {effectivePreviewMode === "diff" ? (
+                    <FileDiffPanel data-mode="diff" data-state={fileDiffState}>
                       <FileDiffHeader>
                         <span aria-hidden="true" className="codicon codicon-diff-modified" />
                         <strong>Changes</strong>
                         {fileDiffTruncated && <FileDiffBadge>Truncated</FileDiffBadge>}
                       </FileDiffHeader>
-                      {fileDiffState === "loading" ? (
-                        <FileDiffMessage>Loading diff...</FileDiffMessage>
-                      ) : fileDiffState === "error" ? (
-                        <FileDiffMessage data-tone="error">{fileDiffError}</FileDiffMessage>
-                      ) : fileDiff ? (
-                        <DiffCodeBlock aria-label="Git diff for selected file">
-                          {diffLines.map((line) => (
-                            <DiffLine data-tone={line.tone} key={line.id}>
-                              {line.line}
-                            </DiffLine>
-                          ))}
-                        </DiffCodeBlock>
-                      ) : (
-                        <FileDiffMessage>No diff available.</FileDiffMessage>
-                      )}
+                      {renderDiffContent("Git diff for selected file")}
                     </FileDiffPanel>
+                  ) : effectivePreviewMode === "review" ? (
+                    <InlineReviewSurface aria-label="Selected file review">
+                      <InlineReviewCodeBlock>
+                        {inlineReview.rows.map((row) => (
+                          <InlineReviewLine
+                            data-kind={row.kind}
+                            data-review-line-number={row.lineNumber || row.oldLineNumber || ""}
+                            data-tone={row.tone}
+                            key={row.id}
+                          >
+                            <InlineReviewLineNumber>
+                              {row.kind === "removed" ? row.oldLineNumber : row.lineNumber}
+                            </InlineReviewLineNumber>
+                            <InlineReviewPrefix>{row.prefix}</InlineReviewPrefix>
+                            <InlineReviewCode
+                              className={`language-${selectedPrismLanguage}`}
+                              dangerouslySetInnerHTML={{ __html: row.html || " " }}
+                            />
+                          </InlineReviewLine>
+                        ))}
+                      </InlineReviewCodeBlock>
+                      <ReviewChangeRuler
+                        aria-label="Review change navigator"
+                        onPointerCancel={handleReviewRulerPointerRelease}
+                        onPointerDown={handleReviewRulerPointerDown}
+                        onPointerMove={handleReviewRulerPointerMove}
+                        onPointerUp={handleReviewRulerPointerRelease}
+                        role="button"
+                        style={reviewRulerHeight ? { height: `${reviewRulerHeight}px` } : undefined}
+                        tabIndex={-1}
+                        title="Drag to jump between changes"
+                      >
+                        {inlineReview.markers.map((marker) => (
+                          <ReviewChangeMarker
+                            data-tone={marker.tone}
+                            key={marker.id}
+                            style={{ top: `${marker.top}%` }}
+                          />
+                        ))}
+                      </ReviewChangeRuler>
+                    </InlineReviewSurface>
+                  ) : (
+                    <HighlightedCodeBlock
+                      aria-label="Selected file content"
+                      className={`language-${selectedPrismLanguage}`}
+                      dangerouslySetInnerHTML={{ __html: highlightedFileHtml || " " }}
+                    />
                   )}
-                  <HighlightedCodeBlock
-                    aria-label="Selected file content"
-                    dangerouslySetInnerHTML={{ __html: highlightedFileHtml || " " }}
-                  />
                 </FilePreviewScroll>
               )}
             </FileContentFrame>

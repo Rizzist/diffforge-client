@@ -999,13 +999,6 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
   return preferredAgent || readyAgents.find((agent) => agent.id === "codex") || readyAgents[0] || null;
 }
 
-function getLaunchableAgent(agentStatuses, preferredAgentId = "codex") {
-  const preferredAgent = agentStatuses.find((agent) => agent.id === preferredAgentId);
-  const codexAgent = agentStatuses.find((agent) => agent.id === "codex");
-
-  return preferredAgent || codexAgent || agentStatuses[0] || getDefaultAgentStatus("codex");
-}
-
 function getAgentStatusSummary(agentStatuses) {
   const codex = agentStatuses.find((agent) => agent.id === "codex");
   const claude = agentStatuses.find((agent) => agent.id === "claude");
@@ -3120,18 +3113,9 @@ export default function App() {
     [activeAgent, agentStatuses],
   );
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
-  const workspacePrewarmAgent = useMemo(
-    () => getLaunchableAgent(agentStatuses, activeAgent),
-    [activeAgent, agentStatuses],
-  );
-  const shouldPrewarmWorkspaceTerminals = authState === "authenticated"
-    && userIsPaid
-    && workspaceState === "initializing"
-    && isStartupAgentGateBlocking
-    && Boolean(activatedWorkspace)
-    && !shouldShowWorkspaceSetup;
+  const shouldPrewarmWorkspaceTerminals = false;
   const workspaceTerminalRenderAgent = activatedWorkspace
-    ? workspaceTerminalAgent || (shouldPrewarmWorkspaceTerminals ? workspacePrewarmAgent : null)
+    ? workspaceTerminalAgent
     : null;
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && Boolean(workspaceTerminalAgent)

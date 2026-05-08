@@ -689,61 +689,64 @@ export function AudioWidgetWindow() {
   const vadLevel = Math.min(100, Math.round((vadStats.rms || 0) * 1800));
 
   return (
-    <AudioWidgetShell>
-      <AudioWidgetHeader>
-        <AudioWidgetTitle>
-          <span aria-hidden="true"><ButtonMicIcon /></span>
-          <strong>Dictation</strong>
-        </AudioWidgetTitle>
-        <WorkspaceModalCloseButton aria-label="Hide recorder" onClick={hideWidget} type="button">
-          <ButtonCloseIcon aria-hidden="true" />
-        </WorkspaceModalCloseButton>
-      </AudioWidgetHeader>
+    <>
+      <GlobalStyle />
+      <AudioWidgetShell>
+        <AudioWidgetHeader>
+          <AudioWidgetTitle>
+            <span aria-hidden="true"><ButtonMicIcon /></span>
+            <strong>Dictation</strong>
+          </AudioWidgetTitle>
+          <WorkspaceModalCloseButton aria-label="Hide recorder" onClick={hideWidget} type="button">
+            <ButtonCloseIcon aria-hidden="true" />
+          </WorkspaceModalCloseButton>
+        </AudioWidgetHeader>
 
-      <AudioWidgetMeter data-active={widgetState === "recording" || vadStats.speech} aria-hidden="true">
-        {Array.from({ length: 18 }, (_, index) => (
-          <span
-            key={index}
-            style={{
-              "--height": `${Math.max(12, Math.min(86, 16 + vadLevel + ((index * 7) % 18)))}%`,
-            }}
-          />
-        ))}
-      </AudioWidgetMeter>
+        <AudioWidgetMeter data-active={widgetState === "recording" || vadStats.speech} aria-hidden="true">
+          {Array.from({ length: 18 }, (_, index) => (
+            <span
+              key={index}
+              style={{
+                "--height": `${Math.max(12, Math.min(86, 16 + vadLevel + ((index * 7) % 18)))}%`,
+              }}
+            />
+          ))}
+        </AudioWidgetMeter>
 
-      <AudioWidgetStatus>
-        <strong>{message}</strong>
-        <span>
-          {installed
-            ? `${modelStatus?.modelName || "Whisper base.en"} / ${Math.round((vadStats.bufferMs || 0) / 1000)}s buffer`
-            : "Whisper missing"}
-        </span>
-      </AudioWidgetStatus>
+        <AudioWidgetStatus>
+          <strong>{message}</strong>
+          <span>
+            {installed
+              ? `${modelStatus?.modelName || "Whisper base.en"} / ${Math.round((vadStats.bufferMs || 0) / 1000)}s buffer`
+              : "Whisper missing"}
+          </span>
+        </AudioWidgetStatus>
 
-      {widgetState === "recording" && (
-        <AudioRecordingTimer>{String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:{String(elapsedSeconds % 60).padStart(2, "0")}</AudioRecordingTimer>
-      )}
-
-      {transcript && <AudioWidgetTranscript>{transcript}</AudioWidgetTranscript>}
-      {error && <FormMessage $state="error">{error}</FormMessage>}
-
-      <AudioWidgetActions>
-        {widgetState === "recording" ? (
-          <PrimaryButton onClick={stopRecording} type="button">
-            <ButtonCheckIcon aria-hidden="true" />
-            <span>Finish</span>
-          </PrimaryButton>
-        ) : (
-          <PrimaryButton disabled={!installed || isWorking} onClick={startRecording} type="button">
-            <ButtonMicIcon aria-hidden="true" />
-            <span>{isWorking ? "Working..." : "Record"}</span>
-          </PrimaryButton>
+        {widgetState === "recording" && (
+          <AudioRecordingTimer>{String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:{String(elapsedSeconds % 60).padStart(2, "0")}</AudioRecordingTimer>
         )}
-        <SecondaryButton onClick={hideWidget} type="button">
-          <ButtonCloseIcon aria-hidden="true" />
-          <span>Hide</span>
-        </SecondaryButton>
-      </AudioWidgetActions>
-    </AudioWidgetShell>
+
+        {transcript && <AudioWidgetTranscript>{transcript}</AudioWidgetTranscript>}
+        {error && <FormMessage $state="error">{error}</FormMessage>}
+
+        <AudioWidgetActions>
+          {widgetState === "recording" ? (
+            <PrimaryButton onClick={stopRecording} type="button">
+              <ButtonCheckIcon aria-hidden="true" />
+              <span>Finish</span>
+            </PrimaryButton>
+          ) : (
+            <PrimaryButton disabled={!installed || isWorking} onClick={startRecording} type="button">
+              <ButtonMicIcon aria-hidden="true" />
+              <span>{isWorking ? "Working..." : "Record"}</span>
+            </PrimaryButton>
+          )}
+          <SecondaryButton onClick={hideWidget} type="button">
+            <ButtonCloseIcon aria-hidden="true" />
+            <span>Hide</span>
+          </SecondaryButton>
+        </AudioWidgetActions>
+      </AudioWidgetShell>
+    </>
   );
 }

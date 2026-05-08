@@ -54,7 +54,7 @@ const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
-const TERMINAL_PTY_POOL_TARGET: usize = 2;
+const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const TERMINAL_OUTPUT_FRAME_MICROS: u64 = 16_667;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
@@ -338,14 +338,6 @@ impl PtyPool {
             refilling: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         }
-    }
-
-    fn take_warm(&self) -> Option<WarmPty> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return None;
-        }
-
-        self.warm.lock().ok().and_then(|mut warm| warm.pop())
     }
 
     fn warm_count(&self) -> usize {

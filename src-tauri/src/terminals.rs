@@ -828,28 +828,6 @@ fn choose_terminal_command_path(command_candidates: &[String]) -> Option<String>
         .cloned()
 }
 
-fn prepare_warm_pty_for_handoff(
-    pool: &Arc<PtyPool>,
-    size: PtySize,
-) -> Result<(WarmPty, bool), String> {
-    let mut warm_pty = if let Some(warm_pty) = pool.take_warm() {
-        (warm_pty, true)
-    } else {
-        (create_warm_shell_pty(size)?, false)
-    };
-
-    if warm_pty.0.size != size {
-        warm_pty
-            .0
-            .master
-            .resize(size)
-            .map_err(|error| format!("Unable to resize warm terminal: {error}"))?;
-        warm_pty.0.size = size;
-    }
-
-    Ok(warm_pty)
-}
-
 fn write_agent_start_input_to_writer(
     writer: &mut dyn Write,
     input: &str,
@@ -975,70 +953,27 @@ async fn terminal_open(
         json!({ "cols": size.cols, "rows": size.rows }),
     );
 
-    let handoff_started_at = Instant::now();
-    let (mut warm_pty, from_pool) = match prepare_warm_pty_for_handoff(&state.pty_pool, size) {
-        Ok(result) => result,
-        Err(error) => {
-            log_terminal_event(
-                "terminal.open.pool_handoff_error",
-                Some(&pane_id),
-                Some(instance_id),
-                Some(handoff_started_at.elapsed()),
-                json!({ "error": clean_terminal_telemetry_text(&error) }),
-            );
-            state.pty_pool.ensure_warm_async();
-            return Err(error);
-        }
-    };
-
-    log_terminal_event(
-        "terminal.open.pool_handoff",
-        Some(&pane_id),
-        Some(instance_id),
-        Some(handoff_started_at.elapsed()),
-        json!({
-            "from_pool": from_pool,
-            "prewarm_pty": is_prewarm_pty,
-            "warm_remaining": state.pty_pool.warm_count(),
-        }),
-    );
-    state.pty_pool.ensure_warm_async();
-
     let mut command = "prepared-shell".to_string();
     let mut agent_started = false;
+    let spawn_started_at = Instant::now();
 
-    if is_prewarm_pty {
-        let input = terminal_set_working_directory_input(&process_working_directory);
-
-        if input.len() > MAX_TERMINAL_WRITE_BYTES {
-            cleanup_warm_pty_with_context(warm_pty, "prewarm_directory_input_too_large");
-            return Err("Terminal directory input is too large.".to_string());
+    let warm_pty = if is_prewarm_pty {
+        match create_warm_shell_pty_in_directory(size, &process_working_directory) {
+            Ok(warm_pty) => warm_pty,
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.open.prewarm_spawn_error",
+                    Some(&pane_id),
+                    Some(instance_id),
+                    Some(spawn_started_at.elapsed()),
+                    json!({ "error": clean_terminal_telemetry_text(&error) }),
+                );
+                return Err(error);
+            }
         }
-
-        let write_started_at = Instant::now();
-        if let Err(error) = write_agent_start_input_to_writer(
-            warm_pty.writer.as_mut(),
-            &input,
-            "terminal working directory",
-        ) {
-            cleanup_warm_pty_with_context(warm_pty, "prewarm_directory_write_error");
-            return Err(error);
-        }
-        log_terminal_event(
-            "terminal.open.prewarm_directory_write",
-            Some(&pane_id),
-            Some(instance_id),
-            Some(write_started_at.elapsed()),
-            json!({
-                "bytes": input.len(),
-                "from_pool": from_pool,
-                "working_directory": workspace_path_display(&working_directory),
-            }),
-        );
     } else {
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
             let error = format!("{label} is not installed or not available on PATH.");
-            cleanup_warm_pty_with_context(warm_pty, "open_missing_command");
             log_terminal_event(
                 "terminal.open.error",
                 Some(&pane_id),
@@ -1048,42 +983,51 @@ async fn terminal_open(
             );
             return Err(error);
         };
-        let input = terminal_agent_start_input_in_directory(
+
+        let warm_pty = match create_agent_terminal_pty(
+            size,
             &command_path,
             &args,
             &process_working_directory,
-        );
-
-        if input.len() > MAX_TERMINAL_WRITE_BYTES {
-            cleanup_warm_pty_with_context(warm_pty, "open_input_too_large");
-            return Err("Terminal launch input is too large.".to_string());
-        }
-
-        let write_started_at = Instant::now();
-        if let Err(error) = write_agent_start_input_to_writer(
-            warm_pty.writer.as_mut(),
-            &input,
-            "terminal agent launch",
         ) {
-            cleanup_warm_pty_with_context(warm_pty, "open_write_error");
-            return Err(error);
-        }
-        log_terminal_event(
-            "terminal.open.agent_start_write",
-            Some(&pane_id),
-            Some(instance_id),
-            Some(write_started_at.elapsed()),
-            json!({
-                "arg_count": args.len(),
-                "bytes": input.len(),
-                "command": clean_terminal_telemetry_text(&command_path),
-                "from_pool": from_pool,
-            }),
-        );
+            Ok(warm_pty) => warm_pty,
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.open.agent_spawn_error",
+                    Some(&pane_id),
+                    Some(instance_id),
+                    Some(spawn_started_at.elapsed()),
+                    json!({
+                        "command": clean_terminal_telemetry_text(&command_path),
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+                return Err(error);
+            }
+        };
 
         command = command_path;
         agent_started = true;
-    }
+        warm_pty
+    };
+
+    log_terminal_event(
+        if is_prewarm_pty {
+            "terminal.open.prewarm_spawn"
+        } else {
+            "terminal.open.agent_spawn"
+        },
+        Some(&pane_id),
+        Some(instance_id),
+        Some(spawn_started_at.elapsed()),
+        json!({
+            "agent_started": agent_started,
+            "arg_count": args.len(),
+            "command": clean_terminal_telemetry_text(&command),
+            "prewarm_pty": is_prewarm_pty,
+            "working_directory": workspace_path_display(&working_directory),
+        }),
+    );
 
     let (instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
@@ -1104,7 +1048,6 @@ async fn terminal_open(
         Some(instance_id),
         Some(insert_started_at.elapsed()),
         json!({
-            "from_pool": from_pool,
             "prewarm_pty": is_prewarm_pty,
             "agent_started": agent_started,
         }),
@@ -1129,7 +1072,6 @@ async fn terminal_open(
         Some(open_started_at.elapsed()),
         json!({
             "command": clean_terminal_telemetry_text(&command),
-            "from_pool": from_pool,
             "working_directory": workspace_path_display(&working_directory),
         }),
     );
