@@ -1,0 +1,4064 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import {
+  availableMonitors,
+  currentMonitor,
+  getCurrentWindow,
+  PhysicalPosition,
+} from "@tauri-apps/api/window";
+import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import "@xterm/xterm/css/xterm.css";
+import "@vscode/codicons/dist/codicon.css";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
+import { TerminalDevMetrics, addTerminalMetrics, getWorkspaceOpenTelemetryFields, patchTerminalMetrics, startWorkspaceOpenTelemetry, useTerminalDevMetrics, writeTerminalTelemetry } from "../terminals/terminalTelemetry.jsx";
+import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
+import AgentWorkspaceView from "../agents/AgentWorkspaceView.jsx";
+import {
+  AUTH_TILE_SIZE,
+  GlobalStyle,
+  AppFrame,
+  WindowResizeEdges,
+  WindowResizeHandle,
+  WindowTitleBar,
+  WindowTitle,
+  WindowControls,
+  WindowControlButton,
+  AppContent,
+  workspaceCloseSpin,
+  WorkspaceCloseOverlay,
+  WorkspaceClosePanel,
+  WorkspaceCloseSpinner,
+  WorkspaceCloseTitle,
+  WorkspaceCloseDetail,
+  WorkspaceCloseCounter,
+  WorkspaceCloseProgressTrack,
+  WorkspaceCloseProgressBar,
+  splashPulse,
+  loadingOrangeSweep,
+  shellReveal,
+  railReveal,
+  sideReveal,
+  panelEnter,
+  panelExit,
+  quietSweep,
+  squareFade,
+  SplashScreen,
+  AmbientPanel,
+  SplashCenter,
+  SplashLogo,
+  SplashTitle,
+  SplashTagline,
+  LoadingTrack,
+  LoadingFill,
+  LoadingText,
+  LoadingDetail,
+  LaunchStatusPanel,
+  LaunchStatusIcon,
+  LaunchStatusCopy,
+  LaunchActions,
+  LoginScreen,
+  LoginLayout,
+  SquareField,
+  SquarePulse,
+  BrandPanel,
+  BrandMark,
+  IntroCopy,
+  Kicker,
+  Headline,
+  Lede,
+  IntroFeatureList,
+  IntroFeature,
+  ApiStatus,
+  StatusSummary,
+  StatusBadge,
+  iconPulse,
+  statusIconSize,
+  ConnectedIcon,
+  ErrorIcon,
+  PendingIcon,
+  StatusButton,
+  ApiBase,
+  PricingScreen,
+  PricingHero,
+  PricingCopy,
+  PricingTitle,
+  PricingText,
+  PricingActions,
+  PricingPlans,
+  PricingPlanCard,
+  PlanEyebrow,
+  PlanPrice,
+  PlanDescription,
+  PlanFeatureList,
+  AuthenticatedWorkspaceFrame,
+  WorkspaceStartupOverlay,
+  DashboardShell,
+  WorkspaceRail,
+  RailTop,
+  RailSectionTitle,
+  WorkspaceList,
+  WorkspaceRow,
+  WorkspaceButton,
+  WorkspaceLabel,
+  WorkspaceSettingsButton,
+  WorkspaceAccent,
+  WorkspaceMuted,
+  RailFooter,
+  RailActionButton,
+  BlankWorkspace,
+  ForgeWorkspace,
+  TerminalWorkspaceSurface,
+  WorkspaceTerminalPanels,
+  ResizePanelGroup,
+  ResizePanel,
+  ResizeHandle,
+  TerminalDevMetricsBar,
+  TerminalDevMetric,
+  TerminalFrame,
+  XtermSurface,
+  TerminalClosedSurface,
+  TerminalClosedLabel,
+  TerminalRestartPill,
+  TerminalRestartButton,
+  TerminalCloseButton,
+  TerminalEmptyPanel,
+  TerminalEmptyActions,
+  TerminalEmptyCopy,
+  TerminalAgentList,
+  TerminalAgentRow,
+  FilesWorkspaceSurface,
+  FileExplorerPane,
+  FileExplorerHeader,
+  FileExplorerActions,
+  FileIconButton,
+  FileRootPath,
+  FileTree,
+  FileTreeItem,
+  FileTreeButton,
+  FileDisclosure,
+  FileKindIcon,
+  FileTreeName,
+  FileGitStatusMark,
+  FileTreeChildren,
+  FileTreeMessage,
+  FileTreeEmpty,
+  FilePreviewPane,
+  FilePreviewHeader,
+  FilePreviewTitle,
+  FilePreviewMeta,
+  FileGitStatusPill,
+  FileMetaPill,
+  FilePreviewPath,
+  FileContentFrame,
+  FilePreviewScroll,
+  HighlightedCodeBlock,
+  FileDiffPanel,
+  FileDiffHeader,
+  FileDiffBadge,
+  FileDiffMessage,
+  DiffCodeBlock,
+  DiffLine,
+  FileEmptyState,
+  FileEmptyIcon,
+  VaultWorkspaceSurface,
+  VaultPlaceholderPanel,
+  VaultPlaceholderIcon,
+  VaultStatusGrid,
+  AudioWorkspaceSurface,
+  AudioSetupPanel,
+  AudioHeroRow,
+  AudioStatePill,
+  AudioStatusGrid,
+  AudioPathBlock,
+  AudioCodePath,
+  AudioRuntimeHint,
+  AudioProgressPanel,
+  AudioProgressTopline,
+  AudioProgressTrack,
+  AudioProgressBar,
+  AudioProgressMeta,
+  AudioActionRow,
+  AudioWidgetShell,
+  AudioWidgetHeader,
+  AudioWidgetTitle,
+  AudioWidgetMeter,
+  AudioWidgetStatus,
+  AudioRecordingTimer,
+  AudioWidgetTranscript,
+  AudioWidgetActions,
+  McpWorkspaceSurface,
+  McpHeaderPanel,
+  McpTitleRow,
+  McpStatsGrid,
+  McpLayout,
+  McpRegistryPanel,
+  McpPanelTopline,
+  McpServerList,
+  McpServerButton,
+  McpServerIcon,
+  McpServerCopy,
+  McpStatusBadge,
+  McpEditorPanel,
+  McpEditorHeader,
+  McpSwitchButton,
+  McpFieldGrid,
+  McpWideField,
+  McpInput,
+  McpTextarea,
+  McpJsonTextarea,
+  McpTransportTabs,
+  McpTransportButton,
+  McpAccessGrid,
+  McpAccessPanel,
+  McpAccessTopline,
+  McpInlineActions,
+  McpCheckList,
+  McpCheckRow,
+  McpEmptyAccess,
+  McpScopePreview,
+  McpEditorActions,
+  WorkspaceSetupPanel,
+  SetupHeader,
+  SetupField,
+  SetupInput,
+  BlankStatusStack,
+  WorkspaceSettingsOverlay,
+  WorkspaceSettingsDialog,
+  WorkspaceSettingsDialogHeader,
+  WorkspaceModalCloseButton,
+  WorkspaceSettingsForm,
+  WorkspaceSettingsInput,
+  WorkspaceNumberInput,
+  RootDirectoryInput,
+  WorkspaceSettingsFieldGrid,
+  WorkspaceSettingsActions,
+  AgentSettingsPanel,
+  AgentPanelActions,
+  AgentReadyPill,
+  AgentCardGrid,
+  AgentCard,
+  AgentCardHeader,
+  AgentIcon,
+  AgentName,
+  AgentMeta,
+  AgentStatusText,
+  AgentInstallPanel,
+  AgentInstallTopline,
+  AgentInstallBadge,
+  AgentInstallHint,
+  AgentInstallActions,
+  AgentInstallCommand,
+  AgentPermissionHint,
+  AgentInstallMessage,
+  AgentActions,
+  AgentActionTooltip,
+  PageHeader,
+  PageSubline,
+  DashboardTitle,
+  PanelHeaderRow,
+  PanelKicker,
+  PanelHeading,
+  SettingsPage,
+  AccountSettingsPanel,
+  AccountCard,
+  AccountCardHeader,
+  AccountCardFooter,
+  SettingsLabel,
+  SettingsValue,
+  SettingsHint,
+  SettingsIdentityGrid,
+  SettingsIdentityItem,
+  LoginCard,
+  LoginPanel,
+  SessionPanel,
+  LoginCardTop,
+  LoginCardBadge,
+  LoginIconWrap,
+  SuccessBadge,
+  SessionTitle,
+  SessionText,
+  AuthStepRail,
+  AuthStep,
+  PrimaryButton,
+  SecondaryButton,
+  PrimaryDangerButton,
+  FormMessage,
+  buttonIconSize,
+  titleIconSize,
+  TitleMinimizeIcon,
+  TitleMaximizeIcon,
+  TitleRestoreIcon,
+  TitleCloseIcon,
+  ButtonRefreshIcon,
+  ButtonAddIcon,
+  ButtonLoginIcon,
+  ButtonBrowserIcon,
+  ButtonCloseIcon,
+  ButtonFolderIcon,
+  ButtonLogoutIcon,
+  ButtonSettingsIcon,
+  ButtonForgeIcon,
+  ButtonCodeIcon,
+  ButtonBotIcon,
+  ButtonTerminalIcon,
+  ButtonKeyIcon,
+  ButtonMicIcon,
+  ButtonHubIcon,
+  ButtonCheckIcon,
+  FileChevronIcon,
+  FileExpandIcon,
+  FileFolderTreeIcon,
+  FileDocumentIcon,
+  VIEW_TRANSITION_MS
+} from "./appStyles";
+import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
+import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
+import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
+import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH } from "../audio/AudioWorkspaceView.jsx";
+
+
+const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
+const PRICING_URL = "https://diffforge.ai/pricing";
+const BRAND_NAME = "Diff Forge AI";
+const LAUNCH_MINIMUM_MS = 1400;
+const AUTH_STARTUP_TIMEOUT_MS = 5000;
+const DEEP_LINK_STARTUP_TIMEOUT_MS = 1000;
+const SESSION_RESTORE_TIMEOUT_MS = 5000;
+const SESSION_RESTORE_TIMEOUT_MESSAGE = "Secure session check timed out after 5 seconds.";
+const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
+const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
+const OPEN_BROWSER_TIMEOUT_MS = 5000;
+const BACKEND_HELLO_TIMEOUT_MS = 5000;
+const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
+const PLAN_REFRESH_TIMEOUT_MS = 5000;
+const LOGOUT_TIMEOUT_MS = 5000;
+const WINDOW_FRAME_STATE_DEFAULT = { isFullscreen: false, isMaximized: false };
+const WINDOW_VIEWPORT_MARGIN_PX = 12;
+const WINDOW_RESIZE_EDGES = [
+  { placement: "top", direction: "North" },
+  { placement: "right", direction: "East" },
+  { placement: "bottom", direction: "South" },
+  { placement: "left", direction: "West" },
+  { placement: "top-left", direction: "NorthWest" },
+  { placement: "top-right", direction: "NorthEast" },
+  { placement: "bottom-right", direction: "SouthEast" },
+  { placement: "bottom-left", direction: "SouthWest" },
+];
+const DEFAULT_WORKSPACE_VIEW = "terminals";
+const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
+const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
+const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
+const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
+const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
+const FILE_EXPLORER_DEFAULT_SIZE = 28;
+const FILE_EXPLORER_MIN_SIZE = 16;
+const FILE_EXPLORER_MAX_SIZE = 76;
+const FILE_PREVIEW_DEFAULT_SIZE = 72;
+const FILE_PREVIEW_MIN_SIZE = 24;
+const FILE_PREVIEW_MAX_SIZE = 84;
+const MCP_REGISTRY_STORAGE_KEY = "diffforge.mcpRegistry.v1";
+const MCP_TEXT_LIMIT = 12000;
+const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH = 2048;
+const MIN_WORKSPACE_TERMINAL_COUNT = 1;
+const MAX_WORKSPACE_TERMINAL_COUNT = 16;
+const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
+const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
+const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
+const TERMINAL_DEFAULT_COLS = 80;
+const TERMINAL_DEFAULT_ROWS = 24;
+const TERMINAL_MIN_COLS = 20;
+const TERMINAL_MIN_ROWS = 6;
+const TERMINAL_MAX_COLS = 400;
+const TERMINAL_MAX_ROWS = 160;
+const TERMINAL_START_METRIC_WAIT_MS = 900;
+const TERMINAL_START_METRIC_POLL_MS = 16;
+const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
+const TERMINAL_METRICS_NOTIFY_MS = 250;
+const TERMINAL_TELEMETRY_FLUSH_MS = 60;
+const TERMINAL_TELEMETRY_MAX_BATCH = 80;
+const TERMINAL_WEBGL_IDLE_DELAY_MS = 420;
+const TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS = 80;
+const TERMINAL_WEBGL_STAGGER_MS = 90;
+const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
+const TERMINAL_RENDER_PROBE_AFTER_WRITE_MS = 80;
+const TERMINAL_RENDER_PROBE_AFTER_WEBGL_MS = 140;
+const TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS = 80;
+const TERMINAL_RESIZE_DEBUG_IDLE_MS = 140;
+const TERMINAL_RESIZE_DEBUG_RECENT_MS = 1800;
+const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
+const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
+const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
+const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
+const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
+const TERMINAL_BLANK_STARTUP_RESTART_LIMIT = 3;
+const WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS = 4500;
+const WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS = 1200;
+const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
+const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
+const AGENT_PROVIDERS = [
+  { id: "codex", label: "Codex", shortLabel: "Codex" },
+  { id: "claude", label: "Claude Code", shortLabel: "Claude" },
+];
+const AGENT_INSTALL_GUIDES = {
+  codex: {
+    nativeInstallUrl: "https://github.com/openai/codex/releases/latest",
+    nativeInstallLabel: "GitHub release binaries",
+    installCommand: "npm install -g @openai/codex",
+  },
+  claude: {
+    nativeInstallUrl: "https://code.claude.com/docs/en/quickstart",
+    nativeInstallLabel: "Native install guide",
+    installCommand: "npm install -g @anthropic-ai/claude-code",
+  },
+};
+const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
+  ...provider,
+  binary: provider.id,
+  installed: false,
+  authenticated: false,
+  version: "Not checked",
+  authMessage: "Check terminal CLI status.",
+  installCommand: AGENT_INSTALL_GUIDES[provider.id].installCommand,
+  nativeInstallUrl: AGENT_INSTALL_GUIDES[provider.id].nativeInstallUrl,
+  nativeInstallLabel: AGENT_INSTALL_GUIDES[provider.id].nativeInstallLabel,
+  npmAvailable: false,
+  npmVersion: "Not checked",
+  npmInstalled: false,
+  npmPackageVersion: "Not checked",
+  npmLatestVersion: "Not checked",
+  npmUpdateAvailable: false,
+  recommendNativeInstall: true,
+  connectCommand: provider.id === "codex" ? "codex login" : "claude",
+}));
+
+function getDefaultAgentStatus(providerId) {
+  return DEFAULT_AGENT_STATUSES.find((status) => status.id === providerId);
+}
+
+function normalizeCachedAgentStatus(status) {
+  if (!status || typeof status !== "object") {
+    return null;
+  }
+
+  const provider = AGENT_PROVIDERS.find((item) => item.id === status.id);
+  const defaults = provider ? getDefaultAgentStatus(provider.id) : null;
+
+  if (!provider || !defaults) {
+    return null;
+  }
+
+  return {
+    ...defaults,
+    ...provider,
+    authenticated: Boolean(status.authenticated),
+    authMessage: status.authenticated
+      ? "Cached terminal CLI session. Rechecking..."
+      : "Cached terminal CLI state. Rechecking...",
+    cached: true,
+    installed: Boolean(status.installed),
+    npmAvailable: Boolean(status.npmAvailable),
+    npmInstalled: Boolean(status.npmInstalled),
+    npmLatestVersion: typeof status.npmLatestVersion === "string"
+      ? status.npmLatestVersion.slice(0, 120)
+      : defaults.npmLatestVersion,
+    npmPackageVersion: typeof status.npmPackageVersion === "string"
+      ? status.npmPackageVersion.slice(0, 120)
+      : defaults.npmPackageVersion,
+    npmUpdateAvailable: Boolean(status.npmUpdateAvailable),
+    npmVersion: typeof status.npmVersion === "string"
+      ? status.npmVersion.slice(0, 80)
+      : defaults.npmVersion,
+    recommendNativeInstall: status.recommendNativeInstall !== false,
+    version: typeof status.version === "string"
+      ? status.version.slice(0, 120)
+      : defaults.version,
+  };
+}
+
+function readCachedAgentStatuses() {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(AGENT_STATUS_CACHE_KEY) || "null");
+    const savedAt = Number(cached?.savedAt);
+
+    if (!Number.isFinite(savedAt) || Date.now() - savedAt > AGENT_STATUS_CACHE_TTL_MS) {
+      return DEFAULT_AGENT_STATUSES;
+    }
+
+    const statusMap = new Map(
+      (Array.isArray(cached?.statuses) ? cached.statuses : [])
+        .map(normalizeCachedAgentStatus)
+        .filter(Boolean)
+        .map((status) => [status.id, status]),
+    );
+
+    if (!statusMap.size) {
+      return DEFAULT_AGENT_STATUSES;
+    }
+
+    return AGENT_PROVIDERS.map((provider) => statusMap.get(provider.id) || getDefaultAgentStatus(provider.id));
+  } catch {
+    return DEFAULT_AGENT_STATUSES;
+  }
+}
+
+function persistAgentStatusCache(statuses) {
+  try {
+    const safeStatuses = statuses.map((status) => ({
+      authenticated: Boolean(status.authenticated),
+      id: status.id,
+      installed: Boolean(status.installed),
+      npmAvailable: Boolean(status.npmAvailable),
+      npmInstalled: Boolean(status.npmInstalled),
+      npmLatestVersion: typeof status.npmLatestVersion === "string" ? status.npmLatestVersion.slice(0, 120) : "",
+      npmPackageVersion: typeof status.npmPackageVersion === "string" ? status.npmPackageVersion.slice(0, 120) : "",
+      npmUpdateAvailable: Boolean(status.npmUpdateAvailable),
+      npmVersion: typeof status.npmVersion === "string" ? status.npmVersion.slice(0, 80) : "",
+      recommendNativeInstall: status.recommendNativeInstall !== false,
+      version: typeof status.version === "string" ? status.version.slice(0, 120) : "",
+    }));
+
+    window.localStorage.setItem(
+      AGENT_STATUS_CACHE_KEY,
+      JSON.stringify({
+        savedAt: Date.now(),
+        statuses: safeStatuses,
+      }),
+    );
+  } catch {
+    // Cached readiness is only a startup hint; fresh native checks remain authoritative.
+  }
+}
+
+let nextWorkspaceTerminalInstanceId = 1;
+const AUTH_TILE_COLUMNS = 64;
+const AUTH_TILE_ROWS = 24;
+const AUTH_TILE_BURSTS = Array.from({ length: 156 }, (_, index) => {
+  const col = (index * 9 + Math.floor(index / 4) * 5) % AUTH_TILE_COLUMNS;
+  const row = (index * 7 + Math.floor(index / 6) * 4) % AUTH_TILE_ROWS;
+  const delay = `${((index * 0.47) % 12).toFixed(1)}s`;
+  const duration = `${(7.2 + (index % 8) * 0.48).toFixed(1)}s`;
+  const peak = (0.2 + (index % 6) * 0.026).toFixed(3);
+
+  return [col, row, delay, duration, peak];
+});
+
+function AuthSquareBackdrop() {
+  return (
+    <SquareField aria-hidden="true">
+      {AUTH_TILE_BURSTS.map(([col, row, delay, duration, peak]) => (
+        <SquarePulse
+          key={`${col}-${row}-${delay}`}
+          style={{
+            "--left": `${col * AUTH_TILE_SIZE}px`,
+            "--top": `${row * AUTH_TILE_SIZE}px`,
+            "--delay": delay,
+            "--duration": duration,
+            "--peak": peak,
+          }}
+        />
+      ))}
+    </SquareField>
+  );
+}
+
+function createAuthState() {
+  const bytes = new Uint8Array(32);
+  window.crypto.getRandomValues(bytes);
+
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function isPaidUser(sessionUser) {
+  return sessionUser?.planStatus === "paid";
+}
+
+function parseAuthCallback(urlValue) {
+  try {
+    const url = new URL(urlValue);
+
+    if (url.protocol !== "diffforge:" || url.hostname !== "auth" || url.pathname !== "/callback") {
+      return null;
+    }
+
+    const code = url.searchParams.get("code") || "";
+    const state = url.searchParams.get("state") || "";
+
+    if (!isSafeAuthValue(code) || !isSafeAuthValue(state)) {
+      return null;
+    }
+
+    return { code, state };
+  } catch {
+    return null;
+  }
+}
+
+function getErrorMessage(error, fallback) {
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  if (error && typeof error.message === "string" && error.message.trim()) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+function isTerminalSessionMissingError(error) {
+  const message = getErrorMessage(error, "").toLowerCase();
+
+  return message.includes("terminal session is not running")
+    || message.includes("terminal session not running");
+}
+
+function isDesktopSessionExpiredError(error) {
+  const message = getErrorMessage(error, "").toLowerCase();
+
+  return (
+    message.includes("desktop session expired")
+    || message.includes("session expired")
+    || message.includes("invalid desktop session")
+    || message.includes("unauthorized")
+    || message.includes("forbidden")
+  );
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(new Error(message));
+    }, timeoutMs);
+
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        window.clearTimeout(timeoutId);
+        reject(error);
+      },
+    );
+  });
+}
+
+function hasTauriWindowMetadata() {
+  return Boolean(window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label);
+}
+
+function getSafeCurrentWindow() {
+  if (!hasTauriWindowMetadata()) {
+    return null;
+  }
+
+  try {
+    return getCurrentWindow();
+  } catch {
+    return null;
+  }
+}
+
+function runWindowAction(action) {
+  try {
+    const result = action();
+
+    if (!result || typeof result.catch !== "function") {
+      return;
+    }
+
+    result.catch(() => {
+      // Window controls are best-effort; failed actions should not break app state.
+    });
+  } catch {
+    // Window controls are best-effort; failed actions should not break app state.
+  }
+}
+
+function normalizeCloseCount(value) {
+  const count = Number(value);
+
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+
+function normalizeTerminalCloseProgress(payload) {
+  const total = normalizeCloseCount(payload?.total);
+  const closed = normalizeCloseCount(payload?.closed);
+
+  return {
+    closed: Math.min(closed, total || closed),
+    total,
+  };
+}
+
+function closeErrorMessage(error) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return typeof error === "string" ? error : "Unknown close error.";
+}
+
+async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
+  const nativeExitStartedAt = performance.now();
+
+  writeTerminalTelemetry({
+    phase: "frontend.workspace.close_app_exit_start",
+    fields: { method: "native_command" },
+  });
+
+  try {
+    await withTimeout(
+      invoke("close_app_after_terminal_shutdown"),
+      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
+      "Native app exit timed out.",
+    );
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.close_app_exit_done",
+      elapsedMs: performance.now() - nativeExitStartedAt,
+      fields: { method: "native_command" },
+    });
+    return;
+  } catch (nativeExitError) {
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.close_app_exit_failed",
+      elapsedMs: performance.now() - nativeExitStartedAt,
+      fields: { error: closeErrorMessage(nativeExitError), method: "native_command" },
+    });
+  }
+
+  const closeStartedAt = performance.now();
+  let closeSucceeded = false;
+
+  writeTerminalTelemetry({
+    phase: "frontend.workspace.close_window_start",
+    fields: { method: "close" },
+  });
+
+  try {
+    await withTimeout(
+      appWindow.close(),
+      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
+      "Window close timed out.",
+    );
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.close_window_done",
+      elapsedMs: performance.now() - closeStartedAt,
+      fields: { method: "close" },
+    });
+    closeSucceeded = true;
+  } catch (closeError) {
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.close_window_close_failed",
+      elapsedMs: performance.now() - closeStartedAt,
+      fields: { error: closeErrorMessage(closeError) },
+    });
+
+    if (typeof appWindow.destroy !== "function") {
+      throw closeError;
+    }
+  }
+
+  if (typeof appWindow.destroy !== "function") {
+    if (closeSucceeded) {
+      return;
+    }
+
+    throw new Error("Window destroy is unavailable.");
+  }
+
+  const destroyStartedAt = performance.now();
+  writeTerminalTelemetry({
+    phase: "frontend.workspace.close_window_destroy_start",
+    fields: {
+      closeSucceeded,
+      method: "destroy",
+    },
+  });
+
+  try {
+    await withTimeout(
+      appWindow.destroy(),
+      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
+      "Window destroy timed out.",
+    );
+  } catch (destroyError) {
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.close_window_destroy_failed",
+      elapsedMs: performance.now() - destroyStartedAt,
+      fields: {
+        closeSucceeded,
+        error: closeErrorMessage(destroyError),
+        method: "destroy",
+      },
+    });
+    throw destroyError;
+  }
+
+  writeTerminalTelemetry({
+    phase: "frontend.workspace.close_window_destroy_done",
+    elapsedMs: performance.now() - destroyStartedAt,
+    fields: {
+      closeSucceeded,
+      method: "destroy",
+    },
+  });
+}
+
+async function readWindowFrameState(appWindow = getSafeCurrentWindow()) {
+  if (!appWindow) {
+    return null;
+  }
+
+  const [isFullscreen, isMaximized] = await Promise.all([
+    appWindow.isFullscreen(),
+    appWindow.isMaximized(),
+  ]);
+
+  return {
+    isFullscreen: Boolean(isFullscreen),
+    isMaximized: Boolean(isMaximized),
+  };
+}
+
+function getFiniteNumber(value, fallback = 0) {
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function getBoundsRect(position, size) {
+  const left = getFiniteNumber(position?.x);
+  const top = getFiniteNumber(position?.y);
+  const width = Math.max(0, getFiniteNumber(size?.width));
+  const height = Math.max(0, getFiniteNumber(size?.height));
+
+  return {
+    left,
+    top,
+    width,
+    height,
+    right: left + width,
+    bottom: top + height,
+  };
+}
+
+function getMonitorWorkAreaRect(monitor) {
+  const area = monitor?.workArea;
+
+  if (!area?.position || !area?.size) {
+    return null;
+  }
+
+  return getBoundsRect(area.position, area.size);
+}
+
+function getRectIntersectionArea(first, second) {
+  const width = Math.max(0, Math.min(first.right, second.right) - Math.max(first.left, second.left));
+  const height = Math.max(0, Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top));
+
+  return width * height;
+}
+
+function getRectCenterDistance(first, second) {
+  const firstX = first.left + first.width / 2;
+  const firstY = first.top + first.height / 2;
+  const secondX = second.left + second.width / 2;
+  const secondY = second.top + second.height / 2;
+  const deltaX = firstX - secondX;
+  const deltaY = firstY - secondY;
+
+  return deltaX * deltaX + deltaY * deltaY;
+}
+
+function selectRecoveryMonitor(monitors, windowRect) {
+  return monitors.reduce((bestMonitor, monitor) => {
+    const workAreaRect = getMonitorWorkAreaRect(monitor);
+
+    if (!workAreaRect) {
+      return bestMonitor;
+    }
+
+    const area = getRectIntersectionArea(windowRect, workAreaRect);
+    const distance = getRectCenterDistance(windowRect, workAreaRect);
+
+    if (!bestMonitor || area > bestMonitor.area || (area === bestMonitor.area && distance < bestMonitor.distance)) {
+      return { monitor, area, distance };
+    }
+
+    return bestMonitor;
+  }, null)?.monitor || null;
+}
+
+async function resolveRecoveryMonitor(windowRect) {
+  try {
+    const monitor = await currentMonitor();
+
+    if (monitor) {
+      return monitor;
+    }
+  } catch {
+    // Fall back to all monitors when the current monitor is unavailable.
+  }
+
+  try {
+    const monitors = await availableMonitors();
+
+    return selectRecoveryMonitor(monitors, windowRect);
+  } catch {
+    return null;
+  }
+}
+
+function clampWindowCoordinate(value, min, max) {
+  if (max < min) {
+    return min;
+  }
+
+  return Math.min(Math.max(value, min), max);
+}
+
+async function recoverWindowIntoViewport(appWindow = getSafeCurrentWindow()) {
+  if (!appWindow) {
+    return;
+  }
+
+  const [position, size] = await Promise.all([
+    appWindow.outerPosition(),
+    appWindow.outerSize(),
+  ]);
+  const windowRect = getBoundsRect(position, size);
+  const monitor = await resolveRecoveryMonitor(windowRect);
+  const workAreaRect = getMonitorWorkAreaRect(monitor);
+
+  if (!workAreaRect) {
+    return;
+  }
+
+  const marginX = Math.min(WINDOW_VIEWPORT_MARGIN_PX, Math.max(0, Math.floor(workAreaRect.width / 4)));
+  const marginY = Math.min(WINDOW_VIEWPORT_MARGIN_PX, Math.max(0, Math.floor(workAreaRect.height / 4)));
+  const nextX = Math.round(clampWindowCoordinate(
+    windowRect.left,
+    workAreaRect.left + marginX,
+    workAreaRect.right - windowRect.width - marginX,
+  ));
+  const nextY = Math.round(clampWindowCoordinate(
+    windowRect.top,
+    workAreaRect.top + marginY,
+    workAreaRect.bottom - windowRect.height - marginY,
+  ));
+
+  if (nextX !== Math.round(position.x) || nextY !== Math.round(position.y)) {
+    await appWindow.setPosition(new PhysicalPosition(nextX, nextY));
+  }
+}
+
+function getAgentTone(agent) {
+  if (!agent?.installed) {
+    return "offline";
+  }
+
+  return agent.authenticated ? "ready" : "needsAuth";
+}
+
+function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
+  const readyAgents = agentStatuses.filter((agent) => agent.installed && agent.authenticated);
+  const preferredAgent = readyAgents.find((agent) => agent.id === preferredAgentId);
+
+  return preferredAgent || readyAgents.find((agent) => agent.id === "codex") || readyAgents[0] || null;
+}
+
+function getLaunchableAgent(agentStatuses, preferredAgentId = "codex") {
+  const preferredAgent = agentStatuses.find((agent) => agent.id === preferredAgentId);
+  const codexAgent = agentStatuses.find((agent) => agent.id === "codex");
+
+  return preferredAgent || codexAgent || agentStatuses[0] || getDefaultAgentStatus("codex");
+}
+
+function getAgentStatusSummary(agentStatuses) {
+  const codex = agentStatuses.find((agent) => agent.id === "codex");
+  const claude = agentStatuses.find((agent) => agent.id === "claude");
+
+  return [codex, claude].filter(Boolean);
+}
+
+function getAgentUpdatesAvailable(agentStatuses) {
+  return agentStatuses.filter((agent) => (
+    agent.installed
+    && agent.npmInstalled
+    && agent.npmUpdateAvailable
+  ));
+}
+
+function formatAgentList(agents) {
+  const labels = agents.map((agent) => agent.shortLabel || agent.label).filter(Boolean);
+
+  if (labels.length <= 1) {
+    return labels[0] || "terminal CLIs";
+  }
+
+  if (labels.length === 2) {
+    return `${labels[0]} and ${labels[1]}`;
+  }
+
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function getAgentUpdateSummary(agents) {
+  const updateLabels = agents.map((agent) => {
+    const currentVersion = agent.npmPackageVersion && agent.npmPackageVersion !== "Detected"
+      ? agent.npmPackageVersion
+      : "installed";
+    const latestVersion = agent.npmLatestVersion && agent.npmLatestVersion !== "Not checked"
+      ? agent.npmLatestVersion
+      : "latest";
+
+    return `${agent.shortLabel || agent.label} ${currentVersion} -> ${latestVersion}`;
+  });
+
+  return updateLabels.join(" / ");
+}
+
+function cleanWorkspaceRootDirectory(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  const uncVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]UNC[\\/](.+)$/i);
+
+  if (uncVerbatimMatch) {
+    return `\\\\${uncVerbatimMatch[1]}`.trim();
+  }
+
+  const driveVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]([a-z]:[\\/].*)$/i);
+
+  if (driveVerbatimMatch) {
+    return driveVerbatimMatch[1].trim();
+  }
+
+  return cleaned;
+}
+
+function isWindowsSystemRootDirectory(value) {
+  const cleaned = cleanWorkspaceRootDirectory(value)
+    .replace(/\\/g, "/")
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+
+  return /^[a-z]:\/windows(?:\/(?:system32|syswow64)(?:\/.*)?)?$/.test(cleaned)
+    || /^\/[a-z]\/windows(?:\/(?:system32|syswow64)(?:\/.*)?)?$/.test(cleaned);
+}
+
+function normalizeWorkspaceTerminalCount(value) {
+  const count = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(count)) {
+    return MIN_WORKSPACE_TERMINAL_COUNT;
+  }
+
+  return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
+}
+
+function normalizeWorkspaceSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([workspaceId, settings]) => {
+        const cleanedRootDirectory = cleanWorkspaceRootDirectory(settings?.rootDirectory);
+        const rootDirectory = isWindowsSystemRootDirectory(cleanedRootDirectory)
+          ? ""
+          : cleanedRootDirectory;
+        const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
+
+        if (!workspaceId || (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT)) {
+          return null;
+        }
+
+        return [
+          workspaceId,
+          {
+            rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
+            terminalCount,
+          },
+        ];
+      })
+      .filter(Boolean),
+  );
+}
+
+function readWorkspaceSettings() {
+  try {
+    return normalizeWorkspaceSettings(
+      JSON.parse(window.localStorage.getItem(WORKSPACE_SETTINGS_STORAGE_KEY) || "{}"),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistWorkspaceSettings(settings) {
+  try {
+    window.localStorage.setItem(
+      WORKSPACE_SETTINGS_STORAGE_KEY,
+      JSON.stringify(normalizeWorkspaceSettings(settings)),
+    );
+  } catch {
+    // Workspace root settings are convenience state; the app can still run without persistence.
+  }
+}
+
+function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
+  return cleanWorkspaceRootDirectory(workspaceSettings?.[workspaceId]?.rootDirectory);
+}
+
+function getWorkspaceTerminalCount(workspaceSettings, workspaceId) {
+  return normalizeWorkspaceTerminalCount(workspaceSettings?.[workspaceId]?.terminalCount);
+}
+
+function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
+  const nextSettings = { ...(settings || {}) };
+
+  if (!workspaceId) {
+    return nextSettings;
+  }
+
+  const currentSettings = settings?.[workspaceId] || {};
+  const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
+  const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
+  const rootDirectory = cleanWorkspaceRootDirectory(
+    hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
+  ).slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH);
+  const terminalCount = normalizeWorkspaceTerminalCount(
+    hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
+  );
+
+  if (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT) {
+    delete nextSettings[workspaceId];
+    return nextSettings;
+  }
+
+  nextSettings[workspaceId] = {
+    rootDirectory,
+    terminalCount,
+  };
+
+  return nextSettings;
+}
+
+export default function App() {
+  if (window.location.hash === AUDIO_WIDGET_HASH) {
+    return <AudioWidgetWindow />;
+  }
+
+  const {
+    status: authState,
+    message: authMessage,
+    error: authError,
+    user,
+  } = useAuthSnapshot();
+  const [apiState, setApiState] = useState("checking");
+  const [apiMessage, setApiMessage] = useState("Checking connection");
+  const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
+  const [visibleView, setVisibleView] = useState(DEFAULT_WORKSPACE_VIEW);
+  const [viewMotion, setViewMotion] = useState("entered");
+  const [activeAgent, setActiveAgent] = useState("codex");
+  const [agentStatuses, setAgentStatuses] = useState(readCachedAgentStatuses);
+  const [agentStatusState, setAgentStatusState] = useState("idle");
+  const [agentStatusError, setAgentStatusError] = useState("");
+  const [startupAgentGateState, setStartupAgentGateState] = useState("idle");
+  const [startupAgentUpdateMessage, setStartupAgentUpdateMessage] = useState("");
+  const [agentInstallState, setAgentInstallState] = useState({});
+  const [agentInstallResults, setAgentInstallResults] = useState({});
+  const [agentDisconnectState, setAgentDisconnectState] = useState({});
+  const [agentActionResults, setAgentActionResults] = useState({});
+  const [audioModelStatus, setAudioModelStatus] = useState(null);
+  const [audioStatusState, setAudioStatusState] = useState("idle");
+  const [audioActionState, setAudioActionState] = useState("idle");
+  const [audioError, setAudioError] = useState("");
+  const [audioDownloadProgress, setAudioDownloadProgress] = useState(null);
+  const [workspaces, setWorkspaces] = useState([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
+  const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
+  const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
+  const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
+  const [workspaceTerminalSlots, setWorkspaceTerminalSlots] = useState({});
+  const [workspaceRootDraft, setWorkspaceRootDraft] = useState("");
+  const [workspaceSettingsState, setWorkspaceSettingsState] = useState("idle");
+  const [workspaceSettingsError, setWorkspaceSettingsError] = useState("");
+  const [workspaceSettingsMessage, setWorkspaceSettingsMessage] = useState("");
+  const [workspaceSettingsModalId, setWorkspaceSettingsModalId] = useState("");
+  const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
+  const [authInitialized, setAuthInitialized] = useState(false);
+  const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
+  const [workspaceState, setWorkspaceState] = useState("idle");
+  const [workspaceAgentLaunchEpoch, setWorkspaceAgentLaunchEpoch] = useState(0);
+  const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
+  const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
+  const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
+  const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
+  const authStartupFinishedRef = useRef(false);
+  const authFlowIdRef = useRef(0);
+  const launchStartedAtRef = useRef(Date.now());
+  const viewTransitionTimeoutRef = useRef(null);
+  const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
+  const agentInitialStatusUserRef = useRef("");
+  const startupAgentFlowIdRef = useRef(0);
+  const startupAgentSettingsPendingRef = useRef(false);
+  const activeWorkspaceIdRef = useRef("");
+  const workspaceAgentLaunchKeyRef = useRef("");
+  const preparedTerminalsRef = useRef(new Map());
+  const workspaceAgentBatchInFlightKeyRef = useRef("");
+  const workspaceCloseInFlightRef = useRef(false);
+  const workspaceCloseAllowNativeRef = useRef(false);
+
+  useEffect(() => {
+    activeWorkspaceIdRef.current = activeWorkspaceId;
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
+    if (!agentStatusCacheHitRef.current) {
+      return;
+    }
+
+    writeTerminalTelemetry({
+      phase: "frontend.agent_status.cache_hit",
+      fields: {
+        authenticatedCount: agentStatuses.filter((agent) => agent.cached && agent.authenticated).length,
+        installedCount: agentStatuses.filter((agent) => agent.cached && agent.installed).length,
+        statusCount: agentStatuses.filter((agent) => agent.cached).length,
+      },
+    });
+  }, []);
+
+  useEffect(() => {
+    let unlistenDownloadProgress = null;
+    let cancelled = false;
+
+    listen(AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, (progressEvent) => {
+      setAudioDownloadProgress(progressEvent.payload);
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+
+      unlistenDownloadProgress = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenDownloadProgress) {
+        unlistenDownloadProgress();
+      }
+    };
+  }, []);
+  const terminalMetrics = useTerminalDevMetrics();
+  const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId) || workspaces[0] || null;
+
+  const applyWindowFrameState = useCallback((nextFrameState) => {
+    setWindowFrameState((currentFrameState) => (
+      currentFrameState.isFullscreen === nextFrameState.isFullscreen
+        && currentFrameState.isMaximized === nextFrameState.isMaximized
+        ? currentFrameState
+        : nextFrameState
+    ));
+  }, []);
+
+  const refreshWindowFrameState = useCallback(async (appWindow = getSafeCurrentWindow()) => {
+    if (!appWindow) {
+      return null;
+    }
+
+    try {
+      const nextFrameState = await readWindowFrameState(appWindow);
+
+      if (!nextFrameState) {
+        return null;
+      }
+
+      applyWindowFrameState(nextFrameState);
+      return nextFrameState;
+    } catch {
+      return null;
+    }
+  }, [applyWindowFrameState]);
+
+  const setSignedOut = useCallback((
+    message = DEFAULT_AUTH_MESSAGE,
+    error = "",
+    options = {},
+  ) => {
+    authStore.setSignedOut({
+      message,
+      error,
+      clearSession: options.clearSession !== false,
+      clearPending: options.clearPending === true,
+    });
+    setActiveView(DEFAULT_WORKSPACE_VIEW);
+    setVisibleView(DEFAULT_WORKSPACE_VIEW);
+    setViewMotion("entered");
+    setWorkspaceState("idle");
+    setWorkspaces([]);
+    setActiveWorkspaceId("");
+    setWorkspaceSyncState("idle");
+    setWorkspaceName("");
+    setWorkspaceNameDraft("");
+    setWorkspaceTerminalCountDraft("1");
+    setWorkspaceRootDraft("");
+    setWorkspaceSettingsState("idle");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceSettingsModalId("");
+    setWorkspaceTerminalSlots({});
+    agentInitialStatusUserRef.current = "";
+    startupAgentFlowIdRef.current += 1;
+    startupAgentSettingsPendingRef.current = false;
+    setStartupAgentGateState("idle");
+    setStartupAgentUpdateMessage("");
+    setWorkspaceError("");
+  }, []);
+
+  const setAuthenticated = useCallback((sessionUser) => {
+    const isPaid = isPaidUser(sessionUser);
+
+    authStore.setAuthenticated(
+      sessionUser,
+      isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
+    );
+    setActiveView(DEFAULT_WORKSPACE_VIEW);
+    setVisibleView(DEFAULT_WORKSPACE_VIEW);
+    setViewMotion("entered");
+    setWorkspaceState(isPaid ? "initializing" : "billingRequired");
+    setWorkspaceSyncState("idle");
+    setWorkspaceNameDraft("");
+    setWorkspaceTerminalCountDraft("1");
+    setWorkspaceSettingsState("idle");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceSettingsModalId("");
+    setWorkspaceTerminalSlots({});
+    agentInitialStatusUserRef.current = "";
+    startupAgentFlowIdRef.current += 1;
+    startupAgentSettingsPendingRef.current = false;
+    setStartupAgentGateState(isPaid ? "checking" : "idle");
+    setStartupAgentUpdateMessage("");
+    setWorkspaceError("");
+  }, []);
+
+  const showView = useCallback((nextView) => {
+    if (nextView === activeView && nextView === visibleView) {
+      return;
+    }
+
+    window.clearTimeout(viewTransitionTimeoutRef.current);
+    setWorkspaceSettingsModalId("");
+    if (nextView === DEFAULT_WORKSPACE_VIEW && activeWorkspaceIdRef.current) {
+      startWorkspaceOpenTelemetry({
+        source: "view_switch",
+        workspaceId: activeWorkspaceIdRef.current,
+        fields: {
+          activeView,
+          nextView,
+          visibleView,
+        },
+      });
+    }
+    setActiveView(nextView);
+    setViewMotion("exiting");
+
+    viewTransitionTimeoutRef.current = window.setTimeout(() => {
+      setVisibleView(nextView);
+      window.requestAnimationFrame(() => {
+        setViewMotion("entered");
+      });
+    }, VIEW_TRANSITION_MS);
+  }, [activeView, visibleView]);
+
+  const completeAuthStartup = useCallback(() => {
+    if (authStartupFinishedRef.current) {
+      return;
+    }
+
+    authStartupFinishedRef.current = true;
+    setAuthInitialized(true);
+  }, []);
+
+  const checkBackend = useCallback(async () => {
+    setApiState("checking");
+    setApiMessage("Checking connection");
+
+    try {
+      await withTimeout(
+        invoke("backend_ping"),
+        BACKEND_HELLO_TIMEOUT_MS,
+        BACKEND_HELLO_TIMEOUT_MESSAGE,
+      );
+      setApiState("online");
+      setApiMessage("Diff Forge API online");
+    } catch (error) {
+      const errorMessage = getErrorMessage(error, BACKEND_HELLO_TIMEOUT_MESSAGE);
+      setApiState("offline");
+      setApiMessage(
+        errorMessage === BACKEND_HELLO_TIMEOUT_MESSAGE
+          ? "Connection check timed out. Check your internet connection."
+          : "Unable to reach Diff Forge API. Check your internet connection.",
+      );
+    }
+  }, []);
+
+  const validateStoredSession = useCallback(async () => {
+    const token = authStore.getToken();
+    const validationFlowId = authFlowIdRef.current;
+
+    if (!isSafeAuthValue(token)) {
+      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
+      return;
+    }
+
+    authStore.setChecking("Checking saved desktop session. You can still sign in with the web app.");
+
+    try {
+      const session = await withTimeout(
+        invoke("validate_desktop_session", { token }),
+        SESSION_RESTORE_TIMEOUT_MS,
+        SESSION_RESTORE_TIMEOUT_MESSAGE,
+      );
+      if (validationFlowId !== authFlowIdRef.current) {
+        return;
+      }
+
+      setAuthenticated(session.user);
+    } catch (error) {
+      if (validationFlowId !== authFlowIdRef.current) {
+        return;
+      }
+
+      const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
+      const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
+      setSignedOut(
+        didTimeout
+          ? "Secure session check timed out. Sign in with the web app."
+          : "Your desktop session expired. Sign in again with the web app.",
+        restoreError,
+        { clearPending: true },
+      );
+    }
+  }, [setAuthenticated, setSignedOut]);
+
+  const completeDesktopLogin = useCallback(async (callbackUrl) => {
+    const callback = parseAuthCallback(callbackUrl);
+
+    if (!callback) {
+      return false;
+    }
+
+    authFlowIdRef.current += 1;
+    const loginFlowId = authFlowIdRef.current;
+    const pendingState = authStore.getPendingState();
+
+    if (!pendingState || callback.state !== pendingState) {
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        "Desktop login state did not match. Start again from this app.",
+        { clearPending: true },
+      );
+      return true;
+    }
+
+    authStore.setExchanging();
+
+    try {
+      const session = await withTimeout(
+        invoke("exchange_desktop_auth_code", {
+          code: callback.code,
+          state: callback.state,
+        }),
+        AUTH_EXCHANGE_TIMEOUT_MS,
+        AUTH_EXCHANGE_TIMEOUT_MESSAGE,
+      );
+
+      if (loginFlowId !== authFlowIdRef.current) {
+        return true;
+      }
+
+      authStore.saveAuthenticatedSession(session);
+      authStore.clearPending();
+      setAuthenticated(session.user);
+    } catch (error) {
+      if (loginFlowId !== authFlowIdRef.current) {
+        return true;
+      }
+
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        getErrorMessage(error, "Desktop login expired. Try again."),
+        { clearPending: true },
+      );
+    }
+
+    return true;
+  }, [setAuthenticated, setSignedOut]);
+
+  const startWebLogin = useCallback(async () => {
+    authFlowIdRef.current += 1;
+    const state = createAuthState();
+    authStore.setWaiting(state);
+
+    try {
+      const loginUrl = `${WEB_LOGIN_URL}?state=${encodeURIComponent(state)}`;
+      await withTimeout(
+        openUrl(loginUrl),
+        OPEN_BROWSER_TIMEOUT_MS,
+        "Unable to open the web login.",
+      );
+    } catch (error) {
+      setSignedOut(
+        DEFAULT_AUTH_MESSAGE,
+        getErrorMessage(error, "Unable to open the web login."),
+        { clearSession: false, clearPending: true },
+      );
+    }
+  }, [setSignedOut]);
+
+  const openPricing = useCallback(async () => {
+    try {
+      await withTimeout(
+        openUrl(PRICING_URL),
+        OPEN_BROWSER_TIMEOUT_MS,
+        "Unable to open pricing.",
+      );
+    } catch (error) {
+      authStore.setError(getErrorMessage(error, "Unable to open pricing."));
+    }
+  }, []);
+
+  const refreshSubscriptionStatus = useCallback(async () => {
+    const token = authStore.getToken();
+    const refreshFlowId = authFlowIdRef.current;
+
+    if (!isSafeAuthValue(token)) {
+      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
+      return;
+    }
+
+    authStore.setMessage("Checking plan status...");
+    authStore.setError("");
+
+    try {
+      const session = await withTimeout(
+        invoke("validate_desktop_session", { token }),
+        PLAN_REFRESH_TIMEOUT_MS,
+        "Plan status check timed out.",
+      );
+      if (refreshFlowId !== authFlowIdRef.current) {
+        return;
+      }
+
+      setAuthenticated(session.user);
+    } catch (error) {
+      if (refreshFlowId !== authFlowIdRef.current) {
+        return;
+      }
+
+      setSignedOut(
+        "Your desktop session expired. Sign in again with the web app.",
+        getErrorMessage(error, "Unable to refresh plan status."),
+        { clearPending: true },
+      );
+    }
+  }, [setAuthenticated, setSignedOut]);
+
+  const refreshAgentStatuses = useCallback(async () => {
+    const agentStatusStartedAt = performance.now();
+    setAgentStatusState("checking");
+    setAgentStatusError("");
+    writeTerminalTelemetry({
+      phase: "frontend.agent_status.start",
+    });
+
+    try {
+      const statuses = await invoke("agent_statuses");
+      const statusMap = new Map(statuses.map((status) => [status.id, status]));
+      const nextStatuses = AGENT_PROVIDERS.map((provider) => ({
+        ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
+        ...provider,
+        ...(statusMap.get(provider.id) || {}),
+      }));
+      persistAgentStatusCache(nextStatuses);
+      setAgentStatuses(nextStatuses);
+      setAgentStatusState("idle");
+      writeTerminalTelemetry({
+        phase: "frontend.agent_status.done",
+        elapsedMs: performance.now() - agentStatusStartedAt,
+        fields: {
+          updateAvailableCount: nextStatuses.filter((status) => status.npmUpdateAvailable).length,
+          authenticatedCount: nextStatuses.filter((status) => status.authenticated).length,
+          installedCount: nextStatuses.filter((status) => status.installed).length,
+          statusCount: nextStatuses.length,
+        },
+      });
+      return nextStatuses;
+    } catch (error) {
+      setAgentStatusState("error");
+      setAgentStatusError(getErrorMessage(error, "Unable to check terminal CLIs."));
+      writeTerminalTelemetry({
+        phase: "frontend.agent_status.error",
+        elapsedMs: performance.now() - agentStatusStartedAt,
+        fields: { error: getErrorMessage(error, "Unable to check terminal CLIs.") },
+      });
+      return null;
+    }
+  }, []);
+
+  const refreshAudioModelStatus = useCallback(async () => {
+    setAudioStatusState("checking");
+    setAudioError("");
+
+    try {
+      const status = await invoke("whisper_model_status");
+      setAudioModelStatus(status);
+      setAudioStatusState("idle");
+
+      if (status?.installed) {
+        setAudioDownloadProgress(null);
+      }
+    } catch (error) {
+      setAudioStatusState("error");
+      setAudioError(getErrorMessage(error, "Unable to check local Whisper."));
+    }
+  }, []);
+
+  const downloadAudioModel = useCallback(async () => {
+    setAudioActionState("downloading");
+    setAudioError("");
+
+    try {
+      const status = await invoke("download_whisper_model");
+      setAudioModelStatus(status);
+      setAudioActionState("idle");
+      setAudioDownloadProgress(null);
+    } catch (error) {
+      setAudioActionState("error");
+      setAudioError(getErrorMessage(error, "Unable to install Whisper."));
+    }
+  }, []);
+
+  const openAudioWidget = useCallback(async () => {
+    setAudioActionState("opening");
+    setAudioError("");
+
+    try {
+      await invoke("show_audio_widget");
+      setAudioActionState("idle");
+    } catch (error) {
+      setAudioActionState("error");
+      setAudioError(getErrorMessage(error, "Unable to open the audio widget."));
+      refreshAudioModelStatus();
+    }
+  }, [refreshAudioModelStatus]);
+
+  const connectAgent = useCallback(async (provider) => {
+    setAgentStatusState("checking");
+    setAgentStatusError("");
+    setAgentActionResults((results) => {
+      const nextResults = { ...results };
+      delete nextResults[provider];
+      return nextResults;
+    });
+
+    try {
+      await invoke("start_agent_login", { provider });
+      setAgentStatusState("idle");
+      setAgentActionResults((results) => ({
+        ...results,
+        [provider]: {
+          tone: "neutral",
+          message: "Opened login in a terminal. Use Recheck after the login completes.",
+        },
+      }));
+    } catch (error) {
+      setAgentStatusState("error");
+      setAgentStatusError(getErrorMessage(error, "Unable to open terminal CLI login."));
+    }
+  }, []);
+
+  const disconnectAgent = useCallback(async (provider) => {
+    setAgentDisconnectState((state) => ({ ...state, [provider]: "disconnecting" }));
+    setAgentStatusError("");
+    setAgentActionResults((results) => {
+      const nextResults = { ...results };
+      delete nextResults[provider];
+      return nextResults;
+    });
+
+    try {
+      const result = await invoke("disconnect_agent", { provider });
+      setAgentActionResults((results) => ({
+        ...results,
+        [provider]: {
+          tone: "warning",
+          message: result?.message || `${result?.label || "Terminal CLI"} disconnected from this machine.`,
+        },
+      }));
+      setAgentStatuses((statuses) => statuses.map((agent) => (
+        agent.id === provider
+          ? {
+            ...agent,
+            authenticated: false,
+            authMessage: result?.message || `${agent.label} disconnected from this machine.`,
+          }
+          : agent
+      )));
+    } catch (error) {
+      setAgentActionResults((results) => ({
+        ...results,
+        [provider]: {
+          tone: "warning",
+          message: getErrorMessage(error, "Unable to disconnect terminal CLI."),
+        },
+      }));
+    } finally {
+      setAgentDisconnectState((state) => ({ ...state, [provider]: "idle" }));
+    }
+  }, []);
+
+  const installAgentWithNpm = useCallback(async (provider) => {
+    setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
+    setAgentStatusError("");
+    setAgentInstallResults((results) => {
+      const nextResults = { ...results };
+      delete nextResults[provider];
+      return nextResults;
+    });
+
+    try {
+      const result = await invoke("install_agent", { provider });
+      setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm" } }));
+
+      if (result?.installed) {
+        await refreshAgentStatuses();
+      }
+    } catch (error) {
+      setAgentInstallResults((results) => ({
+        ...results,
+        [provider]: {
+          source: "npm",
+          installed: false,
+          permissionDenied: false,
+          message: getErrorMessage(error, "Unable to install terminal CLI."),
+        },
+      }));
+    } finally {
+      setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+    }
+  }, [refreshAgentStatuses]);
+
+  const updateAgentWithNpm = useCallback(async (provider) => {
+    setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
+    setAgentStatusError("");
+    setAgentInstallResults((results) => {
+      const nextResults = { ...results };
+      delete nextResults[provider];
+      return nextResults;
+    });
+
+    try {
+      const result = await invoke("update_agent", { provider });
+      setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm-update" } }));
+
+      if (result?.installed) {
+        await refreshAgentStatuses();
+      }
+    } catch (error) {
+      setAgentInstallResults((results) => ({
+        ...results,
+        [provider]: {
+          source: "npm-update",
+          installed: false,
+          permissionDenied: false,
+          message: getErrorMessage(error, "Unable to update terminal CLI."),
+        },
+      }));
+    } finally {
+      setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+    }
+  }, [refreshAgentStatuses]);
+
+  const finishStartupAgentGate = useCallback((statuses = agentStatuses, reason = "complete") => {
+    const nextStatuses = Array.isArray(statuses) && statuses.length ? statuses : agentStatuses;
+    const readyCount = nextStatuses.filter((agent) => agent.installed && agent.authenticated).length;
+    const updateAvailableCount = getAgentUpdatesAvailable(nextStatuses).length;
+
+    startupAgentSettingsPendingRef.current = readyCount === 0;
+    setStartupAgentGateState("complete");
+    setStartupAgentUpdateMessage("");
+    writeTerminalTelemetry({
+      phase: "frontend.agent_status.startup_gate_done",
+      fields: {
+        readyCount,
+        reason,
+        updateAvailableCount,
+      },
+    });
+  }, [agentStatuses]);
+
+  const enterWorkspaceAfterAgentCheck = useCallback(() => {
+    finishStartupAgentGate(agentStatuses, "enter_without_update");
+  }, [agentStatuses, finishStartupAgentGate]);
+
+  const updateStartupAgents = useCallback(async () => {
+    const updates = getAgentUpdatesAvailable(agentStatuses);
+
+    if (!updates.length) {
+      finishStartupAgentGate(agentStatuses, "no_updates");
+      return;
+    }
+
+    const updateStartedAt = performance.now();
+    setStartupAgentGateState("updating");
+    setStartupAgentUpdateMessage(`Updating ${formatAgentList(updates)}...`);
+    writeTerminalTelemetry({
+      phase: "frontend.agent_status.startup_update_start",
+      fields: {
+        providers: updates.map((agent) => agent.id),
+        updateCount: updates.length,
+      },
+    });
+
+    for (const agent of updates) {
+      setStartupAgentUpdateMessage(`Updating ${agent.label}...`);
+      setAgentInstallState((state) => ({ ...state, [agent.id]: "updating" }));
+      setAgentInstallResults((results) => {
+        const nextResults = { ...results };
+        delete nextResults[agent.id];
+        return nextResults;
+      });
+
+      try {
+        const result = await invoke("update_agent", { provider: agent.id });
+        setAgentInstallResults((results) => ({ ...results, [agent.id]: { ...result, source: "npm-update" } }));
+      } catch (error) {
+        setAgentInstallResults((results) => ({
+          ...results,
+          [agent.id]: {
+            source: "npm-update",
+            installed: false,
+            permissionDenied: false,
+            message: getErrorMessage(error, "Unable to update terminal CLI."),
+          },
+        }));
+      } finally {
+        setAgentInstallState((state) => ({ ...state, [agent.id]: "idle" }));
+      }
+    }
+
+    setStartupAgentUpdateMessage("Refreshing terminal CLI status...");
+    const nextStatuses = await refreshAgentStatuses();
+    writeTerminalTelemetry({
+      phase: "frontend.agent_status.startup_update_done",
+      elapsedMs: performance.now() - updateStartedAt,
+      fields: {
+        providers: updates.map((agent) => agent.id),
+        updateCount: updates.length,
+      },
+    });
+    finishStartupAgentGate(nextStatuses || agentStatuses, "updated");
+  }, [agentStatuses, finishStartupAgentGate, refreshAgentStatuses]);
+
+  const openAgentNativeInstaller = useCallback(async (agent) => {
+    const guide = AGENT_INSTALL_GUIDES[agent.id] || {};
+    const nativeInstallUrl = agent.nativeInstallUrl || guide.nativeInstallUrl;
+
+    if (!nativeInstallUrl) {
+      setAgentInstallResults((results) => ({
+        ...results,
+        [agent.id]: {
+          source: "native",
+          installed: false,
+          permissionDenied: false,
+          message: "Native installer page is not configured.",
+        },
+      }));
+      return;
+    }
+
+    try {
+      await withTimeout(
+        openUrl(nativeInstallUrl),
+        OPEN_BROWSER_TIMEOUT_MS,
+        "Unable to open native installer page.",
+      );
+      setAgentInstallResults((results) => ({
+        ...results,
+        [agent.id]: {
+          source: "native",
+          installed: false,
+          permissionDenied: false,
+          message: `Opened ${agent.nativeInstallLabel || guide.nativeInstallLabel}. Recheck after install finishes.`,
+        },
+      }));
+    } catch (error) {
+      setAgentInstallResults((results) => ({
+        ...results,
+        [agent.id]: {
+          source: "native",
+          installed: false,
+          permissionDenied: false,
+          message: getErrorMessage(error, "Unable to open native installer page."),
+        },
+      }));
+    }
+  }, []);
+
+  const expireDesktopSession = useCallback((error) => {
+    setSignedOut(
+      "Your desktop session expired. Sign in again with the web app.",
+      getErrorMessage(error, "Desktop session expired."),
+      { clearPending: true },
+    );
+  }, [setSignedOut]);
+
+  const loadWorkspaces = useCallback(async () => {
+    const token = authStore.getToken();
+    const loadStartedAt = performance.now();
+
+    if (!isSafeAuthValue(token)) {
+      expireDesktopSession("Desktop session required to load workspaces.");
+      return;
+    }
+
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.load_start",
+      fields: {
+        activeWorkspaceId: activeWorkspaceIdRef.current,
+      },
+    });
+    setWorkspaceSyncState("loading");
+    setWorkspaceError("");
+
+    try {
+      const result = await invoke("list_workspaces", { token });
+      const nextWorkspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
+      const currentActiveId = activeWorkspaceIdRef.current;
+      const nextActive = nextWorkspaces.find((workspace) => workspace.id === currentActiveId) || nextWorkspaces[0] || null;
+
+      writeTerminalTelemetry({
+        phase: "frontend.workspace.load_done",
+        elapsedMs: performance.now() - loadStartedAt,
+        fields: {
+          activeWorkspaceId: currentActiveId,
+          nextWorkspaceId: nextActive?.id || "",
+          workspaceCount: nextWorkspaces.length,
+        },
+      });
+
+      if (nextActive) {
+        startWorkspaceOpenTelemetry({
+          source: "workspace_load",
+          workspaceId: nextActive.id,
+          fields: {
+            activeWorkspaceId: currentActiveId,
+            workspaceCount: nextWorkspaces.length,
+          },
+        });
+      }
+
+      setWorkspaces(nextWorkspaces);
+      setActiveWorkspaceId((currentActiveId) => {
+        if (nextWorkspaces.length === 0) {
+          return "";
+        }
+
+        const nextActive = nextWorkspaces.find((workspace) => workspace.id === currentActiveId) || nextWorkspaces[0];
+
+        return nextActive.id;
+      });
+
+      setWorkspaceSyncState("idle");
+    } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+
+      writeTerminalTelemetry({
+        phase: "frontend.workspace.load_error",
+        elapsedMs: performance.now() - loadStartedAt,
+        fields: {
+          error: getErrorMessage(error, "Unable to load workspaces."),
+        },
+      });
+      setWorkspaceSyncState("error");
+      setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
+    }
+  }, [expireDesktopSession]);
+
+  const createFirstWorkspace = useCallback(async (event) => {
+    event.preventDefault();
+
+    const token = authStore.getToken();
+    const name = workspaceName.trim();
+
+    if (!isSafeAuthValue(token)) {
+      expireDesktopSession("Desktop session required to create a workspace.");
+      return;
+    }
+
+    if (!name) {
+      setWorkspaceError("Name your first workspace.");
+      return;
+    }
+
+    setWorkspaceSyncState("creating");
+    setWorkspaceError("");
+
+    try {
+      const result = await invoke("create_workspace", {
+        token,
+        name,
+      });
+      const workspace = result?.workspace;
+
+      if (!workspace) {
+        throw new Error("Workspace was not returned by the API.");
+      }
+
+      startWorkspaceOpenTelemetry({
+        source: "workspace_create",
+        workspaceId: workspace.id,
+        fields: {
+          workspaceCount: 1,
+        },
+      });
+      setWorkspaces([workspace]);
+      setActiveWorkspaceId(workspace.id);
+      setWorkspaceName("");
+      setWorkspaceSyncState("idle");
+    } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+
+      setWorkspaceSyncState("error");
+      setWorkspaceError(getErrorMessage(error, "Unable to create workspace."));
+    }
+  }, [expireDesktopSession, workspaceName]);
+
+  const openWorkspaceSettings = useCallback((workspaceId) => {
+    setActiveWorkspaceId(workspaceId);
+    setWorkspaceSettingsModalId(workspaceId);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, []);
+
+  const closeWorkspaceSettings = useCallback(() => {
+    setWorkspaceSettingsModalId("");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, []);
+
+  const saveWorkspaceSettings = useCallback(async (event) => {
+    event.preventDefault();
+
+    if (!activeWorkspace) {
+      setWorkspaceSettingsError("Select a workspace before changing settings.");
+      return;
+    }
+
+    const token = authStore.getToken();
+    const workspaceNameValue = workspaceNameDraft.replace(/[\u0000-\u001F\u007F]/g, "").trim();
+    const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
+    const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
+    const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, activeWorkspace.id);
+    const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, activeWorkspace.id);
+
+    if (!isSafeAuthValue(token)) {
+      expireDesktopSession("Desktop session required to update workspace settings.");
+      return;
+    }
+
+    if (!workspaceNameValue) {
+      setWorkspaceSettingsError("Workspace name is required.");
+      return;
+    }
+
+    if (workspaceNameValue.length > 80) {
+      setWorkspaceSettingsError("Workspace name must be 80 characters or fewer.");
+      return;
+    }
+
+    if (cleanedRoot.length > MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH) {
+      setWorkspaceSettingsError("Root directory path is too long.");
+      return;
+    }
+
+    writeTerminalTelemetry({
+      paneId: activeWorkspace.id,
+      phase: "frontend.workspace_settings.directory_save_start",
+      fields: {
+        currentRootDirectory,
+        currentTerminalCount,
+        requestedRootDirectory: cleanedRoot,
+        requestedTerminalCount: terminalCount,
+        rootChanged: cleanedRoot !== currentRootDirectory,
+        terminalCountChanged: terminalCount !== currentTerminalCount,
+        workspaceId: activeWorkspace.id,
+      },
+    });
+    setWorkspaceSettingsState("saving");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+
+    try {
+      if (cleanedRoot) {
+        writeTerminalTelemetry({
+          paneId: activeWorkspace.id,
+          phase: "frontend.workspace_settings.directory_validate_start",
+          fields: {
+            requestedRootDirectory: cleanedRoot,
+            workspaceId: activeWorkspace.id,
+          },
+        });
+      }
+
+      const normalizedRoot = cleanedRoot
+        ? await invoke("validate_workspace_root_directory", { path: cleanedRoot })
+        : null;
+      const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
+      const nextTerminalIndexSet = new Set(nextTerminalIndexes);
+      const currentTerminalIndexes = normalizeWorkspaceTerminalIndexes(
+        workspaceTerminalSlots[activeWorkspace.id],
+        currentTerminalCount,
+      );
+      const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
+        !nextTerminalIndexSet.has(terminalIndex)
+      ));
+      let nextWorkspace = activeWorkspace;
+
+      writeTerminalTelemetry({
+        paneId: activeWorkspace.id,
+        phase: cleanedRoot
+          ? "frontend.workspace_settings.directory_validate_done"
+          : "frontend.workspace_settings.directory_clear",
+        fields: {
+          currentRootDirectory,
+          requestedRootDirectory: cleanedRoot,
+          resolvedRootDirectory: rootDirectory,
+          rootChanged: rootDirectory !== currentRootDirectory,
+          workspaceId: activeWorkspace.id,
+        },
+      });
+
+      if (workspaceNameValue !== activeWorkspace.name) {
+        const result = await invoke("update_workspace", {
+          token,
+          workspaceId: activeWorkspace.id,
+          name: workspaceNameValue,
+        });
+
+        if (!result?.workspace) {
+          throw new Error("Workspace was not returned by the API.");
+        }
+
+        nextWorkspace = result.workspace;
+        setWorkspaces((items) => items.map((workspace) => (
+          workspace.id === nextWorkspace.id ? nextWorkspace : workspace
+        )));
+      }
+
+      setWorkspaceSettings((settings) => {
+        const nextSettings = updateWorkspaceLocalSettings(settings, activeWorkspace.id, {
+          rootDirectory,
+          terminalCount,
+        });
+        persistWorkspaceSettings(nextSettings);
+        return nextSettings;
+      });
+
+      if (rootDirectory !== currentRootDirectory || terminalCount !== currentTerminalCount) {
+        setWorkspaceTerminalSlots((slots) => ({
+          ...slots,
+          [activeWorkspace.id]: nextTerminalIndexes,
+        }));
+      }
+
+      removedTerminalIndexes.forEach((terminalIndex) => {
+        closeWorkspaceTerminalPane({
+          agentId: activeAgent,
+          nextTerminalCount: terminalCount,
+          previousTerminalCount: currentTerminalCount,
+          reason: "settings_save",
+          terminalIndex,
+          workspaceId: activeWorkspace.id,
+        });
+      });
+
+      setWorkspaceNameDraft(nextWorkspace.name);
+      setWorkspaceRootDraft(rootDirectory);
+      setWorkspaceTerminalCountDraft(String(terminalCount));
+      setWorkspaceSettingsState("idle");
+      setWorkspaceSettingsMessage("Workspace settings saved.");
+      writeTerminalTelemetry({
+        paneId: activeWorkspace.id,
+        phase: "frontend.workspace_settings.directory_save_done",
+        fields: {
+          removedTerminalIndexes,
+          resolvedRootDirectory: rootDirectory,
+          rootChanged: rootDirectory !== currentRootDirectory,
+          terminalCount,
+          terminalCountChanged: terminalCount !== currentTerminalCount,
+          workspaceId: activeWorkspace.id,
+        },
+      });
+    } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+
+      writeTerminalTelemetry({
+        paneId: activeWorkspace.id,
+        phase: "frontend.workspace_settings.directory_save_error",
+        fields: {
+          error: getErrorMessage(error, "Unable to update workspace settings."),
+          requestedRootDirectory: cleanedRoot,
+          requestedTerminalCount: terminalCount,
+          workspaceId: activeWorkspace.id,
+        },
+      });
+      setWorkspaceSettingsState("error");
+      setWorkspaceSettingsError(getErrorMessage(error, "Unable to update workspace settings."));
+    }
+  }, [
+    activeWorkspace,
+    expireDesktopSession,
+    workspaceNameDraft,
+    workspaceRootDraft,
+    workspaceTerminalCountDraft,
+    workspaceSettings,
+    workspaceTerminalSlots,
+    activeAgent,
+  ]);
+
+  const closeWorkspaceTerminal = useCallback(({ workspaceId, terminalIndex }) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+    const currentIndexes = normalizeWorkspaceTerminalIndexes(
+      workspaceTerminalSlots[workspaceId],
+      terminalCount,
+    );
+
+    if (currentIndexes.length <= MIN_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+
+    let nextIndexes = currentIndexes.filter((index) => index !== terminalIndex);
+
+    if (nextIndexes.length === currentIndexes.length) {
+      nextIndexes = currentIndexes.slice(0, -1);
+    }
+
+    const nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+
+    setWorkspaceTerminalSlots((slots) => ({
+      ...slots,
+      [workspaceId]: nextIndexes,
+    }));
+    setWorkspaceSettings((settings) => {
+      const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
+        terminalCount: nextTerminalCount,
+      });
+
+      persistWorkspaceSettings(nextSettings);
+      return nextSettings;
+    });
+
+    if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
+    }
+  }, [workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
+
+  const useDefaultWorkspaceRoot = useCallback(() => {
+    setWorkspaceRootDraft(defaultWorkingDirectory);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, [defaultWorkingDirectory]);
+
+  const logout = useCallback(async () => {
+    authFlowIdRef.current += 1;
+    const token = authStore.getToken();
+
+    setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
+
+    if (isSafeAuthValue(token)) {
+      try {
+        await withTimeout(
+          invoke("logout_desktop_session", { token }),
+          LOGOUT_TIMEOUT_MS,
+          "Desktop sign out timed out.",
+        );
+      } catch {
+        // Local session cleanup still wins if the remote revoke cannot complete.
+      }
+    }
+  }, [setSignedOut]);
+
+  const toggleWindowSize = useCallback(() => {
+    runWindowAction(async () => {
+      const appWindow = getSafeCurrentWindow();
+
+      if (!appWindow) {
+        return;
+      }
+
+      const latestFrameState = await refreshWindowFrameState(appWindow);
+      const isFullscreen = latestFrameState?.isFullscreen ?? windowFrameState.isFullscreen;
+
+      if (isFullscreen) {
+        await appWindow.setFullscreen(false);
+      } else {
+        await appWindow.toggleMaximize();
+      }
+
+      await refreshWindowFrameState(appWindow);
+    });
+  }, [refreshWindowFrameState, windowFrameState.isFullscreen]);
+
+  const handleTitleBarMouseDown = useCallback((event) => {
+    if (event.button !== 0 || event.target.closest("[data-window-control]")) {
+      return;
+    }
+
+    if (event.detail === 2) {
+      toggleWindowSize();
+      return;
+    }
+
+    runWindowAction(() => getSafeCurrentWindow()?.startDragging());
+  }, [toggleWindowSize]);
+
+  const handleWindowResizeEdgeMouseDown = useCallback((event) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const direction = event.currentTarget.dataset.resizeDirection;
+
+    if (!direction) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (event.detail >= 2) {
+      runWindowAction(() => recoverWindowIntoViewport());
+      return;
+    }
+
+    runWindowAction(() => getSafeCurrentWindow()?.startResizeDragging(direction));
+  }, []);
+
+  const handleWindowResizeEdgeDoubleClick = useCallback((event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    runWindowAction(() => recoverWindowIntoViewport());
+  }, []);
+
+  const minimizeWindow = useCallback((event) => {
+    event.stopPropagation();
+    runWindowAction(() => getSafeCurrentWindow()?.minimize());
+  }, []);
+
+  const toggleMaximizeWindow = useCallback((event) => {
+    event.stopPropagation();
+    toggleWindowSize();
+  }, [toggleWindowSize]);
+
+  const closeWindow = useCallback((event) => {
+    event?.stopPropagation?.();
+
+    if (workspaceCloseInFlightRef.current) {
+      return;
+    }
+
+    const appWindow = getSafeCurrentWindow();
+
+    if (!appWindow) {
+      return;
+    }
+
+    workspaceCloseInFlightRef.current = true;
+    workspaceCloseAllowNativeRef.current = false;
+    setWorkspaceCloseState({ isActive: true, closed: 0, total: 0 });
+
+    runWindowAction(async () => {
+      let unlistenCloseProgress = null;
+
+      try {
+        unlistenCloseProgress = await listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
+          const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
+
+          setWorkspaceCloseState((currentCloseState) => {
+            const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
+
+            return {
+              isActive: true,
+              closed: Math.max(currentProgress.closed, nextProgress.closed),
+              total: Math.max(currentProgress.total, nextProgress.total),
+            };
+          });
+        });
+      } catch {
+        // Missing progress events should not block the close sequence.
+      }
+
+      try {
+        const result = await withTimeout(
+          invoke("terminal_close_all"),
+          WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS,
+          "Terminal shutdown timed out.",
+        );
+        const closed = normalizeCloseCount(result?.closed);
+
+        setWorkspaceCloseState((currentCloseState) => {
+          const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
+          const total = Math.max(currentProgress.total, closed);
+
+          return {
+            isActive: true,
+            closed: total,
+            total,
+          };
+        });
+      } catch {
+        // App close should still complete if terminal cleanup cannot report status.
+      } finally {
+        if (typeof unlistenCloseProgress === "function") {
+          unlistenCloseProgress();
+        }
+      }
+
+      try {
+        workspaceCloseAllowNativeRef.current = true;
+        await closeWorkspaceWindowAfterTerminalShutdown(appWindow);
+      } catch (closeError) {
+        writeTerminalTelemetry({
+          phase: "frontend.workspace.close_sequence_failed",
+          fields: { error: closeErrorMessage(closeError) },
+        });
+        workspaceCloseAllowNativeRef.current = false;
+        workspaceCloseInFlightRef.current = false;
+        setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    let unlistenCloseRequested = null;
+    const appWindow = getSafeCurrentWindow();
+
+    if (!appWindow) {
+      return undefined;
+    }
+
+    appWindow.onCloseRequested((event) => {
+      if (workspaceCloseAllowNativeRef.current) {
+        return;
+      }
+
+      event.preventDefault();
+      closeWindow();
+    })
+      .then((unlisten) => {
+        if (!isMounted && typeof unlisten === "function") {
+          unlisten();
+          return;
+        }
+
+        unlistenCloseRequested = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      isMounted = false;
+
+      if (typeof unlistenCloseRequested === "function") {
+        unlistenCloseRequested();
+      }
+    };
+  }, [closeWindow]);
+
+  useEffect(() => {
+    checkBackend();
+  }, [checkBackend]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let unlistenResize = null;
+    const appWindow = getSafeCurrentWindow();
+
+    if (!appWindow) {
+      return undefined;
+    }
+
+    const refresh = async () => {
+      try {
+        const nextFrameState = await readWindowFrameState(appWindow);
+
+        if (isMounted && nextFrameState) {
+          applyWindowFrameState(nextFrameState);
+        }
+      } catch {
+        // Window frame state is a visual hint; unavailable APIs should not block the shell.
+      }
+    };
+
+    refresh();
+
+    appWindow.onResized(refresh)
+      .then((unlisten) => {
+        if (!isMounted && typeof unlisten === "function") {
+          unlisten();
+          return;
+        }
+
+        unlistenResize = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      isMounted = false;
+
+      if (typeof unlistenResize === "function") {
+        unlistenResize();
+      }
+    };
+  }, [applyWindowFrameState]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    invoke("forge_working_directory")
+      .then((result) => {
+        if (isMounted) {
+          setDefaultWorkingDirectory(result?.workingDirectory || "");
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setDefaultWorkingDirectory("");
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => () => {
+    window.clearTimeout(viewTransitionTimeoutRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (authState === "authenticated") {
+      return;
+    }
+
+    setWorkspaceState("idle");
+    setWorkspaces([]);
+    setActiveWorkspaceId("");
+    setWorkspaceSyncState("idle");
+    setWorkspaceRootDraft("");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceSettingsModalId("");
+    agentInitialStatusUserRef.current = "";
+    startupAgentFlowIdRef.current += 1;
+    startupAgentSettingsPendingRef.current = false;
+    workspaceAgentLaunchKeyRef.current = "";
+    workspaceAgentBatchInFlightKeyRef.current = "";
+    preparedTerminalsRef.current.clear();
+    setStartupAgentGateState("idle");
+    setStartupAgentUpdateMessage("");
+    setWorkspaceAgentLaunchEpoch(0);
+    setWorkspaceAgentBatchSentKey("");
+    setPreparedTerminalVersion((version) => version + 1);
+  }, [authState]);
+
+  useEffect(() => {
+    if (authInitialized) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (authStartupFinishedRef.current) {
+        return;
+      }
+
+      authFlowIdRef.current += 1;
+      setSignedOut(
+        "Secure session check timed out. Sign in with the web app.",
+        SESSION_RESTORE_TIMEOUT_MESSAGE,
+        { clearPending: true },
+      );
+      completeAuthStartup();
+    }, AUTH_STARTUP_TIMEOUT_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [authInitialized, completeAuthStartup, setSignedOut]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let unlistenDeepLinks = null;
+
+    onOpenUrl(async (urls) => {
+      if (!isMounted) {
+        return;
+      }
+
+      for (const url of urls) {
+        const handled = await completeDesktopLogin(url);
+
+        if (!isMounted || handled) {
+          break;
+        }
+      }
+    })
+      .then((unlisten) => {
+        if (!isMounted && typeof unlisten === "function") {
+          unlisten();
+          return;
+        }
+
+        unlistenDeepLinks = unlisten;
+      })
+      .catch((error) => {
+        if (isMounted) {
+          authStore.setError(getErrorMessage(error, "Desktop login callback listener is unavailable."));
+        }
+      });
+
+    async function initializeAuth() {
+      try {
+        let startUrls = [];
+        let handledDeepLink = false;
+
+        try {
+          startUrls = await withTimeout(
+            getCurrent(),
+            DEEP_LINK_STARTUP_TIMEOUT_MS,
+            "Desktop startup link check timed out.",
+          );
+        } catch {
+          startUrls = [];
+        }
+
+        if (!isMounted) {
+          return;
+        }
+
+        if (Array.isArray(startUrls)) {
+          for (const url of startUrls) {
+            const handled = await completeDesktopLogin(url);
+            handledDeepLink = handled || handledDeepLink;
+
+            if (!isMounted || handled) {
+              break;
+            }
+          }
+        }
+
+        if (!handledDeepLink && isMounted) {
+          await validateStoredSession();
+        }
+      } catch (error) {
+        if (isMounted && !authStartupFinishedRef.current) {
+          authFlowIdRef.current += 1;
+          setSignedOut(
+            "Unable to restore your desktop session. Sign in with the web app.",
+            getErrorMessage(error, "Desktop sign in is unavailable."),
+            { clearPending: true },
+          );
+        }
+      } finally {
+        if (isMounted) {
+          completeAuthStartup();
+        }
+      }
+    }
+
+    initializeAuth();
+
+    return () => {
+      isMounted = false;
+
+      if (typeof unlistenDeepLinks === "function") {
+        unlistenDeepLinks();
+      }
+    };
+  }, [completeAuthStartup, completeDesktopLogin, setSignedOut, validateStoredSession]);
+
+  useEffect(() => {
+    if (!authInitialized) {
+      return undefined;
+    }
+
+    const elapsed = Date.now() - launchStartedAtRef.current;
+    const remaining = Math.max(350, LAUNCH_MINIMUM_MS - elapsed);
+    const timeoutId = window.setTimeout(() => {
+      setLaunchScreenVisible(false);
+    }, remaining);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [authInitialized]);
+
+  const isStartupAgentGateBlocking = startupAgentGateState === "checking"
+    || startupAgentGateState === "choice"
+    || startupAgentGateState === "updating";
+
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || workspaceState !== "initializing"
+      || isLaunchScreenVisible
+      || isStartupAgentGateBlocking
+    ) {
+      return undefined;
+    }
+
+    writeTerminalTelemetry({
+      phase: "frontend.workspace.ready_immediate",
+    });
+    setWorkspaceState("ready");
+    authStore.setMessage("Workspace ready.");
+
+    return undefined;
+  }, [authState, isLaunchScreenVisible, isStartupAgentGateBlocking, workspaceState]);
+
+  useEffect(() => {
+    if (authState !== "authenticated" || !isPaidUser(user) || workspaceState !== "initializing") {
+      return undefined;
+    }
+
+    const userKey = user?.id || user?.email || "paid-user";
+
+    if (agentInitialStatusUserRef.current !== userKey) {
+      const startupFlowId = startupAgentFlowIdRef.current + 1;
+
+      startupAgentFlowIdRef.current = startupFlowId;
+      agentInitialStatusUserRef.current = userKey;
+      setStartupAgentGateState("checking");
+      setStartupAgentUpdateMessage("");
+      writeTerminalTelemetry({
+        phase: "frontend.agent_status.startup_gate_start",
+        fields: {
+          userKeyPresent: Boolean(userKey),
+        },
+      });
+      refreshAudioModelStatus();
+      loadWorkspaces();
+
+      refreshAgentStatuses().then((nextStatuses) => {
+        if (startupAgentFlowIdRef.current !== startupFlowId || agentInitialStatusUserRef.current !== userKey) {
+          return;
+        }
+
+        if (!nextStatuses) {
+          finishStartupAgentGate(agentStatuses, "status_error");
+          return;
+        }
+
+        const updates = getAgentUpdatesAvailable(nextStatuses);
+
+        if (updates.length) {
+          setStartupAgentGateState("choice");
+          writeTerminalTelemetry({
+            phase: "frontend.agent_status.startup_update_choice",
+            fields: {
+              providers: updates.map((agent) => agent.id),
+              updateCount: updates.length,
+            },
+          });
+          return;
+        }
+
+        finishStartupAgentGate(nextStatuses, "no_updates");
+      });
+    }
+
+    return undefined;
+  }, [
+    agentStatuses,
+    authState,
+    finishStartupAgentGate,
+    loadWorkspaces,
+    refreshAgentStatuses,
+    refreshAudioModelStatus,
+    user,
+    workspaceState,
+  ]);
+
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || workspaceState !== "ready"
+      || !startupAgentSettingsPendingRef.current
+    ) {
+      return;
+    }
+
+    startupAgentSettingsPendingRef.current = false;
+    showView("settings");
+  }, [authState, showView, workspaceState]);
+
+  useEffect(() => {
+    if (authState === "authenticated" && activeView === "audio") {
+      refreshAudioModelStatus();
+    }
+  }, [activeView, authState, refreshAudioModelStatus]);
+
+  const isAuthBusy = authState === "waiting" || authState === "exchanging";
+  const authPanelTitle = {
+    waiting: "Waiting for web sign in",
+    exchanging: "Finishing desktop sign in",
+    signedOut: "Continue in browser",
+  }[authState] || "Continue in browser";
+  const authButtonLabel = {
+    waiting: "Waiting...",
+    exchanging: "Finishing...",
+  }[authState] || "Sign in with web";
+  const authStateLabel = {
+    authenticated: "active",
+    exchanging: "exchanging",
+    signedOut: "ready",
+    waiting: "waiting",
+  }[authState] || "ready";
+  const displayName = user?.name || user?.email || "there";
+  const userIsPaid = isPaidUser(user);
+  const planLabel = userIsPaid ? "Pro" : "Free";
+  const connectedAgentCount = agentStatuses.filter((agent) => agent.installed && agent.authenticated).length;
+  const startupAgentUpdates = getAgentUpdatesAvailable(agentStatuses);
+  const startupAgentStatusTitle = startupAgentGateState === "choice"
+    ? "Terminal CLI updates available"
+    : startupAgentGateState === "updating"
+      ? startupAgentUpdateMessage || "Updating terminal CLIs..."
+      : startupAgentGateState === "checking"
+        ? "Checking terminal CLIs..."
+        : "Terminal readiness checked";
+  const startupAgentStatusDetail = startupAgentGateState === "choice"
+    ? getAgentUpdateSummary(startupAgentUpdates)
+    : startupAgentGateState === "updating"
+      ? "The workspace will open when the selected updates finish."
+      : startupAgentGateState === "checking"
+        ? "Codex and Claude Code readiness are being checked while the workspace loads."
+        : connectedAgentCount > 0
+          ? `${connectedAgentCount}/2 terminal CLIs ready.`
+          : "No ready terminal CLIs found. Settings will open so you can install or connect one.";
+  const startupAgentStatusState = startupAgentGateState === "choice"
+    ? "update"
+    : startupAgentGateState === "updating"
+      ? "checking"
+      : connectedAgentCount > 0
+        ? "ready"
+        : "warning";
+  const activeWorkspaceRootDirectory = activeWorkspace
+    ? getWorkspaceRootDirectory(workspaceSettings, activeWorkspace.id)
+    : "";
+  const workspaceTerminalAgent = useMemo(
+    () => getReadyAgent(agentStatuses, activeAgent),
+    [activeAgent, agentStatuses],
+  );
+  const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
+  const workspacePrewarmAgent = useMemo(
+    () => getLaunchableAgent(agentStatuses, activeAgent),
+    [activeAgent, agentStatuses],
+  );
+  const shouldPrewarmWorkspaceTerminals = authState === "authenticated"
+    && userIsPaid
+    && workspaceState === "initializing"
+    && isStartupAgentGateBlocking
+    && Boolean(activeWorkspace)
+    && !shouldShowWorkspaceSetup;
+  const workspaceTerminalRenderAgent = workspaceTerminalAgent
+    || (shouldPrewarmWorkspaceTerminals ? workspacePrewarmAgent : null);
+  const workspaceTerminalAgentLaunchReady = workspaceState === "ready" && Boolean(workspaceTerminalAgent);
+  const activeWorkspaceTerminalCount = activeWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceTerminalCount(workspaceSettings, activeWorkspace.id)
+    : MIN_WORKSPACE_TERMINAL_COUNT;
+  const activeWorkspaceTerminalIndexes = useMemo(
+    () => (
+      activeWorkspace && !shouldShowWorkspaceSetup
+        ? normalizeWorkspaceTerminalIndexes(
+          workspaceTerminalSlots[activeWorkspace.id],
+          activeWorkspaceTerminalCount,
+        )
+        : getDefaultTerminalIndexes(MIN_WORKSPACE_TERMINAL_COUNT)
+    ),
+    [
+      activeWorkspace?.id,
+      activeWorkspaceTerminalCount,
+      shouldShowWorkspaceSetup,
+      workspaceTerminalSlots,
+    ],
+  );
+  const activeWorkspaceVisibleTerminalCount = activeWorkspaceTerminalIndexes.length;
+  const workspaceAgentLaunchKey = workspaceTerminalAgentLaunchReady && activeWorkspace
+    ? [
+      activeWorkspace.id,
+      workspaceTerminalAgent.id,
+      activeWorkspaceTerminalIndexes.join(","),
+    ].join(":")
+    : "";
+  const terminalPanelRows = useMemo(
+    () => getTerminalPanelRows(activeWorkspaceTerminalIndexes),
+    [activeWorkspaceTerminalIndexes],
+  );
+  const activeWorkspaceRootDisplay = activeWorkspaceRootDirectory || defaultWorkingDirectory || "App directory";
+  const activeWorkspaceAgentWorkingDirectory = activeWorkspaceRootDirectory || defaultWorkingDirectory;
+  const activeWorkspaceFileRoot = activeWorkspaceRootDirectory || defaultWorkingDirectory;
+  const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && activeWorkspace);
+  const openActiveWorkspaceSettings = useCallback(() => {
+    if (activeWorkspace) {
+      openWorkspaceSettings(activeWorkspace.id);
+      return;
+    }
+
+    showView("settings");
+  }, [activeWorkspace, openWorkspaceSettings, showView]);
+
+  const handlePreparedTerminalChange = useCallback((session) => {
+    if (!session?.paneId) {
+      return;
+    }
+
+    const key = `${session.workspaceId || ""}:${session.terminalIndex}:${session.agentId || ""}:${session.paneId}`;
+
+    if (session.ready) {
+      preparedTerminalsRef.current.set(key, {
+        agentId: session.agentId || "",
+        instanceId: session.instanceId,
+        paneId: session.paneId,
+        terminalIndex: session.terminalIndex,
+        workspaceId: session.workspaceId || "",
+      });
+    } else {
+      preparedTerminalsRef.current.delete(key);
+    }
+
+    setPreparedTerminalVersion((version) => version + 1);
+  }, []);
+
+  const preparedWorkspaceTerminalRequests = useMemo(() => {
+    if (!activeWorkspace || !workspaceTerminalAgent) {
+      return [];
+    }
+
+    const terminalIndexes = new Set(activeWorkspaceTerminalIndexes);
+
+    return Array.from(preparedTerminalsRef.current.values())
+      .filter((session) => (
+        session.workspaceId === activeWorkspace.id
+        && session.agentId === workspaceTerminalAgent.id
+        && terminalIndexes.has(session.terminalIndex)
+      ))
+      .sort((left, right) => left.terminalIndex - right.terminalIndex)
+      .map((session) => ({
+        instanceId: session.instanceId,
+        model: "",
+        paneId: session.paneId,
+        provider: workspaceTerminalAgent.id,
+      }));
+  }, [
+    activeWorkspace?.id,
+    activeWorkspaceTerminalIndexes,
+    preparedTerminalVersion,
+    workspaceTerminalAgent?.id,
+  ]);
+  const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.length;
+  const shouldHoldWorkspaceRevealForTerminalBatch = Boolean(
+    workspaceAgentLaunchKey
+    && preparedWorkspaceTerminalCount > 0
+    && workspaceAgentBatchSentKey !== workspaceAgentLaunchKey,
+  );
+
+  useEffect(() => {
+    if (!workspaceAgentLaunchKey) {
+      workspaceAgentLaunchKeyRef.current = "";
+      workspaceAgentBatchInFlightKeyRef.current = "";
+      setWorkspaceAgentBatchSentKey("");
+      return;
+    }
+
+    if (
+      workspaceAgentBatchSentKey === workspaceAgentLaunchKey
+      || workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
+      || preparedWorkspaceTerminalCount === 0
+      || preparedWorkspaceTerminalCount < activeWorkspaceVisibleTerminalCount
+    ) {
+      return;
+    }
+
+    workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
+    workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
+    const batchStartedAt = performance.now();
+    writeTerminalTelemetry({
+      paneId: activeWorkspace?.id || "",
+      phase: "frontend.agent_launch.batch_start",
+      fields: {
+        agentId: workspaceTerminalAgent?.id || "",
+        preparedTerminalCount: preparedWorkspaceTerminalCount,
+        terminalCount: activeWorkspaceVisibleTerminalCount,
+        terminalIndexes: activeWorkspaceTerminalIndexes,
+        ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
+      },
+    });
+
+    invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
+      .then((result) => {
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+        preparedTerminalsRef.current.forEach((session, key) => {
+          if (preparedWorkspaceTerminalRequests.some((request) => (
+            request.paneId === session.paneId && request.instanceId === session.instanceId
+          ))) {
+            preparedTerminalsRef.current.delete(key);
+          }
+        });
+        setPreparedTerminalVersion((version) => version + 1);
+        writeTerminalTelemetry({
+          paneId: activeWorkspace?.id || "",
+          phase: "frontend.agent_launch.batch_done",
+          elapsedMs: performance.now() - batchStartedAt,
+          fields: {
+            agentId: workspaceTerminalAgent?.id || "",
+            preparedTerminalCount: preparedWorkspaceTerminalCount,
+            started: result?.started ?? null,
+            skipped: result?.skipped ?? null,
+            terminalCount: activeWorkspaceVisibleTerminalCount,
+            ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
+          },
+        });
+      })
+      .catch((error) => {
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+        preparedTerminalsRef.current.forEach((session, key) => {
+          if (preparedWorkspaceTerminalRequests.some((request) => (
+            request.paneId === session.paneId && request.instanceId === session.instanceId
+          ))) {
+            preparedTerminalsRef.current.delete(key);
+          }
+        });
+        setPreparedTerminalVersion((version) => version + 1);
+        writeTerminalTelemetry({
+          paneId: activeWorkspace?.id || "",
+          phase: "frontend.agent_launch.batch_error",
+          elapsedMs: performance.now() - batchStartedAt,
+          fields: {
+            agentId: workspaceTerminalAgent?.id || "",
+            error: getErrorMessage(error, "Unable to start terminal agents."),
+            preparedTerminalCount: preparedWorkspaceTerminalCount,
+            terminalCount: activeWorkspaceVisibleTerminalCount,
+            ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
+          },
+        });
+      });
+  }, [
+    activeWorkspace?.id,
+    activeWorkspaceTerminalIndexes,
+    activeWorkspaceVisibleTerminalCount,
+    preparedWorkspaceTerminalCount,
+    preparedWorkspaceTerminalRequests,
+    workspaceAgentBatchSentKey,
+    workspaceAgentLaunchKey,
+    workspaceTerminalAgent?.id,
+  ]);
+
+  useEffect(() => {
+    setWorkspaceNameDraft(activeWorkspace?.name || "");
+    setWorkspaceTerminalCountDraft(String(activeWorkspace ? activeWorkspaceTerminalCount : MIN_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceRootDraft(activeWorkspaceRootDirectory);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, [activeWorkspace?.id, activeWorkspace?.name, activeWorkspaceRootDirectory, activeWorkspaceTerminalCount, workspaceSettingsModalId]);
+
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || visibleView !== DEFAULT_WORKSPACE_VIEW
+      || !activeWorkspace
+      || shouldShowWorkspaceSetup
+    ) {
+      return;
+    }
+
+    writeTerminalTelemetry({
+      paneId: activeWorkspace.id,
+      phase: "frontend.workspace.terminals_surface_commit",
+      fields: {
+        activeView,
+        agentId: workspaceTerminalAgent?.id || "",
+        agentStatusState,
+        hasAgent: Boolean(workspaceTerminalAgent),
+        rootSelected: Boolean(activeWorkspaceRootDirectory),
+        rowCount: terminalPanelRows.length,
+        terminalCount: activeWorkspaceVisibleTerminalCount,
+        terminalIndexes: activeWorkspaceTerminalIndexes,
+        viewMotion,
+        visibleView,
+        workspaceState,
+        workspaceSyncState,
+        ...getWorkspaceOpenTelemetryFields(activeWorkspace.id),
+      },
+    });
+  }, [
+    activeView,
+    activeWorkspace,
+    activeWorkspaceRootDirectory,
+    activeWorkspaceTerminalIndexes,
+    activeWorkspaceVisibleTerminalCount,
+    agentStatusState,
+    authState,
+    shouldShowWorkspaceSetup,
+    terminalPanelRows.length,
+    viewMotion,
+    visibleView,
+    workspaceState,
+    workspaceSyncState,
+    workspaceTerminalAgent,
+  ]);
+
+  const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
+  const shouldShowLaunchScreen = isLaunchScreenVisible || isConnectivityBlocked;
+  const launchState = isConnectivityBlocked && apiState === "offline"
+    ? "offline"
+    : isConnectivityBlocked && apiState === "checking"
+      ? "checking"
+      : "loading";
+  const launchStatus = launchState === "offline"
+    ? "No internet connection"
+    : launchState === "checking"
+      ? "Checking connection..."
+      : !authInitialized
+        ? "Checking secure session..."
+        : authState === "authenticated"
+          ? "Preparing workspace..."
+          : "Opening sign in...";
+  const launchDetail = launchState === "offline"
+    ? apiMessage
+    : launchState === "checking"
+      ? "Contacting the Diff Forge API before opening sign in."
+      : !authInitialized
+        ? "Validating this device before showing your workspace."
+        : "Finishing the desktop handoff.";
+  const isWindowExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
+  const windowResizeLabel = isWindowExpanded ? "Restore" : "Maximize";
+  const workspaceCloseReportedClosed = normalizeCloseCount(workspaceCloseState.closed);
+  const workspaceCloseTotal = Math.max(normalizeCloseCount(workspaceCloseState.total), workspaceCloseReportedClosed);
+  const workspaceCloseClosed = Math.min(workspaceCloseReportedClosed, workspaceCloseTotal);
+  const workspaceCloseProgress = workspaceCloseTotal > 0
+    ? Math.min(100, Math.round((workspaceCloseClosed / workspaceCloseTotal) * 100))
+    : 0;
+  const workspaceCloseTerminalLabel = workspaceCloseTotal === 1 ? "terminal" : "terminals";
+  const isWorkspaceStartupOverlayVisible = workspaceState !== "ready"
+    || shouldHoldWorkspaceRevealForTerminalBatch;
+
+  return (
+    <>
+      <GlobalStyle />
+      <AppFrame>
+        <WindowTitleBar data-tauri-drag-region onMouseDown={handleTitleBarMouseDown}>
+          <WindowTitle data-tauri-drag-region>
+            <img src="/logo.webp" alt="" />
+            <span>{BRAND_NAME}</span>
+          </WindowTitle>
+          <WindowControls aria-label="Window controls">
+            <WindowControlButton
+              aria-label="Minimize"
+              data-window-control
+              onClick={minimizeWindow}
+              title="Minimize"
+              type="button"
+            >
+              <TitleMinimizeIcon aria-hidden="true" />
+            </WindowControlButton>
+            <WindowControlButton
+              aria-label={windowResizeLabel}
+              data-window-control
+              onClick={toggleMaximizeWindow}
+              title={windowResizeLabel}
+              type="button"
+            >
+              {isWindowExpanded ? (
+                <TitleRestoreIcon aria-hidden="true" />
+              ) : (
+                <TitleMaximizeIcon aria-hidden="true" />
+              )}
+            </WindowControlButton>
+            <WindowControlButton
+              aria-label="Close"
+              data-window-control
+              data-variant="close"
+              onClick={closeWindow}
+              title="Close"
+              type="button"
+            >
+              <TitleCloseIcon aria-hidden="true" />
+            </WindowControlButton>
+          </WindowControls>
+        </WindowTitleBar>
+
+        <WindowResizeEdges aria-hidden="true">
+          {WINDOW_RESIZE_EDGES.map(({ placement, direction }) => (
+            <WindowResizeHandle
+              data-placement={placement}
+              data-resize-direction={direction}
+              key={placement}
+              onDoubleClick={handleWindowResizeEdgeDoubleClick}
+              onMouseDown={handleWindowResizeEdgeMouseDown}
+            />
+          ))}
+        </WindowResizeEdges>
+
+        <AppContent>
+          {shouldShowLaunchScreen ? (
+            <SplashScreen aria-label={`${BRAND_NAME} is launching`} data-state={launchState}>
+              <AmbientPanel data-position="left">
+                <span>&gt; codex</span>
+                <p>Analyzing codebase...</p>
+                <p>Generating changes...</p>
+              </AmbientPanel>
+              <AmbientPanel data-position="right">
+                <span>src/engine/runner.ts</span>
+                <p>+ return output</p>
+                <p>- return result</p>
+              </AmbientPanel>
+              <SplashCenter>
+                <SplashLogo src="/logo.webp" alt="" />
+                <SplashTitle>{BRAND_NAME}</SplashTitle>
+                <SplashTagline>Manage Codex & Claude Code. Build faster.</SplashTagline>
+                <LoadingTrack aria-hidden="true" data-state={launchState}>
+                  {launchState !== "offline" && <LoadingFill />}
+                </LoadingTrack>
+                <LaunchStatusPanel data-state={launchState}>
+                  <LaunchStatusIcon aria-hidden="true" data-state={launchState}>
+                    {launchState === "offline" ? (
+                      <ErrorIcon />
+                    ) : launchState === "checking" ? (
+                      <PendingIcon />
+                    ) : (
+                      <ConnectedIcon />
+                    )}
+                  </LaunchStatusIcon>
+                  <LaunchStatusCopy>
+                    <LoadingText>{launchStatus}</LoadingText>
+                    <LoadingDetail>{launchDetail}</LoadingDetail>
+                  </LaunchStatusCopy>
+                </LaunchStatusPanel>
+                {launchState === "offline" && (
+                  <LaunchActions>
+                    <SecondaryButton disabled={apiState === "checking"} onClick={checkBackend} type="button">
+                      <ButtonRefreshIcon aria-hidden="true" />
+                      <span>Retry connection</span>
+                    </SecondaryButton>
+                  </LaunchActions>
+                )}
+              </SplashCenter>
+            </SplashScreen>
+          ) : authState === "authenticated" && !userIsPaid ? (
+            <PricingScreen aria-label="Desktop pricing">
+              <PricingHero>
+                <BrandMark as="div" aria-label="Diffforge">
+                  <img src="/logo.webp" alt="" />
+                  <strong>Diffforge</strong>
+                </BrandMark>
+                <PricingCopy>
+                  <Kicker>Plan required</Kicker>
+                  <PricingTitle>Upgrade to unlock the desktop workspace</PricingTitle>
+                  <PricingText>
+                    You are signed in as {displayName}. Free accounts can review pricing here,
+                    but the desktop dashboard stays locked until your plan is paid.
+                  </PricingText>
+                </PricingCopy>
+                <PricingActions>
+                  <PrimaryButton onClick={openPricing} type="button">
+                    <ButtonBrowserIcon aria-hidden="true" />
+                    <span>Open pricing</span>
+                  </PrimaryButton>
+                  <SecondaryButton onClick={refreshSubscriptionStatus} type="button">
+                    <ButtonRefreshIcon aria-hidden="true" />
+                    <span>Check status</span>
+                  </SecondaryButton>
+                  <SecondaryButton onClick={logout} type="button">
+                    <ButtonLogoutIcon aria-hidden="true" />
+                    <span>Sign out</span>
+                  </SecondaryButton>
+                </PricingActions>
+                {authError && <FormMessage $state="error">{authError}</FormMessage>}
+              </PricingHero>
+
+              <PricingPlans aria-label="Plans">
+                <PricingPlanCard>
+                  <PlanEyebrow>{planLabel}</PlanEyebrow>
+                  <PlanPrice>$0</PlanPrice>
+                  <PlanDescription>Browser login, pricing access, and account setup.</PlanDescription>
+                  <PlanFeatureList>
+                    <li>Web account login</li>
+                    <li>Pricing and billing status</li>
+                    <li>Desktop dashboard locked</li>
+                  </PlanFeatureList>
+                </PricingPlanCard>
+
+                <PricingPlanCard data-featured="true">
+                  <PlanEyebrow>Pro</PlanEyebrow>
+                  <PlanPrice>
+                    $25<span>/mo</span>
+                  </PlanPrice>
+                  <PlanDescription>Paid status unlocks the native dashboard shell.</PlanDescription>
+                  <PlanFeatureList>
+                    <li>Desktop workspace dashboard</li>
+                    <li>Blank desktop workspace shell</li>
+                    <li>Priority native app access</li>
+                  </PlanFeatureList>
+                </PricingPlanCard>
+              </PricingPlans>
+            </PricingScreen>
+          ) : authState === "authenticated" ? (
+            <AuthenticatedWorkspaceFrame>
+              <DashboardShell
+                aria-hidden={isWorkspaceStartupOverlayVisible}
+                data-startup={isWorkspaceStartupOverlayVisible}
+              >
+              <WorkspaceRail aria-label="Workspace navigation">
+                <RailTop>
+                  <RailSectionTitle>Workspaces</RailSectionTitle>
+                  <WorkspaceList>
+                    {workspaces.map((workspace) => {
+                      const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
+
+                      return (
+                        <WorkspaceRow data-active={workspace.id === activeWorkspaceId} key={workspace.id}>
+                          <WorkspaceButton
+                            data-active={workspace.id === activeWorkspaceId}
+                            onClick={() => {
+                              startWorkspaceOpenTelemetry({
+                                source: "workspace_click",
+                                workspaceId: workspace.id,
+                                fields: {
+                                  activeView,
+                                  fromWorkspaceId: activeWorkspaceId,
+                                  visibleView,
+                                  workspaceCount: workspaces.length,
+                                },
+                              });
+                              setActiveWorkspaceId(workspace.id);
+                            }}
+                            title={workspace.name}
+                            type="button"
+                          >
+                            <WorkspaceAccent aria-hidden="true" />
+                            <WorkspaceLabel>
+                              <strong>{workspace.name}</strong>
+                              <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
+                            </WorkspaceLabel>
+                          </WorkspaceButton>
+                          <WorkspaceSettingsButton
+                            aria-label={`Open settings for ${workspace.name}`}
+                            onClick={() => openWorkspaceSettings(workspace.id)}
+                            title="Workspace settings"
+                            type="button"
+                          >
+                            <ButtonSettingsIcon aria-hidden="true" />
+                          </WorkspaceSettingsButton>
+                        </WorkspaceRow>
+                      );
+                    })}
+                    {workspaceSyncState === "loading" && (
+                      <WorkspaceMuted>Loading...</WorkspaceMuted>
+                    )}
+                  </WorkspaceList>
+                </RailTop>
+
+                <RailFooter>
+                  <RailActionButton
+                    data-active={activeView === DEFAULT_WORKSPACE_VIEW}
+                    onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                    type="button"
+                  >
+                    <ButtonTerminalIcon aria-hidden="true" />
+                    <span>Terminals</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "files"}
+                    onClick={() => showView("files")}
+                    type="button"
+                  >
+                    <ButtonFolderIcon aria-hidden="true" />
+                    <span>Files</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "vault"}
+                    onClick={() => showView("vault")}
+                    type="button"
+                  >
+                    <ButtonKeyIcon aria-hidden="true" />
+                    <span>Vault</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "audio"}
+                    onClick={() => showView("audio")}
+                    type="button"
+                  >
+                    <ButtonMicIcon aria-hidden="true" />
+                    <span>Audio</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "mcps"}
+                    onClick={() => showView("mcps")}
+                    type="button"
+                  >
+                    <ButtonHubIcon aria-hidden="true" />
+                    <span>MCPs</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "settings"}
+                    onClick={() => showView("settings")}
+                    type="button"
+                  >
+                    <ButtonSettingsIcon aria-hidden="true" />
+                    <span>Settings</span>
+                  </RailActionButton>
+                  <RailActionButton onClick={logout} type="button">
+                    <ButtonLogoutIcon aria-hidden="true" />
+                    <span>Sign out</span>
+                  </RailActionButton>
+                </RailFooter>
+              </WorkspaceRail>
+
+              {visibleView === "settings" ? (
+                <SettingsPage data-motion={viewMotion}>
+                  <PageHeader>
+                    <div>
+                      <Kicker>Settings</Kicker>
+                      <DashboardTitle>Desktop settings</DashboardTitle>
+                      <PageSubline>Terminal providers and verified account state for this device.</PageSubline>
+                    </div>
+                    <SecondaryButton onClick={() => showView(DEFAULT_WORKSPACE_VIEW)} type="button">
+                      <ConnectedIcon aria-hidden="true" />
+                      <span>Back</span>
+                    </SecondaryButton>
+                  </PageHeader>
+
+                  <AgentSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Terminal providers</PanelKicker>
+                        <PanelHeading>Codex and Claude Code</PanelHeading>
+                      </div>
+                      <AgentPanelActions>
+                        <AgentReadyPill data-tone={connectedAgentCount > 0 ? "blue" : "orange"}>
+                          <ButtonBotIcon aria-hidden="true" />
+                          <span>{connectedAgentCount}/2 ready</span>
+                        </AgentReadyPill>
+                        <SecondaryButton disabled={agentStatusState === "checking"} onClick={refreshAgentStatuses} type="button">
+                          <ButtonRefreshIcon aria-hidden="true" />
+                          <span>{agentStatusState === "checking" ? "Checking..." : "Recheck"}</span>
+                        </SecondaryButton>
+                      </AgentPanelActions>
+                    </PanelHeaderRow>
+
+                    {agentStatusError && <FormMessage $state="error">{agentStatusError}</FormMessage>}
+
+                    <AgentCardGrid>
+                      {agentStatuses.map((agent) => {
+                        const installResult = agentInstallResults[agent.id];
+                        const actionResult = agentActionResults[agent.id];
+                        const isInstallingAgent = agentInstallState[agent.id] === "installing";
+                        const isUpdatingAgent = agentInstallState[agent.id] === "updating";
+                        const isPackageActionBusy = isInstallingAgent || isUpdatingAgent;
+                        const isDisconnectingAgent = agentDisconnectState[agent.id] === "disconnecting";
+                        const needsInstallMessage = `${agent.label} needs to be installed before this action.`;
+                        const authActionDisabled = !agent.installed || agentStatusState === "checking" || isDisconnectingAgent;
+                        const useDisabled = !agent.installed;
+                        const authActionTitle = !agent.installed
+                          ? needsInstallMessage
+                          : isDisconnectingAgent
+                            ? `Disconnecting ${agent.label}.`
+                          : agentStatusState === "checking"
+                            ? "Checking terminal CLI status."
+                            : agent.authenticated
+                              ? `Disconnect ${agent.label} from this machine.`
+                              : `Connect ${agent.label}`;
+                        const useTitle = !agent.installed ? needsInstallMessage : `Use ${agent.label}`;
+                        const npmInstallLabel = isInstallingAgent
+                          ? "Installing..."
+                          : installResult?.source === "npm" && !installResult.installed
+                            ? "Retry npm install"
+                            : agent.installed
+                              ? "Update with npm"
+                              : "Install with npm";
+                        const npmUpdateLabel = isUpdatingAgent
+                          ? "Updating..."
+                          : installResult?.source === "npm-update" && installResult.permissionDenied
+                            ? "Retry update"
+                            : "Update with npm";
+                        const installMessageTone = installResult?.installed
+                          ? "success"
+                          : installResult?.permissionDenied
+                            ? "warning"
+                            : "neutral";
+
+                        return (
+                          <AgentCard data-tone={getAgentTone(agent)} key={agent.id}>
+                            <AgentCardHeader>
+                              <AgentIcon data-tone={getAgentTone(agent)}>
+                                {agent.id === "codex" ? <ButtonCodeIcon aria-hidden="true" /> : <ButtonBotIcon aria-hidden="true" />}
+                              </AgentIcon>
+                              <div>
+                                <AgentName>{agent.label}</AgentName>
+                                <AgentMeta>{agent.version}</AgentMeta>
+                              </div>
+                            </AgentCardHeader>
+                            <AgentStatusText>{agent.authMessage}</AgentStatusText>
+
+                            {!agent.installed && (
+                              <AgentInstallPanel>
+                                <AgentInstallTopline>
+                                  <span>{agent.nativeInstallLabel}</span>
+                                  <AgentInstallBadge>Recommended</AgentInstallBadge>
+                                </AgentInstallTopline>
+                                <AgentInstallHint>
+                                  {agent.npmAvailable
+                                    ? `npm ${agent.npmVersion} detected. Native install is still preferred.`
+                                    : "npm was not detected. Use the native installer path."}
+                                </AgentInstallHint>
+                                <AgentInstallActions>
+                                  <PrimaryButton onClick={() => openAgentNativeInstaller(agent)} type="button">
+                                    <ButtonBrowserIcon aria-hidden="true" />
+                                    <span>Native installer</span>
+                                  </PrimaryButton>
+                                  {agent.npmAvailable && (
+                                    <SecondaryButton
+                                      disabled={isPackageActionBusy}
+                                      onClick={() => installAgentWithNpm(agent.id)}
+                                      type="button"
+                                    >
+                                      {isInstallingAgent ? <PendingIcon aria-hidden="true" /> : <ButtonTerminalIcon aria-hidden="true" />}
+                                      <span>{npmInstallLabel}</span>
+                                    </SecondaryButton>
+                                  )}
+                                </AgentInstallActions>
+                                {agent.npmAvailable && <AgentInstallCommand>{agent.installCommand}</AgentInstallCommand>}
+                                {installResult?.permissionDenied && (
+                                  <AgentPermissionHint>
+                                    Close running terminals, then retry from an elevated app/terminal or move npm global packages to a user-writable prefix.
+                                  </AgentPermissionHint>
+                                )}
+                                {installResult?.message && (
+                                  <AgentInstallMessage data-tone={installMessageTone}>
+                                    {installResult.message}
+                                  </AgentInstallMessage>
+                                )}
+                              </AgentInstallPanel>
+                            )}
+
+                            {agent.installed && agent.npmAvailable && (
+                              <AgentInstallPanel>
+                                <AgentInstallTopline>
+                                  <span>npm package</span>
+                                  <AgentInstallBadge>Update</AgentInstallBadge>
+                                </AgentInstallTopline>
+                                <AgentInstallHint>
+                                  Updates use your global npm prefix. Permission errors usually mean old package folders were created by an elevated process or are still locked.
+                                </AgentInstallHint>
+                                <AgentInstallActions>
+                                  <SecondaryButton
+                                    disabled={isPackageActionBusy}
+                                    onClick={() => updateAgentWithNpm(agent.id)}
+                                    type="button"
+                                  >
+                                    {isUpdatingAgent ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                                    <span>{npmUpdateLabel}</span>
+                                  </SecondaryButton>
+                                </AgentInstallActions>
+                                <AgentInstallCommand>{agent.installCommand}</AgentInstallCommand>
+                                {installResult?.permissionDenied && (
+                                  <AgentPermissionHint>
+                                    Close running terminals, then retry from an elevated app/terminal or move npm global packages to a user-writable prefix.
+                                  </AgentPermissionHint>
+                                )}
+                                {installResult?.message && (
+                                  <AgentInstallMessage data-tone={installMessageTone}>
+                                    {installResult.message}
+                                  </AgentInstallMessage>
+                                )}
+                              </AgentInstallPanel>
+                            )}
+
+                            <AgentActions>
+                              {agent.authenticated ? (
+                                <AgentActionTooltip title={authActionTitle}>
+                                  <PrimaryDangerButton
+                                    disabled={authActionDisabled}
+                                    onClick={() => disconnectAgent(agent.id)}
+                                    title={authActionTitle}
+                                    type="button"
+                                  >
+                                    {isDisconnectingAgent ? <PendingIcon aria-hidden="true" /> : <ButtonLogoutIcon aria-hidden="true" />}
+                                    <span>{isDisconnectingAgent ? "Disconnecting..." : "Disconnect"}</span>
+                                  </PrimaryDangerButton>
+                                </AgentActionTooltip>
+                              ) : (
+                                <AgentActionTooltip title={authActionTitle}>
+                                  <SecondaryButton
+                                    disabled={authActionDisabled}
+                                    onClick={() => connectAgent(agent.id)}
+                                    title={authActionTitle}
+                                    type="button"
+                                  >
+                                    <ButtonKeyIcon aria-hidden="true" />
+                                    <span>Connect</span>
+                                  </SecondaryButton>
+                                </AgentActionTooltip>
+                              )}
+                              <AgentActionTooltip title={useTitle}>
+                                <SecondaryButton
+                                  disabled={useDisabled}
+                                  onClick={() => {
+                                    setActiveAgent(agent.id);
+                                    showView(DEFAULT_WORKSPACE_VIEW);
+                                  }}
+                                  title={useTitle}
+                                  type="button"
+                                >
+                                  <ButtonTerminalIcon aria-hidden="true" />
+                                  <span>Use</span>
+                                </SecondaryButton>
+                              </AgentActionTooltip>
+                            </AgentActions>
+                            {actionResult?.message && (
+                              <AgentInstallMessage data-tone={actionResult.tone || "neutral"}>
+                                {actionResult.message}
+                              </AgentInstallMessage>
+                            )}
+                          </AgentCard>
+                        );
+                      })}
+                    </AgentCardGrid>
+                  </AgentSettingsPanel>
+
+                  <AccountSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Account info</PanelKicker>
+                        <PanelHeading>Signed-in desktop account</PanelHeading>
+                      </div>
+                    </PanelHeaderRow>
+
+                    <AccountCard data-tone="blue">
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Account</SettingsLabel>
+                          <SettingsValue>{displayName}</SettingsValue>
+                          <SettingsHint>Server-returned desktop session user.</SettingsHint>
+                        </div>
+                        <AgentReadyPill data-tone={connectedAgentCount > 0 ? "blue" : "orange"}>
+                          <ButtonBotIcon aria-hidden="true" />
+                          <span>{connectedAgentCount}/2 ready</span>
+                        </AgentReadyPill>
+                      </AccountCardHeader>
+
+                      <SettingsIdentityGrid>
+                        <SettingsIdentityItem>
+                          <span>Email</span>
+                          <strong>{user?.email || "Not returned"}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Plan</span>
+                          <strong>{planLabel}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Session</span>
+                          <strong>Device active</strong>
+                        </SettingsIdentityItem>
+                      </SettingsIdentityGrid>
+
+                      <AccountCardFooter>
+                        <SettingsHint>Signing out clears this device session.</SettingsHint>
+                        <PrimaryDangerButton onClick={logout} type="button">
+                          <ButtonLogoutIcon aria-hidden="true" />
+                          <span>Sign out</span>
+                        </PrimaryDangerButton>
+                      </AccountCardFooter>
+                    </AccountCard>
+                  </AccountSettingsPanel>
+                </SettingsPage>
+              ) : visibleView === "files" ? (
+                <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion}>
+                  {shouldShowWorkspaceSetup ? (
+                    <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
+                      <SetupHeader>
+                        <Kicker>First workspace</Kicker>
+                        <DashboardTitle>Create your workspace</DashboardTitle>
+                        <PageSubline>Name it, then the workspace syncs through the protected API.</PageSubline>
+                      </SetupHeader>
+                      {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
+                      <SetupField>
+                        <SettingsLabel>Workspace name</SettingsLabel>
+                        <SetupInput
+                          maxLength={80}
+                          onChange={(event) => setWorkspaceName(event.target.value)}
+                          placeholder="My workspace"
+                          value={workspaceName}
+                        />
+                      </SetupField>
+                      <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
+                        <ButtonForgeIcon aria-hidden="true" />
+                        <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
+                      </PrimaryButton>
+                    </WorkspaceSetupPanel>
+                  ) : (
+                    <FilesWorkspaceView
+                      defaultWorkingDirectory={defaultWorkingDirectory}
+                      onOpenWorkspaceSettings={openActiveWorkspaceSettings}
+                      rootDirectory={activeWorkspaceFileRoot}
+                      workspace={activeWorkspace}
+                      workspaceError={workspaceError}
+                    />
+                  )}
+                </ForgeWorkspace>
+              ) : visibleView === "vault" ? (
+                <ForgeWorkspace aria-label="Workspace vault" data-motion={viewMotion}>
+                  <VaultWorkspaceView
+                    onOpenSettings={() => showView("settings")}
+                    workspace={activeWorkspace}
+                  />
+                </ForgeWorkspace>
+              ) : visibleView === "audio" ? (
+                <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>
+                  <AudioWorkspaceView
+                    audioActionState={audioActionState}
+                    audioDownloadProgress={audioDownloadProgress}
+                    audioError={audioError}
+                    audioModelStatus={audioModelStatus}
+                    audioStatusState={audioStatusState}
+                    onDownloadModel={downloadAudioModel}
+                    onOpenWidget={openAudioWidget}
+                    onRefreshStatus={refreshAudioModelStatus}
+                    workspace={activeWorkspace}
+                  />
+                </ForgeWorkspace>
+              ) : visibleView === "mcps" ? (
+                <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
+                  <McpsWorkspaceView
+                    agentStatuses={agentStatuses}
+                    workspace={activeWorkspace}
+                    workspaces={workspaces}
+                  />
+                </ForgeWorkspace>
+              ) : (
+                <AgentWorkspaceView
+                  activeWorkspace={activeWorkspace}
+                  activeWorkspaceAgentWorkingDirectory={activeWorkspaceAgentWorkingDirectory}
+                  activeWorkspaceTerminalIndexes={activeWorkspaceTerminalIndexes}
+                  activeWorkspaceVisibleTerminalCount={activeWorkspaceVisibleTerminalCount}
+                  agentStatusError={agentStatusError}
+                  agentStatuses={agentStatuses}
+                  agentStatusState={agentStatusState}
+                  closeWorkspaceTerminal={closeWorkspaceTerminal}
+                  createFirstWorkspace={createFirstWorkspace}
+                  handlePreparedTerminalChange={handlePreparedTerminalChange}
+                  refreshAgentStatuses={refreshAgentStatuses}
+                  setWorkspaceName={setWorkspaceName}
+                  shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
+                  shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
+                  showSettingsView={() => showView("settings")}
+                  terminalMetrics={terminalMetrics}
+                  terminalPanelRows={terminalPanelRows}
+                  viewMotion={viewMotion}
+                  workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
+                  workspaceError={workspaceError}
+                  workspaceName={workspaceName}
+                  workspaceSyncState={workspaceSyncState}
+                  workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
+                  workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
+                />
+              )}
+              {isWorkspaceSettingsOpen && (
+                <WorkspaceSettingsOverlay
+                  aria-label="Workspace settings modal"
+                  onMouseDown={(event) => {
+                    if (event.target === event.currentTarget) {
+                      closeWorkspaceSettings();
+                    }
+                  }}
+                >
+                  <WorkspaceSettingsDialog
+                    aria-labelledby="workspace-settings-title"
+                    aria-modal="true"
+                    role="dialog"
+                  >
+                    <WorkspaceSettingsDialogHeader>
+                      <div>
+                        <PanelKicker>Workspace settings</PanelKicker>
+                        <PanelHeading id="workspace-settings-title">{activeWorkspace.name}</PanelHeading>
+                      </div>
+                      <WorkspaceModalCloseButton
+                        aria-label="Close workspace settings"
+                        onClick={closeWorkspaceSettings}
+                        title="Close"
+                        type="button"
+                      >
+                        <ButtonCloseIcon aria-hidden="true" />
+                      </WorkspaceModalCloseButton>
+                    </WorkspaceSettingsDialogHeader>
+
+                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
+                      <SetupField>
+                        <SettingsLabel>Name</SettingsLabel>
+                        <WorkspaceSettingsInput
+                          maxLength={80}
+                          onChange={(event) => {
+                            setWorkspaceNameDraft(event.target.value);
+                            setWorkspaceSettingsError("");
+                            setWorkspaceSettingsMessage("");
+                          }}
+                          value={workspaceNameDraft}
+                        />
+                      </SetupField>
+
+                      <WorkspaceSettingsFieldGrid>
+                        <SetupField>
+                          <SettingsLabel>Terminals</SettingsLabel>
+                          <WorkspaceNumberInput
+                            max={MAX_WORKSPACE_TERMINAL_COUNT}
+                            min={MIN_WORKSPACE_TERMINAL_COUNT}
+                            onChange={(event) => {
+                              setWorkspaceTerminalCountDraft(event.target.value);
+                              setWorkspaceSettingsError("");
+                              setWorkspaceSettingsMessage("");
+                            }}
+                            step="1"
+                            type="number"
+                            value={workspaceTerminalCountDraft}
+                          />
+                        </SetupField>
+
+                        <SetupField>
+                          <SettingsLabel>Root directory</SettingsLabel>
+                          <RootDirectoryInput
+                            maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+                            onChange={(event) => {
+                              setWorkspaceRootDraft(event.target.value);
+                              setWorkspaceSettingsError("");
+                              setWorkspaceSettingsMessage("");
+                            }}
+                            placeholder={defaultWorkingDirectory || "C:\\path\\to\\project"}
+                            value={workspaceRootDraft}
+                          />
+                        </SetupField>
+                      </WorkspaceSettingsFieldGrid>
+
+                      <SettingsHint>{activeWorkspaceRootDisplay}</SettingsHint>
+
+                      <WorkspaceSettingsActions>
+                        <SecondaryButton
+                          disabled={!defaultWorkingDirectory || workspaceSettingsState === "saving"}
+                          onClick={useDefaultWorkspaceRoot}
+                          type="button"
+                        >
+                          <ButtonFolderIcon aria-hidden="true" />
+                          <span>Use app dir</span>
+                        </SecondaryButton>
+                        <PrimaryButton disabled={workspaceSettingsState === "saving"} type="submit">
+                          <ButtonCheckIcon aria-hidden="true" />
+                          <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>
+                        </PrimaryButton>
+                      </WorkspaceSettingsActions>
+                    </WorkspaceSettingsForm>
+
+                    {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
+                    {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
+                  </WorkspaceSettingsDialog>
+                </WorkspaceSettingsOverlay>
+              )}
+              </DashboardShell>
+              {isWorkspaceStartupOverlayVisible && (
+                <WorkspaceStartupOverlay aria-label={`${BRAND_NAME} is initializing workspace`}>
+                  <AmbientPanel data-position="left">
+                    <span>&gt; workspace</span>
+                    <p>Syncing session...</p>
+                    <p>Preparing workspace...</p>
+                  </AmbientPanel>
+                  <AmbientPanel data-position="right">
+                    <span>{displayName}</span>
+                    <p>Terminals ready</p>
+                    <p>Workspace ready</p>
+                  </AmbientPanel>
+                  <SplashCenter>
+                    <SplashLogo src="/logo.webp" alt="" />
+                    <SplashTitle>Welcome back</SplashTitle>
+                    <SplashTagline>{displayName}</SplashTagline>
+                    <LoadingTrack aria-hidden="true">
+                      <LoadingFill />
+                    </LoadingTrack>
+                    <LaunchStatusPanel data-state={startupAgentStatusState}>
+                      <LaunchStatusIcon aria-hidden="true" data-state={startupAgentStatusState}>
+                        {startupAgentGateState === "choice" ? (
+                          <ButtonRefreshIcon />
+                        ) : startupAgentGateState === "checking" || startupAgentGateState === "updating" ? (
+                          <PendingIcon />
+                        ) : connectedAgentCount > 0 ? (
+                          <ConnectedIcon />
+                        ) : (
+                          <ErrorIcon />
+                        )}
+                      </LaunchStatusIcon>
+                      <LaunchStatusCopy>
+                        <LoadingText>{startupAgentStatusTitle}</LoadingText>
+                        <LoadingDetail>{startupAgentStatusDetail}</LoadingDetail>
+                      </LaunchStatusCopy>
+                    </LaunchStatusPanel>
+                    {startupAgentGateState === "choice" && (
+                      <LaunchActions data-layout="split">
+                        <PrimaryButton onClick={updateStartupAgents} type="button">
+                          <ButtonRefreshIcon aria-hidden="true" />
+                          <span>Update first</span>
+                        </PrimaryButton>
+                        <SecondaryButton onClick={enterWorkspaceAfterAgentCheck} type="button">
+                          <ConnectedIcon aria-hidden="true" />
+                          <span>Enter workspace</span>
+                        </SecondaryButton>
+                      </LaunchActions>
+                    )}
+                  </SplashCenter>
+                </WorkspaceStartupOverlay>
+              )}
+            </AuthenticatedWorkspaceFrame>
+          ) : (
+            <LoginScreen>
+              <AuthSquareBackdrop />
+              <LoginLayout>
+                <BrandPanel aria-labelledby="desktop-title">
+                  <BrandMark href="#" aria-label={BRAND_NAME}>
+                    <img src="/logo.webp" alt="" />
+                    <strong>{BRAND_NAME}</strong>
+                  </BrandMark>
+
+                  <IntroCopy>
+                    <Kicker>Web sign in</Kicker>
+                    <Headline id="desktop-title">Sign in to {BRAND_NAME}</Headline>
+                    <Lede>
+                      Use your browser for secure {BRAND_NAME} authentication, then return to this native app.
+                    </Lede>
+                    <IntroFeatureList aria-label="Desktop auth status">
+                      <IntroFeature data-tone="blue">
+                        <span />
+                        Browser handoff
+                      </IntroFeature>
+                      <IntroFeature data-tone="orange">
+                        <span />
+                        Deep-link callback
+                      </IntroFeature>
+                      <IntroFeature>
+                        <span />
+                        Server session check
+                      </IntroFeature>
+                    </IntroFeatureList>
+                  </IntroCopy>
+                </BrandPanel>
+
+                <LoginCard aria-label="Desktop sign in">
+                  <LoginPanel>
+                    <LoginCardTop>
+                      <PanelKicker>Native app access</PanelKicker>
+                      <LoginCardBadge data-state={authState}>{authStateLabel}</LoginCardBadge>
+                    </LoginCardTop>
+                    <LoginIconWrap aria-hidden="true">
+                      {isAuthBusy ? <PendingIcon /> : <ButtonLoginIcon />}
+                    </LoginIconWrap>
+                    <SessionTitle>{authPanelTitle}</SessionTitle>
+                    <SessionText>{authMessage}</SessionText>
+                    {authError && <FormMessage $state="error">{authError}</FormMessage>}
+                    <AuthStepRail aria-label="Desktop sign in checkpoints">
+                      {AUTH_STEPS.map((step, index) => (
+                        <AuthStep data-active={index === 0 || isAuthBusy} key={step}>
+                          <span>{index + 1}</span>
+                          <strong>{step}</strong>
+                        </AuthStep>
+                      ))}
+                    </AuthStepRail>
+                    <PrimaryButton disabled={isAuthBusy} onClick={startWebLogin} type="button">
+                      <ButtonBrowserIcon aria-hidden="true" />
+                      <span>{authButtonLabel}</span>
+                    </PrimaryButton>
+                  </LoginPanel>
+                </LoginCard>
+              </LoginLayout>
+            </LoginScreen>
+          )}
+        </AppContent>
+
+        {workspaceCloseState.isActive && (
+          <WorkspaceCloseOverlay aria-live="polite" role="status">
+            <WorkspaceClosePanel aria-label="Closing workspace">
+              <WorkspaceCloseSpinner aria-hidden="true" />
+              <WorkspaceCloseTitle>Closing workspace</WorkspaceCloseTitle>
+              <WorkspaceCloseDetail>
+                Shutting down terminals before closing {BRAND_NAME}.
+              </WorkspaceCloseDetail>
+              <WorkspaceCloseCounter>
+                {workspaceCloseClosed} / {workspaceCloseTotal} {workspaceCloseTerminalLabel} closed
+              </WorkspaceCloseCounter>
+              <WorkspaceCloseProgressTrack aria-hidden="true">
+                <WorkspaceCloseProgressBar $progress={workspaceCloseProgress} />
+              </WorkspaceCloseProgressTrack>
+            </WorkspaceClosePanel>
+          </WorkspaceCloseOverlay>
+        )}
+      </AppFrame>
+    </>
+  );
+}
