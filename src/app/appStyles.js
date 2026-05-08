@@ -1450,12 +1450,16 @@ export const WorkspaceButton = styled.button`
     white-space: nowrap;
   }
 
-  &[data-active="true"],
+  &[data-selected="true"],
   &:hover,
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
     border-color: rgba(47, 128, 255, 0.36);
     background: rgba(47, 128, 255, 0.14);
+  }
+
+  &[data-runtime="activated"] {
+    color: #ffffff;
   }
 `;
 
@@ -1529,12 +1533,20 @@ export const WorkspaceAccent = styled.span`
     box-shadow 180ms ease,
     transform 180ms ease;
 
-  ${WorkspaceButton}[data-active="true"] & {
-    background: linear-gradient(180deg, #62a0ff, #ff9a3d);
+  ${WorkspaceButton}[data-runtime="activating"] & {
+    background: linear-gradient(180deg, #ffcf6a, #ff7a18);
     box-shadow:
-      0 0 10px rgba(47, 128, 255, 0.32),
-      0 0 10px rgba(255, 122, 24, 0.18);
+      0 0 10px rgba(255, 179, 71, 0.36),
+      0 0 10px rgba(255, 122, 24, 0.2);
     transform: scaleY(1.12);
+  }
+
+  ${WorkspaceButton}[data-runtime="activated"] & {
+    background: linear-gradient(180deg, #66f0aa, #1fbf75);
+    box-shadow:
+      0 0 12px rgba(57, 217, 138, 0.42),
+      0 0 14px rgba(31, 191, 117, 0.22);
+    transform: scaleY(1.18);
   }
 `;
 
@@ -1621,6 +1633,87 @@ export const BlankWorkspace = styled.section`
   @media (max-width: 980px) {
     min-height: 360px;
   }
+`;
+
+export const WorkspaceViewStack = styled.div`
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #030508;
+`;
+
+export const WorkspaceViewPane = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity ${VIEW_TRANSITION_MS}ms ease,
+    visibility ${VIEW_TRANSITION_MS}ms step-end;
+
+  &[data-visible="true"] {
+    z-index: 2;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition:
+      opacity ${VIEW_TRANSITION_MS}ms ease,
+      visibility 0ms step-start;
+  }
+`;
+
+export const WorkspaceIdleSurface = styled(BlankWorkspace)`
+  display: grid;
+  place-items: center;
+  padding: 24px;
+`;
+
+export const WorkspaceIdlePanel = styled.div`
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  color: #e8eef8;
+  text-align: center;
+`;
+
+export const WorkspaceIdleLogo = styled.img`
+  width: clamp(74px, 10vw, 118px);
+  height: clamp(74px, 10vw, 118px);
+  border: 1px solid rgba(98, 160, 255, 0.24);
+  border-radius: 8px;
+  background: rgba(6, 9, 16, 0.72);
+  box-shadow:
+    0 18px 70px rgba(47, 128, 255, 0.16),
+    0 0 32px rgba(255, 122, 24, 0.08);
+`;
+
+export const WorkspaceIdleTitle = styled.h2`
+  margin: 0;
+  color: #ffffff;
+  font-size: clamp(20px, 3vw, 34px);
+  font-weight: 900;
+  letter-spacing: 0;
+`;
+
+export const WorkspaceIdleDetail = styled.p`
+  max-width: 360px;
+  margin: 0;
+  color: #8d99aa;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.55;
 `;
 
 export const ForgeWorkspace = styled.section`
@@ -3939,6 +4032,49 @@ export const WorkspaceSettingsFieldGrid = styled.div`
   }
 `;
 
+export const WorkspaceRuntimePanel = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+
+  &[data-state="activated"] {
+    border-color: rgba(57, 217, 138, 0.28);
+    background:
+      linear-gradient(90deg, rgba(57, 217, 138, 0.12), rgba(47, 128, 255, 0.045)),
+      rgba(255, 255, 255, 0.035);
+  }
+
+  @media (max-width: 640px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const WorkspaceRuntimeActions = styled.div`
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  button {
+    min-width: 116px;
+  }
+
+  @media (max-width: 640px) {
+    justify-content: stretch;
+
+    button {
+      flex: 1 1 140px;
+    }
+  }
+`;
+
 export const WorkspaceSettingsActions = styled.div`
   display: flex;
   min-width: 0;
@@ -3968,7 +4104,7 @@ export const AgentSettingsPanel = styled.section`
   align-self: start;
   min-width: 0;
   min-height: 340px;
-  overflow: visible;
+  overflow: hidden;
   padding: 20px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 8px;
@@ -4034,6 +4170,7 @@ export const AgentReadyPill = styled.div`
 export const AgentCardGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 12px;
   min-height: 0;
 
@@ -4047,7 +4184,7 @@ export const AgentCard = styled.section`
   display: grid;
   align-content: start;
   gap: 12px;
-  min-height: 100%;
+  min-height: 0;
   overflow: hidden;
   padding: 16px;
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -4335,8 +4472,12 @@ export const PanelHeading = styled.h2`
 
 export const SettingsPage = styled.section`
   display: grid;
-  grid-column: 2 / -1;
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
   align-content: start;
+  grid-auto-rows: max-content;
   gap: 18px;
   min-height: 0;
   overflow: auto;

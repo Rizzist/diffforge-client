@@ -322,6 +322,31 @@ const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
 let fileExplorerLayoutFlushFrame = 0;
 let pendingFileExplorerLayout = null;
+
+function toPanelPercent(value) {
+  const numericValue = Number(value);
+  return `${Number.isFinite(numericValue) ? numericValue : 0}%`;
+}
+
+function getFileExplorerLayoutSizes(layout, explorerPanelId, previewPanelId) {
+  if (Array.isArray(layout)) {
+    return layout;
+  }
+
+  if (!layout || typeof layout !== "object") {
+    return [FILE_EXPLORER_DEFAULT_SIZE, FILE_PREVIEW_DEFAULT_SIZE];
+  }
+
+  const explorerSize = layout[explorerPanelId];
+  const previewSize = layout[previewPanelId];
+
+  if (Number.isFinite(Number(explorerSize)) && Number.isFinite(Number(previewSize))) {
+    return [explorerSize, previewSize];
+  }
+
+  return [FILE_EXPLORER_DEFAULT_SIZE, FILE_PREVIEW_DEFAULT_SIZE];
+}
+
 function cleanWorkspaceRootDirectory(value) {
   if (typeof value !== "string") {
     return "";
@@ -888,9 +913,24 @@ export default function FilesWorkspaceView({
   const [fileDiffError, setFileDiffError] = useState("");
   const [fileDiffTruncated, setFileDiffTruncated] = useState(false);
   const workspaceRoot = cleanWorkspaceRootDirectory(rootDirectory || defaultWorkingDirectory);
+  const fileExplorerLayoutOwner = workspace?.id || workspaceRoot;
+  const fileExplorerLayoutKey = useMemo(
+    () => getFileExplorerLayoutKey(fileExplorerLayoutOwner),
+    [fileExplorerLayoutOwner],
+  );
+  const fileExplorerGroupId = `files-layout-${fileExplorerLayoutKey}`;
+  const fileExplorerPanelId = `files-explorer-${fileExplorerLayoutKey}`;
+  const filePreviewPanelId = `files-preview-${fileExplorerLayoutKey}`;
   const fileExplorerLayout = useMemo(
-    () => getFileExplorerLayout(workspace?.id || workspaceRoot),
-    [workspace?.id, workspaceRoot],
+    () => getFileExplorerLayout(fileExplorerLayoutOwner),
+    [fileExplorerLayoutOwner],
+  );
+  const fileExplorerDefaultLayout = useMemo(
+    () => ({
+      [fileExplorerPanelId]: fileExplorerLayout[0],
+      [filePreviewPanelId]: fileExplorerLayout[1],
+    }),
+    [fileExplorerLayout, fileExplorerPanelId, filePreviewPanelId],
   );
   const rootEntry = useMemo(() => ({
     kind: "directory",
@@ -898,12 +938,12 @@ export default function FilesWorkspaceView({
     relativePath: "",
   }), [workspaceRoot]);
 
-  const queueExplorerLayout = useCallback((sizes) => {
+  const queueExplorerLayout = useCallback((layout) => {
     queueFileExplorerLayout({
-      workspaceId: workspace?.id || workspaceRoot,
-      sizes,
+      workspaceId: fileExplorerLayoutOwner,
+      sizes: getFileExplorerLayoutSizes(layout, fileExplorerPanelId, filePreviewPanelId),
     });
-  }, [workspace?.id, workspaceRoot]);
+  }, [fileExplorerLayoutOwner, fileExplorerPanelId, filePreviewPanelId]);
 
   const loadDirectory = useCallback(async (relativePath = "") => {
     const directoryPath = relativePath || "";
@@ -1064,15 +1104,16 @@ export default function FilesWorkspaceView({
   return (
     <FilesWorkspaceSurface aria-label="Workspace files">
       <ResizePanelGroup
-        id={`files-layout-${getFileExplorerLayoutKey(workspace?.id || workspaceRoot)}`}
-        onLayout={queueExplorerLayout}
+        defaultLayout={fileExplorerDefaultLayout}
+        id={fileExplorerGroupId}
+        onLayoutChanged={queueExplorerLayout}
         orientation="horizontal"
       >
         <ResizePanel
-          defaultSize={fileExplorerLayout[0]}
-          id={`files-explorer-${getFileExplorerLayoutKey(workspace?.id || workspaceRoot)}`}
-          maxSize={FILE_EXPLORER_MAX_SIZE}
-          minSize={FILE_EXPLORER_MIN_SIZE}
+          defaultSize={toPanelPercent(fileExplorerLayout[0])}
+          id={fileExplorerPanelId}
+          maxSize={toPanelPercent(FILE_EXPLORER_MAX_SIZE)}
+          minSize={toPanelPercent(FILE_EXPLORER_MIN_SIZE)}
         >
           <FileExplorerPane>
             <FileExplorerHeader>
@@ -1125,9 +1166,10 @@ export default function FilesWorkspaceView({
         <ResizeHandle data-direction="horizontal" data-surface="files" />
 
         <ResizePanel
-          defaultSize={fileExplorerLayout[1]}
-          id={`files-preview-${getFileExplorerLayoutKey(workspace?.id || workspaceRoot)}`}
-          minSize={FILE_PREVIEW_MIN_SIZE}
+          defaultSize={toPanelPercent(fileExplorerLayout[1])}
+          id={filePreviewPanelId}
+          maxSize={toPanelPercent(FILE_PREVIEW_MAX_SIZE)}
+          minSize={toPanelPercent(FILE_PREVIEW_MIN_SIZE)}
         >
           <FilePreviewPane>
             <FilePreviewHeader>

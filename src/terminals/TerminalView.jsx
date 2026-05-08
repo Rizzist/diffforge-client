@@ -18,14 +18,14 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
-import { TerminalDevMetrics } from "../terminals/terminalTelemetry.jsx";
-import WorkspaceTerminal, { getTerminalPaneMinSizePercent } from "../terminals/WorkspaceTerminal.jsx";
+import { TerminalDevMetrics } from "./terminalTelemetry.jsx";
+import WorkspaceTerminal, { getTerminalPaneMinSizePercent } from "./WorkspaceTerminal.jsx";
 
-export default function AgentWorkspaceView({
-  activeWorkspace,
-  activeWorkspaceAgentWorkingDirectory,
-  activeWorkspaceTerminalIndexes,
-  activeWorkspaceVisibleTerminalCount,
+export default function TerminalView({
+  terminalWorkspace,
+  terminalWorkspaceWorkingDirectory,
+  terminalWorkspaceTerminalIndexes,
+  terminalWorkspaceVisibleTerminalCount,
   agentStatusError,
   agentStatuses,
   agentStatusState,
@@ -72,10 +72,10 @@ export default function AgentWorkspaceView({
           </PrimaryButton>
         </WorkspaceSetupPanel>
       ) : (
-        activeWorkspace && workspaceTerminalRenderAgent ? (
+        terminalWorkspace && workspaceTerminalRenderAgent ? (
           <WorkspaceTerminalPanels>
             <ResizePanelGroup
-              id={`workspace-terminal-rows-${activeWorkspace.id}`}
+              id={`workspace-terminal-rows-${terminalWorkspace.id}`}
               orientation="vertical"
             >
               {terminalPanelRows.map((row, rowOrderIndex) => (
@@ -88,15 +88,15 @@ export default function AgentWorkspaceView({
                   <ResizePanel
                     data-terminal-row="true"
                     defaultSize={`${100 / terminalPanelRows.length}%`}
-                    id={`workspace-terminal-row-${activeWorkspace.id}-${row.rowIndex}`}
+                    id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
                     minSize={getTerminalPaneMinSizePercent(terminalPanelRows.length)}
                   >
                     <ResizePanelGroup
-                      id={`workspace-terminal-cols-${activeWorkspace.id}-${row.rowIndex}`}
+                      id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
                       orientation="horizontal"
                     >
                       {row.terminalIndexes.map((terminalIndex, columnIndex) => (
-                        <Fragment key={`${activeWorkspace.id}-${terminalIndex}`}>
+                        <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
                           {columnIndex > 0 && (
                             <ResizeHandle
                               data-direction="horizontal"
@@ -106,7 +106,7 @@ export default function AgentWorkspaceView({
                             data-terminal-column="true"
                             data-terminal-leaf="true"
                             defaultSize={`${100 / row.terminalIndexes.length}%`}
-                            id={`workspace-terminal-col-${activeWorkspace.id}-${terminalIndex}`}
+                            id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
                             minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
                           >
                             <WorkspaceTerminal
@@ -121,10 +121,10 @@ export default function AgentWorkspaceView({
                               onPreparedTerminalChange={handlePreparedTerminalChange}
                               onRecheckAgents={refreshAgentStatuses}
                               prewarmShell={shouldPrewarmWorkspaceTerminals}
-                              terminalCount={activeWorkspaceVisibleTerminalCount}
+                              terminalCount={terminalWorkspaceVisibleTerminalCount}
                               terminalIndex={terminalIndex}
-                              workingDirectory={activeWorkspaceAgentWorkingDirectory}
-                              workspace={activeWorkspace}
+                              workingDirectory={terminalWorkspaceWorkingDirectory}
+                              workspace={terminalWorkspace}
                               workspaceError={workspaceError}
                             />
                           </ResizePanel>
@@ -138,7 +138,7 @@ export default function AgentWorkspaceView({
           </WorkspaceTerminalPanels>
         ) : (
           <WorkspaceTerminal
-            agent={activeWorkspace ? workspaceTerminalRenderAgent : null}
+            agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
             agentLaunchEpoch={workspaceAgentLaunchEpoch}
             agentLaunchReady={workspaceTerminalAgentLaunchReady}
             agentStatuses={agentStatuses}
@@ -148,11 +148,11 @@ export default function AgentWorkspaceView({
             onOpenSettings={showSettingsView}
             onPreparedTerminalChange={handlePreparedTerminalChange}
             onRecheckAgents={refreshAgentStatuses}
-            prewarmShell={activeWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-            terminalCount={activeWorkspaceVisibleTerminalCount}
-            terminalIndex={activeWorkspaceTerminalIndexes[0] || 0}
-            workingDirectory={activeWorkspaceAgentWorkingDirectory}
-            workspace={activeWorkspace}
+            prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
+            terminalCount={terminalWorkspaceVisibleTerminalCount}
+            terminalIndex={terminalWorkspaceTerminalIndexes[0] || 0}
+            workingDirectory={terminalWorkspaceWorkingDirectory}
+            workspace={terminalWorkspace}
             workspaceError={workspaceError}
           />
         )

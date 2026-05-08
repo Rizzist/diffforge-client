@@ -485,16 +485,24 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
 }
 
 #[cfg(windows)]
+fn terminal_set_working_directory_input(working_directory: &Path) -> String {
+    let directory = working_directory.to_string_lossy();
+
+    format!(
+        "Set-Location -LiteralPath {}\r",
+        quote_powershell_literal(&directory)
+    )
+}
+
+#[cfg(windows)]
 fn terminal_agent_start_input_in_directory(
     command_path: &str,
     args: &[String],
     working_directory: &Path,
 ) -> String {
-    let directory = working_directory.to_string_lossy();
-
     format!(
-        "Set-Location -LiteralPath {}; {}",
-        quote_powershell_literal(&directory),
+        "{}{}",
+        terminal_set_working_directory_input(working_directory),
         terminal_agent_start_input(command_path, args)
     )
 }
@@ -512,16 +520,21 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
 }
 
 #[cfg(not(windows))]
+fn terminal_set_working_directory_input(working_directory: &Path) -> String {
+    let directory = working_directory.to_string_lossy();
+
+    format!("cd {}\n", quote_shell_literal(&directory))
+}
+
+#[cfg(not(windows))]
 fn terminal_agent_start_input_in_directory(
     command_path: &str,
     args: &[String],
     working_directory: &Path,
 ) -> String {
-    let directory = working_directory.to_string_lossy();
-
     format!(
-        "cd {}; {}",
-        quote_shell_literal(&directory),
+        "{}{}",
+        terminal_set_working_directory_input(working_directory),
         terminal_agent_start_input(command_path, args)
     )
 }

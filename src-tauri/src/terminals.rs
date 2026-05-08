@@ -27,7 +27,7 @@ fn clean_terminal_telemetry_text(value: &str) -> String {
 }
 
 fn write_terminal_telemetry_entries(entries: Vec<Value>) {
-    if entries.is_empty() {
+    if !TERMINAL_TELEMETRY_LOGGING_ENABLED || entries.is_empty() {
         return;
     }
 
@@ -1007,7 +1007,35 @@ async fn terminal_open(
     let mut command = "prepared-shell".to_string();
     let mut agent_started = false;
 
-    if !is_prewarm_pty {
+    if is_prewarm_pty {
+        let input = terminal_set_working_directory_input(&process_working_directory);
+
+        if input.len() > MAX_TERMINAL_WRITE_BYTES {
+            cleanup_warm_pty_with_context(warm_pty, "prewarm_directory_input_too_large");
+            return Err("Terminal directory input is too large.".to_string());
+        }
+
+        let write_started_at = Instant::now();
+        if let Err(error) = write_agent_start_input_to_writer(
+            warm_pty.writer.as_mut(),
+            &input,
+            "terminal working directory",
+        ) {
+            cleanup_warm_pty_with_context(warm_pty, "prewarm_directory_write_error");
+            return Err(error);
+        }
+        log_terminal_event(
+            "terminal.open.prewarm_directory_write",
+            Some(&pane_id),
+            Some(instance_id),
+            Some(write_started_at.elapsed()),
+            json!({
+                "bytes": input.len(),
+                "from_pool": from_pool,
+                "working_directory": workspace_path_display(&working_directory),
+            }),
+        );
+    } else {
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
             let error = format!("{label} is not installed or not available on PATH.");
             cleanup_warm_pty_with_context(warm_pty, "open_missing_command");
