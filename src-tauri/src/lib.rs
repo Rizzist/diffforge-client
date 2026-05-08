@@ -29,6 +29,8 @@ use tokio::{
     time::{interval, MissedTickBehavior},
 };
 
+pub mod coordination;
+
 const API_BASE_URL: &str = "https://diffforge.ai/api";
 const MIN_AUTH_VALUE_LENGTH: usize = 24;
 const MAX_AUTH_VALUE_LENGTH: usize = 192;
@@ -65,8 +67,8 @@ const GIT_STATUS_TIMEOUT_SECS: u64 = 2;
 const GIT_DIFF_TIMEOUT_SECS: u64 = 3;
 const TERMINAL_SHUTDOWN_POLL_ATTEMPTS: usize = 40;
 const TERMINAL_SHUTDOWN_POLL_INTERVAL_MS: u64 = 25;
-const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 3_000;
-const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 3_000;
+const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
+const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
@@ -207,6 +209,7 @@ struct WindowsInput {
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
     next_terminal_instance_id: AtomicU64,
 }
@@ -285,6 +288,15 @@ struct TerminalInstance {
     size: Arc<Mutex<PtySize>>,
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
+    coordination: Option<TerminalCoordinationSession>,
+}
+
+#[derive(Clone)]
+struct TerminalCoordinationSession {
+    repo_path: String,
+    db_path: String,
+    agent_id: String,
+    session_id: String,
 }
 
 impl TerminalInstance {
@@ -293,6 +305,7 @@ impl TerminalInstance {
         warm_pty: WarmPty,
         working_directory: PathBuf,
         agent_started: bool,
+        coordination: Option<TerminalCoordinationSession>,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
             child,
@@ -311,6 +324,7 @@ impl TerminalInstance {
                 size: Arc::new(Mutex::new(size)),
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
+                coordination,
             },
             reader,
         )
@@ -663,6 +677,8 @@ struct TerminalOpenRequest {
     provider: Option<String>,
     model: Option<String>,
     working_directory: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
@@ -674,6 +690,7 @@ struct TerminalStartAgentRequest {
     instance_id: Option<u64>,
     provider: String,
     model: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -930,6 +947,7 @@ pub fn run() {
     builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
         })
@@ -1010,6 +1028,47 @@ pub fn run() {
             terminal_resize,
             terminal_close,
             terminal_close_all,
+            coordination::tauri_commands::coordination_init,
+            coordination::tauri_commands::coordination_get_snapshot,
+            coordination::tauri_commands::coordination_get_alignment_report,
+            coordination::tauri_commands::coordination_get_workspace_mcp_status,
+            coordination::tauri_commands::coordination_create_task,
+            coordination::tauri_commands::coordination_claim_task,
+            coordination::tauri_commands::coordination_create_session,
+            coordination::tauri_commands::coordination_heartbeat_session,
+            coordination::tauri_commands::coordination_acquire_lease,
+            coordination::tauri_commands::coordination_release_lease,
+            coordination::tauri_commands::coordination_list_events,
+            coordination::tauri_commands::coordination_list_active_leases,
+            coordination::tauri_commands::coordination_write_memory,
+            coordination::tauri_commands::coordination_search_memory,
+            coordination::tauri_commands::coordination_write_contract_memory,
+            coordination::tauri_commands::coordination_write_handoff_memory,
+            coordination::tauri_commands::coordination_get_repo_policy,
+            coordination::tauri_commands::coordination_update_repo_policy,
+            coordination::tauri_commands::coordination_create_worktree,
+            coordination::tauri_commands::coordination_validate_patch,
+            coordination::tauri_commands::coordination_submit_patch,
+            coordination::tauri_commands::coordination_request_merge,
+            coordination::tauri_commands::coordination_apply_merge,
+            coordination::tauri_commands::coordination_list_workspace_violations,
+            coordination::tauri_commands::coordination_resolve_workspace_violation,
+            coordination::tauri_commands::coordination_db_classify_sql,
+            coordination::tauri_commands::coordination_db_get_mode,
+            coordination::tauri_commands::coordination_db_propose_migration,
+            coordination::tauri_commands::coordination_request_approval,
+            coordination::tauri_commands::coordination_get_cloud_orchestrator_status,
+            coordination::tauri_commands::coordination_update_cloud_orchestrator_config,
+            coordination::tauri_commands::coordination_create_orchestration_run,
+            coordination::tauri_commands::coordination_create_cloud_context_export,
+            coordination::tauri_commands::coordination_import_orchestration_plan,
+            coordination::tauri_commands::coordination_adopt_orchestration_plan,
+            coordination::tauri_commands::coordination_list_orchestration_runs,
+            coordination::tauri_commands::coordination_get_orchestration_brief,
+            coordination::tauri_commands::coordination_orchestrator_sync_once,
+            coordination::tauri_commands::coordination_propose_agent_assignments,
+            coordination::tauri_commands::coordination_adopt_agent_assignment,
+            coordination::tauri_commands::coordination_scan_workspace_violations,
             close_app_after_terminal_shutdown
         ])
         .run(tauri::generate_context!())

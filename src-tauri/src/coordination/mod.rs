@@ -1,0 +1,23 @@
+pub mod alignment;
+pub mod cloud_context;
+pub mod cloud_mock;
+pub mod cloud_orchestrator;
+pub mod cloud_redaction;
+pub mod db;
+pub mod events;
+pub mod kernel;
+pub mod mcp;
+pub mod memory;
+pub mod merge_gate;
+pub mod models;
+pub mod patches;
+pub mod resources;
+pub mod schema;
+pub mod sql_classifier;
+pub mod sql_policy;
+pub mod tauri_commands;
+pub mod violations;
+pub mod watcher;
+pub mod worktrees;
+
+pub use kernel::{api_error, api_ok, CoordinationKernel};

@@ -108,6 +108,7 @@ import {
   TerminalClosedLabel,
   TerminalClosingOverlay,
   TerminalRestartPill,
+  TerminalAgentIdBadge,
   TerminalRestartButton,
   TerminalCloseButton,
   TerminalEmptyPanel,
@@ -334,6 +335,8 @@ const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
 const TERMINAL_BLANK_STARTUP_RESTART_LIMIT = 3;
+const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -376,6 +379,35 @@ function getSafePaneToken(value) {
 
 export function getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId = "agent") {
   return `${WORKSPACE_TERMINAL_PANE_PREFIX}-${getSafePaneToken(workspaceId)}-${terminalIndex}-${agentId || "agent"}`;
+}
+
+function getTerminalAgentKind(agentId) {
+  const normalizedAgentId = String(agentId || "").toLowerCase();
+
+  if (normalizedAgentId.includes("claude")) {
+    return "claude";
+  }
+
+  if (normalizedAgentId.includes("codex")) {
+    return "codex";
+  }
+
+  return "agent";
+}
+
+function getTerminalAgentId(agentId, terminalIndex) {
+  const kind = getTerminalAgentKind(agentId);
+  const prefix = kind === "claude" ? "CL" : kind === "codex" ? "CX" : "AG";
+  const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+  const suffix = TERMINAL_AGENT_ID_SUFFIXES[safeIndex % TERMINAL_AGENT_ID_SUFFIXES.length] || "A";
+
+  return `${prefix}${suffix}`;
+}
+
+function getTerminalAgentColorSlot(terminalIndex) {
+  const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+
+  return String(safeIndex % TERMINAL_AGENT_COLOR_SLOT_COUNT);
 }
 
 export function getDefaultTerminalIndexes(count) {
@@ -805,6 +837,9 @@ export default function WorkspaceTerminal({
   const [terminalClosed, setTerminalClosed] = useState(false);
   const [terminalClosing, setTerminalClosing] = useState(false);
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, agent?.id);
+  const terminalAgentKind = getTerminalAgentKind(agent?.id);
+  const terminalAgentId = getTerminalAgentId(agent?.id, terminalIndex);
+  const terminalAgentTitle = `${agent?.label || "Agent"} terminal ${terminalAgentId}`;
 
   useEffect(() => {
     setTerminalClosed(false);
@@ -2042,6 +2077,8 @@ export default function WorkspaceTerminal({
             provider: openProvider,
             model: "",
             workingDirectory: workingDirectory || "",
+            workspaceId: workspace?.id || "",
+            workspaceName: workspace?.name || "",
             cols: initialSize.cols,
             rows: initialSize.rows,
           },
@@ -2259,6 +2296,14 @@ export default function WorkspaceTerminal({
   return (
     <TerminalWorkspaceSurface>
       <TerminalRestartPill>
+        <TerminalAgentIdBadge
+          aria-label={terminalAgentTitle}
+          data-agent={terminalAgentKind}
+          data-slot={getTerminalAgentColorSlot(terminalIndex)}
+          title={terminalAgentTitle}
+        >
+          {terminalAgentId}
+        </TerminalAgentIdBadge>
         <TerminalRestartButton
           aria-label="Restart terminal"
           disabled={terminalClosing}

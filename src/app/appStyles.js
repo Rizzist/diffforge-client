@@ -2100,6 +2100,125 @@ export const TerminalRestartPill = styled.div`
   backdrop-filter: blur(16px);
 `;
 
+export const TerminalAgentIdBadge = styled.span`
+  --agent-id-bg: rgba(143, 157, 183, 0.1);
+  --agent-id-border: rgba(143, 157, 183, 0.28);
+  --agent-id-text: #e8eef8;
+  --terminal-slot-accent: #62a0ff;
+
+  position: relative;
+  display: inline-flex;
+  width: 38px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--agent-id-border);
+  border-radius: 999px;
+  color: var(--agent-id-text);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.015)),
+    var(--agent-id-bg);
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  font-size: 11px;
+  font-weight: 950;
+  letter-spacing: 0;
+  line-height: 1;
+  text-transform: uppercase;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.035),
+    0 0 18px rgba(0, 0, 0, 0.22);
+
+  &::after {
+    position: absolute;
+    right: 8px;
+    bottom: 4px;
+    left: 8px;
+    height: 2px;
+    border-radius: 999px;
+    background: var(--terminal-slot-accent);
+    box-shadow: 0 0 10px var(--terminal-slot-accent);
+    content: "";
+  }
+
+  &[data-agent="codex"] {
+    --agent-id-bg: rgba(47, 128, 255, 0.14);
+    --agent-id-border: rgba(98, 160, 255, 0.44);
+    --agent-id-text: #d9e7ff;
+  }
+
+  &[data-agent="claude"] {
+    --agent-id-bg: rgba(255, 122, 24, 0.13);
+    --agent-id-border: rgba(255, 157, 72, 0.44);
+    --agent-id-text: #ffd1a1;
+  }
+
+  &[data-slot="1"] {
+    --terminal-slot-accent: #ff9d48;
+  }
+
+  &[data-slot="2"] {
+    --terminal-slot-accent: #3ccb7f;
+  }
+
+  &[data-slot="3"] {
+    --terminal-slot-accent: #e5c45f;
+  }
+
+  &[data-slot="4"] {
+    --terminal-slot-accent: #68d8d6;
+  }
+
+  &[data-slot="5"] {
+    --terminal-slot-accent: #f46d8a;
+  }
+
+  &[data-slot="6"] {
+    --terminal-slot-accent: #aac66d;
+  }
+
+  &[data-slot="7"] {
+    --terminal-slot-accent: #d0d7e6;
+  }
+
+  &[data-slot="8"] {
+    --terminal-slot-accent: #54b6ff;
+  }
+
+  &[data-slot="9"] {
+    --terminal-slot-accent: #ffbf66;
+  }
+
+  &[data-slot="10"] {
+    --terminal-slot-accent: #7bdc9d;
+  }
+
+  &[data-slot="11"] {
+    --terminal-slot-accent: #ff8a9c;
+  }
+
+  &[data-slot="12"] {
+    --terminal-slot-accent: #56d0b6;
+  }
+
+  &[data-slot="13"] {
+    --terminal-slot-accent: #d8b34d;
+  }
+
+  &[data-slot="14"] {
+    --terminal-slot-accent: #9fb6d9;
+  }
+
+  &[data-slot="15"] {
+    --terminal-slot-accent: #f0f4ff;
+  }
+`;
+
 export const TerminalRestartButton = styled.button`
   display: inline-flex;
   width: 30px;

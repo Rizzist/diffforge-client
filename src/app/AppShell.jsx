@@ -325,6 +325,7 @@ import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH } from "../audio/AudioWorkspaceView.jsx";
+import CoordinationWorkspaceView from "../coordination/CoordinationWorkspaceView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -1429,17 +1430,20 @@ export default function App() {
     setWorkspaceError("");
   }, []);
 
-  const showView = useCallback((nextView) => {
+  const showView = useCallback((nextView, options = {}) => {
     if (nextView === activeView && nextView === visibleView) {
       return;
     }
 
+    const telemetryWorkspaceId = options.telemetryWorkspaceId || selectedWorkspaceIdRef.current;
+    const telemetrySource = options.telemetrySource || "view_switch";
+
     window.clearTimeout(viewTransitionTimeoutRef.current);
     setWorkspaceSettingsModalId("");
-    if (nextView === DEFAULT_WORKSPACE_VIEW && selectedWorkspaceIdRef.current) {
+    if (nextView === DEFAULT_WORKSPACE_VIEW && telemetryWorkspaceId) {
       startWorkspaceOpenTelemetry({
-        source: "view_switch",
-        workspaceId: selectedWorkspaceIdRef.current,
+        source: telemetrySource,
+        workspaceId: telemetryWorkspaceId,
         fields: {
           activeView,
           nextView,
@@ -1552,6 +1556,14 @@ export default function App() {
       },
     });
   }, [activeView, clearPreparedWorkspaceTerminals, visibleView, workspaces]);
+
+  const activateWorkspaceFromRail = useCallback((workspaceId) => {
+    activateWorkspace(workspaceId, "workspace_click");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      telemetrySource: "workspace_click_terminal_focus",
+      telemetryWorkspaceId: workspaceId,
+    });
+  }, [activateWorkspace, showView]);
 
   const deactivateWorkspace = useCallback((workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
@@ -3213,6 +3225,7 @@ export default function App() {
         model: "",
         paneId: session.paneId,
         provider: workspaceTerminalAgent.id,
+        workspaceId: activatedWorkspace.id,
       }));
   }, [
     activatedWorkspace?.id,
@@ -3599,7 +3612,7 @@ export default function App() {
                             data-runtime={workspaceRuntimeState}
                             data-selected={workspace.id === selectedWorkspaceId}
                             onClick={() => {
-                              activateWorkspace(workspace.id, "workspace_click");
+                              activateWorkspaceFromRail(workspace.id);
                             }}
                             title={workspace.name}
                             type="button"
@@ -3667,6 +3680,14 @@ export default function App() {
                   >
                     <ButtonHubIcon aria-hidden="true" />
                     <span>MCPs</span>
+                  </RailActionButton>
+                  <RailActionButton
+                    data-active={activeView === "coordination"}
+                    onClick={() => showView("coordination")}
+                    type="button"
+                  >
+                    <ButtonForgeIcon aria-hidden="true" />
+                    <span>Coordination</span>
                   </RailActionButton>
                   <RailActionButton
                     data-active={activeView === "settings"}
@@ -4103,7 +4124,9 @@ export default function App() {
               ) : visibleView === "vault" ? (
                 <ForgeWorkspace aria-label="Workspace vault" data-motion={viewMotion}>
                   <VaultWorkspaceView
+                    defaultWorkingDirectory={defaultWorkingDirectory}
                     onOpenSettings={() => showView("settings")}
+                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
                     workspace={selectedWorkspace}
                   />
                 </ForgeWorkspace>
@@ -4124,7 +4147,17 @@ export default function App() {
               ) : visibleView === "mcps" ? (
                 <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
                   <McpsWorkspaceView
+                    defaultWorkingDirectory={defaultWorkingDirectory}
                     onOpenSettings={() => showView("settings")}
+                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
+                    workspace={selectedWorkspace}
+                  />
+                </ForgeWorkspace>
+              ) : visibleView === "coordination" ? (
+                <ForgeWorkspace aria-label="Workspace coordination" data-motion={viewMotion}>
+                  <CoordinationWorkspaceView
+                    defaultWorkingDirectory={defaultWorkingDirectory}
+                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
                     workspace={selectedWorkspace}
                   />
                 </ForgeWorkspace>

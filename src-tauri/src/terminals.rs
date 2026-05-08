@@ -285,6 +285,60 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     report
 }
 
+fn terminal_coordination_session_from_context(
+    context: &crate::coordination::models::TerminalCoordinationContext,
+) -> TerminalCoordinationSession {
+    TerminalCoordinationSession {
+        repo_path: context.repo_path.clone(),
+        db_path: context.db_path.clone(),
+        agent_id: context.agent_id.clone(),
+        session_id: context.session_id.clone(),
+    }
+}
+
+fn interrupt_terminal_coordination_session(
+    coordination: &TerminalCoordinationSession,
+    pane_id: Option<&str>,
+    instance_id: Option<u64>,
+    reason: &str,
+) {
+    let interrupt_started_at = Instant::now();
+    match crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    )
+    .and_then(|kernel| kernel.interrupt_session(&coordination.session_id, reason).map(|_| ()))
+    {
+        Ok(()) => {
+            log_terminal_event(
+                "terminal.coordination_session_interrupted",
+                pane_id,
+                instance_id,
+                Some(interrupt_started_at.elapsed()),
+                json!({
+                    "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                    "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                    "reason": clean_terminal_telemetry_text(reason),
+                }),
+            );
+        }
+        Err(error) => {
+            log_terminal_event(
+                "terminal.coordination_session_interrupt_error",
+                pane_id,
+                instance_id,
+                Some(interrupt_started_at.elapsed()),
+                json!({
+                    "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                    "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                    "reason": clean_terminal_telemetry_text(reason),
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+        }
+    }
+}
+
 fn cleanup_terminal_instance_with_context(
     instance: TerminalInstance,
     kill_first: bool,
@@ -300,6 +354,7 @@ fn cleanup_terminal_instance_with_context(
         size,
         working_directory,
         agent_started,
+        coordination,
     } = instance;
 
     log_terminal_event(
@@ -314,6 +369,15 @@ fn cleanup_terminal_instance_with_context(
         }),
     );
 
+    if let Some(coordination) = coordination.as_ref() {
+        interrupt_terminal_coordination_session(
+            coordination,
+            pane_id.as_deref(),
+            Some(instance_id),
+            reason,
+        );
+    }
+
     let maybe_child = {
         let mut child = child.blocking_lock();
         child.take()
@@ -324,6 +388,7 @@ fn cleanup_terminal_instance_with_context(
         drop(size);
         drop(working_directory);
         drop(agent_started);
+        drop(coordination);
         log_terminal_event(
             "terminal.cleanup.no_child",
             pane_id.as_deref(),
@@ -382,6 +447,7 @@ fn cleanup_terminal_instance_with_context(
     drop(size);
     drop(working_directory);
     drop(agent_started);
+    drop(coordination);
 }
 
 fn cleanup_terminal_instance_async(
@@ -849,14 +915,19 @@ async fn terminal_open(
     output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
     validate_terminal_pane_id(&request.pane_id)?;
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     let pane_id = request.pane_id;
     let open_started_at = Instant::now();
     let requested_cols = request.cols;
     let requested_rows = request.rows;
     let kind = request.kind;
     let provider = request.provider;
+    let provider_for_coordination = provider.clone();
     let model = request.model;
     let working_directory_request = request.working_directory;
+    let workspace_id = request.workspace_id;
+    let workspace_name = request.workspace_name;
 
     log_terminal_event(
         "terminal.open.start",
@@ -875,6 +946,7 @@ async fn terminal_open(
             "working_directory_request": working_directory_request
                 .as_deref()
                 .map(clean_terminal_telemetry_text),
+            "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
         }),
     );
 
@@ -916,7 +988,8 @@ async fn terminal_open(
         Some(resolve_started_at.elapsed()),
         json!({ "working_directory": workspace_path_display(&working_directory) }),
     );
-    let process_working_directory = workspace_path_for_process(&working_directory);
+    let mut process_working_directory = workspace_path_for_process(&working_directory);
+    let mut coordination_context = None;
 
     let command_started_at = Instant::now();
     let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
@@ -925,6 +998,77 @@ async fn terminal_open(
     } else {
         terminal_launch(&kind, provider, model)?
     };
+    if !is_prewarm_pty {
+        let coordination_started_at = Instant::now();
+        let agent_kind = provider_for_coordination
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(kind.as_str());
+        match crate::coordination::CoordinationKernel::init(&working_directory, None)
+            .and_then(|kernel| {
+                kernel.prepare_terminal_context(
+                    &label,
+                    agent_kind,
+                    Some(&pane_id),
+                    workspace_id.as_deref(),
+                    workspace_name.as_deref(),
+                    None,
+                    None,
+                    None,
+                )
+            }) {
+            Ok(context) => {
+                let write_root = PathBuf::from(&context.write_root);
+                process_working_directory = workspace_path_for_process(&write_root);
+                log_terminal_event(
+                    "terminal.open.coordination_ready",
+                    Some(&pane_id),
+                    request.instance_id,
+                    Some(coordination_started_at.elapsed()),
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(&context.agent_id),
+                        "session_id": clean_terminal_telemetry_text(&context.session_id),
+                        "workspace_id": context.workspace_id.as_deref().map(clean_terminal_telemetry_text),
+                        "objective_key": clean_terminal_telemetry_text(&context.objective_key),
+                        "worktree_id": context.worktree_id.as_deref().map(clean_terminal_telemetry_text),
+                        "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
+                        "write_root": workspace_path_display(&process_working_directory),
+                    }),
+                );
+                if context.enforcement_mode == "coordination_only"
+                    && working_directory.join(".git").exists()
+                {
+                    let coordination = terminal_coordination_session_from_context(&context);
+                    interrupt_terminal_coordination_session(
+                        &coordination,
+                        Some(&pane_id),
+                        request.instance_id,
+                        "unsafe_coordination_only_launch_blocked",
+                    );
+                    let error = "Unable to create an isolated git worktree for this agent; refusing to launch a write-enabled agent in the shared repo root.".to_string();
+                    log_terminal_event(
+                        "terminal.open.coordination_unsafe_mode_blocked",
+                        Some(&pane_id),
+                        request.instance_id,
+                        Some(coordination_started_at.elapsed()),
+                        json!({ "error": clean_terminal_telemetry_text(&error) }),
+                    );
+                    return Err(error);
+                }
+                coordination_context = Some(context);
+            }
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.open.coordination_error",
+                    Some(&pane_id),
+                    request.instance_id,
+                    Some(coordination_started_at.elapsed()),
+                    json!({ "error": clean_terminal_telemetry_text(&error) }),
+                );
+                return Err(format!("Unable to prepare coordination kernel for agent terminal: {error}"));
+            }
+        }
+    }
     log_terminal_event(
         "terminal.open.resolve_command",
         Some(&pane_id),
@@ -974,6 +1118,15 @@ async fn terminal_open(
     } else {
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
             let error = format!("{label} is not installed or not available on PATH.");
+            if let Some(context) = coordination_context.as_ref() {
+                let coordination = terminal_coordination_session_from_context(context);
+                interrupt_terminal_coordination_session(
+                    &coordination,
+                    Some(&pane_id),
+                    Some(instance_id),
+                    "command_unavailable",
+                );
+            }
             log_terminal_event(
                 "terminal.open.error",
                 Some(&pane_id),
@@ -984,14 +1137,29 @@ async fn terminal_open(
             return Err(error);
         };
 
+        let coordination_env_vars = coordination_context
+            .as_ref()
+            .map(|context| context.env_vars())
+            .unwrap_or_default();
         let warm_pty = match create_agent_terminal_pty(
             size,
             &command_path,
             &args,
             &process_working_directory,
+            coordination_env_vars.as_slice(),
+            None,
         ) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
+                if let Some(context) = coordination_context.as_ref() {
+                    let coordination = terminal_coordination_session_from_context(context);
+                    interrupt_terminal_coordination_session(
+                        &coordination,
+                        Some(&pane_id),
+                        Some(instance_id),
+                        "agent_spawn_error",
+                    );
+                }
                 log_terminal_event(
                     "terminal.open.agent_spawn_error",
                     Some(&pane_id),
@@ -1011,6 +1179,10 @@ async fn terminal_open(
         warm_pty
     };
 
+    let terminal_coordination = coordination_context
+        .as_ref()
+        .map(terminal_coordination_session_from_context);
+
     log_terminal_event(
         if is_prewarm_pty {
             "terminal.open.prewarm_spawn"
@@ -1025,7 +1197,8 @@ async fn terminal_open(
             "arg_count": args.len(),
             "command": clean_terminal_telemetry_text(&command),
             "prewarm_pty": is_prewarm_pty,
-            "working_directory": workspace_path_display(&working_directory),
+            "repo_working_directory": workspace_path_display(&working_directory),
+            "working_directory": workspace_path_display(&process_working_directory),
         }),
     );
 
@@ -1034,14 +1207,24 @@ async fn terminal_open(
         warm_pty,
         process_working_directory.clone(),
         agent_started,
+        terminal_coordination,
     );
 
     let insert_started_at = Instant::now();
-    state
+    let displaced_instance = state
         .terminals
         .write()
         .await
         .insert(pane_id.clone(), instance);
+    let displaced_existing = displaced_instance.is_some();
+    if let Some(displaced_instance) = displaced_instance {
+        cleanup_terminal_instance_async(
+            displaced_instance,
+            true,
+            Some(pane_id.clone()),
+            "terminal_open_displaced",
+        );
+    }
     log_terminal_event(
         "terminal.open.insert_instance",
         Some(&pane_id),
@@ -1050,6 +1233,7 @@ async fn terminal_open(
         json!({
             "prewarm_pty": is_prewarm_pty,
             "agent_started": agent_started,
+            "displaced_existing": displaced_existing,
         }),
     );
 
@@ -1072,7 +1256,8 @@ async fn terminal_open(
         Some(open_started_at.elapsed()),
         json!({
             "command": clean_terminal_telemetry_text(&command),
-            "working_directory": workspace_path_display(&working_directory),
+            "repo_working_directory": workspace_path_display(&working_directory),
+            "working_directory": workspace_path_display(&process_working_directory),
         }),
     );
 
@@ -1080,7 +1265,7 @@ async fn terminal_open(
         pane_id,
         instance_id,
         command,
-        working_directory: workspace_path_display(&working_directory),
+        working_directory: workspace_path_display(&process_working_directory),
     })
 }
 
@@ -1132,6 +1317,8 @@ async fn terminal_start_agent(
     model: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     let provider = parse_agent_provider(&provider)?;
     let definition = agent_definition(provider);
     let mut args = Vec::new();
@@ -1170,6 +1357,19 @@ async fn terminal_start_agent(
         );
         return Err("Terminal session is not running.".to_string());
     };
+    if instance.coordination.is_none() {
+        log_terminal_event(
+            "terminal.agent_start.blocked_uncoordinated",
+            Some(&pane_id),
+            Some(instance.id),
+            None,
+            json!({ "provider": definition.id }),
+        );
+        return Err(
+            "Deferred agent start is blocked because this terminal has no coordination session."
+                .to_string(),
+        );
+    }
     let input = terminal_agent_start_input_in_directory(
         &command_path,
         &args,
@@ -1221,6 +1421,7 @@ async fn start_terminal_agent_in_prepared_pty(
 ) -> TerminalStartAgentPaneResult {
     let pane_id = request.pane_id;
     let instance_id = request.instance_id;
+    let workspace_id = request.workspace_id;
     let start_started_at = Instant::now();
 
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
@@ -1274,7 +1475,10 @@ async fn start_terminal_agent_in_prepared_pty(
             Some(&pane_id),
             instance_id,
             Some(start_started_at.elapsed()),
-            json!({ "provider": definition.id }),
+            json!({
+                "provider": definition.id,
+                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+            }),
         );
         return TerminalStartAgentPaneResult {
             pane_id,
@@ -1294,6 +1498,7 @@ async fn start_terminal_agent_in_prepared_pty(
             json!({
                 "current_instance_id": instance.id,
                 "provider": definition.id,
+                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
             }),
         );
         return TerminalStartAgentPaneResult {
@@ -1305,6 +1510,27 @@ async fn start_terminal_agent_in_prepared_pty(
         };
     }
 
+    if instance.coordination.is_none() {
+        log_terminal_event(
+            "terminal.agent_start_many.blocked_uncoordinated",
+            Some(&pane_id),
+            Some(instance.id),
+            Some(start_started_at.elapsed()),
+            json!({
+                "provider": definition.id,
+                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+            }),
+        );
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id: Some(instance.id),
+            started: false,
+            skipped: true,
+            message: "Prepared terminal has no coordination session; restart through terminal_open."
+                .to_string(),
+        };
+    }
+
     let mut agent_started_guard = instance.agent_started.lock().await;
 
     if *agent_started_guard {
@@ -1313,7 +1539,10 @@ async fn start_terminal_agent_in_prepared_pty(
             Some(&pane_id),
             Some(instance.id),
             Some(start_started_at.elapsed()),
-            json!({ "provider": definition.id }),
+            json!({
+                "provider": definition.id,
+                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+            }),
         );
         return TerminalStartAgentPaneResult {
             pane_id,
@@ -1373,6 +1602,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         "command": clean_terminal_telemetry_text(&command_path),
                         "arg_count": args.len(),
                         "bytes": input.len(),
+                        "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
                         "working_directory": workspace_path_display(instance.working_directory.as_ref()),
                     }),
                 );
@@ -1394,6 +1624,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         "provider": definition.id,
                         "command": clean_terminal_telemetry_text(&command_path),
                         "error": clean_terminal_telemetry_text(&error),
+                        "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
                     }),
                 );
                 return TerminalStartAgentPaneResult {
@@ -1412,7 +1643,10 @@ async fn start_terminal_agent_in_prepared_pty(
         Some(&pane_id),
         Some(instance.id),
         Some(start_started_at.elapsed()),
-        json!({ "provider": definition.id }),
+        json!({
+            "provider": definition.id,
+            "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+        }),
     );
     TerminalStartAgentPaneResult {
         pane_id,
@@ -1428,6 +1662,8 @@ async fn terminal_start_agent_many(
     state: State<'_, TerminalState>,
     requests: Vec<TerminalStartAgentRequest>,
 ) -> Result<TerminalStartAgentManyResult, String> {
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     if requests.len() > MAX_TERMINAL_START_AGENT_BATCH {
         return Err(format!(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
@@ -1666,6 +1902,8 @@ async fn terminal_close(
     pane_id: String,
     instance_id: Option<u64>,
 ) -> Result<(), String> {
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     let close_started_at = Instant::now();
     log_terminal_event(
         "terminal.close.start",
@@ -1705,6 +1943,8 @@ async fn terminal_close_all(
     app: AppHandle,
     state: State<'_, TerminalState>,
 ) -> Result<TerminalCloseAllResult, String> {
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     let closed = close_all_terminal_sessions(app, &state).await?;
 
     Ok(TerminalCloseAllResult { closed })

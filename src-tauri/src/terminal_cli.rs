@@ -494,11 +494,18 @@ fn terminal_agent_launch_command(
     command_path: &str,
     args: &[String],
     working_directory: &Path,
+    banner: Option<&str>,
 ) -> CommandBuilder {
     let mut command = terminal_idle_shell_command();
+    let invocation = terminal_agent_invocation(command_path, args);
+    let command_text = if let Some(banner) = banner {
+        format!("Write-Host {}; {}", quote_powershell_literal(banner), invocation)
+    } else {
+        invocation
+    };
 
     command.arg("-Command");
-    command.arg(terminal_agent_invocation(command_path, args));
+    command.arg(command_text);
     command.cwd(working_directory);
 
     command
@@ -544,13 +551,31 @@ fn terminal_agent_launch_command(
     command_path: &str,
     args: &[String],
     working_directory: &Path,
+    banner: Option<&str>,
 ) -> CommandBuilder {
-    let mut command = CommandBuilder::new(command_path);
+    if let Some(banner) = banner {
+        let mut invocation = quote_shell_literal(command_path);
 
+        for arg in args {
+            invocation.push(' ');
+            invocation.push_str(&quote_shell_literal(arg));
+        }
+
+        let mut command = terminal_idle_shell_command();
+        command.arg("-lc");
+        command.arg(format!(
+            "printf %s {}; exec {}",
+            quote_shell_literal(banner),
+            invocation
+        ));
+        command.cwd(working_directory);
+        return command;
+    }
+
+    let mut command = CommandBuilder::new(command_path);
     for arg in args {
         command.arg(arg.as_str());
     }
-
     command.cwd(working_directory);
 
     command
@@ -644,8 +669,14 @@ fn create_agent_terminal_pty(
     command_path: &str,
     args: &[String],
     working_directory: &Path,
+    env_vars: &[(String, String)],
+    banner: Option<&str>,
 ) -> Result<WarmPty, String> {
-    let command = terminal_agent_launch_command(command_path, args, working_directory);
+    let mut command = terminal_agent_launch_command(command_path, args, working_directory, banner);
+
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
 
     spawn_terminal_pty(size, command, "agent terminal")
 }

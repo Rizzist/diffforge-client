@@ -1,3 +1,6 @@
+import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
 import {
   ButtonHubIcon,
   ButtonKeyIcon,
@@ -29,8 +32,90 @@ import {
   VaultPlaceholderIcon,
 } from "../app/appStyles";
 
-export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
+const COORDINATION_TOOLS = [
+  "get_brief",
+  "claim_task",
+  "acquire_lease",
+  "validate_patch",
+  "submit_patch",
+  "request_merge",
+  "search_memory",
+  "write_contract_memory",
+  "write_handoff_memory",
+  "db_classify_sql",
+  "orchestrator_get_status",
+];
+
+function unwrapData(response, fallback = {}) {
+  if (!response || typeof response !== "object") {
+    return fallback;
+  }
+
+  return response.data || response;
+}
+
+function errorMessage(error) {
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error?.message) {
+    return error.message;
+  }
+  return "Unable to load workspace MCP state.";
+}
+
+function shortPath(value) {
+  if (!value) {
+    return "Not generated";
+  }
+  const text = String(value);
+  return text.length > 84 ? `...${text.slice(-81)}` : text;
+}
+
+export default function McpsWorkspaceView({
+  defaultWorkingDirectory,
+  onOpenSettings,
+  rootDirectory,
+  workspace,
+}) {
   const workspaceName = workspace?.name || "Workspace";
+  const workspaceId = workspace?.id || "";
+  const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const [status, setStatus] = useState("idle");
+  const [error, setError] = useState("");
+  const [coordinator, setCoordinator] = useState(null);
+
+  const commandBase = useMemo(() => ({ repoPath }), [repoPath]);
+
+  const refresh = useCallback(async () => {
+    setError("");
+    setCoordinator(null);
+    if (!repoPath || !workspaceId) {
+      setStatus("missing_workspace");
+      return;
+    }
+
+    setStatus("loading");
+    try {
+      const response = await invoke("coordination_get_workspace_mcp_status", {
+        ...commandBase,
+        workspaceId,
+        workspaceName,
+      });
+      setCoordinator(unwrapData(response));
+      setStatus("ready");
+    } catch (caught) {
+      setStatus("error");
+      setError(errorMessage(caught));
+    }
+  }, [commandBase, repoPath, workspaceId, workspaceName]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const isReady = status === "ready" && coordinator;
+  const objectiveKey = coordinator?.objective_key || workspaceId;
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
@@ -55,15 +140,15 @@ export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
         <McpStatsGrid>
           <SettingsIdentityItem>
             <span>Connected</span>
-            <strong>0 servers</strong>
+            <strong>{isReady ? "1 server" : "0 servers"}</strong>
           </SettingsIdentityItem>
           <SettingsIdentityItem>
-            <span>Registry</span>
-            <strong>Not configured</strong>
+            <span>Coordinator MCP</span>
+            <strong>{isReady ? "Auto-on" : "Requires workspace UUID"}</strong>
           </SettingsIdentityItem>
           <SettingsIdentityItem>
-            <span>Scope</span>
-            <strong>{workspaceName}</strong>
+            <span>Objective key</span>
+            <strong>{objectiveKey || "Missing"}</strong>
           </SettingsIdentityItem>
         </McpStatsGrid>
       </McpHeaderPanel>
@@ -72,18 +157,20 @@ export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
         <McpRegistryPanel>
           <McpPanelTopline>
             <span>Registry</span>
-            <strong>Local</strong>
+            <strong>Workspace</strong>
           </McpPanelTopline>
           <McpServerList>
             <McpServerButton as="div" data-active="true">
-              <McpServerIcon data-state="planned">
+              <McpServerIcon data-state={isReady ? "enabled" : "planned"}>
                 <ButtonHubIcon aria-hidden="true" />
               </McpServerIcon>
               <McpServerCopy>
-                <strong>Workspace MCPs</strong>
-                <span>No servers connected</span>
+                <strong>Coordination Kernel</strong>
+                <span>{workspaceId ? "Built-in workspace MCP" : "Workspace UUID missing"}</span>
               </McpServerCopy>
-              <McpStatusBadge data-state="planned">Empty</McpStatusBadge>
+              <McpStatusBadge data-state={isReady ? "enabled" : "planned"}>
+                {isReady ? "Auto-on" : "Blocked"}
+              </McpStatusBadge>
             </McpServerButton>
             <McpServerButton as="div">
               <McpServerIcon>
@@ -91,7 +178,7 @@ export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
               </McpServerIcon>
               <McpServerCopy>
                 <strong>Secrets</strong>
-                <span>Use settings for account state</span>
+                <span>Not exposed to agent MCPs</span>
               </McpServerCopy>
               <McpStatusBadge>Locked</McpStatusBadge>
             </McpServerButton>
@@ -101,24 +188,36 @@ export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
         <McpEditorPanel>
           <McpEditorHeader>
             <div>
-              <PanelKicker>Profile</PanelKicker>
-              <PanelHeading>No MCP server selected</PanelHeading>
+              <PanelKicker>Built-in</PanelKicker>
+              <PanelHeading>Coordination Kernel MCP</PanelHeading>
+              <PageSubline>
+                Always on for this workspace. The objective key is the server-backed workspace UUID.
+              </PageSubline>
             </div>
-            <McpStatusBadge data-state="planned">Pending setup</McpStatusBadge>
+            <McpStatusBadge data-state={isReady ? "enabled" : "planned"}>
+              {isReady ? "Enabled" : "Needs UUID"}
+            </McpStatusBadge>
           </McpEditorHeader>
+
+          {error && <McpEmptyAccess>{error}</McpEmptyAccess>}
+          {!workspaceId && (
+            <McpEmptyAccess>
+              The Coordination Kernel MCP cannot start without the server-backed workspace UUID.
+            </McpEmptyAccess>
+          )}
 
           <McpScopePreview>
             <SettingsIdentityItem>
               <span>Transport</span>
-              <strong>Not set</strong>
+              <strong>stdio</strong>
             </SettingsIdentityItem>
             <SettingsIdentityItem>
-              <span>Tools</span>
-              <strong>0 allowed</strong>
+              <span>Toggle</span>
+              <strong>Unavailable</strong>
             </SettingsIdentityItem>
             <SettingsIdentityItem>
-              <span>Prompts</span>
-              <strong>0 available</strong>
+              <span>Scope</span>
+              <strong>{workspaceId || "Missing UUID"}</strong>
             </SettingsIdentityItem>
           </McpScopePreview>
 
@@ -129,19 +228,45 @@ export default function McpsWorkspaceView({ onOpenSettings, workspace }) {
                   <ButtonHubIcon aria-hidden="true" />
                   Tool access
                 </span>
+                <McpStatusBadge data-state="enabled">Required</McpStatusBadge>
               </McpAccessTopline>
-              <McpEmptyAccess>No tools are exposed for this workspace yet.</McpEmptyAccess>
+              <McpEmptyAccess>
+                {COORDINATION_TOOLS.join(", ")}
+              </McpEmptyAccess>
             </McpAccessPanel>
             <McpAccessPanel>
               <McpAccessTopline>
                 <span>
                   <ButtonKeyIcon aria-hidden="true" />
-                  Secrets
+                  Workspace identity
                 </span>
+                <McpStatusBadge data-state={workspaceId ? "enabled" : "planned"}>
+                  {workspaceId ? "Server UUID" : "Missing"}
+                </McpStatusBadge>
               </McpAccessTopline>
-              <McpEmptyAccess>Secrets stay unavailable until an MCP server is configured.</McpEmptyAccess>
+              <McpEmptyAccess>
+                Objective key: {objectiveKey || "missing"}
+                <br />
+                Config: {shortPath(coordinator?.config_path)}
+                <br />
+                Codex: {shortPath(coordinator?.codex_config_path)}
+                <br />
+                Claude: {shortPath(coordinator?.claude_config_path)}
+              </McpEmptyAccess>
             </McpAccessPanel>
           </McpAccessGrid>
+
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonKeyIcon aria-hidden="true" />
+                Security boundary
+              </span>
+            </McpAccessTopline>
+            <McpEmptyAccess>
+              Production SQL credentials are not placed in agent env or MCP config. The hosted workspace UUID is used only as local coordination identity.
+            </McpEmptyAccess>
+          </McpAccessPanel>
         </McpEditorPanel>
       </McpLayout>
     </McpWorkspaceSurface>
