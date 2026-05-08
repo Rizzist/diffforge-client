@@ -1,9 +1,8 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -53,10 +52,12 @@ import { Settings } from "@styled-icons/material-rounded/Settings";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "./authStore";
+import { createTerminalResizeController, measureTerminalGrid } from "./terminalResizeController";
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
 const PRICING_URL = "https://diffforge.ai/pricing";
 const BRAND_NAME = "Diff Forge AI";
+const TERMINAL_THEME_BACKGROUND = "#020304";
 const TITLE_BAR_HEIGHT = "34px";
 const LAUNCH_MINIMUM_MS = 1400;
 const AUTH_STARTUP_TIMEOUT_MS = 5000;
@@ -113,6 +114,12 @@ const TERMINAL_MIN_COLS = 20;
 const TERMINAL_MIN_ROWS = 6;
 const TERMINAL_MAX_COLS = 400;
 const TERMINAL_MAX_ROWS = 160;
+const TERMINAL_START_METRIC_WAIT_MS = 900;
+const TERMINAL_START_METRIC_POLL_MS = 16;
+const TERMINAL_MIN_CELL_WIDTH_PX = 9;
+const TERMINAL_MIN_CELL_HEIGHT_PX = 16;
+const TERMINAL_PANE_MIN_WIDTH_PX = TERMINAL_MIN_COLS * TERMINAL_MIN_CELL_WIDTH_PX;
+const TERMINAL_PANE_MIN_HEIGHT_PX = TERMINAL_MIN_ROWS * TERMINAL_MIN_CELL_HEIGHT_PX;
 const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
 const TERMINAL_METRICS_NOTIFY_MS = 250;
 const TERMINAL_TELEMETRY_FLUSH_MS = 60;
@@ -124,9 +131,10 @@ const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_RENDER_PROBE_AFTER_WRITE_MS = 80;
 const TERMINAL_RENDER_PROBE_AFTER_WEBGL_MS = 140;
 const TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS = 80;
-const TERMINAL_INITIAL_SPAWN_STAGGER_MS = 220;
-const TERMINAL_RETRY_SPAWN_STAGGER_MS = 800;
-const TERMINAL_START_DEBOUNCE_MS = import.meta.env.DEV ? 180 : 0;
+const TERMINAL_RESIZE_DEBUG_IDLE_MS = 140;
+const TERMINAL_RESIZE_DEBUG_RECENT_MS = 1800;
+const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
+const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
@@ -472,8 +480,6 @@ function getMcpAccessSummary(ids, options, emptyLabel) {
 }
 
 let nextWorkspaceTerminalInstanceId = 1;
-const pendingTerminalResizeRequests = new Map();
-const pendingWorkspaceTerminalFits = new Map();
 const pendingTerminalTelemetry = [];
 const terminalMetricsSubscribers = new Set();
 const terminalMetricsState = {
@@ -482,20 +488,16 @@ const terminalMetricsState = {
   ipcBytes: 0,
   outputLagMs: 0,
   startupMs: 0,
-  fitMs: 0,
+  gridMs: 0,
   webglMs: 0,
   resizeBatches: 0,
   resizePanes: 0,
   resizeLagMs: 0,
 };
 let terminalMetricsNotifyTimer = 0;
-let terminalResizeFlushFrame = 0;
-let workspaceTerminalFitFrame = 0;
 let fileExplorerLayoutFlushFrame = 0;
 let pendingFileExplorerLayout = null;
 let terminalTelemetryFlushTimer = 0;
-let terminalSpawnQueue = Promise.resolve();
-let terminalLastSpawnStartedAt = 0;
 let nextWorkspaceOpenTelemetryId = 1;
 let currentWorkspaceOpenTelemetry = {
   id: 0,
@@ -1561,6 +1563,10 @@ function getSafePaneToken(value) {
   return token || "workspace";
 }
 
+function getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId = "agent") {
+  return `${WORKSPACE_TERMINAL_PANE_PREFIX}-${getSafePaneToken(workspaceId)}-${terminalIndex}-${agentId || "agent"}`;
+}
+
 function getDefaultTerminalIndexes(count) {
   const terminalCount = normalizeWorkspaceTerminalCount(count);
 
@@ -1600,6 +1606,61 @@ function normalizeWorkspaceTerminalIndexes(indexes, count) {
   }
 
   return normalizedIndexes.slice(0, terminalCount);
+}
+
+function closeWorkspaceTerminalPane({
+  agentId,
+  nextTerminalCount,
+  previousTerminalCount,
+  reason,
+  terminalIndex,
+  workspaceId,
+}) {
+  const paneId = getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId);
+
+  writeTerminalTelemetry({
+    paneId,
+    phase: "frontend.workspace.terminal.close_removed_start",
+    fields: {
+      agentId,
+      nextTerminalCount,
+      previousTerminalCount,
+      reason,
+      terminalIndex,
+      workspaceId,
+    },
+  });
+
+  invoke("terminal_close", { paneId })
+    .then(() => {
+      writeTerminalTelemetry({
+        paneId,
+        phase: "frontend.workspace.terminal.close_removed_done",
+        fields: {
+          agentId,
+          nextTerminalCount,
+          previousTerminalCount,
+          reason,
+          terminalIndex,
+          workspaceId,
+        },
+      });
+    })
+    .catch((error) => {
+      writeTerminalTelemetry({
+        paneId,
+        phase: "frontend.workspace.terminal.close_removed_error",
+        fields: {
+          agentId,
+          error: getErrorMessage(error, "Unable to close removed terminal."),
+          nextTerminalCount,
+          previousTerminalCount,
+          reason,
+          terminalIndex,
+          workspaceId,
+        },
+      });
+    });
 }
 
 function getTerminalPanelRows(terminalIndexes) {
@@ -1652,114 +1713,12 @@ function normalizeTerminalDimension(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, dimension));
 }
 
-function isValidTerminalSize(cols, rows) {
-  return Number.isInteger(cols)
-    && Number.isInteger(rows)
-    && cols >= TERMINAL_MIN_COLS
-    && cols <= TERMINAL_MAX_COLS
-    && rows >= TERMINAL_MIN_ROWS
-    && rows <= TERMINAL_MAX_ROWS;
-}
+function getTerminalPaneMinSizePercent(panelCount) {
+  const count = Math.max(1, Number.parseInt(panelCount, 10) || 1);
+  const fairShare = 100 / count;
+  const minimum = Math.max(5, Math.min(18, fairShare * 0.55));
 
-function waitForMs(delayMs) {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, Math.max(0, delayMs));
-  });
-}
-
-async function runQueuedTerminalSpawn(task, queuedAt, shouldRun, spawnGapMs) {
-  if (shouldRun && !shouldRun()) {
-    return task({
-      queuedAt,
-      spawnGapMs,
-      skippedBeforePace: true,
-      spawnWaitMs: 0,
-      waitMs: performance.now() - queuedAt,
-    });
-  }
-
-  const now = performance.now();
-  const spawnWaitMs = Math.max(0, terminalLastSpawnStartedAt + spawnGapMs - now);
-
-  if (spawnWaitMs > 0) {
-    await waitForMs(spawnWaitMs);
-  }
-
-  if (shouldRun && !shouldRun()) {
-    return task({
-      queuedAt,
-      spawnGapMs,
-      skippedAfterPace: true,
-      spawnWaitMs,
-      waitMs: performance.now() - queuedAt,
-    });
-  }
-
-  terminalLastSpawnStartedAt = performance.now();
-
-  return task({
-    queuedAt,
-    spawnGapMs,
-    spawnWaitMs,
-    waitMs: performance.now() - queuedAt,
-  });
-}
-
-function enqueueTerminalSpawn(task, options = {}) {
-  const queuedAt = performance.now();
-  const shouldRun = typeof options.shouldRun === "function" ? options.shouldRun : null;
-  const spawnGapMs = Number.isFinite(options.spawnGapMs)
-    ? Math.max(0, options.spawnGapMs)
-    : TERMINAL_INITIAL_SPAWN_STAGGER_MS;
-  const queuedTask = terminalSpawnQueue.then(
-    () => runQueuedTerminalSpawn(task, queuedAt, shouldRun, spawnGapMs),
-    () => runQueuedTerminalSpawn(task, queuedAt, shouldRun, spawnGapMs),
-  );
-
-  terminalSpawnQueue = queuedTask.catch(() => {});
-
-  return queuedTask;
-}
-
-function fitTerminalToContainer(fitAddon, terminal) {
-  const dimensions = fitAddon.proposeDimensions();
-  const fallbackCols = normalizeTerminalDimension(
-    terminal.cols || TERMINAL_DEFAULT_COLS,
-    TERMINAL_DEFAULT_COLS,
-    TERMINAL_MIN_COLS,
-    TERMINAL_MAX_COLS,
-  );
-  const fallbackRows = normalizeTerminalDimension(
-    terminal.rows || TERMINAL_DEFAULT_ROWS,
-    TERMINAL_DEFAULT_ROWS,
-    TERMINAL_MIN_ROWS,
-    TERMINAL_MAX_ROWS,
-  );
-  const proposedCols = Number.isFinite(dimensions?.cols) ? Math.floor(dimensions.cols) : 0;
-  const proposedRows = Number.isFinite(dimensions?.rows) ? Math.floor(dimensions.rows) : 0;
-
-  if (proposedCols <= 0 || proposedRows <= 0) {
-    return { cols: fallbackCols, rows: fallbackRows, skipped: true };
-  }
-
-  const cols = normalizeTerminalDimension(
-    proposedCols,
-    fallbackCols,
-    TERMINAL_MIN_COLS,
-    TERMINAL_MAX_COLS,
-  );
-  const rows = normalizeTerminalDimension(
-    proposedRows,
-    fallbackRows,
-    TERMINAL_MIN_ROWS,
-    TERMINAL_MAX_ROWS,
-  );
-
-  if (terminal.cols !== cols || terminal.rows !== rows) {
-    terminal.resize(cols, rows);
-  }
-
-  return { cols, rows, skipped: false };
+  return `${minimum.toFixed(2)}%`;
 }
 
 function getElementDiagnostics(element) {
@@ -1773,9 +1732,127 @@ function getElementDiagnostics(element) {
   return {
     width: Math.round(rect.width),
     height: Math.round(rect.height),
+    left: Math.round(rect.left),
+    top: Math.round(rect.top),
     display: style.display,
     visibility: style.visibility,
     opacity: Number.parseFloat(style.opacity || "1"),
+    overflow: style.overflow,
+    overflowX: style.overflowX,
+    overflowY: style.overflowY,
+    position: style.position,
+    zIndex: style.zIndex,
+    pointerEvents: style.pointerEvents,
+    backgroundColor: style.backgroundColor,
+    color: style.color,
+    transform: style.transform === "none" ? "" : style.transform,
+  };
+}
+
+function getShortElementClassName(element) {
+  if (!element?.className) {
+    return "";
+  }
+
+  if (typeof element.className === "string") {
+    return element.className.slice(0, 180);
+  }
+
+  return String(element.className?.baseVal || "").slice(0, 180);
+}
+
+function getElementDescriptor(element) {
+  if (!element) {
+    return null;
+  }
+
+  const style = window.getComputedStyle(element);
+
+  return {
+    tag: element.tagName?.toLowerCase() || "",
+    id: (element.id || "").slice(0, 80),
+    className: getShortElementClassName(element),
+    dataState: element.getAttribute?.("data-state") || "",
+    dataDirection: element.getAttribute?.("data-direction") || "",
+    dataResizeHandleState: element.getAttribute?.("data-resize-handle-state") || "",
+    dataPanelId: element.getAttribute?.("data-panel-id") || element.getAttribute?.("data-panel") || "",
+    display: style.display,
+    visibility: style.visibility,
+    opacity: Number.parseFloat(style.opacity || "1"),
+    pointerEvents: style.pointerEvents,
+    position: style.position,
+    zIndex: style.zIndex,
+    backgroundColor: style.backgroundColor,
+  };
+}
+
+function getPointElementDiagnostics(container, label, x, y) {
+  const topElement = document.elementFromPoint(x, y);
+  const containerContainsTop = Boolean(topElement && container.contains(topElement));
+
+  return {
+    label,
+    x: Math.round(x),
+    y: Math.round(y),
+    containerContainsTop,
+    topElement: getElementDescriptor(topElement),
+    closestXterm: getElementDescriptor(topElement?.closest?.(".xterm")),
+    closestFrame: getElementDescriptor(topElement?.closest?.("[data-state]")),
+    closestResizeHandle: getElementDescriptor(topElement?.closest?.("[data-resize-handle-state]")),
+  };
+}
+
+function getTerminalPointDiagnostics(container) {
+  const rect = container.getBoundingClientRect();
+
+  if (rect.width <= 0 || rect.height <= 0) {
+    return [];
+  }
+
+  const left = rect.left;
+  const top = rect.top;
+  const right = rect.right;
+  const bottom = rect.bottom;
+
+  return [
+    getPointElementDiagnostics(container, "center", left + rect.width / 2, top + rect.height / 2),
+    getPointElementDiagnostics(container, "top_left", left + Math.min(12, rect.width / 3), top + Math.min(12, rect.height / 3)),
+    getPointElementDiagnostics(container, "top_right", right - Math.min(12, rect.width / 3), top + Math.min(12, rect.height / 3)),
+    getPointElementDiagnostics(container, "bottom_left", left + Math.min(12, rect.width / 3), bottom - Math.min(12, rect.height / 3)),
+    getPointElementDiagnostics(container, "bottom_right", right - Math.min(12, rect.width / 3), bottom - Math.min(12, rect.height / 3)),
+  ];
+}
+
+function getTerminalDomRowsDiagnostics(rowsElement) {
+  if (!rowsElement) {
+    return null;
+  }
+
+  const rowElements = Array.from(rowsElement.children);
+  let nonEmptyDomRows = 0;
+  let domTextLength = 0;
+  let firstNonEmptyText = "";
+
+  rowElements.forEach((row) => {
+    const text = (row.textContent || "").trim();
+
+    if (!text) {
+      return;
+    }
+
+    nonEmptyDomRows += 1;
+    domTextLength += text.length;
+
+    if (!firstNonEmptyText) {
+      firstNonEmptyText = text.slice(0, 120);
+    }
+  });
+
+  return {
+    childCount: rowElements.length,
+    nonEmptyDomRows,
+    domTextLength,
+    firstNonEmptyText,
   };
 }
 
@@ -1824,6 +1901,8 @@ function getTerminalRenderDiagnostics(container, terminal, rendererMode) {
   const rowsElement = container.querySelector(".xterm-rows");
   const viewportElement = container.querySelector(".xterm-viewport");
   const helperTextarea = container.querySelector(".xterm-helper-textarea");
+  const terminalFrame = container.closest("[data-state]");
+  const resizePanel = container.closest("[data-panel-id], [data-panel]");
   const canvases = Array.from(container.querySelectorAll("canvas"));
   const visibleCanvasCount = canvases.filter((canvas) => {
     const rect = canvas.getBoundingClientRect();
@@ -1838,16 +1917,28 @@ function getTerminalRenderDiagnostics(container, terminal, rendererMode) {
   const primaryCanvas = canvases[0];
   const canvasRect = primaryCanvas?.getBoundingClientRect();
 
+  const buffer = getTerminalBufferDiagnostics(terminal);
+  const domRows = getTerminalDomRowsDiagnostics(rowsElement);
+
   return {
     rendererMode,
     devicePixelRatio: window.devicePixelRatio || 1,
     terminalCols: terminal.cols,
     terminalRows: terminal.rows,
     container: getElementDiagnostics(container),
+    containerScroll: {
+      scrollLeft: Math.round(container.scrollLeft || 0),
+      scrollTop: Math.round(container.scrollTop || 0),
+    },
+    terminalFrame: getElementDiagnostics(terminalFrame),
+    resizePanel: getElementDiagnostics(resizePanel),
     terminalElement: getElementDiagnostics(terminalElement),
     screen: getElementDiagnostics(screenElement),
     rows: getElementDiagnostics(rowsElement),
+    domRows,
     viewport: getElementDiagnostics(viewportElement),
+    topElements: getTerminalPointDiagnostics(container),
+    activeElement: getElementDescriptor(document.activeElement),
     helperTextareaFocused: document.activeElement === helperTextarea,
     canvasCount: canvases.length,
     visibleCanvasCount,
@@ -1859,12 +1950,15 @@ function getTerminalRenderDiagnostics(container, terminal, rendererMode) {
         clientHeight: Math.round(canvasRect?.height || 0),
       }
       : null,
-    buffer: getTerminalBufferDiagnostics(terminal),
+    buffer,
+    possibleVisualBlank: Boolean(
+      buffer
+      && domRows
+      && buffer.nonEmptyViewportRows > 0
+      && domRows.nonEmptyDomRows === 0
+      && visibleCanvasCount === 0
+    ),
   };
-}
-
-function getTerminalRuntimeKey(paneId, instanceId) {
-  return `${paneId}:${instanceId}`;
 }
 
 function startWorkspaceOpenTelemetry({
@@ -1919,31 +2013,6 @@ function getWorkspaceOpenTelemetryFields(workspaceId) {
   };
 }
 
-function scheduleWorkspaceTerminalFit({ paneId, instanceId, fit }) {
-  const key = getTerminalRuntimeKey(paneId, instanceId);
-  pendingWorkspaceTerminalFits.set(key, { fit });
-
-  if (workspaceTerminalFitFrame) {
-    return;
-  }
-
-  workspaceTerminalFitFrame = window.requestAnimationFrame(flushWorkspaceTerminalFits);
-}
-
-function cancelWorkspaceTerminalFit(paneId, instanceId) {
-  pendingWorkspaceTerminalFits.delete(getTerminalRuntimeKey(paneId, instanceId));
-}
-
-function flushWorkspaceTerminalFits() {
-  workspaceTerminalFitFrame = 0;
-  const batch = Array.from(pendingWorkspaceTerminalFits.values());
-  pendingWorkspaceTerminalFits.clear();
-
-  batch.forEach(({ fit }) => {
-    fit();
-  });
-}
-
 function getTerminalMetricsSnapshot() {
   return { ...terminalMetricsState };
 }
@@ -1987,93 +2056,6 @@ function useTerminalDevMetrics() {
   useEffect(() => subscribeTerminalMetrics(setMetrics), []);
 
   return metrics;
-}
-
-function queueTerminalNativeResize({ paneId, instanceId, cols, rows }) {
-  if (!isValidTerminalSize(cols, rows)) {
-    writeTerminalTelemetry({
-      paneId,
-      instanceId,
-      phase: "frontend.resize.skip_invalid",
-      cols,
-      rows,
-    });
-    return false;
-  }
-
-  pendingTerminalResizeRequests.set(getTerminalRuntimeKey(paneId, instanceId), {
-    paneId,
-    instanceId,
-    cols,
-    rows,
-    queuedAt: performance.now(),
-  });
-
-  if (terminalResizeFlushFrame) {
-    return true;
-  }
-
-  terminalResizeFlushFrame = window.requestAnimationFrame(flushTerminalNativeResizes);
-  return true;
-}
-
-function flushTerminalNativeResizes() {
-  terminalResizeFlushFrame = 0;
-  const batch = Array.from(pendingTerminalResizeRequests.values());
-  pendingTerminalResizeRequests.clear();
-
-  if (!batch.length) {
-    return;
-  }
-
-  const oldestQueuedAt = batch.reduce(
-    (oldest, request) => Math.min(oldest, request.queuedAt),
-    performance.now(),
-  );
-  const requests = batch
-    .filter(({ cols, rows }) => isValidTerminalSize(cols, rows))
-    .map(({ paneId, instanceId, cols, rows }) => ({
-      paneId,
-      instanceId,
-      cols,
-      rows,
-    }));
-
-  if (!requests.length) {
-    return;
-  }
-
-  writeTerminalTelemetry({
-    phase: "frontend.resize_many.flush",
-    elapsedMs: performance.now() - oldestQueuedAt,
-    fields: { requestCount: requests.length },
-  });
-
-  invoke("terminal_resize_many", { requests })
-    .then(() => {
-      addTerminalMetrics({
-        resizeBatches: 1,
-        resizePanes: requests.length,
-      });
-      patchTerminalMetrics({
-        resizeLagMs: performance.now() - oldestQueuedAt,
-      });
-      writeTerminalTelemetry({
-        phase: "frontend.resize_many.done",
-        elapsedMs: performance.now() - oldestQueuedAt,
-        fields: { requestCount: requests.length },
-      });
-    })
-    .catch(() => {
-      patchTerminalMetrics({
-        resizeLagMs: performance.now() - oldestQueuedAt,
-      });
-      writeTerminalTelemetry({
-        phase: "frontend.resize_many.error",
-        elapsedMs: performance.now() - oldestQueuedAt,
-        fields: { requestCount: requests.length },
-      });
-    });
 }
 
 function writeTerminalTelemetry({
@@ -2159,7 +2141,7 @@ function TerminalDevMetrics({ metrics }) {
       <TerminalDevMetric>ipc {metrics.ipcEvents} / {formatMetricBytes(metrics.ipcBytes)}</TerminalDevMetric>
       <TerminalDevMetric>out {formatMetricMs(metrics.outputLagMs)}</TerminalDevMetric>
       <TerminalDevMetric>open {formatMetricMs(metrics.startupMs)}</TerminalDevMetric>
-      <TerminalDevMetric>fit {formatMetricMs(metrics.fitMs)}</TerminalDevMetric>
+      <TerminalDevMetric>grid {formatMetricMs(metrics.gridMs)}</TerminalDevMetric>
       <TerminalDevMetric>webgl {formatMetricMs(metrics.webglMs)}</TerminalDevMetric>
       <TerminalDevMetric>resize {formatMetricMs(metrics.resizeLagMs)} / {metrics.resizePanes}</TerminalDevMetric>
     </TerminalDevMetricsBar>
@@ -2175,6 +2157,7 @@ function WorkspaceTerminal({
   agentStatusState,
   onCloseTerminal,
   onOpenSettings,
+  onPreparedTerminalChange,
   onRecheckAgents,
   prewarmShell = false,
   terminalIndex = 0,
@@ -2195,7 +2178,7 @@ function WorkspaceTerminal({
   const [terminalError, setTerminalError] = useState("");
   const [restartKey, setRestartKey] = useState(0);
   const [terminalClosed, setTerminalClosed] = useState(false);
-  const paneId = `${WORKSPACE_TERMINAL_PANE_PREFIX}-${getSafePaneToken(workspace?.id)}-${terminalIndex}-${agent?.id || "agent"}`;
+  const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, agent?.id);
 
   useEffect(() => {
     setTerminalClosed(false);
@@ -2247,19 +2230,30 @@ function WorkspaceTerminal({
     let webglAttachAt = 0;
     let webglAttachAttempted = false;
     const renderProbeTimers = new Set();
+    const resizeDebugProbeTimers = new Set();
     const startupWatchTimers = new Set();
-    let rendererMode = "dom";
+    let rendererMode = useWebglRenderer ? "webgl_pending" : "canvas";
     let runtimeTerminalState = "starting";
     let startAgentInCurrentPty = null;
     let hasOpenPty = false;
-    let lastSentSize = null;
+    let activeWebglAddon = null;
+    let resizeController = null;
+    let lastResizeMeasureAt = 0;
+    let lastResizeMeasureSize = null;
+    let lastXtermRenderLogAt = 0;
+    let resizeIdleDebugTimer = 0;
+    let resizeWriteBarrierActive = false;
+    let resizeWriteBarrierStartedAt = 0;
+    let resizeWriteBarrierReason = "";
+    let resizeWriteBarrierBytes = 0;
+    const resizeWriteBarrierQueue = [];
     let sawFirstOutput = false;
     let outputBytes = 0;
     let outputChunks = 0;
     const disposables = [];
+    const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     terminalInstanceIdRef.current = terminalInstanceId;
-    const fitAddon = new FitAddon();
     const lifecycleStartedAt = performance.now();
 
     writeTerminalTelemetry({
@@ -2273,6 +2267,20 @@ function WorkspaceTerminal({
       },
     });
 
+    const waitForStartupMetricPoll = (delayMs) => new Promise((resolve) => {
+      if (isDisposed) {
+        resolve();
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        startupMetricTimers.delete(timer);
+        resolve();
+      }, Math.max(0, delayMs));
+
+      startupMetricTimers.add(timer);
+    });
+
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: true,
@@ -2284,7 +2292,7 @@ function WorkspaceTerminal({
       macOptionIsMeta: true,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       theme: {
-        background: "#020304",
+        background: TERMINAL_THEME_BACKGROUND,
         foreground: "#e8eef8",
         cursor: "#ff9a3d",
         cursorAccent: "#030508",
@@ -2308,9 +2316,7 @@ function WorkspaceTerminal({
       },
     });
 
-    terminal.loadAddon(fitAddon);
     terminal.open(container);
-    fitTerminalToContainer(fitAddon, terminal);
     writeTerminalTelemetry({
       paneId,
       instanceId: terminalInstanceId,
@@ -2336,9 +2342,13 @@ function WorkspaceTerminal({
       try {
         terminal.loadAddon(webglAddon);
         rendererMode = "webgl";
+        activeWebglAddon = webglAddon;
         disposables.push(webglAddon);
         disposables.push(webglAddon.onContextLoss(() => {
-          rendererMode = "webgl_context_lost";
+          rendererMode = "canvas";
+          if (activeWebglAddon === webglAddon) {
+            activeWebglAddon = null;
+          }
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -2358,8 +2368,8 @@ function WorkspaceTerminal({
         refreshTerminalRenderer("webgl_attach_done", { reason });
         scheduleRenderProbe("webgl_attach_done", TERMINAL_RENDER_PROBE_AFTER_WEBGL_MS, { reason });
       } catch {
-        // WebGL is best-effort; xterm keeps the default renderer when WebGL2 is unavailable.
-        rendererMode = "dom";
+        // WebGL is best-effort; xterm keeps its canvas renderer when WebGL2 is unavailable.
+        rendererMode = "canvas";
         webglAddon.dispose();
         patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
         writeTerminalTelemetry({
@@ -2411,6 +2421,8 @@ function WorkspaceTerminal({
       }, delayMs);
     };
 
+    scheduleWebglAttach("xterm_open", 0);
+
     const logRenderProbe = (reason, extraFields = {}) => {
       if (isDisposed) {
         return;
@@ -2454,6 +2466,65 @@ function WorkspaceTerminal({
       }, Math.max(0, delayMs));
 
       renderProbeTimers.add(timer);
+    };
+
+    const scheduleResizeDebugProbes = (reason, extraFields = {}) => {
+      if (isDisposed) {
+        return;
+      }
+
+      TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS.forEach((delayMs) => {
+        const timer = window.setTimeout(() => {
+          resizeDebugProbeTimers.delete(timer);
+
+          if (isDisposed) {
+            return;
+          }
+
+          logRenderProbe(reason, {
+            delayMs,
+            lastResizeMeasureSize,
+            sinceLastResizeMeasureMs: lastResizeMeasureAt ? performance.now() - lastResizeMeasureAt : null,
+            ...extraFields,
+          });
+        }, delayMs);
+
+        resizeDebugProbeTimers.add(timer);
+      });
+    };
+
+    const scheduleResizeIdleDebugProbes = (extraFields = {}) => {
+      if (isDisposed) {
+        return;
+      }
+
+      if (resizeIdleDebugTimer) {
+        window.clearTimeout(resizeIdleDebugTimer);
+      }
+
+      resizeIdleDebugTimer = window.setTimeout(() => {
+        resizeIdleDebugTimer = 0;
+
+        if (isDisposed) {
+          return;
+        }
+
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.resize.idle",
+          cols: terminal.cols,
+          rows: terminal.rows,
+          fields: {
+            lastResizeMeasureSize,
+            rendererMode,
+            sinceLastResizeMeasureMs: lastResizeMeasureAt ? performance.now() - lastResizeMeasureAt : null,
+            terminalIndex,
+            ...extraFields,
+          },
+        });
+        scheduleResizeDebugProbes("resize_idle_probe", extraFields);
+      }, TERMINAL_RESIZE_DEBUG_IDLE_MS);
     };
 
     const refreshTerminalRenderer = (reason, extraFields = {}) => {
@@ -2644,6 +2715,49 @@ function WorkspaceTerminal({
     };
 
     scheduleRenderProbe("xterm_open", 0);
+    disposables.push(terminal.onResize(({ cols, rows }) => {
+      writeTerminalTelemetry({
+        paneId,
+        instanceId: terminalInstanceId,
+        phase: "frontend.xterm.resize",
+        cols,
+        rows,
+        fields: {
+          lastResizeMeasureSize,
+          rendererMode,
+          sinceLastResizeMeasureMs: lastResizeMeasureAt ? performance.now() - lastResizeMeasureAt : null,
+          terminalIndex,
+        },
+      });
+    }));
+    disposables.push(terminal.onRender(({ start, end }) => {
+      const now = performance.now();
+
+      if (
+        !lastResizeMeasureAt
+        || now - lastResizeMeasureAt > TERMINAL_RESIZE_DEBUG_RECENT_MS
+        || now - lastXtermRenderLogAt < TERMINAL_XTERM_RENDER_LOG_MIN_MS
+      ) {
+        return;
+      }
+
+      lastXtermRenderLogAt = now;
+      writeTerminalTelemetry({
+        paneId,
+        instanceId: terminalInstanceId,
+        phase: "frontend.xterm.render",
+        cols: terminal.cols,
+        rows: terminal.rows,
+        fields: {
+          end,
+          lastResizeMeasureSize,
+          rendererMode,
+          sinceLastResizeMeasureMs: now - lastResizeMeasureAt,
+          start,
+          terminalIndex,
+        },
+      });
+    }));
 
     if (terminalIndex === 0) {
       terminal.focus();
@@ -2653,92 +2767,391 @@ function WorkspaceTerminal({
     setTerminalState("starting");
     setTerminalError("");
 
-    const fitAndResizeNow = () => {
-      if (isDisposed) {
-        return;
-      }
+    const measureTerminalSizeForOpen = (reason, options = {}) => {
+      const shouldLogTelemetry = options.logTelemetry !== false;
+      const measuredAt = performance.now();
+      const measurement = measureTerminalGrid({
+        container,
+        term: terminal,
+        defaultCols: TERMINAL_DEFAULT_COLS,
+        defaultRows: TERMINAL_DEFAULT_ROWS,
+        minCols: TERMINAL_MIN_COLS,
+        minRows: TERMINAL_MIN_ROWS,
+        maxCols: TERMINAL_MAX_COLS,
+        maxRows: TERMINAL_MAX_ROWS,
+      });
+      const cols = measurement.ok ? measurement.cols : 0;
+      const rows = measurement.ok ? measurement.rows : 0;
+      const gridMs = performance.now() - measuredAt;
 
-      const bounds = container.getBoundingClientRect();
+      lastResizeMeasureAt = performance.now();
+      lastResizeMeasureSize = {
+        cols,
+        rows,
+        skipped: !measurement.ok,
+      };
+      patchTerminalMetrics({ gridMs });
 
-      if (bounds.width < 1 || bounds.height < 1) {
+      if (shouldLogTelemetry) {
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          phase: "frontend.resize.skip_zero_container",
-          fields: { width: bounds.width, height: bounds.height },
+          phase: "frontend.resize.measure",
+          cols,
+          rows,
+          elapsedMs: gridMs,
+          fields: {
+            actualCellHeight: measurement.actualCellHeight ?? null,
+            actualCellWidth: measurement.actualCellWidth ?? null,
+            containerHeight: Math.round(measurement.containerHeight || 0),
+            containerWidth: Math.round(measurement.containerWidth || 0),
+            measurementOk: measurement.ok,
+            metricSource: measurement.metricSource ?? null,
+            rawCols: measurement.rawCols ?? null,
+            rawRows: measurement.rawRows ?? null,
+            reason,
+            skipped: measurement.ok ? "" : measurement.reason,
+            terminalIndex,
+          },
         });
-        return;
       }
 
-      try {
-        const fitStartedAt = performance.now();
-        const nextSize = fitTerminalToContainer(fitAddon, terminal);
-        const fitMs = performance.now() - fitStartedAt;
-        patchTerminalMetrics({ fitMs });
+      return {
+        ...measurement,
+        cols,
+        elapsedMs: gridMs,
+        rows,
+        skipped: !measurement.ok,
+      };
+    };
+
+    const waitForTerminalSizeForOpen = async (reason) => {
+      const waitStartedAt = performance.now();
+      let attempts = 1;
+      let measurement = measureTerminalSizeForOpen(`${reason}_metric_wait`, { logTelemetry: true });
+
+      while (
+        !isDisposed
+        && !measurement.ok
+        && performance.now() - waitStartedAt < TERMINAL_START_METRIC_WAIT_MS
+      ) {
+        await waitForStartupMetricPoll(TERMINAL_START_METRIC_POLL_MS);
+
+        if (isDisposed) {
+          return null;
+        }
+
+        attempts += 1;
+        measurement = measureTerminalSizeForOpen(`${reason}_metric_wait`, { logTelemetry: false });
+      }
+
+      const waitMs = performance.now() - waitStartedAt;
+
+      if (measurement.ok) {
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          phase: "frontend.resize.fit",
-          cols: nextSize.cols,
-          rows: nextSize.rows,
-          elapsedMs: fitMs,
+          phase: "frontend.open.metrics_ready",
+          cols: measurement.cols,
+          rows: measurement.rows,
+          elapsedMs: waitMs,
+          fields: {
+            actualCellHeight: measurement.actualCellHeight,
+            actualCellWidth: measurement.actualCellWidth,
+            attempts,
+            containerHeight: Math.round(measurement.containerHeight),
+            containerWidth: Math.round(measurement.containerWidth),
+            metricSource: measurement.metricSource,
+            rawCols: measurement.rawCols,
+            rawRows: measurement.rawRows,
+            reason,
+            terminalIndex,
+          },
         });
+        return measurement;
+      }
 
-        if (nextSize.skipped || !isValidTerminalSize(nextSize.cols, nextSize.rows)) {
+      writeTerminalTelemetry({
+        paneId,
+        instanceId: terminalInstanceId,
+        phase: "frontend.open.metrics_timeout",
+        cols: 0,
+        rows: 0,
+        elapsedMs: waitMs,
+        fields: {
+          attempts,
+          lastActualCellHeight: measurement.actualCellHeight ?? null,
+          lastActualCellWidth: measurement.actualCellWidth ?? null,
+          lastReason: measurement.reason,
+          metricSource: measurement.metricSource ?? null,
+          reason,
+          terminalIndex,
+          timeoutMs: TERMINAL_START_METRIC_WAIT_MS,
+        },
+      });
+
+      throw new Error("Terminal render metrics were not ready before PTY startup.");
+    };
+
+    const writeTerminalOutput = (data, options = {}) => {
+      if (isDisposed || !data?.byteLength) {
+        return;
+      }
+
+      const isFirstOutputChunk = options.isFirstOutputChunk === true;
+
+      if (resizeWriteBarrierActive && !options.fromResizeBarrier) {
+        const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
+        const wasEmpty = resizeWriteBarrierQueue.length === 0;
+
+        resizeWriteBarrierQueue.push({
+          data: queuedData,
+          isFirstOutputChunk,
+        });
+        resizeWriteBarrierBytes += queuedData.byteLength;
+
+        if (wasEmpty) {
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
-            phase: "frontend.resize.skip_unusable_fit",
-            cols: nextSize.cols,
-            rows: nextSize.rows,
+            phase: "frontend.output.resize_barrier_queue_start",
+            cols: terminal.cols,
+            rows: terminal.rows,
+            fields: {
+              bytes: queuedData.byteLength,
+              reason: resizeWriteBarrierReason,
+              terminalIndex,
+            },
           });
+        }
+
+        return;
+      }
+
+      terminal.write(data, () => {
+        if (isDisposed) {
           return;
         }
 
-        if (!hasOpenPty) {
+        if (isFirstOutputChunk) {
+          refreshTerminalRenderer("first_output_written", {
+            bytes: data.byteLength,
+            transport: "binary_channel",
+          });
+          scheduleRenderProbe(
+            "first_output_written",
+            TERMINAL_RENDER_PROBE_AFTER_WRITE_MS,
+            {
+              bytes: data.byteLength,
+              transport: "binary_channel",
+            },
+          );
+        }
+      });
+    };
+
+    const openResizeWriteBarrier = (event) => {
+      if (resizeWriteBarrierActive) {
+        return;
+      }
+
+      resizeWriteBarrierActive = true;
+      resizeWriteBarrierStartedAt = performance.now();
+      resizeWriteBarrierReason = event?.reason || "resize";
+      resizeWriteBarrierBytes = 0;
+      resizeWriteBarrierQueue.length = 0;
+      writeTerminalTelemetry({
+        paneId,
+        instanceId: terminalInstanceId,
+        phase: "frontend.output.resize_barrier_start",
+        cols: event?.cols,
+        rows: event?.rows,
+        fields: {
+          reason: resizeWriteBarrierReason,
+          terminalIndex,
+        },
+      });
+    };
+
+    const closeResizeWriteBarrier = (reason) => {
+      const queuedWrites = resizeWriteBarrierQueue.splice(0);
+      const queuedBytes = resizeWriteBarrierBytes;
+      const barrierMs = resizeWriteBarrierStartedAt
+        ? performance.now() - resizeWriteBarrierStartedAt
+        : 0;
+
+      resizeWriteBarrierActive = false;
+      resizeWriteBarrierStartedAt = 0;
+      resizeWriteBarrierReason = "";
+      resizeWriteBarrierBytes = 0;
+
+      if (queuedWrites.length) {
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.output.resize_barrier_flush",
+          cols: terminal.cols,
+          rows: terminal.rows,
+          elapsedMs: barrierMs,
+          fields: {
+            bytes: queuedBytes,
+            chunks: queuedWrites.length,
+            reason,
+            terminalIndex,
+          },
+        });
+      }
+
+      queuedWrites.forEach((queuedWrite) => {
+        writeTerminalOutput(queuedWrite.data, {
+          fromResizeBarrier: true,
+          isFirstOutputChunk: queuedWrite.isFirstOutputChunk,
+        });
+      });
+
+      return {
+        barrierMs,
+        queuedBytes,
+        queuedChunks: queuedWrites.length,
+      };
+    };
+
+    resizeController = createTerminalResizeController({
+      canResize: () => hasOpenPty && !isDisposed,
+      container,
+      defaultCols: TERMINAL_DEFAULT_COLS,
+      defaultRows: TERMINAL_DEFAULT_ROWS,
+      getWebglAddon: () => activeWebglAddon,
+      instanceId: () => terminalInstanceId,
+      maxCols: TERMINAL_MAX_COLS,
+      maxRows: TERMINAL_MAX_ROWS,
+      minCols: TERMINAL_MIN_COLS,
+      minRows: TERMINAL_MIN_ROWS,
+      onDone: (event) => {
+        if (isDisposed) {
           return;
         }
 
-        if (lastSentSize?.cols === nextSize.cols && lastSentSize?.rows === nextSize.rows) {
-          return;
-        }
+        const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_applied");
+        lastResizeMeasureAt = performance.now();
+        lastResizeMeasureSize = {
+          cols: event.cols,
+          rows: event.rows,
+          skipped: false,
+        };
+        patchTerminalMetrics({
+          gridMs: event.elapsedMs,
+          resizeLagMs: event.elapsedMs,
+        });
+        addTerminalMetrics({
+          resizeBatches: 1,
+          resizePanes: 1,
+        });
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.resize.applied",
+          cols: event.cols,
+          rows: event.rows,
+          elapsedMs: event.elapsedMs,
+          fields: {
+            actualCellHeight: event.actualCellHeight,
+            actualCellWidth: event.actualCellWidth,
+            clearedTextureAtlas: event.clearedTextureAtlas,
+            containerHeight: Math.round(event.containerHeight),
+            containerWidth: Math.round(event.containerWidth),
+            metricSource: event.metricSource,
+            rawCols: event.rawCols,
+            rawRows: event.rawRows,
+            reason: event.reason,
+            rendererMode,
+            resizeBarrierBytes: resizeBarrier.queuedBytes,
+            resizeBarrierChunks: resizeBarrier.queuedChunks,
+            resizeBarrierMs: resizeBarrier.barrierMs,
+            terminalIndex,
+          },
+        });
+        scheduleResizeIdleDebugProbes({
+          requestedCols: event.cols,
+          requestedRows: event.rows,
+          resizeReason: event.reason,
+        });
+        scheduleRenderProbe("resize_applied", TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS, {
+          requestedCols: event.cols,
+          requestedRows: event.rows,
+          resizeReason: event.reason,
+        });
+      },
+      onError: (event) => {
+        const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_error");
 
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          phase: "frontend.resize.queue",
-          cols: nextSize.cols,
-          rows: nextSize.rows,
+          phase: "frontend.resize.error",
+          cols: event.cols,
+          rows: event.rows,
+          elapsedMs: event.elapsedMs,
+          fields: {
+            error: getErrorMessage(event.error, "Unable to resize terminal."),
+            reason: event.reason,
+            resizeBarrierBytes: resizeBarrier.queuedBytes,
+            resizeBarrierChunks: resizeBarrier.queuedChunks,
+            resizeBarrierMs: resizeBarrier.barrierMs,
+            terminalIndex,
+          },
         });
-        if (queueTerminalNativeResize({
+      },
+      onSkip: (event) => {
+        writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          cols: nextSize.cols,
-          rows: nextSize.rows,
-        })) {
-          lastSentSize = nextSize;
-          scheduleRenderProbe(
-            "resize_queued",
-            TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS,
-            { requestedCols: nextSize.cols, requestedRows: nextSize.rows },
-          );
-        }
-      } catch {
-        // xterm can reject fit calls during initial layout; the next resize fixes it.
-      }
-    };
-
-    const fitAndResize = () => {
-      scheduleWorkspaceTerminalFit({
-        paneId,
-        instanceId: terminalInstanceId,
-        fit: fitAndResizeNow,
-      });
-    };
-
-    const resizeObserver = new ResizeObserver(fitAndResize);
-    resizeObserver.observe(container);
-    let startTerminalTimer = 0;
+          phase: "frontend.resize.skip",
+          cols: event.cols,
+          rows: event.rows,
+          fields: {
+            actualCellHeight: event.actualCellHeight ?? null,
+            actualCellWidth: event.actualCellWidth ?? null,
+            containerHeight: Math.round(event.containerHeight || 0),
+            containerWidth: Math.round(event.containerWidth || 0),
+            metricSource: event.metricSource ?? null,
+            reason: event.reason,
+            skipped: event.skipped,
+            terminalIndex,
+          },
+        });
+      },
+      onStart: (event) => {
+        openResizeWriteBarrier(event);
+        lastResizeMeasureAt = performance.now();
+        lastResizeMeasureSize = {
+          cols: event.cols,
+          rows: event.rows,
+          skipped: false,
+        };
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.resize.native_start",
+          cols: event.cols,
+          rows: event.rows,
+          fields: {
+            actualCellHeight: event.actualCellHeight,
+            actualCellWidth: event.actualCellWidth,
+            containerHeight: Math.round(event.containerHeight),
+            containerWidth: Math.round(event.containerWidth),
+            metricSource: event.metricSource,
+            rawCols: event.rawCols,
+            rawRows: event.rawRows,
+            reason: event.reason,
+            terminalIndex,
+          },
+        });
+      },
+      paneId: () => paneId,
+      term: terminal,
+    });
+    resizeController?.schedule("mount");
 
     async function startTerminal() {
       try {
@@ -2749,65 +3162,50 @@ function WorkspaceTerminal({
           elapsedMs: performance.now() - lifecycleStartedAt,
           fields: getWorkspaceOpenTelemetryFields(workspace?.id),
         });
-        disposables.push(await listen("forge-terminal-data", (event) => {
-          if (
-            event.payload?.paneId === paneId
-            && event.payload?.instanceId === terminalInstanceId
-            && typeof event.payload.data === "string"
-          ) {
-            const receivedAt = Date.now();
-            const readAtMs = Number.isFinite(event.payload.readAtMs)
-              ? event.payload.readAtMs
-              : receivedAt;
-            const outputLagMs = Math.max(0, receivedAt - readAtMs);
-
-            addTerminalMetrics({
-              ipcEvents: 1,
-              ipcBytes: event.payload.data.length,
-            });
-            patchTerminalMetrics({ outputLagMs });
-
-            const isFirstOutputChunk = !sawFirstOutput;
-            outputChunks += 1;
-            outputBytes += event.payload.data.length;
-
-            if (isFirstOutputChunk) {
-              sawFirstOutput = true;
-              writeTerminalTelemetry({
-                paneId,
-                instanceId: terminalInstanceId,
-                phase: "frontend.output.first_chunk",
-                elapsedMs: performance.now() - lifecycleStartedAt,
-                fields: {
-                  bytes: event.payload.data.length,
-                  outputLagMs,
-                },
-              });
-              scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
-            }
-
-            terminal.write(event.payload.data, () => {
-              if (isDisposed) {
-                return;
-              }
-
-              if (isFirstOutputChunk) {
-                refreshTerminalRenderer("first_output_written", {
-                  bytes: event.payload.data.length,
-                  outputLagMs,
-                });
-                scheduleRenderProbe(
-                  "first_output_written",
-                  TERMINAL_RENDER_PROBE_AFTER_WRITE_MS,
-                  {
-                    bytes: event.payload.data.length,
-                    outputLagMs,
-                  },
-                );
-              }
-            });
+        const outputChannel = new Channel((message) => {
+          if (isDisposed) {
+            return;
           }
-        }));
+
+          const data = message instanceof ArrayBuffer
+            ? new Uint8Array(message)
+            : ArrayBuffer.isView(message)
+              ? new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
+              : null;
+
+          if (!data?.byteLength) {
+            return;
+          }
+
+          addTerminalMetrics({
+            ipcEvents: 1,
+            ipcBytes: data.byteLength,
+          });
+          patchTerminalMetrics({ outputLagMs: 0 });
+
+          const isFirstOutputChunk = !sawFirstOutput;
+          outputChunks += 1;
+          outputBytes += data.byteLength;
+
+          if (isFirstOutputChunk) {
+            sawFirstOutput = true;
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.output.first_chunk",
+              elapsedMs: performance.now() - lifecycleStartedAt,
+              fields: {
+                bytes: data.byteLength,
+                transport: "binary_channel",
+              },
+            });
+            scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
+          }
+
+          writeTerminalOutput(data, {
+            isFirstOutputChunk,
+          });
+        });
         disposables.push(await listen("forge-terminal-exit", (event) => {
           if (
             event.payload?.paneId === paneId
@@ -2822,7 +3220,6 @@ function WorkspaceTerminal({
               fields: { exitCode: event.payload.exitCode ?? null },
             });
             hasOpenPty = false;
-            lastSentSize = null;
             runtimeTerminalState = "exited";
             setTerminalState("exited");
           }
@@ -2858,9 +3255,30 @@ function WorkspaceTerminal({
           });
         }));
 
-        const initialSize = fitTerminalToContainer(fitAddon, terminal);
+        const initialSize = await waitForTerminalSizeForOpen("terminal_open");
+
+        if (isDisposed || !initialSize) {
+          return;
+        }
+
+        if (terminal.cols !== initialSize.cols || terminal.rows !== initialSize.rows) {
+          terminal.resize(initialSize.cols, initialSize.rows);
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.open.xterm_initial_resize",
+            cols: initialSize.cols,
+            rows: initialSize.rows,
+            elapsedMs: performance.now() - lifecycleStartedAt,
+            fields: {
+              metricSource: initialSize.metricSource,
+              terminalIndex,
+            },
+          });
+        }
+
         const shouldPrewarmShell = prewarmShell && !agentLaunchReadyRef.current;
-        const openKind = shouldPrewarmShell ? "prewarm-shell" : agent.id;
+        const openKind = shouldPrewarmShell ? "prewarm-pty" : agent.id;
         const openProvider = shouldPrewarmShell ? null : agent.id;
         let agentStartedInCurrentPty = !shouldPrewarmShell;
 
@@ -2872,24 +3290,15 @@ function WorkspaceTerminal({
           agentStartedInCurrentPty = true;
           startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
           startupWatchTimers.clear();
-          sawFirstOutput = false;
-          outputBytes = 0;
-          outputChunks = 0;
           runtimeTerminalState = "starting";
           setTerminalState("starting");
           setTerminalError("");
-
-          try {
-            terminal.clear();
-          } catch {
-            // Clearing the shell prompt is cosmetic; launching the agent is the important part.
-          }
 
           const agentLaunchStartedAt = performance.now();
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
-            phase: "frontend.agent_launch.invoke_start",
+            phase: "frontend.agent_launch.batch_attach_start",
             cols: terminal.cols,
             rows: terminal.rows,
             fields: {
@@ -2901,63 +3310,30 @@ function WorkspaceTerminal({
             },
           });
 
-          try {
-            await invoke("terminal_start_agent", {
-              paneId,
-              instanceId: terminalInstanceId,
-              provider: agent.id,
-              model: "",
-            });
-
-            if (isDisposed) {
-              return;
-            }
-
-            runtimeTerminalState = "running";
-            setTerminalState("running");
-            writeTerminalTelemetry({
-              paneId,
-              instanceId: terminalInstanceId,
-              phase: "frontend.agent_launch.invoke_done",
-              cols: terminal.cols,
-              rows: terminal.rows,
-              elapsedMs: performance.now() - agentLaunchStartedAt,
-              fields: {
-                agentId: agent.id,
-                launchEpoch,
-                reason,
-                terminalIndex,
-                ...getWorkspaceOpenTelemetryFields(workspace?.id),
-              },
-            });
-            fitAndResize();
-            scheduleRenderProbe("agent_launch_done", TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS, {
-              initialCols: initialSize.cols,
-              initialRows: initialSize.rows,
+          runtimeTerminalState = "running";
+          setTerminalState("running");
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.agent_launch.batch_attach_done",
+            cols: terminal.cols,
+            rows: terminal.rows,
+            elapsedMs: performance.now() - agentLaunchStartedAt,
+            fields: {
+              agentId: agent.id,
+              launchEpoch,
               reason,
-            });
-            scheduleBlankStartupWatch("agent_launch_done");
-          } catch (error) {
-            agentStartedInCurrentPty = false;
-
-            if (!isDisposed) {
-              runtimeTerminalState = "error";
-              setTerminalState("error");
-              setTerminalError(getErrorMessage(error, `Unable to launch ${agent.label}.`));
-              writeTerminalTelemetry({
-                paneId,
-                instanceId: terminalInstanceId,
-                phase: "frontend.agent_launch.error",
-                elapsedMs: performance.now() - agentLaunchStartedAt,
-                fields: {
-                  agentId: agent.id,
-                  launchEpoch,
-                  reason,
-                  error: getErrorMessage(error, "Unable to launch terminal agent."),
-                },
-              });
-            }
-          }
+              terminalIndex,
+              ...getWorkspaceOpenTelemetryFields(workspace?.id),
+            },
+          });
+          resizeController?.resizeNow("agent_launch_done");
+          scheduleRenderProbe("agent_launch_done", TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS, {
+            initialCols: initialSize.cols,
+            initialRows: initialSize.rows,
+            reason,
+          });
+          scheduleBlankStartupWatch("agent_launch_done");
         };
         startAgentInPrewarmedTerminalRef.current = shouldPrewarmShell ? startAgentInCurrentPty : null;
 
@@ -2976,69 +3352,44 @@ function WorkspaceTerminal({
         });
 
         const openStartedAt = performance.now();
-        const terminalSpawnGapMs = restartKey > 0
-          ? TERMINAL_RETRY_SPAWN_STAGGER_MS
-          : TERMINAL_INITIAL_SPAWN_STAGGER_MS;
-        const openResult = await enqueueTerminalSpawn(async ({
-          skippedAfterPace = false,
-          skippedBeforePace = false,
-          spawnGapMs,
-          spawnWaitMs,
-          waitMs,
-        }) => {
+        if (isDisposed) {
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
-            phase: "frontend.open.queue_enter",
-            elapsedMs: waitMs,
+            phase: "frontend.open.skip_disposed",
+            elapsedMs: performance.now() - openStartedAt,
             fields: {
-              skippedAfterPace,
-              skippedBeforePace,
-              spawnWaitMs,
-              terminalSpawnGapMs: spawnGapMs,
               terminalIndex,
               ...getWorkspaceOpenTelemetryFields(workspace?.id),
             },
           });
-
-          if (isDisposed) {
-            writeTerminalTelemetry({
-              paneId,
-              instanceId: terminalInstanceId,
-              phase: "frontend.open.queue_skip_disposed",
-              elapsedMs: performance.now() - openStartedAt,
-              fields: {
-                skippedAfterPace,
-                skippedBeforePace,
-                spawnWaitMs,
-                terminalSpawnGapMs: spawnGapMs,
-                terminalIndex,
-                ...getWorkspaceOpenTelemetryFields(workspace?.id),
-              },
-            });
-            return null;
-          }
-
-          return invoke("terminal_open", {
-            request: {
-              paneId,
-              instanceId: terminalInstanceId,
-              kind: openKind,
-              provider: openProvider,
-              model: "",
-              workingDirectory: workingDirectory || "",
-              cols: initialSize.cols,
-              rows: initialSize.rows,
-            },
-          });
-        }, {
-          shouldRun: () => !isDisposed,
-          spawnGapMs: terminalSpawnGapMs,
-        });
-
-        if (!openResult) {
           return;
         }
+
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.open.dispatch",
+          elapsedMs: performance.now() - openStartedAt,
+          fields: {
+            terminalIndex,
+            transport: "binary_channel",
+            ...getWorkspaceOpenTelemetryFields(workspace?.id),
+          },
+        });
+        await invoke("terminal_open", {
+          request: {
+            paneId,
+            instanceId: terminalInstanceId,
+            kind: openKind,
+            provider: openProvider,
+            model: "",
+            workingDirectory: workingDirectory || "",
+            cols: initialSize.cols,
+            rows: initialSize.rows,
+          },
+          outputChannel,
+        });
 
         if (isDisposed) {
           invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
@@ -3046,7 +3397,6 @@ function WorkspaceTerminal({
         }
 
         hasOpenPty = true;
-        lastSentSize = initialSize;
         runtimeTerminalState = shouldPrewarmShell ? "prewarmed" : "running";
         setTerminalState(shouldPrewarmShell ? "starting" : "running");
         patchTerminalMetrics({ startupMs: performance.now() - openStartedAt });
@@ -3062,7 +3412,7 @@ function WorkspaceTerminal({
             prewarmShell: shouldPrewarmShell,
           },
         });
-        fitAndResize();
+        resizeController?.resizeNow("terminal_open_done");
         scheduleRenderProbe("terminal_open_done", TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS, {
           initialCols: initialSize.cols,
           initialRows: initialSize.rows,
@@ -3086,6 +3436,14 @@ function WorkspaceTerminal({
               terminalIndex,
               ...getWorkspaceOpenTelemetryFields(workspace?.id),
             },
+          });
+          onPreparedTerminalChange?.({
+            agentId: agent.id,
+            instanceId: terminalInstanceId,
+            paneId,
+            ready: true,
+            terminalIndex,
+            workspaceId: workspace?.id || "",
           });
 
           if (agentLaunchReadyRef.current && agentLaunchEpochRef.current > 0) {
@@ -3113,38 +3471,29 @@ function WorkspaceTerminal({
       }
     }
 
-    if (TERMINAL_START_DEBOUNCE_MS > 0) {
-      writeTerminalTelemetry({
-        paneId,
-        instanceId: terminalInstanceId,
-        phase: "frontend.start.deferred",
-        fields: {
-          delayMs: TERMINAL_START_DEBOUNCE_MS,
-          ...getWorkspaceOpenTelemetryFields(workspace?.id),
-        },
-      });
-      startTerminalTimer = window.setTimeout(() => {
-        startTerminalTimer = 0;
-        startTerminal();
-      }, TERMINAL_START_DEBOUNCE_MS);
-    } else {
-      startTerminal();
-    }
+    startTerminal();
 
     return () => {
       isDisposed = true;
-      if (startTerminalTimer) {
-        window.clearTimeout(startTerminalTimer);
-      }
-      cancelWorkspaceTerminalFit(paneId, terminalInstanceId);
+      resizeController?.dispose();
+      activeWebglAddon = null;
       if (webglAttachTimer) {
         window.clearTimeout(webglAttachTimer);
       }
+      if (resizeIdleDebugTimer) {
+        window.clearTimeout(resizeIdleDebugTimer);
+      }
+      startupMetricTimers.forEach((timer) => window.clearTimeout(timer));
+      startupMetricTimers.clear();
       renderProbeTimers.forEach((timer) => window.clearTimeout(timer));
       renderProbeTimers.clear();
+      resizeDebugProbeTimers.forEach((timer) => window.clearTimeout(timer));
+      resizeDebugProbeTimers.clear();
       startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
       startupWatchTimers.clear();
-      resizeObserver.disconnect();
+      resizeWriteBarrierActive = false;
+      resizeWriteBarrierQueue.length = 0;
+      resizeWriteBarrierBytes = 0;
       disposables.forEach((dispose) => {
         if (typeof dispose === "function") {
           dispose();
@@ -3156,6 +3505,14 @@ function WorkspaceTerminal({
       if (startAgentInPrewarmedTerminalRef.current === startAgentInCurrentPty) {
         startAgentInPrewarmedTerminalRef.current = null;
       }
+      onPreparedTerminalChange?.({
+        agentId: agent?.id || "",
+        instanceId: terminalInstanceId,
+        paneId,
+        ready: false,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
       writeTerminalTelemetry({
         paneId,
         instanceId: terminalInstanceId,
@@ -3166,7 +3523,7 @@ function WorkspaceTerminal({
       invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
       terminal.dispose();
     };
-  }, [agent?.id, agent?.label, paneId, restartKey, terminalClosed, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [agent?.id, agent?.label, onPreparedTerminalChange, paneId, restartKey, terminalClosed, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const closeTerminal = useCallback(async () => {
     setTerminalError("");
@@ -4695,6 +5052,8 @@ export default function App() {
   const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
   const [workspaceState, setWorkspaceState] = useState("idle");
   const [workspaceAgentLaunchEpoch, setWorkspaceAgentLaunchEpoch] = useState(0);
+  const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
+  const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
   const authStartupFinishedRef = useRef(false);
@@ -4707,6 +5066,8 @@ export default function App() {
   const startupAgentSettingsPendingRef = useRef(false);
   const activeWorkspaceIdRef = useRef("");
   const workspaceAgentLaunchKeyRef = useRef("");
+  const preparedTerminalsRef = useRef(new Map());
+  const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
 
   useEffect(() => {
@@ -5591,6 +5952,15 @@ export default function App() {
         ? await invoke("validate_workspace_root_directory", { path: cleanedRoot })
         : null;
       const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
+      const nextTerminalIndexSet = new Set(nextTerminalIndexes);
+      const currentTerminalIndexes = normalizeWorkspaceTerminalIndexes(
+        workspaceTerminalSlots[activeWorkspace.id],
+        currentTerminalCount,
+      );
+      const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
+        !nextTerminalIndexSet.has(terminalIndex)
+      ));
       let nextWorkspace = activeWorkspace;
 
       if (workspaceNameValue !== activeWorkspace.name) {
@@ -5622,9 +5992,20 @@ export default function App() {
       if (rootDirectory !== currentRootDirectory || terminalCount !== currentTerminalCount) {
         setWorkspaceTerminalSlots((slots) => ({
           ...slots,
-          [activeWorkspace.id]: getDefaultTerminalIndexes(terminalCount),
+          [activeWorkspace.id]: nextTerminalIndexes,
         }));
       }
+
+      removedTerminalIndexes.forEach((terminalIndex) => {
+        closeWorkspaceTerminalPane({
+          agentId: activeAgent,
+          nextTerminalCount: terminalCount,
+          previousTerminalCount: currentTerminalCount,
+          reason: "settings_save",
+          terminalIndex,
+          workspaceId: activeWorkspace.id,
+        });
+      });
 
       setWorkspaceNameDraft(nextWorkspace.name);
       setWorkspaceRootDraft(rootDirectory);
@@ -5647,6 +6028,8 @@ export default function App() {
     workspaceRootDraft,
     workspaceTerminalCountDraft,
     workspaceSettings,
+    workspaceTerminalSlots,
+    activeAgent,
   ]);
 
   const closeWorkspaceTerminal = useCallback(({ workspaceId, terminalIndex }) => {
@@ -5900,9 +6283,13 @@ export default function App() {
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     workspaceAgentLaunchKeyRef.current = "";
+    workspaceAgentBatchInFlightKeyRef.current = "";
+    preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
     setStartupAgentUpdateMessage("");
     setWorkspaceAgentLaunchEpoch(0);
+    setWorkspaceAgentBatchSentKey("");
+    setPreparedTerminalVersion((version) => version + 1);
   }, [authState]);
 
   useEffect(() => {
@@ -6250,32 +6637,152 @@ export default function App() {
     showView("settings");
   }, [activeWorkspace, openWorkspaceSettings, showView]);
 
-  useEffect(() => {
-    if (!workspaceAgentLaunchKey) {
-      workspaceAgentLaunchKeyRef.current = "";
+  const handlePreparedTerminalChange = useCallback((session) => {
+    if (!session?.paneId) {
       return;
     }
 
-    if (workspaceAgentLaunchKeyRef.current === workspaceAgentLaunchKey) {
+    const key = `${session.workspaceId || ""}:${session.terminalIndex}:${session.agentId || ""}:${session.paneId}`;
+
+    if (session.ready) {
+      preparedTerminalsRef.current.set(key, {
+        agentId: session.agentId || "",
+        instanceId: session.instanceId,
+        paneId: session.paneId,
+        terminalIndex: session.terminalIndex,
+        workspaceId: session.workspaceId || "",
+      });
+    } else {
+      preparedTerminalsRef.current.delete(key);
+    }
+
+    setPreparedTerminalVersion((version) => version + 1);
+  }, []);
+
+  const preparedWorkspaceTerminalRequests = useMemo(() => {
+    if (!activeWorkspace || !workspaceTerminalAgent) {
+      return [];
+    }
+
+    const terminalIndexes = new Set(activeWorkspaceTerminalIndexes);
+
+    return Array.from(preparedTerminalsRef.current.values())
+      .filter((session) => (
+        session.workspaceId === activeWorkspace.id
+        && session.agentId === workspaceTerminalAgent.id
+        && terminalIndexes.has(session.terminalIndex)
+      ))
+      .sort((left, right) => left.terminalIndex - right.terminalIndex)
+      .map((session) => ({
+        instanceId: session.instanceId,
+        model: "",
+        paneId: session.paneId,
+        provider: workspaceTerminalAgent.id,
+      }));
+  }, [
+    activeWorkspace?.id,
+    activeWorkspaceTerminalIndexes,
+    preparedTerminalVersion,
+    workspaceTerminalAgent?.id,
+  ]);
+  const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.length;
+  const shouldHoldWorkspaceRevealForTerminalBatch = Boolean(
+    workspaceAgentLaunchKey
+    && preparedWorkspaceTerminalCount > 0
+    && workspaceAgentBatchSentKey !== workspaceAgentLaunchKey,
+  );
+
+  useEffect(() => {
+    if (!workspaceAgentLaunchKey) {
+      workspaceAgentLaunchKeyRef.current = "";
+      workspaceAgentBatchInFlightKeyRef.current = "";
+      setWorkspaceAgentBatchSentKey("");
+      return;
+    }
+
+    if (
+      workspaceAgentBatchSentKey === workspaceAgentLaunchKey
+      || workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
+      || preparedWorkspaceTerminalCount === 0
+      || preparedWorkspaceTerminalCount < activeWorkspaceVisibleTerminalCount
+    ) {
       return;
     }
 
     workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
-    setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+    workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
+    const batchStartedAt = performance.now();
     writeTerminalTelemetry({
       paneId: activeWorkspace?.id || "",
-      phase: "frontend.agent_launch.broadcast_start",
+      phase: "frontend.agent_launch.batch_start",
       fields: {
         agentId: workspaceTerminalAgent?.id || "",
+        preparedTerminalCount: preparedWorkspaceTerminalCount,
         terminalCount: activeWorkspaceVisibleTerminalCount,
         terminalIndexes: activeWorkspaceTerminalIndexes,
         ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
       },
     });
+
+    invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
+      .then((result) => {
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+        preparedTerminalsRef.current.forEach((session, key) => {
+          if (preparedWorkspaceTerminalRequests.some((request) => (
+            request.paneId === session.paneId && request.instanceId === session.instanceId
+          ))) {
+            preparedTerminalsRef.current.delete(key);
+          }
+        });
+        setPreparedTerminalVersion((version) => version + 1);
+        writeTerminalTelemetry({
+          paneId: activeWorkspace?.id || "",
+          phase: "frontend.agent_launch.batch_done",
+          elapsedMs: performance.now() - batchStartedAt,
+          fields: {
+            agentId: workspaceTerminalAgent?.id || "",
+            preparedTerminalCount: preparedWorkspaceTerminalCount,
+            started: result?.started ?? null,
+            skipped: result?.skipped ?? null,
+            terminalCount: activeWorkspaceVisibleTerminalCount,
+            ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
+          },
+        });
+      })
+      .catch((error) => {
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+        preparedTerminalsRef.current.forEach((session, key) => {
+          if (preparedWorkspaceTerminalRequests.some((request) => (
+            request.paneId === session.paneId && request.instanceId === session.instanceId
+          ))) {
+            preparedTerminalsRef.current.delete(key);
+          }
+        });
+        setPreparedTerminalVersion((version) => version + 1);
+        writeTerminalTelemetry({
+          paneId: activeWorkspace?.id || "",
+          phase: "frontend.agent_launch.batch_error",
+          elapsedMs: performance.now() - batchStartedAt,
+          fields: {
+            agentId: workspaceTerminalAgent?.id || "",
+            error: getErrorMessage(error, "Unable to start terminal agents."),
+            preparedTerminalCount: preparedWorkspaceTerminalCount,
+            terminalCount: activeWorkspaceVisibleTerminalCount,
+            ...getWorkspaceOpenTelemetryFields(activeWorkspace?.id),
+          },
+        });
+      });
   }, [
     activeWorkspace?.id,
     activeWorkspaceTerminalIndexes,
     activeWorkspaceVisibleTerminalCount,
+    preparedWorkspaceTerminalCount,
+    preparedWorkspaceTerminalRequests,
+    workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
     workspaceTerminalAgent?.id,
   ]);
@@ -6366,6 +6873,8 @@ export default function App() {
     ? Math.min(100, Math.round((workspaceCloseClosed / workspaceCloseTotal) * 100))
     : 0;
   const workspaceCloseTerminalLabel = workspaceCloseTotal === 1 ? "terminal" : "terminals";
+  const isWorkspaceStartupOverlayVisible = workspaceState !== "ready"
+    || shouldHoldWorkspaceRevealForTerminalBatch;
 
   return (
     <>
@@ -6518,8 +7027,8 @@ export default function App() {
           ) : authState === "authenticated" ? (
             <AuthenticatedWorkspaceFrame>
               <DashboardShell
-                aria-hidden={workspaceState !== "ready"}
-                data-startup={workspaceState !== "ready"}
+                aria-hidden={isWorkspaceStartupOverlayVisible}
+                data-startup={isWorkspaceStartupOverlayVisible}
               >
               <WorkspaceRail aria-label="Workspace navigation">
                 <RailTop>
@@ -6982,11 +7491,16 @@ export default function App() {
                           >
                             {terminalPanelRows.map((row, rowOrderIndex) => (
                               <Fragment key={`row-${row.rowIndex}`}>
-                                {rowOrderIndex > 0 && <ResizeHandle data-direction="vertical" />}
+                                {rowOrderIndex > 0 && (
+                                  <ResizeHandle
+                                    data-direction="vertical"
+                                  />
+                                )}
                                 <ResizePanel
+                                  data-terminal-row="true"
                                   defaultSize={`${100 / terminalPanelRows.length}%`}
                                   id={`workspace-terminal-row-${activeWorkspace.id}-${row.rowIndex}`}
-                                  minSize={`${terminalPanelRows.length > 3 ? 8 : 12}%`}
+                                  minSize={getTerminalPaneMinSizePercent(terminalPanelRows.length)}
                                 >
                                   <ResizePanelGroup
                                     id={`workspace-terminal-cols-${activeWorkspace.id}-${row.rowIndex}`}
@@ -6994,11 +7508,17 @@ export default function App() {
                                   >
                                     {row.terminalIndexes.map((terminalIndex, columnIndex) => (
                                       <Fragment key={`${activeWorkspace.id}-${terminalIndex}`}>
-                                        {columnIndex > 0 && <ResizeHandle data-direction="horizontal" />}
+                                        {columnIndex > 0 && (
+                                          <ResizeHandle
+                                            data-direction="horizontal"
+                                          />
+                                        )}
                                         <ResizePanel
+                                          data-terminal-column="true"
+                                          data-terminal-leaf="true"
                                           defaultSize={`${100 / row.terminalIndexes.length}%`}
                                           id={`workspace-terminal-col-${activeWorkspace.id}-${terminalIndex}`}
-                                          minSize={`${row.terminalIndexes.length > 3 ? 8 : 12}%`}
+                                          minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
                                         >
                                           <WorkspaceTerminal
                                             agent={workspaceTerminalRenderAgent}
@@ -7009,6 +7529,7 @@ export default function App() {
                                             agentStatusState={agentStatusState}
                                             onCloseTerminal={closeWorkspaceTerminal}
                                             onOpenSettings={() => showView("settings")}
+                                            onPreparedTerminalChange={handlePreparedTerminalChange}
                                             onRecheckAgents={refreshAgentStatuses}
                                             prewarmShell={shouldPrewarmWorkspaceTerminals}
                                             terminalCount={activeWorkspaceVisibleTerminalCount}
@@ -7036,6 +7557,7 @@ export default function App() {
                           agentStatusState={agentStatusState}
                           onCloseTerminal={closeWorkspaceTerminal}
                           onOpenSettings={() => showView("settings")}
+                          onPreparedTerminalChange={handlePreparedTerminalChange}
                           onRecheckAgents={refreshAgentStatuses}
                           prewarmShell={activeWorkspace ? shouldPrewarmWorkspaceTerminals : false}
                           terminalCount={activeWorkspaceVisibleTerminalCount}
@@ -7149,7 +7671,7 @@ export default function App() {
                 </WorkspaceSettingsOverlay>
               )}
               </DashboardShell>
-              {workspaceState !== "ready" && (
+              {isWorkspaceStartupOverlayVisible && (
                 <WorkspaceStartupOverlay aria-label={`${BRAND_NAME} is initializing workspace`}>
                   <AmbientPanel data-position="left">
                     <span>&gt; workspace</span>
@@ -8852,6 +9374,16 @@ const ResizePanel = styled(Panel)`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+
+  &[data-terminal-row="true"],
+  &[data-terminal-leaf="true"] {
+    min-height: ${TERMINAL_PANE_MIN_HEIGHT_PX}px;
+  }
+
+  &[data-terminal-column="true"],
+  &[data-terminal-leaf="true"] {
+    min-width: ${TERMINAL_PANE_MIN_WIDTH_PX}px;
+  }
 `;
 
 const ResizeHandle = styled(Separator)`
@@ -8971,7 +9503,7 @@ const TerminalFrame = styled.section`
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background: #020304;
+  background: ${TERMINAL_THEME_BACKGROUND};
   box-shadow: none;
 
   &[data-state="error"] {
@@ -8985,15 +9517,17 @@ const XtermSurface = styled.div`
   min-width: 0;
   min-height: 0;
   padding: 0;
-  background: #020304;
+  background: ${TERMINAL_THEME_BACKGROUND};
 
   .xterm {
     width: 100%;
     height: 100%;
+    background: ${TERMINAL_THEME_BACKGROUND} !important;
   }
 
-  .xterm-viewport {
-    background: #020304 !important;
+  .xterm-viewport,
+  .xterm-screen {
+    background: ${TERMINAL_THEME_BACKGROUND} !important;
   }
 `;
 

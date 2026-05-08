@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     thread,
@@ -18,10 +18,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    ipc::{Channel, InvokeResponseBody},
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
+};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{mpsc, Mutex, RwLock},
+    time::{interval, MissedTickBehavior},
+};
 
 const API_BASE_URL: &str = "https://diffforge.ai/api";
 const MIN_AUTH_VALUE_LENGTH: usize = 24;
@@ -47,6 +53,10 @@ const TERMINAL_MIN_ROWS: u16 = 6;
 const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
+const TERMINAL_PTY_POOL_TARGET: usize = 2;
+const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
+const TERMINAL_OUTPUT_FRAME_MICROS: u64 = 16_667;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
@@ -190,6 +200,7 @@ struct WindowsInput {
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pty_pool: Arc<PtyPool>,
     next_terminal_instance_id: AtomicU64,
 }
 
@@ -205,22 +216,141 @@ struct TerminalInstance {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     size: Arc<Mutex<PtySize>>,
+    working_directory: Arc<PathBuf>,
+    agent_started: Arc<Mutex<bool>>,
 }
 
 impl TerminalInstance {
-    fn new(
+    fn from_warm_shell(
         id: u64,
-        child: Box<dyn Child + Send>,
-        master: Box<dyn MasterPty + Send>,
-        writer: Box<dyn Write + Send>,
-        size: PtySize,
-    ) -> Self {
+        warm_pty: WarmPty,
+        working_directory: PathBuf,
+        agent_started: bool,
+    ) -> (Self, Box<dyn Read + Send>) {
+        let WarmPty {
+            child,
+            master,
+            writer,
+            reader,
+            size,
+        } = warm_pty;
+
+        (
+            Self {
+                id,
+                child: Arc::new(Mutex::new(Some(child))),
+                master: Arc::new(Mutex::new(master)),
+                writer: Arc::new(Mutex::new(writer)),
+                size: Arc::new(Mutex::new(size)),
+                working_directory: Arc::new(working_directory),
+                agent_started: Arc::new(Mutex::new(agent_started)),
+            },
+            reader,
+        )
+    }
+}
+
+struct WarmPty {
+    child: Box<dyn Child + Send>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn Read + Send>,
+    size: PtySize,
+}
+
+struct PtyPool {
+    warm: StdMutex<Vec<WarmPty>>,
+    refilling: AtomicBool,
+}
+
+impl PtyPool {
+    fn new() -> Self {
         Self {
-            id,
-            child: Arc::new(Mutex::new(Some(child))),
-            master: Arc::new(Mutex::new(master)),
-            writer: Arc::new(Mutex::new(writer)),
-            size: Arc::new(Mutex::new(size)),
+            warm: StdMutex::new(Vec::new()),
+            refilling: AtomicBool::new(false),
+        }
+    }
+
+    fn take_warm(&self) -> Option<WarmPty> {
+        self.warm.lock().ok().and_then(|mut warm| warm.pop())
+    }
+
+    fn warm_count(&self) -> usize {
+        self.warm.lock().map(|warm| warm.len()).unwrap_or(0)
+    }
+
+    fn ensure_warm_async(self: &Arc<Self>) {
+        if self
+            .refilling
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let pool = Arc::clone(self);
+
+        tauri::async_runtime::spawn(async move {
+            let worker_pool = Arc::clone(&pool);
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                worker_pool.refill_blocking();
+            })
+            .await;
+            pool.refilling.store(false, Ordering::Release);
+        });
+    }
+
+    fn refill_blocking(&self) {
+        loop {
+            if self.warm_count() >= TERMINAL_PTY_POOL_TARGET {
+                break;
+            }
+
+            let size = PtySize {
+                rows: TERMINAL_DEFAULT_ROWS,
+                cols: TERMINAL_DEFAULT_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let started_at = Instant::now();
+
+            match create_warm_shell_pty(size) {
+                Ok(warm_pty) => {
+                    let mut should_cleanup = None;
+
+                    if let Ok(mut warm) = self.warm.lock() {
+                        if warm.len() < TERMINAL_PTY_POOL_TARGET {
+                            warm.push(warm_pty);
+                            log_terminal_event(
+                                "terminal.pool.refill_ready",
+                                None,
+                                None,
+                                Some(started_at.elapsed()),
+                                json!({ "warm_count": warm.len() }),
+                            );
+                        } else {
+                            should_cleanup = Some(warm_pty);
+                        }
+                    } else {
+                        should_cleanup = Some(warm_pty);
+                    }
+
+                    if let Some(warm_pty) = should_cleanup {
+                        cleanup_warm_pty(warm_pty);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    log_terminal_event(
+                        "terminal.pool.refill_error",
+                        None,
+                        None,
+                        Some(started_at.elapsed()),
+                        json!({ "error": clean_terminal_telemetry_text(&error) }),
+                    );
+                    break;
+                }
+            }
         }
     }
 }
@@ -427,13 +557,31 @@ struct TerminalOpenRequest {
     rows: Option<u16>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TerminalResizeRequest {
+struct TerminalStartAgentRequest {
     pane_id: String,
     instance_id: Option<u64>,
-    cols: u16,
-    rows: u16,
+    provider: String,
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalStartAgentPaneResult {
+    pane_id: String,
+    instance_id: Option<u64>,
+    started: bool,
+    skipped: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalStartAgentManyResult {
+    started: usize,
+    skipped: usize,
+    results: Vec<TerminalStartAgentPaneResult>,
 }
 
 #[derive(Serialize)]
@@ -447,27 +595,11 @@ struct TerminalOpenResult {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TerminalDataPayload {
-    pane_id: String,
-    instance_id: u64,
-    data: String,
-    read_at_ms: u64,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalExitPayload {
     pane_id: String,
     instance_id: u64,
     exit_code: Option<i32>,
     exited_at_ms: u64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalResizeManyResult {
-    applied: usize,
-    skipped: usize,
 }
 
 #[derive(Serialize)]
@@ -1158,35 +1290,13 @@ fn quote_powershell_literal(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn terminal_shell_command(
-    command_path: &str,
-    args: &[String],
-    label: &str,
-) -> (String, Vec<String>) {
-    let mut invocation = format!("& {}", quote_powershell_literal(command_path));
-
-    for arg in args {
-        invocation.push(' ');
-        invocation.push_str(&quote_powershell_literal(arg));
-    }
-
-    let exit_message = format!("{label} exited. This shell is still open.");
-    let script = format!(
-        "{invocation}; Write-Host ''; Write-Host {}",
-        quote_powershell_literal(&exit_message)
-    );
-
-    (
-        "powershell.exe".to_string(),
-        vec![
-            "-NoLogo".to_string(),
-            "-NoExit".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-Command".to_string(),
-            script,
-        ],
-    )
+fn terminal_idle_shell_command() -> CommandBuilder {
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.arg("-NoLogo");
+    command.arg("-NoExit");
+    command.arg("-ExecutionPolicy");
+    command.arg("Bypass");
+    command
 }
 
 #[cfg(not(windows))]
@@ -1195,55 +1305,21 @@ fn quote_shell_literal(value: &str) -> String {
 }
 
 #[cfg(not(windows))]
-fn terminal_shell_command(
-    command_path: &str,
-    args: &[String],
-    label: &str,
-) -> (String, Vec<String>) {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut invocation = quote_shell_literal(command_path);
-
-    for arg in args {
-        invocation.push(' ');
-        invocation.push_str(&quote_shell_literal(arg));
-    }
-
-    let exit_message = format!("{label} exited. This shell is still open.");
-    let script = format!(
-        "{invocation}; printf '\\n%s\\n' {}; exec {} -l",
-        quote_shell_literal(&exit_message),
-        quote_shell_literal(&shell)
-    );
-
-    (shell, vec!["-lc".to_string(), script])
+fn terminal_idle_shell_command() -> CommandBuilder {
+    CommandBuilder::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()))
 }
 
 fn is_terminal_prewarm_kind(kind: &str) -> bool {
     matches!(
         kind.trim().to_ascii_lowercase().as_str(),
-        "shell" | "prewarm" | "prewarm-shell" | "prewarm_shell"
+        "shell"
+            | "prewarm"
+            | "prewarm-shell"
+            | "prewarm_shell"
+            | "prewarm-pty"
+            | "prewarm_pty"
+            | "pty"
     )
-}
-
-#[cfg(windows)]
-fn terminal_prewarm_shell_command() -> (String, Vec<String>, String) {
-    (
-        "powershell.exe".to_string(),
-        vec![
-            "-NoLogo".to_string(),
-            "-NoExit".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-        ],
-        "PowerShell".to_string(),
-    )
-}
-
-#[cfg(not(windows))]
-fn terminal_prewarm_shell_command() -> (String, Vec<String>, String) {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-    (shell, vec!["-l".to_string()], "Shell".to_string())
 }
 
 #[cfg(windows)]
@@ -1258,6 +1334,21 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
     format!("{invocation}\r")
 }
 
+#[cfg(windows)]
+fn terminal_agent_start_input_in_directory(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+) -> String {
+    let directory = working_directory.to_string_lossy();
+
+    format!(
+        "Set-Location -LiteralPath {}; {}",
+        quote_powershell_literal(&directory),
+        terminal_agent_start_input(command_path, args)
+    )
+}
+
 #[cfg(not(windows))]
 fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
     let mut invocation = quote_shell_literal(command_path);
@@ -1268,6 +1359,83 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
     }
 
     format!("{invocation}\n")
+}
+
+#[cfg(not(windows))]
+fn terminal_agent_start_input_in_directory(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+) -> String {
+    let directory = working_directory.to_string_lossy();
+
+    format!(
+        "cd {}; {}",
+        quote_shell_literal(&directory),
+        terminal_agent_start_input(command_path, args)
+    )
+}
+
+fn default_terminal_working_directory() -> PathBuf {
+    env::current_dir()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf).or(Some(path)))
+        .unwrap_or_else(|| {
+            env::var_os("USERPROFILE")
+                .or_else(|| env::var_os("HOME"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+}
+
+fn create_warm_shell_pty(size: PtySize) -> Result<WarmPty, String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(size)
+        .map_err(|error| format!("Unable to open warm terminal PTY: {error}"))?;
+    let mut command = terminal_idle_shell_command();
+    let working_directory = workspace_path_for_process(&default_terminal_working_directory());
+
+    command.cwd(&working_directory);
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("Unable to start warm terminal shell: {error}"))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| format!("Unable to read warm terminal output: {error}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| format!("Unable to write warm terminal input: {error}"))?;
+
+    Ok(WarmPty {
+        child,
+        master: pair.master,
+        writer,
+        reader,
+        size,
+    })
+}
+
+fn cleanup_warm_pty(warm_pty: WarmPty) {
+    let WarmPty {
+        mut child,
+        master,
+        writer,
+        reader,
+        ..
+    } = warm_pty;
+
+    drop(reader);
+    drop(writer);
+    drop(master);
+    kill_terminal_process_tree(child.as_mut());
+    let _ = poll_terminal_child_exit(child.as_mut());
 }
 
 fn run_agent_command_capture(
@@ -2914,12 +3082,16 @@ fn cleanup_terminal_instance(instance: TerminalInstance, kill_first: bool) {
         master,
         writer,
         size,
+        working_directory,
+        agent_started,
         ..
     } = instance;
 
     drop(writer);
     drop(master);
     drop(size);
+    drop(working_directory);
+    drop(agent_started);
 
     let mut child = child.blocking_lock();
     let Some(mut child) = child.take() else {
@@ -2967,18 +3139,22 @@ fn spawn_terminal_reader(
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     pane_id: String,
     instance_id: u64,
+    output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
 ) {
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader_pane_id = pane_id.clone();
+
     thread::spawn(move || {
         log_terminal_event(
             "terminal.reader.thread_start",
-            Some(&pane_id),
+            Some(&reader_pane_id),
             Some(instance_id),
             None,
             json!({}),
         );
 
-        let mut buffer = [0u8; 8192];
+        let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
         let mut saw_first_output = false;
 
         loop {
@@ -2989,28 +3165,21 @@ fn spawn_terminal_reader(
                         saw_first_output = true;
                         log_terminal_event(
                             "terminal.reader.first_output",
-                            Some(&pane_id),
+                            Some(&reader_pane_id),
                             Some(instance_id),
                             None,
                             json!({ "bytes": bytes_read }),
                         );
                     }
 
-                    let data = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-                    let _ = app.emit(
-                        "forge-terminal-data",
-                        TerminalDataPayload {
-                            pane_id: pane_id.clone(),
-                            instance_id,
-                            data,
-                            read_at_ms: terminal_now_ms(),
-                        },
-                    );
+                    if output_tx.send(buffer[..bytes_read].to_vec()).is_err() {
+                        break;
+                    }
                 }
                 Err(error) => {
                     log_terminal_event(
                         "terminal.reader.error",
-                        Some(&pane_id),
+                        Some(&reader_pane_id),
                         Some(instance_id),
                         None,
                         json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
@@ -3022,10 +3191,78 @@ fn spawn_terminal_reader(
 
         log_terminal_event(
             "terminal.reader.closed",
-            Some(&pane_id),
+            Some(&reader_pane_id),
             Some(instance_id),
             None,
             json!({ "saw_first_output": saw_first_output }),
+        );
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = interval(Duration::from_micros(TERMINAL_OUTPUT_FRAME_MICROS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_READ_BUFFER_BYTES * 2);
+        let mut reader_closed = false;
+        let mut flushed_chunks = 0usize;
+        let mut flushed_bytes = 0usize;
+        let mut channel_failed = false;
+
+        loop {
+            tokio::select! {
+                maybe_chunk = output_rx.recv(), if !reader_closed => {
+                    match maybe_chunk {
+                        Some(chunk) => pending.extend_from_slice(&chunk),
+                        None => reader_closed = true,
+                    }
+                }
+                _ = ticker.tick() => {
+                    while let Ok(chunk) = output_rx.try_recv() {
+                        pending.extend_from_slice(&chunk);
+                    }
+
+                    if !pending.is_empty() {
+                        let bytes = pending.len();
+                        let chunk = std::mem::take(&mut pending);
+
+                        if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
+                            channel_failed = true;
+                            break;
+                        }
+
+                        flushed_chunks += 1;
+                        flushed_bytes += bytes;
+                    }
+
+                    if reader_closed {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !channel_failed && !pending.is_empty() {
+            let bytes = pending.len();
+
+            if output_channel
+                .send(InvokeResponseBody::Raw(std::mem::take(&mut pending)))
+                .is_ok()
+            {
+                flushed_chunks += 1;
+                flushed_bytes += bytes;
+            }
+        }
+
+        log_terminal_event(
+            "terminal.reader.frame_flush_closed",
+            Some(&pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "channel_failed": channel_failed,
+                "flushed_bytes": flushed_bytes,
+                "flushed_chunks": flushed_chunks,
+                "frame_micros": TERMINAL_OUTPUT_FRAME_MICROS,
+            }),
         );
 
         if let Some(instance) =
@@ -3168,11 +3405,55 @@ async fn close_all_terminal_sessions(
     Ok(closed)
 }
 
+fn choose_terminal_command_path(command_candidates: &[String]) -> Option<String> {
+    command_candidates
+        .iter()
+        .find(|candidate| Path::new(candidate.as_str()).exists())
+        .or_else(|| command_candidates.first())
+        .cloned()
+}
+
+fn prepare_warm_pty_for_handoff(
+    pool: &Arc<PtyPool>,
+    size: PtySize,
+) -> Result<(WarmPty, bool), String> {
+    let mut warm_pty = if let Some(warm_pty) = pool.take_warm() {
+        (warm_pty, true)
+    } else {
+        (create_warm_shell_pty(size)?, false)
+    };
+
+    if warm_pty.0.size != size {
+        warm_pty
+            .0
+            .master
+            .resize(size)
+            .map_err(|error| format!("Unable to resize warm terminal: {error}"))?;
+        warm_pty.0.size = size;
+    }
+
+    Ok(warm_pty)
+}
+
+fn write_agent_start_input_to_writer(
+    writer: &mut dyn Write,
+    input: &str,
+    context: &str,
+) -> Result<(), String> {
+    writer
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("Unable to write {context}: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Unable to flush {context}: {error}"))
+}
+
 #[tauri::command]
 async fn terminal_open(
     app: AppHandle,
     state: State<'_, TerminalState>,
     request: TerminalOpenRequest,
+    output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
     validate_terminal_pane_id(&request.pane_id)?;
     let pane_id = request.pane_id;
@@ -3225,11 +3506,9 @@ async fn terminal_open(
     let process_working_directory = workspace_path_for_process(&working_directory);
 
     let command_started_at = Instant::now();
-    let is_prewarm_shell = is_terminal_prewarm_kind(&kind);
-    let (command_candidates, args, label) = if is_prewarm_shell {
-        let (command, args, label) = terminal_prewarm_shell_command();
-
-        (vec![command], args, label)
+    let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
+    let (command_candidates, args, label) = if is_prewarm_pty {
+        (Vec::new(), Vec::new(), "Prepared PTY".to_string())
     } else {
         terminal_launch(&kind, provider, model)?
     };
@@ -3242,7 +3521,7 @@ async fn terminal_open(
             "label": label,
             "candidate_count": command_candidates.len(),
             "arg_count": args.len(),
-            "prewarm_shell": is_prewarm_shell,
+            "prewarm_pty": is_prewarm_pty,
         }),
     );
 
@@ -3261,185 +3540,143 @@ async fn terminal_open(
         json!({ "cols": size.cols, "rows": size.rows }),
     );
 
-    let pty_system = native_pty_system();
-    let mut last_error = format!("{label} is not installed or not available on PATH.");
+    let handoff_started_at = Instant::now();
+    let (mut warm_pty, from_pool) = match prepare_warm_pty_for_handoff(&state.pty_pool, size) {
+        Ok(result) => result,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.open.pool_handoff_error",
+                Some(&pane_id),
+                Some(instance_id),
+                Some(handoff_started_at.elapsed()),
+                json!({ "error": clean_terminal_telemetry_text(&error) }),
+            );
+            state.pty_pool.ensure_warm_async();
+            return Err(error);
+        }
+    };
 
-    for command_path in command_candidates {
-        let attempt_started_at = Instant::now();
-        log_terminal_event(
-            "terminal.open.attempt_start",
-            Some(&pane_id),
-            Some(instance_id),
-            None,
-            json!({ "command": clean_terminal_telemetry_text(&command_path) }),
+    log_terminal_event(
+        "terminal.open.pool_handoff",
+        Some(&pane_id),
+        Some(instance_id),
+        Some(handoff_started_at.elapsed()),
+        json!({
+            "from_pool": from_pool,
+            "prewarm_pty": is_prewarm_pty,
+            "warm_remaining": state.pty_pool.warm_count(),
+        }),
+    );
+    state.pty_pool.ensure_warm_async();
+
+    let mut command = "prepared-shell".to_string();
+    let mut agent_started = false;
+
+    if !is_prewarm_pty {
+        let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
+            let error = format!("{label} is not installed or not available on PATH.");
+            cleanup_warm_pty(warm_pty);
+            log_terminal_event(
+                "terminal.open.error",
+                Some(&pane_id),
+                Some(instance_id),
+                Some(open_started_at.elapsed()),
+                json!({ "error": clean_terminal_telemetry_text(&error) }),
+            );
+            return Err(error);
+        };
+        let input = terminal_agent_start_input_in_directory(
+            &command_path,
+            &args,
+            &process_working_directory,
         );
 
-        let openpty_started_at = Instant::now();
-        let pair = match pty_system.openpty(size) {
-            Ok(pair) => {
-                log_terminal_event(
-                    "terminal.open.openpty",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(openpty_started_at.elapsed()),
-                    json!({ "cols": size.cols, "rows": size.rows }),
-                );
-                pair
-            }
-            Err(error) => {
-                log_terminal_event(
-                    "terminal.open.openpty_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(openpty_started_at.elapsed()),
-                    json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
-                );
-                return Err(format!("Unable to open terminal PTY: {error}"));
-            }
-        };
-
-        let (launch_command, launch_args) = if is_prewarm_shell {
-            (command_path.clone(), args.clone())
-        } else {
-            terminal_shell_command(&command_path, &args, &label)
-        };
-        let mut command = CommandBuilder::new(&launch_command);
-
-        for arg in &launch_args {
-            command.arg(arg);
+        if input.len() > MAX_TERMINAL_WRITE_BYTES {
+            cleanup_warm_pty(warm_pty);
+            return Err("Terminal launch input is too large.".to_string());
         }
 
-        command.cwd(&process_working_directory);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-
-        let spawn_started_at = Instant::now();
-        let mut child = match pair.slave.spawn_command(command) {
-            Ok(child) => {
-                log_terminal_event(
-                    "terminal.open.spawn_child",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(spawn_started_at.elapsed()),
-                    json!({
-                        "command": clean_terminal_telemetry_text(&command_path),
-                        "shell": clean_terminal_telemetry_text(&launch_command),
-                    }),
-                );
-                child
-            }
-            Err(error) => {
-                let detail = error.to_string();
-                last_error = if detail.to_ascii_lowercase().contains("not found") {
-                    format!("{label} is not installed or not available on PATH.")
-                } else {
-                    format!("Unable to start {label}: {detail}")
-                };
-                log_terminal_event(
-                    "terminal.open.spawn_child_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(spawn_started_at.elapsed()),
-                    json!({
-                        "command": clean_terminal_telemetry_text(&command_path),
-                        "error": clean_terminal_telemetry_text(&last_error),
-                    }),
-                );
-                continue;
-            }
-        };
-
-        let io_started_at = Instant::now();
-        let reader = match pair.master.try_clone_reader() {
-            Ok(reader) => reader,
-            Err(error) => {
-                log_terminal_event(
-                    "terminal.open.clone_reader_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(io_started_at.elapsed()),
-                    json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
-                );
-                kill_terminal_process_tree(child.as_mut());
-                let _ = child.wait();
-                return Err(format!("Unable to read terminal output: {error}"));
-            }
-        };
-        let writer = match pair.master.take_writer() {
-            Ok(writer) => {
-                log_terminal_event(
-                    "terminal.open.prepare_io",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(io_started_at.elapsed()),
-                    json!({}),
-                );
-                writer
-            }
-            Err(error) => {
-                log_terminal_event(
-                    "terminal.open.take_writer_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(io_started_at.elapsed()),
-                    json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
-                );
-                kill_terminal_process_tree(child.as_mut());
-                let _ = child.wait();
-                return Err(format!("Unable to write terminal input: {error}"));
-            }
-        };
-
-        let instance = TerminalInstance::new(instance_id, child, pair.master, writer, size);
-
-        let insert_started_at = Instant::now();
-        state
-            .terminals
-            .write()
-            .await
-            .insert(pane_id.clone(), instance);
+        let write_started_at = Instant::now();
+        if let Err(error) = write_agent_start_input_to_writer(
+            warm_pty.writer.as_mut(),
+            &input,
+            "terminal agent launch",
+        ) {
+            cleanup_warm_pty(warm_pty);
+            return Err(error);
+        }
         log_terminal_event(
-            "terminal.open.insert_instance",
+            "terminal.open.agent_start_write",
             Some(&pane_id),
             Some(instance_id),
-            Some(insert_started_at.elapsed()),
-            json!({}),
-        );
-
-        spawn_terminal_reader(
-            app.clone(),
-            Arc::clone(&state.terminals),
-            pane_id.clone(),
-            instance_id,
-            reader,
-        );
-        log_terminal_event(
-            "terminal.open.success",
-            Some(&pane_id),
-            Some(instance_id),
-            Some(open_started_at.elapsed()),
+            Some(write_started_at.elapsed()),
             json!({
-                "attempt_ms": attempt_started_at.elapsed().as_secs_f64() * 1000.0,
+                "arg_count": args.len(),
+                "bytes": input.len(),
                 "command": clean_terminal_telemetry_text(&command_path),
+                "from_pool": from_pool,
             }),
         );
 
-        return Ok(TerminalOpenResult {
-            pane_id,
-            instance_id,
-            command: command_path,
-            working_directory: workspace_path_display(&working_directory),
-        });
+        command = command_path;
+        agent_started = true;
     }
 
+    let (instance, reader) = TerminalInstance::from_warm_shell(
+        instance_id,
+        warm_pty,
+        process_working_directory.clone(),
+        agent_started,
+    );
+
+    let insert_started_at = Instant::now();
+    state
+        .terminals
+        .write()
+        .await
+        .insert(pane_id.clone(), instance);
     log_terminal_event(
-        "terminal.open.error",
+        "terminal.open.insert_instance",
+        Some(&pane_id),
+        Some(instance_id),
+        Some(insert_started_at.elapsed()),
+        json!({
+            "from_pool": from_pool,
+            "prewarm_pty": is_prewarm_pty,
+            "agent_started": agent_started,
+        }),
+    );
+
+    spawn_terminal_reader(
+        app.clone(),
+        Arc::clone(&state.terminals),
+        pane_id.clone(),
+        instance_id,
+        output_channel,
+        reader,
+    );
+    log_terminal_event(
+        if is_prewarm_pty {
+            "terminal.open.prewarm_ready"
+        } else {
+            "terminal.open.success"
+        },
         Some(&pane_id),
         Some(instance_id),
         Some(open_started_at.elapsed()),
-        json!({ "error": clean_terminal_telemetry_text(&last_error) }),
+        json!({
+            "command": clean_terminal_telemetry_text(&command),
+            "from_pool": from_pool,
+            "working_directory": workspace_path_display(&working_directory),
+        }),
     );
-    Err(last_error)
+
+    Ok(TerminalOpenResult {
+        pane_id,
+        instance_id,
+        command,
+        working_directory: workspace_path_display(&working_directory),
+    })
 }
 
 fn terminal_telemetry_entry(request: TerminalTelemetryLogRequest) -> Option<Value> {
@@ -3503,7 +3740,11 @@ async fn terminal_start_agent(
     let command_path = command_candidates
         .iter()
         .find(|candidate| Path::new(candidate.as_str()).exists())
-        .or_else(|| command_candidates.iter().find(|candidate| candidate.as_str() == definition.binary))
+        .or_else(|| {
+            command_candidates
+                .iter()
+                .find(|candidate| candidate.as_str() == definition.binary)
+        })
         .or_else(|| command_candidates.first())
         .cloned()
         .ok_or_else(|| {
@@ -3512,11 +3753,6 @@ async fn terminal_start_agent(
                 definition.label
             )
         })?;
-    let input = terminal_agent_start_input(&command_path, &args);
-
-    if input.len() > MAX_TERMINAL_WRITE_BYTES {
-        return Err("Terminal launch input is too large.".to_string());
-    }
 
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
@@ -3529,15 +3765,34 @@ async fn terminal_start_agent(
         );
         return Err("Terminal session is not running.".to_string());
     };
+    let input = terminal_agent_start_input_in_directory(
+        &command_path,
+        &args,
+        instance.working_directory.as_ref(),
+    );
+
+    if input.len() > MAX_TERMINAL_WRITE_BYTES {
+        return Err("Terminal launch input is too large.".to_string());
+    }
+
     let write_started_at = Instant::now();
+    let mut agent_started = instance.agent_started.lock().await;
+
+    if *agent_started {
+        log_terminal_event(
+            "terminal.agent_start.skipped_already_started",
+            Some(&pane_id),
+            Some(instance.id),
+            Some(write_started_at.elapsed()),
+            json!({ "provider": definition.id }),
+        );
+        return Ok(());
+    }
+
     let mut writer = instance.writer.lock().await;
 
-    writer
-        .write_all(input.as_bytes())
-        .map_err(|error| format!("Unable to write terminal agent launch: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Unable to flush terminal agent launch: {error}"))?;
+    write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch")?;
+    *agent_started = true;
     log_terminal_event(
         "terminal.agent_start.write",
         Some(&pane_id),
@@ -3548,10 +3803,285 @@ async fn terminal_start_agent(
             "command": clean_terminal_telemetry_text(&command_path),
             "arg_count": args.len(),
             "bytes": input.len(),
+            "working_directory": workspace_path_display(instance.working_directory.as_ref()),
         }),
     );
 
     Ok(())
+}
+
+async fn start_terminal_agent_in_prepared_pty(
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    request: TerminalStartAgentRequest,
+) -> TerminalStartAgentPaneResult {
+    let pane_id = request.pane_id;
+    let instance_id = request.instance_id;
+    let start_started_at = Instant::now();
+
+    if let Err(error) = validate_terminal_pane_id(&pane_id) {
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id,
+            started: false,
+            skipped: true,
+            message: error,
+        };
+    }
+
+    let provider = match parse_agent_provider(&request.provider) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id,
+                started: false,
+                skipped: true,
+                message: error,
+            };
+        }
+    };
+    let definition = agent_definition(provider);
+    let mut args = Vec::new();
+
+    match normalize_forge_model(request.model) {
+        Ok(Some(model)) => {
+            args.push("--model".to_string());
+            args.push(model);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id,
+                started: false,
+                skipped: true,
+                message: error,
+            };
+        }
+    }
+
+    let Some(instance) = ({
+        let terminals = terminals.read().await;
+        terminals.get(&pane_id).cloned()
+    }) else {
+        log_terminal_event(
+            "terminal.agent_start_many.skipped_missing",
+            Some(&pane_id),
+            instance_id,
+            Some(start_started_at.elapsed()),
+            json!({ "provider": definition.id }),
+        );
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id,
+            started: false,
+            skipped: true,
+            message: "Terminal session is not running.".to_string(),
+        };
+    };
+
+    if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
+        log_terminal_event(
+            "terminal.agent_start_many.skipped_stale",
+            Some(&pane_id),
+            instance_id,
+            Some(start_started_at.elapsed()),
+            json!({
+                "current_instance_id": instance.id,
+                "provider": definition.id,
+            }),
+        );
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id,
+            started: false,
+            skipped: true,
+            message: "Terminal session was replaced before agent start.".to_string(),
+        };
+    }
+
+    let mut agent_started_guard = instance.agent_started.lock().await;
+
+    if *agent_started_guard {
+        log_terminal_event(
+            "terminal.agent_start_many.skipped_already_started",
+            Some(&pane_id),
+            Some(instance.id),
+            Some(start_started_at.elapsed()),
+            json!({ "provider": definition.id }),
+        );
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id: Some(instance.id),
+            started: false,
+            skipped: true,
+            message: "Terminal agent has already been started.".to_string(),
+        };
+    }
+
+    let child_guard = instance.child.lock().await;
+
+    if child_guard.is_some() {
+        let command_candidates = agent_command_candidates(definition);
+        let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id: Some(instance.id),
+                started: false,
+                skipped: false,
+                message: format!(
+                    "{} is not installed or not available on PATH.",
+                    definition.label
+                ),
+            };
+        };
+        let input = terminal_agent_start_input_in_directory(
+            &command_path,
+            &args,
+            instance.working_directory.as_ref(),
+        );
+
+        if input.len() > MAX_TERMINAL_WRITE_BYTES {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id: Some(instance.id),
+                started: false,
+                skipped: false,
+                message: "Terminal launch input is too large.".to_string(),
+            };
+        }
+
+        drop(child_guard);
+        let write_started_at = Instant::now();
+        let mut writer = instance.writer.lock().await;
+
+        match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
+            Ok(()) => {
+                *agent_started_guard = true;
+                log_terminal_event(
+                    "terminal.agent_start_many.write_done",
+                    Some(&pane_id),
+                    Some(instance.id),
+                    Some(write_started_at.elapsed()),
+                    json!({
+                        "provider": definition.id,
+                        "command": clean_terminal_telemetry_text(&command_path),
+                        "arg_count": args.len(),
+                        "bytes": input.len(),
+                        "working_directory": workspace_path_display(instance.working_directory.as_ref()),
+                    }),
+                );
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    started: true,
+                    skipped: false,
+                    message: "Agent started.".to_string(),
+                };
+            }
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.agent_start_many.write_error",
+                    Some(&pane_id),
+                    Some(instance.id),
+                    Some(write_started_at.elapsed()),
+                    json!({
+                        "provider": definition.id,
+                        "command": clean_terminal_telemetry_text(&command_path),
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
+        }
+    }
+
+    log_terminal_event(
+        "terminal.agent_start_many.skipped_not_warm_shell",
+        Some(&pane_id),
+        Some(instance.id),
+        Some(start_started_at.elapsed()),
+        json!({ "provider": definition.id }),
+    );
+    TerminalStartAgentPaneResult {
+        pane_id,
+        instance_id: Some(instance.id),
+        started: false,
+        skipped: true,
+        message: "Terminal shell is not available for deferred agent launch.".to_string(),
+    }
+}
+
+#[tauri::command]
+async fn terminal_start_agent_many(
+    state: State<'_, TerminalState>,
+    requests: Vec<TerminalStartAgentRequest>,
+) -> Result<TerminalStartAgentManyResult, String> {
+    if requests.len() > MAX_TERMINAL_START_AGENT_BATCH {
+        return Err(format!(
+            "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
+        ));
+    }
+
+    let batch_started_at = Instant::now();
+    log_terminal_event(
+        "terminal.agent_start_many.start",
+        None,
+        None,
+        None,
+        json!({ "request_count": requests.len() }),
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for request in requests {
+        let terminals = Arc::clone(&state.terminals);
+
+        join_set
+            .spawn(async move { start_terminal_agent_in_prepared_pty(terminals, request).await });
+    }
+
+    let mut results = Vec::new();
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(TerminalStartAgentPaneResult {
+                pane_id: String::new(),
+                instance_id: None,
+                started: false,
+                skipped: false,
+                message: format!("Unable to join terminal agent start task: {error}"),
+            }),
+        }
+    }
+
+    let started = results.iter().filter(|result| result.started).count();
+    let skipped = results.iter().filter(|result| result.skipped).count();
+
+    log_terminal_event(
+        "terminal.agent_start_many.done",
+        None,
+        None,
+        Some(batch_started_at.elapsed()),
+        json!({
+            "request_count": results.len(),
+            "started": started,
+            "skipped": skipped,
+        }),
+    );
+
+    Ok(TerminalStartAgentManyResult {
+        started,
+        skipped,
+        results,
+    })
 }
 
 #[tauri::command]
@@ -3612,6 +4142,88 @@ async fn resize_terminal_instance(
     Ok(true)
 }
 
+async fn resolve_terminal_for_resize(
+    state: &TerminalState,
+    pane_id: Option<String>,
+    instance_id: Option<u64>,
+) -> Result<Option<(String, TerminalInstance)>, String> {
+    if let Some(pane_id) = pane_id.filter(|value| !value.trim().is_empty()) {
+        validate_terminal_pane_id(&pane_id)?;
+        return get_terminal_instance_if_current(state, &pane_id, instance_id)
+            .await
+            .map(|instance| instance.map(|instance| (pane_id, instance)));
+    }
+
+    let terminals = state.terminals.read().await;
+
+    if terminals.is_empty() {
+        return Err("Terminal session is not running.".to_string());
+    }
+
+    if terminals.len() > 1 {
+        return Err(
+            "Terminal pane id is required when multiple terminal sessions are running.".to_string(),
+        );
+    }
+
+    let Some((resolved_pane_id, instance)) = terminals
+        .iter()
+        .next()
+        .map(|(resolved_pane_id, instance)| (resolved_pane_id.clone(), instance.clone()))
+    else {
+        return Err("Terminal session is not running.".to_string());
+    };
+
+    if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
+        return Ok(None);
+    }
+
+    Ok(Some((resolved_pane_id, instance)))
+}
+
+#[tauri::command]
+async fn resize_terminal(
+    state: State<'_, TerminalState>,
+    pane_id: Option<String>,
+    instance_id: Option<u64>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let resize_started_at = Instant::now();
+    log_terminal_event(
+        "terminal.resize_terminal.start",
+        pane_id.as_deref(),
+        instance_id,
+        None,
+        json!({ "cols": cols, "rows": rows }),
+    );
+
+    let size = validate_terminal_size(cols, rows)?;
+    let Some((resolved_pane_id, instance)) =
+        resolve_terminal_for_resize(&state, pane_id.clone(), instance_id).await?
+    else {
+        log_terminal_event(
+            "terminal.resize_terminal.skipped_stale",
+            pane_id.as_deref(),
+            instance_id,
+            Some(resize_started_at.elapsed()),
+            json!({ "cols": cols, "rows": rows }),
+        );
+        return Ok(());
+    };
+
+    let applied = resize_terminal_instance(&instance, size).await?;
+    log_terminal_event(
+        "terminal.resize_terminal.done",
+        Some(&resolved_pane_id),
+        Some(instance.id),
+        Some(resize_started_at.elapsed()),
+        json!({ "cols": cols, "rows": rows, "applied": applied }),
+    );
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn terminal_resize(
     state: State<'_, TerminalState>,
@@ -3644,97 +4256,41 @@ async fn terminal_resize(
 }
 
 #[tauri::command]
-async fn terminal_resize_many(
-    state: State<'_, TerminalState>,
-    requests: Vec<TerminalResizeRequest>,
-) -> Result<TerminalResizeManyResult, String> {
-    let batch_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.resize_many.start",
-        None,
-        None,
-        None,
-        json!({ "request_count": requests.len() }),
-    );
-    let mut applied = 0usize;
-    let mut skipped = 0usize;
-
-    for request in requests {
-        let request_started_at = Instant::now();
-        validate_terminal_pane_id(&request.pane_id)?;
-        let size = validate_terminal_size(request.cols, request.rows)?;
-        let instance = state.terminals.read().await.get(&request.pane_id).cloned();
-
-        let Some(instance) = instance else {
-            skipped += 1;
-            log_terminal_event(
-                "terminal.resize_many.skipped_missing",
-                Some(&request.pane_id),
-                request.instance_id,
-                Some(request_started_at.elapsed()),
-                json!({ "cols": request.cols, "rows": request.rows }),
-            );
-            continue;
-        };
-
-        if request
-            .instance_id
-            .is_some_and(|instance_id| instance_id != instance.id)
-        {
-            skipped += 1;
-            log_terminal_event(
-                "terminal.resize_many.skipped_stale",
-                Some(&request.pane_id),
-                request.instance_id,
-                Some(request_started_at.elapsed()),
-                json!({
-                    "current_instance_id": instance.id,
-                    "cols": request.cols,
-                    "rows": request.rows,
-                }),
-            );
-            continue;
-        }
-
-        if resize_terminal_instance(&instance, size).await? {
-            applied += 1;
-            log_terminal_event(
-                "terminal.resize_many.applied",
-                Some(&request.pane_id),
-                Some(instance.id),
-                Some(request_started_at.elapsed()),
-                json!({ "cols": request.cols, "rows": request.rows }),
-            );
-        } else {
-            skipped += 1;
-            log_terminal_event(
-                "terminal.resize_many.noop",
-                Some(&request.pane_id),
-                Some(instance.id),
-                Some(request_started_at.elapsed()),
-                json!({ "cols": request.cols, "rows": request.rows }),
-            );
-        }
-    }
-
-    log_terminal_event(
-        "terminal.resize_many.done",
-        None,
-        None,
-        Some(batch_started_at.elapsed()),
-        json!({ "applied": applied, "skipped": skipped }),
-    );
-
-    Ok(TerminalResizeManyResult { applied, skipped })
-}
-
-#[tauri::command]
 async fn terminal_close(
     state: State<'_, TerminalState>,
     pane_id: String,
     instance_id: Option<u64>,
 ) -> Result<(), String> {
-    close_terminal_session(&state, &pane_id, instance_id).await?;
+    let close_started_at = Instant::now();
+    log_terminal_event(
+        "terminal.close.start",
+        Some(&pane_id),
+        instance_id,
+        None,
+        json!({}),
+    );
+
+    match close_terminal_session(&state, &pane_id, instance_id).await {
+        Ok(closed) => {
+            log_terminal_event(
+                "terminal.close.done",
+                Some(&pane_id),
+                instance_id,
+                Some(close_started_at.elapsed()),
+                json!({ "closed": closed }),
+            );
+        }
+        Err(error) => {
+            log_terminal_event(
+                "terminal.close.error",
+                Some(&pane_id),
+                instance_id,
+                Some(close_started_at.elapsed()),
+                json!({ "error": error }),
+            );
+            return Err(error);
+        }
+    }
 
     Ok(())
 }
@@ -5035,6 +5591,7 @@ async fn insert_transcribed_text(
 
 pub fn run() {
     let mut builder = tauri::Builder::default();
+    let pty_pool = Arc::new(PtyPool::new());
 
     #[cfg(desktop)]
     {
@@ -5049,6 +5606,7 @@ pub fn run() {
     builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
         })
         .manage(AudioState {
@@ -5057,7 +5615,9 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
+            pty_pool.ensure_warm_async();
+
             if let Err(error) =
                 app.global_shortcut()
                     .on_shortcut(AUDIO_SHORTCUT, |app, _shortcut, event| {
@@ -5120,9 +5680,10 @@ pub fn run() {
             terminal_telemetry_log_many,
             terminal_open,
             terminal_start_agent,
+            terminal_start_agent_many,
             terminal_write,
+            resize_terminal,
             terminal_resize,
-            terminal_resize_many,
             terminal_close,
             terminal_close_all
         ])
