@@ -2756,7 +2756,16 @@ export default function App() {
 
   const minimizeWindow = useCallback((event) => {
     event.stopPropagation();
-    runWindowAction(() => getSafeCurrentWindow()?.minimize());
+    runWindowAction(async () => {
+      const appWindow = getSafeCurrentWindow();
+
+      if (!appWindow) {
+        return;
+      }
+
+      await invoke("note_main_window_minimize_requested").catch(() => {});
+      await appWindow.minimize();
+    });
   }, []);
 
   const toggleMaximizeWindow = useCallback((event) => {

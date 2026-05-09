@@ -210,16 +210,9 @@ import {
   AudioActionRow,
   AudioWidgetShell,
   AudioWidgetFocusStage,
-  AudioWidgetHeader,
-  AudioWidgetTitle,
   AudioWidgetLogo,
   AudioWidgetMeter,
   AudioWidgetLoader,
-  AudioWidgetProcessingText,
-  AudioWidgetStatus,
-  AudioRecordingTimer,
-  AudioWidgetTranscript,
-  AudioWidgetActions,
   McpWorkspaceSurface,
   McpHeaderPanel,
   McpTitleRow,
@@ -361,7 +354,7 @@ const AUDIO_INPUT_METER_BARS = 32;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
-const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 210;
+const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
 const AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK = "push-to-talk";
 const AUDIO_SHORTCUT_ACTION_CANCEL = "cancel";
@@ -706,6 +699,8 @@ export default function AudioWorkspaceView({
   const [capturingAudioShortcut, setCapturingAudioShortcut] = useState("");
   const audioInputPreviewRef = useRef(null);
   const audioInputRunRef = useRef(0);
+  const audioInputAutoWarmAttemptedRef = useRef(false);
+  const audioInputAutoWarmSuppressedRef = useRef(false);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const isCloudMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
@@ -918,6 +913,7 @@ export default function AudioWorkspaceView({
 
   const toggleAudioInputPreview = useCallback(() => {
     if (audioInputStateRef.current === "previewing") {
+      audioInputAutoWarmSuppressedRef.current = true;
       stopAudioInputPreview();
       audioInputStateRef.current = "ready";
       setAudioInputState("ready");
@@ -926,6 +922,8 @@ export default function AudioWorkspaceView({
       return;
     }
 
+    audioInputAutoWarmSuppressedRef.current = false;
+    audioInputAutoWarmAttemptedRef.current = true;
     startAudioInputPreview();
   }, [startAudioInputPreview, stopAudioInputPreview]);
 
@@ -1105,6 +1103,22 @@ export default function AudioWorkspaceView({
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [loadAudioInputDevices]);
+
+  useEffect(() => {
+    if (
+      !isMacPlatform()
+      || audioInputAutoWarmAttemptedRef.current
+      || audioInputAutoWarmSuppressedRef.current
+      || !hasAudioInputSetup()
+      || audioInputState !== "ready"
+      || audioInputDevices.length === 0
+    ) {
+      return;
+    }
+
+    audioInputAutoWarmAttemptedRef.current = true;
+    startAudioInputPreview();
+  }, [audioInputDevices.length, audioInputState, startAudioInputPreview]);
 
   useEffect(() => {
     let disposed = false;
@@ -1921,33 +1935,62 @@ export function AudioWidgetWindow() {
     let firstFrame = 0;
     let secondFrame = 0;
     let closeTimer = 0;
+    let handoffFrame = 0;
+    let resizeFrame = 0;
+    let compactFrame = 0;
 
     setWidgetChromeReady(false);
 
     if (wantsFocus) {
-      setWidgetFrameMode("focus");
+      setWidgetFrameMode("opening");
       runWidgetWindowAction((windowHandle) => (
         windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_FOCUS_SIZE.width, AUDIO_WIDGET_FOCUS_SIZE.height))
       ));
       firstFrame = window.requestAnimationFrame(() => {
         secondFrame = window.requestAnimationFrame(() => {
+          if (!isFocusedAudioWidgetState(widgetStateRef.current)) {
+            return;
+          }
+
+          setWidgetFrameMode("focus");
           setWidgetChromeReady(true);
         });
       });
-    } else if (widgetFrameModeRef.current === "focus") {
+    } else if (widgetFrameModeRef.current === "focus" || widgetFrameModeRef.current === "opening") {
       setWidgetFrameMode("closing");
       closeTimer = window.setTimeout(() => {
         if (isFocusedAudioWidgetState(widgetStateRef.current)) {
           return;
         }
 
-        setWidgetFrameMode("compact");
+        setWidgetFrameMode("compact-handoff");
         setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
-        runWidgetWindowAction((windowHandle) => (
-          windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
-        ));
+
+        handoffFrame = window.requestAnimationFrame(() => {
+          if (isFocusedAudioWidgetState(widgetStateRef.current)) {
+            return;
+          }
+
+          runWidgetWindowAction((windowHandle) => (
+            windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
+          ));
+
+          resizeFrame = window.requestAnimationFrame(() => {
+            if (isFocusedAudioWidgetState(widgetStateRef.current)) {
+              return;
+            }
+
+            compactFrame = window.requestAnimationFrame(() => {
+              if (isFocusedAudioWidgetState(widgetStateRef.current)) {
+                return;
+              }
+
+              setWidgetFrameMode("compact");
+            });
+          });
+        });
       }, AUDIO_WIDGET_CLOSE_ANIMATION_MS);
-    } else if (widgetFrameModeRef.current !== "closing") {
+    } else if (widgetFrameModeRef.current !== "closing" && widgetFrameModeRef.current !== "compact-handoff") {
       setWidgetFrameMode("compact");
       runWidgetWindowAction((windowHandle) => (
         windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
@@ -1963,6 +2006,15 @@ export function AudioWidgetWindow() {
       }
       if (closeTimer) {
         window.clearTimeout(closeTimer);
+      }
+      if (handoffFrame) {
+        window.cancelAnimationFrame(handoffFrame);
+      }
+      if (resizeFrame) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
+      if (compactFrame) {
+        window.cancelAnimationFrame(compactFrame);
       }
     };
   }, [runWidgetWindowAction, setWidgetFrameMode, widgetTargetMode]);
@@ -2026,8 +2078,8 @@ export function AudioWidgetWindow() {
 
     try {
       const currentProvider = readAudioTranscriptionProvider();
-      const result = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-        ? await (async () => {
+    const result = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      ? await (async () => {
           setMessage("Capturing final audio");
           await waitForAudioPostBuffer(DEEPGRAM_RELEASE_POST_BUFFER_MS);
           if (recordingRunRef.current !== recordingRunId) {
@@ -2039,12 +2091,16 @@ export function AudioWidgetWindow() {
           return realtimeResult;
         })()
         : await (async () => {
-          const { wavBuffer } = await audioBuffer.finishCapture();
+          const { wavBuffer, audioMs } = await audioBuffer.finishCapture();
+          const { peak, rms } = audioBuffer.getCaptureStats();
           const audioBase64 = arrayBufferToBase64(wavBuffer);
           setMessage("Transcribing locally");
           return invoke("transcribe_whisper_audio", {
             request: {
               audioBase64,
+              audioMs,
+              capturePeak: peak,
+              captureRms: rms,
             },
           });
       })();
@@ -2324,6 +2380,15 @@ export function AudioWidgetWindow() {
     }
   }, [startRecording, widgetState]);
 
+  const applyPushToTalkPayload = useCallback((payload) => {
+    if (payload?.pressed || payload?.phase === "pressed") {
+      pressPushToTalk();
+      return;
+    }
+
+    releasePushToTalk();
+  }, [pressPushToTalk, releasePushToTalk]);
+
   useEffect(() => {
     document.documentElement.dataset.audioWidget = "true";
     document.body.dataset.audioWidget = "true";
@@ -2396,19 +2461,25 @@ export function AudioWidgetWindow() {
         return;
       }
 
-      if (event.payload?.pressed || event.payload?.phase === "pressed") {
-        pressPushToTalk();
-      } else {
-        releasePushToTalk();
-      }
+      applyPushToTalkPayload(event.payload);
     })
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
-          return;
+          return null;
         }
 
         unlisten = nextUnlisten;
+        return invoke("audio_push_to_talk_status");
+      })
+      .then((status) => {
+        if (!status || disposed) {
+          return;
+        }
+
+        if (status.pressed || status.phase === "pressed") {
+          pressPushToTalk();
+        }
       })
       .catch(() => {});
 
@@ -2416,7 +2487,7 @@ export function AudioWidgetWindow() {
       disposed = true;
       unlisten();
     };
-  }, [pressPushToTalk, releasePushToTalk]);
+  }, [applyPushToTalkPayload, pressPushToTalk]);
 
   useEffect(() => {
     let disposed = false;
@@ -2453,8 +2524,20 @@ export function AudioWidgetWindow() {
   const isRecordingFocus = widgetState === "recording";
   const isProcessingFocus = widgetState === "transcribing";
   const widgetHasSignal = isProcessingFocus || (isRecordingFocus && widgetLevel >= 6);
+  const isOpeningFocus = widgetFrameMode === "opening";
   const isClosingFocus = widgetFrameMode === "closing";
-  const isFocusedWidget = widgetFrameMode !== "compact";
+  const isCompactHandoff = widgetFrameMode === "compact-handoff";
+  const isFocusedWidget = widgetFrameMode !== "compact" && !isCompactHandoff;
+  const widgetVisualMode = isClosingFocus
+    ? "closing"
+    : isOpeningFocus
+      ? "opening"
+      : isProcessingFocus
+        ? "processing"
+        : isRecordingFocus
+          ? "recording"
+          : "compact";
+  const widgetLogoSize = isFocusedWidget && !isOpeningFocus && !isClosingFocus ? "focus" : "compact";
   const expandedLabel = isProcessingFocus
     ? (message || "Transcribing audio")
     : `Recording audio ${String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
@@ -2467,44 +2550,45 @@ export function AudioWidgetWindow() {
         aria-label={widgetLabel}
         data-tauri-drag-region
         data-closing={isClosingFocus ? "true" : undefined}
-        data-focus={isFocusedWidget}
+        data-focus={isFocusedWidget ? "true" : undefined}
+        data-handoff={isCompactHandoff ? "true" : undefined}
+        data-opening={isOpeningFocus ? "true" : undefined}
         data-state={widgetState}
         onMouseDown={dragWidget}
       >
-        {isFocusedWidget ? (
-          <AudioWidgetFocusStage
-            aria-label={widgetLabel}
-            data-tauri-drag-region
-            data-mode={isClosingFocus ? "closing" : isProcessingFocus ? "processing" : "recording"}
-            role="status"
+        <AudioWidgetFocusStage
+          aria-label={widgetLabel}
+          data-tauri-drag-region
+          data-mode={widgetVisualMode}
+          role="status"
+        >
+          <AudioWidgetLogo
+            aria-hidden="true"
+            data-hidden={isProcessingFocus && !isClosingFocus ? "true" : undefined}
+            data-size={widgetLogoSize}
+            src="/logo.webp"
+            alt=""
+          />
+          <AudioWidgetLoader
+            aria-hidden="true"
+            data-visible={isProcessingFocus && !isClosingFocus ? "true" : undefined}
+          />
+          <AudioWidgetMeter
+            data-active="true"
+            data-processing={isProcessingFocus ? "true" : undefined}
+            data-prominent="true"
+            data-ready={widgetChromeReady && !isClosingFocus ? "true" : "false"}
+            data-signal={widgetHasSignal ? "live" : "quiet"}
+            aria-hidden="true"
           >
-            {isProcessingFocus && !isClosingFocus ? (
-              <AudioWidgetLoader aria-hidden="true" />
-            ) : (
-              <AudioWidgetLogo aria-hidden="true" data-size="focus" src="/logo.webp" alt="" />
-            )}
-            <AudioWidgetMeter
-              data-active="true"
-              data-closing={isClosingFocus ? "true" : undefined}
-              data-processing={isProcessingFocus ? "true" : undefined}
-              data-prominent="true"
-              data-ready={widgetChromeReady && !isClosingFocus ? "true" : "false"}
-              data-signal={widgetHasSignal ? "live" : "quiet"}
-              aria-hidden="true"
-            >
-              {Array.from({ length: AUDIO_WIDGET_METER_BARS }, (_, index) => (
-                <span
-                  key={index}
-                  style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus)}
-                />
-              ))}
-            </AudioWidgetMeter>
-          </AudioWidgetFocusStage>
-        ) : (
-          <AudioWidgetHeader aria-label={compactLabel} data-tauri-drag-region role="status">
-            <AudioWidgetLogo aria-hidden="true" data-size="compact" src="/logo.webp" alt="" />
-          </AudioWidgetHeader>
-        )}
+            {Array.from({ length: AUDIO_WIDGET_METER_BARS }, (_, index) => (
+              <span
+                key={index}
+                style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus)}
+              />
+            ))}
+          </AudioWidgetMeter>
+        </AudioWidgetFocusStage>
       </AudioWidgetShell>
     </>
   );

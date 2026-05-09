@@ -127,6 +127,8 @@ export const GlobalStyle = createGlobalStyle`
   html[data-audio-widget="true"] #app,
   body[data-audio-widget="true"],
   body[data-audio-widget="true"] #app {
+    overflow: hidden;
+    border-radius: 999px;
     background: transparent !important;
   }
 
@@ -2021,12 +2023,21 @@ export const TerminalFrame = styled.section`
 `;
 
 export const XtermSurface = styled.div`
+  --terminal-scrollbar-opacity: 0;
+  --terminal-scrollbar-pointer-events: none;
+
+  position: relative;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
   padding: 0;
   background: ${TERMINAL_THEME_BACKGROUND};
+
+  &[data-scrolling="true"][data-scrollbar-overflow="true"] {
+    --terminal-scrollbar-opacity: 1;
+    --terminal-scrollbar-pointer-events: auto;
+  }
 
   .xterm {
     width: 100%;
@@ -2037,6 +2048,37 @@ export const XtermSurface = styled.div`
   .xterm-viewport,
   .xterm-screen {
     background: ${TERMINAL_THEME_BACKGROUND} !important;
+  }
+
+  .xterm-viewport {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .xterm-viewport::-webkit-scrollbar {
+    display: none;
+    width: 0 !important;
+    height: 0 !important;
+  }
+
+  .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
+  .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible {
+    right: 1px !important;
+    width: 7px !important;
+    background: transparent !important;
+    opacity: var(--terminal-scrollbar-opacity) !important;
+    pointer-events: var(--terminal-scrollbar-pointer-events) !important;
+    transition: opacity 180ms ease !important;
+  }
+
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider,
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider:hover,
+  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider.active {
+    left: 2px !important;
+    width: 3px !important;
+    border-radius: 999px !important;
+    background: rgba(172, 185, 207, 0.34) !important;
   }
 `;
 
@@ -4462,10 +4504,22 @@ const audioWidgetBarPulse = keyframes`
 
 export const AudioWidgetShell = styled.main`
   display: grid;
+  position: relative;
+  isolation: isolate;
   width: 100vw;
   height: 100vh;
   min-width: 0;
   min-height: 0;
+  --audio-widget-compact-scale: 0.219178;
+  --audio-widget-compact-clip-right: calc(100% - 64px);
+  --audio-widget-shell-clip-right: 0px;
+  --audio-widget-surface-scale-x: 1;
+  --audio-widget-surface-top: 0px;
+  --audio-widget-surface-right: 0px;
+  --audio-widget-surface-bottom: 0px;
+  --audio-widget-surface-left: 0px;
+  --audio-widget-underpaint-opacity: 0;
+  --audio-widget-surface-opacity: 0;
   grid-template-columns: minmax(0, 1fr);
   place-items: center;
   gap: 0;
@@ -4476,47 +4530,105 @@ export const AudioWidgetShell = styled.main`
   color: var(--forge-text);
   box-shadow: none;
   background: transparent;
+  clip-path: inset(0 var(--audio-widget-shell-clip-right) 0 0 round 999px);
   transition:
-    border-color 160ms ease,
-    background 160ms ease,
+    clip-path 190ms cubic-bezier(0.3, 0, 0.2, 1),
     box-shadow 160ms ease;
+  contain: paint;
   -webkit-app-region: drag;
 
-  &[data-focus="true"] {
-    grid-template-columns: minmax(0, 1fr);
-    place-items: center;
-    gap: 0;
-    padding: 8px 9px;
+  &::before,
+  &::after {
+    content: "";
+    position: absolute;
+    top: var(--audio-widget-surface-top);
+    right: var(--audio-widget-surface-right);
+    bottom: var(--audio-widget-surface-bottom);
+    left: var(--audio-widget-surface-left);
+    border-radius: inherit;
+    transform: scaleX(var(--audio-widget-surface-scale-x));
+    transform-origin: left center;
+    pointer-events: none;
+    transition:
+      opacity 160ms ease,
+      transform 190ms cubic-bezier(0.3, 0, 0.2, 1),
+      top 190ms cubic-bezier(0.3, 0, 0.2, 1),
+      right 190ms cubic-bezier(0.3, 0, 0.2, 1),
+      bottom 190ms cubic-bezier(0.3, 0, 0.2, 1),
+      left 190ms cubic-bezier(0.3, 0, 0.2, 1),
+      background 160ms ease;
+    will-change: opacity, transform, top, right, bottom, left;
+  }
+
+  &::before {
+    z-index: 0;
+    background: #020304;
+    opacity: var(--audio-widget-underpaint-opacity);
+  }
+
+  &::after {
+    z-index: 1;
     border: 1px solid rgba(230, 236, 245, 0.13);
-    box-shadow:
-      0 18px 44px rgba(0, 0, 0, 0.34),
-      0 1px 0 rgba(255, 255, 255, 0.07) inset,
-      0 -18px 32px rgba(0, 0, 0, 0.18) inset;
     background:
       radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.13), transparent 34%),
       linear-gradient(180deg, rgba(37, 42, 49, 0.94), rgba(12, 15, 19, 0.96));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.07) inset,
+      0 -18px 32px rgba(0, 0, 0, 0.18) inset;
+    opacity: var(--audio-widget-surface-opacity);
+  }
+
+  &[data-focus="true"] {
+    --audio-widget-underpaint-opacity: 1;
+    --audio-widget-surface-opacity: 1;
+    box-shadow:
+      0 18px 44px rgba(0, 0, 0, 0.34);
+  }
+
+  &[data-opening="true"] {
+    --audio-widget-shell-clip-right: var(--audio-widget-compact-clip-right);
+    --audio-widget-surface-scale-x: var(--audio-widget-compact-scale);
   }
 
   &[data-closing="true"] {
-    box-shadow:
-      0 10px 28px rgba(0, 0, 0, 0.24),
-      0 1px 0 rgba(255, 255, 255, 0.05) inset,
-      0 -12px 24px rgba(0, 0, 0, 0.15) inset;
-    background:
-      radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.08), transparent 34%),
-      linear-gradient(180deg, rgba(30, 35, 42, 0.9), rgba(10, 13, 17, 0.92));
+    --audio-widget-shell-clip-right: var(--audio-widget-compact-clip-right);
+    --audio-widget-surface-top: 6px;
+    --audio-widget-surface-right: calc(100% - 58px);
+    --audio-widget-surface-bottom: 6px;
+    --audio-widget-surface-left: 6px;
+    --audio-widget-underpaint-opacity: 1;
+    --audio-widget-surface-opacity: 1;
+    box-shadow: none;
+  }
+
+  &[data-handoff="true"] {
+    --audio-widget-shell-clip-right: var(--audio-widget-compact-clip-right);
+    --audio-widget-surface-top: 6px;
+    --audio-widget-surface-right: calc(100% - 58px);
+    --audio-widget-surface-bottom: 6px;
+    --audio-widget-surface-left: 6px;
+    --audio-widget-underpaint-opacity: 0;
+    --audio-widget-surface-opacity: 0;
+    box-shadow: none;
+    transition: none;
+  }
+
+  &[data-handoff="true"]::before,
+  &[data-handoff="true"]::after {
+    transition: none;
   }
 `;
 
 export const AudioWidgetFocusStage = styled.div`
-  display: grid;
+  position: relative;
+  z-index: 2;
+  display: block;
   width: 100%;
   height: 100%;
   min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  justify-items: stretch;
-  gap: 10px;
+  overflow: hidden;
+  border-radius: inherit;
+  clip-path: inset(0 round 999px);
   opacity: 1;
   transform: translateX(0) scaleX(1);
   transform-origin: left center;
@@ -4526,17 +4638,8 @@ export const AudioWidgetFocusStage = styled.div`
   -webkit-app-region: drag;
 
   &[data-mode="closing"] {
-    opacity: 0.88;
-    transform: translateX(-3px) scaleX(0.96);
-  }
-
-  &[data-mode="closing"] img,
-  &[data-mode="closing"] > div:first-child {
-    opacity: 0.9;
-    transform: scale(0.94);
-    transition:
-      opacity 160ms ease,
-      transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
+    opacity: 1;
+    transform: translateX(0) scaleX(1);
   }
 `;
 
@@ -4569,11 +4672,19 @@ export const AudioWidgetTitle = styled.div`
   }
 `;
 
-export const AudioWidgetLogo = styled.img`
+export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
   display: block;
+  position: absolute;
+  z-index: 2;
+  top: 6px;
+  left: 6px;
   width: 52px;
   height: 52px;
   flex: 0 0 auto;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
   border: 1px solid rgba(230, 236, 245, 0.14);
   border-radius: 999px;
   object-fit: cover;
@@ -4584,14 +4695,24 @@ export const AudioWidgetLogo = styled.img`
     0 -8px 16px rgba(0, 0, 0, 0.26) inset,
     0 8px 22px rgba(0, 0, 0, 0.24),
     0 0 0 4px rgba(244, 247, 250, 0.018);
+  transform: scale(1);
+  transform-origin: center;
+  transition:
+    box-shadow 180ms ease,
+    transform 190ms cubic-bezier(0.3, 0, 0.2, 1),
+    opacity 160ms ease;
+  will-change: transform, opacity;
 
   &[data-size="focus"] {
-    width: 42px;
-    height: 42px;
+    transform: scale(0.8077);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.08) inset,
       0 -8px 15px rgba(0, 0, 0, 0.24) inset,
       0 6px 16px rgba(0, 0, 0, 0.2);
+  }
+
+  &[data-hidden="true"] {
+    opacity: 0;
   }
 `;
 
@@ -4649,7 +4770,12 @@ export const AudioWidgetMeter = styled.div`
   }
 
   &[data-prominent="true"] {
-    width: 100%;
+    position: absolute;
+    z-index: 1;
+    top: 13px;
+    right: 9px;
+    left: 62px;
+    width: auto;
     height: 38px;
     min-width: 0;
     grid-template-columns: repeat(26, minmax(2px, 1fr));
@@ -4683,22 +4809,6 @@ export const AudioWidgetMeter = styled.div`
     transform: translateX(0) scaleX(1);
   }
 
-  &[data-prominent="true"][data-closing="true"] {
-    opacity: 0;
-    border-color: rgba(230, 236, 245, 0);
-    transform: translateX(-14px) scaleX(0.72);
-    transition:
-      opacity 150ms ease,
-      transform 200ms cubic-bezier(0.3, 0, 0.2, 1),
-      border-color 160ms ease,
-      background 160ms ease;
-  }
-
-  &[data-prominent="true"][data-closing="true"] span {
-    animation-play-state: paused;
-    transform: scaleY(0.2);
-  }
-
   &[data-processing="true"] {
     border-color: rgba(125, 176, 255, 0.18);
     background:
@@ -4720,11 +4830,14 @@ export const AudioWidgetMeter = styled.div`
 `;
 
 export const AudioWidgetLoader = styled.div`
-  position: relative;
+  position: absolute;
+  z-index: 3;
   display: grid;
   width: 42px;
   height: 42px;
   flex: 0 0 auto;
+  top: 11px;
+  left: 11px;
   place-items: center;
   border: 1px solid rgba(230, 236, 245, 0.13);
   border-radius: 999px;
@@ -4733,6 +4846,18 @@ export const AudioWidgetLoader = styled.div`
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.07) inset,
     0 8px 18px rgba(0, 0, 0, 0.22);
+  opacity: 0;
+  transform: scale(0.92);
+  pointer-events: none;
+  transition:
+    opacity 160ms ease,
+    transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
+  will-change: opacity, transform;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    transform: scale(1);
+  }
 
   &::before {
     content: "";

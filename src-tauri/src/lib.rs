@@ -21,13 +21,14 @@ use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use tauri::{
     ipc::{Channel, InvokeResponseBody},
+    utils::config::Color,
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
     sync::{mpsc, oneshot, Mutex, RwLock},
-    time::{interval, timeout, MissedTickBehavior},
+    time::{interval, sleep, timeout, MissedTickBehavior},
 };
 use tokio_tungstenite::{
     connect_async,
@@ -85,8 +86,17 @@ const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = true;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
+const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
+#[cfg(target_os = "macos")]
+const MAIN_WINDOW_RESTORE_FOCUS_DELAY_MS: u64 = 260;
+#[cfg(target_os = "macos")]
+const MAIN_WINDOW_RESTORE_RETRY_DELAYS_MS: [u64; 2] = [160, 240];
+#[cfg(target_os = "macos")]
+const MAIN_WINDOW_RESTORE_COALESCE_RELEASE_MS: u64 = 120;
+#[cfg(target_os = "macos")]
+const MAIN_WINDOW_MINIMIZE_RESTORE_SUPPRESS_MS: u64 = 1_000;
 const WHISPER_MODEL_ID: &str = "base.en";
 const WHISPER_MODEL_NAME: &str = "Whisper base.en";
 const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
@@ -152,6 +162,10 @@ static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Ve
 static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
 static TERMINAL_TELEMETRY_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MAIN_WINDOW_MINIMIZE_REQUESTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
 const WINDOWS_APP_ICON_RESOURCE_ID: u16 = 32512;
@@ -180,6 +194,7 @@ const WM_SETICON: u32 = 0x0080;
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
     next_terminal_instance_id: AtomicU64,
@@ -243,6 +258,19 @@ impl Drop for TerminalState {
             }),
         );
     }
+}
+
+#[derive(Clone)]
+struct TerminalAudioInputTarget {
+    pane_id: String,
+    instance_id: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalAudioInputRefocusPayload {
+    pane_id: String,
+    instance_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -891,6 +919,9 @@ struct WhisperWarmStatus {
 #[serde(rename_all = "camelCase")]
 struct WhisperTranscriptionRequest {
     audio_base64: String,
+    audio_ms: Option<u64>,
+    capture_peak: Option<f32>,
+    capture_rms: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -1043,6 +1074,111 @@ fn close_app_after_terminal_shutdown(
         .map_err(|error| format!("Failed to schedule app close: {error}"))
 }
 
+fn restore_main_window(app: &AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let was_minimized = window.is_minimized().unwrap_or(false);
+
+        if was_minimized {
+            let _ = window.unminimize();
+            return true;
+        }
+
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn focus_restored_main_window(app: &AppHandle) {
+    let _ = app.show();
+
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_minimized().unwrap_or(false) {
+            return;
+        }
+
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mark_main_window_minimize_requested() {
+    MAIN_WINDOW_MINIMIZE_REQUESTED_AT_MS.store(current_time_ms(), Ordering::SeqCst);
+}
+
+#[cfg(target_os = "macos")]
+fn main_window_recently_minimized() -> bool {
+    let requested_at_ms = MAIN_WINDOW_MINIMIZE_REQUESTED_AT_MS.load(Ordering::SeqCst);
+
+    requested_at_ms != 0
+        && current_time_ms().saturating_sub(requested_at_ms)
+            < MAIN_WINDOW_MINIMIZE_RESTORE_SUPPRESS_MS
+}
+
+#[tauri::command]
+fn note_main_window_minimize_requested() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    mark_main_window_minimize_requested();
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn main_window_needs_attention(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|window| {
+            window.is_minimized().unwrap_or(false)
+                || !window.is_visible().unwrap_or(true)
+                || !window.is_focused().unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_main_window_after_reopen(app: AppHandle, has_visible_windows: bool) {
+    if MAIN_WINDOW_RESTORE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let suppress_restore = has_visible_windows && main_window_recently_minimized();
+
+        if !suppress_restore {
+            if restore_main_window(&app) {
+                sleep(Duration::from_millis(MAIN_WINDOW_RESTORE_FOCUS_DELAY_MS)).await;
+                focus_restored_main_window(&app);
+            }
+
+            for delay_ms in MAIN_WINDOW_RESTORE_RETRY_DELAYS_MS {
+                sleep(Duration::from_millis(delay_ms)).await;
+
+                let suppress_retry = has_visible_windows && main_window_recently_minimized();
+
+                if main_window_needs_attention(&app) && !suppress_retry {
+                    if restore_main_window(&app) {
+                        sleep(Duration::from_millis(MAIN_WINDOW_RESTORE_FOCUS_DELAY_MS)).await;
+                        focus_restored_main_window(&app);
+                    }
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(
+            MAIN_WINDOW_RESTORE_COALESCE_RELEASE_MS,
+        ))
+        .await;
+        MAIN_WINDOW_RESTORE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+}
+
 pub fn run() {
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
@@ -1058,16 +1194,17 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            #[cfg(target_os = "macos")]
+            restore_main_window_after_reopen(app.clone(), false);
+            #[cfg(not(target_os = "macos"))]
+            restore_main_window(app);
         }));
     }
 
     builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
@@ -1137,6 +1274,7 @@ pub fn run() {
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
             audio_shortcuts_status,
+            audio_push_to_talk_status,
             open_audio_shortcut_permissions,
             set_audio_shortcut,
             reset_audio_shortcuts,
@@ -1146,11 +1284,13 @@ pub fn run() {
             toggle_audio_widget,
             insert_transcribed_text,
             insert_handsfree_transcribed_text,
+            note_main_window_minimize_requested,
             terminal_telemetry_log,
             terminal_telemetry_log_many,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,
+            set_terminal_audio_input_target,
             terminal_write,
             resize_terminal,
             terminal_resize,
@@ -1199,6 +1339,16 @@ pub fn run() {
             coordination::tauri_commands::coordination_scan_workspace_violations,
             close_app_after_terminal_shutdown
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Diff Forge AI desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Diff Forge AI desktop")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                restore_main_window_after_reopen(app.clone(), has_visible_windows);
+            }
+        });
 }

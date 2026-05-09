@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Window } from "@tauri-apps/api/window";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -335,8 +336,15 @@ const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
 const TERMINAL_BLANK_STARTUP_RESTART_LIMIT = 3;
+const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
+const TERMINAL_SCROLLBAR_INTENT_MS = 900;
+const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
+const TERMINAL_SCROLL_ANCHOR_SEARCH_RADIUS_ROWS = 180;
+const TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS = 360;
+const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
 const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
+const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -757,6 +765,318 @@ function getTerminalBufferDiagnostics(terminal) {
   };
 }
 
+function clampTerminalLine(value, minimum, maximum) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return minimum;
+  }
+
+  return Math.min(maximum, Math.max(minimum, Math.round(numericValue)));
+}
+
+function normalizeTerminalAnchorText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS);
+}
+
+function getTerminalAnchorTokens(value) {
+  return normalizeTerminalAnchorText(value)
+    .toLowerCase()
+    .match(/[a-z0-9_./:-]{2,}/g) || [];
+}
+
+function getTerminalAnchorAlnumCount(value) {
+  const matches = normalizeTerminalAnchorText(value).match(/[a-z0-9]/gi);
+
+  return matches ? matches.length : 0;
+}
+
+function getTerminalAnchorLineText(buffer, row) {
+  const line = buffer?.getLine?.(row);
+
+  if (!line) {
+    return "";
+  }
+
+  return normalizeTerminalAnchorText(line.translateToString(true));
+}
+
+function isUsefulTerminalAnchorText(text) {
+  const normalizedText = normalizeTerminalAnchorText(text);
+
+  if (!normalizedText) {
+    return false;
+  }
+
+  if (getTerminalAnchorAlnumCount(normalizedText) < TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS) {
+    return false;
+  }
+
+  return /[a-z0-9]/i.test(normalizedText);
+}
+
+function getTerminalWrappedGroupBounds(buffer, row) {
+  let start = row;
+  let end = row;
+
+  while (start > 0 && buffer.getLine(start)?.isWrapped) {
+    start -= 1;
+  }
+
+  while (end + 1 < buffer.length && buffer.getLine(end + 1)?.isWrapped) {
+    end += 1;
+  }
+
+  return { end, start };
+}
+
+function getTerminalWrappedGroupText(buffer, bounds) {
+  const parts = [];
+
+  for (let row = bounds.start; row <= bounds.end; row += 1) {
+    const line = buffer.getLine(row);
+
+    if (line) {
+      parts.push(line.translateToString(false));
+    }
+  }
+
+  return normalizeTerminalAnchorText(parts.join(""));
+}
+
+function buildTerminalAnchorCandidate(buffer, row, targetRow) {
+  const lineText = getTerminalAnchorLineText(buffer, row);
+
+  if (!isUsefulTerminalAnchorText(lineText)) {
+    return null;
+  }
+
+  const groupBounds = getTerminalWrappedGroupBounds(buffer, row);
+  const groupText = getTerminalWrappedGroupText(buffer, groupBounds);
+  const groupLineCount = groupBounds.end - groupBounds.start + 1;
+  const distanceFromTarget = Math.abs(row - targetRow);
+  const textLengthScore = Math.min(lineText.length, 120);
+  const alnumScore = Math.min(getTerminalAnchorAlnumCount(lineText), 80);
+  const wrappedPenalty = groupLineCount > 1 ? 4 : 0;
+
+  return {
+    groupLineCount,
+    groupOffsetRatio: groupLineCount > 1 ? (row - groupBounds.start) / (groupLineCount - 1) : 0,
+    groupStart: groupBounds.start,
+    groupText,
+    lineText,
+    row,
+    score: textLengthScore + alnumScore - distanceFromTarget * 24 - wrappedPenalty,
+    viewportOffset: row - buffer.viewportY,
+  };
+}
+
+function captureTerminalScrollAnchor(terminal) {
+  const buffer = terminal.buffer?.active;
+
+  if (!buffer || buffer.type === "alternate" || buffer.length <= 0) {
+    return { mode: "skip", reason: buffer?.type === "alternate" ? "alternate_buffer" : "missing_buffer" };
+  }
+
+  const distanceFromBottom = Math.max(0, buffer.baseY - buffer.viewportY);
+
+  if (distanceFromBottom === 0) {
+    return {
+      baseY: buffer.baseY,
+      distanceFromBottom,
+      mode: "bottom",
+      viewportY: buffer.viewportY,
+    };
+  }
+
+  const viewportStart = Math.max(0, buffer.viewportY || 0);
+  const viewportEnd = Math.min(buffer.length - 1, viewportStart + Math.max(0, terminal.rows - 1));
+  const targetOffset = clampTerminalLine(
+    Math.round(Math.max(0, terminal.rows - 1) * TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION),
+    0,
+    Math.max(0, viewportEnd - viewportStart),
+  );
+  const targetRow = viewportStart + targetOffset;
+  let bestCandidate = null;
+
+  for (let row = viewportStart; row <= viewportEnd; row += 1) {
+    const candidate = buildTerminalAnchorCandidate(buffer, row, targetRow);
+
+    if (!candidate) {
+      continue;
+    }
+
+    if (!bestCandidate || candidate.score > bestCandidate.score) {
+      bestCandidate = candidate;
+    }
+  }
+
+  if (!bestCandidate) {
+    return {
+      baseY: buffer.baseY,
+      distanceFromBottom,
+      mode: "distance",
+      viewportY: buffer.viewportY,
+    };
+  }
+
+  return {
+    ...bestCandidate,
+    baseY: buffer.baseY,
+    distanceFromBottom,
+    mode: "anchor",
+    rows: terminal.rows,
+    viewportY: buffer.viewportY,
+  };
+}
+
+function scoreTerminalAnchorMatch(anchor, candidate, predictedRow) {
+  if (!candidate) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const anchorGroupText = normalizeTerminalAnchorText(anchor.groupText);
+  const anchorLineText = normalizeTerminalAnchorText(anchor.lineText);
+  const candidateGroupText = normalizeTerminalAnchorText(candidate.groupText);
+  const candidateLineText = normalizeTerminalAnchorText(candidate.lineText);
+  let score = 0;
+
+  if (anchorGroupText && candidateGroupText === anchorGroupText) {
+    score += 1000;
+  } else if (anchorLineText && candidateGroupText.includes(anchorLineText)) {
+    score += 760;
+  } else if (anchorLineText && candidateLineText === anchorLineText) {
+    score += 720;
+  } else if (
+    anchorLineText
+    && candidateLineText
+    && (candidateLineText.includes(anchorLineText) || anchorLineText.includes(candidateLineText))
+  ) {
+    score += 520;
+  }
+
+  const anchorTokens = getTerminalAnchorTokens(anchorGroupText || anchorLineText);
+  const candidateTokens = new Set(getTerminalAnchorTokens(candidateGroupText || candidateLineText));
+  const tokenOverlap = anchorTokens.filter((token) => candidateTokens.has(token)).length;
+
+  if (anchorTokens.length > 0) {
+    score += (tokenOverlap / anchorTokens.length) * 360;
+  }
+
+  score -= Math.abs(candidate.row - predictedRow) * 0.8;
+
+  return score;
+}
+
+function findTerminalScrollAnchorMatch(buffer, terminal, anchor, fallbackViewportY) {
+  const targetRow = clampTerminalLine(
+    fallbackViewportY + anchor.viewportOffset,
+    0,
+    Math.max(0, buffer.length - 1),
+  );
+  const searchRadius = Math.max(
+    TERMINAL_SCROLL_ANCHOR_SEARCH_RADIUS_ROWS,
+    Math.max(terminal.rows || 0, anchor.rows || 0) * 4,
+  );
+  const searchStart = Math.max(0, targetRow - searchRadius);
+  const searchEnd = Math.min(buffer.length - 1, targetRow + searchRadius);
+  const seenGroups = new Set();
+  let bestMatch = null;
+
+  for (let row = searchStart; row <= searchEnd; row += 1) {
+    const lineText = getTerminalAnchorLineText(buffer, row);
+
+    if (!isUsefulTerminalAnchorText(lineText)) {
+      continue;
+    }
+
+    const groupBounds = getTerminalWrappedGroupBounds(buffer, row);
+    const groupKey = `${groupBounds.start}:${groupBounds.end}`;
+
+    if (seenGroups.has(groupKey)) {
+      continue;
+    }
+
+    seenGroups.add(groupKey);
+
+    const groupLineCount = groupBounds.end - groupBounds.start + 1;
+    const matchRow = clampTerminalLine(
+      groupBounds.start + Math.round((groupLineCount - 1) * (anchor.groupOffsetRatio || 0)),
+      groupBounds.start,
+      groupBounds.end,
+    );
+    const candidate = {
+      groupText: getTerminalWrappedGroupText(buffer, groupBounds),
+      lineText: getTerminalAnchorLineText(buffer, matchRow),
+      row: matchRow,
+    };
+    const score = scoreTerminalAnchorMatch(anchor, candidate, targetRow);
+
+    if (!bestMatch || score > bestMatch.score) {
+      bestMatch = {
+        ...candidate,
+        score,
+      };
+    }
+  }
+
+  return bestMatch && bestMatch.score >= 360 ? bestMatch : null;
+}
+
+function restoreTerminalScrollAnchor(terminal, anchor) {
+  const buffer = terminal.buffer?.active;
+
+  if (!buffer || !anchor || anchor.mode === "skip" || buffer.type === "alternate") {
+    return { mode: "skip", reason: buffer?.type === "alternate" ? "alternate_buffer" : "missing_anchor" };
+  }
+
+  if (anchor.mode === "bottom") {
+    terminal.scrollToBottom();
+    return { mode: "bottom" };
+  }
+
+  const fallbackViewportY = clampTerminalLine(
+    buffer.baseY - Math.max(0, anchor.distanceFromBottom || 0),
+    0,
+    Math.max(0, buffer.baseY),
+  );
+
+  if (anchor.mode !== "anchor") {
+    terminal.scrollToLine(fallbackViewportY);
+    return {
+      mode: "distance",
+      viewportY: fallbackViewportY,
+    };
+  }
+
+  const match = findTerminalScrollAnchorMatch(buffer, terminal, anchor, fallbackViewportY);
+
+  if (!match) {
+    terminal.scrollToLine(fallbackViewportY);
+    return {
+      mode: "distance_fallback",
+      viewportY: fallbackViewportY,
+    };
+  }
+
+  const nextViewportY = clampTerminalLine(
+    match.row - Math.max(0, anchor.viewportOffset || 0),
+    0,
+    Math.max(0, buffer.baseY),
+  );
+
+  terminal.scrollToLine(nextViewportY);
+
+  return {
+    matchScore: Math.round(match.score),
+    mode: "anchor",
+    viewportY: nextViewportY,
+  };
+}
+
 function getTerminalRenderDiagnostics(container, terminal, rendererMode) {
   const terminalElement = terminal.element || container.querySelector(".xterm");
   const screenElement = container.querySelector(".xterm-screen");
@@ -928,6 +1248,7 @@ export default function WorkspaceTerminal({
     let lastResizeMeasureAt = 0;
     let lastResizeMeasureSize = null;
     let lastXtermRenderLogAt = 0;
+    let pendingResizeScrollAnchor = null;
     let resizeIdleDebugTimer = 0;
     let resizeWriteBarrierActive = false;
     let resizeWriteBarrierStartedAt = 0;
@@ -1004,11 +1325,200 @@ export default function WorkspaceTerminal({
     });
 
     terminal.open(container);
+    const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
     writeTerminalTelemetry({
       paneId,
       instanceId: terminalInstanceId,
       phase: "frontend.terminal.open_xterm",
       elapsedMs: performance.now() - lifecycleStartedAt,
+    });
+
+    const setTerminalAudioInputTarget = (active) => {
+      if (active && isDisposed) {
+        return;
+      }
+
+      invoke("set_terminal_audio_input_target", {
+        active,
+        instanceId: terminalInstanceId,
+        paneId,
+      }).catch(() => {});
+    };
+    let terminalFocusClearTimer = 0;
+    const markTerminalAudioInputTarget = () => {
+      if (terminalFocusClearTimer) {
+        window.clearTimeout(terminalFocusClearTimer);
+        terminalFocusClearTimer = 0;
+      }
+
+      setTerminalAudioInputTarget(true);
+    };
+    const clearTerminalAudioInputTarget = () => setTerminalAudioInputTarget(false);
+    const clearTerminalAudioInputTargetIfAppUnfocused = () => {
+      window.setTimeout(() => {
+        Window.getFocusedWindow()
+          .then((focusedWindow) => {
+            if (!isDisposed && !focusedWindow) {
+              clearTerminalAudioInputTarget();
+            }
+          })
+          .catch(() => {});
+      }, 30);
+    };
+    const scheduleClearTerminalAudioInputTarget = () => {
+      if (terminalFocusClearTimer) {
+        window.clearTimeout(terminalFocusClearTimer);
+      }
+
+      terminalFocusClearTimer = window.setTimeout(() => {
+        terminalFocusClearTimer = 0;
+        if (!container.contains(document.activeElement)) {
+          clearTerminalAudioInputTarget();
+        }
+      }, 0);
+    };
+
+    container.addEventListener("focusin", markTerminalAudioInputTarget, true);
+    container.addEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
+    container.addEventListener("pointerdown", markTerminalAudioInputTarget, true);
+    window.addEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
+    Window.getCurrent()
+      .onFocusChanged((event) => {
+        if (!event.payload) {
+          clearTerminalAudioInputTargetIfAppUnfocused();
+        }
+      })
+      .then((unlisten) => {
+        if (isDisposed) {
+          unlisten();
+          return;
+        }
+
+        disposables.push(unlisten);
+      })
+      .catch(() => {});
+
+    let terminalScrollbarHideTimer = 0;
+    let terminalScrollIntentUntil = 0;
+    const updateTerminalScrollbarOverflow = () => {
+      const activeBuffer = terminal.buffer?.active;
+      const hasOverflow = Boolean(activeBuffer && activeBuffer.baseY > 0);
+
+      if (hasOverflow) {
+        container.dataset.scrollbarOverflow = "true";
+      } else {
+        delete container.dataset.scrollbarOverflow;
+      }
+
+      return hasOverflow;
+    };
+    const hideTerminalScrollbar = () => {
+      terminalScrollbarHideTimer = 0;
+      if (!isDisposed) {
+        delete container.dataset.scrolling;
+      }
+    };
+    const scheduleHideTerminalScrollbar = () => {
+      if (terminalScrollbarHideTimer) {
+        window.clearTimeout(terminalScrollbarHideTimer);
+      }
+
+      terminalScrollbarHideTimer = window.setTimeout(
+        hideTerminalScrollbar,
+        TERMINAL_SCROLLBAR_HIDE_DELAY_MS,
+      );
+    };
+    const showTerminalScrollbar = () => {
+      if (isDisposed) {
+        return;
+      }
+
+      if (updateTerminalScrollbarOverflow()) {
+        container.dataset.scrolling = "true";
+        scheduleHideTerminalScrollbar();
+      }
+    };
+    const markTerminalScrollIntent = () => {
+      terminalScrollIntentUntil = performance.now() + TERMINAL_SCROLLBAR_INTENT_MS;
+    };
+    const handleTerminalScrollIntent = () => {
+      markTerminalScrollIntent();
+      showTerminalScrollbar();
+    };
+    const handleTerminalScrollKeyIntent = (event) => {
+      if (
+        event.key === "PageUp"
+        || event.key === "PageDown"
+        || event.key === "Home"
+        || event.key === "End"
+      ) {
+        handleTerminalScrollIntent();
+      }
+    };
+    const handleTerminalViewportScroll = () => {
+      updateTerminalScrollbarOverflow();
+      if (performance.now() <= terminalScrollIntentUntil) {
+        showTerminalScrollbar();
+      }
+    };
+
+    if (terminalScrollableElement) {
+      terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
+      terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
+      container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
+      disposables.push(terminal.onScroll(handleTerminalViewportScroll));
+      disposables.push(terminal.onWriteParsed(updateTerminalScrollbarOverflow));
+      disposables.push(terminal.onResize(updateTerminalScrollbarOverflow));
+      updateTerminalScrollbarOverflow();
+      disposables.push(() => {
+        if (terminalScrollbarHideTimer) {
+          window.clearTimeout(terminalScrollbarHideTimer);
+          terminalScrollbarHideTimer = 0;
+        }
+
+        delete container.dataset.scrolling;
+        delete container.dataset.scrollbarOverflow;
+        terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
+        terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
+        container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
+      });
+    }
+    listen(TERMINAL_AUDIO_INPUT_REFOCUS_EVENT, (event) => {
+      if (
+        isDisposed
+        || event.payload?.paneId !== paneId
+        || event.payload?.instanceId !== terminalInstanceId
+      ) {
+        return;
+      }
+
+      markTerminalAudioInputTarget();
+      terminal.focus();
+      window.setTimeout(() => {
+        if (!isDisposed) {
+          terminal.focus();
+        }
+      }, 0);
+    })
+      .then((unlisten) => {
+        if (isDisposed) {
+          unlisten();
+          return;
+        }
+
+        disposables.push(unlisten);
+      })
+      .catch(() => {});
+    disposables.push(() => {
+      if (terminalFocusClearTimer) {
+        window.clearTimeout(terminalFocusClearTimer);
+        terminalFocusClearTimer = 0;
+      }
+      container.removeEventListener("focusin", markTerminalAudioInputTarget, true);
+      container.removeEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
+      container.removeEventListener("pointerdown", markTerminalAudioInputTarget, true);
+      window.removeEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
+      clearTerminalAudioInputTarget();
     });
 
     const attachWebglRenderer = (reason = "scheduled") => {
@@ -1739,6 +2249,9 @@ export default function WorkspaceTerminal({
           return;
         }
 
+        const scrollAnchor = pendingResizeScrollAnchor;
+        pendingResizeScrollAnchor = null;
+        const scrollAnchorRestore = restoreTerminalScrollAnchor(terminal, scrollAnchor);
         const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_applied");
         lastResizeMeasureAt = performance.now();
         lastResizeMeasureSize = {
@@ -1775,6 +2288,12 @@ export default function WorkspaceTerminal({
             resizeBarrierBytes: resizeBarrier.queuedBytes,
             resizeBarrierChunks: resizeBarrier.queuedChunks,
             resizeBarrierMs: resizeBarrier.barrierMs,
+            scrollAnchorDistanceFromBottom: scrollAnchor?.distanceFromBottom ?? null,
+            scrollAnchorMatchScore: scrollAnchorRestore?.matchScore ?? null,
+            scrollAnchorMode: scrollAnchor?.mode ?? "",
+            scrollAnchorRestoreMode: scrollAnchorRestore?.mode ?? "",
+            scrollAnchorViewportOffset: scrollAnchor?.viewportOffset ?? null,
+            scrollAnchorViewportY: scrollAnchorRestore?.viewportY ?? null,
             terminalIndex,
           },
         });
@@ -1790,6 +2309,8 @@ export default function WorkspaceTerminal({
         });
       },
       onError: (event) => {
+        const scrollAnchor = pendingResizeScrollAnchor;
+        pendingResizeScrollAnchor = null;
         const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_error");
 
         writeTerminalTelemetry({
@@ -1805,6 +2326,7 @@ export default function WorkspaceTerminal({
             resizeBarrierBytes: resizeBarrier.queuedBytes,
             resizeBarrierChunks: resizeBarrier.queuedChunks,
             resizeBarrierMs: resizeBarrier.barrierMs,
+            scrollAnchorMode: scrollAnchor?.mode ?? "",
             terminalIndex,
           },
         });
@@ -1829,6 +2351,7 @@ export default function WorkspaceTerminal({
         });
       },
       onStart: (event) => {
+        pendingResizeScrollAnchor = captureTerminalScrollAnchor(terminal);
         openResizeWriteBarrier(event);
         lastResizeMeasureAt = performance.now();
         lastResizeMeasureSize = {
@@ -1851,6 +2374,9 @@ export default function WorkspaceTerminal({
             rawCols: event.rawCols,
             rawRows: event.rawRows,
             reason: event.reason,
+            scrollAnchorDistanceFromBottom: pendingResizeScrollAnchor?.distanceFromBottom ?? null,
+            scrollAnchorMode: pendingResizeScrollAnchor?.mode ?? "",
+            scrollAnchorViewportOffset: pendingResizeScrollAnchor?.viewportOffset ?? null,
             terminalIndex,
           },
         });
@@ -2207,6 +2733,7 @@ export default function WorkspaceTerminal({
       resizeWriteBarrierActive = false;
       resizeWriteBarrierQueue.length = 0;
       resizeWriteBarrierBytes = 0;
+      pendingResizeScrollAnchor = null;
       disposables.forEach((dispose) => {
         if (typeof dispose === "function") {
           dispose();

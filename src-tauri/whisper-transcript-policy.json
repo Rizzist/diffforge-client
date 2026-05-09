@@ -1,0 +1,20 @@
+{
+  "name": "whisper-local-coding-policy",
+  "audioMsMinForSpeechMs": 900,
+  "captureRmsMinForSpeech": 0.01,
+  "capturePeakMinForSpeech": 0.02,
+  "suppressBrackettedMarkers": true,
+  "suppressBrackettedMarkersMaxChars": 24,
+  "noSpeechMarkers": [
+    "[BLANK_AUDIO]",
+    "[BLANK]",
+    "[SILENCE]",
+    "[NOISE]",
+    "[MUSIC]"
+  ],
+  "lowEnergySuppressedTokens": [
+    "you"
+  ],
+  "lowEnergyMaxChars": 4,
+  "lowEnergyMaxWords": 1
+}

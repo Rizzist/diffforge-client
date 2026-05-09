@@ -194,6 +194,193 @@ async fn get_terminal_instance_if_current(
     Ok(Some(instance))
 }
 
+fn terminal_audio_input_target_matches(
+    target: &TerminalAudioInputTarget,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> bool {
+    target.pane_id == pane_id && target.instance_id == instance_id
+}
+
+fn active_terminal_audio_input_target(
+    state: &TerminalState,
+) -> Result<Option<TerminalAudioInputTarget>, String> {
+    state
+        .active_audio_input_target
+        .lock()
+        .map(|target| target.clone())
+        .map_err(|_| "Unable to read focused terminal input target.".to_string())
+}
+
+fn clear_terminal_audio_input_target_if_matches(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> Result<(), String> {
+    let mut active_target = state
+        .active_audio_input_target
+        .lock()
+        .map_err(|_| "Unable to clear focused terminal input target.".to_string())?;
+
+    if active_target
+        .as_ref()
+        .is_some_and(|target| terminal_audio_input_target_matches(target, pane_id, instance_id))
+    {
+        *active_target = None;
+    }
+
+    Ok(())
+}
+
+fn clear_terminal_audio_input_target(state: &TerminalState) -> Result<(), String> {
+    let mut active_target = state
+        .active_audio_input_target
+        .lock()
+        .map_err(|_| "Unable to clear focused terminal input target.".to_string())?;
+
+    *active_target = None;
+
+    Ok(())
+}
+
+fn set_terminal_audio_input_target_for(
+    state: &TerminalState,
+    pane_id: String,
+    instance_id: Option<u64>,
+    active: bool,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+
+    if !active {
+        return clear_terminal_audio_input_target_if_matches(state, &pane_id, instance_id);
+    }
+
+    let mut active_target = state
+        .active_audio_input_target
+        .lock()
+        .map_err(|_| "Unable to update focused terminal input target.".to_string())?;
+
+    *active_target = Some(TerminalAudioInputTarget {
+        pane_id,
+        instance_id,
+    });
+
+    Ok(())
+}
+
+fn emit_terminal_audio_input_refocus(app: &AppHandle, target: &TerminalAudioInputTarget) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+
+    let _ = app.emit(
+        TERMINAL_AUDIO_INPUT_REFOCUS_EVENT,
+        TerminalAudioInputRefocusPayload {
+            pane_id: target.pane_id.clone(),
+            instance_id: target.instance_id,
+        },
+    );
+}
+
+fn webview_window_is_focused(app: &AppHandle, label: &str) -> bool {
+    app.get_webview_window(label)
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false)
+}
+
+fn app_has_focused_audio_input_window(app: &AppHandle) -> bool {
+    webview_window_is_focused(app, "main")
+        || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
+}
+
+async fn write_terminal_input(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: Option<u64>,
+    data: &str,
+    skipped_phase: &str,
+) -> Result<bool, String> {
+    validate_terminal_pane_id(pane_id)?;
+
+    if data.is_empty() {
+        return Ok(true);
+    }
+
+    if data.len() > MAX_TERMINAL_WRITE_BYTES {
+        return Err("Terminal input chunk is too large.".to_string());
+    }
+
+    let Some(instance) = get_terminal_instance_if_current(state, pane_id, instance_id).await?
+    else {
+        log_terminal_event(
+            skipped_phase,
+            Some(pane_id),
+            instance_id,
+            None,
+            json!({ "bytes": data.len() }),
+        );
+        return Ok(false);
+    };
+    let mut writer = instance.writer.lock().await;
+
+    writer
+        .write_all(data.as_bytes())
+        .map_err(|error| format!("Unable to write terminal input: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
+
+    Ok(true)
+}
+
+async fn write_to_active_terminal_audio_input_target(
+    app: &AppHandle,
+    state: &TerminalState,
+    data: &str,
+) -> Result<bool, String> {
+    let Some(target) = active_terminal_audio_input_target(state)? else {
+        return Ok(false);
+    };
+
+    if !app_has_focused_audio_input_window(app) {
+        log_terminal_event(
+            "terminal.audio_input.skipped_app_unfocused",
+            Some(&target.pane_id),
+            target.instance_id,
+            None,
+            json!({ "bytes": data.len() }),
+        );
+        clear_terminal_audio_input_target_if_matches(
+            state,
+            &target.pane_id,
+            target.instance_id,
+        )?;
+        return Ok(false);
+    }
+
+    let wrote = write_terminal_input(
+        state,
+        &target.pane_id,
+        target.instance_id,
+        data,
+        "terminal.audio_input.skipped_stale_or_missing",
+    )
+    .await?;
+
+    if wrote {
+        emit_terminal_audio_input_refocus(app, &target);
+    } else {
+        clear_terminal_audio_input_target_if_matches(
+            state,
+            &target.pane_id,
+            target.instance_id,
+        )?;
+    }
+
+    Ok(wrote)
+}
+
 fn poll_terminal_child_exit(child: &mut dyn Child) -> bool {
     for _ in 0..TERMINAL_SHUTDOWN_POLL_ATTEMPTS {
         match child.try_wait() {
@@ -1726,41 +1913,31 @@ async fn terminal_start_agent_many(
 }
 
 #[tauri::command]
+fn set_terminal_audio_input_target(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    active: bool,
+) -> Result<(), String> {
+    set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
+}
+
+#[tauri::command]
 async fn terminal_write(
     state: State<'_, TerminalState>,
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
 ) -> Result<(), String> {
-    validate_terminal_pane_id(&pane_id)?;
-
-    if data.is_empty() {
-        return Ok(());
-    }
-
-    if data.len() > MAX_TERMINAL_WRITE_BYTES {
-        return Err("Terminal input chunk is too large.".to_string());
-    }
-
-    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
-    else {
-        log_terminal_event(
-            "terminal.write.skipped_stale_or_missing",
-            Some(&pane_id),
-            instance_id,
-            None,
-            json!({ "bytes": data.len() }),
-        );
-        return Ok(());
-    };
-    let mut writer = instance.writer.lock().await;
-
-    writer
-        .write_all(data.as_bytes())
-        .map_err(|error| format!("Unable to write terminal input: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Unable to flush terminal input: {error}"))
+    write_terminal_input(
+        &state,
+        &pane_id,
+        instance_id,
+        &data,
+        "terminal.write.skipped_stale_or_missing",
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn resize_terminal_instance(

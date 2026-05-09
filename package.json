@@ -5,15 +5,21 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
+    "dev:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri dev",
     "dev:web": "vite --host 127.0.0.1 --logLevel error",
     "dev:web:verbose": "vite --host 127.0.0.1",
     "build": "tauri build",
+    "build:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri build --bundles app",
     "build:web": "vite build",
     "package": "tauri build",
+    "package:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri build --bundles app",
     "preview": "vite preview",
+    "macos:accessibility:reset": "tccutil reset Accessibility ai.diffforge.desktop",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "tauri:dev:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri dev",
     "tauri:dev:existing": "tauri dev --config src-tauri/tauri.dev.conf.json --no-dev-server-wait",
+    "tauri:dev:existing:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri dev --config src-tauri/tauri.dev.conf.json --no-dev-server-wait",
     "tauri:build": "tauri build"
   },
   "dependencies": {

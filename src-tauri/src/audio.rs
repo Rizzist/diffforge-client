@@ -1653,6 +1653,177 @@ fn normalize_transcript_text(text: &str) -> String {
         .join(" ")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WhisperTranscriptPolicy {
+    name: String,
+    audio_ms_min_for_speech_ms: Option<u64>,
+    capture_rms_min_for_speech: Option<f32>,
+    capture_peak_min_for_speech: Option<f32>,
+    suppress_bracketted_markers: bool,
+    suppress_bracketted_markers_max_chars: usize,
+    no_speech_markers: Vec<String>,
+    low_energy_suppressed_tokens: Vec<String>,
+    low_energy_max_chars: usize,
+    low_energy_max_words: usize,
+}
+
+impl WhisperTranscriptPolicy {
+    fn merged_with_default(mut self) -> Self {
+        let default = WhisperTranscriptPolicy::default();
+
+        if self.name.trim().is_empty() {
+            self.name = default.name;
+        }
+
+        if self.audio_ms_min_for_speech_ms.is_none() {
+            self.audio_ms_min_for_speech_ms = default.audio_ms_min_for_speech_ms;
+        }
+
+        if self.capture_rms_min_for_speech.is_none() {
+            self.capture_rms_min_for_speech = default.capture_rms_min_for_speech;
+        }
+
+        if self.capture_peak_min_for_speech.is_none() {
+            self.capture_peak_min_for_speech = default.capture_peak_min_for_speech;
+        }
+
+        if self.suppress_bracketted_markers_max_chars == 0 {
+            self.suppress_bracketted_markers_max_chars = default.suppress_bracketted_markers_max_chars;
+        }
+
+        if self.low_energy_max_chars == 0 {
+            self.low_energy_max_chars = default.low_energy_max_chars;
+        }
+
+        if self.low_energy_max_words == 0 {
+            self.low_energy_max_words = default.low_energy_max_words;
+        }
+
+        if self.no_speech_markers.is_empty() {
+            self.no_speech_markers = default.no_speech_markers;
+        }
+
+        if self.low_energy_suppressed_tokens.is_empty() {
+            self.low_energy_suppressed_tokens = default.low_energy_suppressed_tokens;
+        }
+
+        self
+    }
+}
+
+impl Default for WhisperTranscriptPolicy {
+    fn default() -> Self {
+        Self {
+            name: "whisper-local-coding-policy".to_string(),
+            audio_ms_min_for_speech_ms: Some(900),
+            capture_rms_min_for_speech: Some(0.01),
+            capture_peak_min_for_speech: Some(0.02),
+            suppress_bracketted_markers: true,
+            suppress_bracketted_markers_max_chars: 24,
+            no_speech_markers: vec![
+                "[BLANK_AUDIO]".to_string(),
+                "[BLANK]".to_string(),
+                "[SILENCE]".to_string(),
+                "[NOISE]".to_string(),
+                "[MUSIC]".to_string(),
+            ],
+            low_energy_suppressed_tokens: vec!["you".to_string()],
+            low_energy_max_chars: 4,
+            low_energy_max_words: 1,
+        }
+    }
+}
+
+fn whisper_transcript_policy_path() -> &'static str {
+    include_str!("../whisper-transcript-policy.json")
+}
+
+fn whisper_transcript_policy() -> &'static WhisperTranscriptPolicy {
+    static POLICY: OnceLock<WhisperTranscriptPolicy> = OnceLock::new();
+
+    POLICY.get_or_init(|| {
+        let default = WhisperTranscriptPolicy::default();
+        let policy: WhisperTranscriptPolicy = serde_json::from_str(whisper_transcript_policy_path()).unwrap_or_else(|error| {
+            log_whisper_local_audio_event(
+                "whisper.policy.load_failed",
+                None,
+                json!({
+                    "policy_name": &default.name,
+                    "policy_path": "whisper-transcript-policy.json",
+                    "error": clean_whisper_local_audio_log_text(&error.to_string()),
+                }),
+            );
+
+            default
+        });
+
+        policy.merged_with_default()
+    })
+}
+
+fn is_low_energy_capture(policy: &WhisperTranscriptPolicy, request: &WhisperTranscriptionRequest) -> bool {
+    let rms = request
+        .capture_rms
+        .map(|value| value.max(0.0f32))
+        .unwrap_or(f32::MAX);
+    let peak = request
+        .capture_peak
+        .map(|value| value.max(0.0f32))
+        .unwrap_or(f32::MAX);
+    let audio_ms = request.audio_ms.unwrap_or(u64::MAX);
+
+    policy
+        .capture_rms_min_for_speech
+        .is_some_and(|threshold| rms < threshold)
+        || policy
+            .capture_peak_min_for_speech
+            .is_some_and(|threshold| peak < threshold)
+        || policy
+            .audio_ms_min_for_speech_ms
+            .is_some_and(|threshold| audio_ms < threshold)
+}
+
+fn whisper_local_transcript_drop_reason(
+    policy: &WhisperTranscriptPolicy,
+    request: &WhisperTranscriptionRequest,
+    text: &str,
+) -> Option<String> {
+    let normalized = text.trim();
+
+    if normalized.is_empty() {
+        return Some("empty_transcript".to_string());
+    }
+
+    let normalized_lower = normalized.to_lowercase();
+    if policy.no_speech_markers.iter().any(|marker| normalized_lower == marker.to_lowercase()) {
+        return Some("no_speech_marker".to_string());
+    }
+
+    if policy.suppress_bracketted_markers
+        && normalized.len() <= policy.suppress_bracketted_markers_max_chars
+        && normalized.starts_with('[')
+        && normalized.ends_with(']')
+    {
+        return Some("bracketed_marker".to_string());
+    }
+
+    if is_low_energy_capture(policy, request) {
+        let word_count = normalized.split_whitespace().count();
+        if word_count <= policy.low_energy_max_words
+            && normalized.chars().count() <= policy.low_energy_max_chars
+            && policy
+                .low_energy_suppressed_tokens
+                .iter()
+                .any(|token| normalized.eq_ignore_ascii_case(token))
+        {
+            return Some("low_energy_short_token".to_string());
+        }
+    }
+
+    None
+}
+
 fn clean_transcript_for_insert(text: String) -> Result<String, String> {
     let cleaned = text
         .chars()
@@ -2033,7 +2204,22 @@ fn transcribe_whisper_audio_for(
     } else {
         command_output_text(&capture.stdout, &capture.stderr)
     };
-    let text = normalize_transcript_text(&transcript);
+    let policy = whisper_transcript_policy();
+    let mut text = normalize_transcript_text(&transcript);
+    if let Some(reason) = whisper_local_transcript_drop_reason(policy, &request, &text) {
+        log_whisper_local_audio_event(
+            "whisper.transcribe.policy_drop",
+            Some(started_at.elapsed()),
+            json!({
+                "policy_name": &policy.name,
+                "reason": reason,
+                "audio_ms": request.audio_ms,
+                "capture_rms": request.capture_rms,
+                "capture_peak": request.capture_peak,
+            }),
+        );
+        text.clear();
+    }
     let _ = fs::remove_file(&audio_path);
     log_whisper_local_audio_event(
         "whisper.transcribe.output_read.done",
@@ -2043,6 +2229,8 @@ fn transcribe_whisper_audio_for(
             "clean_text_chars": text.chars().count(),
             "used_transcript_file": false,
             "audio_path_removed": true,
+            "policy_name": &policy.name,
+            "policy_drop": text.is_empty(),
         }),
     );
 
@@ -2101,11 +2289,14 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     .decorations(false)
     .always_on_top(true)
     .focused(false)
+    .accept_first_mouse(true)
     .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(false)
     .build()
     .map_err(|error| format!("Unable to create audio widget: {error}"))?;
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
 
     let app_handle = app.clone();
     window.on_window_event(move |event| {
@@ -2771,6 +2962,7 @@ async fn toggle_audio_widget(
 #[tauri::command]
 async fn insert_transcribed_text(
     app: AppHandle,
+    terminal_state: State<'_, TerminalState>,
     text: String,
 ) -> Result<AudioWidgetVisibility, String> {
     let text = clean_transcript_for_insert(text)?;
@@ -2778,6 +2970,14 @@ async fn insert_transcribed_text(
         .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
+
+    if write_to_active_terminal_audio_input_target(&app, &terminal_state, &text).await? {
+        return Ok(AudioWidgetVisibility {
+            visible: widget_visible,
+            installed: whisper_model_status_for(&app)?.installed,
+            shortcut: audio_push_to_talk_shortcut_for(&app),
+        });
+    }
 
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(220));

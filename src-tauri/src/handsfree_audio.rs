@@ -2,7 +2,6 @@ const AUDIO_PUSH_TO_TALK_EVENT: &str = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT: &str = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT: &str = "forge-audio-shortcuts-changed";
 const AUDIO_SHORTCUT_SETTINGS_FILE: &str = "audio-shortcuts.json";
-const AUDIO_PUSH_TO_TALK_PRESS_EMIT_DELAY_MS: u64 = 140;
 const AUDIO_HANDSFREE_INSERT_DELAY_MS: u64 = 160;
 #[cfg(target_os = "macos")]
 const MACOS_ACCESSIBILITY_SETTINGS_URL: &str =
@@ -870,15 +869,23 @@ fn emit_audio_push_to_talk_event(
     pressed: bool,
     shortcut: String,
 ) {
-    let _ = app.emit(
-        AUDIO_PUSH_TO_TALK_EVENT,
-        AudioPushToTalkEvent {
-            phase,
-            pressed,
-            shortcut,
-            created_at_ms: current_time_ms(),
-        },
-    );
+    let _ = app.emit(AUDIO_PUSH_TO_TALK_EVENT, AudioPushToTalkEvent {
+        phase,
+        pressed,
+        shortcut,
+        created_at_ms: current_time_ms(),
+    });
+}
+
+fn audio_push_to_talk_status_for(app: &AppHandle) -> AudioPushToTalkEvent {
+    let pressed = AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire);
+
+    AudioPushToTalkEvent {
+        phase: if pressed { "pressed" } else { "released" },
+        pressed,
+        shortcut: audio_push_to_talk_shortcut_for(app),
+        created_at_ms: current_time_ms(),
+    }
 }
 
 fn emit_audio_cancel_event(app: &AppHandle, shortcut: String) {
@@ -916,6 +923,15 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
             }
 
             tauri::async_runtime::spawn(async move {
+                if !app_has_focused_audio_input_window(&app) {
+                    let terminal_state = app.state::<TerminalState>();
+                    let _ = clear_terminal_audio_input_target(&terminal_state);
+                }
+
+                if AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire) {
+                    emit_audio_push_to_talk_event(&app, "pressed", true, shortcut);
+                }
+
                 if let Ok(visibility) = show_audio_widget_for_handsfree(&app) {
                     if visibility.installed {
                         let prepare_app = app.clone();
@@ -924,15 +940,6 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                             let _ = prepare_whisper_model_for(&prepare_app, &engine);
                         });
                     }
-                }
-
-                tokio::time::sleep(Duration::from_millis(
-                    AUDIO_PUSH_TO_TALK_PRESS_EMIT_DELAY_MS,
-                ))
-                .await;
-
-                if AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire) {
-                    emit_audio_push_to_talk_event(&app, "pressed", true, shortcut);
                 }
             });
         }
@@ -981,6 +988,11 @@ async fn audio_shortcuts_status(app: AppHandle) -> Result<AudioShortcutSettingsS
 }
 
 #[tauri::command]
+async fn audio_push_to_talk_status(app: AppHandle) -> Result<AudioPushToTalkEvent, String> {
+    Ok(audio_push_to_talk_status_for(&app))
+}
+
+#[tauri::command]
 async fn open_audio_shortcut_permissions(
     app: AppHandle,
 ) -> Result<AudioShortcutSettingsStatus, String> {
@@ -1009,6 +1021,7 @@ async fn reset_audio_shortcuts(app: AppHandle) -> Result<AudioShortcutSettingsSt
 #[tauri::command]
 async fn insert_handsfree_transcribed_text(
     app: AppHandle,
+    terminal_state: State<'_, TerminalState>,
     text: String,
 ) -> Result<AudioWidgetVisibility, String> {
     let text = clean_transcript_for_insert(text)?;
@@ -1016,6 +1029,14 @@ async fn insert_handsfree_transcribed_text(
         .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
+
+    if write_to_active_terminal_audio_input_target(&app, &terminal_state, &text).await? {
+        return Ok(AudioWidgetVisibility {
+            visible: widget_visible,
+            installed: whisper_model_status_for(&app)?.installed,
+            shortcut: audio_push_to_talk_shortcut_for(&app),
+        });
+    }
 
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(AUDIO_HANDSFREE_INSERT_DELAY_MS));
