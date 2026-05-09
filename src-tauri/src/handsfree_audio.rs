@@ -4,12 +4,40 @@ const AUDIO_SHORTCUTS_CHANGED_EVENT: &str = "forge-audio-shortcuts-changed";
 const AUDIO_SHORTCUT_SETTINGS_FILE: &str = "audio-shortcuts.json";
 const AUDIO_PUSH_TO_TALK_PRESS_EMIT_DELAY_MS: u64 = 140;
 const AUDIO_HANDSFREE_INSERT_DELAY_MS: u64 = 160;
+#[cfg(target_os = "macos")]
+const MACOS_ACCESSIBILITY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 static AUDIO_PUSH_TO_TALK_IS_DOWN: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static AUDIO_CONTEXT_MENU_HOOK_HANDLE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
 static AUDIO_CONTEXT_MENU_HOOK_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
+    fn AXIsProcessTrusted() -> std::os::raw::c_uchar;
+    fn AXIsProcessTrustedWithOptions(
+        options: *const std::ffi::c_void,
+    ) -> std::os::raw::c_uchar;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: *const std::ffi::c_void;
+    fn CFDictionaryCreate(
+        allocator: *const std::ffi::c_void,
+        keys: *const *const std::ffi::c_void,
+        values: *const *const std::ffi::c_void,
+        num_values: isize,
+        key_callbacks: *const std::ffi::c_void,
+        value_callbacks: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(value: *const std::ffi::c_void);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AudioShortcutAction {
@@ -60,7 +88,7 @@ struct AudioPushToTalkEvent {
 
 #[cfg(target_os = "macos")]
 fn default_audio_push_to_talk_shortcut() -> &'static str {
-    "MetaRight"
+    "Alt+KeyP"
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -161,6 +189,131 @@ fn audio_shortcut_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
 
     Ok(app_data_dir.join(AUDIO_SHORTCUT_SETTINGS_FILE))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_accessibility_permission_granted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_request_accessibility_permission() -> bool {
+    unsafe {
+        let keys = [kAXTrustedCheckOptionPrompt];
+        let values = [kCFBooleanTrue];
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        let trusted = AXIsProcessTrustedWithOptions(options) != 0;
+
+        if !options.is_null() {
+            CFRelease(options);
+        }
+
+        trusted
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_or_executable_path() -> Option<PathBuf> {
+    let executable = env::current_exe().ok()?;
+
+    for ancestor in executable.ancestors() {
+        if ancestor
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+
+    Some(executable)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_quarantine_path() -> Option<PathBuf> {
+    let path = macos_app_bundle_or_executable_path()?;
+    let output = Command::new("xattr")
+        .args(["-p", "com.apple.quarantine"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    output.status.success().then_some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_accessibility_settings() -> Result<(), String> {
+    Command::new("open")
+        .arg(MACOS_ACCESSIBILITY_SETTINGS_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open macOS Accessibility settings: {error}"))
+}
+
+fn audio_shortcut_permission_status() -> AudioShortcutPermissionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let accessibility_granted = macos_accessibility_permission_granted();
+        let quarantine_path = macos_quarantine_path();
+        let quarantine_path_label = quarantine_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let quarantine_fix_command = quarantine_path
+            .as_ref()
+            .map(|path| {
+                format!(
+                    "xattr -d com.apple.quarantine {}",
+                    quote_shell_literal(&path.display().to_string())
+                )
+            })
+            .unwrap_or_default();
+        let message = if !accessibility_granted {
+            "Enable Accessibility for Diff Forge AI, then restart the app.".to_string()
+        } else if quarantine_path.is_some() {
+            "Remove the macOS quarantine attribute, then restart the app.".to_string()
+        } else {
+            "Shortcut permissions look ready.".to_string()
+        };
+
+        return AudioShortcutPermissionStatus {
+            platform: "macos",
+            accessibility_required: true,
+            accessibility_granted,
+            accessibility_settings_url: MACOS_ACCESSIBILITY_SETTINGS_URL,
+            quarantine_detected: quarantine_path.is_some(),
+            quarantine_path: quarantine_path_label,
+            quarantine_fix_command,
+            message,
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        AudioShortcutPermissionStatus {
+            platform: "other",
+            accessibility_required: false,
+            accessibility_granted: true,
+            accessibility_settings_url: "",
+            quarantine_detected: false,
+            quarantine_path: String::new(),
+            quarantine_fix_command: String::new(),
+            message: String::new(),
+        }
+    }
 }
 
 fn parse_audio_shortcut_code(value: &str) -> Result<Code, String> {
@@ -291,6 +444,77 @@ fn audio_shortcut_is_bare_context_menu(shortcut: &str) -> bool {
     audio_shortcuts_conflict(shortcut, "ContextMenu")
 }
 
+#[cfg(target_os = "macos")]
+fn macos_push_to_talk_shortcut_needs_modifier(shortcut: &str) -> bool {
+    !shortcut.split('+').any(|token| {
+        matches!(
+            token.trim().to_ascii_uppercase().as_str(),
+            "OPTION"
+                | "ALT"
+                | "CONTROL"
+                | "CTRL"
+                | "COMMAND"
+                | "CMD"
+                | "SUPER"
+                | "META"
+                | "SHIFT"
+                | "COMMANDORCONTROL"
+                | "COMMANDORCTRL"
+                | "CMDORCTRL"
+                | "CMDORCONTROL"
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_push_to_talk_shortcut_needs_modifier(_shortcut: &str) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_push_to_talk_shortcut_is_reserved(shortcut: &str) -> bool {
+    let tokens = shortcut
+        .split('+')
+        .map(|token| token.trim().replace([' ', '-', '_'], "").to_ascii_uppercase())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    (tokens.len() == 2 && tokens[0] == "ALT" && tokens[1] == "SPACE")
+        || (tokens.len() == 3
+            && (tokens[0] == "CONTROL" || tokens[0] == "CTRL")
+            && tokens[1] == "ALT"
+            && tokens[2] == "SPACE")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_push_to_talk_shortcut_is_reserved(_shortcut: &str) -> bool {
+    false
+}
+
+fn validate_audio_shortcut_for_action(
+    action: AudioShortcutAction,
+    shortcut: &str,
+) -> Result<(), String> {
+    if action == AudioShortcutAction::PushToTalk
+        && macos_push_to_talk_shortcut_needs_modifier(shortcut)
+    {
+        return Err(
+            "macOS hold-to-record needs a modifier shortcut, like Option+P.".to_string(),
+        );
+    }
+
+    if action == AudioShortcutAction::PushToTalk
+        && macos_push_to_talk_shortcut_is_reserved(shortcut)
+    {
+        return Err(
+            "Space-based Option shortcuts are unreliable on macOS. Use Option+P instead."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(windows)]
 fn audio_shortcut_uses_windows_context_menu_hook(
     action: AudioShortcutAction,
@@ -309,10 +533,15 @@ fn audio_shortcut_uses_windows_context_menu_hook(
 
 fn sanitized_audio_shortcut_bindings(bindings: AudioShortcutBindings) -> AudioShortcutBindings {
     let defaults = default_audio_shortcut_bindings();
-    let push_to_talk = normalize_audio_shortcut_text(&bindings.push_to_talk)
+    let mut push_to_talk = normalize_audio_shortcut_text(&bindings.push_to_talk)
         .unwrap_or_else(|_| defaults.push_to_talk.clone());
     let mut cancel = normalize_audio_shortcut_text(&bindings.cancel)
         .unwrap_or_else(|_| defaults.cancel.clone());
+
+    if validate_audio_shortcut_for_action(AudioShortcutAction::PushToTalk, &push_to_talk).is_err()
+    {
+        push_to_talk = defaults.push_to_talk;
+    }
 
     if audio_shortcuts_conflict(&push_to_talk, &cancel) {
         cancel = defaults.cancel;
@@ -374,6 +603,7 @@ fn audio_shortcuts_status_from_state(
             state.push_to_talk,
         ),
         cancel: audio_shortcut_registration_status(AudioShortcutAction::Cancel, state.cancel),
+        permissions: audio_shortcut_permission_status(),
     }
 }
 
@@ -476,6 +706,7 @@ fn set_audio_shortcut_for(
 ) -> Result<AudioShortcutSettingsStatus, String> {
     let action = AudioShortcutAction::from_request(&request.action)?;
     let next_shortcut = normalize_audio_shortcut_text(&request.shortcut)?;
+    validate_audio_shortcut_for_action(action, &next_shortcut)?;
     let manager = app.state::<AudioState>().shortcut_manager.clone();
     let state = manager.snapshot();
     let previous = state.registration(action);
@@ -746,6 +977,19 @@ fn insert_text_with_enigo(text: &str) -> Result<(), String> {
 
 #[tauri::command]
 async fn audio_shortcuts_status(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
+    Ok(audio_shortcuts_status_for(&app))
+}
+
+#[tauri::command]
+async fn open_audio_shortcut_permissions(
+    app: AppHandle,
+) -> Result<AudioShortcutSettingsStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = macos_request_accessibility_permission();
+        macos_open_accessibility_settings()?;
+    }
+
     Ok(audio_shortcuts_status_for(&app))
 }
 

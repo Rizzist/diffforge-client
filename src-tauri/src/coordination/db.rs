@@ -74,19 +74,25 @@ pub fn canonical_repo_path(repo_path: impl AsRef<Path>) -> Result<PathBuf, Strin
     let path = repo_path.as_ref();
 
     if path.as_os_str().is_empty() {
-        return std::env::current_dir()
-            .map_err(|error| format!("Unable to resolve current directory: {error}"));
+        return crate::default_working_directory();
     }
 
     if path.exists() {
-        path.canonicalize()
+        let canonical = path
+            .canonicalize()
             .map(|path| PathBuf::from(process_path_text(&path)))
             .map_err(|error| {
                 format!(
                     "Unable to canonicalize repo path {}: {error}",
                     path.display()
                 )
-            })
+            })?;
+
+        if crate::is_filesystem_root_directory(&canonical) {
+            return Err("Workspace root directory cannot be the filesystem root.".to_string());
+        }
+
+        Ok(canonical)
     } else {
         Ok(path.to_path_buf())
     }
@@ -196,4 +202,16 @@ fn is_lock_error(error: &SqliteError) -> bool {
         SqliteError::SqliteFailure(inner, _)
             if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn canonical_repo_path_rejects_filesystem_root() {
+        let error = canonical_repo_path("/").unwrap_err();
+        assert!(error.contains("filesystem root"));
+    }
 }

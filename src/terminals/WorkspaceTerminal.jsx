@@ -395,6 +395,25 @@ function getTerminalAgentKind(agentId) {
   return "agent";
 }
 
+function getAgentTone(agent) {
+  if (!agent?.installed) {
+    return "offline";
+  }
+
+  return agent.authenticated ? "ready" : "needsAuth";
+}
+
+function getAgentStatusSummary(agentStatuses) {
+  if (!Array.isArray(agentStatuses)) {
+    return [];
+  }
+
+  const codex = agentStatuses.find((agent) => agent.id === "codex");
+  const claude = agentStatuses.find((agent) => agent.id === "claude");
+
+  return [codex, claude].filter(Boolean);
+}
+
 function getTerminalAgentId(agentId, terminalIndex) {
   const kind = getTerminalAgentKind(agentId);
   const prefix = kind === "claude" ? "CL" : kind === "codex" ? "CX" : "AG";

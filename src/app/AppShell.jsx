@@ -1094,6 +1094,14 @@ function isWindowsSystemRootDirectory(value) {
     || /^\/[a-z]\/windows(?:\/(?:system32|syswow64)(?:\/.*)?)?$/.test(cleaned);
 }
 
+function isFilesystemRootDirectory(value) {
+  return cleanWorkspaceRootDirectory(value).replace(/\\/g, "/") === "/";
+}
+
+function isDisallowedWorkspaceRootDirectory(value) {
+  return isFilesystemRootDirectory(value) || isWindowsSystemRootDirectory(value);
+}
+
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
 
@@ -1160,7 +1168,7 @@ function normalizeWorkspaceSettings(value) {
     Object.entries(value)
       .map(([workspaceId, settings]) => {
         const cleanedRootDirectory = cleanWorkspaceRootDirectory(settings?.rootDirectory);
-        const rootDirectory = isWindowsSystemRootDirectory(cleanedRootDirectory)
+        const rootDirectory = isDisallowedWorkspaceRootDirectory(cleanedRootDirectory)
           ? ""
           : cleanedRootDirectory;
         const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
@@ -1257,9 +1265,12 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const currentSettings = settings?.[workspaceId] || {};
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
-  const rootDirectory = cleanWorkspaceRootDirectory(
+  const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
   ).slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH);
+  const rootDirectory = isDisallowedWorkspaceRootDirectory(cleanedRootDirectory)
+    ? ""
+    : cleanedRootDirectory;
   const terminalCount = normalizeWorkspaceTerminalCount(
     hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
   );
@@ -1958,8 +1969,16 @@ export default function App() {
       const status = await invoke("download_whisper_model");
       setAudioModelStatus(status);
       setAudioActionState("idle");
-      setAudioDownloadProgress(null);
+      if (status?.installed) {
+        setAudioDownloadProgress(null);
+      }
     } catch (error) {
+      try {
+        const status = await invoke("whisper_model_status");
+        setAudioModelStatus(status);
+      } catch (_statusError) {
+        // Keep the original install failure visible.
+      }
       setAudioActionState("error");
       setAudioError(getErrorMessage(error, "Unable to install Whisper."));
     }

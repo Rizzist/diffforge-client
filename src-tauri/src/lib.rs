@@ -114,7 +114,10 @@ const WHISPER_RUNTIME_SHA256: Option<&str> =
 const WHISPER_RUNTIME_SHA256: Option<&str> = None;
 #[cfg(target_os = "macos")]
 const WHISPER_RUNTIME_INSTALL_HINT: &str =
-    "Install whisper.cpp CLI with Homebrew, then recheck: brew install whisper-cpp";
+    "Install whisper.cpp CLI with Homebrew: brew install whisper-cpp. If Homebrew is missing, install it from https://brew.sh, then recheck.";
+#[cfg(target_os = "macos")]
+const WHISPER_HOMEBREW_MISSING_HINT: &str =
+    "Homebrew is required to install whisper.cpp automatically. Install Homebrew from https://brew.sh, then recheck.";
 #[cfg(target_os = "linux")]
 const WHISPER_RUNTIME_INSTALL_HINT: &str =
     "Install whisper.cpp CLI and make whisper-cli, whisper, or main available on PATH.";
@@ -787,9 +790,23 @@ struct AudioShortcutRegistrationStatus {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct AudioShortcutPermissionStatus {
+    platform: &'static str,
+    accessibility_required: bool,
+    accessibility_granted: bool,
+    accessibility_settings_url: &'static str,
+    quarantine_detected: bool,
+    quarantine_path: String,
+    quarantine_fix_command: String,
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct AudioShortcutSettingsStatus {
     push_to_talk: AudioShortcutRegistrationStatus,
     cancel: AudioShortcutRegistrationStatus,
+    permissions: AudioShortcutPermissionStatus,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1120,6 +1137,7 @@ pub fn run() {
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
             audio_shortcuts_status,
+            open_audio_shortcut_permissions,
             set_audio_shortcut,
             reset_audio_shortcuts,
             audio_widget_status,

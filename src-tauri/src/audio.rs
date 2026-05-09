@@ -1334,6 +1334,8 @@ fn common_whisper_runtime_paths() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/opt/homebrew/bin/whisper-cli"),
             PathBuf::from("/usr/local/bin/whisper-cli"),
+            PathBuf::from("/opt/homebrew/bin/whisper"),
+            PathBuf::from("/usr/local/bin/whisper"),
             PathBuf::from("/opt/homebrew/bin/main"),
             PathBuf::from("/usr/local/bin/main"),
         ]
@@ -1407,6 +1409,97 @@ fn external_whisper_runtime_executable_path() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn whisper_runtime_installable() -> bool {
+    WHISPER_RUNTIME_URL.is_some() || cfg!(target_os = "macos")
+}
+
+#[cfg(target_os = "macos")]
+fn homebrew_executable_path() -> Option<PathBuf> {
+    if let Some(brew) = find_executable_on_path(&["brew"]) {
+        return Some(brew);
+    }
+
+    [
+        PathBuf::from("/opt/homebrew/bin/brew"),
+        PathBuf::from("/usr/local/bin/brew"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String> {
+    let Some(brew_path) = homebrew_executable_path() else {
+        emit_audio_download_progress(
+            app,
+            WhisperModelDownloadProgress {
+                state: "runtime-missing".to_string(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                percent: Some(100.0),
+                message: WHISPER_HOMEBREW_MISSING_HINT.to_string(),
+            },
+        );
+
+        return Ok(false);
+    };
+
+    emit_audio_download_progress(
+        app,
+        WhisperModelDownloadProgress {
+            state: "runtime".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            percent: None,
+            message: "Installing whisper.cpp with Homebrew.".to_string(),
+        },
+    );
+
+    let brew_binary = brew_path.to_string_lossy().to_string();
+    let capture = run_command_capture(
+        &brew_binary,
+        &["install", "whisper-cpp"],
+        None,
+        Duration::from_secs(WHISPER_DOWNLOAD_TIMEOUT_SECS),
+        None,
+    )
+    .map_err(|error| format!("Unable to run Homebrew: {error}"))?;
+
+    if capture.exit_code != Some(0) {
+        let detail = first_output_line(&command_output_text(&capture.stdout, &capture.stderr));
+
+        emit_audio_download_progress(
+            app,
+            WhisperModelDownloadProgress {
+                state: "runtime-missing".to_string(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                percent: Some(100.0),
+                message: "Homebrew could not install whisper.cpp.".to_string(),
+            },
+        );
+
+        if detail.is_empty() {
+            return Err("Homebrew could not install whisper.cpp.".to_string());
+        }
+
+        return Err(format!("Homebrew could not install whisper.cpp: {detail}"));
+    }
+
+    emit_audio_download_progress(
+        app,
+        WhisperModelDownloadProgress {
+            state: "runtime".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            percent: Some(100.0),
+            message: "Homebrew finished installing whisper.cpp.".to_string(),
+        },
+    );
+
+    Ok(true)
+}
+
 fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, String> {
     let model_path = whisper_model_path(app)?;
     let runtime_directory = whisper_runtime_directory(app)?;
@@ -1439,7 +1532,7 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
             .unwrap_or_else(|| {
                 runtime_directory.display().to_string()
             }),
-        runtime_installable: WHISPER_RUNTIME_URL.is_some(),
+        runtime_installable: whisper_runtime_installable(),
         managed_runtime_installed,
         managed_assets_installed,
         runtime_install_hint: WHISPER_RUNTIME_INSTALL_HINT,
@@ -1545,6 +1638,9 @@ fn is_whisper_runtime_warning_line(line: &str) -> bool {
         || lowercase.contains("the binary 'main' is deprecated")
         || lowercase.contains("the binary \"main\" is deprecated")
         || lowercase.contains("deprecation-warning")
+        || lowercase.starts_with("load_backend:")
+        || lowercase.starts_with("whisper_init")
+        || lowercase.starts_with("ggml_")
 }
 
 fn normalize_transcript_text(text: &str) -> String {
@@ -1932,7 +2028,11 @@ fn transcribe_whisper_audio_for(
     };
 
     let read_started_at = Instant::now();
-    let transcript = command_output_text(&capture.stdout, &capture.stderr);
+    let transcript = if capture.exit_code == Some(0) {
+        capture.stdout.trim().to_string()
+    } else {
+        command_output_text(&capture.stdout, &capture.stderr)
+    };
     let text = normalize_transcript_text(&transcript);
     let _ = fs::remove_file(&audio_path);
     log_whisper_local_audio_event(
@@ -2141,6 +2241,22 @@ async fn download_whisper_model(
     fs::create_dir_all(&model_directory)
         .map_err(|error| format!("Unable to create Whisper model directory: {error}"))?;
 
+    #[cfg(target_os = "macos")]
+    if whisper_runtime_executable_path(&app)?.is_none() && homebrew_executable_path().is_none() {
+        emit_audio_download_progress(
+            &app,
+            WhisperModelDownloadProgress {
+                state: "runtime-missing".to_string(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                percent: Some(100.0),
+                message: WHISPER_HOMEBREW_MISSING_HINT.to_string(),
+            },
+        );
+
+        return whisper_model_status_for(&app);
+    }
+
     if !model_path.exists() {
         emit_audio_download_progress(
             &app,
@@ -2207,6 +2323,13 @@ async fn download_whisper_model(
 
         fs::rename(&temp_path, &model_path)
             .map_err(|error| format!("Unable to install Whisper model: {error}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    if whisper_runtime_executable_path(&app)?.is_none()
+        && !install_whisper_runtime_with_homebrew(&app)?
+    {
+        return whisper_model_status_for(&app);
     }
 
     if whisper_runtime_executable_path(&app)?.is_none() {

@@ -19,10 +19,7 @@ fn kernel(
 }
 
 fn default_repo_path() -> PathBuf {
-    std::env::current_dir()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from).or(Some(path)))
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::default_working_directory().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn result(value: Result<Value, String>) -> Result<Value, String> {

@@ -1,4 +1,4 @@
-fn default_working_directory() -> Result<PathBuf, String> {
+pub(crate) fn default_working_directory() -> Result<PathBuf, String> {
     let current_dir = env::current_dir()
         .map_err(|error| format!("Unable to read current working directory: {error}"))?;
 
@@ -16,17 +16,17 @@ fn default_working_directory() -> Result<PathBuf, String> {
         current_dir
     };
 
-    if is_windows_system_startup_directory(&working_directory) {
-        if let Some(project_directory) = source_project_directory() {
-            return Ok(project_directory);
-        }
-
-        if let Some(home_directory) = user_home_dir() {
-            return Ok(home_directory);
+    if should_fallback_default_working_directory(&working_directory) {
+        if let Some(fallback_directory) = default_working_directory_fallback() {
+            return Ok(fallback_directory);
         }
     }
 
     Ok(working_directory)
+}
+
+fn default_working_directory_fallback() -> Option<PathBuf> {
+    source_project_directory().or_else(user_home_dir)
 }
 
 fn source_project_directory() -> Option<PathBuf> {
@@ -45,6 +45,23 @@ fn source_project_directory() -> Option<PathBuf> {
         .canonicalize()
         .ok()
         .filter(|directory| directory.is_dir())
+}
+
+fn should_fallback_default_working_directory(directory: &Path) -> bool {
+    is_filesystem_root_directory(directory) || is_windows_system_startup_directory(directory)
+}
+
+pub(crate) fn is_filesystem_root_directory(directory: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        false
+    }
+
+    #[cfg(not(windows))]
+    {
+        directory.has_root() && directory.parent().is_none()
+    }
 }
 
 #[cfg(windows)]
@@ -282,6 +299,10 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
 
     if !metadata.is_dir() {
         return Err("Workspace root directory must be an existing directory.".to_string());
+    }
+
+    if is_filesystem_root_directory(&canonical) {
+        return Err("Workspace root directory cannot be the filesystem root.".to_string());
     }
 
     if is_windows_system_startup_directory(&canonical) {
@@ -745,4 +766,22 @@ fn read_workspace_file_diff_for(
         diff,
         truncated,
     })
+}
+
+#[cfg(test)]
+mod workspace_files_tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn filesystem_root_is_not_a_valid_workspace_root() {
+        let error = resolve_workspace_root_directory(Some("/")).unwrap_err();
+        assert!(error.contains("filesystem root"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn filesystem_root_triggers_default_directory_fallback() {
+        assert!(should_fallback_default_working_directory(Path::new("/")));
+    }
 }

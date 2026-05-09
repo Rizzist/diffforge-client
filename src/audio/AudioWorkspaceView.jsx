@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -351,6 +351,7 @@ export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibil
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
+const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
 const AUDIO_RECORDING_MAX_SECONDS = 90;
 const AUDIO_RECORDING_TIMER_MS = 250;
@@ -374,6 +375,10 @@ const AUDIO_MODIFIER_CODES = new Set([
   "ShiftLeft",
   "ShiftRight",
 ]);
+function isMacPlatform() {
+  return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
+}
+
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing";
@@ -497,12 +502,34 @@ function waitForAudioPostBuffer(ms) {
   });
 }
 
+function notifyAudioSettingsChanged(reason) {
+  emit(AUDIO_SETTINGS_CHANGED_EVENT, {
+    reason,
+    createdAt: new Date().toISOString(),
+  }).catch(() => {});
+}
+
 function defaultPushToTalkShortcut() {
-  if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "")) {
-    return "MetaRight";
+  if (isMacPlatform()) {
+    return "Alt+KeyP";
   }
 
   return "ContextMenu";
+}
+
+function fallbackShortcutPermissions() {
+  return {
+    platform: isMacPlatform() ? "macos" : "other",
+    accessibilityRequired: isMacPlatform(),
+    accessibilityGranted: !isMacPlatform(),
+    accessibilitySettingsUrl: isMacPlatform()
+      ? "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+      : "",
+    quarantineDetected: false,
+    quarantinePath: "",
+    quarantineFixCommand: "",
+    message: "",
+  };
 }
 
 function fallbackShortcutStatus() {
@@ -521,6 +548,7 @@ function fallbackShortcutStatus() {
       registered: false,
       error: "",
     },
+    permissions: fallbackShortcutPermissions(),
   };
 }
 
@@ -576,7 +604,7 @@ function formatShortcutToken(token) {
     return "Ctrl";
   }
   if (lower === "alt" || lower === "option") {
-    return "Alt";
+    return isMacPlatform() ? "Option" : "Alt";
   }
   if (lower === "shift") {
     return "Shift";
@@ -738,7 +766,17 @@ export default function AudioWorkspaceView({
   const cancelShortcut = effectiveShortcutStatus.cancel?.shortcut || "Escape";
   const pushToTalkShortcutError = effectiveShortcutStatus.pushToTalk?.error || "";
   const cancelShortcutError = effectiveShortcutStatus.cancel?.error || "";
+  const shortcutPermissions = effectiveShortcutStatus.permissions || fallbackShortcutPermissions();
+  const shortcutPermissionMissing = Boolean(
+    shortcutPermissions.accessibilityRequired && !shortcutPermissions.accessibilityGranted,
+  );
+  const shortcutQuarantineDetected = Boolean(shortcutPermissions.quarantineDetected);
   const isSavingShortcut = audioShortcutActionState === "saving";
+  const isOpeningShortcutPermissions = audioShortcutActionState === "opening-permissions";
+  const shortcutReady = !pushToTalkShortcutError
+    && !cancelShortcutError
+    && !shortcutPermissionMissing
+    && !shortcutQuarantineDetected;
 
   const stopAudioInputPreview = useCallback(async () => {
     audioInputRunRef.current += 1;
@@ -777,6 +815,7 @@ export default function AudioWorkspaceView({
         audioInputDeviceIdRef.current = nextDeviceId;
         setAudioInputDeviceId(nextDeviceId);
         writeSelectedAudioInputDeviceId(nextDeviceId);
+        notifyAudioSettingsChanged("input-device");
       }
 
       if (!devices.length) {
@@ -838,6 +877,7 @@ export default function AudioWorkspaceView({
 
       audioInputPreviewRef.current = audioInputPreview;
       markAudioInputSetupReady();
+      notifyAudioSettingsChanged("input-ready");
       audioInputStateRef.current = "previewing";
       setAudioInputState("previewing");
       setAudioInputMessage("Live input stream is active for the selected source.");
@@ -862,6 +902,7 @@ export default function AudioWorkspaceView({
     audioInputDeviceIdRef.current = nextDeviceId;
     setAudioInputDeviceId(nextDeviceId);
     writeSelectedAudioInputDeviceId(nextDeviceId);
+    notifyAudioSettingsChanged("input-device");
     setAudioInputStats(EMPTY_AUDIO_INPUT_STATS);
 
     const currentState = audioInputStateRef.current;
@@ -899,18 +940,21 @@ export default function AudioWorkspaceView({
   const selectAudioMode = useCallback((nextMode) => {
     setAudioMode(nextMode);
     writeAudioTranscriptionProvider(nextMode);
+    notifyAudioSettingsChanged("provider");
   }, []);
 
   const updateDeepgramApiKey = useCallback((event) => {
     const nextApiKey = event.target.value;
     setDeepgramApiKey(nextApiKey);
     writeDeepgramApiKey(nextApiKey);
+    notifyAudioSettingsChanged("deepgram-key");
   }, []);
 
   const updateDeepgramLanguage = useCallback((event) => {
     const nextLanguage = event.target.value;
     setDeepgramLanguage(nextLanguage);
     writeDeepgramLanguage(nextLanguage);
+    notifyAudioSettingsChanged("deepgram-language");
   }, []);
 
   const loadAudioShortcutStatus = useCallback(async () => {
@@ -963,6 +1007,20 @@ export default function AudioWorkspaceView({
       setAudioShortcutActionState("idle");
     }
   }, [onRefreshStatus]);
+
+  const openAudioShortcutPermissions = useCallback(async () => {
+    setAudioShortcutActionState("opening-permissions");
+    setAudioShortcutError("");
+
+    try {
+      const status = await invoke("open_audio_shortcut_permissions");
+      setAudioShortcutStatus(status || fallbackShortcutStatus());
+    } catch (shortcutError) {
+      setAudioShortcutError(getErrorMessage(shortcutError, "Unable to open macOS shortcut permissions."));
+    } finally {
+      setAudioShortcutActionState("idle");
+    }
+  }, []);
 
   useEffect(() => {
     if (audioModelStatus?.shortcuts) {
@@ -1289,8 +1347,14 @@ export default function AudioWorkspaceView({
               <SettingsLabel>Bindings</SettingsLabel>
               <SettingsHint>Native recorder controls</SettingsHint>
             </div>
-            <AudioStatePill data-installed={!pushToTalkShortcutError && !cancelShortcutError}>
-              {isSavingShortcut ? "Saving" : pushToTalkShortcutError || cancelShortcutError ? "Conflict" : "Ready"}
+            <AudioStatePill data-installed={shortcutReady}>
+              {isSavingShortcut || isOpeningShortcutPermissions
+                ? "Checking"
+                : shortcutPermissionMissing || shortcutQuarantineDetected
+                  ? "Needs access"
+                  : pushToTalkShortcutError || cancelShortcutError
+                    ? "Conflict"
+                    : "Ready"}
             </AudioStatePill>
           </AudioDeviceHeader>
 
@@ -1343,6 +1407,30 @@ export default function AudioWorkspaceView({
               <span>Reset defaults</span>
             </SecondaryButton>
           </AudioRecorderOptionRow>
+
+          {shortcutPermissionMissing && (
+            <>
+              <AudioRuntimeHint>{shortcutPermissions.message || "Enable Accessibility for Diff Forge AI, then restart the app."}</AudioRuntimeHint>
+              <AudioRecorderOptionRow>
+                <SettingsHint>System Settings / Privacy & Security / Accessibility</SettingsHint>
+                <SecondaryButton disabled={isOpeningShortcutPermissions} onClick={openAudioShortcutPermissions} type="button">
+                  <ButtonKeyIcon aria-hidden="true" />
+                  <span>{isOpeningShortcutPermissions ? "Opening..." : "Open Settings"}</span>
+                </SecondaryButton>
+              </AudioRecorderOptionRow>
+            </>
+          )}
+
+          {shortcutQuarantineDetected && (
+            <>
+              <AudioRuntimeHint>
+                {shortcutPermissions.message || "Remove the macOS quarantine attribute, then restart the app."}
+              </AudioRuntimeHint>
+              {shortcutPermissions.quarantineFixCommand && (
+                <AudioShortcutKey>{shortcutPermissions.quarantineFixCommand}</AudioShortcutKey>
+              )}
+            </>
+          )}
 
           {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
         </AudioDevicePanel>
@@ -1880,7 +1968,10 @@ export function AudioWidgetWindow() {
   }, [runWidgetWindowAction, setWidgetFrameMode, widgetTargetMode]);
 
   const dragWidget = useCallback((event) => {
-    event.preventDefault();
+    if (event.button !== 0) {
+      return;
+    }
+
     runWidgetWindowAction((windowHandle) => windowHandle.startDragging());
   }, [runWidgetWindowAction]);
 
@@ -2093,10 +2184,32 @@ export function AudioWidgetWindow() {
   }, [closeWarmBuffer, widgetState]);
 
   useEffect(() => {
+    let disposed = false;
+    let refreshTimer = 0;
+    let unlistenSettingsChanged = () => {};
+
+    const refreshAudioSettings = () => {
+      if (refreshTimer) {
+        window.clearTimeout(refreshTimer);
+      }
+
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = 0;
+
+        if (disposed || isBusyAudioWidgetState(widgetStateRef.current)) {
+          return;
+        }
+
+        refreshStatus();
+        refreshShortcutStatus();
+      }, 0);
+    };
+
     const syncAudioSettings = () => {
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());
+      refreshAudioSettings();
     };
 
     const handleStorage = (event) => {
@@ -2106,11 +2219,26 @@ export function AudioWidgetWindow() {
     };
 
     window.addEventListener("storage", handleStorage);
+    listen(AUDIO_SETTINGS_CHANGED_EVENT, syncAudioSettings)
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenSettingsChanged = nextUnlisten;
+      })
+      .catch(() => {});
 
     return () => {
+      disposed = true;
+      if (refreshTimer) {
+        window.clearTimeout(refreshTimer);
+      }
+      unlistenSettingsChanged();
       window.removeEventListener("storage", handleStorage);
     };
-  }, []);
+  }, [refreshShortcutStatus, refreshStatus]);
 
   useEffect(() => {
     let disposed = false;
@@ -2337,13 +2465,16 @@ export function AudioWidgetWindow() {
       <GlobalStyle />
       <AudioWidgetShell
         aria-label={widgetLabel}
+        data-tauri-drag-region
         data-closing={isClosingFocus ? "true" : undefined}
         data-focus={isFocusedWidget}
         data-state={widgetState}
+        onMouseDown={dragWidget}
       >
         {isFocusedWidget ? (
           <AudioWidgetFocusStage
             aria-label={widgetLabel}
+            data-tauri-drag-region
             data-mode={isClosingFocus ? "closing" : isProcessingFocus ? "processing" : "recording"}
             role="status"
           >
@@ -2370,7 +2501,7 @@ export function AudioWidgetWindow() {
             </AudioWidgetMeter>
           </AudioWidgetFocusStage>
         ) : (
-          <AudioWidgetHeader aria-label={compactLabel} role="status">
+          <AudioWidgetHeader aria-label={compactLabel} data-tauri-drag-region role="status">
             <AudioWidgetLogo aria-hidden="true" data-size="compact" src="/logo.webp" alt="" />
           </AudioWidgetHeader>
         )}
