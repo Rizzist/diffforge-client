@@ -523,7 +523,12 @@ fn encode_linear16_audio(samples: &[f32]) -> Vec<u8> {
 }
 
 fn native_audio_trim(shared: &mut NativeAudioShared) {
-    let max_samples = (shared.sample_rate as f64 * AUDIO_BUFFER_MAX_SECONDS).round() as usize;
+    let max_seconds = if shared.capture_started_at.is_some() {
+        AUDIO_CAPTURE_MAX_SECONDS + (AUDIO_CAPTURE_PREROLL_MS as f64 / 1000.0)
+    } else {
+        AUDIO_BUFFER_MAX_SECONDS
+    };
+    let max_samples = (shared.sample_rate as f64 * max_seconds).round() as usize;
 
     while shared.total_samples > max_samples && shared.chunks.len() > 1 {
         if let Some(removed) = shared.chunks.pop_front() {
@@ -856,7 +861,7 @@ fn finish_native_whisper_audio_capture(
         return Err("No audio captured.".to_string());
     }
 
-    let max_samples = (shared.sample_rate as f64 * 90.0).round() as usize;
+    let max_samples = (shared.sample_rate as f64 * AUDIO_CAPTURE_MAX_SECONDS).round() as usize;
     let bounded_samples = if captured_samples.len() > max_samples {
         captured_samples[captured_samples.len() - max_samples..].to_vec()
     } else {
@@ -921,13 +926,55 @@ fn attach_native_audio_realtime_stream(
 ) -> Result<AudioInputMonitorStatus, String> {
     let active_session = session
         .ok_or_else(|| "Enable an input source before starting cloud transcription.".to_string())?;
-    let mut shared = active_session
-        .shared
-        .lock()
-        .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
-    shared.realtime_audio_tx = Some(audio_tx);
+    let (status, buffered_audio, buffered_chunks, buffered_input_ms) = {
+        let mut shared = active_session
+            .shared
+            .lock()
+            .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+        let mut buffered_audio = Vec::new();
+        let mut buffered_chunks = 0u64;
+        let mut buffered_input_ms = 0.0f64;
 
-    Ok(native_audio_status(active_session))
+        if let Some(capture_started_at) = shared.capture_started_at {
+            for chunk in shared
+                .chunks
+                .iter()
+                .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+            {
+                buffered_chunks += 1;
+                buffered_input_ms += chunk.duration_ms;
+                buffered_audio.push(encode_linear16_audio(&chunk.samples));
+            }
+        }
+
+        shared.realtime_audio_tx = Some(audio_tx.clone());
+
+        (
+            native_audio_status(active_session),
+            buffered_audio,
+            buffered_chunks,
+            buffered_input_ms,
+        )
+    };
+
+    for audio_bytes in buffered_audio {
+        let _ = audio_tx.send(audio_bytes);
+    }
+
+    log_whisper_local_audio_event(
+        "audio.realtime.attach",
+        None,
+        json!({
+            "device_id": &status.device_id,
+            "label": &status.label,
+            "sample_rate": status.sample_rate,
+            "owner_count": status.owner_count,
+            "buffered_chunks": buffered_chunks,
+            "buffered_input_ms": buffered_input_ms,
+        }),
+    );
+
+    Ok(status)
 }
 
 fn detach_native_audio_realtime_stream(session: Option<&NativeAudioSession>) -> Result<(), String> {

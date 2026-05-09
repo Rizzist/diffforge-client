@@ -139,8 +139,9 @@ const MAX_AUDIO_TRANSCRIPT_INSERT_CHARS: usize = 8_000;
 const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-progress";
 const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
 const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
-const AUDIO_BUFFER_MAX_SECONDS: f64 = 12.0;
-const AUDIO_CAPTURE_PREROLL_MS: u64 = 300;
+const AUDIO_BUFFER_MAX_SECONDS: f64 = 3.0;
+const AUDIO_CAPTURE_MAX_SECONDS: f64 = 90.0;
+const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
 const AUDIO_STATS_INTERVAL_MS: u64 = 140;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =

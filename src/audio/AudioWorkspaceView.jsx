@@ -354,6 +354,8 @@ const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
 const AUDIO_RECORDING_MAX_SECONDS = 90;
 const AUDIO_RECORDING_TIMER_MS = 250;
+const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
+const AUDIO_WIDGET_PREROLL_READY_MS = 500;
 const AUDIO_INPUT_METER_BARS = 32;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
@@ -375,6 +377,11 @@ const AUDIO_MODIFIER_CODES = new Set([
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing";
+const isBusyAudioWidgetState = (state) => state === "arming"
+  || state === "recording"
+  || state === "transcribing"
+  || state === "checking"
+  || state === "warming";
 const DEEPGRAM_LANGUAGE_OPTIONS = [
   { value: "en", label: "English" },
   { value: "multi", label: "Multilingual" },
@@ -482,6 +489,12 @@ function buildWidgetMeterBarStyle(index, level, processing) {
     "--scale-high": scaleHigh.toFixed(2),
     "--scale-low": scaleLow.toFixed(2),
   };
+}
+
+function waitForAudioPostBuffer(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function defaultPushToTalkShortcut() {
@@ -1500,6 +1513,9 @@ export function AudioWidgetWindow() {
   const [shortcutStatus, setShortcutStatus] = useState(fallbackShortcutStatus);
   const [realtimeTranscript, setRealtimeTranscript] = useState("");
   const audioBufferRef = useRef(null);
+  const audioBufferGenerationRef = useRef(0);
+  const audioBufferReadyAtRef = useRef(0);
+  const audioBufferStartRef = useRef(null);
   const pushToTalkDownRef = useRef(false);
   const recordingRunRef = useRef(0);
   const stopAfterStartRef = useRef(false);
@@ -1560,21 +1576,65 @@ export function AudioWidgetWindow() {
       return audioBufferRef.current;
     }
 
+    if (audioBufferStartRef.current) {
+      return audioBufferStartRef.current;
+    }
+
     if (!hasAudioInputSetup()) {
       throw new Error("Choose and enable a microphone in the Audio tab before recording.");
     }
 
-    setMessage("Starting input");
-    const audioBuffer = await startLowPowerAudioBuffer({
-      deviceId: readSelectedAudioInputDeviceId(),
-      owner: "audio-widget",
-      onStats: setWidgetAudioStats,
-    });
-    audioBufferRef.current = audioBuffer;
-    setMessage("Input ready");
+    const bufferGeneration = audioBufferGenerationRef.current;
+    setMessage("Buffering input");
+    const startPromise = (async () => {
+      const audioBuffer = await startLowPowerAudioBuffer({
+        deviceId: readSelectedAudioInputDeviceId(),
+        owner: "audio-widget",
+        onStats: setWidgetAudioStats,
+      });
+
+      if (audioBufferGenerationRef.current !== bufferGeneration) {
+        await audioBuffer.close().catch(() => {});
+        throw new Error("Audio input buffering was canceled.");
+      }
+
+      audioBufferRef.current = audioBuffer;
+      audioBufferReadyAtRef.current = Date.now();
+      setMessage("Input buffered");
+
+      return audioBuffer;
+    })();
+
+    audioBufferStartRef.current = startPromise;
+
+    try {
+      return await startPromise;
+    } finally {
+      if (audioBufferStartRef.current === startPromise) {
+        audioBufferStartRef.current = null;
+      }
+    }
+  }, []);
+
+  const closeWarmBuffer = useCallback(async () => {
+    audioBufferGenerationRef.current += 1;
+    audioBufferStartRef.current = null;
+    audioBufferReadyAtRef.current = 0;
+    const audioBuffer = audioBufferRef.current;
+    audioBufferRef.current = null;
+    await audioBuffer?.close?.().catch(() => {});
+  }, []);
+
+  const waitForWarmPrerollBuffer = useCallback(async () => {
+    const audioBuffer = await startWarmBuffer();
+    const bufferedMs = Date.now() - audioBufferReadyAtRef.current;
+
+    if (bufferedMs < AUDIO_WIDGET_PREROLL_READY_MS) {
+      await waitForAudioPostBuffer(AUDIO_WIDGET_PREROLL_READY_MS - bufferedMs);
+    }
 
     return audioBuffer;
-  }, []);
+  }, [startWarmBuffer]);
 
   const startRecording = useCallback(async () => {
     const currentState = widgetStateRef.current;
@@ -1612,8 +1672,30 @@ export function AudioWidgetWindow() {
     widgetStateRef.current = "arming";
     setWidgetState("arming");
 
+    let audioBuffer = null;
+    let captureBegan = false;
+
     try {
-      const audioBuffer = await startWarmBuffer();
+      audioBuffer = await waitForWarmPrerollBuffer();
+      if (recordingRunRef.current !== recordingRunId) {
+        if (audioBufferRef.current === audioBuffer) {
+          await closeWarmBuffer();
+        } else {
+          await audioBuffer.close().catch(() => {});
+        }
+        return;
+      }
+      await audioBuffer.beginCapture();
+      captureBegan = true;
+      if (recordingRunRef.current !== recordingRunId) {
+        await audioBuffer.finishCapture().catch(() => null);
+        if (audioBufferRef.current === audioBuffer) {
+          await closeWarmBuffer();
+        } else {
+          await audioBuffer.close().catch(() => {});
+        }
+        return;
+      }
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         setMessage("Opening Deepgram stream");
         await invoke("start_deepgram_realtime_transcription", {
@@ -1627,21 +1709,12 @@ export function AudioWidgetWindow() {
         if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
           await invoke("stop_deepgram_realtime_transcription").catch(() => {});
         }
+        await audioBuffer.finishCapture().catch(() => null);
         if (audioBufferRef.current === audioBuffer) {
-          audioBufferRef.current = null;
+          await closeWarmBuffer();
+        } else {
+          await audioBuffer.close().catch(() => {});
         }
-        await audioBuffer.close().catch(() => {});
-        return;
-      }
-      await audioBuffer.beginCapture();
-      if (recordingRunRef.current !== recordingRunId) {
-        if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
-          await invoke("stop_deepgram_realtime_transcription").catch(() => {});
-        }
-        if (audioBufferRef.current === audioBuffer) {
-          audioBufferRef.current = null;
-        }
-        await audioBuffer.close().catch(() => {});
         return;
       }
       setRecordingStartedAt(Date.now());
@@ -1658,9 +1731,16 @@ export function AudioWidgetWindow() {
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         await invoke("stop_deepgram_realtime_transcription").catch(() => {});
       }
-      const failedAudioBuffer = audioBufferRef.current;
-      audioBufferRef.current = null;
-      await failedAudioBuffer?.close?.().catch(() => {});
+      const failedAudioBuffer = audioBufferRef.current || audioBuffer;
+      if (captureBegan) {
+        await failedAudioBuffer?.finishCapture?.().catch(() => null);
+      }
+      if (failedAudioBuffer && audioBufferRef.current === failedAudioBuffer) {
+        await closeWarmBuffer();
+      } else {
+        audioBufferRef.current = null;
+        await failedAudioBuffer?.close?.().catch(() => {});
+      }
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
@@ -1668,7 +1748,7 @@ export function AudioWidgetWindow() {
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
     }
-  }, [modelStatus?.installed, startWarmBuffer]);
+  }, [closeWarmBuffer, modelStatus?.installed, waitForWarmPrerollBuffer]);
 
   const refreshStatus = useCallback(async () => {
     const currentProvider = readAudioTranscriptionProvider();
@@ -1817,6 +1897,12 @@ export function AudioWidgetWindow() {
       return;
     }
 
+    if (isBusyAudioWidgetState(widgetStateRef.current)) {
+      pushToTalkDownRef.current = false;
+      stopAfterStartRef.current = false;
+      return;
+    }
+
     pushToTalkDownRef.current = true;
     stopAfterStartRef.current = false;
     startRecording();
@@ -1840,6 +1926,8 @@ export function AudioWidgetWindow() {
       return;
     }
 
+    pushToTalkDownRef.current = false;
+    stopAfterStartRef.current = false;
     widgetStateRef.current = "transcribing";
     setWidgetState("transcribing");
     setMessage("Preparing audio");
@@ -1849,6 +1937,11 @@ export function AudioWidgetWindow() {
       const currentProvider = readAudioTranscriptionProvider();
       const result = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? await (async () => {
+          setMessage("Capturing final audio");
+          await waitForAudioPostBuffer(DEEPGRAM_RELEASE_POST_BUFFER_MS);
+          if (recordingRunRef.current !== recordingRunId) {
+            throw new Error("Deepgram transcription canceled.");
+          }
           setMessage("Closing Deepgram stream");
           const realtimeResult = await invoke("stop_deepgram_realtime_transcription");
           await audioBuffer.finishCapture().catch(() => null);
@@ -1864,10 +1957,6 @@ export function AudioWidgetWindow() {
             },
           });
       })();
-      if (audioBufferRef.current === audioBuffer) {
-        audioBufferRef.current = null;
-      }
-      await audioBuffer.close().catch(() => {});
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
@@ -1921,9 +2010,10 @@ export function AudioWidgetWindow() {
       setWidgetState("ready");
     } catch (recordingError) {
       if (audioBufferRef.current === audioBuffer) {
-        audioBufferRef.current = null;
+        await closeWarmBuffer();
+      } else {
+        await audioBuffer.close().catch(() => {});
       }
-      await audioBuffer.close().catch(() => {});
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
@@ -1934,16 +2024,14 @@ export function AudioWidgetWindow() {
       setWidgetState("error");
       setError(messageText);
     }
-  }, []);
+  }, [closeWarmBuffer]);
 
   const cancelRecording = useCallback(async () => {
     recordingRunRef.current += 1;
     pushToTalkDownRef.current = false;
     stopAfterStartRef.current = false;
 
-    const audioBuffer = audioBufferRef.current;
     const currentProvider = readAudioTranscriptionProvider();
-    audioBufferRef.current = null;
 
     if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
       await invoke("stop_deepgram_realtime_transcription").catch(() => {});
@@ -1951,9 +2039,9 @@ export function AudioWidgetWindow() {
       await invoke("cancel_whisper_transcription").catch(() => {});
     }
 
-    await audioBuffer?.close?.().catch(() => {});
+    await closeWarmBuffer();
     resetWidgetToStartState();
-  }, [resetWidgetToStartState]);
+  }, [closeWarmBuffer, resetWidgetToStartState]);
 
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
@@ -1964,13 +2052,45 @@ export function AudioWidgetWindow() {
     refreshShortcutStatus();
 
     return () => {
-      const audioBuffer = audioBufferRef.current;
-      audioBufferRef.current = null;
-      if (audioBuffer) {
-        audioBuffer.close().catch(() => {});
-      }
+      closeWarmBuffer();
     };
-  }, [refreshShortcutStatus, refreshStatus]);
+  }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
+
+  useEffect(() => {
+    if (widgetState !== "ready" || !hasAudioInputSetup()) {
+      return undefined;
+    }
+
+    const providerReady = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      ? Boolean(deepgramApiKey.trim())
+      : Boolean(modelStatus?.installed);
+
+    if (!providerReady) {
+      return undefined;
+    }
+
+    let disposed = false;
+
+    startWarmBuffer().catch((bufferError) => {
+      if (disposed || widgetStateRef.current !== "ready") {
+        return;
+      }
+
+      widgetStateRef.current = "error";
+      setWidgetState("error");
+      setError(getAudioInputErrorMessage(bufferError, "Unable to keep microphone input ready."));
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [deepgramApiKey, modelStatus?.installed, startWarmBuffer, transcriptionProvider, widgetState]);
+
+  useEffect(() => {
+    if (widgetState === "setup" || widgetState === "missing" || widgetState === "error") {
+      closeWarmBuffer();
+    }
+  }, [closeWarmBuffer, widgetState]);
 
   useEffect(() => {
     const syncAudioSettings = () => {
