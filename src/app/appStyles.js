@@ -8,6 +8,7 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudDone } from "@styled-icons/material-rounded/CloudDone";
 import { Code } from "@styled-icons/material-rounded/Code";
 import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
+import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
@@ -119,6 +120,22 @@ export const GlobalStyle = createGlobalStyle`
     background:
       linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(7, 9, 13, 0) 36rem),
       var(--forge-bg);
+  }
+
+  html[data-audio-widget="true"],
+  html[data-audio-widget="true"] body,
+  html[data-audio-widget="true"] #app,
+  body[data-audio-widget="true"],
+  body[data-audio-widget="true"] #app {
+    background: transparent !important;
+  }
+
+  html[data-audio-widget="true"],
+  html[data-audio-widget="true"] body,
+  html[data-audio-widget="true"] #app,
+  body[data-audio-widget="true"] #app {
+    min-width: 0;
+    min-height: 0;
   }
 
   button {
@@ -279,7 +296,7 @@ export const WindowTitle = styled.div`
 export const WindowControls = styled.div`
   display: inline-flex;
   height: 100%;
-  align-items: stretch;
+  align-items: center;
 `;
 
 export const WindowControlButton = styled.button`
@@ -1368,11 +1385,12 @@ export const WorkspaceRail = styled.aside`
   display: grid;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
-  gap: 12px;
-  padding: 12px;
-  border-right: 1px solid var(--forge-border);
-  background: rgba(7, 9, 13, 0.9);
-  backdrop-filter: blur(18px);
+  gap: 10px;
+  padding: 10px;
+  border-right: 1px solid rgba(230, 236, 245, 0.09);
+  background:
+    linear-gradient(180deg, rgba(47, 128, 255, 0.035), rgba(255, 122, 24, 0.018)),
+    rgba(6, 9, 16, 0.94);
   animation: ${railReveal} 300ms cubic-bezier(0.2, 0.8, 0.2, 1) 40ms both;
 
   @media (max-width: 760px) {
@@ -1407,8 +1425,10 @@ export const WorkspaceList = styled.div`
   display: grid;
   min-width: 0;
   max-width: 100%;
-  gap: 5px;
-  overflow: hidden;
+  gap: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
 `;
 
 export const WorkspaceRow = styled.div`
@@ -1439,16 +1459,16 @@ export const WorkspaceButton = styled.button`
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 32px;
+  min-height: 54px;
   grid-template-columns: 4px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  padding: 0 38px 0 9px;
-  border: 1px solid transparent;
+  align-items: stretch;
+  gap: 9px;
+  padding: 8px 40px 8px 9px;
+  border: 1px solid rgba(230, 236, 245, 0.06);
   border-radius: 8px;
   box-sizing: border-box;
   color: var(--forge-text-soft);
-  background: transparent;
+  background: rgba(13, 17, 23, 0.48);
   overflow: hidden;
   text-align: left;
   transition:
@@ -1470,21 +1490,25 @@ export const WorkspaceButton = styled.button`
   &:hover,
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
-    border-color: rgba(125, 160, 205, 0.28);
-    background: var(--forge-surface-selected);
+    border-color: rgba(98, 160, 255, 0.26);
+    background:
+      linear-gradient(90deg, rgba(47, 128, 255, 0.12), rgba(255, 122, 24, 0.035)),
+      rgba(13, 17, 23, 0.72);
   }
 
   &[data-runtime="activated"] {
     color: var(--forge-text);
+    border-color: rgba(60, 203, 127, 0.22);
   }
 `;
 
-export const WorkspaceLabel = styled.span`
+export const WorkspaceLabel = styled.div`
   display: grid;
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  gap: 2px;
+  align-content: center;
+  gap: 4px;
 
   > span {
     display: block;
@@ -1493,6 +1517,31 @@ export const WorkspaceLabel = styled.span`
     color: var(--forge-text-muted);
     font-size: 10px;
     font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const WorkspaceRailMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  gap: 5px;
+  overflow: hidden;
+
+  span {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 74px;
+    align-items: center;
+    overflow: hidden;
+    padding: 2px 6px;
+    border: 1px solid rgba(230, 236, 245, 0.08);
+    border-radius: 6px;
+    color: var(--forge-text-muted);
+    background: rgba(230, 236, 245, 0.035);
+    font-size: 10px;
+    font-weight: 760;
+    line-height: 1;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1509,10 +1558,10 @@ export const WorkspaceSettingsButton = styled.button`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(21, 27, 35, 0.72);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-50%) translateX(3px);
+  background: rgba(7, 9, 13, 0.74);
+  opacity: 0.72;
+  pointer-events: auto;
+  transform: translateY(-50%);
   transition:
     opacity 160ms ease,
     color 160ms ease,
@@ -1534,8 +1583,7 @@ export const WorkspaceSettingsButton = styled.button`
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
     opacity: 1;
-    pointer-events: auto;
-    transform: translateY(-50%) translateX(0);
+    transform: translateY(-50%);
   }
 `;
 
@@ -3884,6 +3932,271 @@ export const AudioStatusGrid = styled(VaultStatusGrid)`
   }
 `;
 
+export const AudioModeGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioModeButton = styled.button`
+  display: grid;
+  min-width: 0;
+  min-height: 54px;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.58);
+  text-align: left;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+
+  > svg {
+    width: 18px;
+    height: 18px;
+    justify-self: center;
+    color: var(--forge-text-muted);
+  }
+
+  strong,
+  span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 780;
+  }
+
+  span {
+    margin-top: 2px;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 650;
+  }
+
+  &[aria-pressed="true"] {
+    border-color: rgba(59, 130, 246, 0.42);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  &[aria-pressed="true"] > svg {
+    color: var(--forge-blue-soft);
+  }
+`;
+
+export const AudioCloudGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) minmax(150px, 0.55fr);
+  gap: 10px;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioCloudField = styled.label`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+`;
+
+export const AudioCloudInput = styled.input`
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.78);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.44);
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+`;
+
+export const AudioDevicePanel = styled.section`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(125, 160, 205, 0.2);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
+    rgba(13, 17, 23, 0.58);
+`;
+
+export const AudioDeviceHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+`;
+
+export const AudioDeviceControls = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 8px;
+
+  button {
+    min-height: 36px;
+  }
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioDeviceSelect = styled.select`
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.78);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: none;
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.44);
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+`;
+
+export const AudioInputMeter = styled.div`
+  display: grid;
+  height: 54px;
+  grid-template-columns: repeat(24, minmax(3px, 1fr));
+  align-items: center;
+  gap: 4px;
+  padding: 9px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.5);
+
+  span {
+    display: block;
+    height: var(--height);
+    min-height: 6px;
+    border-radius: 999px;
+    background: rgba(122, 132, 147, 0.42);
+    transition:
+      background 160ms ease,
+      height 120ms ease,
+      transform 160ms ease;
+  }
+
+  &[data-active="true"] span {
+    background: var(--forge-green);
+  }
+`;
+
+export const AudioInputMeta = styled.p`
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const AudioRecorderOptionRow = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+
+  button {
+    min-height: 34px;
+  }
+`;
+
+export const AudioResultsPanel = styled.section`
+  display: grid;
+  width: min(920px, 100%);
+  justify-self: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(125, 160, 205, 0.2);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
+    rgba(13, 17, 23, 0.58);
+`;
+
+export const AudioResultLine = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.5);
+
+  span {
+    color: var(--forge-text-muted);
+    font-family:
+      "Cascadia Mono",
+      "SFMono-Regular",
+      Consolas,
+      monospace;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 13px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
 export const AudioPathBlock = styled.div`
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -4007,50 +4320,86 @@ export const AudioActionRow = styled.div`
   }
 `;
 
+const audioWidgetSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
+const audioWidgetBarPulse = keyframes`
+  from {
+    opacity: 0.62;
+  }
+
+  to {
+    opacity: 1;
+  }
+`;
+
 export const AudioWidgetShell = styled.main`
   display: grid;
-  min-width: 320px;
-  min-height: 100vh;
-  align-content: start;
-  gap: 14px;
-  padding: 14px;
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  place-items: center;
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
   color: var(--forge-text);
-  background:
-    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
-    var(--forge-bg);
-  background-size: 64px 64px, 64px 64px, auto;
+  box-shadow: none;
+  background: transparent;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+  -webkit-app-region: drag;
+
+  &[data-focus="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    place-items: center;
+    gap: 0;
+    padding: 8px 10px;
+    border: 1px solid rgba(125, 160, 205, 0.24);
+    border-color: rgba(125, 176, 255, 0.36);
+    box-shadow:
+      0 20px 46px rgba(0, 0, 0, 0.36),
+      0 0 0 1px rgba(255, 255, 255, 0.035) inset;
+    background:
+      linear-gradient(180deg, rgba(244, 247, 250, 0.08), rgba(244, 247, 250, 0.018)),
+      rgba(5, 7, 11, 0.97);
+  }
+`;
+
+export const AudioWidgetFocusStage = styled.div`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: stretch;
+  gap: 10px;
+  -webkit-app-region: drag;
 `;
 
 export const AudioWidgetHeader = styled.header`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  -webkit-app-region: drag;
-
-  button {
-    -webkit-app-region: no-drag;
-  }
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  place-items: center;
 `;
 
 export const AudioWidgetTitle = styled.div`
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   color: var(--forge-text);
-
-  > span {
-    display: grid;
-    width: 32px;
-    height: 32px;
-    place-items: center;
-    border: 1px solid rgba(125, 160, 205, 0.28);
-    border-radius: 8px;
-    color: var(--forge-blue-soft);
-    background: rgba(125, 160, 205, 0.09);
-  }
 
   svg {
     width: 17px;
@@ -4059,63 +4408,167 @@ export const AudioWidgetTitle = styled.div`
 
   strong {
     overflow: hidden;
-    font-size: 14px;
+    font-size: 12px;
     font-weight: 760;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 `;
 
+export const AudioWidgetLogo = styled.img`
+  display: block;
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(125, 160, 205, 0.3);
+  border-radius: 999px;
+  object-fit: cover;
+  background: rgba(5, 7, 11, 0.92);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.035) inset,
+    0 0 18px rgba(59, 130, 246, 0.2);
+
+  &[data-size="focus"] {
+    width: 44px;
+    height: 44px;
+  }
+`;
+
 export const AudioWidgetMeter = styled.div`
   display: grid;
-  height: 104px;
-  grid-template-columns: repeat(18, minmax(4px, 1fr));
+  height: 36px;
+  min-width: 0;
+  grid-template-columns: repeat(18, minmax(3px, 1fr));
   align-items: center;
-  gap: 5px;
-  padding: 14px;
+  gap: 3px;
+  padding: 6px 9px;
   border: 1px solid var(--forge-border);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.035), rgba(244, 247, 250, 0.012)),
-    rgba(17, 22, 29, 0.9);
+  border-radius: 999px;
+  background: rgba(17, 22, 29, 0.76);
 
   span {
     display: block;
-    height: var(--height);
-    min-height: 10px;
+    height: 100%;
+    min-height: 0;
     border-radius: 999px;
     background: rgba(122, 132, 147, 0.46);
+    transform: scaleY(var(--scale, 0.2));
     transform-origin: center;
     transition:
       background 160ms ease,
       transform 160ms ease;
+    will-change: transform;
   }
 
   &[data-active="true"] span {
     background: var(--forge-green);
-    animation: ${quietSweep} 900ms ease-in-out infinite alternate;
+    animation: ${audioWidgetBarPulse} 900ms ease-in-out infinite alternate;
   }
+
+  &[data-prominent="true"] {
+    width: 100%;
+    height: 40px;
+    min-width: 0;
+    grid-template-columns: repeat(18, minmax(3px, 1fr));
+    gap: 3px;
+    padding: 7px 10px;
+    border-color: rgba(60, 203, 127, 0.3);
+    background:
+      linear-gradient(180deg, rgba(60, 203, 127, 0.08), rgba(60, 203, 127, 0.018)),
+      rgba(9, 13, 18, 0.78);
+    opacity: 0;
+    transform: translateX(-10px) scaleX(0.82);
+    transform-origin: left center;
+    transition:
+      opacity 120ms ease,
+      transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      border-color 160ms ease,
+      background 160ms ease;
+  }
+
+  &[data-prominent="true"] span {
+    min-height: 7px;
+    box-shadow: 0 0 12px rgba(60, 203, 127, 0.22);
+  }
+
+  &[data-prominent="true"][data-ready="true"] {
+    opacity: 1;
+    transform: translateX(0) scaleX(1);
+  }
+
+  &[data-processing="true"] {
+    border-color: rgba(125, 176, 255, 0.32);
+    background:
+      linear-gradient(180deg, rgba(125, 176, 255, 0.08), rgba(125, 176, 255, 0.018)),
+      rgba(9, 13, 18, 0.78);
+  }
+`;
+
+export const AudioWidgetLoader = styled.div`
+  position: relative;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(125, 160, 205, 0.22);
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.06), rgba(244, 247, 250, 0.016)),
+    rgba(12, 17, 24, 0.86);
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 6px;
+    border: 2px solid rgba(125, 160, 205, 0.16);
+    border-top-color: var(--forge-blue-soft);
+    border-right-color: var(--forge-ember);
+    border-radius: inherit;
+    animation: ${audioWidgetSpin} 820ms linear infinite;
+  }
+
+  &::after {
+    content: "";
+    width: 9px;
+    height: 9px;
+    border-radius: inherit;
+    background: var(--forge-text);
+    box-shadow:
+      0 0 18px rgba(125, 176, 255, 0.34),
+      0 0 20px rgba(217, 121, 53, 0.18);
+  }
+`;
+
+export const AudioWidgetProcessingText = styled.p`
+  margin: 0;
+  max-width: min(320px, 100%);
+  overflow: hidden;
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 export const AudioWidgetStatus = styled.div`
   display: grid;
-  gap: 4px;
+  gap: 2px;
   min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--forge-border);
-  border-radius: 8px;
-  background: rgba(13, 17, 23, 0.62);
 
   strong {
     color: var(--forge-text);
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 760;
+    line-height: 1.15;
   }
 
   span {
     overflow: hidden;
     color: var(--forge-text-muted);
-    font-size: 12px;
+    font-size: 11px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -4129,38 +4582,62 @@ export const AudioRecordingTimer = styled.p`
     "SFMono-Regular",
     Consolas,
     monospace;
-  font-size: 28px;
+  font-size: 13px;
   font-weight: 760;
   text-align: center;
 `;
 
 export const AudioWidgetTranscript = styled.p`
-  max-height: 88px;
+  grid-column: 1 / -1;
   margin: 0;
-  overflow: auto;
-  padding: 10px 12px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
-  border-radius: 8px;
+  overflow: hidden;
   color: var(--forge-text-soft);
-  background: rgba(125, 160, 205, 0.07);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 11px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 export const AudioWidgetActions = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(96px, auto);
-  gap: 8px;
+  display: inline-flex;
+  max-width: 0;
+  align-items: center;
+  gap: 5px;
+  opacity: 0;
+  overflow: hidden;
+  transform: translateX(8px);
+  transition:
+    max-width 160ms ease,
+    opacity 150ms ease,
+    transform 150ms ease;
+  -webkit-app-region: no-drag;
 
   button {
-    min-height: 42px;
-  }
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border: 1px solid var(--forge-border);
+    border-radius: 999px;
+    color: var(--forge-text-soft);
+    background: rgba(21, 27, 35, 0.82);
+    -webkit-app-region: no-drag;
 
-  @media (max-width: 460px) {
-    grid-template-columns: 1fr;
+    &:hover {
+      color: var(--forge-text);
+      border-color: rgba(125, 160, 205, 0.34);
+      background: rgba(125, 160, 205, 0.12);
+    }
 
-    button {
-      width: 100%;
+    &[data-variant="close"]:hover {
+      color: #ffd7d7;
+      border-color: rgba(239, 107, 107, 0.42);
+      background: rgba(239, 107, 107, 0.14);
+    }
+
+    svg {
+      width: 15px;
+      height: 15px;
     }
   }
 `;
@@ -4821,26 +5298,31 @@ export const WorkspaceSettingsOverlay = styled.div`
   justify-content: center;
   min-width: 0;
   min-height: 0;
-  padding: 18px;
-  background: rgba(7, 9, 13, 0.68);
+  padding: 16px;
+  background:
+    linear-gradient(90deg, rgba(3, 5, 8, 0.72), rgba(3, 5, 8, 0.42)),
+    rgba(7, 9, 13, 0.72);
+  backdrop-filter: blur(14px);
   animation: ${panelEnter} 160ms ease both;
 `;
 
 export const WorkspaceSettingsDialog = styled.aside`
   display: grid;
   align-content: start;
-  gap: 16px;
-  width: min(560px, 100%);
-  max-height: min(620px, 100%);
+  gap: 12px;
+  width: min(760px, 100%);
+  max-height: min(720px, 100%);
   min-width: 0;
   overflow: auto;
-  padding: 20px;
+  padding: 14px;
   border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.045), rgba(244, 247, 250, 0.014)),
-    rgba(17, 22, 29, 0.98);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+    linear-gradient(180deg, rgba(98, 160, 255, 0.045), rgba(255, 122, 24, 0.018)),
+    rgba(8, 13, 20, 0.98);
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
   animation: ${panelEnter} 190ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
   @media (max-width: 620px) {
@@ -4855,6 +5337,8 @@ export const WorkspaceSettingsDialogHeader = styled.header`
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding: 2px 2px 10px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
 `;
 
 export const WorkspaceModalCloseButton = styled.button`
@@ -4886,12 +5370,13 @@ export const WorkspaceModalCloseButton = styled.button`
 
 export const WorkspaceSettingsForm = styled.form`
   display: grid;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
 `;
 
 export const WorkspaceSettingsInput = styled(SetupInput)`
-  min-height: 42px;
+  min-height: 36px;
+  font-size: 13px;
 `;
 
 export const WorkspaceNumberInput = styled(WorkspaceSettingsInput)`
@@ -4905,6 +5390,209 @@ export const RootDirectoryInput = styled(WorkspaceSettingsInput)`
     Consolas,
     monospace;
   font-size: 12px;
+`;
+
+export const WorkspaceSettingsSection = styled.section`
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(230, 236, 245, 0.09);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.008)),
+    rgba(13, 17, 23, 0.62);
+`;
+
+export const WorkspaceSettingsSummary = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const WorkspaceSettingsSummaryItem = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.56);
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 760;
+    letter-spacing: 0.06em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 13px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const WorkspacePathSummary = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  padding: 7px 9px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  color: var(--forge-text-muted);
+  background: rgba(7, 9, 13, 0.48);
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  font-size: 11px;
+
+  svg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+    color: var(--forge-blue-soft);
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const TerminalCountGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 720px) {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  @media (max-width: 480px) {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+`;
+
+export const TerminalCountButton = styled.button`
+  display: grid;
+  min-width: 0;
+  min-height: 82px;
+  align-content: start;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.09);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: rgba(7, 9, 13, 0.48);
+  text-align: left;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+
+  &:hover {
+    border-color: rgba(98, 160, 255, 0.28);
+    color: var(--forge-text);
+    background: rgba(21, 27, 35, 0.78);
+    transform: translateY(-1px);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(98, 160, 255, 0.55);
+    color: #ffffff;
+    background:
+      linear-gradient(180deg, rgba(47, 128, 255, 0.18), rgba(255, 122, 24, 0.055)),
+      rgba(13, 17, 23, 0.92);
+    box-shadow: inset 0 0 0 1px rgba(98, 160, 255, 0.12);
+  }
+`;
+
+export const TerminalCountMeta = styled.span`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+
+  strong {
+    color: inherit;
+    font-size: 16px;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 760;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const TerminalLayoutPreview = styled.div`
+  display: grid;
+  min-width: 0;
+  height: 32px;
+  gap: 2px;
+  overflow: hidden;
+  padding: 3px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 6px;
+  background:
+    linear-gradient(90deg, rgba(230, 236, 245, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.028) 1px, transparent 1px),
+    #020304;
+  background-size: 14px 14px, 14px 14px, auto;
+`;
+
+export const TerminalLayoutPreviewRow = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: repeat(var(--preview-columns), minmax(0, 1fr));
+  gap: 2px;
+`;
+
+export const TerminalLayoutPreviewCell = styled.span`
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid rgba(98, 160, 255, 0.18);
+  border-radius: 3px;
+  background: rgba(98, 160, 255, 0.14);
+
+  &[data-slot="primary"] {
+    border-color: rgba(98, 160, 255, 0.42);
+    background: rgba(98, 160, 255, 0.28);
+  }
+
+  &[data-slot="orange"] {
+    border-color: rgba(255, 154, 61, 0.32);
+    background: rgba(255, 122, 24, 0.16);
+  }
 `;
 
 export const WorkspaceSettingsFieldGrid = styled.div`
@@ -5799,6 +6487,10 @@ export const ButtonBrowserIcon = styled(OpenInBrowser)`
 `;
 
 export const ButtonCloseIcon = styled(Close)`
+  ${buttonIconSize}
+`;
+
+export const ButtonDeleteIcon = styled(DeleteOutline)`
   ${buttonIconSize}
 `;
 

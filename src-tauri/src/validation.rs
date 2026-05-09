@@ -38,7 +38,6 @@ unsafe extern "system" {
         load_flags: u32,
     ) -> WindowsHandle;
     fn SendMessageW(hwnd: WindowsHandle, message: u32, wparam: usize, lparam: isize) -> isize;
-    fn SendInput(input_count: u32, inputs: *mut WindowsInput, size: i32) -> u32;
     fn SetClassLongPtrW(hwnd: WindowsHandle, index: i32, value: isize) -> isize;
 }
 
@@ -86,4 +85,3 @@ fn validate_terminal_pane_id(value: &str) -> Result<(), String> {
 
     Err("Terminal pane id is invalid.".to_string())
 }
-

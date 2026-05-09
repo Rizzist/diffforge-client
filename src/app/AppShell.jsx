@@ -16,6 +16,12 @@ import { TerminalDevMetrics, addTerminalMetrics, getWorkspaceOpenTelemetryFields
 import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
+  AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
+  readAudioTranscriptionProvider,
+  readAutoOpenAudioRecorder,
+  readDeepgramApiKey,
+} from "../audio/audioCapture";
+import {
   AUTH_TILE_SIZE,
   GlobalStyle,
   AppFrame,
@@ -236,12 +242,21 @@ import {
   WorkspaceModalCloseButton,
   WorkspaceSettingsForm,
   WorkspaceSettingsInput,
-  WorkspaceNumberInput,
   RootDirectoryInput,
-  WorkspaceSettingsFieldGrid,
   WorkspaceRuntimePanel,
   WorkspaceRuntimeActions,
   WorkspaceSettingsActions,
+  WorkspaceSettingsSection,
+  WorkspaceSettingsSummary,
+  WorkspaceSettingsSummaryItem,
+  WorkspacePathSummary,
+  WorkspaceRailMeta,
+  TerminalCountGrid,
+  TerminalCountButton,
+  TerminalCountMeta,
+  TerminalLayoutPreview,
+  TerminalLayoutPreviewRow,
+  TerminalLayoutPreviewCell,
   AgentSettingsPanel,
   AgentPanelActions,
   AgentReadyPill,
@@ -373,7 +388,7 @@ const MCP_REGISTRY_STORAGE_KEY = "diffforge.mcpRegistry.v1";
 const MCP_TEXT_LIMIT = 12000;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH = 2048;
 const MIN_WORKSPACE_TERMINAL_COUNT = 1;
-const MAX_WORKSPACE_TERMINAL_COUNT = 16;
+const MAX_WORKSPACE_TERMINAL_COUNT = 12;
 const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -412,6 +427,10 @@ const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
 ];
+const WORKSPACE_TERMINAL_COUNT_OPTIONS = Array.from(
+  { length: MAX_WORKSPACE_TERMINAL_COUNT },
+  (_, index) => index + MIN_WORKSPACE_TERMINAL_COUNT,
+);
 const AGENT_INSTALL_GUIDES = {
   codex: {
     nativeInstallUrl: "https://github.com/openai/codex/releases/latest",
@@ -1085,6 +1104,53 @@ function normalizeWorkspaceTerminalCount(value) {
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
 }
 
+function TerminalLayoutMiniature({ count }) {
+  const rows = getTerminalPanelRows(getDefaultTerminalIndexes(count));
+
+  return (
+    <TerminalLayoutPreview aria-hidden="true">
+      {rows.map((row) => (
+        <TerminalLayoutPreviewRow
+          key={`preview-row-${count}-${row.rowIndex}`}
+          style={{ "--preview-columns": row.terminalIndexes.length }}
+        >
+          {row.terminalIndexes.map((terminalIndex) => (
+            <TerminalLayoutPreviewCell
+              data-slot={terminalIndex === 0 ? "primary" : terminalIndex % 2 === 0 ? "blue" : "orange"}
+              key={`preview-cell-${count}-${terminalIndex}`}
+            />
+          ))}
+        </TerminalLayoutPreviewRow>
+      ))}
+    </TerminalLayoutPreview>
+  );
+}
+
+function WorkspaceTerminalCountPicker({ onChange, value }) {
+  const selectedCount = normalizeWorkspaceTerminalCount(value);
+
+  return (
+    <TerminalCountGrid aria-label="Terminal count">
+      {WORKSPACE_TERMINAL_COUNT_OPTIONS.map((count) => (
+        <TerminalCountButton
+          aria-pressed={count === selectedCount}
+          data-selected={count === selectedCount}
+          key={count}
+          onClick={() => onChange(String(count))}
+          title={`${count} ${count === 1 ? "terminal" : "terminals"}`}
+          type="button"
+        >
+          <TerminalCountMeta>
+            <strong>{count}</strong>
+            <span>{count === 1 ? "terminal" : "terminals"}</span>
+          </TerminalCountMeta>
+          <TerminalLayoutMiniature count={count} />
+        </TerminalCountButton>
+      ))}
+    </TerminalCountGrid>
+  );
+}
+
 function normalizeWorkspaceSettings(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -1275,6 +1341,7 @@ export default function App() {
   const agentInitialStatusUserRef = useRef("");
   const startupAgentFlowIdRef = useRef(0);
   const startupAgentSettingsPendingRef = useRef(false);
+  const audioAutoOpenStartupKeyRef = useRef("");
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
@@ -1859,6 +1926,23 @@ export default function App() {
       setAudioError(getErrorMessage(error, "Unable to install Whisper."));
     }
   }, []);
+
+  const uninstallAudioModel = useCallback(async () => {
+    setAudioActionState("uninstalling");
+    setAudioError("");
+    setAudioDownloadProgress(null);
+
+    try {
+      const status = await invoke("uninstall_whisper_model");
+      setAudioModelStatus(status);
+      setAudioActionState("idle");
+      setAudioDownloadProgress(null);
+    } catch (error) {
+      setAudioActionState("error");
+      setAudioError(getErrorMessage(error, "Unable to uninstall Whisper."));
+      refreshAudioModelStatus();
+    }
+  }, [refreshAudioModelStatus]);
 
   const openAudioWidget = useCallback(async () => {
     setAudioActionState("opening");
@@ -3065,6 +3149,48 @@ export default function App() {
   }, [authState, showView, workspaceState]);
 
   useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || workspaceState !== "ready"
+      || !readAutoOpenAudioRecorder()
+    ) {
+      return;
+    }
+
+    const canUseCloudRecorder = readAudioTranscriptionProvider() === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      && Boolean(readDeepgramApiKey().trim());
+
+    if (!canUseCloudRecorder) {
+      if (!audioModelStatus && audioStatusState === "idle") {
+        refreshAudioModelStatus();
+        return;
+      }
+
+      if (!audioModelStatus?.installed) {
+        return;
+      }
+    }
+
+    const startupKey = `${user?.id || user?.email || "user"}:${selectedWorkspaceId || "workspace"}`;
+
+    if (audioAutoOpenStartupKeyRef.current === startupKey) {
+      return;
+    }
+
+    audioAutoOpenStartupKeyRef.current = startupKey;
+    openAudioWidget();
+  }, [
+    audioModelStatus,
+    audioStatusState,
+    authState,
+    openAudioWidget,
+    refreshAudioModelStatus,
+    selectedWorkspaceId,
+    user,
+    workspaceState,
+  ]);
+
+  useEffect(() => {
     if (authState === "authenticated" && activeView === "audio") {
       refreshAudioModelStatus();
     }
@@ -3596,11 +3722,17 @@ export default function App() {
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
+                      const workspaceTerminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
                       const workspaceRuntimeState = workspace.id === activatedWorkspaceId
                         ? workspaceState === "ready"
                           ? "activated"
                           : "activating"
                         : "closed";
+                      const workspaceRuntimeLabel = workspaceRuntimeState === "activated"
+                        ? "Active"
+                        : workspaceRuntimeState === "activating"
+                          ? "Opening"
+                          : "Idle";
 
                       return (
                         <WorkspaceRow
@@ -3620,6 +3752,10 @@ export default function App() {
                             <WorkspaceAccent aria-hidden="true" />
                             <WorkspaceLabel>
                               <strong>{workspace.name}</strong>
+                              <WorkspaceRailMeta>
+                                <span>{workspaceRuntimeLabel}</span>
+                                <span>{workspaceTerminalCount} {workspaceTerminalCount === 1 ? "term" : "terms"}</span>
+                              </WorkspaceRailMeta>
                               <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
                             </WorkspaceLabel>
                           </WorkspaceButton>
@@ -4141,6 +4277,7 @@ export default function App() {
                     onDownloadModel={downloadAudioModel}
                     onOpenWidget={openAudioWidget}
                     onRefreshStatus={refreshAudioModelStatus}
+                    onUninstallModel={uninstallAudioModel}
                     workspace={selectedWorkspace}
                   />
                 </ForgeWorkspace>
@@ -4195,39 +4332,63 @@ export default function App() {
                       </WorkspaceModalCloseButton>
                     </WorkspaceSettingsDialogHeader>
 
-                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
-                      <SetupField>
-                        <SettingsLabel>Name</SettingsLabel>
-                        <WorkspaceSettingsInput
-                          maxLength={80}
-                          onChange={(event) => {
-                            setWorkspaceNameDraft(event.target.value);
-                            setWorkspaceSettingsError("");
-                            setWorkspaceSettingsMessage("");
-                          }}
-                          value={workspaceNameDraft}
-                        />
-                      </SetupField>
+                    <WorkspaceSettingsSummary aria-label="Workspace summary">
+                      <WorkspaceSettingsSummaryItem>
+                        <span>Runtime</span>
+                        <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
+                      </WorkspaceSettingsSummaryItem>
+                      <WorkspaceSettingsSummaryItem>
+                        <span>Terminals</span>
+                        <strong>{normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}</strong>
+                      </WorkspaceSettingsSummaryItem>
+                      <WorkspaceSettingsSummaryItem>
+                        <span>Default</span>
+                        <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
+                      </WorkspaceSettingsSummaryItem>
+                    </WorkspaceSettingsSummary>
 
-                      <WorkspaceSettingsFieldGrid>
+                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Workspace</PanelKicker>
+                          <SettingsHint>Name and local project root for this desktop app.</SettingsHint>
+                        </div>
                         <SetupField>
-                          <SettingsLabel>Terminals</SettingsLabel>
-                          <WorkspaceNumberInput
-                            max={MAX_WORKSPACE_TERMINAL_COUNT}
-                            min={MIN_WORKSPACE_TERMINAL_COUNT}
+                          <SettingsLabel>Name</SettingsLabel>
+                          <WorkspaceSettingsInput
+                            maxLength={80}
                             onChange={(event) => {
-                              setWorkspaceTerminalCountDraft(event.target.value);
+                              setWorkspaceNameDraft(event.target.value);
                               setWorkspaceSettingsError("");
                               setWorkspaceSettingsMessage("");
                             }}
-                            step="1"
-                            type="number"
-                            value={workspaceTerminalCountDraft}
+                            value={workspaceNameDraft}
                           />
                         </SetupField>
+                      </WorkspaceSettingsSection>
 
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Terminal layout</PanelKicker>
+                          <SettingsHint>Select a bounded local layout. The preview matches the resizable terminal panel rows.</SettingsHint>
+                        </div>
+                        <WorkspaceTerminalCountPicker
+                          onChange={(count) => {
+                            setWorkspaceTerminalCountDraft(count);
+                            setWorkspaceSettingsError("");
+                            setWorkspaceSettingsMessage("");
+                          }}
+                          value={workspaceTerminalCountDraft}
+                        />
+                      </WorkspaceSettingsSection>
+
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Root directory</PanelKicker>
+                          <SettingsHint>Saved locally and validated by the Tauri host before terminals start.</SettingsHint>
+                        </div>
                         <SetupField>
-                          <SettingsLabel>Root directory</SettingsLabel>
+                          <SettingsLabel>Path</SettingsLabel>
                           <RootDirectoryInput
                             maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
                             onChange={(event) => {
@@ -4239,9 +4400,11 @@ export default function App() {
                             value={workspaceRootDraft}
                           />
                         </SetupField>
-                      </WorkspaceSettingsFieldGrid>
-
-                      <SettingsHint>{selectedWorkspaceRootDisplay}</SettingsHint>
+                        <WorkspacePathSummary title={selectedWorkspaceRootDisplay}>
+                          <ButtonFolderIcon aria-hidden="true" />
+                          <span>{selectedWorkspaceRootDisplay}</span>
+                        </WorkspacePathSummary>
+                      </WorkspaceSettingsSection>
 
                       <WorkspaceRuntimePanel data-state={isSelectedWorkspaceActivated ? "activated" : "idle"}>
                         <div>

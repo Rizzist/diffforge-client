@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
+use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,10 +24,14 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::{
-    sync::{mpsc, Mutex, RwLock},
-    time::{interval, MissedTickBehavior},
+    sync::{mpsc, oneshot, Mutex, RwLock},
+    time::{interval, timeout, MissedTickBehavior},
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
 };
 
 pub mod coordination;
@@ -76,9 +81,11 @@ const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = false;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
+const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = true;
+const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
+const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
-const AUDIO_WIDGET_ARM_EVENT: &str = "forge-audio-widget-arm";
 const AUDIO_SHORTCUT: &str = "CommandOrControl+Shift+Space";
 const WHISPER_MODEL_ID: &str = "base.en";
 const WHISPER_MODEL_NAME: &str = "Whisper base.en";
@@ -119,13 +126,27 @@ const WHISPER_MODEL_MEMORY_MB: u64 = 500;
 const WHISPER_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
 const WHISPER_MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 const WHISPER_TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
+const DEEPGRAM_LISTEN_WS_URL: &str = "wss://api.deepgram.com/v1/listen";
+const DEEPGRAM_MODEL: &str = "nova-3";
+const DEEPGRAM_DEFAULT_LANGUAGE: &str = "en";
+const DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS: u64 = 90;
+const DEEPGRAM_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
+const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
+const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
+const AUDIO_REALTIME_TRANSCRIPT_EVENT: &str = "forge-audio-realtime-transcript";
 const MAX_AUDIO_TRANSCRIPT_INSERT_CHARS: usize = 8_000;
 const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-progress";
+const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
+const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
+const AUDIO_BUFFER_MAX_SECONDS: f64 = 12.0;
+const AUDIO_STATS_INTERVAL_MS: u64 = 140;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
     OnceLock::new();
 static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
 static TERMINAL_TELEMETRY_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 #[cfg(windows)]
 const WINDOWS_APP_ICON_RESOURCE_ID: u16 = 32512;
@@ -151,61 +172,6 @@ const SM_CXSMICON: i32 = 49;
 const SM_CYSMICON: i32 = 50;
 #[cfg(windows)]
 const WM_SETICON: u32 = 0x0080;
-#[cfg(windows)]
-const INPUT_KEYBOARD: u32 = 1;
-#[cfg(windows)]
-const KEYEVENTF_KEYUP: u32 = 0x0002;
-#[cfg(windows)]
-const KEYEVENTF_UNICODE: u32 = 0x0004;
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WindowsMouseInput {
-    dx: i32,
-    dy: i32,
-    mouse_data: u32,
-    dw_flags: u32,
-    time: u32,
-    dw_extra_info: usize,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WindowsKeyboardInput {
-    w_vk: u16,
-    w_scan: u16,
-    dw_flags: u32,
-    time: u32,
-    dw_extra_info: usize,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WindowsHardwareInput {
-    u_msg: u32,
-    w_param_l: u16,
-    w_param_h: u16,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-union WindowsInputUnion {
-    mi: WindowsMouseInput,
-    ki: WindowsKeyboardInput,
-    hi: WindowsHardwareInput,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WindowsInput {
-    input_type: u32,
-    union: WindowsInputUnion,
-}
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -277,6 +243,13 @@ impl Drop for TerminalState {
 #[derive(Clone)]
 struct AudioState {
     download_lock: Arc<Mutex<()>>,
+    deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
+    input_worker: NativeAudioWorker,
+    whisper_engine: WhisperCliWarmCache,
+}
+
+struct DeepgramRealtimeSession {
+    finished_rx: oneshot::Receiver<Result<WhisperTranscriptionResult, String>>,
 }
 
 #[derive(Clone)]
@@ -760,6 +733,47 @@ struct TerminalTelemetryLogRequest {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct AudioInputDeviceSummary {
+    device_id: String,
+    label: String,
+    is_default: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioInputMonitorRequest {
+    device_id: Option<String>,
+    owner: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioInputMonitorStatus {
+    monitoring: bool,
+    device_id: String,
+    label: String,
+    sample_rate: u32,
+    owner_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioInputStats {
+    device_id: String,
+    rms: f32,
+    peak: f32,
+    buffer_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioInputCaptureResult {
+    audio_base64: String,
+    audio_ms: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct WhisperModelStatus {
     installed: bool,
     model_installed: bool,
@@ -772,6 +786,8 @@ struct WhisperModelStatus {
     runtime_package_name: &'static str,
     runtime_path: String,
     runtime_installable: bool,
+    managed_runtime_installed: bool,
+    managed_assets_installed: bool,
     runtime_install_hint: &'static str,
     download_url: &'static str,
     expected_sha1: &'static str,
@@ -791,6 +807,16 @@ struct WhisperModelDownloadProgress {
     message: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhisperWarmStatus {
+    prepared: bool,
+    cached: bool,
+    model_path: String,
+    elapsed_ms: u128,
+    warmed_bytes: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WhisperTranscriptionRequest {
@@ -803,6 +829,30 @@ struct WhisperTranscriptionResult {
     text: String,
     segments: usize,
     duration_ms: u128,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeepgramRealtimeStartRequest {
+    api_key: String,
+    language: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeepgramRealtimeStartStatus {
+    active: bool,
+    language: String,
+    model: &'static str,
+    sample_rate: u32,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeepgramRealtimeTranscriptEvent {
+    text: String,
+    is_final: bool,
+    speech_final: bool,
 }
 
 #[derive(Serialize)]
@@ -826,6 +876,7 @@ include!("terminal_cli.rs");
 include!("terminals.rs");
 include!("api.rs");
 include!("audio.rs");
+include!("handsfree_audio.rs");
 
 #[tauri::command]
 fn close_app_after_terminal_shutdown(
@@ -953,6 +1004,9 @@ pub fn run() {
         })
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
+            deepgram_stream: Arc::new(Mutex::new(None)),
+            input_worker: NativeAudioWorker::new(),
+            whisper_engine: WhisperCliWarmCache::new(),
         })
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -969,12 +1023,22 @@ pub fn run() {
 
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            let _ = toggle_audio_widget_for(&app);
+                            if let Ok(visibility) = toggle_audio_widget_for(&app) {
+                                if visibility.visible {
+                                    let prepare_app = app.clone();
+                                    let engine = app.state::<AudioState>().whisper_engine.clone();
+                                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                                        let _ = prepare_whisper_model_for(&prepare_app, &engine);
+                                    });
+                                }
+                            }
                         });
                     })
             {
                 eprintln!("Unable to register Diff Forge audio shortcut: {error}");
             }
+
+            register_audio_push_to_talk_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -1013,11 +1077,21 @@ pub fn run() {
             run_forge_prompt,
             whisper_model_status,
             download_whisper_model,
+            uninstall_whisper_model,
+            audio_input_devices,
+            start_audio_input_monitor,
+            stop_audio_input_monitor,
+            begin_audio_input_capture,
+            finish_audio_input_capture,
+            prepare_whisper_model,
             transcribe_whisper_audio,
+            start_deepgram_realtime_transcription,
+            stop_deepgram_realtime_transcription,
             show_audio_widget,
             hide_audio_widget,
             toggle_audio_widget,
             insert_transcribed_text,
+            insert_handsfree_transcribed_text,
             terminal_telemetry_log,
             terminal_telemetry_log_many,
             terminal_open,

@@ -418,6 +418,22 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 return Err(error);
             }
         };
+        let agents_gitignore_update = match ensure_workspace_agents_gitignore(&working_directory) {
+            Ok(update) => update,
+            Err(error) => {
+                log_terminal_event(
+                    "workspace.root.agents_gitignore.error",
+                    None,
+                    None,
+                    Some(validate_started_at.elapsed()),
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "requested_path": clean_terminal_telemetry_text(&path),
+                    }),
+                );
+                return Err(error);
+            }
+        };
         let resolved_directory = workspace_path_display(&working_directory);
 
         log_terminal_event(
@@ -428,6 +444,7 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
             json!({
                 "requested_path": clean_terminal_telemetry_text(&path),
                 "working_directory": resolved_directory,
+                "agents_gitignore": workspace_agents_gitignore_update_label(agents_gitignore_update),
             }),
         );
 

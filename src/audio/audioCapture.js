@@ -1,93 +1,53 @@
-const AUDIO_TARGET_SAMPLE_RATE = 16000;
-const AUDIO_RECORDING_MAX_SECONDS = 90;
-const AUDIO_BUFFER_MAX_SECONDS = 12;
-const AUDIO_BUFFER_PREROLL_SECONDS = 1.2;
-const AUDIO_BUFFER_POSTROLL_SECONDS = 0.55;
-const AUDIO_MIN_SPEECH_MS = 260;
-const AUDIO_VAD_BASE_RMS = 0.012;
-const AUDIO_VAD_PEAK = 0.04;
-const AUDIO_VAD_NOISE_MULTIPLIER = 3;
+import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
 
-export function formatAudioPercent(value) {
-  const percent = Number(value);
+const AUDIO_INPUT_DEVICE_STORAGE_KEY = "diffforge.audio.inputDeviceId";
+const AUDIO_INPUT_SETUP_STORAGE_KEY = "diffforge.audio.inputSetupReady";
+const AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY = "diffforge.audio.autoOpenRecorder";
+const AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY = "diffforge.audio.lastTranscriptionResult";
+const AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY = "diffforge.audio.transcriptionProvider";
+const AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY = "diffforge.audio.deepgramApiKey";
+const AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY = "diffforge.audio.deepgramLanguage";
+export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
+export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
+export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
+const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
+export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
+const EMPTY_CAPTURE_STATS = {
+  bufferMs: 0,
+  peak: 0,
+  rms: 0,
+};
 
-  if (!Number.isFinite(percent)) {
-    return "";
-  }
-
-  return `${Math.max(0, Math.min(100, percent)).toFixed(1)}%`;
+function canUseStorage() {
+  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
 }
 
-function mergeFloat32Chunks(chunks) {
-  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const merged = new Float32Array(totalLength);
-  let offset = 0;
-
-  chunks.forEach((chunk) => {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  });
-
-  return merged;
+function normalizeAudioTranscriptionProvider(value) {
+  return value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    ? AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    : AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
 }
 
-function resampleFloat32(samples, sourceRate, targetRate) {
-  if (!Number.isFinite(sourceRate) || sourceRate <= 0 || sourceRate === targetRate) {
-    return samples;
+function normalizeDeepgramLanguage(value) {
+  const language = String(value || "").trim();
+
+  if (!language || language.length > 24 || !/^[a-zA-Z0-9-]+$/.test(language)) {
+    return AUDIO_DEEPGRAM_DEFAULT_LANGUAGE;
   }
 
-  const outputLength = Math.max(1, Math.round(samples.length * (targetRate / sourceRate)));
-  const output = new Float32Array(outputLength);
-
-  for (let index = 0; index < outputLength; index += 1) {
-    const sourcePosition = index * (sourceRate / targetRate);
-    const leftIndex = Math.floor(sourcePosition);
-    const rightIndex = Math.min(samples.length - 1, leftIndex + 1);
-    const mix = sourcePosition - leftIndex;
-    const left = samples[leftIndex] || 0;
-    const right = samples[rightIndex] || 0;
-
-    output[index] = left + (right - left) * mix;
-  }
-
-  return output;
+  return language;
 }
 
-function writeAscii(view, offset, value) {
-  for (let index = 0; index < value.length; index += 1) {
-    view.setUint8(offset + index, value.charCodeAt(index));
+function base64ToArrayBuffer(value) {
+  const binary = atob(value || "");
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
-}
 
-function encodeWav(samples, sampleRate) {
-  const bytesPerSample = 2;
-  const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
-  const view = new DataView(buffer);
-
-  writeAscii(view, 0, "RIFF");
-  view.setUint32(4, 36 + samples.length * bytesPerSample, true);
-  writeAscii(view, 8, "WAVE");
-  writeAscii(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * bytesPerSample, true);
-  view.setUint16(32, bytesPerSample, true);
-  view.setUint16(34, bytesPerSample * 8, true);
-  writeAscii(view, 36, "data");
-  view.setUint32(40, samples.length * bytesPerSample, true);
-
-  let offset = 44;
-  samples.forEach((sample) => {
-    const clipped = Math.max(-1, Math.min(1, Number.isFinite(sample) ? sample : 0));
-    const value = clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff;
-
-    view.setInt16(offset, value, true);
-    offset += bytesPerSample;
-  });
-
-  return buffer;
+  return bytes.buffer;
 }
 
 export function arrayBufferToBase64(buffer) {
@@ -102,172 +62,243 @@ export function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-function getAudioStats(samples) {
-  let sumSquares = 0;
-  let peak = 0;
+export function readSelectedAudioInputDeviceId() {
+  if (!canUseStorage()) {
+    return "default";
+  }
 
-  samples.forEach((sample) => {
-    const value = Number.isFinite(sample) ? sample : 0;
-    sumSquares += value * value;
-    peak = Math.max(peak, Math.abs(value));
-  });
+  return window.localStorage.getItem(AUDIO_INPUT_DEVICE_STORAGE_KEY) || "default";
+}
+
+export function writeSelectedAudioInputDeviceId(deviceId) {
+  if (!canUseStorage()) {
+    return;
+  }
+
+  window.localStorage.setItem(AUDIO_INPUT_DEVICE_STORAGE_KEY, deviceId || "default");
+}
+
+export function hasAudioInputSetup() {
+  return canUseStorage() && window.localStorage.getItem(AUDIO_INPUT_SETUP_STORAGE_KEY) === "true";
+}
+
+export function markAudioInputSetupReady() {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_INPUT_SETUP_STORAGE_KEY, "true");
+  }
+}
+
+export function readAutoOpenAudioRecorder() {
+  return canUseStorage() && window.localStorage.getItem(AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY) === "true";
+}
+
+export function writeAutoOpenAudioRecorder(enabled) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY, enabled ? "true" : "false");
+  }
+}
+
+export function readAudioTranscriptionProvider() {
+  if (!canUseStorage()) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+  }
+
+  return normalizeAudioTranscriptionProvider(
+    window.localStorage.getItem(AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY),
+  );
+}
+
+export function writeAudioTranscriptionProvider(provider) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY,
+      normalizeAudioTranscriptionProvider(provider),
+    );
+  }
+}
+
+export function readDeepgramApiKey() {
+  if (!canUseStorage()) {
+    return "";
+  }
+
+  return window.localStorage.getItem(AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY) || "";
+}
+
+export function writeDeepgramApiKey(apiKey) {
+  if (!canUseStorage()) {
+    return;
+  }
+
+  const cleanedApiKey = String(apiKey || "").trim();
+  if (cleanedApiKey) {
+    window.localStorage.setItem(AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY, cleanedApiKey);
+  } else {
+    window.localStorage.removeItem(AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY);
+  }
+}
+
+export function readDeepgramLanguage() {
+  if (!canUseStorage()) {
+    return AUDIO_DEEPGRAM_DEFAULT_LANGUAGE;
+  }
+
+  return normalizeDeepgramLanguage(window.localStorage.getItem(AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY));
+}
+
+export function writeDeepgramLanguage(language) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY, normalizeDeepgramLanguage(language));
+  }
+}
+
+function normalizeTranscriptionResult(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const text = typeof value.text === "string"
+    ? value.text
+      .split(/\r?\n/)
+      .filter((line) => {
+        const lowercase = line.trim().toLowerCase();
+
+        return !(
+          lowercase.includes("the binary 'main.exe' is deprecated")
+          || lowercase.includes("the binary \"main.exe\" is deprecated")
+          || lowercase.includes("the binary 'main' is deprecated")
+          || lowercase.includes("the binary \"main\" is deprecated")
+          || lowercase.includes("deprecation-warning")
+        );
+      })
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+    : "";
+
+  if (!text) {
+    return null;
+  }
 
   return {
-    peak,
-    rms: Math.sqrt(sumSquares / Math.max(1, samples.length)),
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+    id: typeof value.id === "string" ? value.id : String(Date.now()),
+    source: typeof value.source === "string" ? value.source : "audio-widget",
+    text,
   };
 }
 
-export async function startLowPowerAudioBuffer({ onStats } = {}) {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error("Microphone capture is not available in this WebView.");
+export function readLastAudioTranscriptionResult() {
+  if (!canUseStorage()) {
+    return null;
   }
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
+  try {
+    return normalizeTranscriptionResult(
+      JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY) || "null"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export async function publishAudioTranscriptionResult(value) {
+  const result = normalizeTranscriptionResult(value);
+
+  if (!result) {
+    return null;
+  }
+
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY, JSON.stringify(result));
+  }
+
+  await emit(AUDIO_TRANSCRIPTION_RESULT_EVENT, result).catch(() => {});
+
+  return result;
+}
+
+export function formatAudioPercent(value) {
+  const percent = Number(value);
+
+  if (!Number.isFinite(percent)) {
+    return "";
+  }
+
+  return `${Math.max(0, Math.min(100, percent)).toFixed(1)}%`;
+}
+
+export function getAudioInputErrorMessage(error, fallback = "Unable to open the selected microphone.") {
+  const message = String(error?.message || error || "").trim();
+  const lowercase = message.toLowerCase();
+
+  if (lowercase.includes("permission") || lowercase.includes("denied") || lowercase.includes("blocked")) {
+    return "Diff Forge cannot access that input through the operating system right now. Check system microphone access, then use Enable input here.";
+  }
+
+  if (lowercase.includes("not available") || lowercase.includes("not found") || lowercase.includes("no default microphone")) {
+    return "That input source is not available. Choose another microphone and refresh sources.";
+  }
+
+  if (lowercase.includes("busy") || lowercase.includes("in use") || lowercase.includes("could not be opened")) {
+    return "That input source could not be opened. Check the OS input settings or choose another source, then try again.";
+  }
+
+  return message || fallback;
+}
+
+export async function listAudioInputDevices() {
+  return invoke("audio_input_devices");
+}
+
+export async function prepareWhisperModel() {
+  return invoke("prepare_whisper_model");
+}
+
+export async function startLowPowerAudioBuffer({
+  deviceId = "default",
+  owner = "audio",
+  onStats,
+} = {}) {
+  let closed = false;
+  let latestStats = { ...EMPTY_CAPTURE_STATS };
+  const unlisten = onStats
+    ? await listen(AUDIO_INPUT_STATS_EVENT, (event) => {
+      latestStats = {
+        ...EMPTY_CAPTURE_STATS,
+        ...(event.payload || {}),
+      };
+      onStats(latestStats);
+    })
+    : null;
+
+  const status = await invoke("start_audio_input_monitor", {
+    request: {
+      deviceId,
+      owner,
     },
   });
-  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
 
-  if (!AudioContextCtor) {
-    stream.getTracks().forEach((track) => track.stop());
-    throw new Error("AudioContext is not available in this WebView.");
-  }
-
-  const audioContext = new AudioContextCtor();
-  await audioContext.resume();
-  const source = audioContext.createMediaStreamSource(stream);
-  const processor = audioContext.createScriptProcessor(4096, 1, 1);
-  const chunks = [];
-  const maxBufferedSamples = Math.round(audioContext.sampleRate * AUDIO_BUFFER_MAX_SECONDS);
-  let totalBufferedSamples = 0;
-  let noiseFloor = AUDIO_VAD_BASE_RMS / 2;
-  let captureStartedAt = 0;
-  let captureSpeechMs = 0;
-  let captureSpeechDetected = false;
-  let lastSpeechAt = 0;
-  let lastStatsAt = 0;
-  let closed = false;
-
-  const emitStats = (stats) => {
-    const now = performance.now();
-
-    if (!onStats || now - lastStatsAt < 140) {
-      return;
-    }
-
-    lastStatsAt = now;
-    onStats({
-      ...stats,
-      bufferMs: Math.round((totalBufferedSamples / audioContext.sampleRate) * 1000),
-      captureSpeechDetected,
-      lastSpeechAgoMs: lastSpeechAt ? Math.max(0, Math.round(now - lastSpeechAt)) : 0,
-      noiseFloor,
-    });
-  };
-
-  const trimBufferedAudio = () => {
-    while (totalBufferedSamples > maxBufferedSamples && chunks.length > 1) {
-      const removed = chunks.shift();
-      totalBufferedSamples -= removed.samples.length;
-    }
-  };
-
-  processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-    const output = event.outputBuffer.getChannelData(0);
-    const samples = new Float32Array(input);
-    const now = performance.now();
-    const { rms, peak } = getAudioStats(samples);
-    const threshold = Math.max(AUDIO_VAD_BASE_RMS, noiseFloor * AUDIO_VAD_NOISE_MULTIPLIER);
-    const speech = rms >= threshold || peak >= AUDIO_VAD_PEAK;
-    const durationMs = (samples.length / audioContext.sampleRate) * 1000;
-
-    output.fill(0);
-    chunks.push({
-      durationMs,
-      peak,
-      rms,
-      samples,
-      speech,
-      timestamp: now,
-    });
-    totalBufferedSamples += samples.length;
-    trimBufferedAudio();
-
-    if (speech) {
-      lastSpeechAt = now;
-      if (captureStartedAt) {
-        captureSpeechMs += durationMs;
-        captureSpeechDetected = true;
-      }
-    } else if (!captureStartedAt) {
-      noiseFloor = (noiseFloor * 0.97) + (rms * 0.03);
-    }
-
-    emitStats({
-      peak,
-      rms,
-      speech,
-      threshold,
-    });
-  };
-
-  source.connect(processor);
-  processor.connect(audioContext.destination);
+  markAudioInputSetupReady();
 
   return {
-    sampleRate: audioContext.sampleRate,
-    beginCapture() {
-      captureStartedAt = performance.now();
-      captureSpeechMs = 0;
-      captureSpeechDetected = false;
-      lastSpeechAt = 0;
+    sampleRate: status?.sampleRate || 16000,
+    async beginCapture() {
+      await invoke("begin_audio_input_capture");
     },
-    finishCapture() {
-      if (!captureStartedAt) {
-        throw new Error("Recorder is not armed.");
-      }
-
-      const captureStart = captureStartedAt - (AUDIO_BUFFER_PREROLL_SECONDS * 1000);
-      const candidates = chunks.filter((chunk) => (
-        chunk.timestamp + chunk.durationMs >= captureStart
-      ));
-      const firstSpeech = candidates.find((chunk) => chunk.speech);
-      const lastSpeech = [...candidates].reverse().find((chunk) => chunk.speech);
-      const speechMs = candidates
-        .filter((chunk) => chunk.speech)
-        .reduce((sum, chunk) => sum + chunk.durationMs, 0);
-
-      captureStartedAt = 0;
-
-      if (!firstSpeech || !lastSpeech || speechMs < AUDIO_MIN_SPEECH_MS) {
-        throw new Error("No speech detected.");
-      }
-
-      const trimStart = firstSpeech.timestamp - (AUDIO_BUFFER_PREROLL_SECONDS * 1000);
-      const trimEnd = lastSpeech.timestamp + lastSpeech.durationMs + (AUDIO_BUFFER_POSTROLL_SECONDS * 1000);
-      const speechChunks = candidates.filter((chunk) => (
-        chunk.timestamp + chunk.durationMs >= trimStart && chunk.timestamp <= trimEnd
-      ));
-      const merged = mergeFloat32Chunks(speechChunks.map((chunk) => chunk.samples));
-      const maxSamples = Math.round(audioContext.sampleRate * AUDIO_RECORDING_MAX_SECONDS);
-      const bounded = merged.length > maxSamples ? merged.slice(merged.length - maxSamples) : merged;
-      const resampled = resampleFloat32(bounded, audioContext.sampleRate, AUDIO_TARGET_SAMPLE_RATE);
+    async finishCapture() {
+      const result = await invoke("finish_audio_input_capture");
 
       return {
-        speechMs: Math.round(speechMs),
-        wavBuffer: encodeWav(resampled, AUDIO_TARGET_SAMPLE_RATE),
+        audioMs: Number(result?.audioMs || 0),
+        wavBuffer: base64ToArrayBuffer(result?.audioBase64 || ""),
       };
     },
     getCaptureStats() {
       return {
-        lastSpeechAgoMs: lastSpeechAt ? Math.max(0, performance.now() - lastSpeechAt) : 0,
-        speechDetected: captureSpeechDetected,
-        speechMs: captureSpeechMs,
+        bufferMs: latestStats.bufferMs || 0,
+        peak: latestStats.peak || 0,
+        rms: latestStats.rms || 0,
       };
     },
     async close() {
@@ -276,10 +307,14 @@ export async function startLowPowerAudioBuffer({ onStats } = {}) {
       }
 
       closed = true;
-      processor.disconnect();
-      source.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
-      await audioContext.close();
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+      await invoke("stop_audio_input_monitor", {
+        request: {
+          owner,
+        },
+      }).catch(() => {});
     },
   };
 }

@@ -106,6 +106,116 @@ fn workspace_path_display(path: &Path) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceAgentsGitignoreUpdate {
+    Added,
+    AlreadyIgnored,
+    NoAgentsDirectory,
+}
+
+fn trim_gitignore_ascii(value: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = value.len();
+
+    while start < end && matches!(value[start], b' ' | b'\t' | b'\r') {
+        start += 1;
+    }
+
+    while end > start && matches!(value[end - 1], b' ' | b'\t' | b'\r') {
+        end -= 1;
+    }
+
+    &value[start..end]
+}
+
+fn gitignore_pattern_ignores_agents(line: &[u8]) -> bool {
+    let mut pattern = trim_gitignore_ascii(line);
+
+    if pattern.is_empty() || pattern.starts_with(b"#") || pattern.starts_with(b"!") {
+        return false;
+    }
+
+    if let Some(stripped) = pattern.strip_prefix(b"/") {
+        pattern = stripped;
+    }
+
+    if let Some(stripped) = pattern.strip_suffix(b"/**") {
+        pattern = stripped;
+    }
+
+    while let Some(stripped) = pattern.strip_suffix(b"/") {
+        pattern = stripped;
+    }
+
+    pattern == b".agents"
+}
+
+fn workspace_agents_gitignore_update_label(update: WorkspaceAgentsGitignoreUpdate) -> &'static str {
+    match update {
+        WorkspaceAgentsGitignoreUpdate::Added => "added",
+        WorkspaceAgentsGitignoreUpdate::AlreadyIgnored => "already_ignored",
+        WorkspaceAgentsGitignoreUpdate::NoAgentsDirectory => "no_agents_directory",
+    }
+}
+
+fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitignoreUpdate, String> {
+    let agents_path = root.join(".agents");
+    let agents_metadata = match fs::metadata(&agents_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceAgentsGitignoreUpdate::NoAgentsDirectory);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to inspect workspace .agents directory: {error}"
+            ));
+        }
+    };
+
+    if !agents_metadata.is_dir() {
+        return Ok(WorkspaceAgentsGitignoreUpdate::NoAgentsDirectory);
+    }
+
+    let gitignore_path = root.join(".gitignore");
+    let existing = match fs::read(&gitignore_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read workspace .gitignore for .agents protection: {error}"
+            ));
+        }
+    };
+
+    if existing
+        .split(|byte| *byte == b'\n')
+        .any(gitignore_pattern_ignores_agents)
+    {
+        return Ok(WorkspaceAgentsGitignoreUpdate::AlreadyIgnored);
+    }
+
+    let mut addition = Vec::new();
+
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        addition.push(b'\n');
+    }
+
+    addition.extend_from_slice(b".agents/\n");
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gitignore_path)
+        .map_err(|error| {
+            format!("Unable to update workspace .gitignore for .agents protection: {error}")
+        })?;
+    file.write_all(&addition).map_err(|error| {
+        format!("Unable to write workspace .gitignore for .agents protection: {error}")
+    })?;
+
+    Ok(WorkspaceAgentsGitignoreUpdate::Added)
+}
+
 fn normalized_path_key(path: &Path) -> String {
     workspace_path_display(path)
         .replace('\\', "/")
@@ -636,4 +746,3 @@ fn read_workspace_file_diff_for(
         truncated,
     })
 }
-

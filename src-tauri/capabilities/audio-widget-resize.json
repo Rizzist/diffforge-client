@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "audio-widget-resize",
+  "description": "Capability allowing only the floating audio widget to switch between compact and focused recorder sizes.",
+  "windows": ["audio-widget"],
+  "permissions": ["core:window:allow-set-size"]
+}

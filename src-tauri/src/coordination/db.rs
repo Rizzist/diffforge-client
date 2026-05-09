@@ -64,6 +64,8 @@ impl StoragePaths {
                 .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
         }
 
+        crate::ensure_workspace_agents_gitignore(&self.repo_path)?;
+
         Ok(())
     }
 }
