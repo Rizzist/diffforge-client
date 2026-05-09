@@ -33,6 +33,33 @@ fn run_command_capture(
     timeout: Duration,
     working_directory: Option<&Path>,
 ) -> Result<CommandCapture, String> {
+    run_command_capture_with_cancel(
+        binary,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        || false,
+        "Command canceled.",
+    )
+}
+
+fn run_command_capture_with_cancel<F>(
+    binary: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    mut should_cancel: F,
+    canceled_message: &str,
+) -> Result<CommandCapture, String>
+where
+    F: FnMut() -> bool,
+{
+    if should_cancel() {
+        return Err(canceled_message.to_string());
+    }
+
     let mut command = Command::new(binary);
     command.args(args);
 
@@ -69,6 +96,12 @@ fn run_command_capture(
     let started_at = Instant::now();
 
     loop {
+        if should_cancel() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(canceled_message.to_string());
+        }
+
         match child.try_wait() {
             Ok(Some(_status)) => {
                 let output = child
@@ -97,4 +130,3 @@ fn run_command_capture(
         }
     }
 }
-

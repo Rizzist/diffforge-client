@@ -27,6 +27,26 @@ use super::{
 
 const SESSION_STALE_SECONDS: i64 = 1800;
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 1800;
+const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
+    "get_brief",
+    "claim_task",
+    "post_plan",
+    "acquire_lease",
+    "db_acquire_lease",
+    "renew_lease",
+    "release_lease",
+    "list_active_leases",
+    "announce_change",
+    "validate_patch",
+    "list_workspace_violations",
+    "search_memory",
+    "db_get_mode",
+    "db_classify_sql",
+    "request_approval",
+    "orchestrator_get_status",
+    "orchestrator_list_runs",
+    "orchestrator_get_brief",
+];
 
 pub fn now_rfc3339() -> String {
     let duration = SystemTime::now()
@@ -4476,11 +4496,20 @@ fn codex_config_toml(command: &str, args: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    format!(
-        "[mcp_servers.coordination-kernel]\ncommand = \"{}\"\nargs = [{}]\n",
+    let mut config = format!(
+        "[mcp_servers.coordination-kernel]\ncommand = \"{}\"\nargs = [{}]\ndefault_tools_approval_mode = \"prompt\"\n",
         toml_escape(command),
         args
-    )
+    );
+
+    for tool in CODEX_AUTO_APPROVED_COORDINATION_TOOLS {
+        config.push_str(&format!(
+            "\n[mcp_servers.coordination-kernel.tools.{}]\napproval_mode = \"approve\"\n",
+            tool
+        ));
+    }
+
+    config
 }
 
 fn toml_escape(value: &str) -> String {
@@ -4732,6 +4761,46 @@ mod tests {
         assert_eq!(status["always_on"].as_bool(), Some(true));
         assert_eq!(status["toggleable"].as_bool(), Some(false));
         assert!(PathBuf::from(status["config_path"].as_str().unwrap()).exists());
+    }
+
+    #[test]
+    fn codex_mcp_config_prompts_by_default_and_approves_safe_tools() {
+        let repo = temp_repo("codex_mcp_tool_approvals");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let status = kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
+
+        assert!(config.contains("default_tools_approval_mode = \"prompt\""));
+        for tool in [
+            "get_brief",
+            "claim_task",
+            "acquire_lease",
+            "validate_patch",
+            "db_classify_sql",
+            "request_approval",
+            "orchestrator_get_status",
+        ] {
+            assert!(config.contains(&format!(
+                "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
+            )));
+        }
+        for prompt_gated_tool in [
+            "submit_patch",
+            "request_merge",
+            "resolve_workspace_violation",
+            "db_query_readonly",
+            "db_propose_migration",
+            "db_validate_shadow",
+            "write_memory",
+            "orchestrator_create_context_export",
+            "orchestrator_sync_once",
+        ] {
+            assert!(!config.contains(&format!(
+                "[mcp_servers.coordination-kernel.tools.{prompt_gated_tool}]"
+            )));
+        }
     }
 
     #[test]

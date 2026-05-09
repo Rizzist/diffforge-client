@@ -4097,16 +4097,36 @@ export const AudioDeviceSelect = styled.select`
   }
 `;
 
+const audioInputBarFlow = keyframes`
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scaleY(var(--motion-low, 0.78)) translateY(1px);
+  }
+
+  38% {
+    opacity: 1;
+    transform: scaleY(var(--motion-high, 1.12)) translateY(-1px);
+  }
+
+  66% {
+    opacity: 0.88;
+    transform: scaleY(var(--motion-mid, 0.92)) translateY(0);
+  }
+`;
+
 export const AudioInputMeter = styled.div`
   display: grid;
   height: 54px;
-  grid-template-columns: repeat(24, minmax(3px, 1fr));
+  grid-template-columns: repeat(32, minmax(2px, 1fr));
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   padding: 9px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.5);
+  background:
+    linear-gradient(90deg, rgba(125, 176, 255, 0.05) 0 1px, transparent 1px 10px),
+    rgba(7, 9, 13, 0.5);
 
   span {
     display: block;
@@ -4114,14 +4134,37 @@ export const AudioInputMeter = styled.div`
     min-height: 6px;
     border-radius: 999px;
     background: rgba(122, 132, 147, 0.42);
+    transform: scaleY(0.86);
+    transform-origin: center;
     transition:
       background 160ms ease,
       height 120ms ease,
       transform 160ms ease;
+    will-change: height, transform;
   }
 
   &[data-active="true"] span {
-    background: var(--forge-green);
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.9), transparent 56%),
+      linear-gradient(
+        180deg,
+        hsl(var(--bar-hue, 190) 96% 78% / 0.96),
+        rgba(75, 212, 170, 0.84) 54%,
+        rgba(217, 121, 53, 0.74)
+      );
+    animation: ${audioInputBarFlow} var(--duration, 900ms) ease-in-out infinite;
+    animation-delay: var(--delay, 0ms);
+    box-shadow:
+      0 0 10px rgba(75, 212, 170, 0.12),
+      0 1px 0 rgba(255, 255, 255, 0.16) inset;
+  }
+
+  &[data-active="true"][data-signal="quiet"] span {
+    opacity: 0.58;
+    filter: saturate(0.52) brightness(0.84);
+    box-shadow:
+      0 0 7px rgba(125, 176, 255, 0.06),
+      0 1px 0 rgba(255, 255, 255, 0.08) inset;
   }
 `;
 
@@ -4146,6 +4189,79 @@ export const AudioRecorderOptionRow = styled.div`
 
   button {
     min-height: 34px;
+  }
+`;
+
+export const AudioShortcutGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioShortcutCard = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.5);
+
+  > span {
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 760;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  &[data-error="true"] {
+    border-color: rgba(239, 107, 107, 0.34);
+  }
+`;
+
+export const AudioShortcutKey = styled.kbd`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  padding: 7px 9px;
+  border: 1px solid rgba(125, 160, 205, 0.24);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.74);
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-capturing="true"] {
+    border-color: rgba(223, 165, 90, 0.42);
+    color: #ffd396;
+    background: rgba(223, 165, 90, 0.09);
+  }
+`;
+
+export const AudioShortcutActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  button {
+    min-height: 32px;
   }
 `;
 
@@ -4327,12 +4443,20 @@ const audioWidgetSpin = keyframes`
 `;
 
 const audioWidgetBarPulse = keyframes`
-  from {
-    opacity: 0.62;
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scaleY(var(--scale-low, 0.18)) translateY(1px);
   }
 
-  to {
+  42% {
     opacity: 1;
+    transform: scaleY(var(--scale-high, 0.78)) translateY(-1px);
+  }
+
+  70% {
+    opacity: 0.88;
+    transform: scaleY(var(--scale, 0.36)) translateY(0);
   }
 `;
 
@@ -4362,15 +4486,25 @@ export const AudioWidgetShell = styled.main`
     grid-template-columns: minmax(0, 1fr);
     place-items: center;
     gap: 0;
-    padding: 8px 10px;
-    border: 1px solid rgba(125, 160, 205, 0.24);
-    border-color: rgba(125, 176, 255, 0.36);
+    padding: 8px 9px;
+    border: 1px solid rgba(230, 236, 245, 0.13);
     box-shadow:
-      0 20px 46px rgba(0, 0, 0, 0.36),
-      0 0 0 1px rgba(255, 255, 255, 0.035) inset;
+      0 18px 44px rgba(0, 0, 0, 0.34),
+      0 1px 0 rgba(255, 255, 255, 0.07) inset,
+      0 -18px 32px rgba(0, 0, 0, 0.18) inset;
     background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.08), rgba(244, 247, 250, 0.018)),
-      rgba(5, 7, 11, 0.97);
+      radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.13), transparent 34%),
+      linear-gradient(180deg, rgba(37, 42, 49, 0.94), rgba(12, 15, 19, 0.96));
+  }
+
+  &[data-closing="true"] {
+    box-shadow:
+      0 10px 28px rgba(0, 0, 0, 0.24),
+      0 1px 0 rgba(255, 255, 255, 0.05) inset,
+      0 -12px 24px rgba(0, 0, 0, 0.15) inset;
+    background:
+      radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.08), transparent 34%),
+      linear-gradient(180deg, rgba(30, 35, 42, 0.9), rgba(10, 13, 17, 0.92));
   }
 `;
 
@@ -4383,7 +4517,27 @@ export const AudioWidgetFocusStage = styled.div`
   align-items: center;
   justify-items: stretch;
   gap: 10px;
+  opacity: 1;
+  transform: translateX(0) scaleX(1);
+  transform-origin: left center;
+  transition:
+    opacity 160ms ease,
+    transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
   -webkit-app-region: drag;
+
+  &[data-mode="closing"] {
+    opacity: 0.88;
+    transform: translateX(-3px) scaleX(0.96);
+  }
+
+  &[data-mode="closing"] img,
+  &[data-mode="closing"] > div:first-child {
+    opacity: 0.9;
+    transform: scale(0.94);
+    transition:
+      opacity 160ms ease,
+      transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
+  }
 `;
 
 export const AudioWidgetHeader = styled.header`
@@ -4420,62 +4574,92 @@ export const AudioWidgetLogo = styled.img`
   width: 52px;
   height: 52px;
   flex: 0 0 auto;
-  border: 1px solid rgba(125, 160, 205, 0.3);
+  border: 1px solid rgba(230, 236, 245, 0.14);
   border-radius: 999px;
   object-fit: cover;
-  background: rgba(5, 7, 11, 0.92);
+  background:
+    linear-gradient(180deg, rgba(36, 41, 48, 0.88), rgba(6, 8, 11, 0.9));
   box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.035) inset,
-    0 0 18px rgba(59, 130, 246, 0.2);
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 -8px 16px rgba(0, 0, 0, 0.26) inset,
+    0 8px 22px rgba(0, 0, 0, 0.24),
+    0 0 0 4px rgba(244, 247, 250, 0.018);
 
   &[data-size="focus"] {
-    width: 44px;
-    height: 44px;
+    width: 42px;
+    height: 42px;
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.08) inset,
+      0 -8px 15px rgba(0, 0, 0, 0.24) inset,
+      0 6px 16px rgba(0, 0, 0, 0.2);
   }
 `;
 
 export const AudioWidgetMeter = styled.div`
   display: grid;
-  height: 36px;
+  height: 34px;
   min-width: 0;
-  grid-template-columns: repeat(18, minmax(3px, 1fr));
+  grid-template-columns: repeat(26, minmax(2px, 1fr));
   align-items: center;
   gap: 3px;
-  padding: 6px 9px;
-  border: 1px solid var(--forge-border);
+  padding: 6px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 999px;
-  background: rgba(17, 22, 29, 0.76);
+  background:
+    linear-gradient(90deg, rgba(125, 176, 255, 0.05) 0 1px, transparent 1px 9px),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
+    rgba(9, 11, 14, 0.74);
 
   span {
     display: block;
     height: 100%;
     min-height: 0;
     border-radius: 999px;
-    background: rgba(122, 132, 147, 0.46);
+    background:
+      linear-gradient(180deg, rgba(226, 232, 240, 0.95), rgba(125, 137, 152, 0.78));
+    opacity: 0.78;
     transform: scaleY(var(--scale, 0.2));
     transform-origin: center;
     transition:
       background 160ms ease,
+      opacity 160ms ease,
       transform 160ms ease;
     will-change: transform;
   }
 
   &[data-active="true"] span {
-    background: var(--forge-green);
-    animation: ${audioWidgetBarPulse} 900ms ease-in-out infinite alternate;
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.9), transparent 56%),
+      linear-gradient(
+        180deg,
+        hsl(var(--bar-hue, 208) 98% 82% / 0.98),
+        hsl(var(--bar-hue, 208) 92% 62% / 0.82) 54%,
+        rgba(217, 121, 53, 0.78)
+      );
+    animation: ${audioWidgetBarPulse} var(--duration, 860ms) cubic-bezier(0.5, 0, 0.2, 1) infinite;
+    animation-delay: var(--delay, 0ms);
+  }
+
+  &[data-active="true"][data-signal="quiet"] span {
+    opacity: 0.62;
+    filter: saturate(0.58) brightness(0.88);
+    box-shadow:
+      0 0 8px rgba(125, 176, 255, 0.08),
+      0 1px 0 rgba(255, 255, 255, 0.1) inset;
   }
 
   &[data-prominent="true"] {
     width: 100%;
-    height: 40px;
+    height: 38px;
     min-width: 0;
-    grid-template-columns: repeat(18, minmax(3px, 1fr));
+    grid-template-columns: repeat(26, minmax(2px, 1fr));
     gap: 3px;
-    padding: 7px 10px;
-    border-color: rgba(60, 203, 127, 0.3);
+    padding: 7px 11px;
+    border-color: rgba(230, 236, 245, 0.11);
     background:
-      linear-gradient(180deg, rgba(60, 203, 127, 0.08), rgba(60, 203, 127, 0.018)),
-      rgba(9, 13, 18, 0.78);
+      linear-gradient(90deg, rgba(125, 176, 255, 0.055) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 18% 0%, rgba(125, 176, 255, 0.11), transparent 42%),
+      linear-gradient(180deg, rgba(33, 38, 45, 0.78), rgba(9, 11, 14, 0.76));
     opacity: 0;
     transform: translateX(-10px) scaleX(0.82);
     transform-origin: left center;
@@ -4487,8 +4671,11 @@ export const AudioWidgetMeter = styled.div`
   }
 
   &[data-prominent="true"] span {
-    min-height: 7px;
-    box-shadow: 0 0 12px rgba(60, 203, 127, 0.22);
+    min-height: 6px;
+    box-shadow:
+      0 0 12px rgba(125, 176, 255, 0.16),
+      0 0 18px rgba(217, 121, 53, 0.05),
+      0 1px 0 rgba(255, 255, 255, 0.14) inset;
   }
 
   &[data-prominent="true"][data-ready="true"] {
@@ -4496,47 +4683,77 @@ export const AudioWidgetMeter = styled.div`
     transform: translateX(0) scaleX(1);
   }
 
+  &[data-prominent="true"][data-closing="true"] {
+    opacity: 0;
+    border-color: rgba(230, 236, 245, 0);
+    transform: translateX(-14px) scaleX(0.72);
+    transition:
+      opacity 150ms ease,
+      transform 200ms cubic-bezier(0.3, 0, 0.2, 1),
+      border-color 160ms ease,
+      background 160ms ease;
+  }
+
+  &[data-prominent="true"][data-closing="true"] span {
+    animation-play-state: paused;
+    transform: scaleY(0.2);
+  }
+
   &[data-processing="true"] {
-    border-color: rgba(125, 176, 255, 0.32);
+    border-color: rgba(125, 176, 255, 0.18);
     background:
-      linear-gradient(180deg, rgba(125, 176, 255, 0.08), rgba(125, 176, 255, 0.018)),
-      rgba(9, 13, 18, 0.78);
+      linear-gradient(90deg, rgba(217, 121, 53, 0.055) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 12% 0%, rgba(217, 121, 53, 0.12), transparent 40%),
+      linear-gradient(180deg, rgba(34, 39, 46, 0.8), rgba(9, 11, 14, 0.78));
+  }
+
+  &[data-processing="true"] span {
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.86), transparent 56%),
+      linear-gradient(
+        180deg,
+        rgba(242, 246, 252, 0.96),
+        hsl(var(--bar-hue, 198) 92% 64% / 0.8) 52%,
+        rgba(217, 121, 53, 0.72)
+      );
   }
 `;
 
 export const AudioWidgetLoader = styled.div`
   position: relative;
   display: grid;
-  width: 44px;
-  height: 44px;
+  width: 42px;
+  height: 42px;
   flex: 0 0 auto;
   place-items: center;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid rgba(230, 236, 245, 0.13);
   border-radius: 999px;
   background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.06), rgba(244, 247, 250, 0.016)),
-    rgba(12, 17, 24, 0.86);
+    linear-gradient(180deg, rgba(42, 48, 56, 0.88), rgba(9, 11, 14, 0.9));
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.07) inset,
+    0 8px 18px rgba(0, 0, 0, 0.22);
 
   &::before {
     content: "";
     position: absolute;
-    inset: 6px;
-    border: 2px solid rgba(125, 160, 205, 0.16);
+    inset: 5px;
+    border: 2px solid rgba(230, 236, 245, 0.1);
     border-top-color: var(--forge-blue-soft);
     border-right-color: var(--forge-ember);
     border-radius: inherit;
-    animation: ${audioWidgetSpin} 820ms linear infinite;
+    animation: ${audioWidgetSpin} 860ms linear infinite;
   }
 
   &::after {
     content: "";
-    width: 9px;
-    height: 9px;
+    width: 7px;
+    height: 7px;
     border-radius: inherit;
-    background: var(--forge-text);
+    background: rgba(244, 247, 250, 0.92);
     box-shadow:
-      0 0 18px rgba(125, 176, 255, 0.34),
-      0 0 20px rgba(217, 121, 53, 0.18);
+      0 0 14px rgba(125, 176, 255, 0.28),
+      0 0 18px rgba(217, 121, 53, 0.14);
   }
 `;
 

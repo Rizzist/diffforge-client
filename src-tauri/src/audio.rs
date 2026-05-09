@@ -532,6 +532,10 @@ fn native_audio_trim(shared: &mut NativeAudioShared) {
     }
 }
 
+fn native_audio_chunk_reaches(chunk: &NativeAudioChunk, started_at: Instant) -> bool {
+    chunk.timestamp + Duration::from_secs_f64(chunk.duration_ms / 1000.0) >= started_at
+}
+
 fn process_native_audio_samples(
     app: &AppHandle,
     device_id: &str,
@@ -830,10 +834,7 @@ fn finish_native_whisper_audio_capture(
     let candidates = shared
         .chunks
         .iter()
-        .filter(|chunk| {
-            chunk.timestamp + Duration::from_secs_f64(chunk.duration_ms / 1000.0)
-                >= capture_started_at
-        })
+        .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
         .collect::<Vec<_>>();
     let candidate_chunks = candidates.len();
     let capture_chunk_count = shared.capture_chunk_count;
@@ -1114,14 +1115,49 @@ fn begin_native_audio_capture_for_session(
         .shared
         .lock()
         .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+    let now = Instant::now();
+    let capture_started_at = now
+        .checked_sub(Duration::from_millis(AUDIO_CAPTURE_PREROLL_MS))
+        .unwrap_or(now);
     let buffered_ms = ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0)
         .round() as u64;
+    let realtime_audio_tx = shared.realtime_audio_tx.clone();
+    let mut preroll_audio = Vec::new();
+    let mut preroll_chunk_count = 0u64;
+    let mut preroll_input_ms = 0.0f64;
+    let mut preroll_peak = 0.0f32;
+    let mut preroll_rms = 0.0f32;
 
-    shared.capture_started_at = Some(Instant::now());
-    shared.capture_chunk_count = 0;
-    shared.capture_input_ms = 0.0;
-    shared.capture_peak = 0.0;
-    shared.capture_rms = 0.0;
+    for chunk in shared
+        .chunks
+        .iter()
+        .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+    {
+        let (chunk_rms, chunk_peak) = native_audio_stats(&chunk.samples);
+
+        preroll_chunk_count += 1;
+        preroll_input_ms += chunk.duration_ms;
+        preroll_peak = preroll_peak.max(chunk_peak);
+        preroll_rms = preroll_rms.max(chunk_rms);
+
+        if realtime_audio_tx.is_some() {
+            preroll_audio.push(encode_linear16_audio(&chunk.samples));
+        }
+    }
+
+    shared.capture_started_at = Some(capture_started_at);
+    shared.capture_chunk_count = preroll_chunk_count;
+    shared.capture_input_ms = preroll_input_ms;
+    shared.capture_peak = preroll_peak;
+    shared.capture_rms = preroll_rms;
+    let buffer_chunks = shared.chunks.len();
+    drop(shared);
+
+    if let Some(audio_tx) = realtime_audio_tx {
+        for audio_bytes in preroll_audio {
+            let _ = audio_tx.send(audio_bytes);
+        }
+    }
 
     log_whisper_local_audio_event(
         "audio.capture.begin",
@@ -1132,7 +1168,10 @@ fn begin_native_audio_capture_for_session(
             "sample_rate": session.sample_rate,
             "owner_count": session.owners.len(),
             "buffered_ms": buffered_ms,
-            "buffer_chunks": shared.chunks.len(),
+            "buffer_chunks": buffer_chunks,
+            "preroll_ms": AUDIO_CAPTURE_PREROLL_MS,
+            "preroll_input_ms": preroll_input_ms,
+            "preroll_chunks": preroll_chunk_count,
         }),
     );
 
@@ -1362,7 +1401,8 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
         approximate_disk_mb: WHISPER_MODEL_DISK_MB,
         approximate_memory_mb: WHISPER_MODEL_MEMORY_MB,
         bytes,
-        shortcut: AUDIO_SHORTCUT,
+        shortcut: audio_push_to_talk_shortcut_for(app),
+        shortcuts: audio_shortcuts_status_for(app),
     })
 }
 
@@ -1664,6 +1704,8 @@ fn transcribe_whisper_audio_for(
     app: &AppHandle,
     warm_cache: &WhisperCliWarmCache,
     request: WhisperTranscriptionRequest,
+    cancel_token: Arc<AtomicU64>,
+    cancel_generation: u64,
 ) -> Result<WhisperTranscriptionResult, String> {
     let started_at = Instant::now();
     let audio_base64_chars = request.audio_base64.len();
@@ -1675,6 +1717,10 @@ fn transcribe_whisper_audio_for(
             "max_audio_bytes": WHISPER_MAX_AUDIO_BYTES,
         }),
     );
+
+    if cancel_token.load(Ordering::Acquire) != cancel_generation {
+        return Err("Local Whisper transcription canceled.".to_string());
+    }
 
     if request.audio_base64.len() > WHISPER_MAX_AUDIO_BYTES * 2 {
         log_whisper_local_audio_event(
@@ -1801,12 +1847,15 @@ fn transcribe_whisper_audio_for(
             "timeout_secs": WHISPER_TRANSCRIBE_TIMEOUT_SECS,
         }),
     );
-    let capture_result = run_command_capture(
+    let cancel_token_for_command = Arc::clone(&cancel_token);
+    let capture_result = run_command_capture_with_cancel(
         &runtime,
         &arg_refs,
         None,
         Duration::from_secs(WHISPER_TRANSCRIBE_TIMEOUT_SECS),
         None,
+        move || cancel_token_for_command.load(Ordering::Acquire) != cancel_generation,
+        "Local Whisper transcription canceled.",
     );
     let capture = match capture_result {
         Ok(capture) => {
@@ -1893,7 +1942,7 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         return Ok(window);
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         AUDIO_WIDGET_WINDOW_LABEL,
         WebviewUrl::App("index.html#/audio-widget".into()),
@@ -1904,12 +1953,53 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
-    .focused(true)
+    .focused(false)
     .transparent(true)
     .visible(false)
     .shadow(false)
     .build()
-    .map_err(|error| format!("Unable to create audio widget: {error}"))
+    .map_err(|error| format!("Unable to create audio widget: {error}"))?;
+
+    let app_handle = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::Destroyed) {
+            emit_audio_widget_current_visibility(&app_handle, false);
+        }
+    });
+
+    Ok(window)
+}
+
+fn audio_widget_visibility_for(
+    app: &AppHandle,
+    visible: bool,
+) -> Result<AudioWidgetVisibility, String> {
+    let status = whisper_model_status_for(app)?;
+
+    Ok(AudioWidgetVisibility {
+        visible,
+        installed: status.installed,
+        shortcut: status.shortcut,
+    })
+}
+
+fn audio_widget_status_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
+    let visible = app
+        .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+
+    audio_widget_visibility_for(app, visible)
+}
+
+fn emit_audio_widget_visibility_changed(app: &AppHandle, visibility: &AudioWidgetVisibility) {
+    let _ = app.emit(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, visibility.clone());
+}
+
+fn emit_audio_widget_current_visibility(app: &AppHandle, visible: bool) {
+    if let Ok(visibility) = audio_widget_visibility_for(app, visible) {
+        emit_audio_widget_visibility_changed(app, &visibility);
+    }
 }
 
 fn show_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
@@ -1921,11 +2011,13 @@ fn show_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Strin
         .map_err(|error| format!("Unable to show audio widget: {error}"))?;
     let _ = window.set_focus();
 
-    Ok(AudioWidgetVisibility {
+    let visibility = AudioWidgetVisibility {
         visible: true,
         installed: status.installed,
-        shortcut: AUDIO_SHORTCUT,
-    })
+        shortcut: audio_push_to_talk_shortcut_for(app),
+    };
+    emit_audio_widget_visibility_changed(app, &visibility);
+    Ok(visibility)
 }
 
 fn hide_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
@@ -1935,11 +2027,9 @@ fn hide_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Strin
             .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
     }
 
-    Ok(AudioWidgetVisibility {
-        visible: false,
-        installed: whisper_model_status_for(app)?.installed,
-        shortcut: AUDIO_SHORTCUT,
-    })
+    let visibility = audio_widget_visibility_for(app, false)?;
+    emit_audio_widget_visibility_changed(app, &visibility);
+    Ok(visibility)
 }
 
 fn toggle_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
@@ -2187,6 +2277,7 @@ async fn uninstall_whisper_model(
 
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
         let _ = window.hide();
+        emit_audio_widget_current_visibility(&app, false);
     }
 
     match fs::remove_dir_all(&model_directory) {
@@ -2217,12 +2308,22 @@ async fn transcribe_whisper_audio(
     request: WhisperTranscriptionRequest,
 ) -> Result<WhisperTranscriptionResult, String> {
     let engine = audio_state.whisper_engine.clone();
+    let cancel_token = Arc::clone(&audio_state.whisper_cancel_token);
+    let cancel_generation = cancel_token.load(Ordering::Acquire);
 
     tauri::async_runtime::spawn_blocking(move || {
-        transcribe_whisper_audio_for(&app, &engine, request)
+        transcribe_whisper_audio_for(&app, &engine, request, cancel_token, cancel_generation)
     })
         .await
         .map_err(|error| format!("Unable to run local Whisper transcription: {error}"))?
+}
+
+#[tauri::command]
+async fn cancel_whisper_transcription(audio_state: State<'_, AudioState>) -> Result<(), String> {
+    audio_state
+        .whisper_cancel_token
+        .fetch_add(1, Ordering::AcqRel);
+    Ok(())
 }
 
 async fn run_deepgram_realtime_stream(
@@ -2452,6 +2553,11 @@ async fn stop_deepgram_realtime_transcription(
 }
 
 #[tauri::command]
+async fn audio_widget_status(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
+    audio_widget_status_for(&app)
+}
+
+#[tauri::command]
 async fn show_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -2517,6 +2623,6 @@ async fn insert_transcribed_text(
     Ok(AudioWidgetVisibility {
         visible: widget_visible,
         installed: whisper_model_status_for(&app)?.installed,
-        shortcut: AUDIO_SHORTCUT,
+        shortcut: audio_push_to_talk_shortcut_for(&app),
     })
 }

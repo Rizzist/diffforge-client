@@ -193,6 +193,10 @@ import {
   AudioInputMeter,
   AudioInputMeta,
   AudioRecorderOptionRow,
+  AudioShortcutGrid,
+  AudioShortcutCard,
+  AudioShortcutKey,
+  AudioShortcutActions,
   AudioResultsPanel,
   AudioResultLine,
   AudioPathBlock,
@@ -343,14 +347,31 @@ import {
 
 export const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT = "forge-audio-model-download-progress";
 export const AUDIO_WIDGET_HASH = "#/audio-widget";
+export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibility-changed";
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
+const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
+const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
 const AUDIO_RECORDING_MAX_SECONDS = 90;
 const AUDIO_RECORDING_TIMER_MS = 250;
-const AUDIO_INPUT_METER_BARS = 24;
+const AUDIO_INPUT_METER_BARS = 32;
+const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
+const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 210;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
+const AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK = "push-to-talk";
+const AUDIO_SHORTCUT_ACTION_CANCEL = "cancel";
+const AUDIO_MODIFIER_CODES = new Set([
+  "AltLeft",
+  "AltRight",
+  "ControlLeft",
+  "ControlRight",
+  "MetaLeft",
+  "MetaRight",
+  "ShiftLeft",
+  "ShiftRight",
+]);
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing";
@@ -400,8 +421,205 @@ function formatFileSize(size) {
 }
 
 function formatAudioLevel(value) {
-  const level = Math.round(Math.max(0, Math.min(100, Number(value) || 0)));
+  const level = Math.round(clampAudioLevel(value));
   return `${level}%`;
+}
+
+function clampAudioLevel(value) {
+  return Math.max(0, Math.min(100, Number(value) || 0));
+}
+
+function buildInputMeterBarStyle(index, level, active) {
+  const normalizedLevel = clampAudioLevel(level) / 100;
+  const hasSignal = normalizedLevel >= 0.06;
+  const midpoint = (AUDIO_INPUT_METER_BARS - 1) / 2;
+  const centerLift = 1 - (Math.abs(index - midpoint) / midpoint);
+  const scatter = ((index * 7) % 19) / 18;
+  const ripple = Math.abs(Math.sin(index * 0.82));
+  const quietHeight = active
+    ? 10
+      + (centerLift * (hasSignal ? 18 : 8))
+      + (scatter * (hasSignal ? 12 : 4))
+      + (ripple * (hasSignal ? 8 : 3))
+    : 8;
+  const signalHeight = active
+    ? normalizedLevel * (44 + (centerLift * 24) + (scatter * 16))
+    : 0;
+  const height = Math.max(8, Math.min(96, quietHeight + signalHeight));
+
+  return {
+    "--bar-hue": `${184 + ((index * 11) % 68)}`,
+    "--delay": `${-1 * ((index * 53) % 920)}ms`,
+    "--duration": `${(hasSignal ? 760 : 1280) + ((index * 37) % (hasSignal ? 360 : 520))}ms`,
+    "--height": `${height.toFixed(1)}%`,
+    "--motion-high": hasSignal ? "1.12" : "1.035",
+    "--motion-low": hasSignal ? "0.78" : "0.94",
+    "--motion-mid": hasSignal ? "0.92" : "0.985",
+  };
+}
+
+function buildWidgetMeterBarStyle(index, level, processing) {
+  const normalizedLevel = clampAudioLevel(level) / 100;
+  const signalEnergy = processing ? 0.75 : Math.min(1, normalizedLevel * 8);
+  const midpoint = (AUDIO_WIDGET_METER_BARS - 1) / 2;
+  const centerLift = 1 - (Math.abs(index - midpoint) / midpoint);
+  const scatter = ((index * 11) % 23) / 22;
+  const ripple = Math.abs(Math.sin((index * 1.17) + (processing ? 0.9 : 0)));
+  const baseScale = (processing ? 0.24 : 0.14)
+    + (centerLift * (0.08 + (signalEnergy * 0.12)))
+    + (scatter * (0.04 + (signalEnergy * 0.1)))
+    + (ripple * (0.03 + (signalEnergy * 0.05)));
+  const signalScale = normalizedLevel * (0.34 + (centerLift * 0.32) + (scatter * 0.16));
+  const scale = Math.min(0.92, baseScale + signalScale);
+  const scaleLow = Math.max(0.12, scale - (processing ? 0.12 : 0.06 + (signalEnergy * 0.1)) - (scatter * 0.03));
+  const scaleHigh = Math.min(0.98, scale + (processing ? 0.17 : 0.08 + (signalEnergy * 0.16)) + (centerLift * 0.07));
+
+  return {
+    "--bar-hue": `${processing ? 192 + ((index * 9) % 46) : 198 + ((index * 13) % 66)}`,
+    "--delay": `${-1 * ((index * (processing ? 41 : 57)) % (processing ? 1100 : signalEnergy > 0.2 ? 1100 : 1700))}ms`,
+    "--duration": `${(processing ? 760 : signalEnergy > 0.2 ? 620 : 1320) + ((index * (processing ? 29 : 47)) % (processing ? 260 : signalEnergy > 0.2 ? 430 : 560))}ms`,
+    "--scale": scale.toFixed(2),
+    "--scale-high": scaleHigh.toFixed(2),
+    "--scale-low": scaleLow.toFixed(2),
+  };
+}
+
+function defaultPushToTalkShortcut() {
+  if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "")) {
+    return "MetaRight";
+  }
+
+  return "ContextMenu";
+}
+
+function fallbackShortcutStatus() {
+  const pushToTalk = defaultPushToTalkShortcut();
+
+  return {
+    pushToTalk: {
+      shortcut: pushToTalk,
+      defaultShortcut: pushToTalk,
+      registered: false,
+      error: "",
+    },
+    cancel: {
+      shortcut: "Escape",
+      defaultShortcut: "Escape",
+      registered: false,
+      error: "",
+    },
+  };
+}
+
+function normalizeShortcutForCompare(value) {
+  return String(value || "")
+    .split("+")
+    .map((token) => token.trim().replace(/[\s_-]+/g, "").toLowerCase())
+    .filter(Boolean)
+    .join("+");
+}
+
+function shortcutFromKeyboardEvent(event) {
+  const code = event.code || event.key || "";
+
+  if (!code) {
+    return "";
+  }
+
+  if (AUDIO_MODIFIER_CODES.has(code)) {
+    return code;
+  }
+
+  const modifiers = [];
+
+  if (event.ctrlKey) {
+    modifiers.push("Control");
+  }
+  if (event.altKey) {
+    modifiers.push("Alt");
+  }
+  if (event.shiftKey) {
+    modifiers.push("Shift");
+  }
+  if (event.metaKey) {
+    modifiers.push("Super");
+  }
+
+  return [...modifiers, code].join("+");
+}
+
+function shortcutMatchesEvent(shortcut, event) {
+  const eventShortcut = shortcutFromKeyboardEvent(event);
+
+  return Boolean(eventShortcut)
+    && normalizeShortcutForCompare(eventShortcut) === normalizeShortcutForCompare(shortcut);
+}
+
+function formatShortcutToken(token) {
+  const compact = String(token || "").trim().replace(/[\s_-]+/g, "");
+  const lower = compact.toLowerCase();
+
+  if (lower === "control" || lower === "ctrl") {
+    return "Ctrl";
+  }
+  if (lower === "alt" || lower === "option") {
+    return "Alt";
+  }
+  if (lower === "shift") {
+    return "Shift";
+  }
+  if (lower === "super" || lower === "command" || lower === "cmd" || lower === "meta") {
+    return "Cmd/Win";
+  }
+  if (lower === "contextmenu" || lower === "menu") {
+    return "Menu";
+  }
+  if (lower === "metaright" || lower === "osright") {
+    return "Right Cmd";
+  }
+  if (lower === "metaleft" || lower === "osleft") {
+    return "Left Cmd";
+  }
+  if (lower === "controlright") {
+    return "Right Ctrl";
+  }
+  if (lower === "controlleft") {
+    return "Left Ctrl";
+  }
+  if (lower === "altright") {
+    return "Right Alt";
+  }
+  if (lower === "altleft") {
+    return "Left Alt";
+  }
+  if (lower === "shiftright") {
+    return "Right Shift";
+  }
+  if (lower === "shiftleft") {
+    return "Left Shift";
+  }
+  if (lower === "escape" || lower === "esc") {
+    return "Esc";
+  }
+  if (lower === "space") {
+    return "Space";
+  }
+  if (/^key[a-z]$/i.test(compact)) {
+    return compact.slice(3).toUpperCase();
+  }
+  if (/^digit[0-9]$/i.test(compact)) {
+    return compact.slice(5);
+  }
+
+  return compact || "Unset";
+}
+
+function formatShortcutLabel(value) {
+  return String(value || "")
+    .split("+")
+    .map(formatShortcutToken)
+    .filter(Boolean)
+    .join(" + ") || "Unset";
 }
 
 function formatResultTime(value) {
@@ -423,6 +641,7 @@ export default function AudioWorkspaceView({
   audioError,
   audioModelStatus,
   audioStatusState,
+  audioWidgetVisible,
   onDownloadModel,
   onOpenWidget,
   onRefreshStatus,
@@ -440,6 +659,10 @@ export default function AudioWorkspaceView({
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
   const [latestAudioResult, setLatestAudioResult] = useState(readLastAudioTranscriptionResult);
+  const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
+  const [audioShortcutError, setAudioShortcutError] = useState("");
+  const [audioShortcutActionState, setAudioShortcutActionState] = useState("idle");
+  const [capturingAudioShortcut, setCapturingAudioShortcut] = useState("");
   const audioInputPreviewRef = useRef(null);
   const audioInputRunRef = useRef(0);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
@@ -447,11 +670,18 @@ export default function AudioWorkspaceView({
   const isCloudMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const deepgramReady = Boolean(deepgramApiKey.trim());
   const installed = Boolean(audioModelStatus?.installed);
+  const recorderOpen = Boolean(audioWidgetVisible);
   const recorderReady = isCloudMode ? deepgramReady : installed;
   const isBusy = audioActionState === "downloading"
     || audioActionState === "opening"
     || audioActionState === "uninstalling"
     || (!isCloudMode && audioStatusState === "checking");
+  const RecorderOpenButton = recorderOpen ? SecondaryButton : PrimaryButton;
+  const recorderButtonLabel = recorderOpen
+    ? "Recorder open"
+    : audioActionState === "opening"
+      ? "Opening..."
+      : "Open recorder";
   const canUninstall = Boolean(audioModelStatus?.managedAssetsInstalled || audioModelStatus?.modelInstalled);
   const downloadPercent = audioDownloadProgress?.percent;
   const modelBytes = Number(audioModelStatus?.bytes || 0);
@@ -478,7 +708,8 @@ export default function AudioWorkspaceView({
   const isUninstalling = audioActionState === "uninstalling";
   const selectedAudioInput = audioInputDevices.find((device) => device.deviceId === audioInputDeviceId);
   const selectedAudioInputLabel = selectedAudioInput?.label || "Default microphone";
-  const audioInputLevel = Math.min(100, Math.round(Math.max(audioInputStats.rms * 2400, audioInputStats.peak * 100)));
+  const audioInputLevel = Math.round(clampAudioLevel(Math.max(audioInputStats.rms * 2600, audioInputStats.peak * 120)));
+  const audioInputHasSignal = audioInputLevel >= 6;
   const audioInputStatusLabel = {
     checking: "Checking",
     "needs-access": "Setup needed",
@@ -487,6 +718,14 @@ export default function AudioWorkspaceView({
     previewing: "Monitoring",
     error: "Input issue",
   }[audioInputState] || "Input";
+  const effectiveShortcutStatus = audioShortcutStatus || audioModelStatus?.shortcuts || fallbackShortcutStatus();
+  const pushToTalkShortcut = effectiveShortcutStatus.pushToTalk?.shortcut
+    || audioModelStatus?.shortcut
+    || defaultPushToTalkShortcut();
+  const cancelShortcut = effectiveShortcutStatus.cancel?.shortcut || "Escape";
+  const pushToTalkShortcutError = effectiveShortcutStatus.pushToTalk?.error || "";
+  const cancelShortcutError = effectiveShortcutStatus.cancel?.error || "";
+  const isSavingShortcut = audioShortcutActionState === "saving";
 
   const stopAudioInputPreview = useCallback(async () => {
     audioInputRunRef.current += 1;
@@ -661,6 +900,119 @@ export default function AudioWorkspaceView({
     writeDeepgramLanguage(nextLanguage);
   }, []);
 
+  const loadAudioShortcutStatus = useCallback(async () => {
+    try {
+      const status = await invoke("audio_shortcuts_status");
+      setAudioShortcutStatus(status || fallbackShortcutStatus());
+      setAudioShortcutError("");
+    } catch (shortcutError) {
+      setAudioShortcutError(getErrorMessage(shortcutError, "Unable to load audio shortcuts."));
+    }
+  }, []);
+
+  const applyAudioShortcut = useCallback(async (action, shortcut) => {
+    if (!shortcut) {
+      return;
+    }
+
+    setAudioShortcutActionState("saving");
+    setAudioShortcutError("");
+
+    try {
+      const status = await invoke("set_audio_shortcut", {
+        request: {
+          action,
+          shortcut,
+        },
+      });
+      setAudioShortcutStatus(status || fallbackShortcutStatus());
+      setCapturingAudioShortcut("");
+      await onRefreshStatus?.();
+    } catch (shortcutError) {
+      setAudioShortcutError(getErrorMessage(shortcutError, "Unable to save that audio shortcut."));
+    } finally {
+      setAudioShortcutActionState("idle");
+    }
+  }, [onRefreshStatus]);
+
+  const resetAudioShortcuts = useCallback(async () => {
+    setAudioShortcutActionState("saving");
+    setAudioShortcutError("");
+
+    try {
+      const status = await invoke("reset_audio_shortcuts");
+      setAudioShortcutStatus(status || fallbackShortcutStatus());
+      setCapturingAudioShortcut("");
+      await onRefreshStatus?.();
+    } catch (shortcutError) {
+      setAudioShortcutError(getErrorMessage(shortcutError, "Unable to reset audio shortcuts."));
+    } finally {
+      setAudioShortcutActionState("idle");
+    }
+  }, [onRefreshStatus]);
+
+  useEffect(() => {
+    if (audioModelStatus?.shortcuts) {
+      setAudioShortcutStatus(audioModelStatus.shortcuts);
+    }
+  }, [audioModelStatus?.shortcuts]);
+
+  useEffect(() => {
+    loadAudioShortcutStatus();
+  }, [loadAudioShortcutStatus]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(AUDIO_SHORTCUTS_CHANGED_EVENT, (event) => {
+      if (!disposed) {
+        setAudioShortcutStatus(event.payload || fallbackShortcutStatus());
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!capturingAudioShortcut) {
+      return undefined;
+    }
+
+    const onKeyDown = (event) => {
+      if (event.repeat) {
+        return;
+      }
+
+      const shortcut = shortcutFromKeyboardEvent(event);
+
+      if (!shortcut) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      applyAudioShortcut(capturingAudioShortcut, shortcut);
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [applyAudioShortcut, capturingAudioShortcut]);
+
   useEffect(() => {
     loadAudioInputDevices();
 
@@ -810,7 +1162,7 @@ export default function AudioWorkspaceView({
               </SettingsIdentityItem>
               <SettingsIdentityItem>
                 <span>Shortcut</span>
-                <strong>{audioModelStatus?.shortcut || "CommandOrControl+Shift+Space"}</strong>
+                <strong>{formatShortcutLabel(pushToTalkShortcut)}</strong>
               </SettingsIdentityItem>
             </>
           )}
@@ -897,15 +1249,12 @@ export default function AudioWorkspaceView({
           <AudioInputMeter
             aria-hidden="true"
             data-active={audioInputState === "previewing"}
+            data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
           >
             {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
               <span
                 key={index}
-                style={{
-                  "--height": `${audioInputState === "previewing"
-                    ? Math.max(8, Math.min(94, 10 + audioInputLevel + ((index * 5) % 16)))
-                    : 10}%`,
-                }}
+                style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
               />
             ))}
           </AudioInputMeter>
@@ -919,6 +1268,70 @@ export default function AudioWorkspaceView({
               Auto-open after startup
             </McpSwitchButton>
           </AudioRecorderOptionRow>
+        </AudioDevicePanel>
+
+        <AudioDevicePanel aria-label="Audio shortcut settings">
+          <AudioDeviceHeader>
+            <div>
+              <SettingsLabel>Bindings</SettingsLabel>
+              <SettingsHint>Native recorder controls</SettingsHint>
+            </div>
+            <AudioStatePill data-installed={!pushToTalkShortcutError && !cancelShortcutError}>
+              {isSavingShortcut ? "Saving" : pushToTalkShortcutError || cancelShortcutError ? "Conflict" : "Ready"}
+            </AudioStatePill>
+          </AudioDeviceHeader>
+
+          <AudioShortcutGrid>
+            <AudioShortcutCard data-error={Boolean(pushToTalkShortcutError)}>
+              <span>Hold to record</span>
+              <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK}>
+                {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK
+                  ? "Press key"
+                  : formatShortcutLabel(pushToTalkShortcut)}
+              </AudioShortcutKey>
+              <AudioShortcutActions>
+                <SecondaryButton
+                  disabled={isSavingShortcut}
+                  onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK)}
+                  type="button"
+                >
+                  <ButtonKeyIcon aria-hidden="true" />
+                  <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK ? "Listening..." : "Change"}</span>
+                </SecondaryButton>
+              </AudioShortcutActions>
+              {pushToTalkShortcutError && <AudioInputMeta>{pushToTalkShortcutError}</AudioInputMeta>}
+            </AudioShortcutCard>
+
+            <AudioShortcutCard data-error={Boolean(cancelShortcutError)}>
+              <span>Cancel</span>
+              <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL}>
+                {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL
+                  ? "Press key"
+                  : formatShortcutLabel(cancelShortcut)}
+              </AudioShortcutKey>
+              <AudioShortcutActions>
+                <SecondaryButton
+                  disabled={isSavingShortcut}
+                  onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_CANCEL)}
+                  type="button"
+                >
+                  <ButtonKeyIcon aria-hidden="true" />
+                  <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL ? "Listening..." : "Change"}</span>
+                </SecondaryButton>
+              </AudioShortcutActions>
+              {cancelShortcutError && <AudioInputMeta>{cancelShortcutError}</AudioInputMeta>}
+            </AudioShortcutCard>
+          </AudioShortcutGrid>
+
+          <AudioRecorderOptionRow>
+            <SettingsHint>Default: {formatShortcutLabel(effectiveShortcutStatus.pushToTalk?.defaultShortcut || defaultPushToTalkShortcut())} / {formatShortcutLabel(effectiveShortcutStatus.cancel?.defaultShortcut || "Escape")}</SettingsHint>
+            <SecondaryButton disabled={isSavingShortcut} onClick={resetAudioShortcuts} type="button">
+              <ButtonRefreshIcon aria-hidden="true" />
+              <span>Reset defaults</span>
+            </SecondaryButton>
+          </AudioRecorderOptionRow>
+
+          {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
         </AudioDevicePanel>
 
         <AudioResultsPanel aria-label="Audio results">
@@ -988,15 +1401,15 @@ export default function AudioWorkspaceView({
 
         <AudioActionRow>
           {isCloudMode ? (
-            <PrimaryButton disabled={isBusy || !deepgramReady} onClick={onOpenWidget} type="button">
+            <RecorderOpenButton disabled={isBusy || recorderOpen || !deepgramReady} onClick={onOpenWidget} type="button">
               <ButtonMicIcon aria-hidden="true" />
-              <span>{audioActionState === "opening" ? "Opening..." : "Open recorder"}</span>
-            </PrimaryButton>
+              <span>{recorderButtonLabel}</span>
+            </RecorderOpenButton>
           ) : installed ? (
-            <PrimaryButton disabled={isBusy} onClick={onOpenWidget} type="button">
+            <RecorderOpenButton disabled={isBusy || recorderOpen} onClick={onOpenWidget} type="button">
               <ButtonMicIcon aria-hidden="true" />
-              <span>{audioActionState === "opening" ? "Opening..." : "Open recorder"}</span>
-            </PrimaryButton>
+              <span>{recorderButtonLabel}</span>
+            </RecorderOpenButton>
           ) : (
             <PrimaryButton disabled={isBusy} onClick={onDownloadModel} type="button">
               <ButtonMicIcon aria-hidden="true" />
@@ -1083,16 +1496,64 @@ export function AudioWidgetWindow() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [widgetAudioStats, setWidgetAudioStats] = useState(EMPTY_AUDIO_INPUT_STATS);
   const [widgetChromeReady, setWidgetChromeReady] = useState(false);
+  const [widgetFrameMode, setWidgetFrameModeState] = useState("compact");
+  const [shortcutStatus, setShortcutStatus] = useState(fallbackShortcutStatus);
   const [realtimeTranscript, setRealtimeTranscript] = useState("");
   const audioBufferRef = useRef(null);
   const pushToTalkDownRef = useRef(false);
+  const recordingRunRef = useRef(0);
   const stopAfterStartRef = useRef(false);
   const stopRecordingRef = useRef(null);
+  const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
 
   useEffect(() => {
     widgetStateRef.current = widgetState;
   }, [widgetState]);
+
+  const setWidgetFrameMode = useCallback((nextMode) => {
+    widgetFrameModeRef.current = nextMode;
+    setWidgetFrameModeState(nextMode);
+  }, []);
+
+  const resetWidgetToStartState = useCallback(() => {
+    const currentProvider = readAudioTranscriptionProvider();
+    const currentApiKey = readDeepgramApiKey();
+    const currentLanguage = readDeepgramLanguage();
+    const hasSetup = hasAudioInputSetup();
+
+    setTranscriptionProvider(currentProvider);
+    setDeepgramApiKey(currentApiKey);
+    setDeepgramLanguage(currentLanguage);
+    setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
+    setRealtimeTranscript("");
+    setRecordingStartedAt(0);
+    setElapsedMs(0);
+    setError("");
+
+    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+      const hasApiKey = Boolean(currentApiKey.trim());
+      const nextState = hasApiKey ? (hasSetup ? "ready" : "setup") : "missing";
+      widgetStateRef.current = nextState;
+      setWidgetState(nextState);
+      setModelStatus(null);
+      setMessage(hasApiKey
+        ? (hasSetup ? "Deepgram ready" : "Audio setup needed")
+        : "Add Deepgram key");
+      return;
+    }
+
+    if (!modelStatus?.installed) {
+      widgetStateRef.current = "missing";
+      setWidgetState("missing");
+      setMessage("Install Whisper from the Audio tab.");
+      return;
+    }
+
+    widgetStateRef.current = hasSetup ? "ready" : "setup";
+    setWidgetState(hasSetup ? "ready" : "setup");
+    setMessage(hasSetup ? "Model ready" : "Audio setup needed");
+  }, [modelStatus?.installed]);
 
   const startWarmBuffer = useCallback(async () => {
     if (audioBufferRef.current) {
@@ -1142,6 +1603,8 @@ export function AudioWidgetWindow() {
       return;
     }
 
+    const recordingRunId = recordingRunRef.current + 1;
+    recordingRunRef.current = recordingRunId;
     setError("");
     setMessage("Arming buffer");
     setRealtimeTranscript("");
@@ -1160,7 +1623,27 @@ export function AudioWidgetWindow() {
           },
         });
       }
+      if (recordingRunRef.current !== recordingRunId) {
+        if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+          await invoke("stop_deepgram_realtime_transcription").catch(() => {});
+        }
+        if (audioBufferRef.current === audioBuffer) {
+          audioBufferRef.current = null;
+        }
+        await audioBuffer.close().catch(() => {});
+        return;
+      }
       await audioBuffer.beginCapture();
+      if (recordingRunRef.current !== recordingRunId) {
+        if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+          await invoke("stop_deepgram_realtime_transcription").catch(() => {});
+        }
+        if (audioBufferRef.current === audioBuffer) {
+          audioBufferRef.current = null;
+        }
+        await audioBuffer.close().catch(() => {});
+        return;
+      }
       setRecordingStartedAt(Date.now());
       setElapsedMs(0);
       widgetStateRef.current = "recording";
@@ -1178,6 +1661,9 @@ export function AudioWidgetWindow() {
       const failedAudioBuffer = audioBufferRef.current;
       audioBufferRef.current = null;
       await failedAudioBuffer?.close?.().catch(() => {});
+      if (recordingRunRef.current !== recordingRunId) {
+        return;
+      }
       widgetStateRef.current = "error";
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
@@ -1243,6 +1729,15 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
+  const refreshShortcutStatus = useCallback(async () => {
+    try {
+      const status = await invoke("audio_shortcuts_status");
+      setShortcutStatus(status || fallbackShortcutStatus());
+    } catch {
+      setShortcutStatus(fallbackShortcutStatus());
+    }
+  }, []);
+
   const runWidgetWindowAction = useCallback((action) => {
     try {
       Promise.resolve(action(getCurrentWindow())).catch(() => {});
@@ -1251,28 +1746,44 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
-  const widgetSizeMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
+  const widgetTargetMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
 
   useEffect(() => {
-    const wantsFocus = widgetSizeMode === "focus";
-    const nextSize = wantsFocus
-      ? AUDIO_WIDGET_FOCUS_SIZE
-      : AUDIO_WIDGET_COMPACT_SIZE;
+    const wantsFocus = widgetTargetMode === "focus";
     let firstFrame = 0;
     let secondFrame = 0;
+    let closeTimer = 0;
 
     setWidgetChromeReady(false);
 
-    runWidgetWindowAction((windowHandle) => (
-      windowHandle.setSize(new LogicalSize(nextSize.width, nextSize.height))
-    ));
-
     if (wantsFocus) {
+      setWidgetFrameMode("focus");
+      runWidgetWindowAction((windowHandle) => (
+        windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_FOCUS_SIZE.width, AUDIO_WIDGET_FOCUS_SIZE.height))
+      ));
       firstFrame = window.requestAnimationFrame(() => {
         secondFrame = window.requestAnimationFrame(() => {
           setWidgetChromeReady(true);
         });
       });
+    } else if (widgetFrameModeRef.current === "focus") {
+      setWidgetFrameMode("closing");
+      closeTimer = window.setTimeout(() => {
+        if (isFocusedAudioWidgetState(widgetStateRef.current)) {
+          return;
+        }
+
+        setWidgetFrameMode("compact");
+        setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
+        runWidgetWindowAction((windowHandle) => (
+          windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
+        ));
+      }, AUDIO_WIDGET_CLOSE_ANIMATION_MS);
+    } else if (widgetFrameModeRef.current !== "closing") {
+      setWidgetFrameMode("compact");
+      runWidgetWindowAction((windowHandle) => (
+        windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
+      ));
     }
 
     return () => {
@@ -1282,8 +1793,11 @@ export function AudioWidgetWindow() {
       if (secondFrame) {
         window.cancelAnimationFrame(secondFrame);
       }
+      if (closeTimer) {
+        window.clearTimeout(closeTimer);
+      }
     };
-  }, [runWidgetWindowAction, widgetSizeMode]);
+  }, [runWidgetWindowAction, setWidgetFrameMode, widgetTargetMode]);
 
   const dragWidget = useCallback((event) => {
     event.preventDefault();
@@ -1320,6 +1834,7 @@ export function AudioWidgetWindow() {
 
   const stopRecording = useCallback(async () => {
     const audioBuffer = audioBufferRef.current;
+    const recordingRunId = recordingRunRef.current;
 
     if (!audioBuffer || widgetStateRef.current !== "recording") {
       return;
@@ -1349,17 +1864,24 @@ export function AudioWidgetWindow() {
             },
           });
       })();
-      audioBufferRef.current = null;
+      if (audioBufferRef.current === audioBuffer) {
+        audioBufferRef.current = null;
+      }
       await audioBuffer.close().catch(() => {});
+      if (recordingRunRef.current !== recordingRunId) {
+        return;
+      }
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "Deepgram final"
         : "Transcribed locally");
       const nextTranscript = (result?.text || "").trim();
 
       if (!nextTranscript) {
+        if (recordingRunRef.current !== recordingRunId) {
+          return;
+        }
         widgetStateRef.current = "ready";
         setWidgetState("ready");
-        setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
         setMessage("No transcript returned");
         return;
       }
@@ -1371,23 +1893,40 @@ export function AudioWidgetWindow() {
         text: nextTranscript,
       });
 
+      if (recordingRunRef.current !== recordingRunId) {
+        return;
+      }
+
       try {
         setMessage("Inserting into target");
         await invoke("insert_handsfree_transcribed_text", {
           text: nextTranscript,
         });
+        if (recordingRunRef.current !== recordingRunId) {
+          return;
+        }
         setMessage("Inserted into target");
       } catch (insertError) {
+        if (recordingRunRef.current !== recordingRunId) {
+          return;
+        }
         setMessage("Sent to Audio tab");
         setError(getErrorMessage(insertError, "Transcript saved, but focused insertion failed."));
       }
 
+      if (recordingRunRef.current !== recordingRunId) {
+        return;
+      }
       widgetStateRef.current = "ready";
       setWidgetState("ready");
-      setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
     } catch (recordingError) {
-      audioBufferRef.current = null;
+      if (audioBufferRef.current === audioBuffer) {
+        audioBufferRef.current = null;
+      }
       await audioBuffer.close().catch(() => {});
+      if (recordingRunRef.current !== recordingRunId) {
+        return;
+      }
       setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
       const messageText = getErrorMessage(recordingError, "Unable to transcribe audio.");
 
@@ -1397,12 +1936,32 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
+  const cancelRecording = useCallback(async () => {
+    recordingRunRef.current += 1;
+    pushToTalkDownRef.current = false;
+    stopAfterStartRef.current = false;
+
+    const audioBuffer = audioBufferRef.current;
+    const currentProvider = readAudioTranscriptionProvider();
+    audioBufferRef.current = null;
+
+    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+      await invoke("stop_deepgram_realtime_transcription").catch(() => {});
+    } else {
+      await invoke("cancel_whisper_transcription").catch(() => {});
+    }
+
+    await audioBuffer?.close?.().catch(() => {});
+    resetWidgetToStartState();
+  }, [resetWidgetToStartState]);
+
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
   }, [stopRecording]);
 
   useEffect(() => {
     refreshStatus();
+    refreshShortcutStatus();
 
     return () => {
       const audioBuffer = audioBufferRef.current;
@@ -1411,7 +1970,7 @@ export function AudioWidgetWindow() {
         audioBuffer.close().catch(() => {});
       }
     };
-  }, [refreshStatus]);
+  }, [refreshShortcutStatus, refreshStatus]);
 
   useEffect(() => {
     const syncAudioSettings = () => {
@@ -1430,6 +1989,31 @@ export function AudioWidgetWindow() {
 
     return () => {
       window.removeEventListener("storage", handleStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(AUDIO_SHORTCUTS_CHANGED_EVENT, (event) => {
+      if (!disposed) {
+        setShortcutStatus(event.payload || fallbackShortcutStatus());
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
     };
   }, []);
 
@@ -1502,14 +2086,18 @@ export function AudioWidgetWindow() {
     };
   }, []);
 
+  const widgetPushToTalkShortcut = shortcutStatus?.pushToTalk?.shortcut || defaultPushToTalkShortcut();
+  const widgetCancelShortcut = shortcutStatus?.cancel?.shortcut || "Escape";
+
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (event.key === "Escape") {
-        minimizeWidget();
+      if (shortcutMatchesEvent(widgetCancelShortcut, event)) {
+        event.preventDefault();
+        cancelRecording();
         return;
       }
 
-      if (event.key.toLowerCase() !== "p" || event.repeat) {
+      if (event.repeat || !shortcutMatchesEvent(widgetPushToTalkShortcut, event)) {
         return;
       }
 
@@ -1518,7 +2106,7 @@ export function AudioWidgetWindow() {
     };
 
     const onKeyUp = (event) => {
-      if (event.key.toLowerCase() !== "p") {
+      if (!shortcutMatchesEvent(widgetPushToTalkShortcut, event)) {
         return;
       }
 
@@ -1532,7 +2120,24 @@ export function AudioWidgetWindow() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [minimizeWidget, pressPushToTalk, releasePushToTalk]);
+  }, [cancelRecording, pressPushToTalk, releasePushToTalk, widgetCancelShortcut, widgetPushToTalkShortcut]);
+
+  useEffect(() => {
+    const onContextMenu = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+
+      if (pushToTalkDownRef.current) {
+        releasePushToTalk();
+      }
+    };
+
+    window.addEventListener("contextmenu", onContextMenu, true);
+    return () => {
+      window.removeEventListener("contextmenu", onContextMenu, true);
+    };
+  }, [releasePushToTalk]);
 
   useEffect(() => {
     let disposed = false;
@@ -1565,45 +2170,81 @@ export function AudioWidgetWindow() {
     };
   }, [pressPushToTalk, releasePushToTalk]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(AUDIO_CANCEL_EVENT, () => {
+      if (!disposed) {
+        cancelRecording();
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [cancelRecording]);
+
   const isCloudWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const installed = isCloudWidget ? Boolean(deepgramApiKey.trim()) : Boolean(modelStatus?.installed);
   const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
-  const widgetLevel = Math.min(100, Math.round((widgetAudioStats.rms || 0) * 1800));
+  const widgetLevel = Math.round(clampAudioLevel(Math.max((widgetAudioStats.rms || 0) * 2100, (widgetAudioStats.peak || 0) * 120)));
   const compactLabel = error
     || message
     || (installed ? "Audio recorder ready" : "Audio recorder setup needed");
   const isRecordingFocus = widgetState === "recording";
   const isProcessingFocus = widgetState === "transcribing";
-  const isFocusedWidget = widgetSizeMode === "focus";
-  const widgetMeterBars = 18;
+  const widgetHasSignal = isProcessingFocus || (isRecordingFocus && widgetLevel >= 6);
+  const isClosingFocus = widgetFrameMode === "closing";
+  const isFocusedWidget = widgetFrameMode !== "compact";
   const expandedLabel = isProcessingFocus
     ? (message || "Transcribing audio")
     : `Recording audio ${String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
 
   return (
     <>
       <GlobalStyle />
-      <AudioWidgetShell aria-label={isFocusedWidget ? expandedLabel : compactLabel} data-focus={isFocusedWidget} data-state={widgetState}>
+      <AudioWidgetShell
+        aria-label={widgetLabel}
+        data-closing={isClosingFocus ? "true" : undefined}
+        data-focus={isFocusedWidget}
+        data-state={widgetState}
+      >
         {isFocusedWidget ? (
-          <AudioWidgetFocusStage aria-label={expandedLabel} data-mode={isProcessingFocus ? "processing" : "recording"} role="status">
-            {isProcessingFocus ? (
+          <AudioWidgetFocusStage
+            aria-label={widgetLabel}
+            data-mode={isClosingFocus ? "closing" : isProcessingFocus ? "processing" : "recording"}
+            role="status"
+          >
+            {isProcessingFocus && !isClosingFocus ? (
               <AudioWidgetLoader aria-hidden="true" />
             ) : (
               <AudioWidgetLogo aria-hidden="true" data-size="focus" src="/logo.webp" alt="" />
             )}
             <AudioWidgetMeter
               data-active="true"
+              data-closing={isClosingFocus ? "true" : undefined}
               data-processing={isProcessingFocus ? "true" : undefined}
               data-prominent="true"
-              data-ready={widgetChromeReady ? "true" : "false"}
+              data-ready={widgetChromeReady && !isClosingFocus ? "true" : "false"}
+              data-signal={widgetHasSignal ? "live" : "quiet"}
               aria-hidden="true"
             >
-              {Array.from({ length: widgetMeterBars }, (_, index) => (
+              {Array.from({ length: AUDIO_WIDGET_METER_BARS }, (_, index) => (
                 <span
                   key={index}
-                  style={{
-                    "--scale": `${(Math.max(14, Math.min(92, 18 + widgetLevel + ((index * 9) % 24))) / 100).toFixed(2)}`,
-                  }}
+                  style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus)}
                 />
               ))}
             </AudioWidgetMeter>

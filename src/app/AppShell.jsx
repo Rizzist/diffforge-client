@@ -339,7 +339,7 @@ import {
 import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH } from "../audio/AudioWorkspaceView.jsx";
+import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import CoordinationWorkspaceView from "../coordination/CoordinationWorkspaceView.jsx";
 
 
@@ -1308,6 +1308,7 @@ export default function App() {
   const [audioActionState, setAudioActionState] = useState("idle");
   const [audioError, setAudioError] = useState("");
   const [audioDownloadProgress, setAudioDownloadProgress] = useState(null);
+  const [audioWidgetVisible, setAudioWidgetVisible] = useState(false);
   const [workspaces, setWorkspaces] = useState([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
@@ -1397,6 +1398,43 @@ export default function App() {
       cancelled = true;
       if (unlistenDownloadProgress) {
         unlistenDownloadProgress();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlistenVisibility = null;
+    let cancelled = false;
+
+    const syncAudioWidgetVisibility = async () => {
+      try {
+        const visibility = await invoke("audio_widget_status");
+        if (!cancelled) {
+          setAudioWidgetVisible(Boolean(visibility?.visible));
+        }
+      } catch {
+        if (!cancelled) {
+          setAudioWidgetVisible(false);
+        }
+      }
+    };
+
+    syncAudioWidgetVisibility();
+    listen(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, (visibilityEvent) => {
+      setAudioWidgetVisible(Boolean(visibilityEvent.payload?.visible));
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+
+      unlistenVisibility = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenVisibility) {
+        unlistenVisibility();
       }
     };
   }, []);
@@ -1935,6 +1973,7 @@ export default function App() {
     try {
       const status = await invoke("uninstall_whisper_model");
       setAudioModelStatus(status);
+      setAudioWidgetVisible(false);
       setAudioActionState("idle");
       setAudioDownloadProgress(null);
     } catch (error) {
@@ -1949,7 +1988,8 @@ export default function App() {
     setAudioError("");
 
     try {
-      await invoke("show_audio_widget");
+      const visibility = await invoke("show_audio_widget");
+      setAudioWidgetVisible(Boolean(visibility?.visible));
       setAudioActionState("idle");
     } catch (error) {
       setAudioActionState("error");
@@ -4274,6 +4314,7 @@ export default function App() {
                     audioError={audioError}
                     audioModelStatus={audioModelStatus}
                     audioStatusState={audioStatusState}
+                    audioWidgetVisible={audioWidgetVisible}
                     onDownloadModel={downloadAudioModel}
                     onOpenWidget={openAudioWidget}
                     onRefreshStatus={refreshAudioModelStatus}

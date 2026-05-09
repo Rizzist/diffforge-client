@@ -21,10 +21,10 @@ use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use tauri::{
     ipc::{Channel, InvokeResponseBody},
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
     sync::{mpsc, oneshot, Mutex, RwLock},
     time::{interval, timeout, MissedTickBehavior},
@@ -86,7 +86,7 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
-const AUDIO_SHORTCUT: &str = "CommandOrControl+Shift+Space";
+const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
 const WHISPER_MODEL_ID: &str = "base.en";
 const WHISPER_MODEL_NAME: &str = "Whisper base.en";
 const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
@@ -140,6 +140,7 @@ const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-pr
 const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
 const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_BUFFER_MAX_SECONDS: f64 = 12.0;
+const AUDIO_CAPTURE_PREROLL_MS: u64 = 300;
 const AUDIO_STATS_INTERVAL_MS: u64 = 140;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
@@ -245,6 +246,8 @@ struct AudioState {
     download_lock: Arc<Mutex<()>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     input_worker: NativeAudioWorker,
+    shortcut_manager: AudioShortcutManager,
+    whisper_cancel_token: Arc<AtomicU64>,
     whisper_engine: WhisperCliWarmCache,
 }
 
@@ -774,6 +777,54 @@ struct AudioInputCaptureResult {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct AudioShortcutRegistrationStatus {
+    shortcut: String,
+    default_shortcut: String,
+    registered: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioShortcutSettingsStatus {
+    push_to_talk: AudioShortcutRegistrationStatus,
+    cancel: AudioShortcutRegistrationStatus,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioShortcutBindings {
+    push_to_talk: String,
+    cancel: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioShortcutUpdateRequest {
+    action: String,
+    shortcut: String,
+}
+
+#[derive(Clone)]
+struct AudioShortcutManager {
+    state: Arc<StdMutex<AudioShortcutManagerState>>,
+}
+
+#[derive(Clone)]
+struct AudioShortcutManagerState {
+    push_to_talk: AudioShortcutRegistration,
+    cancel: AudioShortcutRegistration,
+}
+
+#[derive(Clone)]
+struct AudioShortcutRegistration {
+    shortcut: String,
+    registered: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct WhisperModelStatus {
     installed: bool,
     model_installed: bool,
@@ -794,7 +845,8 @@ struct WhisperModelStatus {
     approximate_disk_mb: u64,
     approximate_memory_mb: u64,
     bytes: u64,
-    shortcut: &'static str,
+    shortcut: String,
+    shortcuts: AudioShortcutSettingsStatus,
 }
 
 #[derive(Serialize, Clone)]
@@ -855,12 +907,12 @@ struct DeepgramRealtimeTranscriptEvent {
     speech_final: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AudioWidgetVisibility {
     visible: bool,
     installed: bool,
-    shortcut: &'static str,
+    shortcut: String,
 }
 
 struct PreparedPromptImages {
@@ -1006,6 +1058,8 @@ pub fn run() {
             download_lock: Arc::new(Mutex::new(())),
             deepgram_stream: Arc::new(Mutex::new(None)),
             input_worker: NativeAudioWorker::new(),
+            shortcut_manager: AudioShortcutManager::new(),
+            whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
         })
         .plugin(tauri_plugin_deep_link::init())
@@ -1014,31 +1068,7 @@ pub fn run() {
         .setup(move |app| {
             pty_pool.ensure_warm_async();
 
-            if let Err(error) =
-                app.global_shortcut()
-                    .on_shortcut(AUDIO_SHORTCUT, |app, _shortcut, event| {
-                        if event.state != ShortcutState::Pressed {
-                            return;
-                        }
-
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Ok(visibility) = toggle_audio_widget_for(&app) {
-                                if visibility.visible {
-                                    let prepare_app = app.clone();
-                                    let engine = app.state::<AudioState>().whisper_engine.clone();
-                                    let _ = tauri::async_runtime::spawn_blocking(move || {
-                                        let _ = prepare_whisper_model_for(&prepare_app, &engine);
-                                    });
-                                }
-                            }
-                        });
-                    })
-            {
-                eprintln!("Unable to register Diff Forge audio shortcut: {error}");
-            }
-
-            register_audio_push_to_talk_shortcut(app.handle());
+            register_audio_shortcuts(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -1085,8 +1115,13 @@ pub fn run() {
             finish_audio_input_capture,
             prepare_whisper_model,
             transcribe_whisper_audio,
+            cancel_whisper_transcription,
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
+            audio_shortcuts_status,
+            set_audio_shortcut,
+            reset_audio_shortcuts,
+            audio_widget_status,
             show_audio_widget,
             hide_audio_widget,
             toggle_audio_widget,
