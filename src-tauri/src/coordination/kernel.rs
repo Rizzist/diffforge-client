@@ -32,7 +32,6 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "claim_task",
     "post_plan",
     "acquire_lease",
-    "db_acquire_lease",
     "renew_lease",
     "release_lease",
     "list_active_leases",
@@ -40,12 +39,11 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "validate_patch",
     "list_workspace_violations",
     "search_memory",
+    "get_slot_status",
     "db_get_mode",
     "db_classify_sql",
+    "db_request_approval",
     "request_approval",
-    "orchestrator_get_status",
-    "orchestrator_list_runs",
-    "orchestrator_get_brief",
 ];
 
 pub fn now_rfc3339() -> String {
@@ -208,6 +206,7 @@ impl CoordinationKernel {
         let payload_json = payload.to_string();
         let task_id = refs.task_id.as_deref();
         let agent_id = refs.agent_id.as_deref();
+        let agent_slot_id = refs.agent_slot_id.as_deref();
         let session_id = refs.session_id.as_deref();
         let resource_id = refs.resource_id.as_deref();
         let artifact_id = refs.artifact_id.as_deref();
@@ -217,12 +216,12 @@ impl CoordinationKernel {
             let id = uuid();
             match self.conn.execute(
                 "INSERT INTO events(
-                    id, seq, event_type, actor_type, actor_id, task_id, agent_id, session_id,
+                    id, seq, event_type, actor_type, actor_id, task_id, agent_id, agent_slot_id, session_id,
                     resource_id, artifact_id, orchestration_run_id, payload_json, created_at
                 ) VALUES(
                     ?1,
                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM events),
-                    ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                    ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
                 )",
                 params![
                     id,
@@ -231,6 +230,7 @@ impl CoordinationKernel {
                     actor_id,
                     task_id,
                     agent_id,
+                    agent_slot_id,
                     session_id,
                     resource_id,
                     artifact_id,
@@ -298,6 +298,170 @@ impl CoordinationKernel {
         Ok(json!({"id": id, "name": name, "kind": kind, "role": role, "status": "available"}))
     }
 
+    pub fn normalize_slot_key(&self, slot_key: &str) -> Result<String, String> {
+        normalize_agent_slot_key(slot_key)
+    }
+
+    pub fn get_or_create_agent_slot(
+        &self,
+        slot_key: &str,
+        agent_name: &str,
+        agent_kind: &str,
+        role: Option<&str>,
+    ) -> Result<Value, String> {
+        let slot_key = normalize_agent_slot_key(slot_key)?;
+        let agent = self.create_or_get_agent(agent_name, agent_kind, role)?;
+        self.get_or_create_agent_slot_for_agent(&slot_key, &agent)
+    }
+
+    fn get_or_create_agent_slot_for_agent(
+        &self,
+        slot_key: &str,
+        agent: &Value,
+    ) -> Result<Value, String> {
+        let slot_key = normalize_agent_slot_key(slot_key)?;
+        let agent_id = required_string(agent, "id")?;
+        let agent_name = required_string(agent, "name")?;
+        let agent_kind = required_string(agent, "kind")?;
+        let mcp_config_path = self
+            .paths
+            .mcp_root
+            .join("agents")
+            .join(format!("{slot_key}.json"));
+        let mcp_config_path_text = process_path_text(&mcp_config_path);
+
+        if let Some(slot_id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM agent_slots WHERE slot_key=?1",
+                [&slot_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to inspect agent slot: {error}"))?
+        {
+            let now = now_rfc3339();
+            self.conn
+                .execute(
+                    "UPDATE agent_slots
+                     SET agent_id=?1, agent_name=?2, agent_kind=?3, mcp_config_path=?4,
+                         status=CASE WHEN status='disabled' THEN status ELSE 'available' END,
+                         updated_at=?5
+                     WHERE id=?6",
+                    params![
+                        agent_id,
+                        agent_name,
+                        agent_kind,
+                        mcp_config_path_text,
+                        now,
+                        slot_id
+                    ],
+                )
+                .map_err(|error| format!("Unable to refresh agent slot: {error}"))?;
+            self.emit_event(
+                "agent_slot_reused",
+                "agent",
+                agent_id,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: Some(slot_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({"slot_key": slot_key}),
+            )?;
+            return self.get_agent_slot_by_id(&slot_id);
+        }
+
+        let id = uuid();
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO agent_slots(
+                    id, slot_key, agent_id, agent_name, agent_kind, status,
+                    active_session_id, default_task_id, mcp_config_path, worktree_id,
+                    created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 'available', NULL, NULL, ?6, NULL, ?7, ?7)",
+                params![
+                    id,
+                    slot_key,
+                    agent_id,
+                    agent_name,
+                    agent_kind,
+                    mcp_config_path_text,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to create agent slot: {error}"))?;
+        self.emit_event(
+            "agent_slot_created",
+            "agent",
+            agent_id,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: Some(id.clone()),
+                ..EventRefs::default()
+            },
+            json!({"slot_key": slot_key, "mcp_config_path": mcp_config_path_text}),
+        )?;
+        self.get_agent_slot_by_id(&id)
+    }
+
+    fn get_agent_slot_by_id(&self, slot_id: &str) -> Result<Value, String> {
+        self.query_one(
+            "SELECT * FROM agent_slots WHERE id=?1",
+            &[&slot_id],
+            "Agent slot does not exist.",
+        )
+    }
+
+    fn get_agent_by_id(&self, agent_id: &str) -> Result<Value, String> {
+        self.query_one(
+            "SELECT * FROM agents WHERE id=?1",
+            &[&agent_id],
+            "Agent does not exist.",
+        )
+    }
+
+    pub fn get_slot_status(
+        &self,
+        agent_slot_id: Option<&str>,
+        slot_key: Option<&str>,
+    ) -> Result<Value, String> {
+        let slot = if let Some(agent_slot_id) =
+            agent_slot_id.filter(|value| !value.trim().is_empty())
+        {
+            self.get_agent_slot_by_id(agent_slot_id)?
+        } else if let Some(slot_key) = slot_key.filter(|value| !value.trim().is_empty()) {
+            let slot_key = normalize_agent_slot_key(slot_key)?;
+            self.query_one(
+                "SELECT * FROM agent_slots WHERE slot_key=?1",
+                &[&slot_key],
+                "Agent slot does not exist.",
+            )?
+        } else {
+            return Ok(api_ok(json!({
+                "slots": self.query_json("SELECT * FROM agent_slots ORDER BY slot_key", &[])?,
+                "mcp_configs": self.query_json("SELECT * FROM mcp_configs ORDER BY updated_at DESC", &[])?,
+            })));
+        };
+        let slot_id = slot["id"].as_str().unwrap_or_default();
+        Ok(api_ok(json!({
+            "slot": slot,
+            "session": self.query_json(
+                "SELECT * FROM agent_sessions WHERE agent_slot_id=?1 ORDER BY updated_at DESC LIMIT 1",
+                &[&slot_id],
+            )?,
+            "worktree": self.query_json(
+                "SELECT * FROM worktrees WHERE agent_slot_id=?1 ORDER BY updated_at DESC LIMIT 1",
+                &[&slot_id],
+            )?,
+            "mcp_config": self.query_json(
+                "SELECT * FROM mcp_configs WHERE agent_slot_id=?1",
+                &[&slot_id],
+            )?,
+        })))
+    }
+
     pub fn create_task(
         &self,
         title: &str,
@@ -353,7 +517,8 @@ impl CoordinationKernel {
         agent_id: &str,
         session_id: &str,
     ) -> Result<Value, String> {
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        let agent_slot_id = session["agent_slot_id"].as_str();
         let blockers = self.unsatisfied_dependencies(task_id)?;
         if !blockers.is_empty() {
             self.emit_event(
@@ -363,6 +528,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: agent_slot_id.map(str::to_string),
                     session_id: Some(session_id.to_string()),
                     ..EventRefs::default()
                 },
@@ -401,6 +567,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.map(str::to_string),
                 session_id: Some(session_id.to_string()),
                 ..EventRefs::default()
             },
@@ -441,7 +608,8 @@ impl CoordinationKernel {
         session_id: &str,
         plan: &str,
     ) -> Result<Value, String> {
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        let agent_slot_id = session["agent_slot_id"].as_str();
         self.ensure_session_authorized_for_task(session_id, task_id)?;
         self.emit_event(
             "plan_posted",
@@ -450,6 +618,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.map(str::to_string),
                 session_id: Some(session_id.to_string()),
                 ..EventRefs::default()
             },
@@ -469,6 +638,106 @@ impl CoordinationKernel {
         orchestration_role: Option<&str>,
     ) -> Result<Value, String> {
         self.ensure_agent_exists(agent_id)?;
+        let agent = self.get_agent_by_id(agent_id)?;
+        let slot_key = derive_slot_key(agent["kind"].as_str().unwrap_or("agent"), pty_id, None)?;
+        let slot = self.get_or_create_agent_slot_for_agent(&slot_key, &agent)?;
+        self.create_session_for_slot(
+            &slot,
+            task_id,
+            pty_id,
+            write_enabled,
+            orchestration_run_id,
+            orchestration_role,
+        )
+    }
+
+    pub fn create_session_for_slot_key(
+        &self,
+        slot_key: &str,
+        agent_name: &str,
+        agent_kind: &str,
+        role: Option<&str>,
+        task_id: Option<&str>,
+        pty_id: Option<&str>,
+        write_enabled: bool,
+        orchestration_run_id: Option<&str>,
+        orchestration_role: Option<&str>,
+    ) -> Result<Value, String> {
+        let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
+        self.create_session_for_slot(
+            &slot,
+            task_id,
+            pty_id,
+            write_enabled,
+            orchestration_run_id,
+            orchestration_role,
+        )
+    }
+
+    fn create_session_for_slot(
+        &self,
+        slot: &Value,
+        task_id: Option<&str>,
+        pty_id: Option<&str>,
+        write_enabled: bool,
+        orchestration_run_id: Option<&str>,
+        orchestration_role: Option<&str>,
+    ) -> Result<Value, String> {
+        let agent_id = required_string(slot, "agent_id")?;
+        let agent_slot_id = required_string(slot, "id")?;
+        let slot_key = required_string(slot, "slot_key")?;
+        self.ensure_agent_exists(agent_id)?;
+
+        if let Some(active_session_id) = slot["active_session_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            if let Ok(existing) = self.query_one(
+                "SELECT * FROM agent_sessions WHERE id=?1",
+                &[&active_session_id],
+                "Session does not exist.",
+            ) {
+                if existing["status"].as_str() == Some("active") && session_is_fresh(&existing) {
+                    let existing_pty = existing["pty_id"].as_str().unwrap_or("");
+                    let requested_pty = pty_id.unwrap_or("");
+                    if !requested_pty.is_empty() && existing_pty == requested_pty {
+                        self.heartbeat_session(active_session_id)?;
+                        if let Some(task_id) = task_id {
+                            self.conn
+                                .execute(
+                                    "UPDATE agent_sessions SET task_id=?1, updated_at=?2 WHERE id=?3",
+                                    params![task_id, now_rfc3339(), active_session_id],
+                                )
+                                .map_err(|error| {
+                                    format!("Unable to refresh active slot session: {error}")
+                                })?;
+                        }
+                        let worktree_path = existing["worktree_id"]
+                            .as_str()
+                            .and_then(|_| existing["write_root"].as_str());
+                        let mcp_config = self.write_or_update_slot_mcp_config(
+                            agent_slot_id,
+                            active_session_id,
+                            task_id.or_else(|| existing["task_id"].as_str()),
+                            existing["worktree_id"].as_str(),
+                            worktree_path,
+                            orchestration_run_id
+                                .or_else(|| existing["orchestration_run_id"].as_str()),
+                            orchestration_role.or_else(|| existing["orchestration_role"].as_str()),
+                        )?;
+                        return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
+                    }
+                    return Err(format!(
+                        "slot_busy: agent slot {slot_key} already has active session {active_session_id}."
+                    ));
+                }
+
+                if existing["status"].as_str() == Some("active") {
+                    let _ = self.interrupt_session(active_session_id, "stale_slot_session")?;
+                }
+            }
+        }
+
         let id = uuid();
         let now = now_rfc3339();
         let mut enforcement_mode = if write_enabled {
@@ -482,75 +751,38 @@ impl CoordinationKernel {
         let mut base_git_sha = None;
         let mut warnings = Vec::new();
 
-        self.conn
-            .execute(
-                "INSERT INTO agent_sessions(
-                    id, agent_id, task_id, orchestration_run_id, orchestration_role, pty_id,
-                    status, write_root, enforcement_mode, last_heartbeat_at, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?9, ?9)",
-                params![
-                    id,
-                    agent_id,
-                    task_id,
-                    orchestration_run_id,
-                    orchestration_role,
-                    pty_id,
-                    write_root,
-                    enforcement_mode,
-                    now
-                ],
-            )
-            .map_err(|error| format!("Unable to create agent session: {error}"))?;
-
         if write_enabled {
-            match self.create_worktree_for_session(agent_id, &id, task_id) {
+            match self.create_or_reuse_worktree_for_slot(agent_slot_id) {
                 Ok(worktree) => {
                     worktree_id = Some(worktree["id"].as_str().unwrap_or_default().to_string());
                     write_root = worktree["path"].as_str().unwrap_or_default().to_string();
                     base_git_sha = worktree["baseSha"].as_str().map(str::to_string);
-                    self.conn
-                        .execute(
-                            "UPDATE agent_sessions
-                             SET worktree_id=?1, write_root=?2, base_git_sha=?3, current_git_sha=?3,
-                                 enforcement_mode='worktree_required', updated_at=?4
-                             WHERE id=?5",
-                            params![worktree_id, write_root, base_git_sha, now_rfc3339(), id],
-                        )
-                        .map_err(|error| {
-                            format!("Unable to attach worktree to session: {error}")
-                        })?;
                     self.emit_event(
                         "session_write_root_assigned",
                         "agent",
                         agent_id,
                         EventRefs {
                             agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(id.clone()),
                             task_id: task_id.map(str::to_string),
                             orchestration_run_id: orchestration_run_id.map(str::to_string),
                             ..EventRefs::default()
                         },
-                        json!({"worktree_id": worktree_id, "write_root": write_root, "enforcement_mode": enforcement_mode}),
+                        json!({"slot_key": slot_key, "worktree_id": worktree_id, "write_root": write_root, "enforcement_mode": enforcement_mode}),
                     )?;
                 }
                 Err(error) => {
                     enforcement_mode = "coordination_only".to_string();
                     warnings.push(error.clone());
                     warnings.push("Safe git worktree isolation is unavailable; submit_patch and merge are blocked by default.".to_string());
-                    self.conn
-                        .execute(
-                            "UPDATE agent_sessions SET enforcement_mode='coordination_only', write_root=?1, updated_at=?2 WHERE id=?3",
-                            params![self.paths.repo_path.display().to_string(), now_rfc3339(), id],
-                        )
-                        .map_err(|update_error| {
-                            format!("Unable to mark session coordination_only after worktree failure: {update_error}")
-                        })?;
                     self.emit_event(
                         "workspace_violation_created",
                         "kernel",
                         REPO_ID,
                         EventRefs {
                             agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(id.clone()),
                             task_id: task_id.map(str::to_string),
                             orchestration_run_id: orchestration_run_id.map(str::to_string),
@@ -562,18 +794,67 @@ impl CoordinationKernel {
             }
         }
 
+        self.conn
+            .execute(
+                "INSERT INTO agent_sessions(
+                    id, agent_id, agent_slot_id, task_id, orchestration_run_id,
+                    orchestration_role, pty_id, worktree_id, base_git_sha, current_git_sha,
+                    status, write_root, enforcement_mode, last_heartbeat_at, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'active', ?10, ?11, ?12, ?12, ?12)",
+                params![
+                    id,
+                    agent_id,
+                    agent_slot_id,
+                    task_id,
+                    orchestration_run_id,
+                    orchestration_role,
+                    pty_id,
+                    worktree_id,
+                    base_git_sha,
+                    write_root,
+                    enforcement_mode,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to create agent session: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE agent_slots
+                 SET active_session_id=?1, worktree_id=COALESCE(?2, worktree_id), status='active', updated_at=?3
+                 WHERE id=?4",
+                params![id, worktree_id, now_rfc3339(), agent_slot_id],
+            )
+            .map_err(|error| format!("Unable to attach session to agent slot: {error}"))?;
+
+        let mcp_config = self.write_or_update_slot_mcp_config(
+            agent_slot_id,
+            &id,
+            task_id,
+            worktree_id.as_deref(),
+            if worktree_id.is_some() {
+                Some(write_root.as_str())
+            } else {
+                None
+            },
+            orchestration_run_id,
+            orchestration_role,
+        )?;
+
         self.emit_event(
             "agent_started",
             "agent",
             agent_id,
             EventRefs {
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: Some(agent_slot_id.to_string()),
                 session_id: Some(id.clone()),
                 task_id: task_id.map(str::to_string),
                 orchestration_run_id: orchestration_run_id.map(str::to_string),
                 ..EventRefs::default()
             },
             json!({
+                "slot_key": slot_key,
+                "agent_slot_id": agent_slot_id,
                 "pty_id": pty_id,
                 "write_enabled": write_enabled,
                 "worktree_id": worktree_id,
@@ -582,18 +863,12 @@ impl CoordinationKernel {
             }),
         )?;
 
-        Ok(json!({
-            "id": id,
-            "agentId": agent_id,
-            "taskId": task_id,
-            "ptyId": pty_id,
-            "worktreeId": worktree_id,
-            "writeRoot": write_root,
-            "enforcementMode": enforcement_mode,
-            "baseGitSha": base_git_sha,
-            "status": "active",
-            "warnings": warnings,
-        }))
+        let session = self.query_one(
+            "SELECT * FROM agent_sessions WHERE id=?1",
+            &[&id],
+            "Session does not exist after creation.",
+        )?;
+        Ok(self.session_response(&session, slot, &mcp_config, warnings))
     }
 
     pub fn prepare_terminal_context(
@@ -626,6 +901,8 @@ impl CoordinationKernel {
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
             .to_string();
+        let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
+        let slot_key = session["slotKey"].as_str().map(str::to_string);
         let worktree_id = session["worktreeId"].as_str().map(str::to_string);
         let write_root = session["writeRoot"]
             .as_str()
@@ -649,20 +926,23 @@ impl CoordinationKernel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mcp_config = self.write_session_mcp_config(
-            &agent_id,
-            &session_id,
-            workspace_id,
-            &objective_key,
-            task_id,
-            worktree_id.as_deref(),
-            worktree_path.as_deref(),
-            orchestration_run_id,
-            orchestration_role,
-        )?;
+        let mcp_config_path = session["mcpConfigPath"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let codex_mcp_config_path = session["codexMcpConfigPath"]
+            .as_str()
+            .unwrap_or(mcp_config_path.as_str())
+            .to_string();
+        let claude_mcp_config_path = session["claudeMcpConfigPath"]
+            .as_str()
+            .unwrap_or(mcp_config_path.as_str())
+            .to_string();
 
         Ok(TerminalCoordinationContext {
             agent_id,
+            agent_slot_id,
+            slot_key,
             session_id,
             task_id: task_id.map(str::to_string),
             worktree_id,
@@ -671,9 +951,9 @@ impl CoordinationKernel {
             enforcement_mode,
             db_path: self.paths.db_path.display().to_string(),
             repo_path: self.paths.repo_path.display().to_string(),
-            mcp_config_path: mcp_config.generic_path,
-            codex_mcp_config_path: mcp_config.codex_path,
-            claude_mcp_config_path: mcp_config.claude_path,
+            mcp_config_path,
+            codex_mcp_config_path,
+            claude_mcp_config_path,
             mcp_command: "coordination_mcp".to_string(),
             workspace_id: workspace_id.map(str::to_string),
             objective_key,
@@ -701,7 +981,7 @@ impl CoordinationKernel {
         }
 
         let active_leases = self.query_json(
-            "SELECT id, task_id, agent_id, session_id, resource_id FROM leases WHERE session_id=?1 AND status='active'",
+            "SELECT id, task_id, agent_id, agent_slot_id, session_id, resource_id FROM leases WHERE session_id=?1 AND status='active'",
             &[&session_id],
         )?;
         let active_worktrees = self.query_json(
@@ -731,6 +1011,14 @@ impl CoordinationKernel {
                 params![now, session_id],
             )
             .map_err(|error| format!("Unable to mark interrupted session worktrees: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE agent_slots
+                 SET active_session_id=NULL, status='available', updated_at=?1
+                 WHERE active_session_id=?2",
+                params![now, session_id],
+            )
+            .map_err(|error| format!("Unable to release interrupted session slot: {error}"))?;
 
         for lease in &active_leases {
             self.emit_event(
@@ -740,6 +1028,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: lease["task_id"].as_str().map(str::to_string),
                     agent_id: lease["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: lease["agent_slot_id"].as_str().map(str::to_string),
                     session_id: lease["session_id"].as_str().map(str::to_string),
                     resource_id: lease["resource_id"].as_str().map(str::to_string),
                     ..EventRefs::default()
@@ -759,6 +1048,7 @@ impl CoordinationKernel {
             EventRefs {
                 session_id: session["id"].as_str().map(str::to_string),
                 agent_id: session["agent_id"].as_str().map(str::to_string),
+                agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
                 task_id: session["task_id"].as_str().map(str::to_string),
                 orchestration_run_id: session["orchestration_run_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
@@ -785,7 +1075,6 @@ impl CoordinationKernel {
         workspace_name: Option<&str>,
     ) -> Result<Value, String> {
         let objective_key = require_workspace_objective_key(workspace_id)?;
-        let workspace_slug = slug(&objective_key);
         let (command, mut args) = self.coordination_mcp_command_spec();
         args.extend([
             "--repo-path".to_string(),
@@ -824,21 +1113,12 @@ impl CoordinationKernel {
                 }
             }
         });
-        let generic_path = self
-            .paths
-            .mcp_root
-            .join(format!("workspace-{workspace_slug}.json"));
-        let codex_path = self
-            .paths
-            .mcp_root
-            .join(format!("workspace-{workspace_slug}.codex.toml"));
-        let claude_path = self
-            .paths
-            .mcp_root
-            .join(format!("workspace-{workspace_slug}.claude.json"));
-        write_json_file(&generic_path, &generic_config)?;
-        write_text_file(&codex_path, &codex_config_toml(&command, &args))?;
-        write_json_file(&claude_path, &generic_config)?;
+        let generic_path = self.paths.mcp_root.join("coordination.json");
+        let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
+        let claude_path = self.paths.mcp_root.join("coordination.claude.json");
+        write_json_file_atomic(&generic_path, &generic_config)?;
+        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+        write_json_file_atomic(&claude_path, &generic_config)?;
 
         Ok(json!({
             "server_name": "coordination-kernel",
@@ -859,18 +1139,19 @@ impl CoordinationKernel {
         }))
     }
 
-    fn write_session_mcp_config(
+    fn write_or_update_slot_mcp_config(
         &self,
-        agent_id: &str,
+        agent_slot_id: &str,
         session_id: &str,
-        workspace_id: Option<&str>,
-        objective_key: &str,
         task_id: Option<&str>,
         worktree_id: Option<&str>,
         worktree_path: Option<&str>,
         orchestration_run_id: Option<&str>,
         orchestration_role: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
+        let slot = self.get_agent_slot_by_id(agent_slot_id)?;
+        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_key = required_string(&slot, "slot_key")?;
         let (command, mut args) = self.coordination_mcp_command_spec();
         args.extend([
             "--repo-path".to_string(),
@@ -879,14 +1160,13 @@ impl CoordinationKernel {
             process_path_text(&self.paths.db_path),
             "--agent-id".to_string(),
             agent_id.to_string(),
+            "--agent-slot-id".to_string(),
+            agent_slot_id.to_string(),
+            "--slot-key".to_string(),
+            slot_key.to_string(),
             "--session-id".to_string(),
             session_id.to_string(),
-            "--objective-key".to_string(),
-            objective_key.to_string(),
         ]);
-        if let Some(value) = workspace_id {
-            args.extend(["--workspace-id".to_string(), value.to_string()]);
-        }
         if let Some(value) = task_id {
             args.extend(["--task-id".to_string(), value.to_string()]);
         }
@@ -911,32 +1191,47 @@ impl CoordinationKernel {
                     "env": {
                         "COORDINATION_ENABLED": "1",
                         "COORDINATION_AGENT_ID": agent_id,
+                        "COORDINATION_AGENT_SLOT_ID": agent_slot_id,
+                        "COORDINATION_SLOT_KEY": slot_key,
                         "COORDINATION_SESSION_ID": session_id,
-                        "COORDINATION_WORKSPACE_ID": workspace_id,
-                        "COORDINATION_OBJECTIVE_KEY": objective_key,
                         "COORDINATION_MCP_ALWAYS_ON": "1"
                     },
                     "diffforge": {
                         "scope": "workspace",
-                        "workspaceId": workspace_id,
-                        "objectiveKey": objective_key,
+                        "slotKey": slot_key,
+                        "agentSlotId": agent_slot_id,
                         "alwaysOn": true,
-                        "toggleable": false
+                        "toggleable": false,
+                        "authority": "local_coordination_kernel"
                     }
                 }
             }
         });
         let claude_config = generic_config.clone();
-        let generic_path = self.paths.mcp_root.join(format!("{session_id}.json"));
-        let codex_path = self.paths.mcp_root.join(format!("{session_id}.codex.toml"));
+        let generic_path = self
+            .paths
+            .mcp_root
+            .join("agents")
+            .join(format!("{slot_key}.json"));
+        let codex_path = self
+            .paths
+            .mcp_root
+            .join("agents")
+            .join(format!("{slot_key}.codex.toml"));
         let claude_path = self
             .paths
             .mcp_root
-            .join(format!("{session_id}.claude.json"));
-        write_json_file(&generic_path, &generic_config)?;
-        write_text_file(&codex_path, &codex_config_toml(&command, &args))?;
-        write_json_file(&claude_path, &claude_config)?;
-        if let Some(worktree_path) = worktree_path {
+            .join("agents")
+            .join(format!("{slot_key}.claude.json"));
+        write_json_file_atomic(&generic_path, &generic_config)?;
+        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+        write_json_file_atomic(&claude_path, &claude_config)?;
+        if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
+            if !path_text_under_path(worktree_path, &self.paths.worktrees_root) {
+                return Err(format!(
+                    "Refusing to write MCP activation files outside .agents/worktrees: {worktree_path}"
+                ));
+            }
             self.write_worktree_mcp_activation_files(
                 worktree_path,
                 &generic_config,
@@ -944,6 +1239,54 @@ impl CoordinationKernel {
                 &args,
             )?;
         }
+        let config_bytes = serde_json::to_vec(&generic_config)
+            .map_err(|error| format!("Unable to serialize MCP config for hashing: {error}"))?;
+        let config_hash = sha256_hex(&config_bytes);
+        let config_id = self
+            .conn
+            .query_row(
+                "SELECT id FROM mcp_configs WHERE agent_slot_id=?1",
+                [agent_slot_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to inspect MCP config record: {error}"))?
+            .unwrap_or_else(uuid);
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO mcp_configs(
+                    id, agent_slot_id, path, config_hash, last_written_session_id,
+                    status, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)
+                ON CONFLICT(agent_slot_id) DO UPDATE SET
+                    path=excluded.path,
+                    config_hash=excluded.config_hash,
+                    last_written_session_id=excluded.last_written_session_id,
+                    status='active',
+                    updated_at=excluded.updated_at",
+                params![
+                    config_id,
+                    agent_slot_id,
+                    process_path_text(&generic_path),
+                    config_hash,
+                    session_id,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record MCP config: {error}"))?;
+        self.emit_event(
+            "mcp_config_written",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: Some(agent_slot_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({"slot_key": slot_key, "path": process_path_text(&generic_path)}),
+        )?;
         Ok(SessionMcpConfigPaths {
             generic_path: process_path_text(&generic_path),
             codex_path: process_path_text(&codex_path),
@@ -993,11 +1336,19 @@ impl CoordinationKernel {
         }
 
         self.ensure_worktree_mcp_files_ignored(&worktree)?;
-        write_json_file(&worktree.join(".mcp.json"), generic_config)?;
+        let worktree_text = process_path_text(&worktree);
+        if !path_text_under_path(&worktree_text, &self.paths.worktrees_root) {
+            return Err(format!(
+                "Refusing to write MCP activation files outside .agents/worktrees: {}",
+                worktree.display()
+            ));
+        }
+
+        write_json_file_atomic(&worktree.join(".mcp.json"), generic_config)?;
         let codex_dir = worktree.join(".codex");
         fs::create_dir_all(&codex_dir)
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
-        write_text_file(
+        write_text_file_atomic(
             &codex_dir.join("config.toml"),
             &codex_config_toml(command, args),
         )?;
@@ -1032,8 +1383,7 @@ impl CoordinationKernel {
             }
         }
         if next != existing {
-            fs::write(&exclude_path, next)
-                .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+            write_text_file_atomic(&exclude_path, &next)?;
         }
         Ok(())
     }
@@ -1062,8 +1412,9 @@ impl CoordinationKernel {
         ttl_seconds: Option<i64>,
         reason: Option<&str>,
     ) -> Result<Value, String> {
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
         self.ensure_session_authorized_for_task(session_id, task_id)?;
+        let agent_slot_id = session["agent_slot_id"].as_str();
         self.expire_old_leases()?;
         let resource_key = normalize_resource_key(resource_key);
         let mode = non_empty(mode, "Lease mode")?;
@@ -1075,6 +1426,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.map(str::to_string),
                 session_id: Some(session_id.to_string()),
                 resource_id: Some(resource_id.clone()),
                 ..EventRefs::default()
@@ -1087,9 +1439,9 @@ impl CoordinationKernel {
             let conflict_id = uuid();
             self.conn
                 .execute(
-                    "INSERT INTO lease_conflicts(id, requested_resource_id, requested_by_agent_id, blocking_lease_id, task_id, status, created_at)
-                     VALUES(?1, ?2, ?3, ?4, ?5, 'open', ?6)",
-                    params![conflict_id, resource_id, agent_id, blocker["id"].as_str().unwrap_or_default(), task_id, now_rfc3339()],
+                    "INSERT INTO lease_conflicts(id, requested_resource_id, requested_by_agent_id, requested_by_slot_id, blocking_lease_id, task_id, status, created_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
+                    params![conflict_id, resource_id, agent_id, agent_slot_id, blocker["id"].as_str().unwrap_or_default(), task_id, now_rfc3339()],
                 )
                 .map_err(|error| format!("Unable to record lease conflict: {error}"))?;
             self.emit_event(
@@ -1099,6 +1451,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: agent_slot_id.map(str::to_string),
                     session_id: Some(session_id.to_string()),
                     resource_id: Some(resource_id),
                     ..EventRefs::default()
@@ -1126,14 +1479,15 @@ impl CoordinationKernel {
         self.conn
             .execute(
                 "INSERT INTO leases(
-                    id, resource_id, task_id, agent_id, session_id, mode, status, fence_token,
+                    id, resource_id, task_id, agent_id, agent_slot_id, session_id, mode, status, fence_token,
                     reason, acquired_at, expires_at, last_heartbeat_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?9)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?10)",
                 params![
                     lease_id,
                     resource_id,
                     task_id,
                     agent_id,
+                    agent_slot_id,
                     session_id,
                     mode,
                     fence_token,
@@ -1150,6 +1504,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.map(str::to_string),
                 session_id: Some(session_id.to_string()),
                 resource_id: Some(resource_id.clone()),
                 ..EventRefs::default()
@@ -1248,6 +1603,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: lease["task_id"].as_str().map(str::to_string),
                 agent_id: lease["agent_id"].as_str().map(str::to_string),
+                agent_slot_id: lease["agent_slot_id"].as_str().map(str::to_string),
                 session_id: lease["session_id"].as_str().map(str::to_string),
                 resource_id: lease["resource_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
@@ -1282,6 +1638,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: lease["task_id"].as_str().map(str::to_string),
                 agent_id: lease["agent_id"].as_str().map(str::to_string),
+                agent_slot_id: lease["agent_slot_id"].as_str().map(str::to_string),
                 session_id: lease["session_id"].as_str().map(str::to_string),
                 resource_id: lease["resource_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
@@ -1308,7 +1665,7 @@ impl CoordinationKernel {
         let now = now_rfc3339();
         let mut stmt = self
             .conn
-            .prepare("SELECT id, task_id, agent_id, session_id, resource_id FROM leases WHERE status='active' AND expires_at < ?1")
+            .prepare("SELECT id, task_id, agent_id, agent_slot_id, session_id, resource_id FROM leases WHERE status='active' AND expires_at < ?1")
             .map_err(|error| format!("Unable to prepare lease expiration query: {error}"))?;
         let rows = stmt
             .query_map([now.as_str()], |row| {
@@ -1316,8 +1673,9 @@ impl CoordinationKernel {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|error| format!("Unable to query expired leases: {error}"))?;
@@ -1332,7 +1690,7 @@ impl CoordinationKernel {
             )
             .map_err(|error| format!("Unable to expire leases: {error}"))?;
 
-        for (id, task_id, agent_id, session_id, resource_id) in expired {
+        for (id, task_id, agent_id, agent_slot_id, session_id, resource_id) in expired {
             self.emit_event(
                 "lease_expired",
                 "kernel",
@@ -1340,6 +1698,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: Some(task_id),
                     agent_id: Some(agent_id),
+                    agent_slot_id,
                     session_id: Some(session_id),
                     resource_id: Some(resource_id),
                     ..EventRefs::default()
@@ -1405,7 +1764,8 @@ impl CoordinationKernel {
         paths: Vec<String>,
         summary: Option<&str>,
     ) -> Result<Value, String> {
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        let agent_slot_id = session["agent_slot_id"].as_str();
         let mut warnings = Vec::new();
         let mut normalized_paths = Vec::new();
 
@@ -1442,6 +1802,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.map(str::to_string),
                 session_id: Some(session_id.to_string()),
                 ..EventRefs::default()
             },
@@ -1546,7 +1907,7 @@ impl CoordinationKernel {
             json!({"worktree_id": worktree_id, "submit": submit, "summary": summary}),
         )?;
         self.expire_old_leases()?;
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
         self.ensure_session_authorized_for_task(session_id, task_id)?;
         let policy = self.repo_policy()?;
         let worktree_required = policy["agent_worktree_required"].as_i64().unwrap_or(1) == 1;
@@ -1588,11 +1949,20 @@ impl CoordinationKernel {
         }
 
         let worktree = self.get_worktree(worktree_id)?;
-        if worktree["session_id"].as_str() != Some(session_id) {
-            return Err("Worktree does not belong to this session.".to_string());
+        if session["worktree_id"].as_str() != Some(worktree_id) {
+            return Err("Session is not linked to this worktree.".to_string());
         }
         if worktree["agent_id"].as_str() != Some(agent_id) {
             return Err("Worktree does not belong to this agent.".to_string());
+        }
+        let session_slot = session["agent_slot_id"].as_str().unwrap_or("");
+        let worktree_slot = worktree["agent_slot_id"].as_str().unwrap_or("");
+        let legacy_session_match = worktree["session_id"].as_str() == Some(session_id);
+        if !worktree_slot.is_empty() && worktree_slot != session_slot {
+            return Err("Worktree does not belong to this agent slot.".to_string());
+        }
+        if worktree_slot.is_empty() && !legacy_session_match {
+            return Err("Worktree does not belong to this session.".to_string());
         }
         let worktree_path = PathBuf::from(worktree["path"].as_str().unwrap_or_default());
         if !worktree_path.exists() {
@@ -1902,17 +2272,27 @@ impl CoordinationKernel {
         summary: Option<&str>,
     ) -> Result<(), String> {
         let now = now_rfc3339();
+        let agent_slot_id = self
+            .query_one(
+                "SELECT agent_slot_id FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "Session does not exist.",
+            )?
+            .get("agent_slot_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         self.conn
             .execute(
                 "INSERT INTO patches(
-                    id, task_id, agent_id, session_id, worktree_id, base_sha, head_sha,
+                    id, task_id, agent_id, agent_slot_id, session_id, worktree_id, base_sha, head_sha,
                     diff_artifact_id, status, risk_level, validation_id, diff_hash, summary,
                     created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
                 params![
                     patch_id,
                     task_id,
                     agent_id,
+                    agent_slot_id,
                     session_id,
                     worktree_id,
                     base_sha,
@@ -3360,6 +3740,8 @@ impl CoordinationKernel {
     pub fn get_snapshot(&self) -> Result<Value, String> {
         Ok(api_ok(json!({
             "tasks": self.query_json("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "agent_slots": self.query_json("SELECT * FROM agent_slots ORDER BY slot_key ASC LIMIT 200", &[])?,
+            "mcp_configs": self.query_json("SELECT * FROM mcp_configs ORDER BY updated_at DESC LIMIT 200", &[])?,
             "sessions": self.query_json("SELECT * FROM agent_sessions ORDER BY updated_at DESC LIMIT 200", &[])?,
             "active_leases": self.list_active_leases_internal(None, None, None)?,
             "events": self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 200", &[])?,
@@ -3611,15 +3993,27 @@ impl CoordinationKernel {
                 );
 
                 let mut missing = Vec::new();
-                for path in [
-                    self.paths.mcp_root.join(format!("{session_id}.json")),
-                    self.paths.mcp_root.join(format!("{session_id}.codex.toml")),
-                    self.paths
-                        .mcp_root
-                        .join(format!("{session_id}.claude.json")),
-                ] {
-                    if !path.exists() {
-                        missing.push(process_path_text(&path));
+                if let Some(agent_slot_id) = session["agent_slot_id"].as_str() {
+                    if let Ok(slot) = self.get_agent_slot_by_id(agent_slot_id) {
+                        let slot_key = slot["slot_key"].as_str().unwrap_or("");
+                        for path in [
+                            self.paths
+                                .mcp_root
+                                .join("agents")
+                                .join(format!("{slot_key}.json")),
+                            self.paths
+                                .mcp_root
+                                .join("agents")
+                                .join(format!("{slot_key}.codex.toml")),
+                            self.paths
+                                .mcp_root
+                                .join("agents")
+                                .join(format!("{slot_key}.claude.json")),
+                        ] {
+                            if !path.exists() {
+                                missing.push(process_path_text(&path));
+                            }
+                        }
                     }
                 }
                 if !write_root.is_empty() {
@@ -3858,13 +4252,47 @@ impl CoordinationKernel {
             "sql_mcp_default",
             "repo_has_sql",
             "sql_engine",
-            "raw_sql_mcp_allowed",
             "agent_worktree_required",
             "patch_lease_validation_required",
             "merge_gate_required",
             "unleased_write_policy",
             "merge_requires_clean_target",
         ];
+        let hard_gates = [
+            "agent_worktree_required",
+            "patch_lease_validation_required",
+            "merge_gate_required",
+            "merge_requires_clean_target",
+        ];
+        if patch["raw_sql_mcp_allowed"].as_bool() == Some(true)
+            || patch["raw_sql_mcp_allowed"].as_i64().unwrap_or(0) != 0
+        {
+            return Err(
+                "raw_sql_mcp_allowed cannot be enabled; the coordination MCP does not expose raw SQL execution."
+                    .to_string(),
+            );
+        }
+        if let Some(mode) = patch["sql_mcp_default"].as_str() {
+            if !matches!(mode, "off" | "proposal_only" | "metadata_only") {
+                return Err(
+                    "sql_mcp_default must be off, proposal_only, or metadata_only.".to_string(),
+                );
+            }
+        }
+        if let Some(policy) = patch["unleased_write_policy"].as_str() {
+            if policy != "reject_patch" {
+                return Err(
+                    "unleased_write_policy cannot be loosened; use reject_patch.".to_string(),
+                );
+            }
+        }
+        for key in hard_gates {
+            if patch[key].as_bool() == Some(false) || patch[key].as_i64() == Some(0) {
+                return Err(format!(
+                    "{key} cannot be disabled through the client policy gate."
+                ));
+            }
+        }
         for key in allowed {
             if let Some(value) = patch.get(key) {
                 let sql =
@@ -3892,8 +4320,8 @@ impl CoordinationKernel {
             }
         }
         self.emit_event(
-            "sql_policy_updated",
-            "user",
+            "repo_policy_updated",
+            "human",
             "local",
             EventRefs::default(),
             json!({"patch": patch}),
@@ -4140,12 +4568,10 @@ impl CoordinationKernel {
         Ok(())
     }
 
-    pub fn create_worktree_for_session(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        task_id: Option<&str>,
-    ) -> Result<Value, String> {
+    pub fn create_or_reuse_worktree_for_slot(&self, agent_slot_id: &str) -> Result<Value, String> {
+        let slot = self.get_agent_slot_by_id(agent_slot_id)?;
+        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_key = required_string(&slot, "slot_key")?;
         if !self.paths.repo_path.join(".git").exists() {
             return Err("Repo has no .git; worktree isolation is unavailable.".to_string());
         }
@@ -4153,72 +4579,272 @@ impl CoordinationKernel {
         let base_sha = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
-        let safe_agent = safe_id(agent_id);
-        let safe_task = safe_id(task_id.unwrap_or(session_id));
-        let mut branch = format!("agent/{safe_agent}/{safe_task}");
-        let mut path = self
-            .paths
-            .worktrees_root
-            .join(format!("{safe_agent}_{safe_task}"));
-        let mut suffix = 0usize;
-        while path.exists() || self.branch_exists(&branch)? {
-            suffix += 1;
-            branch = format!("agent/{safe_agent}/{safe_task}-{suffix}");
-            path = self
-                .paths
-                .worktrees_root
-                .join(format!("{safe_agent}_{safe_task}_{suffix}"));
+        let branch = format!("agent/{slot_key}");
+        let path = self.paths.worktrees_root.join(slot_key);
+
+        if let Some(existing_id) = slot["worktree_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            if let Ok(existing) = self.get_worktree(existing_id) {
+                let existing_path = PathBuf::from(existing["path"].as_str().unwrap_or_default());
+                if !same_path_text(
+                    &process_path_text(&existing_path),
+                    &process_path_text(&path),
+                ) || !path_text_under_path(
+                    &process_path_text(&existing_path),
+                    &self.paths.worktrees_root,
+                ) {
+                    self.emit_event(
+                        "worktree_reuse_failed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "slot_key": slot_key,
+                            "recorded_path": existing["path"],
+                            "expected_path": process_path_text(&path),
+                            "reason": "recorded_worktree_path_is_not_slot_stable"
+                        }),
+                    )?;
+                    return Err(format!(
+                        "Recorded worktree path for slot {slot_key} is not the stable slot path: {}",
+                        existing_path.display()
+                    ));
+                }
+                if existing_path.exists() {
+                    self.conn
+                        .execute(
+                            "UPDATE worktrees SET status='active', current_sha=?1, updated_at=?2 WHERE id=?3",
+                            params![base_sha, now_rfc3339(), existing_id],
+                        )
+                        .map_err(|error| format!("Unable to refresh worktree: {error}"))?;
+                    self.emit_event(
+                        "worktree_reused",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({"slot_key": slot_key, "worktree_id": existing_id, "path": existing["path"]}),
+                    )?;
+                    return Ok(json!({
+                        "id": existing_id,
+                        "agentId": agent_id,
+                        "agentSlotId": agent_slot_id,
+                        "slotKey": slot_key,
+                        "path": existing["path"],
+                        "branchName": existing["branch_name"],
+                        "baseSha": existing["base_sha"],
+                        "status": "active",
+                    }));
+                }
+            }
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Unable to create worktree root: {error}"))?;
+
+        if path.exists() {
+            match run_git(&path, &["rev-parse", "--is-inside-work-tree"]) {
+                Ok(value) if value.trim() == "true" => {}
+                _ => {
+                    self.emit_event(
+                        "worktree_reuse_failed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({"slot_key": slot_key, "path": process_path_text(&path), "reason": "stable_path_exists_but_is_not_git_worktree"}),
+                    )?;
+                    return Err(format!(
+                        "Stable worktree path already exists but is not a usable git worktree: {}",
+                        path.display()
+                    ));
+                }
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Unable to create worktree root: {error}"))?;
+            }
+            let path_string = process_path_text(&path);
+            let args = if self.branch_exists(&branch)? {
+                vec!["worktree", "add", &path_string, &branch]
+            } else {
+                vec!["worktree", "add", "-b", &branch, &path_string]
+            };
+            if let Err(error) = run_git(&self.paths.repo_path, &args) {
+                self.emit_event(
+                    "worktree_create_failed",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: Some(agent_slot_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"slot_key": slot_key, "path": path_string, "branch_name": branch, "error": error}),
+                )?;
+                return Err(error);
+            }
         }
-        let path_string = process_path_text(&path);
-        run_git(
-            &self.paths.repo_path,
-            &["worktree", "add", "-b", &branch, &path_string],
-        )?;
         let canonical_worktree = path.canonicalize().unwrap_or(path);
         let worktree_path_text = process_path_text(&canonical_worktree);
-        let id = uuid();
+        if !path_text_under_path(&worktree_path_text, &self.paths.worktrees_root) {
+            self.emit_event(
+                "worktree_reuse_failed",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: Some(agent_slot_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({"slot_key": slot_key, "path": worktree_path_text, "reason": "stable_worktree_path_escapes_worktrees_root"}),
+            )?;
+            return Err(format!(
+                "Stable worktree path escapes .agents/worktrees for slot {slot_key}."
+            ));
+        }
+        let existing_row_id = self
+            .conn
+            .query_row(
+                "SELECT id FROM worktrees WHERE agent_slot_id=?1",
+                [agent_slot_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to inspect stable worktree row: {error}"))?;
+        let id = existing_row_id.clone().unwrap_or_else(uuid);
         let now = now_rfc3339();
+        if existing_row_id.is_some() {
+            self.conn
+                .execute(
+                    "UPDATE worktrees
+                     SET agent_id=?1, path=?2, branch_name=?3, base_sha=?4,
+                         current_sha=?4, status='active', updated_at=?5
+                     WHERE id=?6",
+                    params![
+                        agent_id,
+                        worktree_path_text.clone(),
+                        branch.clone(),
+                        base_sha.clone(),
+                        now,
+                        id
+                    ],
+                )
+                .map_err(|error| format!("Unable to update worktree: {error}"))?;
+        } else {
+            self.conn
+                .execute(
+                    "INSERT INTO worktrees(
+                        id, agent_slot_id, agent_id, session_id, path, branch_name,
+                        base_sha, current_sha, status, created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, 'active', ?7, ?7)",
+                    params![
+                        id,
+                        agent_slot_id,
+                        agent_id,
+                        worktree_path_text.clone(),
+                        branch.clone(),
+                        base_sha.clone(),
+                        now
+                    ],
+                )
+                .map_err(|error| format!("Unable to record worktree: {error}"))?;
+        }
         self.conn
             .execute(
-                "INSERT INTO worktrees(id, agent_id, session_id, path, branch_name, base_sha, current_sha, status, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, 'active', ?7, ?7)",
-                params![
-                    id,
-                    agent_id,
-                    session_id,
-                    worktree_path_text.clone(),
-                    branch.clone(),
-                    base_sha.clone(),
-                    now
-                ],
+                "UPDATE agent_slots SET worktree_id=?1, updated_at=?2 WHERE id=?3",
+                params![id, now_rfc3339(), agent_slot_id],
             )
-            .map_err(|error| format!("Unable to record worktree: {error}"))?;
+            .map_err(|error| format!("Unable to attach worktree to slot: {error}"))?;
         self.emit_event(
-            "worktree_created",
+            if slot["worktree_id"].as_str().is_some() {
+                "worktree_recovered"
+            } else {
+                "worktree_created"
+            },
             "kernel",
             REPO_ID,
             EventRefs {
                 agent_id: Some(agent_id.to_string()),
-                session_id: Some(session_id.to_string()),
-                task_id: task_id.map(str::to_string),
+                agent_slot_id: Some(agent_slot_id.to_string()),
                 ..EventRefs::default()
             },
-            json!({"worktree_id": id, "path": worktree_path_text.clone(), "branch_name": branch.clone(), "base_sha": base_sha.clone()}),
+            json!({"slot_key": slot_key, "worktree_id": id, "path": worktree_path_text.clone(), "branch_name": branch.clone(), "base_sha": base_sha.clone()}),
         )?;
 
         Ok(json!({
             "id": id,
             "agentId": agent_id,
-            "sessionId": session_id,
+            "agentSlotId": agent_slot_id,
+            "slotKey": slot_key,
             "path": worktree_path_text,
             "branchName": branch,
             "baseSha": base_sha,
             "status": "active",
         }))
+    }
+
+    pub fn create_worktree_for_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        _task_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let session = self.query_one(
+            "SELECT * FROM agent_sessions WHERE id=?1 AND agent_id=?2",
+            &[&session_id, &agent_id],
+            "Session does not exist for this agent.",
+        )?;
+        let agent_slot_id = if let Some(slot_id) = session["agent_slot_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            slot_id.to_string()
+        } else {
+            let agent = self.get_agent_by_id(agent_id)?;
+            let slot_key = derive_slot_key(
+                agent["kind"].as_str().unwrap_or("agent"),
+                session["pty_id"].as_str(),
+                None,
+            )?;
+            let slot = self.get_or_create_agent_slot_for_agent(&slot_key, &agent)?;
+            let slot_id = required_string(&slot, "id")?.to_string();
+            self.conn
+                .execute(
+                    "UPDATE agent_sessions SET agent_slot_id=?1, updated_at=?2 WHERE id=?3",
+                    params![slot_id, now_rfc3339(), session_id],
+                )
+                .map_err(|error| format!("Unable to attach legacy session to slot: {error}"))?;
+            slot_id
+        };
+        let worktree = self.create_or_reuse_worktree_for_slot(&agent_slot_id)?;
+        self.conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET worktree_id=?1, write_root=?2, base_git_sha=?3,
+                     current_git_sha=?3, enforcement_mode='worktree_required',
+                     updated_at=?4
+                 WHERE id=?5",
+                params![
+                    worktree["id"].as_str(),
+                    worktree["path"].as_str(),
+                    worktree["baseSha"].as_str(),
+                    now_rfc3339(),
+                    session_id
+                ],
+            )
+            .map_err(|error| format!("Unable to attach stable worktree to session: {error}"))?;
+        Ok(worktree)
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, String> {
@@ -4241,6 +4867,32 @@ impl CoordinationKernel {
             &[&worktree_id],
             "Worktree does not exist.",
         )
+    }
+
+    fn session_response(
+        &self,
+        session: &Value,
+        slot: &Value,
+        mcp_config: &SessionMcpConfigPaths,
+        warnings: Vec<String>,
+    ) -> Value {
+        json!({
+            "id": session["id"].as_str().unwrap_or_default(),
+            "agentId": session["agent_id"].as_str().unwrap_or_default(),
+            "agentSlotId": slot["id"].as_str().unwrap_or_default(),
+            "slotKey": slot["slot_key"].as_str().unwrap_or_default(),
+            "taskId": session["task_id"].as_str(),
+            "ptyId": session["pty_id"].as_str(),
+            "worktreeId": session["worktree_id"].as_str(),
+            "writeRoot": session["write_root"].as_str().unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or("")),
+            "enforcementMode": session["enforcement_mode"].as_str().unwrap_or("coordination_only"),
+            "baseGitSha": session["base_git_sha"].as_str(),
+            "status": session["status"].as_str().unwrap_or("unknown"),
+            "mcpConfigPath": mcp_config.generic_path.clone(),
+            "codexMcpConfigPath": mcp_config.codex_path.clone(),
+            "claudeMcpConfigPath": mcp_config.claude_path.clone(),
+            "warnings": warnings,
+        })
     }
 
     fn write_artifact(
@@ -4353,6 +5005,7 @@ impl CoordinationKernel {
 pub struct EventRefs {
     pub task_id: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_slot_id: Option<String>,
     pub session_id: Option<String>,
     pub resource_id: Option<String>,
     pub artifact_id: Option<String>,
@@ -4370,6 +5023,7 @@ impl EventRefs {
         Self {
             task_id: patch["task_id"].as_str().map(str::to_string),
             agent_id: patch["agent_id"].as_str().map(str::to_string),
+            agent_slot_id: patch["agent_slot_id"].as_str().map(str::to_string),
             session_id: patch["session_id"].as_str().map(str::to_string),
             resource_id: None,
             artifact_id: patch["diff_artifact_id"].as_str().map(str::to_string),
@@ -4468,25 +5122,58 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
-    }
-    let mut file = fs::File::create(path)
-        .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
+fn write_json_file_atomic(path: &Path, value: &Value) -> Result<(), String> {
     let body = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Unable to serialize {}: {error}", path.display()))?;
-    file.write_all(&body)
-        .map_err(|error| format!("Unable to write {}: {error}", path.display()))
+    write_bytes_atomic(path, &body)
 }
 
-fn write_text_file(path: &Path, value: &str) -> Result<(), String> {
+fn write_text_file_atomic(path: &Path, value: &str) -> Result<(), String> {
+    write_bytes_atomic(path, value.as_bytes())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
     }
-    fs::write(path, value).map_err(|error| format!("Unable to write {}: {error}", path.display()))
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("swap")
+    ));
+    {
+        let mut file = fs::File::create(&tmp_path)
+            .map_err(|error| format!("Unable to create {}: {error}", tmp_path.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("Unable to write {}: {error}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("Unable to flush {}: {error}", tmp_path.display()))?;
+    }
+    match fs::rename(&tmp_path, path) {
+        Ok(_) => Ok(()),
+        Err(first_error) if path.exists() => {
+            fs::remove_file(path).map_err(|error| {
+                format!(
+                    "Unable to replace existing {} after rename failed ({first_error}): {error}",
+                    path.display()
+                )
+            })?;
+            fs::rename(&tmp_path, path).map_err(|error| {
+                format!(
+                    "Unable to replace {} with {}: {error}",
+                    path.display(),
+                    tmp_path.display()
+                )
+            })
+        }
+        Err(error) => Err(format!(
+            "Unable to replace {} with {}: {error}",
+            path.display(),
+            tmp_path.display()
+        )),
+    }
 }
 
 fn codex_config_toml(command: &str, args: &[String]) -> String {
@@ -4531,6 +5218,90 @@ fn safe_id(value: &str) -> String {
         .chars()
         .take(48)
         .collect::<String>()
+}
+
+fn normalize_agent_slot_key(value: &str) -> Result<String, String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Err("Agent slot key is required.".to_string());
+    }
+    if raw.contains('/') || raw.contains('\\') || raw.contains("..") {
+        return Err("Agent slot key cannot contain path separators or '..'.".to_string());
+    }
+    if looks_like_uuid(raw) {
+        return Err("Agent slot key must be stable and cannot be a UUID.".to_string());
+    }
+    let normalized = raw
+        .chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_lowercase();
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['-', '.', '_'])
+        .to_string();
+    if normalized.is_empty() {
+        return Err("Agent slot key normalizes to empty.".to_string());
+    }
+    if looks_like_uuid(&normalized) || looks_like_timestamp_key(&normalized) {
+        return Err("Agent slot key must not be derived from a UUID or timestamp.".to_string());
+    }
+    Ok(normalized)
+}
+
+fn derive_slot_key(
+    agent_kind: &str,
+    pty_id: Option<&str>,
+    explicit: Option<&str>,
+) -> Result<String, String> {
+    if let Some(explicit) = explicit.filter(|value| !value.trim().is_empty()) {
+        return normalize_agent_slot_key(explicit);
+    }
+    let kind = safe_id(agent_kind);
+    let kind = if kind.is_empty() {
+        "agent".to_string()
+    } else {
+        kind
+    };
+    if let Some(pty_id) = pty_id {
+        let parts = pty_id.split('-').collect::<Vec<_>>();
+        for part in parts.iter().rev().skip(1) {
+            if let Ok(index) = part.parse::<usize>() {
+                return normalize_agent_slot_key(&format!("{kind}-{:02}", index + 1));
+            }
+        }
+    }
+    normalize_agent_slot_key(&format!("{kind}-01"))
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    if parts.len() != 5 {
+        return false;
+    }
+    let lengths = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(lengths)
+        .all(|(part, len)| part.len() == len && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+fn looks_like_timestamp_key(value: &str) -> bool {
+    value.len() >= 10 && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn session_is_fresh(session: &Value) -> bool {
+    if session["status"].as_str() != Some("active") {
+        return false;
+    }
+    let Some(last_heartbeat) = session["last_heartbeat_at"].as_str() else {
+        return false;
+    };
+    last_heartbeat >= rfc3339_after_seconds(-SESSION_STALE_SECONDS).as_str()
 }
 
 fn slug(value: &str) -> String {
@@ -4718,6 +5489,126 @@ mod tests {
     }
 
     #[test]
+    fn repo_policy_gate_rejects_unsafe_downgrades() {
+        let repo = temp_repo("policy_gate");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        assert!(kernel
+            .update_repo_policy(&json!({"agent_worktree_required": false}))
+            .is_err());
+        assert!(kernel
+            .update_repo_policy(&json!({"patch_lease_validation_required": 0}))
+            .is_err());
+        assert!(kernel
+            .update_repo_policy(&json!({"merge_gate_required": false}))
+            .is_err());
+        assert!(kernel
+            .update_repo_policy(&json!({"unleased_write_policy": "warn"}))
+            .is_err());
+        assert!(kernel
+            .update_repo_policy(&json!({"raw_sql_mcp_allowed": true}))
+            .is_err());
+
+        let policy = kernel.repo_policy().unwrap();
+        assert_eq!(policy["agent_worktree_required"].as_i64(), Some(1));
+        assert_eq!(policy["patch_lease_validation_required"].as_i64(), Some(1));
+        assert_eq!(policy["merge_gate_required"].as_i64(), Some(1));
+        assert_eq!(
+            policy["unleased_write_policy"].as_str(),
+            Some("reject_patch")
+        );
+        assert_eq!(policy["raw_sql_mcp_allowed"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn slot_busy_rejects_different_fresh_pty() {
+        let repo = init_git_repo("slot_busy");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .create_session_for_slot_key(
+                "codex-01",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("workspace-terminal-test-0-codex"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let second = kernel.create_session_for_slot_key(
+            "codex-01",
+            "Codex",
+            "codex",
+            None,
+            None,
+            Some("workspace-terminal-test-1-codex"),
+            true,
+            None,
+            None,
+        );
+
+        assert!(second.unwrap_err().contains("slot_busy"));
+        let active = kernel
+            .query_json(
+                "SELECT * FROM agent_sessions WHERE agent_slot_id=?1 AND status='active'",
+                &[&first["agentSlotId"].as_str().unwrap()],
+            )
+            .unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn mcp_activation_files_are_slot_stable_and_worktree_scoped() {
+        let repo = init_git_repo("mcp_activation");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let session = kernel
+            .create_session_for_slot_key(
+                "codex-01",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("workspace-terminal-test-0-codex"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let mcp_config_path = session["mcpConfigPath"].as_str().unwrap();
+        let worktree_path = session["writeRoot"].as_str().unwrap();
+
+        assert!(normalize_path_for_compare(mcp_config_path)
+            .ends_with(".agents/mcp/agents/codex-01.json"));
+        assert!(!mcp_config_path.contains(session_id));
+        assert!(PathBuf::from(mcp_config_path).exists());
+        assert!(repo
+            .join(".agents")
+            .join("mcp")
+            .join("agents")
+            .join("codex-01.codex.toml")
+            .exists());
+        assert!(repo
+            .join(".agents")
+            .join("mcp")
+            .join("agents")
+            .join("codex-01.claude.json")
+            .exists());
+
+        let worktree = PathBuf::from(worktree_path);
+        assert!(path_text_under_path(
+            worktree_path,
+            &kernel.paths.worktrees_root
+        ));
+        assert!(worktree.join(".mcp.json").exists());
+        assert!(worktree.join(".codex").join("config.toml").exists());
+        assert!(!repo.join(".mcp.json").exists());
+        assert!(!repo.join(".codex").join("config.toml").exists());
+    }
+
+    #[test]
     fn alignment_report_logs_kernel_policy_state() {
         let repo = temp_repo("alignment");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -4778,9 +5669,10 @@ mod tests {
             "claim_task",
             "acquire_lease",
             "validate_patch",
+            "get_slot_status",
             "db_classify_sql",
+            "db_request_approval",
             "request_approval",
-            "orchestrator_get_status",
         ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
@@ -4794,6 +5686,7 @@ mod tests {
             "db_propose_migration",
             "db_validate_shadow",
             "write_memory",
+            "orchestrator_get_status",
             "orchestrator_create_context_export",
             "orchestrator_sync_once",
         ] {
@@ -4917,8 +5810,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_interrupts_duplicate_pty_sessions_and_marks_worktrees() {
-        let repo = init_git_repo("duplicate_pty_sessions");
+    fn same_pty_session_reuses_slot_session_and_worktree() {
+        let repo = init_git_repo("same_pty_slot_reuse");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
@@ -4946,6 +5839,9 @@ mod tests {
         let second_id = second["id"].as_str().unwrap().to_string();
         let first_worktree_id = first["worktreeId"].as_str().unwrap().to_string();
         let second_worktree_id = second["worktreeId"].as_str().unwrap().to_string();
+        assert_eq!(first_id, second_id);
+        assert_eq!(first_worktree_id, second_worktree_id);
+        assert_eq!(first["mcpConfigPath"], second["mcpConfigPath"]);
         kernel
             .conn
             .execute(
@@ -4953,48 +5849,25 @@ mod tests {
                 params![first_id],
             )
             .unwrap();
-        kernel
-            .conn
-            .execute(
-                "UPDATE agent_sessions SET updated_at='2000.000Z' WHERE id=?1",
-                params![second_id],
-            )
-            .unwrap();
         drop(kernel);
 
         let recovered = CoordinationKernel::open(&repo, None).unwrap();
-        let first_session = recovered
+        let session = recovered
             .query_one(
                 "SELECT status FROM agent_sessions WHERE id=?1",
                 &[&first_id],
-                "missing first session",
+                "missing session",
             )
             .unwrap();
-        let second_session = recovered
-            .query_one(
-                "SELECT status FROM agent_sessions WHERE id=?1",
-                &[&second_id],
-                "missing second session",
-            )
-            .unwrap();
-        let first_worktree = recovered
+        let worktree = recovered
             .query_one(
                 "SELECT status FROM worktrees WHERE id=?1",
                 &[&first_worktree_id],
-                "missing first worktree",
+                "missing worktree",
             )
             .unwrap();
-        let second_worktree = recovered
-            .query_one(
-                "SELECT status FROM worktrees WHERE id=?1",
-                &[&second_worktree_id],
-                "missing second worktree",
-            )
-            .unwrap();
-        assert_eq!(first_session["status"].as_str(), Some("interrupted"));
-        assert_eq!(second_session["status"].as_str(), Some("active"));
-        assert_eq!(first_worktree["status"].as_str(), Some("interrupted"));
-        assert_eq!(second_worktree["status"].as_str(), Some("active"));
+        assert_eq!(session["status"].as_str(), Some("active"));
+        assert_eq!(worktree["status"].as_str(), Some("active"));
     }
 
     #[test]

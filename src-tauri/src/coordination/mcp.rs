@@ -22,30 +22,16 @@ pub const TOOL_NAMES: &[&str] = &[
     "announce_change",
     "validate_patch",
     "submit_patch",
-    "request_merge",
     "list_workspace_violations",
-    "resolve_workspace_violation",
+    "get_slot_status",
     "search_memory",
     "write_memory",
-    "write_contract_memory",
-    "write_handoff_memory",
     "db_get_mode",
-    "db_acquire_lease",
     "db_classify_sql",
-    "db_query_readonly",
+    "db_attach_migration_proposal",
     "db_propose_migration",
-    "db_validate_shadow",
+    "db_request_approval",
     "request_approval",
-    "orchestrator_get_status",
-    "orchestrator_create_run",
-    "orchestrator_create_context_export",
-    "orchestrator_import_plan",
-    "orchestrator_adopt_plan",
-    "orchestrator_list_runs",
-    "orchestrator_get_brief",
-    "orchestrator_sync_once",
-    "orchestrator_write_contract",
-    "orchestrator_write_handoff",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +39,8 @@ pub struct McpContext {
     pub repo_path: Option<String>,
     pub db_path: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_slot_id: Option<String>,
+    pub slot_key: Option<String>,
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub worktree_id: Option<String>,
@@ -74,6 +62,8 @@ impl McpContext {
                 ("--repo-path", Some(value)) => context.repo_path = Some(value),
                 ("--db-path", Some(value)) => context.db_path = Some(value),
                 ("--agent-id", Some(value)) => context.agent_id = Some(value),
+                ("--agent-slot-id", Some(value)) => context.agent_slot_id = Some(value),
+                ("--slot-key", Some(value)) => context.slot_key = Some(value),
                 ("--session-id", Some(value)) => context.session_id = Some(value),
                 ("--task-id", Some(value)) => context.task_id = Some(value),
                 ("--worktree-id", Some(value)) => context.worktree_id = Some(value),
@@ -279,6 +269,13 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
 }
 
 pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Value {
+    if !TOOL_NAMES.contains(&tool) {
+        return api_error(
+            "unknown_tool",
+            format!("Unknown coordination tool: {tool}"),
+            json!({"allowed_tools": TOOL_NAMES}),
+        );
+    }
     apply_context_defaults(context, &mut input);
     match dispatch_tool_result(context, tool, input) {
         Ok(value) => value,
@@ -379,6 +376,9 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             input["worktree_id"].as_str(),
             input["status"].as_str().or(Some("open")),
         ),
+        "get_slot_status" => {
+            kernel.get_slot_status(input["agent_slot_id"].as_str(), input["slot_key"].as_str())
+        }
         "resolve_workspace_violation" => kernel.resolve_workspace_violation(
             req(&input, "violation_id")?,
             req(&input, "resolution")?,
@@ -409,10 +409,7 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
         }
         "db_get_mode" => kernel.db_get_mode(),
         "db_classify_sql" => kernel.db_classify_sql(req(&input, "sql")?),
-        "db_query_readonly" => {
-            kernel.db_query_readonly(req(&input, "sql")?, input["environment"].as_str())
-        }
-        "db_propose_migration" => kernel.db_propose_migration(
+        "db_propose_migration" | "db_attach_migration_proposal" => kernel.db_propose_migration(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
             req(&input, "session_id")?,
@@ -421,11 +418,11 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             req(&input, "up_sql")?,
             input["down_sql_or_rollforward_plan"]
                 .as_str()
+                .or_else(|| input["down_sql_or_rollback_plan"].as_str())
                 .unwrap_or("Roll forward manually after review."),
             input["summary"].as_str(),
         ),
-        "db_validate_shadow" => kernel.db_validate_shadow(req(&input, "migration_id")?),
-        "request_approval" => kernel.request_approval(
+        "request_approval" | "db_request_approval" => kernel.request_approval(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
             req(&input, "approval_kind")?,
@@ -466,6 +463,8 @@ fn apply_context_defaults(context: &McpContext, input: &mut Value) {
         ("repo_path", &context.repo_path),
         ("db_path", &context.db_path),
         ("agent_id", &context.agent_id),
+        ("agent_slot_id", &context.agent_slot_id),
+        ("slot_key", &context.slot_key),
         ("session_id", &context.session_id),
         ("task_id", &context.task_id),
         ("worktree_id", &context.worktree_id),

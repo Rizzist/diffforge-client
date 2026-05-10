@@ -1,5 +1,11 @@
-pub const MIGRATION_VERSION: i64 = 1;
-pub const MIGRATION_NAME: &str = "coordination_kernel_initial";
+pub const INITIAL_MIGRATION_VERSION: i64 = 1;
+pub const INITIAL_MIGRATION_NAME: &str = "coordination_kernel_initial";
+pub const SLOT_MIGRATION_VERSION: i64 = 2;
+pub const SLOT_MIGRATION_NAME: &str = "coordination_kernel_slots";
+pub const RUNTIME_GUARD_MIGRATION_VERSION: i64 = 3;
+pub const RUNTIME_GUARD_MIGRATION_NAME: &str = "coordination_kernel_runtime_guards";
+pub const MIGRATION_VERSION: i64 = RUNTIME_GUARD_MIGRATION_VERSION;
+pub const MIGRATION_NAME: &str = RUNTIME_GUARD_MIGRATION_NAME;
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -19,9 +25,36 @@ CREATE TABLE IF NOT EXISTS agents(
   UNIQUE(name, kind)
 );
 
+CREATE TABLE IF NOT EXISTS agent_slots(
+  id TEXT PRIMARY KEY,
+  slot_key TEXT NOT NULL UNIQUE,
+  agent_id TEXT NOT NULL,
+  agent_name TEXT NOT NULL,
+  agent_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  active_session_id TEXT,
+  default_task_id TEXT,
+  mcp_config_path TEXT NOT NULL UNIQUE,
+  worktree_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_configs(
+  id TEXT PRIMARY KEY,
+  agent_slot_id TEXT NOT NULL UNIQUE,
+  path TEXT NOT NULL UNIQUE,
+  config_hash TEXT,
+  last_written_session_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS agent_sessions(
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
+  agent_slot_id TEXT,
   task_id TEXT,
   orchestration_run_id TEXT,
   orchestration_role TEXT,
@@ -81,6 +114,7 @@ CREATE TABLE IF NOT EXISTS leases(
   resource_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
+  agent_slot_id TEXT,
   session_id TEXT NOT NULL,
   mode TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -96,6 +130,7 @@ CREATE TABLE IF NOT EXISTS lease_conflicts(
   id TEXT PRIMARY KEY,
   requested_resource_id TEXT NOT NULL,
   requested_by_agent_id TEXT NOT NULL,
+  requested_by_slot_id TEXT,
   blocking_lease_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -111,6 +146,7 @@ CREATE TABLE IF NOT EXISTS events(
   actor_id TEXT NOT NULL,
   task_id TEXT,
   agent_id TEXT,
+  agent_slot_id TEXT,
   session_id TEXT,
   resource_id TEXT,
   artifact_id TEXT,
@@ -121,6 +157,7 @@ CREATE TABLE IF NOT EXISTS events(
 
 CREATE TABLE IF NOT EXISTS worktrees(
   id TEXT PRIMARY KEY,
+  agent_slot_id TEXT,
   agent_id TEXT NOT NULL,
   session_id TEXT,
   path TEXT NOT NULL,
@@ -136,6 +173,7 @@ CREATE TABLE IF NOT EXISTS patches(
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
+  agent_slot_id TEXT,
   session_id TEXT NOT NULL,
   worktree_id TEXT NOT NULL,
   base_sha TEXT,
@@ -227,6 +265,7 @@ CREATE TABLE IF NOT EXISTS artifacts(
   id TEXT PRIMARY KEY,
   task_id TEXT,
   agent_id TEXT,
+  agent_slot_id TEXT,
   artifact_kind TEXT NOT NULL,
   path TEXT NOT NULL,
   content_hash TEXT NOT NULL,
@@ -245,9 +284,11 @@ CREATE TABLE IF NOT EXISTS memories(
   evidence_artifact_id TEXT,
   task_id TEXT,
   patch_id TEXT,
+  db_change_request_id TEXT,
   migration_id TEXT,
   orchestration_run_id TEXT,
   created_by_agent_id TEXT,
+  created_by_slot_id TEXT,
   certified_by TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -491,11 +532,66 @@ CREATE TABLE IF NOT EXISTS cloud_sync_jobs(
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_slot_status ON agent_sessions(agent_slot_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_slot
+ON agent_sessions(agent_slot_id)
+WHERE status='active' AND agent_slot_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_pty
+ON agent_sessions(pty_id)
+WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
 CREATE INDEX IF NOT EXISTS idx_leases_resource_status ON leases(resource_id, status);
+CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_violations_status ON workspace_violations(status);
 CREATE INDEX IF NOT EXISTS idx_patches_status ON patches(status);
 CREATE INDEX IF NOT EXISTS idx_merge_jobs_status ON merge_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(memory_kind, trust_level);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_slot ON worktrees(agent_slot_id) WHERE agent_slot_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_branch ON worktrees(branch_name);
+"#;
+
+pub const SLOT_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_slots(
+  id TEXT PRIMARY KEY,
+  slot_key TEXT NOT NULL UNIQUE,
+  agent_id TEXT NOT NULL,
+  agent_name TEXT NOT NULL,
+  agent_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  active_session_id TEXT,
+  default_task_id TEXT,
+  mcp_config_path TEXT NOT NULL UNIQUE,
+  worktree_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_configs(
+  id TEXT PRIMARY KEY,
+  agent_slot_id TEXT NOT NULL UNIQUE,
+  path TEXT NOT NULL UNIQUE,
+  config_hash TEXT,
+  last_written_session_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_slot_status ON agent_sessions(agent_slot_id, status);
+CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_slot ON worktrees(agent_slot_id) WHERE agent_slot_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_branch ON worktrees(branch_name);
+"#;
+
+pub const RUNTIME_GUARD_SCHEMA_SQL: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_slot
+ON agent_sessions(agent_slot_id)
+WHERE status='active' AND agent_slot_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_pty
+ON agent_sessions(pty_id)
+WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
 "#;

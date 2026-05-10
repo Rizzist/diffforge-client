@@ -4,6 +4,29 @@ const WRITE_LIKE_MODES: &[&str] = &[
     "write",
     "exclusive",
     "contract",
+    "db_plan",
+    "db_migration",
+    "db_destructive",
+    "db_exclusive",
+    "migration_proposal",
+    "migration_exclusive",
+    "sandbox_write",
+    "data_backfill",
+    "security_policy",
+    "destructive",
+    "prod_write",
+];
+
+const KNOWN_LEASE_MODES: &[&str] = &[
+    "read",
+    "write",
+    "exclusive",
+    "contract",
+    "db_read",
+    "db_plan",
+    "db_migration",
+    "db_destructive",
+    "db_exclusive",
     "migration_proposal",
     "migration_exclusive",
     "sandbox_write",
@@ -31,6 +54,35 @@ pub fn normalize_resource_key(value: &str) -> String {
         "db" => format!("db:{}", rest.to_ascii_lowercase().replace('\\', "/")),
         _ => format!("{prefix}:{rest}"),
     }
+}
+
+pub fn normalize_resource_key_checked(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Resource key is required.".to_string());
+    }
+
+    let Some((prefix, rest)) = trimmed.split_once(':') else {
+        return Ok(normalize_resource_key(trimmed));
+    };
+    let prefix = prefix.trim().to_ascii_lowercase();
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("Resource key value is required.".to_string());
+    }
+    if matches!(prefix.as_str(), "file" | "glob") {
+        reject_path_escape(rest)?;
+    }
+
+    Ok(normalize_resource_key(trimmed))
+}
+
+pub fn validate_lease_mode(value: &str) -> Result<String, String> {
+    let mode = value.trim().to_ascii_lowercase();
+    if KNOWN_LEASE_MODES.contains(&mode.as_str()) {
+        return Ok(mode);
+    }
+    Err(format!("Unknown lease mode: {value}"))
 }
 
 pub fn resource_type(resource_key: &str) -> String {
@@ -63,18 +115,34 @@ pub fn is_write_like(mode: &str) -> bool {
 }
 
 pub fn lease_modes_conflict(existing: &str, requested: &str) -> bool {
+    let existing = existing.trim().to_ascii_lowercase();
+    let requested = requested.trim().to_ascii_lowercase();
+
     if existing == "read" && requested == "read" {
         return false;
     }
 
-    existing == "exclusive"
-        || requested == "exclusive"
-        || existing == "destructive"
+    if existing == "exclusive" || requested == "exclusive" {
+        return true;
+    }
+
+    if is_db_mode(&existing) || is_db_mode(&requested) {
+        return db_modes_conflict(&existing, &requested);
+    }
+
+    if existing == "read" || requested == "read" {
+        return false;
+    }
+
+    if existing == "destructive"
         || requested == "destructive"
         || existing == "prod_write"
         || requested == "prod_write"
-        || is_write_like(existing)
-        || is_write_like(requested)
+    {
+        return true;
+    }
+
+    is_write_like(&existing) && is_write_like(&requested)
 }
 
 pub fn resources_conflict(a: &str, b: &str) -> bool {
@@ -196,16 +264,78 @@ fn db_resources_conflict(a: &str, b: &str) -> bool {
         return true;
     }
 
+    if a.starts_with("db:migration_stream:") || b.starts_with("db:migration_stream:") {
+        return true;
+    }
+
+    if a.starts_with("db:database:") || b.starts_with("db:database:") {
+        return true;
+    }
+
+    if is_broad_db_resource(a) || is_broad_db_resource(b) {
+        return true;
+    }
+
     let Some(a_table) = db_table_name(a) else {
-        return a.starts_with("db:migration_stream:") && b.starts_with("db:migration_stream:")
-            || a.starts_with("db:policy:") && b.starts_with("db:policy:");
+        return a.starts_with("db:policy:") && b.starts_with("db:policy:");
     };
     let Some(b_table) = db_table_name(b) else {
-        return b.starts_with("db:migration_stream:") && a.starts_with("db:migration_stream:")
-            || b.starts_with("db:policy:") && a.starts_with("db:policy:");
+        return b.starts_with("db:policy:") && a.starts_with("db:policy:");
     };
 
     a_table == b_table
+}
+
+fn is_db_mode(mode: &str) -> bool {
+    mode.starts_with("db_")
+        || matches!(
+            mode,
+            "migration_proposal"
+                | "migration_exclusive"
+                | "data_backfill"
+                | "security_policy"
+                | "destructive"
+                | "prod_write"
+        )
+}
+
+fn db_modes_conflict(existing: &str, requested: &str) -> bool {
+    if existing == "db_destructive"
+        || requested == "db_destructive"
+        || existing == "destructive"
+        || requested == "destructive"
+        || existing == "prod_write"
+        || requested == "prod_write"
+        || existing == "db_exclusive"
+        || requested == "db_exclusive"
+        || existing == "migration_exclusive"
+        || requested == "migration_exclusive"
+    {
+        return true;
+    }
+
+    matches!(
+        (existing, requested),
+        ("db_plan", "db_migration")
+            | ("db_migration", "db_plan")
+            | ("db_plan", "migration_proposal")
+            | ("migration_proposal", "db_plan")
+            | ("db_migration", "db_migration")
+            | ("db_migration", "migration_proposal")
+            | ("migration_proposal", "db_migration")
+            | ("migration_proposal", "migration_proposal")
+            | ("data_backfill", _)
+            | (_, "data_backfill")
+            | ("security_policy", _)
+            | (_, "security_policy")
+    )
+}
+
+fn is_broad_db_resource(value: &str) -> bool {
+    matches!(
+        value,
+        "db:tenant_isolation" | "db:security_policy" | "db:auth" | "db:pii"
+    )
 }
 
 fn db_table_name(value: &str) -> Option<String> {
@@ -227,6 +357,9 @@ fn db_table_name(value: &str) -> Option<String> {
     }
     if let Some(backfill) = tail.strip_prefix("backfill:") {
         return backfill.split('.').next().map(str::to_string);
+    }
+    if let Some(data) = tail.strip_prefix("data:") {
+        return data.split('.').next().map(str::to_string);
     }
     None
 }

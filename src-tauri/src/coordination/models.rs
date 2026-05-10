@@ -25,6 +25,8 @@ pub struct ApiErrorEnvelope {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCoordinationContext {
     pub agent_id: String,
+    pub agent_slot_id: Option<String>,
+    pub slot_key: Option<String>,
     pub session_id: String,
     pub task_id: Option<String>,
     pub worktree_id: Option<String>,
@@ -116,6 +118,12 @@ impl TerminalCoordinationContext {
         if let Some(value) = &self.workspace_id {
             values.push(("COORDINATION_WORKSPACE_ID".to_string(), value.clone()));
         }
+        if let Some(value) = &self.agent_slot_id {
+            values.push(("COORDINATION_AGENT_SLOT_ID".to_string(), value.clone()));
+        }
+        if let Some(value) = &self.slot_key {
+            values.push(("COORDINATION_SLOT_KEY".to_string(), value.clone()));
+        }
         if let Some(value) = &self.task_id {
             values.push(("COORDINATION_TASK_ID".to_string(), value.clone()));
         }
@@ -148,16 +156,19 @@ impl TerminalCoordinationContext {
         let role = self.orchestration_role.as_deref().unwrap_or("none");
         let run = self.orchestration_run_id.as_deref().unwrap_or("none");
         let workspace = self.workspace_id.as_deref().unwrap_or("none");
+        let slot = self.slot_key.as_deref().unwrap_or("none");
         let worktree = self.worktree_path.as_deref().unwrap_or(&self.write_root);
         let mut banner = format!(
-            "COORDINATION ENABLED\nYou are in an isolated worktree.\nAgent: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nRole: {}\nOrchestration Run: {}\nWorktree: {}\nCoordinator MCP: always on\nCloud Orchestrator: {}\nDo not edit the shared repo root directly.\nBefore editing:\n1. call get_brief\n2. claim_task\n3. search_memory for relevant decisions/contracts/handoffs\n4. post_plan\n5. acquire_lease for files/symbols/db resources\n6. edit only inside COORDINATION_WORKTREE_PATH\n7. write contract/handoff memory if another agent depends on your work\n8. submit_patch when done\nDo not merge directly. The kernel merge gate applies accepted patches.\n",
+            "COORDINATION ENABLED\nYou are in an isolated worktree.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nRole: {}\nOrchestration Run: {}\nMCP config: {}\nWorktree: {}\nThis slot reuses the same MCP config and worktree across sessions.\nCoordinator MCP: always on\nCloud Orchestrator: {}\nDo not edit the shared repo root directly.\nBefore editing:\n1. call get_brief\n2. claim_task\n3. search_memory for relevant decisions/contracts/handoffs\n4. post_plan\n5. acquire_lease for files/symbols/db resources\n6. edit only inside COORDINATION_WORKTREE_PATH\n7. write contract/handoff memory if another agent depends on your work\n8. submit_patch when done\nDo not merge directly. The kernel merge gate applies accepted patches.\n",
             self.agent_id,
+            slot,
             self.session_id,
             workspace,
             self.objective_key,
             task,
             role,
             run,
+            self.mcp_config_path,
             worktree,
             cloud
         );

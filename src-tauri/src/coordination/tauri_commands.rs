@@ -119,6 +119,26 @@ pub fn coordination_create_session(
     input: Value,
 ) -> Result<Value, String> {
     let kernel = kernel(repo_path, db_path)?;
+    if let Some(slot_key) = input["slot_key"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return result(
+            kernel
+                .create_session_for_slot_key(
+                    slot_key,
+                    input["agent_name"].as_str().unwrap_or("Local agent"),
+                    input["agent_kind"].as_str().unwrap_or("coding_agent"),
+                    input["role"].as_str(),
+                    input["task_id"].as_str(),
+                    input["pty_id"].as_str(),
+                    input["write_enabled"].as_bool().unwrap_or(true),
+                    input["orchestration_run_id"].as_str(),
+                    input["orchestration_role"].as_str(),
+                )
+                .map(api_ok_from_data),
+        );
+    }
     let agent_id = match input["agent_id"].as_str() {
         Some(agent_id) if !agent_id.is_empty() => agent_id.to_string(),
         _ => {

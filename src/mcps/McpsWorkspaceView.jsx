@@ -35,15 +35,24 @@ import {
 const COORDINATION_TOOLS = [
   "get_brief",
   "claim_task",
+  "post_plan",
   "acquire_lease",
+  "renew_lease",
+  "release_lease",
+  "list_active_leases",
+  "announce_change",
   "validate_patch",
   "submit_patch",
-  "request_merge",
+  "list_workspace_violations",
+  "get_slot_status",
   "search_memory",
-  "write_contract_memory",
-  "write_handoff_memory",
+  "write_memory",
+  "db_get_mode",
   "db_classify_sql",
-  "orchestrator_get_status",
+  "db_attach_migration_proposal",
+  "db_propose_migration",
+  "db_request_approval",
+  "request_approval",
 ];
 
 function unwrapData(response, fallback = {}) {

@@ -7,7 +7,11 @@ use std::{
 
 use rusqlite::{Connection, Error as SqliteError, ErrorCode};
 
-use super::schema::{CREATE_SCHEMA_SQL, MIGRATION_NAME, MIGRATION_VERSION};
+use super::schema::{
+    CREATE_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION, MIGRATION_NAME,
+    MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
+    RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
+};
 
 pub const REPO_ID: &str = "local";
 
@@ -42,6 +46,10 @@ impl StoragePaths {
         for path in [
             &self.agents_root,
             &self.artifacts_root,
+            &self.artifacts_root.join("db-change-requests"),
+            &self.artifacts_root.join("migrations"),
+            &self.artifacts_root.join("cloud"),
+            &self.artifacts_root.join("repo-sketches"),
             &self.memory_root,
             &self.memory_root.join("decisions"),
             &self.memory_root.join("contracts"),
@@ -52,6 +60,7 @@ impl StoragePaths {
             &self.memory_root.join("runs"),
             &self.worktrees_root,
             &self.mcp_root,
+            &self.mcp_root.join("agents"),
             &self.cloud_root,
             &self.cloud_root.join("mock-plans"),
             &self.cloud_root.join("context-exports"),
@@ -65,6 +74,7 @@ impl StoragePaths {
         }
 
         crate::ensure_workspace_agents_gitignore(&self.repo_path)?;
+        clean_stale_mcp_temp_files(&self.mcp_root)?;
 
         Ok(())
     }
@@ -146,28 +156,179 @@ fn run_migrations(connection: &Connection) -> Result<(), String> {
         connection.execute_batch(CREATE_SCHEMA_SQL)
     })?;
 
+    record_migration_if_missing(
+        connection,
+        INITIAL_MIGRATION_VERSION,
+        INITIAL_MIGRATION_NAME,
+    )?;
+    apply_slot_migration(connection)?;
+    apply_runtime_guard_migration(connection)?;
+    record_migration_if_missing(connection, MIGRATION_VERSION, MIGRATION_NAME)?;
+
+    Ok(())
+}
+
+fn apply_slot_migration(connection: &Connection) -> Result<(), String> {
+    if migration_applied(connection, SLOT_MIGRATION_VERSION)? {
+        return Ok(());
+    }
+
+    with_sqlite_lock_retry("Unable to initialize stable slot schema", || {
+        connection.execute_batch(SLOT_SCHEMA_SQL)
+    })?;
+    ensure_column(connection, "agent_sessions", "agent_slot_id", "TEXT")?;
+    ensure_column(connection, "leases", "agent_slot_id", "TEXT")?;
+    ensure_column(
+        connection,
+        "lease_conflicts",
+        "requested_by_slot_id",
+        "TEXT",
+    )?;
+    ensure_column(connection, "events", "agent_slot_id", "TEXT")?;
+    ensure_column(connection, "worktrees", "agent_slot_id", "TEXT")?;
+    ensure_column(connection, "patches", "agent_slot_id", "TEXT")?;
+    ensure_column(connection, "artifacts", "agent_slot_id", "TEXT")?;
+    ensure_column(connection, "memories", "db_change_request_id", "TEXT")?;
+    ensure_column(connection, "memories", "created_by_slot_id", "TEXT")?;
+    record_migration_if_missing(connection, SLOT_MIGRATION_VERSION, SLOT_MIGRATION_NAME)
+}
+
+fn apply_runtime_guard_migration(connection: &Connection) -> Result<(), String> {
+    if migration_applied(connection, RUNTIME_GUARD_MIGRATION_VERSION)? {
+        return Ok(());
+    }
+
+    interrupt_duplicate_active_sessions_for_guard_indexes(connection)?;
+    with_sqlite_lock_retry("Unable to initialize coordination runtime guards", || {
+        connection.execute_batch(RUNTIME_GUARD_SCHEMA_SQL)
+    })?;
+    record_migration_if_missing(
+        connection,
+        RUNTIME_GUARD_MIGRATION_VERSION,
+        RUNTIME_GUARD_MIGRATION_NAME,
+    )
+}
+
+fn interrupt_duplicate_active_sessions_for_guard_indexes(
+    connection: &Connection,
+) -> Result<(), String> {
+    let now = super::kernel::now_rfc3339();
+    with_sqlite_lock_retry("Unable to normalize active slot sessions", || {
+        connection.execute(
+            "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY agent_slot_id
+                         ORDER BY updated_at DESC, created_at DESC, id DESC
+                       ) AS rank
+                FROM agent_sessions
+                WHERE status='active' AND agent_slot_id IS NOT NULL
+             )
+             UPDATE agent_sessions
+             SET status='interrupted', updated_at=?1
+             WHERE id IN (SELECT id FROM ranked WHERE rank > 1)",
+            [&now],
+        )
+    })?;
+    with_sqlite_lock_retry("Unable to normalize active PTY sessions", || {
+        connection.execute(
+            "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY pty_id
+                         ORDER BY updated_at DESC, created_at DESC, id DESC
+                       ) AS rank
+                FROM agent_sessions
+                WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> ''
+             )
+             UPDATE agent_sessions
+             SET status='interrupted', updated_at=?1
+             WHERE id IN (SELECT id FROM ranked WHERE rank > 1)",
+            [&now],
+        )
+    })?;
+    Ok(())
+}
+
+fn migration_applied(connection: &Connection, version: i64) -> Result<bool, String> {
     let applied: i64 =
         with_sqlite_lock_retry("Unable to inspect coordination schema migrations", || {
             connection.query_row(
                 "SELECT COUNT(1) FROM schema_migrations WHERE version = ?1",
-                [MIGRATION_VERSION],
+                [version],
                 |row| row.get(0),
             )
         })?;
+    Ok(applied > 0)
+}
 
-    if applied == 0 {
-        with_sqlite_lock_retry("Unable to record coordination schema migration", || {
-            connection.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?1, ?2, ?3)",
-                rusqlite::params![
-                    MIGRATION_VERSION,
-                    MIGRATION_NAME,
-                    super::kernel::now_rfc3339()
-                ],
-            )
-        })?;
+fn record_migration_if_missing(
+    connection: &Connection,
+    version: i64,
+    name: &str,
+) -> Result<(), String> {
+    if migration_applied(connection, version)? {
+        return Ok(());
+    }
+    with_sqlite_lock_retry("Unable to record coordination schema migration", || {
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?1, ?2, ?3)",
+            rusqlite::params![version, name, super::kernel::now_rfc3339()],
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("Unable to inspect {table} columns: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Unable to read {table} columns: {error}"))?;
+    for row in rows {
+        if row.map_err(|error| format!("Unable to read {table} column row: {error}"))? == column {
+            return Ok(());
+        }
     }
 
+    with_sqlite_lock_retry("Unable to add coordination schema column", || {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+    })?;
+    Ok(())
+}
+
+fn clean_stale_mcp_temp_files(mcp_root: &Path) -> Result<(), String> {
+    for directory in [mcp_root.to_path_buf(), mcp_root.join("agents")] {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Unable to inspect MCP temp files in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("tmp") {
+                fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "Unable to remove stale MCP temp file {}: {error}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
     Ok(())
 }
 
