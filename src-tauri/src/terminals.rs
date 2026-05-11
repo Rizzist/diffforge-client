@@ -2125,6 +2125,7 @@ fn set_terminal_audio_input_target(
 struct TerminalSubmittedPrompt {
     prompt: String,
     bypass_cloud_plan: bool,
+    stale_restored_prompt: bool,
 }
 
 fn terminal_normalize_prompt_for_gate(prompt: &str) -> String {
@@ -2191,11 +2192,10 @@ fn terminal_prompt_requires_cloud_plan(prompt: &str) -> bool {
     !terminal_is_control_prompt(&prompt)
 }
 
-async fn terminal_capture_submitted_prompt(
-    instance: &TerminalInstance,
+fn terminal_capture_submitted_prompt_from_gate(
+    gate: &mut TerminalInputGate,
     data: &str,
 ) -> Option<TerminalSubmittedPrompt> {
-    let mut gate = instance.input_gate.lock().await;
     let mut submitted = None;
 
     for character in data.chars() {
@@ -2221,6 +2221,8 @@ async fn terminal_capture_submitted_prompt(
             }
             '\r' | '\n' => {
                 let prompt = gate.current_line.trim().to_string();
+                let normalized_prompt = terminal_normalize_prompt_for_gate(&prompt);
+                let line_user_touched = gate.current_line_user_touched;
                 let control_prompt = terminal_is_control_prompt(&prompt);
                 let bypass_followup = gate.control_command_bypass_submits > 0;
                 if bypass_followup {
@@ -2230,22 +2232,27 @@ async fn terminal_capture_submitted_prompt(
                 gate.control_command_bypass_submits =
                     terminal_control_followup_bypass_count(&prompt);
                 gate.current_line.clear();
-                if !prompt.is_empty() {
+                gate.current_line_user_touched = false;
+                if !normalized_prompt.is_empty() {
                     submitted = Some(TerminalSubmittedPrompt {
                         prompt,
-                        bypass_cloud_plan: control_prompt || bypass_followup,
+                        bypass_cloud_plan: control_prompt || bypass_followup || !line_user_touched,
+                        stale_restored_prompt: !line_user_touched,
                     });
                 }
             }
             '\u{7f}' | '\u{8}' => {
                 gate.current_line.pop();
+                gate.current_line_user_touched = true;
             }
             '\u{15}' => {
                 gate.current_line.clear();
+                gate.current_line_user_touched = true;
             }
             character if character.is_control() => {}
             character => {
                 gate.current_line.push(character);
+                gate.current_line_user_touched = true;
                 if gate.current_line.len() > 8192 {
                     let drain_to = gate.current_line.len().saturating_sub(4096);
                     gate.current_line.drain(..drain_to);
@@ -2257,12 +2264,72 @@ async fn terminal_capture_submitted_prompt(
     submitted
 }
 
+async fn terminal_capture_submitted_prompt(
+    instance: &TerminalInstance,
+    data: &str,
+) -> Option<TerminalSubmittedPrompt> {
+    let mut gate = instance.input_gate.lock().await;
+    terminal_capture_submitted_prompt_from_gate(&mut gate, data)
+}
+
 async fn terminal_instance_requires_cloud_prompt_gate(instance: &TerminalInstance) -> bool {
     if instance.coordination.is_none() {
         return false;
     }
 
     *instance.agent_started.lock().await
+}
+
+#[cfg(test)]
+mod terminal_input_gate_tests {
+    use super::*;
+
+    #[test]
+    fn empty_enter_does_not_submit_prompt() {
+        let mut gate = TerminalInputGate::default();
+
+        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r");
+
+        assert!(submitted.is_none());
+    }
+
+    #[test]
+    fn typed_prompt_submits_when_enter_arrives_separately() {
+        let mut gate = TerminalInputGate::default();
+
+        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "fix the bug").is_none());
+        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").unwrap();
+
+        assert_eq!(submitted.prompt, "fix the bug");
+        assert!(!submitted.bypass_cloud_plan);
+        assert!(!submitted.stale_restored_prompt);
+    }
+
+    #[test]
+    fn stale_restored_prompt_is_marked_on_blank_enter() {
+        let mut gate = TerminalInputGate {
+            current_line: "fix the bug".to_string(),
+            current_line_user_touched: false,
+            ..TerminalInputGate::default()
+        };
+
+        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").unwrap();
+
+        assert_eq!(submitted.prompt, "fix the bug");
+        assert!(submitted.bypass_cloud_plan);
+        assert!(submitted.stale_restored_prompt);
+        assert!(gate.current_line.is_empty());
+        assert!(!gate.current_line_user_touched);
+    }
+
+    #[test]
+    fn prompt_marker_only_input_does_not_submit_prompt() {
+        let mut gate = TerminalInputGate::default();
+
+        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "$\r");
+
+        assert!(submitted.is_none());
+    }
 }
 
 #[tauri::command]
@@ -2288,6 +2355,29 @@ async fn terminal_write(
 
     if let Some(submitted) = terminal_capture_submitted_prompt(&instance, &data).await {
         let prompt = submitted.prompt;
+        if submitted.stale_restored_prompt {
+            log_terminal_event(
+                "terminal.write.stale_restored_prompt_enter_ignored",
+                Some(&pane_id),
+                Some(instance.id),
+                None,
+                json!({
+                    "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
+                    "bytes": data.len(),
+                }),
+            );
+            write_terminal_input(
+                &state,
+                &pane_id,
+                Some(instance.id),
+                "\u{15}",
+                "terminal.write.stale_restored_prompt_clear_skipped",
+            )
+            .await
+            .map(|_| ())?;
+            return Ok(());
+        }
+
         if terminal_instance_requires_cloud_prompt_gate(&instance).await
             && !submitted.bypass_cloud_plan
             && terminal_prompt_requires_cloud_plan(&prompt)
@@ -2347,6 +2437,7 @@ async fn terminal_write(
                         let mut gate = instance.input_gate.lock().await;
                         if gate.current_line.trim().is_empty() {
                             gate.current_line = prompt.clone();
+                            gate.current_line_user_touched = false;
                         }
                     }
                     log_terminal_event(

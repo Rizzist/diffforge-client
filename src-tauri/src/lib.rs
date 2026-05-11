@@ -313,6 +313,7 @@ struct TerminalCoordinationSession {
 #[derive(Default)]
 struct TerminalInputGate {
     current_line: String,
+    current_line_user_touched: bool,
     control_command_bypass_submits: usize,
     ansi_escape_active: bool,
     ansi_csi_active: bool,
