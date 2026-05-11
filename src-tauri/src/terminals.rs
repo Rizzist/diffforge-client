@@ -541,6 +541,7 @@ fn cleanup_terminal_instance_with_context(
         size,
         working_directory,
         agent_started,
+        input_gate,
         coordination,
     } = instance;
 
@@ -575,6 +576,7 @@ fn cleanup_terminal_instance_with_context(
         drop(size);
         drop(working_directory);
         drop(agent_started);
+        drop(input_gate);
         drop(coordination);
         log_terminal_event(
             "terminal.cleanup.no_child",
@@ -1098,6 +1100,7 @@ fn write_agent_start_input_to_writer(
 async fn terminal_open(
     app: AppHandle,
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     request: TerminalOpenRequest,
     output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
@@ -1136,6 +1139,41 @@ async fn terminal_open(
             "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
         }),
     );
+
+    let cloud_gate_started_at = Instant::now();
+    match require_cloud_mcp_terminal_gate(
+        cloud_mcp_state.inner(),
+        working_directory_request.as_deref(),
+        workspace_id.as_deref(),
+        workspace_name.as_deref(),
+    )
+    .await
+    {
+        Ok(status) => log_terminal_event(
+            "terminal.open.cloud_mcp_gate_ready",
+            Some(&pane_id),
+            request.instance_id,
+            Some(cloud_gate_started_at.elapsed()),
+            json!({
+                "base_url": clean_terminal_telemetry_text(&status.base_url),
+                "registered_workspace_count": status.registered_workspace_count,
+                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+            }),
+        ),
+        Err(error) => {
+            log_terminal_event(
+                "terminal.open.cloud_mcp_gate_blocked",
+                Some(&pane_id),
+                request.instance_id,
+                Some(cloud_gate_started_at.elapsed()),
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+                }),
+            );
+            return Err(error);
+        }
+    }
 
     let close_started_at = Instant::now();
     let closed_existing = close_terminal_session(&state, &pane_id, None)
@@ -1186,6 +1224,34 @@ async fn terminal_open(
         terminal_launch(&kind, provider, model)?
     };
     if !is_prewarm_pty {
+        let git_started_at = Instant::now();
+        let git_bootstrap = match ensure_workspace_git_ready_for_coordination(&working_directory) {
+            Ok(result) => result,
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.open.git_preflight_error",
+                    Some(&pane_id),
+                    request.instance_id,
+                    Some(git_started_at.elapsed()),
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "working_directory": workspace_path_display(&working_directory),
+                    }),
+                );
+                return Err(format!(
+                    "Unable to prepare Git for coordinated agent work in {}: {error}",
+                    workspace_path_display(&working_directory)
+                ));
+            }
+        };
+        log_terminal_event(
+            "terminal.open.git_preflight_ready",
+            Some(&pane_id),
+            request.instance_id,
+            Some(git_started_at.elapsed()),
+            serde_json::to_value(&git_bootstrap).unwrap_or_else(|_| json!({})),
+        );
+
         let coordination_started_at = Instant::now();
         let agent_kind = provider_for_coordination
             .as_deref()
@@ -1205,8 +1271,8 @@ async fn terminal_open(
                 )
             }) {
             Ok(context) => {
-                let write_root = PathBuf::from(&context.write_root);
-                process_working_directory = workspace_path_for_process(&write_root);
+                let write_root = workspace_path_for_process(&PathBuf::from(&context.write_root));
+                process_working_directory = write_root.clone();
                 log_terminal_event(
                     "terminal.open.coordination_ready",
                     Some(&pane_id),
@@ -1219,7 +1285,9 @@ async fn terminal_open(
                         "objective_key": clean_terminal_telemetry_text(&context.objective_key),
                         "worktree_id": context.worktree_id.as_deref().map(clean_terminal_telemetry_text),
                         "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
-                        "write_root": workspace_path_display(&process_working_directory),
+                        "write_root": workspace_path_display(&write_root),
+                        "launch_cwd": workspace_path_display(&process_working_directory),
+                        "cwd_policy": "isolated_worktree_cwd",
                     }),
                 );
                 if context.enforcement_mode == "coordination_only"
@@ -1386,6 +1454,14 @@ async fn terminal_open(
             "prewarm_pty": is_prewarm_pty,
             "repo_working_directory": workspace_path_display(&working_directory),
             "working_directory": workspace_path_display(&process_working_directory),
+            "agent_branch_root": coordination_context
+                .as_ref()
+                .map(|context| clean_terminal_telemetry_text(&context.write_root)),
+            "cwd_policy": if coordination_context.is_some() {
+                "isolated_worktree_cwd"
+            } else {
+                "plain_project_root"
+            },
         }),
     );
 
@@ -1445,6 +1521,14 @@ async fn terminal_open(
             "command": clean_terminal_telemetry_text(&command),
             "repo_working_directory": workspace_path_display(&working_directory),
             "working_directory": workspace_path_display(&process_working_directory),
+            "agent_branch_root": coordination_context
+                .as_ref()
+                .map(|context| clean_terminal_telemetry_text(&context.write_root)),
+            "cwd_policy": if coordination_context.is_some() {
+                "isolated_worktree_cwd"
+            } else {
+                "plain_project_root"
+            },
         }),
     );
 
@@ -1453,6 +1537,22 @@ async fn terminal_open(
         instance_id,
         command,
         working_directory: workspace_path_display(&process_working_directory),
+        project_root: workspace_path_display(&working_directory),
+        agent_branch_root: coordination_context
+            .as_ref()
+            .map(|context| context.write_root.clone()),
+        agent_branch: coordination_context.as_ref().and_then(|context| {
+            context
+                .slot_key
+                .as_deref()
+                .map(|slot_key| format!("agent/{slot_key}"))
+        }),
+        slot_key: coordination_context
+            .as_ref()
+            .and_then(|context| context.slot_key.clone()),
+        coordination_mode: coordination_context
+            .as_ref()
+            .map(|context| context.enforcement_mode.clone()),
     })
 }
 
@@ -1498,6 +1598,7 @@ fn terminal_telemetry_log_many(requests: Vec<TerminalTelemetryLogRequest>) -> Re
 #[tauri::command]
 async fn terminal_start_agent(
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
     instance_id: Option<u64>,
     provider: String,
@@ -1556,6 +1657,39 @@ async fn terminal_start_agent(
             "Deferred agent start is blocked because this terminal has no coordination session."
                 .to_string(),
         );
+    }
+    let cloud_gate_started_at = Instant::now();
+    match require_cloud_mcp_terminal_gate_for_path(
+        cloud_mcp_state.inner(),
+        instance.working_directory.as_ref(),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(status) => log_terminal_event(
+            "terminal.agent_start.cloud_mcp_gate_ready",
+            Some(&pane_id),
+            Some(instance.id),
+            Some(cloud_gate_started_at.elapsed()),
+            json!({
+                "base_url": clean_terminal_telemetry_text(&status.base_url),
+                "provider": definition.id,
+            }),
+        ),
+        Err(error) => {
+            log_terminal_event(
+                "terminal.agent_start.cloud_mcp_gate_blocked",
+                Some(&pane_id),
+                Some(instance.id),
+                Some(cloud_gate_started_at.elapsed()),
+                json!({
+                    "provider": definition.id,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            return Err(error);
+        }
     }
     let input = terminal_agent_start_input_in_directory(
         &command_path,
@@ -1847,6 +1981,7 @@ async fn start_terminal_agent_in_prepared_pty(
 #[tauri::command]
 async fn terminal_start_agent_many(
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     requests: Vec<TerminalStartAgentRequest>,
 ) -> Result<TerminalStartAgentManyResult, String> {
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
@@ -1855,6 +1990,32 @@ async fn terminal_start_agent_many(
         return Err(format!(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
         ));
+    }
+    let cloud_gate_started_at = Instant::now();
+    match require_cloud_mcp_connected_state(cloud_mcp_state.inner()).await {
+        Ok(status) => log_terminal_event(
+            "terminal.agent_start_many.cloud_mcp_gate_ready",
+            None,
+            None,
+            Some(cloud_gate_started_at.elapsed()),
+            json!({
+                "base_url": clean_terminal_telemetry_text(&status.base_url),
+                "request_count": requests.len(),
+            }),
+        ),
+        Err(error) => {
+            log_terminal_event(
+                "terminal.agent_start_many.cloud_mcp_gate_blocked",
+                None,
+                None,
+                Some(cloud_gate_started_at.elapsed()),
+                json!({
+                    "request_count": requests.len(),
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            return Err(error);
+        }
     }
 
     let batch_started_at = Instant::now();
@@ -1922,13 +2083,238 @@ fn set_terminal_audio_input_target(
     set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
 }
 
+struct TerminalSubmittedPrompt {
+    prompt: String,
+    bypass_cloud_plan: bool,
+}
+
+fn terminal_normalize_prompt_for_gate(prompt: &str) -> String {
+    let mut normalized = prompt
+        .replace("[200~", "")
+        .replace("[201~", "")
+        .replace("\u{1b}[200~", "")
+        .replace("\u{1b}[201~", "");
+    normalized.retain(|character| !character.is_control());
+    let mut normalized = normalized.trim().to_string();
+
+    loop {
+        let next = normalized
+            .strip_prefix('>')
+            .or_else(|| normalized.strip_prefix('›'))
+            .or_else(|| normalized.strip_prefix('$'))
+            .or_else(|| normalized.strip_prefix('#'))
+            .map(str::trim_start);
+        let Some(next) = next else {
+            break;
+        };
+        normalized = next.to_string();
+    }
+
+    normalized
+}
+
+fn terminal_control_followup_bypass_count(prompt: &str) -> usize {
+    let prompt = terminal_normalize_prompt_for_gate(prompt);
+    let lower = prompt.to_ascii_lowercase();
+    if lower.starts_with("/model") {
+        return 1;
+    }
+
+    0
+}
+
+fn terminal_is_control_prompt(prompt: &str) -> bool {
+    let prompt = terminal_normalize_prompt_for_gate(prompt);
+    if prompt.is_empty() {
+        return true;
+    }
+    if prompt.starts_with('/') {
+        return true;
+    }
+
+    matches!(
+        prompt.to_ascii_lowercase().as_str(),
+        "exit"
+            | "quit"
+            | "clear"
+            | "cls"
+            | "reset"
+            | "y"
+            | "yes"
+            | "n"
+            | "no"
+            | "cancel"
+    )
+}
+
+fn terminal_prompt_requires_cloud_plan(prompt: &str) -> bool {
+    let prompt = terminal_normalize_prompt_for_gate(prompt);
+    !terminal_is_control_prompt(&prompt)
+}
+
+async fn terminal_capture_submitted_prompt(
+    instance: &TerminalInstance,
+    data: &str,
+) -> Option<TerminalSubmittedPrompt> {
+    let mut gate = instance.input_gate.lock().await;
+    let mut submitted = None;
+
+    for character in data.chars() {
+        if gate.ansi_escape_active {
+            if gate.ansi_csi_active {
+                if ('@'..='~').contains(&character) {
+                    gate.ansi_escape_active = false;
+                    gate.ansi_csi_active = false;
+                }
+            } else if character == '[' {
+                gate.ansi_csi_active = true;
+            } else {
+                gate.ansi_escape_active = false;
+                gate.ansi_csi_active = false;
+            }
+            continue;
+        }
+
+        match character {
+            '\u{1b}' => {
+                gate.ansi_escape_active = true;
+                gate.ansi_csi_active = false;
+            }
+            '\r' | '\n' => {
+                let prompt = gate.current_line.trim().to_string();
+                let control_prompt = terminal_is_control_prompt(&prompt);
+                let bypass_followup = gate.control_command_bypass_submits > 0;
+                if bypass_followup {
+                    gate.control_command_bypass_submits =
+                        gate.control_command_bypass_submits.saturating_sub(1);
+                }
+                gate.control_command_bypass_submits =
+                    terminal_control_followup_bypass_count(&prompt);
+                gate.current_line.clear();
+                if !prompt.is_empty() {
+                    submitted = Some(TerminalSubmittedPrompt {
+                        prompt,
+                        bypass_cloud_plan: control_prompt || bypass_followup,
+                    });
+                }
+            }
+            '\u{7f}' | '\u{8}' => {
+                gate.current_line.pop();
+            }
+            '\u{15}' => {
+                gate.current_line.clear();
+            }
+            character if character.is_control() => {}
+            character => {
+                gate.current_line.push(character);
+                if gate.current_line.len() > 8192 {
+                    let drain_to = gate.current_line.len().saturating_sub(4096);
+                    gate.current_line.drain(..drain_to);
+                }
+            }
+        }
+    }
+
+    submitted
+}
+
 #[tauri::command]
 async fn terminal_write(
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
 ) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        log_terminal_event(
+            "terminal.write.skipped_stale_or_missing",
+            Some(&pane_id),
+            instance_id,
+            None,
+            json!({ "bytes": data.len() }),
+        );
+        return Ok(());
+    };
+
+    if let Some(submitted) = terminal_capture_submitted_prompt(&instance, &data).await {
+        let prompt = submitted.prompt;
+        if !submitted.bypass_cloud_plan && terminal_prompt_requires_cloud_plan(&prompt) {
+            match cloud_mcp_require_prompt_plan_accepted(
+                cloud_mcp_state.inner(),
+                instance.working_directory.as_ref(),
+                &prompt,
+            )
+            .await
+            {
+                Ok(enhanced_prompt) => {
+                    let enhanced_input = format!("\u{15}{enhanced_prompt}\r");
+                    if enhanced_input.len() > MAX_TERMINAL_WRITE_BYTES {
+                        return Err(
+                            "Enhanced Cloud MCP prompt is too large for terminal input.".to_string(),
+                        );
+                    }
+                    log_terminal_event(
+                        "terminal.write.cloud_mcp_plan_accepted",
+                        Some(&pane_id),
+                        Some(instance.id),
+                        None,
+                        json!({
+                            "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
+                            "original_bytes": data.len(),
+                            "enhanced_bytes": enhanced_input.len(),
+                        }),
+                    );
+                    write_terminal_input(
+                        &state,
+                        &pane_id,
+                        Some(instance.id),
+                        &enhanced_input,
+                        "terminal.write.enhanced_prompt_skipped_stale_or_missing",
+                    )
+                    .await
+                    .map(|_| ())?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let data_without_submit = data
+                        .chars()
+                        .filter(|character| !matches!(character, '\r' | '\n'))
+                        .collect::<String>();
+                    if !data_without_submit.is_empty() {
+                        let _ = write_terminal_input(
+                            &state,
+                            &pane_id,
+                            Some(instance.id),
+                            &data_without_submit,
+                            "terminal.write.cloud_mcp_plan_echo_skipped",
+                        )
+                        .await;
+                    }
+                    {
+                        let mut gate = instance.input_gate.lock().await;
+                        if gate.current_line.trim().is_empty() {
+                            gate.current_line = prompt.clone();
+                        }
+                    }
+                    log_terminal_event(
+                        "terminal.write.cloud_mcp_plan_blocked",
+                        Some(&pane_id),
+                        Some(instance.id),
+                        None,
+                        json!({
+                            "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
+                            "error": clean_terminal_telemetry_text(&error),
+                        }),
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     write_terminal_input(
         &state,
         &pane_id,

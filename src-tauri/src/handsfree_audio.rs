@@ -90,9 +90,14 @@ fn default_audio_push_to_talk_shortcut() -> &'static str {
     "Alt+KeyP"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn default_audio_push_to_talk_shortcut() -> &'static str {
     "ContextMenu"
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn default_audio_push_to_talk_shortcut() -> &'static str {
+    "Alt+KeyP"
 }
 
 impl AudioShortcutRegistration {
@@ -661,19 +666,27 @@ fn register_audio_shortcut_registration(
     action: AudioShortcutAction,
     shortcut: String,
 ) -> AudioShortcutRegistration {
+    if audio_shortcut_uses_windows_context_menu_hook(action, &shortcut) {
+        return match register_audio_context_menu_keyboard_hook(app) {
+            Ok(()) => AudioShortcutRegistration {
+                shortcut,
+                registered: true,
+                error: None,
+            },
+            Err(error) => AudioShortcutRegistration {
+                shortcut,
+                registered: false,
+                error: Some(error),
+            },
+        };
+    }
+
     match register_audio_shortcut_handler(app, action, &shortcut) {
         Ok(()) => AudioShortcutRegistration {
             shortcut,
             registered: true,
             error: None,
         },
-        Err(_) if audio_shortcut_uses_windows_context_menu_hook(action, &shortcut) => {
-            AudioShortcutRegistration {
-                shortcut,
-                registered: true,
-                error: None,
-            }
-        }
         Err(error) => AudioShortcutRegistration {
             shortcut,
             registered: false,
@@ -695,7 +708,7 @@ fn register_audio_shortcuts(app: &AppHandle) {
         register_audio_shortcut_registration(app, AudioShortcutAction::Cancel, bindings.cancel);
 
     app.state::<AudioState>().shortcut_manager.replace(state);
-    register_audio_context_menu_keyboard_hook(app);
+    let _ = register_audio_context_menu_keyboard_hook(app);
     emit_audio_shortcuts_changed(app);
 }
 
@@ -832,7 +845,7 @@ unsafe extern "system" fn audio_context_menu_keyboard_hook(
 }
 
 #[cfg(windows)]
-fn register_audio_context_menu_keyboard_hook(app: &AppHandle) {
+fn register_audio_context_menu_keyboard_hook(app: &AppHandle) -> Result<(), String> {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL};
 
@@ -842,7 +855,7 @@ fn register_audio_context_menu_keyboard_hook(app: &AppHandle) {
     }
 
     if AUDIO_CONTEXT_MENU_HOOK_HANDLE.load(Ordering::Acquire) != 0 {
-        return;
+        return Ok(());
     }
 
     let module_handle = unsafe { GetModuleHandleW(std::ptr::null()) };
@@ -857,11 +870,16 @@ fn register_audio_context_menu_keyboard_hook(app: &AppHandle) {
 
     if !hook.is_null() {
         AUDIO_CONTEXT_MENU_HOOK_HANDLE.store(hook as usize, Ordering::Release);
+        return Ok(());
     }
+
+    Err("Unable to install the Windows Menu key hook for hold-to-record.".to_string())
 }
 
 #[cfg(not(windows))]
-fn register_audio_context_menu_keyboard_hook(_app: &AppHandle) {}
+fn register_audio_context_menu_keyboard_hook(_app: &AppHandle) -> Result<(), String> {
+    Ok(())
+}
 
 fn emit_audio_push_to_talk_event(
     app: &AppHandle,

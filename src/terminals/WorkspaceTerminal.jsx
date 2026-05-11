@@ -105,11 +105,17 @@ import {
   TerminalDevMetric,
   TerminalFrame,
   XtermSurface,
+  TerminalScrollRail,
+  TerminalScrollThumb,
   TerminalClosedSurface,
   TerminalClosedLabel,
   TerminalClosingOverlay,
   TerminalRestartPill,
   TerminalAgentIdBadge,
+  TerminalProjectBadge,
+  TerminalRestartMenu,
+  TerminalRestartDropdown,
+  TerminalRestartOption,
   TerminalRestartButton,
   TerminalCloseButton,
   TerminalEmptyPanel,
@@ -301,7 +307,11 @@ import {
   FileFolderTreeIcon,
   FileDocumentIcon
 } from "../app/appStyles";
-import { createTerminalResizeController, measureTerminalGrid } from "./terminalResizeController";
+import {
+  createTerminalResizeController,
+  getTerminalActualCellSize,
+  measureTerminalGrid,
+} from "./terminalResizeController";
 import { addTerminalMetrics, getWorkspaceOpenTelemetryFields, patchTerminalMetrics, writeTerminalTelemetry } from "./terminalTelemetry.jsx";
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
@@ -345,6 +355,75 @@ const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
 const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
+const TODO_DRAG_MIME = "application/x-diffforge-todo";
+const TODO_DROP_OVERLAY_STYLE = {
+  position: "absolute",
+  inset: "10px",
+  zIndex: 9,
+  display: "grid",
+  placeItems: "center",
+  border: "2px dotted rgba(138, 216, 255, 0.92)",
+  borderRadius: "14px",
+  background: "rgba(2, 8, 14, 0.54)",
+  boxShadow: "inset 0 0 0 1px rgba(255, 173, 124, 0.24), 0 0 32px rgba(138, 216, 255, 0.12)",
+  pointerEvents: "none",
+};
+const TODO_DROP_OVERLAY_LABEL_STYLE = {
+  border: "1px solid rgba(138, 216, 255, 0.3)",
+  borderRadius: "999px",
+  padding: "8px 12px",
+  color: "#e9f8ff",
+  background: "linear-gradient(135deg, rgba(6, 16, 26, 0.96), rgba(28, 16, 10, 0.92))",
+  fontSize: "12px",
+  fontWeight: 800,
+  letterSpacing: "0.04em",
+  textTransform: "uppercase",
+};
+
+function isWindowsTerminalHost() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const platform = String(navigator.platform || "");
+  const userAgent = String(navigator.userAgent || "");
+
+  return /windows|win32|win64|wince/i.test(`${platform} ${userAgent}`);
+}
+
+const TERMINAL_SCROLLBAR_PLATFORM = isWindowsTerminalHost() ? "windows" : "overlay";
+const TERMINAL_ROLE_SWITCH_OPTIONS = [
+  { id: "codex", label: "Codex", shortLabel: "CX" },
+  { id: "claude", label: "Claude Code", shortLabel: "CL" },
+  { id: "generic", label: "Terminal", shortLabel: "SH" },
+];
+
+function getTerminalWheelScrollRows(event, terminal) {
+  const deltaY = Number(event?.deltaY || 0);
+
+  if (!Number.isFinite(deltaY) || deltaY === 0) {
+    return 0;
+  }
+
+  const direction = deltaY > 0 ? 1 : -1;
+
+  if (event.deltaMode === 1) {
+    return direction * Math.max(1, Math.ceil(Math.abs(deltaY)));
+  }
+
+  if (event.deltaMode === 2) {
+    const pageRows = Math.max(1, (Number(terminal?.rows) || TERMINAL_DEFAULT_ROWS) - 1);
+    return direction * Math.max(1, Math.ceil(Math.abs(deltaY) * pageRows));
+  }
+
+  const cellSize = getTerminalActualCellSize(terminal);
+  const cellHeight = Number(cellSize.actualCellHeight);
+  const normalizedCellHeight = cellSize.valid && Number.isFinite(cellHeight) && cellHeight > 0
+    ? cellHeight
+    : 16;
+
+  return direction * Math.max(1, Math.ceil(Math.abs(deltaY) / normalizedCellHeight));
+}
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -366,6 +445,31 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function getDraggedTodoPrompt(dataTransfer) {
+  const customPayload = dataTransfer?.getData(TODO_DRAG_MIME);
+  if (customPayload) {
+    try {
+      const parsed = JSON.parse(customPayload);
+      const text = String(parsed?.text || "").trim();
+      if (text) {
+        return text;
+      }
+    } catch (_error) {
+      const text = String(customPayload || "").trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  return String(dataTransfer?.getData("text/plain") || "").trim();
+}
+
+function isTodoDragTransfer(dataTransfer) {
+  const transferTypes = Array.from(dataTransfer?.types || []);
+  return transferTypes.includes(TODO_DRAG_MIME) || transferTypes.includes("text/plain");
 }
 
 function isTerminalSessionMissingError(error) {
@@ -391,6 +495,10 @@ export function getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId =
 
 function getTerminalAgentKind(agentId) {
   const normalizedAgentId = String(agentId || "").toLowerCase();
+
+  if (normalizedAgentId.includes("generic") || normalizedAgentId.includes("shell")) {
+    return "generic";
+  }
 
   if (normalizedAgentId.includes("claude")) {
     return "claude";
@@ -424,11 +532,18 @@ function getAgentStatusSummary(agentStatuses) {
 
 function getTerminalAgentId(agentId, terminalIndex) {
   const kind = getTerminalAgentKind(agentId);
-  const prefix = kind === "claude" ? "CL" : kind === "codex" ? "CX" : "AG";
+  const prefix = kind === "claude" ? "CL" : kind === "codex" ? "CX" : kind === "generic" ? "SH" : "AG";
   const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
   const suffix = TERMINAL_AGENT_ID_SUFFIXES[safeIndex % TERMINAL_AGENT_ID_SUFFIXES.length] || "A";
 
   return `${prefix}${suffix}`;
+}
+
+function getPathLeaf(value) {
+  const text = String(value || "").replace(/\\/g, "/").replace(/\/+$/g, "");
+  const parts = text.split("/").filter(Boolean);
+
+  return parts[parts.length - 1] || "";
 }
 
 function getTerminalAgentColorSlot(terminalIndex) {
@@ -1150,6 +1265,7 @@ export default function WorkspaceTerminal({
   agentStatuses,
   agentStatusError,
   agentStatusState,
+  onChangeTerminalRole,
   onCloseTerminal,
   onOpenSettings,
   onPreparedTerminalChange,
@@ -1157,12 +1273,15 @@ export default function WorkspaceTerminal({
   prewarmShell = false,
   terminalIndex = 0,
   terminalCount = 1,
+  terminalRole = "",
   useWebglRenderer = TERMINAL_ENABLE_WEBGL_RENDERER,
   workingDirectory,
   workspace,
   workspaceError,
 }) {
   const containerRef = useRef(null);
+  const scrollRailRef = useRef(null);
+  const scrollThumbRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
@@ -1175,18 +1294,37 @@ export default function WorkspaceTerminal({
   const [restartKey, setRestartKey] = useState(0);
   const [terminalClosed, setTerminalClosed] = useState(false);
   const [terminalClosing, setTerminalClosing] = useState(false);
-  const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, agent?.id);
-  const terminalAgentKind = getTerminalAgentKind(agent?.id);
-  const terminalAgentId = getTerminalAgentId(agent?.id, terminalIndex);
-  const terminalAgentTitle = `${agent?.label || "Agent"} terminal ${terminalAgentId}`;
+  const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
+  const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
+  const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
+  const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
+  const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
+  const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const terminalAgentId = getTerminalAgentId(paneAgentId, terminalIndex);
+  const terminalAgentTitle = `${isGenericTerminal ? "Generic shell" : agent?.label || "Agent"} terminal ${terminalAgentId}`;
+  const projectRoot = terminalLaunchInfo?.projectRoot || workingDirectory || "";
+  const projectLabel = getPathLeaf(projectRoot) || workspace?.name || "Project";
+  const isolationLabel = isGenericTerminal
+    ? "plain shell"
+    : terminalLaunchInfo?.coordinationMode === "worktree_required"
+      ? "isolated edits"
+      : "preparing isolation";
+  const projectBadgeLabel = isGenericTerminal
+    ? `${projectLabel} plain shell terminal`
+    : `${projectLabel} editing with isolated branch protection`;
+  const projectBadgeTitle = isGenericTerminal
+    ? `${projectLabel} - generic shell with normal terminal controls`
+    : `${projectLabel} - edits are isolated until merge`;
 
   useEffect(() => {
     setTerminalClosed(false);
     terminalClosingRef.current = false;
     setTerminalClosing(false);
+    setTerminalLaunchInfo(null);
     lastAgentLaunchEpochRef.current = 0;
     blankStartupRestartCountRef.current = 0;
-  }, [agent?.id, terminalIndex, workspace?.id]);
+  }, [agent?.id, terminalIndex, terminalRoleId, workspace?.id]);
 
   useEffect(() => {
     agentLaunchEpochRef.current = agentLaunchEpoch;
@@ -1212,6 +1350,7 @@ export default function WorkspaceTerminal({
       startAgentInPrewarmedTerminalRef.current = null;
       setTerminalState("blocked");
       setTerminalError("");
+      setTerminalLaunchInfo(null);
       terminalClosingRef.current = false;
       setTerminalClosing(false);
       return undefined;
@@ -1220,6 +1359,7 @@ export default function WorkspaceTerminal({
     if (terminalClosed) {
       setTerminalState("closed");
       setTerminalError("");
+      setTerminalLaunchInfo(null);
       terminalClosingRef.current = false;
       setTerminalClosing(false);
       return undefined;
@@ -1241,6 +1381,7 @@ export default function WorkspaceTerminal({
     // Tauri's WebView can corrupt xterm's WebGL glyph atlas during rapid multi-pane resize.
     let rendererMode = useWebglRenderer ? "webgl_pending" : "canvas";
     let runtimeTerminalState = "starting";
+    setTerminalLaunchInfo(null);
     let startAgentInCurrentPty = null;
     let hasOpenPty = false;
     let activeWebglAddon = null;
@@ -1289,6 +1430,8 @@ export default function WorkspaceTerminal({
       startupMetricTimers.add(timer);
     });
 
+    container.dataset.scrollbarPlatform = TERMINAL_SCROLLBAR_PLATFORM;
+
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: true,
@@ -1299,6 +1442,7 @@ export default function WorkspaceTerminal({
       lineHeight: 1.22,
       macOptionIsMeta: true,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
+      ...(TERMINAL_SCROLLBAR_PLATFORM === "windows" ? { windowsPty: { backend: "conpty" } } : {}),
       theme: {
         background: TERMINAL_THEME_BACKGROUND,
         foreground: "#e8eef8",
@@ -1321,11 +1465,15 @@ export default function WorkspaceTerminal({
         brightWhite: "#ffffff",
         yellow: "#ffb269",
         brightYellow: "#ffd08a",
+        scrollbarSliderBackground: "rgba(172, 185, 207, 0.46)",
+        scrollbarSliderHoverBackground: "rgba(192, 204, 224, 0.62)",
+        scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
       },
     });
 
     terminal.open(container);
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+    const terminalViewportElement = container.querySelector(".xterm-viewport");
     writeTerminalTelemetry({
       paneId,
       instanceId: terminalInstanceId,
@@ -1399,10 +1547,42 @@ export default function WorkspaceTerminal({
       .catch(() => {});
 
     let terminalScrollbarHideTimer = 0;
+    const terminalScrollbarRefreshTimers = new Set();
     let terminalScrollIntentUntil = 0;
+    const getTerminalMaxViewportY = (activeBuffer) => Math.max(
+      0,
+      Number(activeBuffer?.baseY || 0),
+      Number(activeBuffer?.length || 0) - Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS),
+    );
+    const updateWindowsTerminalScrollbarThumb = (activeBuffer, hasOverflow) => {
+      if (TERMINAL_SCROLLBAR_PLATFORM !== "windows" || !scrollThumbRef.current) {
+        return;
+      }
+
+      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
+      const viewportY = clampTerminalLine(activeBuffer?.viewportY || 0, 0, maxViewportY);
+      const viewportRows = Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS);
+      const totalRows = Math.max(viewportRows, maxViewportY + viewportRows);
+      const thumbHeightPercent = hasOverflow
+        ? Math.max(12, Math.min(100, (viewportRows / totalRows) * 100))
+        : 100;
+      const thumbTopPercent = hasOverflow && maxViewportY > 0
+        ? (viewportY / maxViewportY) * (100 - thumbHeightPercent)
+        : 0;
+
+      scrollThumbRef.current.style.height = `${thumbHeightPercent}%`;
+      scrollThumbRef.current.style.top = `${thumbTopPercent}%`;
+    };
     const updateTerminalScrollbarOverflow = () => {
       const activeBuffer = terminal.buffer?.active;
-      const hasOverflow = Boolean(activeBuffer && activeBuffer.baseY > 0);
+      const hasOverflow = Boolean(
+        activeBuffer
+        && activeBuffer.type !== "alternate"
+        && (
+          Number(activeBuffer.baseY || 0) > 0
+          || getTerminalMaxViewportY(activeBuffer) > 0
+        ),
+      );
 
       if (hasOverflow) {
         container.dataset.scrollbarOverflow = "true";
@@ -1410,7 +1590,21 @@ export default function WorkspaceTerminal({
         delete container.dataset.scrollbarOverflow;
       }
 
+      updateWindowsTerminalScrollbarThumb(activeBuffer, hasOverflow);
+
       return hasOverflow;
+    };
+    const scheduleTerminalScrollbarRefresh = (delays = [0, 80, 240]) => {
+      delays.forEach((delayMs) => {
+        const refreshTimer = window.setTimeout(() => {
+          terminalScrollbarRefreshTimers.delete(refreshTimer);
+          if (!isDisposed) {
+            updateTerminalScrollbarOverflow();
+          }
+        }, Math.max(0, delayMs));
+
+        terminalScrollbarRefreshTimers.add(refreshTimer);
+      });
     };
     const hideTerminalScrollbar = () => {
       terminalScrollbarHideTimer = 0;
@@ -1445,6 +1639,11 @@ export default function WorkspaceTerminal({
       markTerminalScrollIntent();
       showTerminalScrollbar();
     };
+    const handleTerminalScrollbarRefreshIntent = () => {
+      markTerminalScrollIntent();
+      scheduleTerminalScrollbarRefresh([0, 80]);
+      showTerminalScrollbar();
+    };
     const handleTerminalScrollKeyIntent = (event) => {
       if (
         event.key === "PageUp"
@@ -1461,26 +1660,212 @@ export default function WorkspaceTerminal({
         showTerminalScrollbar();
       }
     };
+    const finishHandledTerminalScroll = (event) => {
+      container.dataset.scrolling = "true";
+      scheduleHideTerminalScrollbar();
 
-    if (terminalScrollableElement) {
-      terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
-      terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
-      container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
-      disposables.push(terminal.onScroll(handleTerminalViewportScroll));
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        }
+      }
+    };
+    const scrollWindowsTerminalToLine = (line, event) => {
+      const activeBuffer = terminal.buffer?.active;
+      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
+
+      if (!activeBuffer || activeBuffer.type === "alternate" || maxViewportY <= 0) {
+        updateTerminalScrollbarOverflow();
+        return false;
+      }
+
+      const currentViewportY = clampTerminalLine(activeBuffer.viewportY || 0, 0, maxViewportY);
+      const nextViewportY = clampTerminalLine(line, 0, maxViewportY);
+
+      if (nextViewportY === currentViewportY) {
+        updateTerminalScrollbarOverflow();
+        return false;
+      }
+
+      terminal.scrollToLine(nextViewportY);
+      updateTerminalScrollbarOverflow();
+      window.requestAnimationFrame(() => {
+        if (!isDisposed) {
+          updateTerminalScrollbarOverflow();
+        }
+      });
+      finishHandledTerminalScroll(event);
+      return true;
+    };
+    const scrollWindowsTerminalByLines = (lineDelta, event) => {
+      const activeBuffer = terminal.buffer?.active;
+      const normalizedLineDelta = Number.parseInt(lineDelta, 10) || 0;
+
+      if (!activeBuffer || activeBuffer.type === "alternate" || normalizedLineDelta === 0) {
+        updateTerminalScrollbarOverflow();
+        return false;
+      }
+
+      terminal.scrollLines(normalizedLineDelta);
+      updateTerminalScrollbarOverflow();
+      window.requestAnimationFrame(() => {
+        if (!isDisposed) {
+          updateTerminalScrollbarOverflow();
+        }
+      });
+      finishHandledTerminalScroll(event);
+      return true;
+    };
+    const handleWindowsTerminalWheel = (event) => {
+      const rows = getTerminalWheelScrollRows(event, terminal);
+
+      if (event.ctrlKey || rows === 0) {
+        return true;
+      }
+
+      markTerminalScrollIntent();
+      showTerminalScrollbar();
+
+      if (scrollWindowsTerminalByLines(rows, event)) {
+        return false;
+      }
+
+      return true;
+    };
+    const handleWindowsTerminalScrollKey = (event) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      if (event.shiftKey && event.key === "PageUp") {
+        terminal.scrollPages(-1);
+        finishHandledTerminalScroll(event);
+        return;
+      }
+
+      if (event.shiftKey && event.key === "PageDown") {
+        terminal.scrollPages(1);
+        finishHandledTerminalScroll(event);
+        return;
+      }
+
+      if (event.ctrlKey && event.key === "Home") {
+        scrollWindowsTerminalToLine(0, event);
+        return;
+      }
+
+      if (event.ctrlKey && event.key === "End") {
+        const activeBuffer = terminal.buffer?.active;
+        scrollWindowsTerminalToLine(getTerminalMaxViewportY(activeBuffer), event);
+      }
+    };
+    const scrollWindowsTerminalFromScrollbarPointer = (event) => {
+      const railElement = scrollRailRef.current;
+      const activeBuffer = terminal.buffer?.active;
+      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
+
+      if (
+        TERMINAL_SCROLLBAR_PLATFORM !== "windows"
+        || !railElement
+        || !activeBuffer
+        || activeBuffer.type === "alternate"
+        || maxViewportY <= 0
+      ) {
+        return;
+      }
+
+      const scrollToClientY = (clientY) => {
+        const rect = railElement.getBoundingClientRect();
+        const ratio = rect.height > 0
+          ? Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+          : 0;
+        const targetLine = Math.round(ratio * maxViewportY);
+
+        terminal.scrollToLine(targetLine);
+        showTerminalScrollbar();
+        updateTerminalScrollbarOverflow();
+      };
+
+      event.preventDefault();
+      event.stopPropagation();
+      markTerminalScrollIntent();
+      scrollToClientY(event.clientY);
+      railElement.setPointerCapture?.(event.pointerId);
+
+      const handlePointerMove = (moveEvent) => {
+        moveEvent.preventDefault();
+        scrollToClientY(moveEvent.clientY);
+      };
+      const stopPointerTracking = (upEvent) => {
+        railElement.releasePointerCapture?.(upEvent.pointerId);
+        railElement.removeEventListener("pointermove", handlePointerMove);
+        railElement.removeEventListener("pointerup", stopPointerTracking);
+        railElement.removeEventListener("pointercancel", stopPointerTracking);
+        scheduleHideTerminalScrollbar();
+      };
+
+      railElement.addEventListener("pointermove", handlePointerMove);
+      railElement.addEventListener("pointerup", stopPointerTracking);
+      railElement.addEventListener("pointercancel", stopPointerTracking);
+    };
+
+    if (terminalScrollableElement || terminalViewportElement || TERMINAL_SCROLLBAR_PLATFORM === "windows") {
       disposables.push(terminal.onWriteParsed(updateTerminalScrollbarOverflow));
       disposables.push(terminal.onResize(updateTerminalScrollbarOverflow));
+
+      if (TERMINAL_SCROLLBAR_PLATFORM === "windows") {
+        const windowsScrollIntentTarget = terminalViewportElement || terminalScrollableElement || container;
+
+        disposables.push(terminal.onScroll(handleTerminalViewportScroll));
+        terminal.attachCustomWheelEventHandler(handleWindowsTerminalWheel);
+        container.addEventListener("wheel", handleWindowsTerminalWheel, { capture: true, passive: false });
+        container.addEventListener("pointerenter", handleTerminalScrollbarRefreshIntent);
+        container.addEventListener("pointermove", updateTerminalScrollbarOverflow);
+        container.addEventListener("focusin", handleTerminalScrollbarRefreshIntent, true);
+        windowsScrollIntentTarget.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
+        windowsScrollIntentTarget.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
+        scrollRailRef.current?.addEventListener("pointerdown", scrollWindowsTerminalFromScrollbarPointer);
+        container.addEventListener("keydown", handleWindowsTerminalScrollKey, true);
+      } else {
+        terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
+        terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
+        container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
+        disposables.push(terminal.onScroll(handleTerminalViewportScroll));
+      }
+
       updateTerminalScrollbarOverflow();
+      scheduleTerminalScrollbarRefresh([0, 80, 240, 800, 1600]);
       disposables.push(() => {
         if (terminalScrollbarHideTimer) {
           window.clearTimeout(terminalScrollbarHideTimer);
           terminalScrollbarHideTimer = 0;
         }
+        terminalScrollbarRefreshTimers.forEach((timer) => window.clearTimeout(timer));
+        terminalScrollbarRefreshTimers.clear();
 
         delete container.dataset.scrolling;
         delete container.dataset.scrollbarOverflow;
-        terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
-        terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
-        container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
+        delete container.dataset.scrollbarPlatform;
+
+        if (TERMINAL_SCROLLBAR_PLATFORM === "windows") {
+          const windowsScrollIntentTarget = terminalViewportElement || terminalScrollableElement || container;
+
+          terminal.attachCustomWheelEventHandler(() => true);
+          container.removeEventListener("wheel", handleWindowsTerminalWheel, true);
+          container.removeEventListener("pointerenter", handleTerminalScrollbarRefreshIntent);
+          container.removeEventListener("pointermove", updateTerminalScrollbarOverflow);
+          container.removeEventListener("focusin", handleTerminalScrollbarRefreshIntent, true);
+          windowsScrollIntentTarget.removeEventListener("wheel", handleTerminalScrollIntent);
+          windowsScrollIntentTarget.removeEventListener("touchmove", handleTerminalScrollIntent);
+          scrollRailRef.current?.removeEventListener("pointerdown", scrollWindowsTerminalFromScrollbarPointer);
+          container.removeEventListener("keydown", handleWindowsTerminalScrollKey, true);
+        } else if (terminalScrollableElement) {
+          terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
+          terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
+          container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
+        }
       });
     }
     listen(TERMINAL_AUDIO_INPUT_REFOCUS_EVENT, (event) => {
@@ -2150,6 +2535,9 @@ export default function WorkspaceTerminal({
           return;
         }
 
+        updateTerminalScrollbarOverflow();
+        scheduleTerminalScrollbarRefresh([40, 160]);
+
         if (isFirstOutputChunk) {
           refreshTerminalRenderer("first_output_written", {
             bytes: data.byteLength,
@@ -2462,7 +2850,7 @@ export default function WorkspaceTerminal({
             return;
           }
 
-          const safeData = data.replace(/\x03/g, "");
+          const safeData = isGenericTerminal ? data : data.replace(/\x03/g, "");
 
           if (!safeData) {
             return;
@@ -2510,10 +2898,10 @@ export default function WorkspaceTerminal({
           });
         }
 
-        const shouldPrewarmShell = prewarmShell && !agentLaunchReadyRef.current;
-        const openKind = shouldPrewarmShell ? "prewarm-pty" : agent.id;
-        const openProvider = shouldPrewarmShell ? null : agent.id;
-        let agentStartedInCurrentPty = !shouldPrewarmShell;
+        const shouldPrewarmShell = !isGenericTerminal && prewarmShell && !agentLaunchReadyRef.current;
+        const openKind = isGenericTerminal || shouldPrewarmShell ? "prewarm-pty" : agent.id;
+        const openProvider = isGenericTerminal || shouldPrewarmShell ? null : agent.id;
+        let agentStartedInCurrentPty = isGenericTerminal || !shouldPrewarmShell;
 
         startAgentInCurrentPty = async (reason = "agent_launch_ready", launchEpoch = agentLaunchEpochRef.current) => {
           if (isDisposed || !hasOpenPty || agentStartedInCurrentPty) {
@@ -2614,7 +3002,7 @@ export default function WorkspaceTerminal({
             ...getWorkspaceOpenTelemetryFields(workspace?.id),
           },
         });
-        await invoke("terminal_open", {
+        const openResult = await invoke("terminal_open", {
           request: {
             paneId,
             instanceId: terminalInstanceId,
@@ -2636,6 +3024,7 @@ export default function WorkspaceTerminal({
         }
 
         hasOpenPty = true;
+        setTerminalLaunchInfo(openResult || null);
         runtimeTerminalState = shouldPrewarmShell ? "prewarmed" : "running";
         setTerminalState(shouldPrewarmShell ? "starting" : "running");
         patchTerminalMetrics({ startupMs: performance.now() - openStartedAt });
@@ -2649,6 +3038,9 @@ export default function WorkspaceTerminal({
           fields: {
             kind: openKind,
             prewarmShell: shouldPrewarmShell,
+            projectRoot: openResult?.projectRoot || "",
+            agentBranch: openResult?.agentBranch || "",
+            agentBranchRoot: openResult?.agentBranchRoot || "",
           },
         });
         resizeController?.resizeNow("terminal_open_done");
@@ -2763,7 +3155,76 @@ export default function WorkspaceTerminal({
       invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
       terminal.dispose();
     };
-  }, [agent?.id, agent?.label, onPreparedTerminalChange, paneId, restartKey, terminalClosed, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [agent?.id, agent?.label, isGenericTerminal, onPreparedTerminalChange, paneId, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
+
+  const [terminalDropActive, setTerminalDropActive] = useState(false);
+
+  const handleTerminalTodoDragEnter = useCallback((event) => {
+    if (terminalClosed || terminalClosing) {
+      return;
+    }
+
+    if (!isTodoDragTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setTerminalDropActive(true);
+    event.dataTransfer.dropEffect = "copy";
+  }, [terminalClosed, terminalClosing]);
+
+  const handleTerminalTodoDragOver = useCallback((event) => {
+    if (terminalClosed || terminalClosing) {
+      return;
+    }
+
+    if (!isTodoDragTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setTerminalDropActive(true);
+    event.dataTransfer.dropEffect = "copy";
+  }, [terminalClosed, terminalClosing]);
+
+  const handleTerminalTodoDragLeave = useCallback((event) => {
+    if (!isTodoDragTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setTerminalDropActive(false);
+  }, []);
+
+  const handleTerminalTodoDrop = useCallback(async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setTerminalDropActive(false);
+
+    if (terminalClosed || terminalClosing) {
+      return;
+    }
+
+    const prompt = getDraggedTodoPrompt(event.dataTransfer);
+    if (!prompt) {
+      return;
+    }
+
+    setTerminalError("");
+
+    try {
+      await invoke("terminal_write", {
+        paneId,
+        instanceId: terminalInstanceIdRef.current || undefined,
+        data: `${prompt}\r`,
+      });
+    } catch (error) {
+      setTerminalError(getErrorMessage(error, "Cloud MCP needs this plan accepted before execution."));
+    }
+  }, [paneId, terminalClosed, terminalClosing]);
 
   const closeTerminal = useCallback(async () => {
     if (terminalClosed || terminalClosingRef.current) {
@@ -2797,6 +3258,32 @@ export default function WorkspaceTerminal({
       workspaceId: workspace?.id || "",
     });
   }, [onCloseTerminal, paneId, terminalClosed, terminalIndex, workspace?.id]);
+
+  const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
+    if (terminalClosing) {
+      return;
+    }
+
+    const nextRoleId = String(roleId || terminalAgentKind).toLowerCase();
+    setRestartRoleMenuOpen(false);
+
+    if (nextRoleId && nextRoleId !== terminalAgentKind) {
+      onChangeTerminalRole?.({
+        role: nextRoleId,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+      return;
+    }
+
+    setTerminalClosed(false);
+    terminalClosingRef.current = false;
+    setTerminalClosing(false);
+    setTerminalState("starting");
+    setTerminalError("");
+    setTerminalLaunchInfo(null);
+    setRestartKey((key) => key + 1);
+  }, [onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
 
   if (!agent) {
     return (
@@ -2850,26 +3337,48 @@ export default function WorkspaceTerminal({
         >
           {terminalAgentId}
         </TerminalAgentIdBadge>
-        <TerminalRestartButton
-          aria-label="Restart terminal"
-          disabled={terminalClosing}
-          onClick={() => {
-            if (terminalClosing) {
-              return;
-            }
-
-            setTerminalClosed(false);
-            terminalClosingRef.current = false;
-            setTerminalClosing(false);
-            setTerminalState("starting");
-            setTerminalError("");
-            setRestartKey((key) => key + 1);
-          }}
-          title="Restart terminal"
-          type="button"
+        <TerminalProjectBadge
+          aria-label={projectBadgeLabel}
+          title={projectBadgeTitle}
         >
-          <ButtonRefreshIcon aria-hidden="true" />
-        </TerminalRestartButton>
+          <strong>{projectLabel}</strong>
+          <span>{isolationLabel}</span>
+        </TerminalProjectBadge>
+        <TerminalRestartMenu
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) {
+              setRestartRoleMenuOpen(false);
+            }
+          }}
+        >
+          <TerminalRestartButton
+            aria-expanded={restartRoleMenuOpen ? "true" : "false"}
+            aria-haspopup="menu"
+            aria-label="Restart terminal"
+            disabled={terminalClosing}
+            onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
+            title="Restart terminal or choose runtime"
+            type="button"
+          >
+            <ButtonRefreshIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
+            {TERMINAL_ROLE_SWITCH_OPTIONS.map((option) => (
+              <TerminalRestartOption
+                data-role={option.id}
+                data-selected={option.id === terminalAgentKind ? "true" : "false"}
+                key={option.id}
+                onClick={() => restartTerminalAs(option.id)}
+                role="menuitem"
+                title={`Restart as ${option.label}`}
+                type="button"
+              >
+                <strong>{option.id === terminalAgentKind ? `Restart ${option.label}` : option.label}</strong>
+                <span>{option.shortLabel}</span>
+              </TerminalRestartOption>
+            ))}
+          </TerminalRestartDropdown>
+        </TerminalRestartMenu>
         <TerminalCloseButton
           aria-label="Close terminal"
           disabled={terminalClosed || terminalClosing}
@@ -2889,14 +3398,34 @@ export default function WorkspaceTerminal({
         </BlankStatusStack>
       )}
 
-      <TerminalFrame aria-busy={terminalClosing ? "true" : "false"} data-state={terminalState}>
+      <TerminalFrame
+        aria-busy={terminalClosing ? "true" : "false"}
+        data-state={terminalState}
+        data-drop-active={!isGenericTerminal && terminalDropActive ? "true" : "false"}
+        onDragEnter={isGenericTerminal ? undefined : handleTerminalTodoDragEnter}
+        onDragLeave={isGenericTerminal ? undefined : handleTerminalTodoDragLeave}
+        onDragOver={isGenericTerminal ? undefined : handleTerminalTodoDragOver}
+        onDrop={isGenericTerminal ? undefined : handleTerminalTodoDrop}
+      >
         {terminalClosed ? (
           <TerminalClosedSurface aria-live="polite" role="status">
             <TerminalClosedLabel>Terminal Closed</TerminalClosedLabel>
           </TerminalClosedSurface>
         ) : (
           <>
-            <XtermSurface ref={containerRef} />
+            <XtermSurface
+              data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
+              onDragEnter={isGenericTerminal ? undefined : handleTerminalTodoDragEnter}
+              onDragLeave={isGenericTerminal ? undefined : handleTerminalTodoDragLeave}
+              onDragOver={isGenericTerminal ? undefined : handleTerminalTodoDragOver}
+              onDrop={isGenericTerminal ? undefined : handleTerminalTodoDrop}
+              ref={containerRef}
+            />
+            {TERMINAL_SCROLLBAR_PLATFORM === "windows" && (
+              <TerminalScrollRail aria-hidden="true" ref={scrollRailRef}>
+                <TerminalScrollThumb ref={scrollThumbRef} />
+              </TerminalScrollRail>
+            )}
             {terminalClosing && (
               <TerminalClosingOverlay aria-live="polite" role="status">
                 <div>
@@ -2905,6 +3434,11 @@ export default function WorkspaceTerminal({
                   <span>Shutting it down...</span>
                 </div>
               </TerminalClosingOverlay>
+            )}
+            {terminalDropActive && (
+              <div style={TODO_DROP_OVERLAY_STYLE}>
+                <div style={TODO_DROP_OVERLAY_LABEL_STYLE}>Drop grouped prompt here</div>
+              </div>
             )}
           </>
         )}

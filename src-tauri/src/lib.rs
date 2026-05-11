@@ -71,6 +71,8 @@ const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
 const GIT_STATUS_TIMEOUT_SECS: u64 = 2;
 const GIT_DIFF_TIMEOUT_SECS: u64 = 3;
+const GIT_INIT_TIMEOUT_SECS: u64 = 15;
+const GIT_COMMIT_TIMEOUT_SECS: u64 = 30;
 const TERMINAL_SHUTDOWN_POLL_ATTEMPTS: usize = 40;
 const TERMINAL_SHUTDOWN_POLL_INTERVAL_MS: u64 = 25;
 const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
@@ -296,6 +298,7 @@ struct TerminalInstance {
     size: Arc<Mutex<PtySize>>,
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
+    input_gate: Arc<Mutex<TerminalInputGate>>,
     coordination: Option<TerminalCoordinationSession>,
 }
 
@@ -305,6 +308,14 @@ struct TerminalCoordinationSession {
     db_path: String,
     agent_id: String,
     session_id: String,
+}
+
+#[derive(Default)]
+struct TerminalInputGate {
+    current_line: String,
+    control_command_bypass_submits: usize,
+    ansi_escape_active: bool,
+    ansi_csi_active: bool,
 }
 
 impl TerminalInstance {
@@ -332,6 +343,7 @@ impl TerminalInstance {
                 size: Arc::new(Mutex::new(size)),
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
+                input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
                 coordination,
             },
             reader,
@@ -726,6 +738,11 @@ struct TerminalOpenResult {
     instance_id: u64,
     command: String,
     working_directory: String,
+    project_root: String,
+    agent_branch_root: Option<String>,
+    agent_branch: Option<String>,
+    slot_key: Option<String>,
+    coordination_mode: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -974,6 +991,7 @@ include!("platform.rs");
 include!("process.rs");
 include!("workspace_files.rs");
 include!("terminal_cli.rs");
+include!("cloud_mcp.rs");
 include!("terminals.rs");
 include!("api.rs");
 include!("audio.rs");
@@ -1209,6 +1227,7 @@ pub fn run() {
             pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
         })
+        .manage(CloudMcpState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
             deepgram_stream: Arc::new(Mutex::new(None)),
@@ -1218,10 +1237,23 @@ pub fn run() {
             whisper_engine: WhisperCliWarmCache::new(),
         })
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             pty_pool.ensure_warm_async();
+            let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = cloud_mcp_connect_state(&cloud_mcp_state, "startup").await {
+                    log_terminal_event(
+                        "cloud_mcp.startup_connect.error",
+                        None,
+                        None,
+                        None,
+                        json!({ "error": clean_terminal_telemetry_text(&error) }),
+                    );
+                }
+            });
 
             register_audio_shortcuts(app.handle());
 
@@ -1287,6 +1319,16 @@ pub fn run() {
             note_main_window_minimize_requested,
             terminal_telemetry_log,
             terminal_telemetry_log_many,
+            cloud_mcp_connect,
+            cloud_mcp_get_status,
+            cloud_mcp_register_workspace,
+            cloud_mcp_sync_workspace,
+            cloud_mcp_get_policy,
+            cloud_mcp_decide_policy,
+            cloud_mcp_prepare_task_plan,
+            cloud_mcp_decide_plan,
+            cloud_mcp_get_todo,
+            cloud_mcp_save_todo,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,
@@ -1298,15 +1340,23 @@ pub fn run() {
             terminal_close_all,
             coordination::tauri_commands::coordination_init,
             coordination::tauri_commands::coordination_get_snapshot,
+            coordination::tauri_commands::coordination_log_ui_surface_event,
+            coordination::tauri_commands::coordination_cleanup_bloat_dry_run,
+            coordination::tauri_commands::coordination_start_file_watcher,
+            coordination::tauri_commands::coordination_stop_file_watcher,
+            coordination::tauri_commands::coordination_get_file_watcher_status,
             coordination::tauri_commands::coordination_get_alignment_report,
             coordination::tauri_commands::coordination_get_workspace_mcp_status,
             coordination::tauri_commands::coordination_create_task,
+            coordination::tauri_commands::coordination_add_task_dependency,
+            coordination::tauri_commands::coordination_list_task_dependencies,
             coordination::tauri_commands::coordination_claim_task,
             coordination::tauri_commands::coordination_create_session,
             coordination::tauri_commands::coordination_heartbeat_session,
             coordination::tauri_commands::coordination_acquire_lease,
             coordination::tauri_commands::coordination_release_lease,
             coordination::tauri_commands::coordination_list_events,
+            coordination::tauri_commands::coordination_list_resources,
             coordination::tauri_commands::coordination_list_active_leases,
             coordination::tauri_commands::coordination_write_memory,
             coordination::tauri_commands::coordination_search_memory,
@@ -1320,11 +1370,17 @@ pub fn run() {
             coordination::tauri_commands::coordination_request_merge,
             coordination::tauri_commands::coordination_apply_merge,
             coordination::tauri_commands::coordination_list_workspace_violations,
+            coordination::tauri_commands::coordination_list_workspace_changes,
             coordination::tauri_commands::coordination_resolve_workspace_violation,
             coordination::tauri_commands::coordination_db_classify_sql,
             coordination::tauri_commands::coordination_db_get_mode,
+            coordination::tauri_commands::coordination_db_request_change,
+            coordination::tauri_commands::coordination_db_list_change_requests,
+            coordination::tauri_commands::coordination_db_get_change_request,
+            coordination::tauri_commands::coordination_db_request_approval,
             coordination::tauri_commands::coordination_db_propose_migration,
             coordination::tauri_commands::coordination_request_approval,
+            coordination::tauri_commands::coordination_resolve_approval,
             coordination::tauri_commands::coordination_get_cloud_orchestrator_status,
             coordination::tauri_commands::coordination_update_cloud_orchestrator_config,
             coordination::tauri_commands::coordination_create_orchestration_run,

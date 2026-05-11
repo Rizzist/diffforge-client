@@ -7,6 +7,7 @@ import {
   PhysicalPosition,
 } from "@tauri-apps/api/window";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import "@vscode/codicons/dist/codicon.css";
@@ -239,17 +240,19 @@ import {
   WorkspaceSettingsOverlay,
   WorkspaceSettingsDialog,
   WorkspaceSettingsDialogHeader,
+  WorkspaceSettingsHeaderMain,
+  WorkspaceSettingsHeaderMeta,
+  WorkspaceSettingsHeaderActions,
+  WorkspaceSettingsMetaPill,
   WorkspaceModalCloseButton,
   WorkspaceSettingsForm,
   WorkspaceSettingsInput,
   RootDirectoryInput,
-  WorkspaceRuntimePanel,
-  WorkspaceRuntimeActions,
+  WorkspaceSettingsTopGrid,
+  WorkspaceRootChooser,
+  WorkspaceRootActions,
   WorkspaceSettingsActions,
   WorkspaceSettingsSection,
-  WorkspaceSettingsSummary,
-  WorkspaceSettingsSummaryItem,
-  WorkspacePathSummary,
   WorkspaceRailMeta,
   TerminalCountGrid,
   TerminalCountButton,
@@ -257,6 +260,14 @@ import {
   TerminalLayoutPreview,
   TerminalLayoutPreviewRow,
   TerminalLayoutPreviewCell,
+  TerminalRoleSummary,
+  TerminalRoleSliderGrid,
+  TerminalRoleSliderRow,
+  TerminalRoleRange,
+  TerminalRoleGrid,
+  TerminalRoleCard,
+  TerminalRoleButtonGroup,
+  TerminalRoleButton,
   AgentSettingsPanel,
   AgentPanelActions,
   AgentReadyPill,
@@ -427,6 +438,23 @@ const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
 ];
+const WORKSPACE_TERMINAL_ROLE_GENERIC = "generic";
+const WORKSPACE_TERMINAL_ROLE_OPTIONS = [
+  { id: "codex", label: "Codex", shortLabel: "CX" },
+  { id: "claude", label: "Claude Code", shortLabel: "CL" },
+  { id: WORKSPACE_TERMINAL_ROLE_GENERIC, label: "Terminal", shortLabel: "SH" },
+];
+const WORKSPACE_TERMINAL_ROLE_IDS = new Set(WORKSPACE_TERMINAL_ROLE_OPTIONS.map((role) => role.id));
+const GENERIC_TERMINAL_AGENT = {
+  id: WORKSPACE_TERMINAL_ROLE_GENERIC,
+  label: "Generic shell",
+  shortLabel: "Shell",
+  binary: "",
+  installed: true,
+  authenticated: true,
+  version: "Local shell",
+  authMessage: "Plain terminal",
+};
 const WORKSPACE_TERMINAL_COUNT_OPTIONS = Array.from(
   { length: MAX_WORKSPACE_TERMINAL_COUNT },
   (_, index) => index + MIN_WORKSPACE_TERMINAL_COUNT,
@@ -1112,8 +1140,137 @@ function normalizeWorkspaceTerminalCount(value) {
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
 }
 
-function TerminalLayoutMiniature({ count }) {
+function normalizeWorkspaceTerminalRole(value, fallback = "codex") {
+  const roleId = String(value || "").toLowerCase().trim();
+
+  if (WORKSPACE_TERMINAL_ROLE_IDS.has(roleId)) {
+    return roleId;
+  }
+
+  return WORKSPACE_TERMINAL_ROLE_IDS.has(fallback)
+    ? fallback
+    : "codex";
+}
+
+function normalizeWorkspaceTerminalRoles(value, count, fallback = "codex") {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const fallbackRole = normalizeWorkspaceTerminalRole(fallback, "codex");
+  const roles = Array.isArray(value) ? value : [];
+
+  return Array.from(
+    { length: terminalCount },
+    (_, index) => normalizeWorkspaceTerminalRole(roles[index], fallbackRole),
+  );
+}
+
+function areWorkspaceTerminalRolesEqual(leftRoles, rightRoles) {
+  if (!Array.isArray(leftRoles) || !Array.isArray(rightRoles) || leftRoles.length !== rightRoles.length) {
+    return false;
+  }
+
+  return leftRoles.every((role, index) => role === rightRoles[index]);
+}
+
+function getTerminalRoleOption(role) {
+  const roleId = normalizeWorkspaceTerminalRole(role, "codex");
+
+  return WORKSPACE_TERMINAL_ROLE_OPTIONS.find((option) => option.id === roleId)
+    || WORKSPACE_TERMINAL_ROLE_OPTIONS[0];
+}
+
+function getWorkspaceTerminalRoleCounts(roles) {
+  return WORKSPACE_TERMINAL_ROLE_OPTIONS.map((option) => ({
+    ...option,
+    count: roles.filter((role) => role === option.id).length,
+  }));
+}
+
+function getWorkspaceTerminalRoleCountMap(roles) {
+  return Object.fromEntries(
+    getWorkspaceTerminalRoleCounts(roles).map((role) => [role.id, role.count]),
+  );
+}
+
+function buildWorkspaceTerminalRolesFromCounts(counts, count) {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const nextRoles = [];
+
+  WORKSPACE_TERMINAL_ROLE_OPTIONS.forEach((option) => {
+    const roleCount = Math.max(0, Math.min(terminalCount, Number.parseInt(counts?.[option.id], 10) || 0));
+
+    for (let index = 0; index < roleCount && nextRoles.length < terminalCount; index += 1) {
+      nextRoles.push(option.id);
+    }
+  });
+
+  while (nextRoles.length < terminalCount) {
+    nextRoles.push(WORKSPACE_TERMINAL_ROLE_GENERIC);
+  }
+
+  return nextRoles.slice(0, terminalCount);
+}
+
+function rebalanceWorkspaceTerminalRoleCounts(roles, targetRole, targetCount, count) {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const roleId = normalizeWorkspaceTerminalRole(targetRole, "codex");
+  const counts = getWorkspaceTerminalRoleCountMap(normalizeWorkspaceTerminalRoles(roles, terminalCount));
+  const requestedCount = Math.max(0, Math.min(terminalCount, Number.parseInt(targetCount, 10) || 0));
+  const previousCount = counts[roleId] || 0;
+  const delta = requestedCount - previousCount;
+
+  counts[roleId] = requestedCount;
+
+  if (delta > 0) {
+    let remaining = delta;
+    const drainOrder = [
+      WORKSPACE_TERMINAL_ROLE_GENERIC,
+      "claude",
+      "codex",
+    ].filter((otherRole) => otherRole !== roleId);
+
+    drainOrder.forEach((otherRole) => {
+      if (remaining <= 0) {
+        return;
+      }
+
+      const removed = Math.min(counts[otherRole] || 0, remaining);
+      counts[otherRole] = (counts[otherRole] || 0) - removed;
+      remaining -= removed;
+    });
+
+    counts[roleId] -= remaining;
+  } else if (delta < 0) {
+    const recipientRole = roleId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "codex" : WORKSPACE_TERMINAL_ROLE_GENERIC;
+    counts[recipientRole] = (counts[recipientRole] || 0) + Math.abs(delta);
+  }
+
+  return buildWorkspaceTerminalRolesFromCounts(counts, terminalCount);
+}
+
+function getWorkspaceTerminalRoleSummaryText(roles) {
+  return getWorkspaceTerminalRoleCounts(roles)
+    .filter((role) => role.count > 0)
+    .map((role) => `${role.shortLabel} ${role.count}`)
+    .join(" / ") || "CX 1";
+}
+
+function getWorkspaceTerminalPaneAgentId(role) {
+  return normalizeWorkspaceTerminalRole(role, "codex");
+}
+
+function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
+  const roleId = normalizeWorkspaceTerminalRole(role, "codex");
+
+  if (roleId === WORKSPACE_TERMINAL_ROLE_GENERIC) {
+    return GENERIC_TERMINAL_AGENT;
+  }
+
+  return getReadyAgent(agentStatuses, roleId);
+}
+
+function TerminalLayoutMiniature({ count, roles = [] }) {
   const rows = getTerminalPanelRows(getDefaultTerminalIndexes(count));
+  const previewRoles = normalizeWorkspaceTerminalRoles(roles, count);
 
   return (
     <TerminalLayoutPreview aria-hidden="true">
@@ -1124,7 +1281,7 @@ function TerminalLayoutMiniature({ count }) {
         >
           {row.terminalIndexes.map((terminalIndex) => (
             <TerminalLayoutPreviewCell
-              data-slot={terminalIndex === 0 ? "primary" : terminalIndex % 2 === 0 ? "blue" : "orange"}
+              data-slot={previewRoles[terminalIndex] || "codex"}
               key={`preview-cell-${count}-${terminalIndex}`}
             />
           ))}
@@ -1134,7 +1291,7 @@ function TerminalLayoutMiniature({ count }) {
   );
 }
 
-function WorkspaceTerminalCountPicker({ onChange, value }) {
+function WorkspaceTerminalCountPicker({ onChange, roles, value }) {
   const selectedCount = normalizeWorkspaceTerminalCount(value);
 
   return (
@@ -1152,10 +1309,55 @@ function WorkspaceTerminalCountPicker({ onChange, value }) {
             <strong>{count}</strong>
             <span>{count === 1 ? "terminal" : "terminals"}</span>
           </TerminalCountMeta>
-          <TerminalLayoutMiniature count={count} />
+          <TerminalLayoutMiniature count={count} roles={roles} />
         </TerminalCountButton>
       ))}
     </TerminalCountGrid>
+  );
+}
+
+function WorkspaceTerminalRolePicker({ count, onChange, value }) {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const roles = normalizeWorkspaceTerminalRoles(value, terminalCount);
+  const roleCounts = getWorkspaceTerminalRoleCounts(roles);
+
+  return (
+    <>
+      <TerminalRoleSummary aria-label="Terminal role counts">
+        {roleCounts.map((role) => (
+          <WorkspaceSettingsMetaPill key={role.id}>
+            <span>{role.shortLabel}</span>
+            <strong>{role.count}</strong>
+          </WorkspaceSettingsMetaPill>
+        ))}
+      </TerminalRoleSummary>
+      <TerminalRoleSliderGrid aria-label="Terminal role distribution">
+        {roleCounts.map((role) => (
+          <TerminalRoleSliderRow data-role={role.id} key={role.id}>
+            <span>
+              <strong>{role.label}</strong>
+              <em>{role.count}</em>
+            </span>
+            <TerminalRoleRange
+              aria-label={`${role.label} terminal count`}
+              data-role={role.id}
+              max={terminalCount}
+              min="0"
+              onChange={(event) => {
+                onChange(rebalanceWorkspaceTerminalRoleCounts(
+                  roles,
+                  role.id,
+                  event.target.value,
+                  terminalCount,
+                ));
+              }}
+              type="range"
+              value={role.count}
+            />
+          </TerminalRoleSliderRow>
+        ))}
+      </TerminalRoleSliderGrid>
+    </>
   );
 }
 
@@ -1170,10 +1372,12 @@ function normalizeWorkspaceSettings(value) {
         const cleanedRootDirectory = cleanWorkspaceRootDirectory(settings?.rootDirectory);
         const rootDirectory = isDisallowedWorkspaceRootDirectory(cleanedRootDirectory)
           ? ""
-          : cleanedRootDirectory;
+            : cleanedRootDirectory;
         const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
+        const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
+        const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
 
-        if (!workspaceId || (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT)) {
+        if (!workspaceId || (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT && !hasCustomTerminalRoles)) {
           return null;
         }
 
@@ -1182,6 +1386,7 @@ function normalizeWorkspaceSettings(value) {
           {
             rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
             terminalCount,
+            terminalRoles,
           },
         ];
       })
@@ -1255,6 +1460,10 @@ function getWorkspaceTerminalCount(workspaceSettings, workspaceId) {
   return normalizeWorkspaceTerminalCount(workspaceSettings?.[workspaceId]?.terminalCount);
 }
 
+function getWorkspaceTerminalRoles(workspaceSettings, workspaceId, count, fallback = "codex") {
+  return normalizeWorkspaceTerminalRoles(workspaceSettings?.[workspaceId]?.terminalRoles, count, fallback);
+}
+
 function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const nextSettings = { ...(settings || {}) };
 
@@ -1265,6 +1474,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const currentSettings = settings?.[workspaceId] || {};
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
+  const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
   ).slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH);
@@ -1274,8 +1484,15 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const terminalCount = normalizeWorkspaceTerminalCount(
     hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
   );
+  const fallbackRole = currentSettings.terminalRoles?.[0] || "codex";
+  const terminalRoles = normalizeWorkspaceTerminalRoles(
+    hasTerminalRoles ? nextValues.terminalRoles : currentSettings.terminalRoles,
+    terminalCount,
+    fallbackRole,
+  );
+  const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
 
-  if (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT) {
+  if (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT && !hasCustomTerminalRoles) {
     delete nextSettings[workspaceId];
     return nextSettings;
   }
@@ -1283,6 +1500,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   nextSettings[workspaceId] = {
     rootDirectory,
     terminalCount,
+    terminalRoles,
   };
 
   return nextSettings;
@@ -1327,6 +1545,7 @@ export default function App() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
+  const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceTerminalSlots, setWorkspaceTerminalSlots] = useState({});
@@ -1503,6 +1722,7 @@ export default function App() {
     setWorkspaceName("");
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
+    setWorkspaceTerminalRolesDraft(["codex"]);
     setWorkspaceRootDraft("");
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
@@ -1533,6 +1753,7 @@ export default function App() {
     setActivatedWorkspaceId("");
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
+    setWorkspaceTerminalRolesDraft(["codex"]);
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -2453,9 +2674,17 @@ export default function App() {
     const token = authStore.getToken();
     const workspaceNameValue = workspaceNameDraft.replace(/[\u0000-\u001F\u007F]/g, "").trim();
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
+    const terminalRoles = normalizeWorkspaceTerminalRoles(workspaceTerminalRolesDraft, terminalCount, activeAgent);
     const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
+    const currentTerminalRoles = getWorkspaceTerminalRoles(
+      workspaceSettings,
+      selectedWorkspace.id,
+      currentTerminalCount,
+      activeAgent,
+    );
+    const terminalRolesChanged = !areWorkspaceTerminalRolesEqual(currentTerminalRoles, terminalRoles);
 
     if (!isSafeAuthValue(token)) {
       expireDesktopSession("Desktop session required to update workspace settings.");
@@ -2485,8 +2714,10 @@ export default function App() {
         currentTerminalCount,
         requestedRootDirectory: cleanedRoot,
         requestedTerminalCount: terminalCount,
+        requestedTerminalRoles: terminalRoles,
         rootChanged: cleanedRoot !== currentRootDirectory,
         terminalCountChanged: terminalCount !== currentTerminalCount,
+        terminalRolesChanged,
         workspaceId: selectedWorkspace.id,
       },
     });
@@ -2512,6 +2743,9 @@ export default function App() {
       const rootDirectory = normalizedRoot?.workingDirectory || "";
       const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
+      const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
+        [terminalIndex, terminalRoles[index]]
+      )));
       const currentTerminalIndexes = normalizeWorkspaceTerminalIndexes(
         workspaceTerminalSlots[selectedWorkspace.id],
         currentTerminalCount,
@@ -2519,6 +2753,14 @@ export default function App() {
       const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
         !nextTerminalIndexSet.has(terminalIndex)
       ));
+      const roleChangedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex, index) => (
+        nextTerminalIndexSet.has(terminalIndex)
+        && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
+      ));
+      const terminalIndexesToClose = Array.from(new Set([
+        ...removedTerminalIndexes,
+        ...roleChangedTerminalIndexes,
+      ]));
       let nextWorkspace = selectedWorkspace;
 
       writeTerminalTelemetry({
@@ -2556,24 +2798,26 @@ export default function App() {
         const nextSettings = updateWorkspaceLocalSettings(settings, selectedWorkspace.id, {
           rootDirectory,
           terminalCount,
+          terminalRoles,
         });
         persistWorkspaceSettings(nextSettings);
         return nextSettings;
       });
 
-      if (rootDirectory !== currentRootDirectory || terminalCount !== currentTerminalCount) {
+      if (rootDirectory !== currentRootDirectory || terminalCount !== currentTerminalCount || terminalRolesChanged) {
         setWorkspaceTerminalSlots((slots) => ({
           ...slots,
           [selectedWorkspace.id]: nextTerminalIndexes,
         }));
       }
 
-      removedTerminalIndexes.forEach((terminalIndex) => {
+      terminalIndexesToClose.forEach((terminalIndex) => {
+        const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
         closeWorkspaceTerminalPane({
-          agentId: activeAgent,
+          agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
           nextTerminalCount: terminalCount,
           previousTerminalCount: currentTerminalCount,
-          reason: "settings_save",
+          reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
           terminalIndex,
           workspaceId: selectedWorkspace.id,
         });
@@ -2582,6 +2826,7 @@ export default function App() {
       setWorkspaceNameDraft(nextWorkspace.name);
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
+      setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceSettingsState("idle");
       setWorkspaceSettingsMessage("Workspace settings saved.");
       writeTerminalTelemetry({
@@ -2589,10 +2834,13 @@ export default function App() {
         phase: "frontend.workspace_settings.directory_save_done",
         fields: {
           removedTerminalIndexes,
+          roleChangedTerminalIndexes,
           resolvedRootDirectory: rootDirectory,
           rootChanged: rootDirectory !== currentRootDirectory,
           terminalCount,
           terminalCountChanged: terminalCount !== currentTerminalCount,
+          terminalRoles,
+          terminalRolesChanged,
           workspaceId: selectedWorkspace.id,
         },
       });
@@ -2609,6 +2857,7 @@ export default function App() {
           error: getErrorMessage(error, "Unable to update workspace settings."),
           requestedRootDirectory: cleanedRoot,
           requestedTerminalCount: terminalCount,
+          requestedTerminalRoles: terminalRoles,
           workspaceId: selectedWorkspace.id,
         },
       });
@@ -2621,6 +2870,7 @@ export default function App() {
     workspaceNameDraft,
     workspaceRootDraft,
     workspaceTerminalCountDraft,
+    workspaceTerminalRolesDraft,
     workspaceSettings,
     workspaceTerminalSlots,
     activeAgent,
@@ -2632,6 +2882,7 @@ export default function App() {
     }
 
     const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+    const currentTerminalRoles = getWorkspaceTerminalRoles(workspaceSettings, workspaceId, terminalCount, activeAgent);
     const currentIndexes = normalizeWorkspaceTerminalIndexes(
       workspaceTerminalSlots[workspaceId],
       terminalCount,
@@ -2648,6 +2899,10 @@ export default function App() {
     }
 
     const nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+    const nextTerminalRoles = nextIndexes.map((index) => {
+      const roleIndex = currentIndexes.indexOf(index);
+      return currentTerminalRoles[roleIndex] || activeAgent;
+    });
 
     setWorkspaceTerminalSlots((slots) => ({
       ...slots,
@@ -2656,6 +2911,7 @@ export default function App() {
     setWorkspaceSettings((settings) => {
       const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
         terminalCount: nextTerminalCount,
+        terminalRoles: nextTerminalRoles,
       });
 
       persistWorkspaceSettings(nextSettings);
@@ -2664,14 +2920,85 @@ export default function App() {
 
     if (workspaceSettingsModalId === workspaceId) {
       setWorkspaceTerminalCountDraft(String(nextTerminalCount));
+      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
     }
-  }, [workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
+  }, [activeAgent, workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
+
+  const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, workspaceId }) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const nextRole = normalizeWorkspaceTerminalRole(role, activeAgent);
+    const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+    const currentIndexes = normalizeWorkspaceTerminalIndexes(
+      workspaceTerminalSlots[workspaceId],
+      terminalCount,
+    );
+    const roleIndex = currentIndexes.indexOf(terminalIndex);
+
+    if (roleIndex < 0) {
+      return;
+    }
+
+    const currentRoles = getWorkspaceTerminalRoles(workspaceSettings, workspaceId, terminalCount, activeAgent);
+    const previousRole = currentRoles[roleIndex] || activeAgent;
+
+    if (previousRole === nextRole) {
+      return;
+    }
+
+    const nextRoles = currentRoles.slice();
+    nextRoles[roleIndex] = nextRole;
+
+    setWorkspaceSettings((settings) => {
+      const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
+        terminalRoles: nextRoles,
+      });
+
+      persistWorkspaceSettings(nextSettings);
+      return nextSettings;
+    });
+
+    if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalRolesDraft(nextRoles);
+    }
+
+    closeWorkspaceTerminalPane({
+      agentId: getWorkspaceTerminalPaneAgentId(previousRole),
+      nextTerminalCount: terminalCount,
+      previousTerminalCount: terminalCount,
+      reason: "terminal_role_switch",
+      terminalIndex,
+      workspaceId,
+    });
+  }, [activeAgent, workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
 
   const useDefaultWorkspaceRoot = useCallback(() => {
     setWorkspaceRootDraft(defaultWorkingDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
   }, [defaultWorkingDirectory]);
+
+  const chooseWorkspaceRootDirectory = useCallback(async () => {
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose workspace root directory",
+      });
+      const selectedPath = Array.isArray(selected) ? selected[0] : selected;
+
+      if (typeof selectedPath === "string" && selectedPath.trim()) {
+        setWorkspaceRootDraft(selectedPath);
+      }
+    } catch (error) {
+      setWorkspaceSettingsError(getErrorMessage(error, "Unable to choose root directory."));
+    }
+  }, []);
 
   const logout = useCallback(async () => {
     authFlowIdRef.current += 1;
@@ -3314,24 +3641,42 @@ export default function App() {
   const activatedWorkspaceRootDirectory = activatedWorkspace
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspace.id)
     : "";
-  const workspaceTerminalAgent = useMemo(
-    () => getReadyAgent(agentStatuses, activeAgent),
-    [activeAgent, agentStatuses],
-  );
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
   const shouldPrewarmWorkspaceTerminals = false;
-  const workspaceTerminalRenderAgent = activatedWorkspace
-    ? workspaceTerminalAgent
-    : null;
-  const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
-    && Boolean(workspaceTerminalAgent)
-    && Boolean(activatedWorkspace);
   const selectedWorkspaceTerminalCount = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
   const activatedWorkspaceTerminalCount = activatedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, activatedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
+  const selectedWorkspaceTerminalRoles = useMemo(
+    () => (
+      selectedWorkspace && !shouldShowWorkspaceSetup
+        ? getWorkspaceTerminalRoles(workspaceSettings, selectedWorkspace.id, selectedWorkspaceTerminalCount, activeAgent)
+        : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent)
+    ),
+    [
+      activeAgent,
+      selectedWorkspace?.id,
+      selectedWorkspaceTerminalCount,
+      shouldShowWorkspaceSetup,
+      workspaceSettings,
+    ],
+  );
+  const activatedWorkspaceTerminalRoles = useMemo(
+    () => (
+      activatedWorkspace && !shouldShowWorkspaceSetup
+        ? getWorkspaceTerminalRoles(workspaceSettings, activatedWorkspace.id, activatedWorkspaceTerminalCount, activeAgent)
+        : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent)
+    ),
+    [
+      activeAgent,
+      activatedWorkspace?.id,
+      activatedWorkspaceTerminalCount,
+      shouldShowWorkspaceSetup,
+      workspaceSettings,
+    ],
+  );
   const activatedWorkspaceTerminalIndexes = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
@@ -3349,11 +3694,39 @@ export default function App() {
     ],
   );
   const activatedWorkspaceVisibleTerminalCount = activatedWorkspaceTerminalIndexes.length;
+  const activatedWorkspaceTerminalRoleEntries = useMemo(
+    () => activatedWorkspaceTerminalIndexes.map((terminalIndex, index) => ({
+      role: activatedWorkspaceTerminalRoles[index] || activeAgent,
+      terminalIndex,
+    })),
+    [activatedWorkspaceTerminalIndexes, activatedWorkspaceTerminalRoles, activeAgent],
+  );
+  const activatedWorkspaceTerminalAgentsByIndex = useMemo(() => (
+    Object.fromEntries(activatedWorkspaceTerminalRoleEntries.map(({ role, terminalIndex }) => (
+      [terminalIndex, getReadyWorkspaceTerminalAgent(agentStatuses, role)]
+    )))
+  ), [activatedWorkspaceTerminalRoleEntries, agentStatuses]);
+  const activatedWorkspaceTerminalRolesByIndex = useMemo(() => (
+    Object.fromEntries(activatedWorkspaceTerminalRoleEntries.map(({ role, terminalIndex }) => (
+      [terminalIndex, normalizeWorkspaceTerminalRole(role, activeAgent)]
+    )))
+  ), [activatedWorkspaceTerminalRoleEntries, activeAgent]);
+  const activatedWorkspaceAgentTerminalEntries = useMemo(() => (
+    activatedWorkspaceTerminalRoleEntries.filter(({ role, terminalIndex }) => (
+      normalizeWorkspaceTerminalRole(role, activeAgent) !== WORKSPACE_TERMINAL_ROLE_GENERIC
+      && Boolean(activatedWorkspaceTerminalAgentsByIndex[terminalIndex])
+    ))
+  ), [activatedWorkspaceTerminalAgentsByIndex, activatedWorkspaceTerminalRoleEntries, activeAgent]);
+  const workspaceTerminalRenderAgent = activatedWorkspace
+    ? getReadyWorkspaceTerminalAgent(agentStatuses, activatedWorkspaceTerminalRoles[0] || activeAgent)
+    : null;
+  const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
+    && Boolean(activatedWorkspace)
+    && activatedWorkspaceAgentTerminalEntries.length > 0;
   const workspaceAgentLaunchKey = workspaceTerminalAgentLaunchReady && activatedWorkspace
     ? [
       activatedWorkspace.id,
-      workspaceTerminalAgent.id,
-      activatedWorkspaceTerminalIndexes.join(","),
+      activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => `${terminalIndex}:${role}`).join(","),
     ].join(":")
     : "";
   const terminalPanelRows = useMemo(
@@ -3401,31 +3774,32 @@ export default function App() {
   }, []);
 
   const preparedWorkspaceTerminalRequests = useMemo(() => {
-    if (!activatedWorkspace || !workspaceTerminalAgent) {
+    if (!activatedWorkspace || activatedWorkspaceAgentTerminalEntries.length === 0) {
       return [];
     }
 
-    const terminalIndexes = new Set(activatedWorkspaceTerminalIndexes);
+    const terminalRoleByIndex = new Map(activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => (
+      [terminalIndex, normalizeWorkspaceTerminalRole(role, activeAgent)]
+    )));
 
     return Array.from(preparedTerminalsRef.current.values())
       .filter((session) => (
         session.workspaceId === activatedWorkspace.id
-        && session.agentId === workspaceTerminalAgent.id
-        && terminalIndexes.has(session.terminalIndex)
+        && session.agentId === terminalRoleByIndex.get(session.terminalIndex)
       ))
       .sort((left, right) => left.terminalIndex - right.terminalIndex)
       .map((session) => ({
         instanceId: session.instanceId,
         model: "",
         paneId: session.paneId,
-        provider: workspaceTerminalAgent.id,
+        provider: session.agentId,
         workspaceId: activatedWorkspace.id,
       }));
   }, [
+    activeAgent,
     activatedWorkspace?.id,
-    activatedWorkspaceTerminalIndexes,
+    activatedWorkspaceAgentTerminalEntries,
     preparedTerminalVersion,
-    workspaceTerminalAgent?.id,
   ]);
   const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.length;
   const shouldHoldWorkspaceRevealForTerminalBatch = Boolean(
@@ -3446,7 +3820,7 @@ export default function App() {
       workspaceAgentBatchSentKey === workspaceAgentLaunchKey
       || workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
       || preparedWorkspaceTerminalCount === 0
-      || preparedWorkspaceTerminalCount < activatedWorkspaceVisibleTerminalCount
+      || preparedWorkspaceTerminalCount < activatedWorkspaceAgentTerminalEntries.length
     ) {
       return;
     }
@@ -3458,8 +3832,9 @@ export default function App() {
       paneId: activatedWorkspace?.id || "",
       phase: "frontend.agent_launch.batch_start",
       fields: {
-        agentId: workspaceTerminalAgent?.id || "",
+        agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
         preparedTerminalCount: preparedWorkspaceTerminalCount,
+        providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
         terminalCount: activatedWorkspaceVisibleTerminalCount,
         terminalIndexes: activatedWorkspaceTerminalIndexes,
         ...getWorkspaceOpenTelemetryFields(activatedWorkspace?.id),
@@ -3484,8 +3859,9 @@ export default function App() {
           phase: "frontend.agent_launch.batch_done",
           elapsedMs: performance.now() - batchStartedAt,
           fields: {
-            agentId: workspaceTerminalAgent?.id || "",
+            agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
             preparedTerminalCount: preparedWorkspaceTerminalCount,
+            providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
             started: result?.started ?? null,
             skipped: result?.skipped ?? null,
             terminalCount: activatedWorkspaceVisibleTerminalCount,
@@ -3510,9 +3886,10 @@ export default function App() {
           phase: "frontend.agent_launch.batch_error",
           elapsedMs: performance.now() - batchStartedAt,
           fields: {
-            agentId: workspaceTerminalAgent?.id || "",
+            agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
             error: getErrorMessage(error, "Unable to start terminal agents."),
             preparedTerminalCount: preparedWorkspaceTerminalCount,
+            providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
             terminalCount: activatedWorkspaceVisibleTerminalCount,
             ...getWorkspaceOpenTelemetryFields(activatedWorkspace?.id),
           },
@@ -3520,22 +3897,31 @@ export default function App() {
       });
   }, [
     activatedWorkspace?.id,
+    activatedWorkspaceAgentTerminalEntries.length,
     activatedWorkspaceTerminalIndexes,
     activatedWorkspaceVisibleTerminalCount,
     preparedWorkspaceTerminalCount,
     preparedWorkspaceTerminalRequests,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
-    workspaceTerminalAgent?.id,
   ]);
 
   useEffect(() => {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
     setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalCount : MIN_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalRoles : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent));
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
-  }, [selectedWorkspace?.id, selectedWorkspace?.name, selectedWorkspaceRootDirectory, selectedWorkspaceTerminalCount, workspaceSettingsModalId]);
+  }, [
+    activeAgent,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceRootDirectory,
+    selectedWorkspaceTerminalCount,
+    selectedWorkspaceTerminalRoles,
+    workspaceSettingsModalId,
+  ]);
 
   useEffect(() => {
     if (
@@ -3551,14 +3937,17 @@ export default function App() {
       phase: "frontend.workspace.terminals_surface_commit",
       fields: {
         activeView,
-        agentId: workspaceTerminalAgent?.id || "",
+        agentId: Array.from(new Set(activatedWorkspaceAgentTerminalEntries.map(({ role }) => (
+          normalizeWorkspaceTerminalRole(role, activeAgent)
+        )))).join(","),
         agentStatusState,
-        hasAgent: Boolean(workspaceTerminalAgent),
+        hasAgent: activatedWorkspaceAgentTerminalEntries.length > 0,
         rootSelected: Boolean(activatedWorkspaceRootDirectory),
         rowCount: terminalPanelRows.length,
         surfaceVisible: visibleView === DEFAULT_WORKSPACE_VIEW,
         terminalCount: activatedWorkspaceVisibleTerminalCount,
         terminalIndexes: activatedWorkspaceTerminalIndexes,
+        terminalRoles: activatedWorkspaceTerminalRoleEntries.map(({ role }) => role),
         viewMotion,
         visibleView,
         workspaceState,
@@ -3568,11 +3957,14 @@ export default function App() {
     });
   }, [
     activeView,
+    activeAgent,
     agentStatusState,
     authState,
     activatedWorkspace,
+    activatedWorkspaceAgentTerminalEntries,
     activatedWorkspaceRootDirectory,
     activatedWorkspaceTerminalIndexes,
+    activatedWorkspaceTerminalRoleEntries,
     activatedWorkspaceVisibleTerminalCount,
     shouldShowWorkspaceSetup,
     terminalPanelRows.length,
@@ -3580,7 +3972,6 @@ export default function App() {
     visibleView,
     workspaceState,
     workspaceSyncState,
-    workspaceTerminalAgent,
   ]);
 
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
@@ -3916,6 +4307,8 @@ export default function App() {
                   {shouldShowWorkspaceSetup || activatedWorkspace ? (
                     <TerminalView
                       terminalWorkspace={activatedWorkspace}
+                      terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
+                      terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
                       terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
                       terminalWorkspaceTerminalIndexes={activatedWorkspaceTerminalIndexes}
                       terminalWorkspaceVisibleTerminalCount={activatedWorkspaceVisibleTerminalCount}
@@ -3923,6 +4316,7 @@ export default function App() {
                       agentStatuses={agentStatuses}
                       agentStatusState={agentStatusState}
                       closeWorkspaceTerminal={closeWorkspaceTerminal}
+                      changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                       createFirstWorkspace={createFirstWorkspace}
                       handlePreparedTerminalChange={handlePreparedTerminalChange}
                       refreshAgentStatuses={refreshAgentStatuses}
@@ -4385,106 +4779,39 @@ export default function App() {
                     aria-labelledby="workspace-settings-title"
                     aria-modal="true"
                     role="dialog"
-                  >
-                    <WorkspaceSettingsDialogHeader>
-                      <div>
-                        <PanelKicker>Workspace settings</PanelKicker>
-                        <PanelHeading id="workspace-settings-title">{selectedWorkspace.name}</PanelHeading>
-                      </div>
-                      <WorkspaceModalCloseButton
-                        aria-label="Close workspace settings"
-                        onClick={closeWorkspaceSettings}
-                        title="Close"
-                        type="button"
-                      >
-                        <ButtonCloseIcon aria-hidden="true" />
-                      </WorkspaceModalCloseButton>
-                    </WorkspaceSettingsDialogHeader>
-
-                    <WorkspaceSettingsSummary aria-label="Workspace summary">
-                      <WorkspaceSettingsSummaryItem>
-                        <span>Runtime</span>
-                        <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
-                      </WorkspaceSettingsSummaryItem>
-                      <WorkspaceSettingsSummaryItem>
-                        <span>Terminals</span>
-                        <strong>{normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}</strong>
-                      </WorkspaceSettingsSummaryItem>
-                      <WorkspaceSettingsSummaryItem>
-                        <span>Default</span>
-                        <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
-                      </WorkspaceSettingsSummaryItem>
-                    </WorkspaceSettingsSummary>
-
-                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Workspace</PanelKicker>
-                          <SettingsHint>Name and local project root for this desktop app.</SettingsHint>
-                        </div>
-                        <SetupField>
-                          <SettingsLabel>Name</SettingsLabel>
-                          <WorkspaceSettingsInput
-                            maxLength={80}
-                            onChange={(event) => {
-                              setWorkspaceNameDraft(event.target.value);
-                              setWorkspaceSettingsError("");
-                              setWorkspaceSettingsMessage("");
-                            }}
-                            value={workspaceNameDraft}
-                          />
-                        </SetupField>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Terminal layout</PanelKicker>
-                          <SettingsHint>Select a bounded local layout. The preview matches the resizable terminal panel rows.</SettingsHint>
-                        </div>
-                        <WorkspaceTerminalCountPicker
-                          onChange={(count) => {
-                            setWorkspaceTerminalCountDraft(count);
-                            setWorkspaceSettingsError("");
-                            setWorkspaceSettingsMessage("");
-                          }}
-                          value={workspaceTerminalCountDraft}
-                        />
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Root directory</PanelKicker>
-                          <SettingsHint>Saved locally and validated by the Tauri host before terminals start.</SettingsHint>
-                        </div>
-                        <SetupField>
-                          <SettingsLabel>Path</SettingsLabel>
-                          <RootDirectoryInput
-                            maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
-                            onChange={(event) => {
-                              setWorkspaceRootDraft(event.target.value);
-                              setWorkspaceSettingsError("");
-                              setWorkspaceSettingsMessage("");
-                            }}
-                            placeholder={defaultWorkingDirectory || "C:\\path\\to\\project"}
-                            value={workspaceRootDraft}
-                          />
-                        </SetupField>
-                        <WorkspacePathSummary title={selectedWorkspaceRootDisplay}>
-                          <ButtonFolderIcon aria-hidden="true" />
-                          <span>{selectedWorkspaceRootDisplay}</span>
-                        </WorkspacePathSummary>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceRuntimePanel data-state={isSelectedWorkspaceActivated ? "activated" : "idle"}>
-                        <div>
-                          <SettingsLabel>Runtime</SettingsLabel>
-                          <SettingsHint>
-                            {isSelectedWorkspaceActivated
-                              ? "This workspace is active and its terminals are running."
-                              : "This workspace is selected but not active."}
-                          </SettingsHint>
-                        </div>
-                        <WorkspaceRuntimeActions>
+                    >
+                      <WorkspaceSettingsDialogHeader>
+                        <WorkspaceSettingsHeaderMain>
+                          <div>
+                            <PanelKicker>Workspace settings</PanelKicker>
+                            <PanelHeading id="workspace-settings-title">{selectedWorkspace.name}</PanelHeading>
+                          </div>
+                          <WorkspaceSettingsHeaderMeta aria-label="Workspace summary">
+                            <WorkspaceSettingsMetaPill>
+                              <span>Runtime</span>
+                              <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
+                            </WorkspaceSettingsMetaPill>
+                            <WorkspaceSettingsMetaPill>
+                              <span>Terminals</span>
+                              <strong>
+                                {normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}
+                                {" "}
+                                {getWorkspaceTerminalRoleSummaryText(
+                                  normalizeWorkspaceTerminalRoles(
+                                    workspaceTerminalRolesDraft,
+                                    normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft),
+                                    activeAgent,
+                                  ),
+                                )}
+                              </strong>
+                            </WorkspaceSettingsMetaPill>
+                            <WorkspaceSettingsMetaPill>
+                              <span>Default</span>
+                              <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
+                            </WorkspaceSettingsMetaPill>
+                          </WorkspaceSettingsHeaderMeta>
+                        </WorkspaceSettingsHeaderMain>
+                        <WorkspaceSettingsHeaderActions>
                           {isSelectedWorkspaceActivated ? (
                             <PrimaryDangerButton
                               onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings")}
@@ -4519,18 +4846,97 @@ export default function App() {
                               <span>Set default</span>
                             </SecondaryButton>
                           )}
-                        </WorkspaceRuntimeActions>
-                      </WorkspaceRuntimePanel>
+                          <WorkspaceModalCloseButton
+                            aria-label="Close workspace settings"
+                            onClick={closeWorkspaceSettings}
+                            title="Close"
+                            type="button"
+                          >
+                            <ButtonCloseIcon aria-hidden="true" />
+                          </WorkspaceModalCloseButton>
+                        </WorkspaceSettingsHeaderActions>
+                      </WorkspaceSettingsDialogHeader>
+
+                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Workspace</PanelKicker>
+                          <SettingsHint>Name on the left, project root chooser on the right.</SettingsHint>
+                        </div>
+                        <WorkspaceSettingsTopGrid>
+                          <SetupField>
+                            <SettingsLabel>Name</SettingsLabel>
+                            <WorkspaceSettingsInput
+                              maxLength={80}
+                              onChange={(event) => {
+                                setWorkspaceNameDraft(event.target.value);
+                                setWorkspaceSettingsError("");
+                                setWorkspaceSettingsMessage("");
+                              }}
+                              value={workspaceNameDraft}
+                            />
+                          </SetupField>
+                          <WorkspaceRootChooser>
+                            <SettingsLabel>Root directory</SettingsLabel>
+                            <RootDirectoryInput
+                              maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+                              placeholder={defaultWorkingDirectory || "Choose project root"}
+                              readOnly
+                              title={workspaceRootDraft || selectedWorkspaceRootDisplay}
+                              value={workspaceRootDraft}
+                            />
+                            <WorkspaceRootActions>
+                              <SecondaryButton
+                                disabled={workspaceSettingsState === "saving"}
+                                onClick={chooseWorkspaceRootDirectory}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Choose directory</span>
+                              </SecondaryButton>
+                              <SecondaryButton
+                                disabled={!defaultWorkingDirectory || workspaceSettingsState === "saving"}
+                                onClick={useDefaultWorkspaceRoot}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Use app dir</span>
+                              </SecondaryButton>
+                            </WorkspaceRootActions>
+                          </WorkspaceRootChooser>
+                        </WorkspaceSettingsTopGrid>
+                      </WorkspaceSettingsSection>
+
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Terminal layout</PanelKicker>
+                          <SettingsHint>Choose the total, then distribute panes across Codex, Claude Code, and plain terminals.</SettingsHint>
+                        </div>
+                        <WorkspaceTerminalCountPicker
+                          onChange={(count) => {
+                            const nextCount = normalizeWorkspaceTerminalCount(count);
+                            setWorkspaceTerminalCountDraft(count);
+                            setWorkspaceTerminalRolesDraft((roles) => (
+                              normalizeWorkspaceTerminalRoles(roles, nextCount, activeAgent)
+                            ));
+                            setWorkspaceSettingsError("");
+                            setWorkspaceSettingsMessage("");
+                          }}
+                          roles={workspaceTerminalRolesDraft}
+                          value={workspaceTerminalCountDraft}
+                        />
+                        <WorkspaceTerminalRolePicker
+                          count={workspaceTerminalCountDraft}
+                          onChange={(roles) => {
+                            setWorkspaceTerminalRolesDraft(roles);
+                            setWorkspaceSettingsError("");
+                            setWorkspaceSettingsMessage("");
+                          }}
+                          value={workspaceTerminalRolesDraft}
+                        />
+                      </WorkspaceSettingsSection>
 
                       <WorkspaceSettingsActions>
-                        <SecondaryButton
-                          disabled={!defaultWorkingDirectory || workspaceSettingsState === "saving"}
-                          onClick={useDefaultWorkspaceRoot}
-                          type="button"
-                        >
-                          <ButtonFolderIcon aria-hidden="true" />
-                          <span>Use app dir</span>
-                        </SecondaryButton>
                         <PrimaryButton disabled={workspaceSettingsState === "saving"} type="submit">
                           <ButtonCheckIcon aria-hidden="true" />
                           <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>

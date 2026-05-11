@@ -7,7 +7,8 @@ use std::{
 use serde_json::{json, Value};
 
 use super::{
-    kernel::{api_error, api_ok, CoordinationKernel},
+    db::REPO_ID,
+    kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
     watcher,
 };
 
@@ -18,20 +19,39 @@ pub const TOOL_NAMES: &[&str] = &[
     "acquire_lease",
     "renew_lease",
     "release_lease",
+    "list_resources",
     "list_active_leases",
+    "list_task_dependencies",
     "announce_change",
     "validate_patch",
     "submit_patch",
+    "request_merge",
     "list_workspace_violations",
+    "list_workspace_changes",
+    "file_watcher_status",
+    "watcher_scan",
     "get_slot_status",
     "search_memory",
     "write_memory",
     "db_get_mode",
     "db_classify_sql",
+    "db_request_change",
+    "db_list_change_requests",
+    "db_get_change_request",
     "db_attach_migration_proposal",
     "db_propose_migration",
     "db_request_approval",
     "request_approval",
+    "orchestrator_get_status",
+    "orchestrator_create_run",
+    "orchestrator_create_context_export",
+    "orchestrator_import_plan",
+    "orchestrator_adopt_plan",
+    "orchestrator_list_runs",
+    "orchestrator_get_brief",
+    "orchestrator_sync_once",
+    "orchestrator_propose_agent_assignments",
+    "orchestrator_adopt_agent_assignment",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -83,6 +103,12 @@ impl McpContext {
 }
 
 pub fn run_stdio_server(context: McpContext) -> Result<(), String> {
+    record_mcp_client_event(
+        &context,
+        "mcp_agent_server_started",
+        json!({"transport": "stdio"}),
+    );
+
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
     let mut stdout = io::stdout();
@@ -225,26 +251,48 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
         return Value::Null;
     }
     match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "diffforge-coordination-kernel", "version": "0.1.0"},
-                "capabilities": {"tools": {}}
-            }
-        }),
-        "tools/list" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "tools": TOOL_NAMES.iter().map(|name| json!({
-                    "name": name,
-                    "description": format!("Diffforge local coordination tool: {name}"),
-                    "inputSchema": {"type": "object", "additionalProperties": true}
-                })).collect::<Vec<_>>()
-            }
-        }),
+        "initialize" => {
+            record_mcp_client_event(
+                context,
+                "mcp_agent_client_initialized",
+                json!({
+                    "method": "initialize",
+                    "protocol_version": "2024-11-05",
+                    "server_name": "diffforge-coordination-kernel",
+                }),
+            );
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "diffforge-coordination-kernel", "version": "0.1.0"},
+                    "capabilities": {"tools": {}}
+                }
+            })
+        }
+        "tools/list" => {
+            record_mcp_client_event(
+                context,
+                "mcp_agent_tools_listed",
+                json!({
+                    "method": "tools/list",
+                    "tool_count": TOOL_NAMES.len(),
+                    "tools": TOOL_NAMES,
+                }),
+            );
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": TOOL_NAMES.iter().map(|name| json!({
+                        "name": name,
+                        "description": format!("Diffforge local coordination tool: {name}"),
+                        "inputSchema": {"type": "object", "additionalProperties": true}
+                    })).collect::<Vec<_>>()
+                }
+            })
+        }
         "tools/call" => {
             let params = &request["params"];
             let name = params["name"].as_str().unwrap_or("");
@@ -268,8 +316,59 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
     }
 }
 
+fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Value) {
+    if context.agent_id.is_none()
+        && context.agent_slot_id.is_none()
+        && context.session_id.is_none()
+        && context.slot_key.is_none()
+    {
+        return;
+    }
+
+    let Some(repo_path) = context.repo_path.as_deref() else {
+        return;
+    };
+    let db_path = context.db_path.as_deref().map(PathBuf::from);
+    let Ok(kernel) = CoordinationKernel::open(repo_path, db_path) else {
+        return;
+    };
+    let actor_id = context.agent_id.as_deref().unwrap_or(REPO_ID);
+    let _ = kernel.emit_event(
+        event_type,
+        "agent_mcp_client",
+        actor_id,
+        EventRefs {
+            task_id: context.task_id.clone(),
+            agent_id: context.agent_id.clone(),
+            agent_slot_id: context.agent_slot_id.clone(),
+            session_id: context.session_id.clone(),
+            orchestration_run_id: context.orchestration_run_id.clone(),
+            ..EventRefs::default()
+        },
+        json!({
+            "slot_key": context.slot_key.clone(),
+            "worktree_id": context.worktree_id.clone(),
+            "worktree_path": context.worktree_path.clone(),
+            "workspace_id": context.workspace_id.clone(),
+            "objective_key": context.objective_key.clone(),
+            "orchestration_role": context.orchestration_role.clone(),
+            "details": details,
+        }),
+    );
+}
+
 pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Value {
     if !TOOL_NAMES.contains(&tool) {
+        record_mcp_client_event(
+            context,
+            "mcp_agent_tool_failed",
+            json!({
+                "method": "tools/call",
+                "tool": tool,
+                "ok": false,
+                "error_code": "unknown_tool",
+            }),
+        );
         return api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),
@@ -277,10 +376,26 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
         );
     }
     apply_context_defaults(context, &mut input);
-    match dispatch_tool_result(context, tool, input) {
+    let result = match dispatch_tool_result(context, tool, input) {
         Ok(value) => value,
         Err(error) => api_error("tool_failed", error, json!({"tool": tool})),
-    }
+    };
+    let ok = result["ok"].as_bool() != Some(false);
+    record_mcp_client_event(
+        context,
+        if ok {
+            "mcp_agent_tool_called"
+        } else {
+            "mcp_agent_tool_failed"
+        },
+        json!({
+            "method": "tools/call",
+            "tool": tool,
+            "ok": ok,
+            "error_code": result["error"]["code"].as_str(),
+        }),
+    );
+    result
 }
 
 fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Result<Value, String> {
@@ -335,11 +450,16 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             req(&input, "lease_id")?,
             input["fence_token"].as_i64().unwrap_or(0),
         ),
+        "list_resources" => kernel.list_resources(
+            input["resource_type"].as_str(),
+            input["min_risk_level"].as_i64(),
+        ),
         "list_active_leases" => kernel.list_active_leases(
             input["task_id"].as_str(),
             input["agent_id"].as_str(),
             input["resource_key"].as_str(),
         ),
+        "list_task_dependencies" => kernel.list_task_dependencies(input["task_id"].as_str()),
         "announce_change" => kernel.announce_change(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
@@ -376,15 +496,19 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             input["worktree_id"].as_str(),
             input["status"].as_str().or(Some("open")),
         ),
+        "list_workspace_changes" => kernel.list_workspace_changes(
+            input["task_id"].as_str(),
+            input["agent_id"].as_str(),
+            input["session_id"].as_str(),
+            input["worktree_id"].as_str(),
+            input["resource_key"].as_str(),
+            input["limit"].as_i64(),
+        ),
+        "file_watcher_status" => watcher::file_watcher_status(&kernel),
+        "watcher_scan" => watcher::scan_known_violations(&kernel),
         "get_slot_status" => {
             kernel.get_slot_status(input["agent_slot_id"].as_str(), input["slot_key"].as_str())
         }
-        "resolve_workspace_violation" => kernel.resolve_workspace_violation(
-            req(&input, "violation_id")?,
-            req(&input, "resolution")?,
-            input["reason"].as_str().unwrap_or("Resolved by human."),
-            req(&input, "human_actor")?,
-        ),
         "search_memory" => kernel.search_memory(
             input["query"].as_str(),
             input["memory_kind"].as_str(),
@@ -399,7 +523,7 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             input["evidence_artifact_id"].as_str(),
             input["orchestration_run_id"].as_str(),
             input["agent_id"].as_str(),
-            input["certified_by"].as_str(),
+            None,
         ),
         "write_contract_memory" | "orchestrator_write_contract" => {
             kernel.write_contract_memory(&input)
@@ -409,6 +533,13 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
         }
         "db_get_mode" => kernel.db_get_mode(),
         "db_classify_sql" => kernel.db_classify_sql(req(&input, "sql")?),
+        "db_request_change" => kernel.db_request_change(&input),
+        "db_list_change_requests" => {
+            kernel.db_list_change_requests(input["status"].as_str(), input["task_id"].as_str())
+        }
+        "db_get_change_request" => {
+            kernel.db_get_change_request(req(&input, "db_change_request_id")?)
+        }
         "db_propose_migration" | "db_attach_migration_proposal" => kernel.db_propose_migration(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
@@ -422,9 +553,18 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
                 .unwrap_or("Roll forward manually after review."),
             input["summary"].as_str(),
         ),
+        "db_request_approval" if input["db_change_request_id"].as_str().is_some() => kernel
+            .db_request_approval(
+                req(&input, "db_change_request_id")?,
+                req(&input, "agent_id")?,
+                input["session_id"].as_str(),
+                input["reason"].as_str(),
+                input["risk_summary"].as_str(),
+            ),
         "request_approval" | "db_request_approval" => kernel.request_approval(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
+            input["session_id"].as_str(),
             req(&input, "approval_kind")?,
             req(&input, "reason")?,
             input["risk_summary"].as_str(),
@@ -446,7 +586,12 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
         "orchestrator_list_runs" => kernel.list_orchestration_runs(input["status"].as_str()),
         "orchestrator_get_brief" => kernel.get_orchestration_brief(req(&input, "run_id")?),
         "orchestrator_sync_once" => kernel.cloud_sync_once(input["run_id"].as_str()),
-        "watcher_scan" => watcher::scan_known_violations(&kernel),
+        "orchestrator_propose_agent_assignments" => {
+            kernel.propose_agent_assignments(req(&input, "run_id")?)
+        }
+        "orchestrator_adopt_agent_assignment" => {
+            kernel.adopt_agent_assignment(req(&input, "assignment_id")?)
+        }
         _ => Ok(api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),

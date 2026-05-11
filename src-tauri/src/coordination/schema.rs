@@ -4,8 +4,11 @@ pub const SLOT_MIGRATION_VERSION: i64 = 2;
 pub const SLOT_MIGRATION_NAME: &str = "coordination_kernel_slots";
 pub const RUNTIME_GUARD_MIGRATION_VERSION: i64 = 3;
 pub const RUNTIME_GUARD_MIGRATION_NAME: &str = "coordination_kernel_runtime_guards";
-pub const MIGRATION_VERSION: i64 = RUNTIME_GUARD_MIGRATION_VERSION;
-pub const MIGRATION_NAME: &str = RUNTIME_GUARD_MIGRATION_NAME;
+pub const APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION: i64 = 4;
+pub const APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME: &str =
+    "coordination_kernel_approval_sql_orchestration_alignment";
+pub const MIGRATION_VERSION: i64 = 5;
+pub const MIGRATION_NAME: &str = "coordination_kernel_ui_cleanup_alignment";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -200,6 +203,43 @@ CREATE TABLE IF NOT EXISTS patch_files(
   lines_removed INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS workspace_changes(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  task_id TEXT,
+  agent_id TEXT,
+  agent_slot_id TEXT,
+  session_id TEXT,
+  worktree_id TEXT,
+  change_source TEXT NOT NULL,
+  path TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  change_kind TEXT NOT NULL,
+  lease_id TEXT,
+  fence_token INTEGER,
+  lease_status TEXT NOT NULL,
+  violation_id TEXT,
+  summary TEXT,
+  details_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_watchers(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  watched_paths_json TEXT NOT NULL,
+  watched_path_count INTEGER NOT NULL DEFAULT 0,
+  debounce_ms INTEGER NOT NULL DEFAULT 750,
+  last_scan_at TEXT,
+  last_event_at TEXT,
+  last_error TEXT,
+  started_at TEXT NOT NULL,
+  stopped_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workspace_violations(
   id TEXT PRIMARY KEY,
   repo_id TEXT,
@@ -270,6 +310,25 @@ CREATE TABLE IF NOT EXISTS artifacts(
   path TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   size_bytes INTEGER,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifact_storage_logs(
+  id TEXT PRIMARY KEY,
+  artifact_id TEXT,
+  repo_id TEXT NOT NULL,
+  task_id TEXT,
+  agent_id TEXT,
+  agent_slot_id TEXT,
+  artifact_kind TEXT NOT NULL,
+  requested_path TEXT NOT NULL,
+  stored_path TEXT,
+  content_hash TEXT,
+  size_bytes INTEGER,
+  status TEXT NOT NULL,
+  action TEXT NOT NULL,
+  error TEXT,
   metadata_json TEXT,
   created_at TEXT NOT NULL
 );
@@ -347,6 +406,73 @@ CREATE TABLE IF NOT EXISTS approvals(
   approved_by TEXT,
   created_at TEXT NOT NULL,
   resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS approval_gate_logs(
+  id TEXT PRIMARY KEY,
+  approval_id TEXT,
+  task_id TEXT,
+  agent_id TEXT,
+  session_id TEXT,
+  action TEXT NOT NULL,
+  decision TEXT,
+  human_actor TEXT,
+  status TEXT NOT NULL,
+  reason TEXT,
+  details_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS db_change_requests(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  requested_by_agent_id TEXT NOT NULL,
+  requested_by_session_id TEXT NOT NULL,
+  change_kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  status TEXT NOT NULL,
+  risk_level INTEGER NOT NULL DEFAULT 3,
+  destructive INTEGER NOT NULL DEFAULT 0,
+  production_impact TEXT,
+  rollback_summary TEXT,
+  approval_id TEXT,
+  migration_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS db_change_request_resources(
+  id TEXT PRIMARY KEY,
+  db_change_request_id TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coordination_ui_surface_logs(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  surface TEXT NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  command_name TEXT,
+  actor TEXT,
+  details_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coordination_bloat_audits(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  dry_run INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL,
+  unexpected_mcp_file_count INTEGER NOT NULL DEFAULT 0,
+  unexpected_worktree_dir_count INTEGER NOT NULL DEFAULT 0,
+  stale_temp_file_count INTEGER NOT NULL DEFAULT 0,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sql_connections(
@@ -543,10 +669,23 @@ CREATE INDEX IF NOT EXISTS idx_leases_resource_status ON leases(resource_id, sta
 CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
+CREATE INDEX IF NOT EXISTS idx_workspace_changes_task ON workspace_changes(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_changes_session ON workspace_changes(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_changes_resource ON workspace_changes(resource_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_file_watchers_status ON file_watchers(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_violations_status ON workspace_violations(status);
 CREATE INDEX IF NOT EXISTS idx_patches_status ON patches(status);
 CREATE INDEX IF NOT EXISTS idx_merge_jobs_status ON merge_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_artifact ON artifact_storage_logs(artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_status ON artifact_storage_logs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(memory_kind, trust_level);
+CREATE INDEX IF NOT EXISTS idx_approval_gate_logs_approval ON approval_gate_logs(approval_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_approval_gate_logs_task ON approval_gate_logs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_db_change_requests_status ON db_change_requests(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_db_change_requests_task ON db_change_requests(task_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_db_change_request_resources_request ON db_change_request_resources(db_change_request_id);
+CREATE INDEX IF NOT EXISTS idx_ui_surface_logs_surface ON coordination_ui_surface_logs(surface, created_at);
+CREATE INDEX IF NOT EXISTS idx_bloat_audits_created ON coordination_bloat_audits(created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_slot ON worktrees(agent_slot_id) WHERE agent_slot_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_branch ON worktrees(branch_name);

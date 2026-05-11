@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,19 +14,30 @@ use uuid::Uuid;
 
 use super::{
     alignment,
-    db::{canonical_repo_path, open_connection, process_path_text, StoragePaths, REPO_ID},
+    db::{
+        canonical_repo_path, open_connection, process_path_text, SchemaMigrationDiagnostics,
+        StoragePaths, REPO_ID,
+    },
     events,
     models::{ApiEnvelope, ApiErrorEnvelope, PatchValidationResult, TerminalCoordinationContext},
     resources::{
-        is_write_like, lease_modes_conflict, normalize_resource_key, path_to_file_resource,
-        reject_path_escape, resource_covers, resource_risk_level, resource_type,
-        resources_conflict,
+        is_write_like, lease_mode_conflict_reason, normalize_resource_key,
+        normalize_resource_key_checked, path_to_file_resource, reject_path_escape,
+        resource_conflict_reason, resource_covers, resource_risk_level, resource_type,
+        validate_lease_mode,
     },
     sql_classifier,
 };
 
 const SESSION_STALE_SECONDS: i64 = 1800;
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 1800;
+const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
+    "mcp_agent_server_started",
+    "mcp_agent_client_initialized",
+    "mcp_agent_tools_listed",
+    "mcp_agent_tool_called",
+    "mcp_agent_tool_failed",
+];
 const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "get_brief",
     "claim_task",
@@ -34,14 +45,22 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "acquire_lease",
     "renew_lease",
     "release_lease",
+    "list_resources",
     "list_active_leases",
+    "list_task_dependencies",
     "announce_change",
     "validate_patch",
     "list_workspace_violations",
+    "list_workspace_changes",
+    "file_watcher_status",
     "search_memory",
     "get_slot_status",
+    "request_merge",
     "db_get_mode",
     "db_classify_sql",
+    "db_request_change",
+    "db_list_change_requests",
+    "db_get_change_request",
     "db_request_approval",
     "request_approval",
 ];
@@ -121,7 +140,7 @@ impl CoordinationKernel {
     ) -> Result<Self, String> {
         let repo_path = canonical_repo_path(repo_path)?;
         let paths = StoragePaths::new(repo_path, db_path);
-        let (conn, existed) = open_connection(&paths)?;
+        let (conn, existed, storage_diagnostics) = open_connection(&paths)?;
         let kernel = Self { paths, conn };
 
         kernel.insert_default_repo_policy()?;
@@ -130,7 +149,24 @@ impl CoordinationKernel {
         kernel.mark_stale_sessions_interrupted()?;
         kernel.mark_duplicate_pty_sessions_interrupted()?;
         kernel.mark_unsafe_coordination_only_sessions_interrupted()?;
+        kernel.mark_invalid_worktree_sessions_interrupted()?;
         if emit_recovery_event {
+            let storage_payload = storage_diagnostics.to_json();
+            let lifecycle_event = if existed {
+                "kernel.recovered"
+            } else {
+                "kernel.initialized"
+            };
+            kernel.emit_event(
+                "kernel_storage_opened",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                storage_payload.clone(),
+            )?;
+            for migration in &storage_diagnostics.migrations {
+                kernel.emit_schema_migration_log_event(migration)?;
+            }
             kernel.emit_event(
                 if existed {
                     events::KERNEL_RECOVERED
@@ -143,12 +179,73 @@ impl CoordinationKernel {
                 json!({
                     "repo_path": kernel.paths.repo_path.display().to_string(),
                     "db_path": kernel.paths.db_path.display().to_string(),
+                    "storage": storage_payload,
                     "cloud_orchestrator_enabled": false,
                 }),
             )?;
+            kernel.write_alignment_lifecycle_log(
+                "kernel_startup",
+                lifecycle_event,
+                "aligned",
+                if existed {
+                    "Kernel storage opened and recovery checks completed."
+                } else {
+                    "Kernel storage created and initialization checks completed."
+                },
+                storage_diagnostics.to_json(),
+            );
         }
 
         Ok(kernel)
+    }
+
+    fn emit_schema_migration_log_event(
+        &self,
+        migration: &SchemaMigrationDiagnostics,
+    ) -> Result<(), String> {
+        let event_type = match migration.status.as_str() {
+            "applied" => "schema_migration_applied",
+            "already_applied" => "schema_migration_checked",
+            _ => "schema_migration_ensured",
+        };
+        self.emit_event(
+            event_type,
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            migration.to_json(),
+        )?;
+        Ok(())
+    }
+
+    fn write_alignment_lifecycle_log(
+        &self,
+        context: &str,
+        event: &str,
+        status: &str,
+        reason: &str,
+        details: Value,
+    ) {
+        if let Err(error) = alignment::write_lifecycle(
+            &self.paths.repo_path,
+            context,
+            event,
+            status,
+            reason,
+            details,
+        ) {
+            let _ = self.emit_event(
+                "alignment_log_write_failed",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "context": context,
+                    "event": event,
+                    "error": error,
+                }),
+            );
+        }
     }
 
     fn insert_default_repo_policy(&self) -> Result<(), String> {
@@ -511,6 +608,144 @@ impl CoordinationKernel {
         Ok(json!({"id": id, "title": title, "status": "ready"}))
     }
 
+    pub fn add_task_dependency(
+        &self,
+        task_id: &str,
+        depends_on_task_id: &str,
+        dependency_kind: Option<&str>,
+    ) -> Result<Value, String> {
+        let dependency_kind = normalize_task_dependency_kind(dependency_kind);
+        self.begin_immediate_transaction("add task dependency")?;
+        let result = (|| -> Result<Value, String> {
+            self.insert_task_dependency_checked(
+                task_id,
+                depends_on_task_id,
+                &dependency_kind,
+                "user",
+                "local",
+            )
+        })();
+        match self.finish_transaction(result, "add task dependency") {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let _ = self.emit_event(
+                    "task_dependency_rejected",
+                    "user",
+                    "local",
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "depends_on_task_id": depends_on_task_id,
+                        "dependency_kind": dependency_kind,
+                        "error": error,
+                    }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub fn list_task_dependencies(&self, task_id: Option<&str>) -> Result<Value, String> {
+        let dependencies = if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+            self.task_dependency_rows(task_id)?
+        } else {
+            self.query_json(
+                "SELECT d.task_id,
+                        dependent.title AS task_title,
+                        dependent.status AS task_status,
+                        d.depends_on_task_id,
+                        prerequisite.title AS depends_on_title,
+                        prerequisite.status AS depends_on_status,
+                        d.dependency_kind,
+                        d.created_at
+                 FROM task_dependencies d
+                 LEFT JOIN tasks dependent ON dependent.id = d.task_id
+                 LEFT JOIN tasks prerequisite ON prerequisite.id = d.depends_on_task_id
+                 ORDER BY d.created_at DESC
+                 LIMIT 500",
+                &[],
+            )?
+        };
+        let blockers = if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+            self.unsatisfied_dependency_details(task_id)?
+        } else {
+            Vec::new()
+        };
+        Ok(api_ok(json!({
+            "dependencies": dependencies,
+            "blocking_dependencies": blockers,
+        })))
+    }
+
+    fn insert_task_dependency_checked(
+        &self,
+        task_id: &str,
+        depends_on_task_id: &str,
+        dependency_kind: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<Value, String> {
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Dependent task does not exist.",
+        )?;
+        let dependency = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&depends_on_task_id],
+            "Dependency task does not exist.",
+        )?;
+        if task_id == depends_on_task_id {
+            return Err("A task cannot depend on itself.".to_string());
+        }
+        if self.task_dependency_would_cycle(task_id, depends_on_task_id)? {
+            return Err("Task dependency would create a cycle.".to_string());
+        }
+
+        let now = now_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO task_dependencies(
+                    task_id, depends_on_task_id, dependency_kind, created_at
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![task_id, depends_on_task_id, dependency_kind, now],
+            )
+            .map_err(|error| format!("Unable to create task dependency: {error}"))?;
+        let reused = changed == 0;
+        self.emit_event(
+            if reused {
+                "task_dependency_reused"
+            } else {
+                "task_dependency_created"
+            },
+            actor_type,
+            actor_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                orchestration_run_id: task["orchestration_run_id"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "task_id": task_id,
+                "task_title": task["title"].clone(),
+                "depends_on_task_id": depends_on_task_id,
+                "depends_on_title": dependency["title"].clone(),
+                "dependency_kind": dependency_kind,
+                "reused": reused,
+            }),
+        )?;
+        self.refresh_task_dependency_blocked_status(task_id, actor_type, actor_id)?;
+        Ok(json!({
+            "task_id": task_id,
+            "depends_on_task_id": depends_on_task_id,
+            "dependency_kind": dependency_kind,
+            "reused": reused,
+        }))
+    }
+
     pub fn claim_task(
         &self,
         task_id: &str,
@@ -518,87 +753,268 @@ impl CoordinationKernel {
         session_id: &str,
     ) -> Result<Value, String> {
         let session = self.ensure_session_active(session_id, agent_id)?;
-        let agent_slot_id = session["agent_slot_id"].as_str();
-        let blockers = self.unsatisfied_dependencies(task_id)?;
-        if !blockers.is_empty() {
+        let agent_slot_id = session["agent_slot_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+
+        self.begin_immediate_transaction("claim task")?;
+        let result = (|| -> Result<Value, String> {
+            let _ = self.query_one(
+                "SELECT * FROM tasks WHERE id=?1",
+                &[&task_id],
+                "Task does not exist.",
+            )?;
+            let blockers = self.unsatisfied_dependency_details(task_id)?;
+            if !blockers.is_empty() {
+                self.conn
+                    .execute(
+                        "UPDATE tasks
+                         SET status='blocked', updated_at=?1
+                         WHERE id=?2
+                           AND (claimed_session_id IS NULL OR claimed_session_id='')
+                           AND status NOT IN ('done', 'completed', 'merged')",
+                        params![now_rfc3339(), task_id],
+                    )
+                    .map_err(|error| format!("Unable to mark task blocked: {error}"))?;
+                self.emit_event(
+                    "task_blocked",
+                    "agent",
+                    agent_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: agent_slot_id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "blocking_dependencies": blockers.clone(),
+                        "reason": "unsatisfied_dependencies",
+                    }),
+                )?;
+                return Ok(api_error(
+                    "task_blocked",
+                    format!("Task {task_id} is blocked by unfinished dependencies."),
+                    json!({"blocking_dependencies": blockers}),
+                ));
+            }
+
+            let now = now_rfc3339();
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='claimed', claimed_by_agent_id=?1, claimed_session_id=?2, updated_at=?3
+                     WHERE id=?4
+                       AND (claimed_session_id IS NULL OR claimed_session_id='')
+                       AND status NOT IN ('done', 'completed', 'merged')",
+                    params![agent_id, session_id, now, task_id],
+                )
+                .map_err(|error| format!("Unable to claim task: {error}"))?;
+
+            if changed == 0 {
+                return Err("Task is already claimed or does not exist.".to_string());
+            }
+
+            self.conn
+                .execute(
+                    "UPDATE agent_sessions SET task_id=?1, updated_at=?2 WHERE id=?3",
+                    params![task_id, now, session_id],
+                )
+                .map_err(|error| format!("Unable to attach session to claimed task: {error}"))?;
             self.emit_event(
-                "task_blocked",
+                "task_claimed",
                 "agent",
                 agent_id,
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
-                    agent_slot_id: agent_slot_id.map(str::to_string),
+                    agent_slot_id: agent_slot_id.clone(),
                     session_id: Some(session_id.to_string()),
                     ..EventRefs::default()
                 },
-                json!({"blocking_tasks": blockers}),
+                json!({"dependency_gate": "satisfied"}),
             )?;
-            return Err(format!(
-                "Task {task_id} is blocked by unfinished dependencies."
-            ));
-        }
 
-        let now = now_rfc3339();
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE tasks
-                 SET status='claimed', claimed_by_agent_id=?1, claimed_session_id=?2, updated_at=?3
-                 WHERE id=?4 AND (claimed_session_id IS NULL OR claimed_session_id='')",
-                params![agent_id, session_id, now, task_id],
+            Ok(
+                json!({"task_id": task_id, "agent_id": agent_id, "session_id": session_id, "status": "claimed"}),
             )
-            .map_err(|error| format!("Unable to claim task: {error}"))?;
+        })();
 
-        if changed == 0 {
-            return Err("Task is already claimed or does not exist.".to_string());
-        }
-
-        self.conn
-            .execute(
-                "UPDATE agent_sessions SET task_id=?1, updated_at=?2 WHERE id=?3",
-                params![task_id, now, session_id],
-            )
-            .map_err(|error| format!("Unable to attach session to claimed task: {error}"))?;
-        self.emit_event(
-            "task_claimed",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_slot_id: agent_slot_id.map(str::to_string),
-                session_id: Some(session_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({}),
-        )?;
-
-        Ok(
-            json!({"task_id": task_id, "agent_id": agent_id, "session_id": session_id, "status": "claimed"}),
-        )
+        self.finish_transaction(result, "claim task")
     }
 
-    fn unsatisfied_dependencies(&self, task_id: &str) -> Result<Vec<String>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT depends_on_task_id
-                 FROM task_dependencies d
-                 LEFT JOIN tasks t ON t.id = d.depends_on_task_id
-                 WHERE d.task_id = ?1 AND COALESCE(t.status, '') NOT IN ('done', 'completed')",
-            )
-            .map_err(|error| format!("Unable to inspect task dependencies: {error}"))?;
-        let rows = stmt
-            .query_map([task_id], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("Unable to read task dependencies: {error}"))?;
-
-        let mut dependencies = Vec::new();
-        for row in rows {
-            dependencies
-                .push(row.map_err(|error| format!("Unable to read dependency row: {error}"))?);
+    fn task_dependency_rows(&self, task_id: &str) -> Result<Vec<Value>, String> {
+        let mut rows = self.query_json(
+            "SELECT d.task_id,
+                    dependent.title AS task_title,
+                    dependent.status AS task_status,
+                    d.depends_on_task_id,
+                    prerequisite.title AS depends_on_title,
+                    prerequisite.status AS depends_on_status,
+                    d.dependency_kind,
+                    d.created_at
+             FROM task_dependencies d
+             LEFT JOIN tasks dependent ON dependent.id = d.task_id
+             LEFT JOIN tasks prerequisite ON prerequisite.id = d.depends_on_task_id
+             WHERE d.task_id=?1
+             ORDER BY d.created_at ASC",
+            &[&task_id],
+        )?;
+        for row in &mut rows {
+            let status = row["depends_on_status"].as_str().unwrap_or("").to_string();
+            let dependency_exists = !status.is_empty();
+            let satisfied = dependency_exists && task_dependency_satisfied_status(&status);
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "dependency_exists".to_string(),
+                    Value::Bool(dependency_exists),
+                );
+                object.insert("satisfied".to_string(), Value::Bool(satisfied));
+            }
         }
-        Ok(dependencies)
+        Ok(rows)
+    }
+
+    fn unsatisfied_dependency_details(&self, task_id: &str) -> Result<Vec<Value>, String> {
+        Ok(self
+            .task_dependency_rows(task_id)?
+            .into_iter()
+            .filter(|dependency| dependency["satisfied"].as_bool() != Some(true))
+            .collect())
+    }
+
+    fn task_dependency_would_cycle(
+        &self,
+        task_id: &str,
+        depends_on_task_id: &str,
+    ) -> Result<bool, String> {
+        if task_id == depends_on_task_id {
+            return Ok(true);
+        }
+        let cycle_count: i64 = self
+            .conn
+            .query_row(
+                "WITH RECURSIVE dependency_tree(id) AS (
+                    SELECT depends_on_task_id
+                    FROM task_dependencies
+                    WHERE task_id=?1
+                    UNION
+                    SELECT d.depends_on_task_id
+                    FROM task_dependencies d
+                    JOIN dependency_tree tree ON d.task_id = tree.id
+                 )
+                 SELECT COUNT(1) FROM dependency_tree WHERE id=?2",
+                params![depends_on_task_id, task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to inspect task dependency graph: {error}"))?;
+        Ok(cycle_count > 0)
+    }
+
+    fn refresh_task_dependency_blocked_status(
+        &self,
+        task_id: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<(), String> {
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let now = now_rfc3339();
+        if blockers.is_empty() {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='ready', updated_at=?1
+                     WHERE id=?2
+                       AND status='blocked'
+                       AND (claimed_session_id IS NULL OR claimed_session_id='')",
+                    params![now, task_id],
+                )
+                .map_err(|error| format!("Unable to mark task unblocked: {error}"))?;
+            if changed > 0 {
+                self.emit_event(
+                    "task_unblocked",
+                    actor_type,
+                    actor_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        orchestration_run_id: task["orchestration_run_id"]
+                            .as_str()
+                            .map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({"reason": "dependencies_satisfied"}),
+                )?;
+            }
+        } else {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='blocked', updated_at=?1
+                     WHERE id=?2
+                       AND (claimed_session_id IS NULL OR claimed_session_id='')
+                       AND status IN ('ready', 'created')",
+                    params![now, task_id],
+                )
+                .map_err(|error| format!("Unable to mark task blocked: {error}"))?;
+            if changed > 0 {
+                self.emit_event(
+                    "task_blocked",
+                    actor_type,
+                    actor_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        orchestration_run_id: task["orchestration_run_id"]
+                            .as_str()
+                            .map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": "dependency_added",
+                        "blocking_dependencies": blockers,
+                    }),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_dependent_tasks(&self, depends_on_task_id: &str) -> Result<(), String> {
+        let dependents = self.query_json(
+            "SELECT task_id, dependency_kind
+             FROM task_dependencies
+             WHERE depends_on_task_id=?1
+             ORDER BY created_at ASC",
+            &[&depends_on_task_id],
+        )?;
+        for dependent in dependents {
+            let Some(task_id) = dependent["task_id"].as_str() else {
+                continue;
+            };
+            self.emit_event(
+                "task_dependency_satisfied",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "depends_on_task_id": depends_on_task_id,
+                    "dependency_kind": dependent["dependency_kind"].clone(),
+                }),
+            )?;
+            self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
+        }
+        Ok(())
     }
 
     pub fn post_plan(
@@ -712,6 +1128,33 @@ impl CoordinationKernel {
                                     format!("Unable to refresh active slot session: {error}")
                                 })?;
                         }
+                        self.emit_event(
+                            "agent_session_reused",
+                            "agent",
+                            agent_id,
+                            EventRefs {
+                                agent_id: Some(agent_id.to_string()),
+                                agent_slot_id: Some(agent_slot_id.to_string()),
+                                session_id: Some(active_session_id.to_string()),
+                                task_id: task_id
+                                    .or_else(|| existing["task_id"].as_str())
+                                    .map(str::to_string),
+                                orchestration_run_id: orchestration_run_id
+                                    .or_else(|| existing["orchestration_run_id"].as_str())
+                                    .map(str::to_string),
+                                ..EventRefs::default()
+                            },
+                            json!({
+                                "slot_key": slot_key,
+                                "pty_id": requested_pty,
+                                "reason": "same_fresh_pty_reused",
+                            }),
+                        )?;
+                        let existing = self.query_one(
+                            "SELECT * FROM agent_sessions WHERE id=?1",
+                            &[&active_session_id],
+                            "Session does not exist after reuse.",
+                        )?;
                         let worktree_path = existing["worktree_id"]
                             .as_str()
                             .and_then(|_| existing["write_root"].as_str());
@@ -727,6 +1170,28 @@ impl CoordinationKernel {
                         )?;
                         return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
                     }
+                    self.emit_event(
+                        "agent_slot_busy",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
+                            session_id: Some(active_session_id.to_string()),
+                            task_id: existing["task_id"].as_str().map(str::to_string),
+                            orchestration_run_id: existing["orchestration_run_id"]
+                                .as_str()
+                                .map(str::to_string),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "slot_key": slot_key,
+                            "active_session_id": active_session_id,
+                            "existing_pty_id": existing_pty,
+                            "requested_pty_id": requested_pty,
+                            "reason": "fresh_active_session_for_different_pty",
+                        }),
+                    )?;
                     return Err(format!(
                         "slot_busy: agent slot {slot_key} already has active session {active_session_id}."
                     ));
@@ -736,6 +1201,116 @@ impl CoordinationKernel {
                     let _ = self.interrupt_session(active_session_id, "stale_slot_session")?;
                 }
             }
+        }
+
+        let active_sessions = self.query_json(
+            "SELECT * FROM agent_sessions
+             WHERE agent_slot_id=?1 AND status='active'
+             ORDER BY updated_at DESC, created_at DESC",
+            &[&agent_slot_id],
+        )?;
+        for existing in active_sessions {
+            let Some(existing_session_id) = existing["id"].as_str() else {
+                continue;
+            };
+            if !session_is_fresh(&existing) {
+                let _ =
+                    self.interrupt_session(existing_session_id, "stale_slot_session_recovered")?;
+                continue;
+            }
+
+            let existing_pty = existing["pty_id"].as_str().unwrap_or("");
+            let requested_pty = pty_id.unwrap_or("");
+            if !requested_pty.is_empty() && existing_pty == requested_pty {
+                self.conn
+                    .execute(
+                        "UPDATE agent_slots
+                         SET active_session_id=?1, status='active', updated_at=?2
+                         WHERE id=?3",
+                        params![existing_session_id, now_rfc3339(), agent_slot_id],
+                    )
+                    .map_err(|error| format!("Unable to repair active slot pointer: {error}"))?;
+                self.heartbeat_session(existing_session_id)?;
+                let mcp_config = self.write_or_update_slot_mcp_config(
+                    agent_slot_id,
+                    existing_session_id,
+                    task_id.or_else(|| existing["task_id"].as_str()),
+                    existing["worktree_id"].as_str(),
+                    existing["worktree_id"]
+                        .as_str()
+                        .and_then(|_| existing["write_root"].as_str()),
+                    orchestration_run_id.or_else(|| existing["orchestration_run_id"].as_str()),
+                    orchestration_role.or_else(|| existing["orchestration_role"].as_str()),
+                )?;
+                self.emit_event(
+                    "agent_session_reused",
+                    "agent",
+                    agent_id,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: Some(agent_slot_id.to_string()),
+                        session_id: Some(existing_session_id.to_string()),
+                        task_id: task_id
+                            .or_else(|| existing["task_id"].as_str())
+                            .map(str::to_string),
+                        orchestration_run_id: orchestration_run_id
+                            .or_else(|| existing["orchestration_run_id"].as_str())
+                            .map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "slot_key": slot_key,
+                        "pty_id": requested_pty,
+                        "reason": "repaired_missing_slot_active_session_pointer",
+                    }),
+                )?;
+                let repaired_slot = self.get_agent_slot_by_id(agent_slot_id)?;
+                let repaired_session = self.query_one(
+                    "SELECT * FROM agent_sessions WHERE id=?1",
+                    &[&existing_session_id],
+                    "Session does not exist after slot pointer repair.",
+                )?;
+                return Ok(self.session_response(
+                    &repaired_session,
+                    &repaired_slot,
+                    &mcp_config,
+                    Vec::new(),
+                ));
+            }
+
+            self.conn
+                .execute(
+                    "UPDATE agent_slots
+                     SET active_session_id=?1, status='active', updated_at=?2
+                     WHERE id=?3",
+                    params![existing_session_id, now_rfc3339(), agent_slot_id],
+                )
+                .map_err(|error| format!("Unable to repair busy slot pointer: {error}"))?;
+            self.emit_event(
+                "agent_slot_busy",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: Some(agent_slot_id.to_string()),
+                    session_id: Some(existing_session_id.to_string()),
+                    task_id: existing["task_id"].as_str().map(str::to_string),
+                    orchestration_run_id: existing["orchestration_run_id"]
+                        .as_str()
+                        .map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "slot_key": slot_key,
+                    "active_session_id": existing_session_id,
+                    "existing_pty_id": existing_pty,
+                    "requested_pty_id": requested_pty,
+                    "reason": "fresh_active_session_found_without_slot_pointer",
+                }),
+            )?;
+            return Err(format!(
+                "slot_busy: agent slot {slot_key} already has active session {existing_session_id}."
+            ));
         }
 
         let id = uuid();
@@ -1139,6 +1714,193 @@ impl CoordinationKernel {
         }))
     }
 
+    pub fn get_workspace_mcp_status(
+        &self,
+        workspace_id: Option<&str>,
+        workspace_name: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut status = self.ensure_workspace_mcp_config(workspace_id, workspace_name)?;
+        let health = self.workspace_mcp_health(&status);
+        self.emit_event(
+            "mcp_health_checked",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+                "health": health,
+            }),
+        )?;
+        if let Some(object) = status.as_object_mut() {
+            object.insert("health".to_string(), health);
+        }
+        Ok(status)
+    }
+
+    fn workspace_mcp_health(&self, status: &Value) -> Value {
+        let command = status["command"].as_str().unwrap_or_default();
+        let args = status["args"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let config_path = status["config_path"].as_str().unwrap_or_default();
+        let codex_config_path = status["codex_config_path"].as_str().unwrap_or_default();
+        let claude_config_path = status["claude_config_path"].as_str().unwrap_or_default();
+        let config_files_exist = Path::new(config_path).exists()
+            && Path::new(codex_config_path).exists()
+            && Path::new(claude_config_path).exists();
+        let command_exists = mcp_command_can_be_spawned(command);
+        let probe = probe_mcp_stdio(command, &args);
+        let responded = probe["responded"].as_bool() == Some(true);
+        let tool_count = probe["tool_count"].as_u64().unwrap_or(0);
+        let healthy = config_files_exist && command_exists && responded && tool_count > 0;
+        let client_mount = self.mcp_client_mount_summary().unwrap_or_else(|error| {
+            json!({
+                "status": "error",
+                "error": error,
+                "active_session_count": 0,
+                "confirmed_session_count": 0,
+                "mounts": [],
+                "events": [],
+            })
+        });
+
+        json!({
+            "status": if healthy { "healthy" } else { "warning" },
+            "config_generated": config_files_exist,
+            "configured_always_on": status["always_on"].as_bool() == Some(true),
+            "toggleable": status["toggleable"].clone(),
+            "authority": "local_coordination_kernel",
+            "command": command,
+            "command_exists_or_path_resolvable": command_exists,
+            "spawn_probe": probe,
+            "agent_client_mount": client_mount["status"].clone(),
+            "agent_client_mount_summary": client_mount,
+        })
+    }
+
+    pub fn mcp_client_mount_summary(&self) -> Result<Value, String> {
+        let sessions = self.query_json(
+            "SELECT s.*, a.name AS agent_name, sl.slot_key
+             FROM agent_sessions s
+             LEFT JOIN agents a ON a.id = s.agent_id
+             LEFT JOIN agent_slots sl ON sl.id = s.agent_slot_id
+             WHERE s.status='active'
+             ORDER BY s.updated_at DESC LIMIT 200",
+            &[],
+        )?;
+        let events = self.mcp_client_events(500)?;
+        let mut mounts = Vec::new();
+        let mut confirmed = 0usize;
+        let mut initialized = 0usize;
+        let mut partial = 0usize;
+
+        for session in &sessions {
+            let session_id = session["id"].as_str().unwrap_or_default();
+            let matching = events
+                .iter()
+                .filter(|event| event["session_id"].as_str() == Some(session_id))
+                .collect::<Vec<_>>();
+            let latest = matching.first().copied();
+            let tools_listed = matching.iter().any(|event| {
+                event["event_type"].as_str() == Some("mcp_agent_tools_listed")
+                    && event["payload_json"]["details"]["tool_count"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        > 0
+            });
+            let successful_tool_calls = matching
+                .iter()
+                .filter(|event| event["event_type"].as_str() == Some("mcp_agent_tool_called"))
+                .count();
+            let failed_tool_calls = matching
+                .iter()
+                .filter(|event| event["event_type"].as_str() == Some("mcp_agent_tool_failed"))
+                .count();
+            let initialized_seen = matching
+                .iter()
+                .any(|event| event["event_type"].as_str() == Some("mcp_agent_client_initialized"));
+            let server_started = matching
+                .iter()
+                .any(|event| event["event_type"].as_str() == Some("mcp_agent_server_started"));
+            let status = if tools_listed || successful_tool_calls > 0 {
+                confirmed += 1;
+                "confirmed"
+            } else if initialized_seen {
+                initialized += 1;
+                "initialized"
+            } else if server_started {
+                partial += 1;
+                "server_started"
+            } else {
+                "not_seen"
+            };
+            mounts.push(json!({
+                "session_id": session_id,
+                "agent_id": session["agent_id"].clone(),
+                "agent_name": session["agent_name"].clone(),
+                "agent_slot_id": session["agent_slot_id"].clone(),
+                "slot_key": session["slot_key"].clone(),
+                "worktree_id": session["worktree_id"].clone(),
+                "write_root": session["write_root"].clone(),
+                "status": status,
+                "latest_event_type": latest.and_then(|event| event["event_type"].as_str()).unwrap_or("none"),
+                "latest_event_at": latest.and_then(|event| event["created_at"].as_str()).unwrap_or("none"),
+                "tools_listed": tools_listed,
+                "successful_tool_calls": successful_tool_calls,
+                "failed_tool_calls": failed_tool_calls,
+                "event_count": matching.len(),
+            }));
+        }
+
+        let active_count = sessions.len();
+        let status = if active_count == 0 {
+            "idle"
+        } else if confirmed == active_count {
+            "confirmed"
+        } else if confirmed > 0 {
+            "partial"
+        } else if initialized > 0 {
+            "initialized_only"
+        } else if partial > 0 {
+            "server_started_only"
+        } else {
+            "not_seen"
+        };
+
+        Ok(json!({
+            "status": status,
+            "active_session_count": active_count,
+            "confirmed_session_count": confirmed,
+            "initialized_session_count": initialized,
+            "server_started_only_count": partial,
+            "event_count": events.len(),
+            "mounts": mounts,
+            "events": events,
+        }))
+    }
+
+    fn mcp_client_events(&self, limit: i64) -> Result<Vec<Value>, String> {
+        let limit = limit.clamp(1, 1000);
+        let event_types = MCP_CLIENT_EVENT_TYPES
+            .iter()
+            .map(|event_type| format!("'{event_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.query_json(
+            &format!(
+                "SELECT * FROM events WHERE event_type IN ({event_types}) ORDER BY seq DESC LIMIT {limit}"
+            ),
+            &[],
+        )
+    }
+
     fn write_or_update_slot_mcp_config(
         &self,
         agent_slot_id: &str,
@@ -1413,113 +2175,189 @@ impl CoordinationKernel {
         reason: Option<&str>,
     ) -> Result<Value, String> {
         let session = self.ensure_session_active(session_id, agent_id)?;
-        self.ensure_session_authorized_for_task(session_id, task_id)?;
-        let agent_slot_id = session["agent_slot_id"].as_str();
+        self.ensure_session_owns_task(session_id, task_id)?;
+        let agent_slot_id = session["agent_slot_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
         self.expire_old_leases()?;
-        let resource_key = normalize_resource_key(resource_key);
-        let mode = non_empty(mode, "Lease mode")?;
-        let resource_id = self.create_or_get_resource(&resource_key, mode)?;
-        self.emit_event(
-            "lease_requested",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_slot_id: agent_slot_id.map(str::to_string),
-                session_id: Some(session_id.to_string()),
-                resource_id: Some(resource_id.clone()),
-                ..EventRefs::default()
-            },
-            json!({"resource_key": resource_key, "mode": mode, "reason": reason}),
-        )?;
+        let resource_key = normalize_resource_key_checked(resource_key)?;
+        let mode = validate_lease_mode(mode)?;
 
-        let blockers = self.active_conflicting_leases(&resource_key, mode)?;
-        if let Some(blocker) = blockers.first() {
-            let conflict_id = uuid();
-            self.conn
-                .execute(
-                    "INSERT INTO lease_conflicts(id, requested_resource_id, requested_by_agent_id, requested_by_slot_id, blocking_lease_id, task_id, status, created_at)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
-                    params![conflict_id, resource_id, agent_id, agent_slot_id, blocker["id"].as_str().unwrap_or_default(), task_id, now_rfc3339()],
-                )
-                .map_err(|error| format!("Unable to record lease conflict: {error}"))?;
+        self.begin_immediate_transaction("acquire lease")?;
+        let result = (|| -> Result<Value, String> {
+            let (resource_id, resource_created) =
+                self.create_or_get_resource(&resource_key, &mode)?;
             self.emit_event(
-                "lease_denied",
+                if resource_created {
+                    "resource_registered"
+                } else {
+                    "resource_reused"
+                },
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: agent_slot_id.clone(),
+                    session_id: Some(session_id.to_string()),
+                    resource_id: Some(resource_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "resource_key": resource_key.clone(),
+                    "resource_type": resource_type(&resource_key),
+                    "risk_level": resource_risk_level(&resource_key, &mode),
+                    "mode": mode.clone(),
+                }),
+            )?;
+            self.emit_event(
+                "lease_requested",
                 "agent",
                 agent_id,
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
-                    agent_slot_id: agent_slot_id.map(str::to_string),
+                    agent_slot_id: agent_slot_id.clone(),
                     session_id: Some(session_id.to_string()),
-                    resource_id: Some(resource_id),
+                    resource_id: Some(resource_id.clone()),
                     ..EventRefs::default()
                 },
-                json!({"resource_key": resource_key, "mode": mode, "blockers": blockers}),
+                json!({"resource_key": resource_key.clone(), "mode": mode.clone(), "reason": reason}),
             )?;
-            return Ok(api_error(
-                "lease_conflict",
-                "Resource is already covered by an active conflicting lease.",
-                json!({"blockers": blockers}),
-            ));
-        }
 
-        let fence_token: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(fence_token), 0) + 1 FROM leases WHERE resource_id=?1",
-                [&resource_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to allocate lease fence token: {error}"))?;
-        let lease_id = uuid();
-        let now = now_rfc3339();
-        let expires_at = rfc3339_after_seconds(ttl_seconds.unwrap_or(DEFAULT_LEASE_TTL_SECONDS));
-        self.conn
-            .execute(
-                "INSERT INTO leases(
-                    id, resource_id, task_id, agent_id, agent_slot_id, session_id, mode, status, fence_token,
-                    reason, acquired_at, expires_at, last_heartbeat_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?10)",
-                params![
-                    lease_id,
-                    resource_id,
-                    task_id,
+            let blockers = self.active_conflicting_leases(&resource_key, &mode)?;
+            if !blockers.is_empty() {
+                let mut conflict_ids = Vec::new();
+                for blocker in &blockers {
+                    let conflict_id = uuid();
+                    self.conn
+                        .execute(
+                            "INSERT INTO lease_conflicts(id, requested_resource_id, requested_by_agent_id, requested_by_slot_id, blocking_lease_id, task_id, status, created_at)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
+                            params![
+                                conflict_id,
+                                resource_id,
+                                agent_id,
+                                agent_slot_id.as_deref(),
+                                blocker["id"].as_str().unwrap_or_default(),
+                                task_id,
+                                now_rfc3339()
+                            ],
+                        )
+                        .map_err(|error| format!("Unable to record lease conflict: {error}"))?;
+                    self.emit_event(
+                        "lease_conflict_detected",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            task_id: Some(task_id.to_string()),
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: agent_slot_id.clone(),
+                            session_id: Some(session_id.to_string()),
+                            resource_id: Some(resource_id.clone()),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "conflict_id": conflict_id,
+                            "requested_resource_key": resource_key.clone(),
+                            "requested_mode": mode.clone(),
+                            "blocking_lease_id": blocker["id"].clone(),
+                            "blocking_resource_key": blocker["resource_key"].clone(),
+                            "blocking_mode": blocker["mode"].clone(),
+                            "mode_conflict_reason": blocker["mode_conflict_reason"].clone(),
+                            "resource_conflict_reason": blocker["resource_conflict_reason"].clone(),
+                            "conflict_reason": blocker["conflict_reason"].clone(),
+                        }),
+                    )?;
+                    conflict_ids.push(conflict_id);
+                }
+                self.emit_event(
+                    "lease_denied",
+                    "agent",
                     agent_id,
-                    agent_slot_id,
-                    session_id,
-                    mode,
-                    fence_token,
-                    reason,
-                    now,
-                    expires_at
-                ],
-            )
-            .map_err(|error| format!("Unable to acquire lease: {error}"))?;
-        self.emit_event(
-            "lease_granted",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_slot_id: agent_slot_id.map(str::to_string),
-                session_id: Some(session_id.to_string()),
-                resource_id: Some(resource_id.clone()),
-                ..EventRefs::default()
-            },
-            json!({"lease_id": lease_id, "resource_key": resource_key, "mode": mode, "fence_token": fence_token, "expires_at": expires_at}),
-        )?;
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: agent_slot_id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        resource_id: Some(resource_id),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "resource_key": resource_key.clone(),
+                        "mode": mode.clone(),
+                        "blockers": blockers.clone(),
+                        "conflict_ids": conflict_ids,
+                        "detector": "resource_registry_overlap_v1",
+                    }),
+                )?;
+                return Ok(api_error(
+                    "lease_conflict",
+                    "Resource is already covered by an active conflicting lease.",
+                    json!({"blockers": blockers}),
+                ));
+            }
 
-        Ok(api_ok(json!({
-            "lease_id": lease_id,
-            "resource_id": resource_id,
-            "resource_key": resource_key,
-            "mode": mode,
-            "fence_token": fence_token,
-            "expires_at": expires_at
-        })))
+            let fence_token: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(MAX(fence_token), 0) + 1 FROM leases WHERE resource_id=?1",
+                    [&resource_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Unable to allocate lease fence token: {error}"))?;
+            let lease_id = uuid();
+            let now = now_rfc3339();
+            let expires_at =
+                rfc3339_after_seconds(ttl_seconds.unwrap_or(DEFAULT_LEASE_TTL_SECONDS));
+            self.conn
+                .execute(
+                    "INSERT INTO leases(
+                        id, resource_id, task_id, agent_id, agent_slot_id, session_id, mode, status, fence_token,
+                        reason, acquired_at, expires_at, last_heartbeat_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?10)",
+                    params![
+                        lease_id,
+                        resource_id,
+                        task_id,
+                        agent_id,
+                        agent_slot_id.as_deref(),
+                        session_id,
+                        mode.as_str(),
+                        fence_token,
+                        reason,
+                        now,
+                        expires_at
+                    ],
+                )
+                .map_err(|error| format!("Unable to acquire lease: {error}"))?;
+            self.emit_event(
+                "lease_granted",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: agent_slot_id.clone(),
+                    session_id: Some(session_id.to_string()),
+                    resource_id: Some(resource_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({"lease_id": lease_id.clone(), "resource_key": resource_key.clone(), "mode": mode.clone(), "fence_token": fence_token, "expires_at": expires_at.clone()}),
+            )?;
+
+            Ok(api_ok(json!({
+                "lease_id": lease_id.clone(),
+                "resource_id": resource_id,
+                "resource_key": resource_key,
+                "mode": mode,
+                "fence_token": fence_token,
+                "expires_at": expires_at
+            })))
+        })();
+
+        self.finish_transaction(result, "acquire lease")
     }
 
     fn active_conflicting_leases(
@@ -1527,19 +2365,79 @@ impl CoordinationKernel {
         resource_key: &str,
         mode: &str,
     ) -> Result<Vec<Value>, String> {
-        let active = self.list_active_leases_internal(None, None, None)?;
+        let now = now_rfc3339();
+        let active = self.query_json(
+            "SELECT l.*, r.resource_key, r.resource_type
+             FROM leases l
+             JOIN resources r ON r.id = l.resource_id
+             WHERE l.status='active' AND l.expires_at >= ?1
+             ORDER BY l.expires_at ASC",
+            &[&now],
+        )?;
         Ok(active
             .into_iter()
-            .filter(|lease| {
+            .filter_map(|mut lease| {
                 let existing_key = lease["resource_key"].as_str().unwrap_or_default();
                 let existing_mode = lease["mode"].as_str().unwrap_or_default();
-                lease_modes_conflict(existing_mode, mode)
-                    && resources_conflict(existing_key, resource_key)
+                let mode_reason = lease_mode_conflict_reason(existing_mode, mode)?;
+                let resource_reason = resource_conflict_reason(existing_key, resource_key)?;
+                if let Some(object) = lease.as_object_mut() {
+                    object.insert(
+                        "requested_resource_key".to_string(),
+                        Value::String(resource_key.to_string()),
+                    );
+                    object.insert(
+                        "requested_mode".to_string(),
+                        Value::String(mode.to_string()),
+                    );
+                    object.insert(
+                        "mode_conflict_reason".to_string(),
+                        Value::String(mode_reason.clone()),
+                    );
+                    object.insert(
+                        "resource_conflict_reason".to_string(),
+                        Value::String(resource_reason.clone()),
+                    );
+                    object.insert(
+                        "conflict_reason".to_string(),
+                        Value::String(format!("{mode_reason};{resource_reason}")),
+                    );
+                }
+                Some(lease)
             })
             .collect())
     }
 
-    fn create_or_get_resource(&self, resource_key: &str, mode: &str) -> Result<String, String> {
+    pub fn list_resources(
+        &self,
+        resource_type_filter: Option<&str>,
+        min_risk_level: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut sql = "SELECT * FROM resources WHERE 1=1".to_string();
+        let mut values = Vec::new();
+        if let Some(resource_type) = resource_type_filter.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND resource_type=?");
+            values.push(resource_type.trim().to_ascii_lowercase());
+        }
+        if let Some(min_risk_level) = min_risk_level {
+            sql.push_str(" AND risk_level >= ?");
+            values.push(min_risk_level.to_string());
+        }
+        sql.push_str(" ORDER BY risk_level DESC, resource_type ASC, resource_key ASC LIMIT 500");
+        let params = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        Ok(api_ok(
+            json!({"resources": self.query_json(&sql, &params)?}),
+        ))
+    }
+
+    fn create_or_get_resource(
+        &self,
+        resource_key: &str,
+        mode: &str,
+    ) -> Result<(String, bool), String> {
         if let Some(id) = self
             .conn
             .query_row(
@@ -1550,7 +2448,15 @@ impl CoordinationKernel {
             .optional()
             .map_err(|error| format!("Unable to inspect resource: {error}"))?
         {
-            return Ok(id);
+            self.conn
+                .execute(
+                    "UPDATE resources
+                     SET risk_level=MAX(risk_level, ?1), updated_at=?2
+                     WHERE id=?3",
+                    params![resource_risk_level(resource_key, mode), now_rfc3339(), id],
+                )
+                .map_err(|error| format!("Unable to refresh resource record: {error}"))?;
+            return Ok((id, false));
         }
 
         let id = uuid();
@@ -1568,7 +2474,7 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to create resource record: {error}"))?;
-        Ok(id)
+        Ok((id, true))
     }
 
     pub fn renew_lease(
@@ -1765,34 +2671,55 @@ impl CoordinationKernel {
         summary: Option<&str>,
     ) -> Result<Value, String> {
         let session = self.ensure_session_active(session_id, agent_id)?;
+        self.ensure_session_owns_task(session_id, task_id)?;
         let agent_slot_id = session["agent_slot_id"].as_str();
+        let worktree_id = session["worktree_id"].as_str();
         let mut warnings = Vec::new();
         let mut normalized_paths = Vec::new();
+        let mut changes = Vec::new();
 
         for path in paths {
             reject_path_escape(&path)?;
-            let normalized = path.replace('\\', "/");
+            let normalized = normalize_change_path(&path)?;
             let resource_key = path_to_file_resource(&normalized);
             normalized_paths.push(normalized.clone());
-            if self
-                .find_covering_lease(task_id, agent_id, session_id, &resource_key)?
-                .is_none()
-            {
+            let lease = self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?;
+            let mut violation_id = None;
+            if lease.is_none() {
                 warnings.push(format!(
                     "{normalized} has no active lease; submit_patch will reject it."
                 ));
-                self.create_workspace_violation(
+                violation_id = Some(self.create_workspace_violation(
                     Some(task_id),
                     Some(agent_id),
                     Some(session_id),
-                    None,
+                    worktree_id,
                     "unleased_write",
                     Some(&normalized),
                     Some(&resource_key),
                     "warning",
-                    json!({"summary": summary}),
-                )?;
+                    json!({
+                        "summary": summary,
+                        "change_source": "manual_announce",
+                    }),
+                )?);
             }
+            let change = self.record_workspace_change(WorkspaceChangeInput {
+                task_id: Some(task_id),
+                agent_id: Some(agent_id),
+                agent_slot_id,
+                session_id: Some(session_id),
+                worktree_id,
+                change_source: "manual_announce",
+                path: &normalized,
+                resource_key: &resource_key,
+                change_kind: "modified",
+                lease: lease.as_ref(),
+                violation_id: violation_id.as_deref(),
+                summary,
+                details: json!({"announced": true}),
+            })?;
+            changes.push(change);
         }
 
         self.emit_event(
@@ -1806,13 +2733,365 @@ impl CoordinationKernel {
                 session_id: Some(session_id.to_string()),
                 ..EventRefs::default()
             },
-            json!({"paths": normalized_paths, "summary": summary, "warnings": warnings}),
+            json!({
+                "paths": normalized_paths,
+                "summary": summary,
+                "warnings": warnings,
+                "change_count": changes.len(),
+                "changes": changes.clone(),
+            }),
         )?;
 
         Ok(api_ok_warnings(
-            json!({"paths": normalized_paths}),
+            json!({"paths": normalized_paths, "changes": changes}),
             warnings,
         ))
+    }
+
+    pub fn list_workspace_changes(
+        &self,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        worktree_id: Option<&str>,
+        resource_key: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut sql = "SELECT * FROM workspace_changes WHERE 1=1".to_string();
+        let mut values = Vec::new();
+        for (column, value) in [
+            ("task_id", task_id),
+            ("agent_id", agent_id),
+            ("session_id", session_id),
+            ("worktree_id", worktree_id),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(&format!(" AND {column}=?"));
+                values.push(value.to_string());
+            }
+        }
+        if let Some(value) = resource_key.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND resource_key=?");
+            values.push(normalize_resource_key(value));
+        }
+        let limit = limit.unwrap_or(200).clamp(1, 1000);
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {limit}"));
+        let params = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        Ok(api_ok(json!({"changes": self.query_json(&sql, &params)?})))
+    }
+
+    pub fn active_file_watcher_targets(&self) -> Result<Vec<Value>, String> {
+        self.query_json(
+            "SELECT w.id AS worktree_id,
+                    w.path,
+                    w.branch_name,
+                    w.agent_slot_id,
+                    s.agent_id,
+                    COUNT(s.id) AS active_session_count
+             FROM worktrees w
+             JOIN agent_sessions s ON s.worktree_id = w.id
+             WHERE s.status='active'
+               AND s.task_id IS NOT NULL
+               AND s.task_id <> ''
+               AND w.status='active'
+               AND w.path IS NOT NULL
+               AND w.path <> ''
+             GROUP BY w.id, w.path, w.branch_name, w.agent_slot_id, s.agent_id
+             ORDER BY w.path ASC",
+            &[],
+        )
+    }
+
+    pub fn list_file_watchers(&self) -> Result<Value, String> {
+        Ok(api_ok(json!({
+            "watchers": self.query_json("SELECT * FROM file_watchers ORDER BY updated_at DESC LIMIT 50", &[])?,
+            "active_targets": self.active_file_watcher_targets()?,
+        })))
+    }
+
+    pub fn record_file_watcher_event(
+        &self,
+        watcher_id: &str,
+        status: &str,
+        backend: &str,
+        watched_paths: &[String],
+        debounce_ms: i64,
+        event_type: &str,
+        details: Value,
+        last_error: Option<&str>,
+    ) -> Result<Value, String> {
+        let now = now_rfc3339();
+        let watched_paths_json =
+            serde_json::to_string(watched_paths).unwrap_or_else(|_| "[]".to_string());
+        let last_scan_at =
+            if event_type.contains("scan_finished") || event_type.contains("scan_failed") {
+                Some(now.as_str())
+            } else {
+                None
+            };
+        let last_event_at = if event_type.contains("scan_triggered")
+            || event_type.contains("paths_refreshed")
+            || event_type.contains("event_detected")
+        {
+            Some(now.as_str())
+        } else {
+            None
+        };
+        let stopped_at = if status == "stopped" {
+            Some(now.as_str())
+        } else {
+            None
+        };
+        self.conn
+            .execute(
+                "INSERT INTO file_watchers(
+                    id, repo_id, status, backend, watched_paths_json, watched_path_count,
+                    debounce_ms, last_scan_at, last_event_at, last_error, started_at, stopped_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    backend=excluded.backend,
+                    watched_paths_json=excluded.watched_paths_json,
+                    watched_path_count=excluded.watched_path_count,
+                    debounce_ms=excluded.debounce_ms,
+                    last_scan_at=COALESCE(excluded.last_scan_at, file_watchers.last_scan_at),
+                    last_event_at=COALESCE(excluded.last_event_at, file_watchers.last_event_at),
+                    last_error=excluded.last_error,
+                    stopped_at=excluded.stopped_at,
+                    updated_at=excluded.updated_at",
+                params![
+                    watcher_id,
+                    REPO_ID,
+                    status,
+                    backend,
+                    watched_paths_json,
+                    watched_paths.len() as i64,
+                    debounce_ms,
+                    last_scan_at,
+                    last_event_at,
+                    last_error,
+                    now,
+                    stopped_at,
+                ],
+            )
+            .map_err(|error| format!("Unable to record file watcher state: {error}"))?;
+        self.emit_event(
+            event_type,
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "watcher_id": watcher_id,
+                "status": status,
+                "backend": backend,
+                "watched_path_count": watched_paths.len(),
+                "watched_paths": watched_paths,
+                "debounce_ms": debounce_ms,
+                "last_error": last_error,
+                "details": details,
+            }),
+        )?;
+        self.query_one(
+            "SELECT * FROM file_watchers WHERE id=?1",
+            &[&watcher_id],
+            "File watcher state was not recorded.",
+        )
+    }
+
+    pub fn scan_workspace_changes(&self) -> Result<Value, String> {
+        let sessions = self.query_json(
+            "SELECT s.id AS session_id, s.task_id, s.agent_id, s.agent_slot_id, s.worktree_id,
+                    w.path AS worktree_path
+             FROM agent_sessions s
+             JOIN worktrees w ON w.id = s.worktree_id
+             WHERE s.status='active'
+               AND s.task_id IS NOT NULL
+               AND s.task_id <> ''
+               AND s.worktree_id IS NOT NULL
+               AND s.worktree_id <> ''
+             ORDER BY s.updated_at DESC",
+            &[],
+        )?;
+        self.emit_event(
+            "change_scan_started",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({"session_count": sessions.len(), "scanner": "git_status"}),
+        )?;
+        let mut changes = Vec::new();
+        let mut warnings = Vec::new();
+        for session in sessions {
+            let session_id = session["session_id"].as_str().unwrap_or_default();
+            let task_id = session["task_id"].as_str().unwrap_or_default();
+            let agent_id = session["agent_id"].as_str().unwrap_or_default();
+            let agent_slot_id = session["agent_slot_id"].as_str();
+            let worktree_id = session["worktree_id"].as_str();
+            let worktree_path = PathBuf::from(session["worktree_path"].as_str().unwrap_or(""));
+            if !worktree_path.exists() {
+                warnings.push(format!(
+                    "Skipping session {session_id}; worktree path is missing."
+                ));
+                continue;
+            }
+            let canonical_worktree = worktree_path.canonicalize().map_err(|error| {
+                format!(
+                    "Unable to canonicalize worktree path {}: {error}",
+                    worktree_path.display()
+                )
+            })?;
+            if !canonical_worktree.starts_with(
+                self.paths
+                    .worktrees_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.paths.worktrees_root.clone()),
+            ) {
+                warnings.push(format!(
+                    "Skipping session {session_id}; worktree path escapes .agents/worktrees."
+                ));
+                continue;
+            }
+            for changed_file in self.changed_files(&canonical_worktree)? {
+                reject_path_escape(&changed_file.path)?;
+                let resource_key = path_to_file_resource(&changed_file.path);
+                let lease =
+                    self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?;
+                let mut violation_id = None;
+                if lease.is_none() {
+                    violation_id = Some(self.create_workspace_violation(
+                        Some(task_id),
+                        Some(agent_id),
+                        Some(session_id),
+                        worktree_id,
+                        "unleased_write",
+                        Some(&changed_file.path),
+                        Some(&resource_key),
+                        "warning",
+                        json!({
+                            "change_source": "watcher_scan",
+                            "change_kind": changed_file.change_kind,
+                        }),
+                    )?);
+                }
+                let change = self.record_workspace_change(WorkspaceChangeInput {
+                    task_id: Some(task_id),
+                    agent_id: Some(agent_id),
+                    agent_slot_id,
+                    session_id: Some(session_id),
+                    worktree_id,
+                    change_source: "watcher_scan",
+                    path: &changed_file.path,
+                    resource_key: &resource_key,
+                    change_kind: &changed_file.change_kind,
+                    lease: lease.as_ref(),
+                    violation_id: violation_id.as_deref(),
+                    summary: Some("Workspace change scan"),
+                    details: json!({"untracked": changed_file.untracked}),
+                })?;
+                changes.push(change);
+            }
+        }
+        self.emit_event(
+            "change_scan_finished",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "change_count": changes.len(),
+                "warning_count": warnings.len(),
+                "scanner": "git_status",
+            }),
+        )?;
+        Ok(api_ok_warnings(
+            json!({"changes": changes, "scanner": "git_status"}),
+            warnings,
+        ))
+    }
+
+    fn record_workspace_change(&self, input: WorkspaceChangeInput<'_>) -> Result<Value, String> {
+        let id = uuid();
+        let now = now_rfc3339();
+        let lease_id = input
+            .lease
+            .and_then(|lease| lease["id"].as_str())
+            .map(str::to_string);
+        let fence_token = input.lease.and_then(|lease| lease["fence_token"].as_i64());
+        let lease_status = if lease_id.is_some() {
+            "covered"
+        } else {
+            "unleased"
+        };
+        self.conn
+            .execute(
+                "INSERT INTO workspace_changes(
+                    id, repo_id, task_id, agent_id, agent_slot_id, session_id, worktree_id,
+                    change_source, path, resource_key, change_kind, lease_id, fence_token,
+                    lease_status, violation_id, summary, details_json, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![
+                    id,
+                    REPO_ID,
+                    input.task_id,
+                    input.agent_id,
+                    input.agent_slot_id,
+                    input.session_id,
+                    input.worktree_id,
+                    input.change_source,
+                    input.path,
+                    input.resource_key,
+                    input.change_kind,
+                    lease_id.as_deref(),
+                    fence_token,
+                    lease_status,
+                    input.violation_id,
+                    input.summary,
+                    input.details.to_string(),
+                    now,
+                ],
+            )
+            .map_err(|error| format!("Unable to record workspace change: {error}"))?;
+        self.emit_event(
+            "file_changed",
+            input.agent_id.map(|_| "agent").unwrap_or("kernel"),
+            input.agent_id.unwrap_or(REPO_ID),
+            EventRefs {
+                task_id: input.task_id.map(str::to_string),
+                agent_id: input.agent_id.map(str::to_string),
+                agent_slot_id: input.agent_slot_id.map(str::to_string),
+                session_id: input.session_id.map(str::to_string),
+                resource_id: input
+                    .lease
+                    .and_then(|lease| lease["resource_id"].as_str())
+                    .map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "change_id": id,
+                "change_source": input.change_source,
+                "path": input.path,
+                "resource_key": input.resource_key,
+                "change_kind": input.change_kind,
+                "lease_id": lease_id.clone(),
+                "fence_token": fence_token,
+                "lease_status": lease_status,
+                "violation_id": input.violation_id,
+                "summary": input.summary,
+            }),
+        )?;
+        Ok(json!({
+            "id": id,
+            "path": input.path,
+            "resource_key": input.resource_key,
+            "change_kind": input.change_kind,
+            "change_source": input.change_source,
+            "lease_id": lease_id,
+            "fence_token": fence_token,
+            "lease_status": lease_status,
+            "violation_id": input.violation_id,
+        }))
     }
 
     pub fn submit_patch(
@@ -1826,6 +3105,17 @@ impl CoordinationKernel {
         let validation =
             self.run_patch_validation(task_id, agent_id, session_id, worktree_id, summary, true)?;
         if validation.status == "passed" {
+            let session = self.ensure_session_active(session_id, agent_id)?;
+            let agent_slot_id = session["agent_slot_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            self.conn
+                .execute(
+                    "UPDATE tasks SET status='patch_submitted', updated_at=?1 WHERE id=?2",
+                    params![now_rfc3339(), task_id],
+                )
+                .map_err(|error| format!("Unable to mark task patch_submitted: {error}"))?;
             self.emit_event(
                 "patch_submitted",
                 "agent",
@@ -1833,6 +3123,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
+                    agent_slot_id,
                     session_id: Some(session_id.to_string()),
                     artifact_id: validation.diff_artifact_id.clone(),
                     ..EventRefs::default()
@@ -1894,6 +3185,13 @@ impl CoordinationKernel {
         summary: Option<&str>,
         submit: bool,
     ) -> Result<PatchValidationResult, String> {
+        self.expire_old_leases()?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        self.ensure_session_owns_task(session_id, task_id)?;
+        let agent_slot_id = session["agent_slot_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
         self.emit_event(
             "patch_validation_started",
             "agent",
@@ -1901,14 +3199,12 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.clone(),
                 session_id: Some(session_id.to_string()),
                 ..EventRefs::default()
             },
             json!({"worktree_id": worktree_id, "submit": submit, "summary": summary}),
         )?;
-        self.expire_old_leases()?;
-        let session = self.ensure_session_active(session_id, agent_id)?;
-        self.ensure_session_authorized_for_task(session_id, task_id)?;
         let policy = self.repo_policy()?;
         let worktree_required = policy["agent_worktree_required"].as_i64().unwrap_or(1) == 1;
         let Some(worktree_id) = worktree_id.filter(|value| !value.trim().is_empty()) else {
@@ -1991,6 +3287,58 @@ impl CoordinationKernel {
             return Err("Worktree path escapes the configured .agents/worktrees root.".to_string());
         }
 
+        if policy["root_repo_write_policy"].as_str() == Some("detect_and_reject_patch") {
+            let target_changes = self.repo_dirty_project_files()?;
+            if !target_changes.is_empty() {
+                let changed_files = target_changes
+                    .iter()
+                    .map(|change| change.path.clone())
+                    .collect::<Vec<_>>();
+                let violation_id = self.create_workspace_violation(
+                    Some(task_id),
+                    Some(agent_id),
+                    Some(session_id),
+                    Some(worktree_id),
+                    "direct_project_root_write",
+                    None,
+                    None,
+                    "error",
+                    json!({
+                        "summary": summary,
+                        "changed_files": changed_files,
+                        "policy": "root_repo_write_policy",
+                    }),
+                )?;
+                let validation_id = self.finish_patch_validation(
+                    None,
+                    task_id,
+                    agent_id,
+                    session_id,
+                    worktree_id,
+                    "failed",
+                    "Patch rejected: the shared project root has uncommitted changes; agent edits must stay in the isolated branch root.",
+                    json!({
+                        "reason": "direct_project_root_write",
+                        "changed_files": changed_files,
+                        "violation_id": violation_id,
+                    }),
+                )?;
+                return Ok(PatchValidationResult {
+                    status: "failed".to_string(),
+                    validation_id,
+                    patch_id: None,
+                    diff_artifact_id: None,
+                    diff_hash: None,
+                    changed_files: Vec::new(),
+                    violations: vec![json!({
+                        "violation_kind": "direct_project_root_write",
+                        "violation_id": violation_id,
+                    })],
+                    warnings: Vec::new(),
+                });
+            }
+        }
+
         let changed = self.changed_files(&canonical_worktree)?;
         if changed.is_empty() {
             let validation_id = self.finish_patch_validation(
@@ -2049,7 +3397,8 @@ impl CoordinationKernel {
             let resource_key = path_to_file_resource(&changed_file.path);
             let lease = self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?;
             let file_validation_id = uuid();
-            match lease {
+            let mut violation_id = None;
+            match lease.as_ref() {
                 Some(lease) => {
                     self.conn
                         .execute(
@@ -2075,7 +3424,7 @@ impl CoordinationKernel {
                             params![file_validation_id, patch_id, changed_file.path, resource_key, now_rfc3339()],
                         )
                         .map_err(|error| format!("Unable to record failed patch file lease validation: {error}"))?;
-                    self.create_workspace_violation(
+                    violation_id = Some(self.create_workspace_violation(
                         Some(task_id),
                         Some(agent_id),
                         Some(session_id),
@@ -2085,14 +3434,34 @@ impl CoordinationKernel {
                         Some(&resource_key),
                         "error",
                         json!({"change_kind": changed_file.change_kind}),
-                    )?;
+                    )?);
                     violations.push(json!({
                         "path": changed_file.path,
                         "resource_key": resource_key,
-                        "violation_kind": "patch_without_lease"
+                        "violation_kind": "patch_without_lease",
+                        "violation_id": violation_id.clone(),
                     }));
                 }
             }
+            self.record_workspace_change(WorkspaceChangeInput {
+                task_id: Some(task_id),
+                agent_id: Some(agent_id),
+                agent_slot_id: agent_slot_id.as_deref(),
+                session_id: Some(session_id),
+                worktree_id: Some(worktree_id),
+                change_source: "patch_validation",
+                path: &changed_file.path,
+                resource_key: &resource_key,
+                change_kind: &changed_file.change_kind,
+                lease: lease.as_ref(),
+                violation_id: violation_id.as_deref(),
+                summary,
+                details: json!({
+                    "submit": submit,
+                    "validation_file_id": file_validation_id,
+                    "untracked": changed_file.untracked,
+                }),
+            })?;
             patch_file_rows.push(changed_file.clone());
         }
 
@@ -2145,6 +3514,7 @@ impl CoordinationKernel {
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: agent_slot_id.clone(),
                     session_id: Some(session_id.to_string()),
                     ..EventRefs::default()
                 },
@@ -2236,6 +3606,7 @@ impl CoordinationKernel {
             EventRefs {
                 task_id: Some(task_id.to_string()),
                 agent_id: Some(agent_id.to_string()),
+                agent_slot_id: agent_slot_id.clone(),
                 session_id: Some(session_id.to_string()),
                 artifact_id: Some(diff_artifact_id.clone()),
                 ..EventRefs::default()
@@ -2379,7 +3750,10 @@ impl CoordinationKernel {
     }
 
     fn changed_files(&self, worktree_path: &Path) -> Result<Vec<ChangedFile>, String> {
-        let output = run_git_bytes(worktree_path, &["status", "--porcelain", "-z"])?;
+        let output = run_git_bytes(
+            worktree_path,
+            &["status", "--porcelain", "-z", "--untracked-files=all"],
+        )?;
         let mut files = Vec::new();
         let mut parts = output
             .split(|byte| *byte == 0)
@@ -2458,6 +3832,28 @@ impl CoordinationKernel {
             return Err("Only patch_apply merge strategy is implemented in this pass.".to_string());
         }
         let patch = self.get_patch(patch_id)?;
+        let policy = self.repo_policy()?;
+        if policy["merge_gate_required"].as_i64().unwrap_or(1) != 1 {
+            let job_id = self.create_merge_job(
+                &patch,
+                "blocked",
+                target_branch,
+                strategy,
+                Some("The local merge gate is not enabled."),
+            )?;
+            self.emit_event(
+                "merge_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({"merge_job_id": job_id, "patch_id": patch_id, "reason": "merge_gate_disabled"}),
+            )?;
+            return Ok(api_error(
+                "merge_blocked",
+                "The local merge gate must remain enabled before a patch can be queued.",
+                json!({"merge_job_id": job_id}),
+            ));
+        }
         let validation = patch["validation_id"]
             .as_str()
             .ok_or_else(|| "Patch has no validation.".to_string())
@@ -2486,10 +3882,32 @@ impl CoordinationKernel {
             ));
         }
         self.verify_patch_artifact_hash(&patch)?;
-        if self.repo_policy()?["merge_requires_clean_target"]
-            .as_i64()
-            .unwrap_or(1)
-            == 1
+        let blocking_violations = self.open_blocking_violations(
+            patch["session_id"].as_str().unwrap_or_default(),
+            patch["worktree_id"].as_str().unwrap_or_default(),
+        )?;
+        if !blocking_violations.is_empty() {
+            let job_id = self.create_merge_job(
+                &patch,
+                "blocked",
+                target_branch,
+                strategy,
+                Some("Open blocking workspace violations exist."),
+            )?;
+            self.emit_event(
+                "merge_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({"merge_job_id": job_id, "patch_id": patch_id, "reason": "open_workspace_violations", "violations": blocking_violations.clone()}),
+            )?;
+            return Ok(api_error(
+                "merge_blocked",
+                "Open blocking workspace violations must be resolved before merge.",
+                json!({"merge_job_id": job_id, "violations": blocking_violations}),
+            ));
+        }
+        if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
             && !self.repo_is_clean()?
         {
             let job_id = self.create_merge_job(
@@ -2550,11 +3968,76 @@ impl CoordinationKernel {
         }
         let patch_id = job["patch_id"].as_str().unwrap_or_default();
         let patch = self.get_patch(patch_id)?;
+        let validation = patch["validation_id"]
+            .as_str()
+            .ok_or_else(|| "Patch has no validation.".to_string())
+            .and_then(|id| self.get_patch_validation(id))?;
+        if validation["status"].as_str() != Some("passed")
+            || patch["status"].as_str() != Some("merge_queued")
+        {
+            self.update_merge_job(
+                merge_job_id,
+                "blocked",
+                Some("Patch is no longer in a merge-queued state with passed validation."),
+            )?;
+            self.emit_event(
+                "merge_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({"merge_job_id": merge_job_id, "patch_id": patch_id, "reason": "patch_not_merge_queued"}),
+            )?;
+            return Ok(api_error(
+                "merge_blocked",
+                "Patch must be merge_queued with passed validation before apply.",
+                json!({"merge_job_id": merge_job_id}),
+            ));
+        }
         self.verify_patch_artifact_hash(&patch)?;
-        if self.repo_policy()?["merge_requires_clean_target"]
-            .as_i64()
-            .unwrap_or(1)
-            == 1
+        let policy = self.repo_policy()?;
+        if policy["merge_gate_required"].as_i64().unwrap_or(1) != 1 {
+            self.update_merge_job(
+                merge_job_id,
+                "blocked",
+                Some("The local merge gate is not enabled."),
+            )?;
+            self.emit_event(
+                "merge_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({"merge_job_id": merge_job_id, "patch_id": patch_id, "reason": "merge_gate_disabled"}),
+            )?;
+            return Ok(api_error(
+                "merge_blocked",
+                "The local merge gate must remain enabled before a patch can be applied.",
+                json!({"merge_job_id": merge_job_id}),
+            ));
+        }
+        let blocking_violations = self.open_blocking_violations(
+            patch["session_id"].as_str().unwrap_or_default(),
+            patch["worktree_id"].as_str().unwrap_or_default(),
+        )?;
+        if !blocking_violations.is_empty() {
+            self.update_merge_job(
+                merge_job_id,
+                "blocked",
+                Some("Open blocking workspace violations exist."),
+            )?;
+            self.emit_event(
+                "merge_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({"merge_job_id": merge_job_id, "patch_id": patch_id, "reason": "open_workspace_violations", "violations": blocking_violations.clone()}),
+            )?;
+            return Ok(api_error(
+                "merge_blocked",
+                "Open blocking workspace violations must be resolved before merge apply.",
+                json!({"merge_job_id": merge_job_id, "violations": blocking_violations}),
+            ));
+        }
+        if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
             && !self.repo_is_clean()?
         {
             self.update_merge_job(merge_job_id, "blocked", Some("Target repo root is dirty."))?;
@@ -2587,6 +4070,15 @@ impl CoordinationKernel {
                         params![now_rfc3339(), patch_id],
                     )
                     .map_err(|error| format!("Unable to mark patch merged: {error}"))?;
+                self.conn
+                    .execute(
+                        "UPDATE tasks SET status='merged', updated_at=?1 WHERE id=?2",
+                        params![now_rfc3339(), patch["task_id"].as_str()],
+                    )
+                    .map_err(|error| format!("Unable to mark task merged: {error}"))?;
+                if let Some(task_id) = patch["task_id"].as_str() {
+                    self.refresh_dependent_tasks(task_id)?;
+                }
                 self.emit_event(
                     "merge_succeeded",
                     "kernel",
@@ -2666,8 +4158,15 @@ impl CoordinationKernel {
     }
 
     fn repo_is_clean(&self) -> Result<bool, String> {
-        let status = run_git_bytes(&self.paths.repo_path, &["status", "--porcelain", "-z"])?;
-        Ok(status.is_empty())
+        Ok(self.repo_dirty_project_files()?.is_empty())
+    }
+
+    fn repo_dirty_project_files(&self) -> Result<Vec<ChangedFile>, String> {
+        Ok(self
+            .changed_files(&self.paths.repo_path)?
+            .into_iter()
+            .filter(|change| !is_coordination_owned_root_status_path(&change.path))
+            .collect())
     }
 
     fn git_apply_check(&self, patch: &Value) -> Result<(), String> {
@@ -2741,25 +4240,107 @@ impl CoordinationKernel {
         created_by_agent_id: Option<&str>,
         certified_by: Option<&str>,
     ) -> Result<Value, String> {
-        let trust_level = trust_level.unwrap_or("draft");
-        if trust_level == "certified" && evidence_artifact_id.is_none() && certified_by.is_none() {
-            return Err(
-                "Certified memory requires evidence_artifact_id or certified_by.".to_string(),
-            );
-        }
         let memory_kind = normalize_memory_kind(memory_kind);
+        let trust_level = match normalize_trust_level(trust_level) {
+            Ok(value) => value,
+            Err(error) => {
+                self.log_memory_write_rejected(
+                    &memory_kind,
+                    title,
+                    trust_level,
+                    &error,
+                    json!({"reason": "invalid_trust_level"}),
+                );
+                return Err(error);
+            }
+        };
+        if let Some(artifact_id) = evidence_artifact_id {
+            if let Err(error) = self.get_artifact(artifact_id) {
+                self.log_memory_write_rejected(
+                    &memory_kind,
+                    title,
+                    Some(&trust_level),
+                    &error,
+                    json!({"reason": "missing_evidence_artifact", "evidence_artifact_id": artifact_id}),
+                );
+                return Err(error);
+            }
+        }
+        if let Some(task_id) = task_id {
+            if let Err(error) = self.query_one(
+                "SELECT id FROM tasks WHERE id=?1",
+                &[&task_id],
+                "Task does not exist.",
+            ) {
+                self.log_memory_write_rejected(
+                    &memory_kind,
+                    title,
+                    Some(&trust_level),
+                    &error,
+                    json!({"reason": "missing_task", "task_id": task_id}),
+                );
+                return Err(error);
+            }
+        }
+        if let Some(run_id) = orchestration_run_id {
+            if let Err(error) = self.query_one(
+                "SELECT id FROM orchestration_runs WHERE id=?1",
+                &[&run_id],
+                "Orchestration run does not exist.",
+            ) {
+                self.log_memory_write_rejected(
+                    &memory_kind,
+                    title,
+                    Some(&trust_level),
+                    &error,
+                    json!({"reason": "missing_orchestration_run", "orchestration_run_id": run_id}),
+                );
+                return Err(error);
+            }
+        }
+        if let Some(agent_id) = created_by_agent_id.filter(|value| *value != "local") {
+            if let Err(error) = self.ensure_agent_exists(agent_id) {
+                self.log_memory_write_rejected(
+                    &memory_kind,
+                    title,
+                    Some(&trust_level),
+                    &error,
+                    json!({"reason": "missing_agent", "agent_id": agent_id}),
+                );
+                return Err(error);
+            }
+        }
+        if trust_level == "certified"
+            && evidence_artifact_id.is_none()
+            && !certified_by
+                .map(is_trusted_memory_certifier)
+                .unwrap_or(false)
+        {
+            let error = "Certified memory requires an evidence artifact or trusted UI certifier."
+                .to_string();
+            self.log_memory_write_rejected(
+                &memory_kind,
+                title,
+                Some(&trust_level),
+                &error,
+                json!({"reason": "certified_memory_missing_evidence"}),
+            );
+            return Err(error);
+        }
+        let created_by_slot_id = created_by_agent_id
+            .filter(|value| *value != "local")
+            .and_then(|agent_id| self.artifact_agent_slot_id(agent_id).ok())
+            .flatten();
         let id = uuid();
         let directory = self.paths.memory_root.join(memory_directory(&memory_kind));
         fs::create_dir_all(&directory)
             .map_err(|error| format!("Unable to create memory directory: {error}"))?;
         let filename = format!("{}_{}.md", slug(title), &id[..8]);
         let path = directory.join(filename);
-        fs::write(&path, body).map_err(|error| {
-            format!(
-                "Unable to write memory markdown {}: {error}",
-                path.display()
-            )
-        })?;
+        if !path_text_under_path(&process_path_text(&path), &self.paths.memory_root) {
+            return Err("Memory path escapes .agents/memory.".to_string());
+        }
+        write_text_file_atomic(&path, body)?;
         let summary = body
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -2768,50 +4349,120 @@ impl CoordinationKernel {
             .take(280)
             .collect::<String>();
         let now = now_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO memories(
-                    id, memory_kind, trust_level, title, body_path, summary, evidence_artifact_id,
-                    task_id, orchestration_run_id, created_by_agent_id, certified_by, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
-                params![
-                    id,
-                    memory_kind,
-                    trust_level,
-                    title,
-                    path.display().to_string(),
-                    summary,
-                    evidence_artifact_id,
-                    task_id,
-                    orchestration_run_id,
-                    created_by_agent_id,
-                    certified_by,
-                    now
-                ],
-            )
-            .map_err(|error| format!("Unable to record memory: {error}"))?;
         let event_type = match memory_kind.as_str() {
             "contract" => "contract_memory_written",
             "handoff" => "handoff_memory_written",
             _ => "memory_written",
         };
-        self.emit_event(
-            event_type,
-            "agent",
-            created_by_agent_id.unwrap_or("local"),
-            EventRefs {
-                task_id: task_id.map(str::to_string),
-                agent_id: created_by_agent_id.map(str::to_string),
-                artifact_id: evidence_artifact_id.map(str::to_string),
-                orchestration_run_id: orchestration_run_id.map(str::to_string),
-                ..EventRefs::default()
-            },
-            json!({"memory_id": id, "memory_kind": memory_kind, "title": title, "trust_level": trust_level}),
-        )?;
+        self.begin_immediate_transaction("write memory")?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "INSERT INTO memories(
+                        id, memory_kind, trust_level, title, body_path, summary, evidence_artifact_id,
+                        task_id, orchestration_run_id, created_by_agent_id, created_by_slot_id,
+                        certified_by, created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                    params![
+                        id,
+                        memory_kind,
+                        trust_level,
+                        title,
+                        path.display().to_string(),
+                        summary,
+                        evidence_artifact_id,
+                        task_id,
+                        orchestration_run_id,
+                        created_by_agent_id,
+                        created_by_slot_id.as_deref(),
+                        certified_by,
+                        now
+                    ],
+                )
+                .map_err(|error| format!("Unable to record memory: {error}"))?;
+            self.emit_event(
+                event_type,
+                "agent",
+                created_by_agent_id.unwrap_or("local"),
+                EventRefs {
+                    task_id: task_id.map(str::to_string),
+                    agent_id: created_by_agent_id.map(str::to_string),
+                    agent_slot_id: created_by_slot_id.clone(),
+                    artifact_id: evidence_artifact_id.map(str::to_string),
+                    orchestration_run_id: orchestration_run_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "memory_id": id.clone(),
+                    "memory_kind": memory_kind.clone(),
+                    "title": title,
+                    "trust_level": trust_level.clone(),
+                    "body_path": path.display().to_string(),
+                    "summary": summary.clone(),
+                    "evidence_artifact_id": evidence_artifact_id,
+                    "created_by_slot_id": created_by_slot_id.clone(),
+                }),
+            )?;
+            if trust_level == "certified" {
+                self.emit_event(
+                    "memory_certified",
+                    if certified_by.is_some() {
+                        "human"
+                    } else {
+                        "kernel"
+                    },
+                    certified_by.unwrap_or(REPO_ID),
+                    EventRefs {
+                        task_id: task_id.map(str::to_string),
+                        agent_id: created_by_agent_id.map(str::to_string),
+                        agent_slot_id: created_by_slot_id.clone(),
+                        artifact_id: evidence_artifact_id.map(str::to_string),
+                        orchestration_run_id: orchestration_run_id.map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "memory_id": id.clone(),
+                        "memory_kind": memory_kind.clone(),
+                        "title": title,
+                        "evidence_artifact_id": evidence_artifact_id,
+                        "certified_by": certified_by,
+                    }),
+                )?;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = self.finish_transaction(result, "write memory") {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
 
         Ok(api_ok(
             json!({"memory_id": id, "memory_kind": memory_kind, "title": title, "body_path": path.display().to_string()}),
         ))
+    }
+
+    fn log_memory_write_rejected(
+        &self,
+        memory_kind: &str,
+        title: &str,
+        trust_level: Option<&str>,
+        error: &str,
+        details: Value,
+    ) {
+        let _ = self.emit_event(
+            "memory_write_rejected",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "memory_kind": memory_kind,
+                "title": title,
+                "trust_level": trust_level,
+                "error": error,
+                "details": details,
+            }),
+        );
     }
 
     pub fn write_contract_memory(&self, input: &Value) -> Result<Value, String> {
@@ -2942,6 +4593,15 @@ impl CoordinationKernel {
             let query_lower = query.to_ascii_lowercase();
             for row in &mut rows {
                 if let Some(path) = row["body_path"].as_str() {
+                    let body_path = PathBuf::from(path);
+                    if !path_text_under_path(
+                        &process_path_text(&body_path),
+                        &self.paths.memory_root,
+                    ) {
+                        row["snippet"] =
+                            Value::String("[memory body path outside memory root]".to_string());
+                        continue;
+                    }
                     if let Ok(body) = fs::read_to_string(path) {
                         if body.to_ascii_lowercase().contains(&query_lower) {
                             row["snippet"] = Value::String(body.chars().take(360).collect());
@@ -2950,6 +4610,19 @@ impl CoordinationKernel {
                 }
             }
         }
+
+        self.emit_event(
+            "memory_searched",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "query_present": query.map(|value| !value.trim().is_empty()).unwrap_or(false),
+                "memory_kind": memory_kind,
+                "trust_level": trust_level,
+                "result_count": rows.len(),
+            }),
+        )?;
 
         Ok(api_ok(json!({"memories": rows})))
     }
@@ -2972,6 +4645,625 @@ impl CoordinationKernel {
         serde_json::to_value(classification)
             .map(api_ok)
             .map_err(|error| format!("Unable to serialize SQL classification: {error}"))
+    }
+
+    fn record_approval_gate_log(
+        &self,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        action: &str,
+        decision: Option<&str>,
+        human_actor: Option<&str>,
+        status: &str,
+        reason: Option<&str>,
+        details: Value,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO approval_gate_logs(
+                    id, approval_id, task_id, agent_id, session_id, action, decision,
+                    human_actor, status, reason, details_json, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    uuid(),
+                    approval_id,
+                    task_id,
+                    agent_id,
+                    session_id,
+                    action,
+                    decision,
+                    human_actor,
+                    status,
+                    reason,
+                    details.to_string(),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Unable to record approval gate log: {error}"))?;
+        Ok(())
+    }
+
+    fn record_db_coordination_rejection(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        reason: &str,
+        details: Value,
+    ) -> Result<(), String> {
+        self.emit_event(
+            "db_change_request_rejected",
+            "agent",
+            agent_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({"reason": reason, "details": details}),
+        )?;
+        Ok(())
+    }
+
+    fn find_covering_db_lease(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        resource_key: &str,
+        destructive: bool,
+    ) -> Result<Option<Value>, String> {
+        let active = self.list_active_leases_internal(Some(task_id), Some(agent_id), None)?;
+        Ok(active.into_iter().find(|lease| {
+            if lease["session_id"].as_str() != Some(session_id) {
+                return false;
+            }
+            let mode = lease["mode"].as_str().unwrap_or_default();
+            let allowed = if destructive {
+                matches!(mode, "db_destructive" | "db_exclusive")
+            } else {
+                matches!(
+                    mode,
+                    "db_plan" | "db_migration" | "db_destructive" | "db_exclusive"
+                )
+            };
+            allowed
+                && resource_covers(
+                    lease["resource_key"].as_str().unwrap_or_default(),
+                    resource_key,
+                )
+        }))
+    }
+
+    pub fn db_request_change(&self, input: &Value) -> Result<Value, String> {
+        let policy = self.repo_policy()?;
+        let mode = policy["sql_mcp_default"].as_str().unwrap_or("off");
+        let task_id = required_string(input, "task_id")?;
+        let agent_id = required_string(input, "agent_id")?;
+        let session_id = required_string(input, "session_id")?;
+        if mode == "off" {
+            let _ = self.record_db_coordination_rejection(
+                task_id,
+                agent_id,
+                session_id,
+                "sql_mcp_default_off",
+                json!({"mode": mode}),
+            );
+            return Ok(api_error(
+                "sql_disabled",
+                "Production SQL coordination is disabled for this repo policy.",
+                json!({"mode": mode}),
+            ));
+        }
+
+        let _ = self.ensure_session_active(session_id, agent_id)?;
+        self.ensure_session_owns_task(session_id, task_id)?;
+        let change_kind = non_empty(
+            input["change_kind"].as_str().unwrap_or("other"),
+            "DB change kind",
+        )?;
+        let title = required_string(input, "title")?;
+        let summary = required_string(input, "summary")?;
+        let resources = input["resources"]
+            .as_array()
+            .ok_or_else(|| "DB change request requires at least one DB resource.".to_string())?;
+        if resources.is_empty() {
+            let _ = self.record_db_coordination_rejection(
+                task_id,
+                agent_id,
+                session_id,
+                "missing_db_resources",
+                json!({"change_kind": change_kind}),
+            );
+            return Ok(api_error(
+                "db_resources_required",
+                "DB change request requires at least one DB resource.",
+                json!({}),
+            ));
+        }
+
+        let mut normalized_resources = Vec::new();
+        let mut destructive = db_change_kind_destructive(change_kind);
+        let mut risk_level = input["risk_level"].as_i64().unwrap_or(3).clamp(1, 5);
+        for resource in resources {
+            let resource_key = required_string(resource, "resource_key")?;
+            let normalized = normalize_resource_key_checked(resource_key)?;
+            if !normalized.starts_with("db:") {
+                return Err("DB change request resources must use db: resource keys.".to_string());
+            }
+            let operation = resource["operation"].as_str().unwrap_or("change").trim();
+            if matches!(
+                operation,
+                "drop" | "remove" | "delete" | "destructive" | "rollback" | "truncate"
+            ) {
+                destructive = true;
+            }
+            if normalized.contains("tenant_isolation")
+                || normalized.contains("security_policy")
+                || normalized.contains("auth")
+                || normalized.contains("pii")
+            {
+                risk_level = risk_level.max(5);
+            }
+            normalized_resources.push(json!({
+                "resource_key": normalized,
+                "operation": if operation.is_empty() { "change" } else { operation },
+            }));
+        }
+        if destructive {
+            risk_level = risk_level.max(4);
+        }
+
+        for resource in &normalized_resources {
+            let resource_key = resource["resource_key"].as_str().unwrap_or_default();
+            if self
+                .find_covering_db_lease(task_id, agent_id, session_id, resource_key, destructive)?
+                .is_none()
+            {
+                let _ = self.record_db_coordination_rejection(
+                    task_id,
+                    agent_id,
+                    session_id,
+                    "db_lease_required",
+                    json!({
+                        "resource_key": resource_key,
+                        "destructive": destructive,
+                        "required_modes": if destructive {
+                            json!(["db_destructive", "db_exclusive"])
+                        } else {
+                            json!(["db_plan", "db_migration", "db_destructive", "db_exclusive"])
+                        }
+                    }),
+                );
+                return Ok(api_error(
+                    "db_lease_required",
+                    "Acquire an active covering DB lease before requesting a production SQL change.",
+                    json!({"resource_key": resource_key, "destructive": destructive}),
+                ));
+            }
+        }
+
+        let id = uuid();
+        let now = now_rfc3339();
+        self.begin_immediate_transaction("request db change")?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "INSERT INTO db_change_requests(
+                        id, task_id, requested_by_agent_id, requested_by_session_id,
+                        change_kind, title, summary, status, risk_level, destructive,
+                        production_impact, rollback_summary, created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8, ?9, ?10, ?11, ?12, ?12)",
+                    params![
+                        id,
+                        task_id,
+                        agent_id,
+                        session_id,
+                        change_kind,
+                        title,
+                        summary,
+                        risk_level,
+                        bool_i64(destructive),
+                        input["production_impact"].as_str(),
+                        input["rollback_summary"].as_str(),
+                        now
+                    ],
+                )
+                .map_err(|error| format!("Unable to create DB change request: {error}"))?;
+            for resource in &normalized_resources {
+                let resource_key = resource["resource_key"].as_str().unwrap_or_default();
+                let operation = resource["operation"].as_str().unwrap_or("change");
+                self.conn
+                    .execute(
+                        "INSERT INTO db_change_request_resources(
+                            id, db_change_request_id, resource_key, resource_type, operation, created_at
+                        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            uuid(),
+                            id,
+                            resource_key,
+                            resource_type(resource_key),
+                            operation,
+                            now
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to record DB change resource: {error}"))?;
+            }
+            self.emit_event(
+                "db_change_requested",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "db_change_request_id": id,
+                    "change_kind": change_kind,
+                    "risk_level": risk_level,
+                    "destructive": destructive,
+                    "resources": normalized_resources,
+                }),
+            )?;
+            if destructive {
+                self.emit_event(
+                    "db_change_approval_required",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        session_id: Some(session_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"db_change_request_id": id, "risk_level": risk_level}),
+                )?;
+            }
+            Ok(())
+        })();
+        self.finish_transaction(result, "request db change")?;
+        Ok(api_ok(json!({
+            "db_change_request_id": id,
+            "status": "requested",
+            "risk_level": risk_level,
+            "destructive": destructive,
+        })))
+    }
+
+    pub fn db_list_change_requests(
+        &self,
+        status: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut sql = "SELECT * FROM db_change_requests WHERE 1=1".to_string();
+        let mut values = Vec::new();
+        if let Some(status) = status.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND status=?");
+            values.push(status.to_string());
+        }
+        if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND task_id=?");
+            values.push(task_id.to_string());
+        }
+        sql.push_str(" ORDER BY updated_at DESC LIMIT 200");
+        let params = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        Ok(api_ok(json!({
+            "change_requests": self.query_json(&sql, &params)?,
+        })))
+    }
+
+    pub fn db_get_change_request(&self, db_change_request_id: &str) -> Result<Value, String> {
+        let request = self.query_one(
+            "SELECT * FROM db_change_requests WHERE id=?1",
+            &[&db_change_request_id],
+            "DB change request does not exist.",
+        )?;
+        let resources = self.query_json(
+            "SELECT * FROM db_change_request_resources WHERE db_change_request_id=?1 ORDER BY created_at ASC",
+            &[&db_change_request_id],
+        )?;
+        Ok(api_ok(
+            json!({"change_request": request, "resources": resources}),
+        ))
+    }
+
+    pub fn log_ui_surface_event(&self, input: &Value) -> Result<Value, String> {
+        let surface = non_empty(
+            input["surface"]
+                .as_str()
+                .unwrap_or("coordination_workspace"),
+            "UI surface",
+        )?;
+        let action = non_empty(input["action"].as_str().unwrap_or("event"), "UI action")?;
+        let status = non_empty(input["status"].as_str().unwrap_or("info"), "UI status")?;
+        let command_name = input["command_name"].as_str();
+        let actor = input["actor"].as_str().unwrap_or("ui");
+        let details = input.get("details").cloned().unwrap_or_else(|| json!({}));
+        let id = uuid();
+        self.conn
+            .execute(
+                "INSERT INTO coordination_ui_surface_logs(
+                    id, repo_id, surface, action, status, command_name, actor, details_json, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    REPO_ID,
+                    surface,
+                    action,
+                    status,
+                    command_name,
+                    actor,
+                    details.to_string(),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Unable to record UI surface log: {error}"))?;
+        self.emit_event(
+            "ui_surface_logged",
+            "ui",
+            actor,
+            EventRefs::default(),
+            json!({
+                "ui_surface_log_id": id,
+                "surface": surface,
+                "action": action,
+                "status": status,
+                "command_name": command_name,
+            }),
+        )?;
+        Ok(api_ok(json!({"ui_surface_log_id": id, "status": status})))
+    }
+
+    pub fn cleanup_bloat_dry_run(&self) -> Result<Value, String> {
+        self.cleanup_coordination_bloat(true)
+    }
+
+    fn cleanup_coordination_bloat(&self, dry_run: bool) -> Result<Value, String> {
+        self.emit_event(
+            "coordination_bloat_audit_started",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({"dry_run": dry_run}),
+        )?;
+
+        let mut allowed_mcp_paths = HashSet::new();
+        for path in [
+            self.paths.mcp_root.join("coordination.json"),
+            self.paths.mcp_root.join("coordination.codex.toml"),
+            self.paths.mcp_root.join("coordination.claude.json"),
+        ] {
+            allowed_mcp_paths.insert(normalize_path_for_compare(&process_path_text(&path)));
+        }
+
+        let slots = self.query_json(
+            "SELECT id, slot_key, mcp_config_path FROM agent_slots ORDER BY slot_key ASC",
+            &[],
+        )?;
+        for slot in &slots {
+            if let Some(path) = slot["mcp_config_path"].as_str() {
+                allowed_mcp_paths.insert(normalize_path_for_compare(path));
+            }
+            if let Some(slot_key) = slot["slot_key"].as_str() {
+                for path in [
+                    self.paths
+                        .mcp_root
+                        .join("agents")
+                        .join(format!("{slot_key}.json")),
+                    self.paths
+                        .mcp_root
+                        .join("agents")
+                        .join(format!("{slot_key}.codex.toml")),
+                    self.paths
+                        .mcp_root
+                        .join("agents")
+                        .join(format!("{slot_key}.claude.json")),
+                ] {
+                    allowed_mcp_paths.insert(normalize_path_for_compare(&process_path_text(&path)));
+                }
+            }
+        }
+        for config in self.query_json("SELECT path FROM mcp_configs ORDER BY path ASC", &[])? {
+            if let Some(path) = config["path"].as_str() {
+                allowed_mcp_paths.insert(normalize_path_for_compare(path));
+            }
+        }
+
+        let mut unexpected_mcp_files = Vec::new();
+        let mut stale_temp_files = Vec::new();
+        for directory in [
+            self.paths.mcp_root.clone(),
+            self.paths.mcp_root.join("agents"),
+        ] {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let path_text = process_path_text(&path);
+                let filename = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if filename.ends_with(".tmp") || filename.contains(".tmp.") {
+                    stale_temp_files.push(json!({"path": path_text, "kind": "mcp_temp_file"}));
+                    continue;
+                }
+                if !allowed_mcp_paths.contains(&normalize_path_for_compare(&path_text)) {
+                    unexpected_mcp_files.push(json!({
+                        "path": path_text,
+                        "kind": "unexpected_mcp_file",
+                    }));
+                }
+            }
+        }
+
+        let mut allowed_worktree_paths = HashSet::new();
+        for worktree in self.query_json(
+            "SELECT path FROM worktrees WHERE path IS NOT NULL AND path<>'' ORDER BY path ASC",
+            &[],
+        )? {
+            if let Some(path) = worktree["path"].as_str() {
+                allowed_worktree_paths.insert(normalize_path_for_compare(path));
+            }
+        }
+        for slot in &slots {
+            if let Some(slot_key) = slot["slot_key"].as_str() {
+                let path = self.paths.worktrees_root.join(slot_key);
+                allowed_worktree_paths
+                    .insert(normalize_path_for_compare(&process_path_text(&path)));
+            }
+        }
+
+        let mut unexpected_worktree_dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.paths.worktrees_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let path_text = process_path_text(&path);
+                if !allowed_worktree_paths.contains(&normalize_path_for_compare(&path_text)) {
+                    unexpected_worktree_dirs.push(json!({
+                        "path": path_text,
+                        "kind": "unexpected_worktree_dir",
+                    }));
+                }
+            }
+        }
+
+        let unexpected_mcp_file_count = unexpected_mcp_files.len();
+        let unexpected_worktree_dir_count = unexpected_worktree_dirs.len();
+        let stale_temp_file_count = stale_temp_files.len();
+        let status = if unexpected_mcp_file_count == 0
+            && unexpected_worktree_dir_count == 0
+            && stale_temp_file_count == 0
+        {
+            "clean"
+        } else {
+            "attention_required"
+        };
+        let details = json!({
+            "dry_run": dry_run,
+            "allowed_mcp_path_count": allowed_mcp_paths.len(),
+            "allowed_worktree_path_count": allowed_worktree_paths.len(),
+            "unexpected_mcp_files": unexpected_mcp_files,
+            "unexpected_worktree_dirs": unexpected_worktree_dirs,
+            "stale_temp_files": stale_temp_files,
+            "destructive_cleanup_performed": false,
+            "destructive_cleanup_note": "This audit is non-destructive; unknown MCP files and worktrees are never deleted automatically.",
+        });
+        let audit_id = uuid();
+        self.conn
+            .execute(
+                "INSERT INTO coordination_bloat_audits(
+                    id, repo_id, dry_run, status, unexpected_mcp_file_count,
+                    unexpected_worktree_dir_count, stale_temp_file_count, details_json, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    audit_id,
+                    REPO_ID,
+                    bool_i64(dry_run),
+                    status,
+                    unexpected_mcp_file_count as i64,
+                    unexpected_worktree_dir_count as i64,
+                    stale_temp_file_count as i64,
+                    details.to_string(),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Unable to record coordination bloat audit: {error}"))?;
+        self.emit_event(
+            "coordination_bloat_audit_finished",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "audit_id": audit_id,
+                "status": status,
+                "dry_run": dry_run,
+                "unexpected_mcp_file_count": unexpected_mcp_file_count,
+                "unexpected_worktree_dir_count": unexpected_worktree_dir_count,
+                "stale_temp_file_count": stale_temp_file_count,
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "audit_id": audit_id,
+            "status": status,
+            "dry_run": dry_run,
+            "unexpected_mcp_files": details["unexpected_mcp_files"].clone(),
+            "unexpected_worktree_dirs": details["unexpected_worktree_dirs"].clone(),
+            "stale_temp_files": details["stale_temp_files"].clone(),
+            "destructive_cleanup_performed": false,
+        })))
+    }
+
+    pub fn db_request_approval(
+        &self,
+        db_change_request_id: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+        reason: Option<&str>,
+        risk_summary: Option<&str>,
+    ) -> Result<Value, String> {
+        let request = self.query_one(
+            "SELECT * FROM db_change_requests WHERE id=?1",
+            &[&db_change_request_id],
+            "DB change request does not exist.",
+        )?;
+        let task_id = request["task_id"].as_str().unwrap_or_default();
+        let approval = self.request_approval(
+            task_id,
+            agent_id,
+            session_id,
+            "production_sql_change",
+            reason.unwrap_or("Review and approve production SQL coordination request."),
+            risk_summary.or_else(|| request["summary"].as_str()),
+        )?;
+        let approval_id = approval["data"]["approval_id"]
+            .as_str()
+            .ok_or_else(|| "Approval request did not return an approval_id.".to_string())?;
+        self.conn
+            .execute(
+                "UPDATE db_change_requests
+                 SET approval_id=?1, status='review_requested', updated_at=?2
+                 WHERE id=?3",
+                params![approval_id, now_rfc3339(), db_change_request_id],
+            )
+            .map_err(|error| format!("Unable to link DB approval request: {error}"))?;
+        self.emit_event(
+            "db_change_review_requested",
+            "agent",
+            agent_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: session_id.map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "db_change_request_id": db_change_request_id,
+                "approval_id": approval_id,
+                "reused": approval["data"]["reused"].as_bool().unwrap_or(false),
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "db_change_request_id": db_change_request_id,
+            "approval_id": approval_id,
+            "status": "review_requested",
+        })))
     }
 
     pub fn db_query_readonly(&self, sql: &str, environment: Option<&str>) -> Result<Value, String> {
@@ -3037,6 +5329,13 @@ impl CoordinationKernel {
             .find_covering_lease(task_id, agent_id, session_id, migration_resource)?
             .is_none()
         {
+            let _ = self.record_db_coordination_rejection(
+                task_id,
+                agent_id,
+                session_id,
+                "db_migration_stream_lease_required",
+                json!({"resource_key": migration_resource}),
+            );
             return Ok(api_error(
                 "db_lease_required",
                 "Acquire db:migration_stream:main or a covering db resource lease before proposing a migration.",
@@ -3081,6 +5380,50 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to record migration proposal: {error}"))?;
+        let change_request_id = uuid();
+        let change_kind = if classification.destructive {
+            "rollback"
+        } else {
+            "other"
+        };
+        self.conn
+            .execute(
+                "INSERT INTO db_change_requests(
+                    id, task_id, requested_by_agent_id, requested_by_session_id,
+                    change_kind, title, summary, status, risk_level, destructive,
+                    production_impact, rollback_summary, migration_id, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'migration_attached', ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    change_request_id,
+                    task_id,
+                    agent_id,
+                    session_id,
+                    change_kind,
+                    migration_name,
+                    summary.unwrap_or("Production SQL migration proposal."),
+                    classification.risk_level,
+                    bool_i64(classification.destructive),
+                    "Migration proposal only; this MCP does not execute production SQL.",
+                    "See migration proposal artifact for rollback or roll-forward text.",
+                    migration_id,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record DB change request for migration proposal: {error}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO db_change_request_resources(
+                    id, db_change_request_id, resource_key, resource_type, operation, created_at
+                ) VALUES(?1, ?2, ?3, ?4, 'migrate', ?5)",
+                params![
+                    uuid(),
+                    change_request_id,
+                    migration_resource,
+                    resource_type(migration_resource),
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record migration DB resource: {error}"))?;
         self.emit_event(
             "db_migration_proposed",
             "agent",
@@ -3092,11 +5435,18 @@ impl CoordinationKernel {
                 artifact_id: Some(artifact_id.clone()),
                 ..EventRefs::default()
             },
-            json!({"migration_id": migration_id, "migration_name": migration_name, "classification": classification.classification}),
+            json!({
+                "migration_id": migration_id,
+                "db_change_request_id": change_request_id,
+                "migration_name": migration_name,
+                "classification": classification.classification,
+                "risk_level": classification.risk_level,
+                "destructive": classification.destructive,
+            }),
         )?;
 
         Ok(api_ok(
-            json!({"migration_id": migration_id, "artifact_id": artifact_id, "status": "draft"}),
+            json!({"migration_id": migration_id, "db_change_request_id": change_request_id, "artifact_id": artifact_id, "status": "draft"}),
         ))
     }
 
@@ -3119,30 +5469,315 @@ impl CoordinationKernel {
         &self,
         task_id: &str,
         agent_id: &str,
+        session_id: Option<&str>,
         approval_kind: &str,
         reason: &str,
         risk_summary: Option<&str>,
     ) -> Result<Value, String> {
-        let id = uuid();
-        self.conn
-            .execute(
-                "INSERT INTO approvals(id, task_id, requested_by_agent_id, approval_kind, status, reason, risk_summary, created_at)
-                 VALUES(?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
-                params![id, task_id, agent_id, approval_kind, reason, risk_summary, now_rfc3339()],
-            )
-            .map_err(|error| format!("Unable to create approval request: {error}"))?;
-        self.emit_event(
-            "approval_requested",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({"approval_id": id, "approval_kind": approval_kind, "reason": reason, "risk_summary": risk_summary}),
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
         )?;
+        if agent_id != "local" {
+            self.ensure_agent_exists(agent_id)?;
+            if let Some(session_id) = session_id {
+                let _ = self.ensure_session_active(session_id, agent_id)?;
+                if let Err(error) = self.ensure_session_owns_task(session_id, task_id) {
+                    let _ = self.record_approval_gate_log(
+                        None,
+                        Some(task_id),
+                        Some(agent_id),
+                        Some(session_id),
+                        "request",
+                        None,
+                        None,
+                        "rejected",
+                        Some(&error),
+                        json!({"approval_kind": approval_kind}),
+                    );
+                    let _ = self.emit_event(
+                        "approval_request_rejected",
+                        "agent",
+                        agent_id,
+                        EventRefs {
+                            task_id: Some(task_id.to_string()),
+                            agent_id: Some(agent_id.to_string()),
+                            session_id: Some(session_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({"approval_kind": approval_kind, "reason": error}),
+                    );
+                    return Err(error);
+                }
+            } else if task["claimed_by_agent_id"].as_str() != Some(agent_id) {
+                let reason = "Approval requests from agents require a task claimed by that agent.";
+                let _ = self.record_approval_gate_log(
+                    None,
+                    Some(task_id),
+                    Some(agent_id),
+                    None,
+                    "request",
+                    None,
+                    None,
+                    "rejected",
+                    Some(reason),
+                    json!({"approval_kind": approval_kind}),
+                );
+                let _ = self.emit_event(
+                    "approval_request_rejected",
+                    "agent",
+                    agent_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"approval_kind": approval_kind, "reason": reason}),
+                );
+                return Err(reason.to_string());
+            }
+        }
+        let approval_kind = non_empty(approval_kind, "Approval kind")?;
+        let reason = non_empty(reason, "Approval reason")?;
+        if let Some(existing) = self
+            .query_json(
+                "SELECT * FROM approvals
+                 WHERE task_id=?1 AND requested_by_agent_id=?2 AND approval_kind=?3 AND status='pending'
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                &[&task_id, &agent_id, &approval_kind],
+            )?
+            .into_iter()
+            .next()
+        {
+            let existing_id = existing["id"].as_str().unwrap_or_default();
+            self.record_approval_gate_log(
+                Some(existing_id),
+                Some(task_id),
+                Some(agent_id),
+                session_id,
+                "request",
+                None,
+                None,
+                "reused",
+                Some("Existing pending approval request reused."),
+                json!({"approval_kind": approval_kind}),
+            )?;
+            self.emit_event(
+                "approval_request_reused",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: session_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({"approval_id": existing_id, "approval_kind": approval_kind}),
+            )?;
+            return Ok(api_ok_warnings(
+                json!({"approval_id": existing["id"], "status": "pending", "reused": true}),
+                vec!["Existing pending approval request reused.".to_string()],
+            ));
+        }
+        let id = uuid();
+        self.begin_immediate_transaction("request approval")?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "INSERT INTO approvals(id, task_id, requested_by_agent_id, approval_kind, status, reason, risk_summary, created_at)
+                     VALUES(?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
+                    params![id, task_id, agent_id, approval_kind, reason, risk_summary, now_rfc3339()],
+                )
+                .map_err(|error| format!("Unable to create approval request: {error}"))?;
+            self.record_approval_gate_log(
+                Some(&id),
+                Some(task_id),
+                Some(agent_id),
+                session_id,
+                "request",
+                None,
+                None,
+                "pending",
+                Some(reason),
+                json!({"approval_kind": approval_kind, "risk_summary": risk_summary}),
+            )?;
+            self.emit_event(
+                "approval_requested",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: session_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({"approval_id": id, "approval_kind": approval_kind, "reason": reason, "risk_summary": risk_summary}),
+            )?;
+            Ok(())
+        })();
+        self.finish_transaction(result, "request approval")?;
         Ok(api_ok(json!({"approval_id": id, "status": "pending"})))
+    }
+
+    pub fn resolve_approval(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        human_actor: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, String> {
+        let human_actor = non_empty(human_actor, "Human actor")?;
+        if !is_trusted_memory_certifier(human_actor) {
+            let _ = self.record_approval_gate_log(
+                Some(approval_id),
+                None,
+                None,
+                None,
+                "resolve",
+                Some(decision),
+                Some(human_actor),
+                "rejected",
+                Some("Approval decisions require a trusted local UI/human actor."),
+                json!({}),
+            );
+            let _ = self.emit_event(
+                "approval_resolution_rejected",
+                "agent",
+                human_actor,
+                EventRefs::default(),
+                json!({"approval_id": approval_id, "decision": decision, "reason": "untrusted_actor"}),
+            );
+            return Err("Approval decisions require a trusted local UI/human actor.".to_string());
+        }
+        let status = match decision.trim().to_ascii_lowercase().as_str() {
+            "approve" | "approved" | "grant" | "granted" => "approved",
+            "deny" | "denied" | "reject" | "rejected" => "denied",
+            _ => return Err("Approval decision must be approved or denied.".to_string()),
+        };
+        let approval = self.query_one(
+            "SELECT * FROM approvals WHERE id=?1",
+            &[&approval_id],
+            "Approval request does not exist.",
+        )?;
+        if approval["status"].as_str() != Some("pending") {
+            self.record_approval_gate_log(
+                Some(approval_id),
+                approval["task_id"].as_str(),
+                approval["requested_by_agent_id"].as_str(),
+                None,
+                "resolve",
+                Some(status),
+                Some(human_actor),
+                "rejected",
+                Some("Only pending approval requests can be resolved."),
+                json!({"existing_status": approval["status"].clone()}),
+            )?;
+            self.emit_event(
+                "approval_resolution_rejected",
+                "user",
+                human_actor,
+                EventRefs {
+                    task_id: approval["task_id"].as_str().map(str::to_string),
+                    agent_id: approval["requested_by_agent_id"]
+                        .as_str()
+                        .map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({"approval_id": approval_id, "decision": status, "reason": "not_pending"}),
+            )?;
+            return Err("Only pending approval requests can be resolved.".to_string());
+        }
+        self.begin_immediate_transaction("resolve approval")?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "UPDATE approvals
+                     SET status=?1, approved_by=?2, resolved_at=?3
+                     WHERE id=?4 AND status='pending'",
+                    params![status, human_actor, now_rfc3339(), approval_id],
+                )
+                .map_err(|error| format!("Unable to resolve approval: {error}"))?;
+            self.record_approval_gate_log(
+                Some(approval_id),
+                approval["task_id"].as_str(),
+                approval["requested_by_agent_id"].as_str(),
+                None,
+                "resolve",
+                Some(status),
+                Some(human_actor),
+                status,
+                reason,
+                json!({}),
+            )?;
+            let db_status = if status == "approved" {
+                "approved"
+            } else {
+                "rejected"
+            };
+            let linked_db_requests = self.query_json(
+                "SELECT * FROM db_change_requests WHERE approval_id=?1",
+                &[&approval_id],
+            )?;
+            if !linked_db_requests.is_empty() {
+                self.conn
+                    .execute(
+                        "UPDATE db_change_requests SET status=?1, updated_at=?2 WHERE approval_id=?3",
+                        params![db_status, now_rfc3339(), approval_id],
+                    )
+                    .map_err(|error| format!("Unable to update DB change approval status: {error}"))?;
+                for request in linked_db_requests {
+                    self.emit_event(
+                        if status == "approved" {
+                            "db_change_approved"
+                        } else {
+                            "db_change_rejected"
+                        },
+                        "user",
+                        human_actor,
+                        EventRefs {
+                            task_id: request["task_id"].as_str().map(str::to_string),
+                            agent_id: request["requested_by_agent_id"]
+                                .as_str()
+                                .map(str::to_string),
+                            session_id: request["requested_by_session_id"]
+                                .as_str()
+                                .map(str::to_string),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "db_change_request_id": request["id"],
+                            "approval_id": approval_id,
+                            "status": db_status,
+                            "reason": reason,
+                        }),
+                    )?;
+                }
+            }
+            self.emit_event(
+                if status == "approved" {
+                    "approval_granted"
+                } else {
+                    "approval_denied"
+                },
+                "user",
+                human_actor,
+                EventRefs {
+                    task_id: approval["task_id"].as_str().map(str::to_string),
+                    agent_id: approval["requested_by_agent_id"]
+                        .as_str()
+                        .map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({"approval_id": approval_id, "status": status, "reason": reason}),
+            )?;
+            Ok(())
+        })();
+        self.finish_transaction(result, "resolve approval")?;
+        Ok(api_ok(
+            json!({"approval_id": approval_id, "status": status}),
+        ))
     }
 
     pub fn get_cloud_orchestrator_status(&self) -> Result<Value, String> {
@@ -3338,6 +5973,42 @@ impl CoordinationKernel {
     }
 
     pub fn import_orchestration_plan(&self, run_id: &str, plan: &Value) -> Result<Value, String> {
+        let run = self.query_one(
+            "SELECT * FROM orchestration_runs WHERE id=?1",
+            &[&run_id],
+            "Orchestration run does not exist.",
+        )?;
+        let existing_items = self.query_json(
+            "SELECT id FROM orchestration_plan_items WHERE run_id=?1 ORDER BY created_at ASC",
+            &[&run_id],
+        )?;
+        if !existing_items.is_empty() || run["plan_artifact_id"].as_str().is_some() {
+            let plan_item_ids = existing_items
+                .iter()
+                .filter_map(|item| item["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            self.emit_event(
+                "orchestration_plan_reused",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    orchestration_run_id: Some(run_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "plan_item_count": plan_item_ids.len(),
+                    "plan_artifact_id": run["plan_artifact_id"].clone(),
+                }),
+            )?;
+            return Ok(api_ok_warnings(
+                json!({"run_id": run_id, "plan_artifact_id": run["plan_artifact_id"], "plan_item_ids": plan_item_ids, "status": run["status"], "reused": true}),
+                vec!["Existing orchestration plan reused; duplicate import skipped.".to_string()],
+            ));
+        }
+        let items = plan["items"].as_array().cloned().unwrap_or_default();
+        if items.is_empty() {
+            return Err("Orchestration plan must include at least one item.".to_string());
+        }
         let plan_bytes = serde_json::to_vec_pretty(plan)
             .map_err(|error| format!("Unable to serialize orchestration plan: {error}"))?;
         let artifact_id = self.write_artifact(
@@ -3348,7 +6019,6 @@ impl CoordinationKernel {
             &plan_bytes,
             json!({"run_id": run_id}),
         )?;
-        let items = plan["items"].as_array().cloned().unwrap_or_default();
         let mut item_ids = Vec::new();
         let mut title_to_id = HashMap::new();
         for item in &items {
@@ -3412,149 +6082,239 @@ impl CoordinationKernel {
     }
 
     pub fn adopt_orchestration_plan(&self, run_id: &str) -> Result<Value, String> {
+        let _ = self.query_one(
+            "SELECT id FROM orchestration_runs WHERE id=?1",
+            &[&run_id],
+            "Orchestration run does not exist.",
+        )?;
         let items = self.query_json(
             "SELECT * FROM orchestration_plan_items WHERE run_id=?1 AND status='proposed' ORDER BY priority DESC, created_at ASC",
             &[&run_id],
         )?;
-        let mut plan_to_task = BTreeMap::new();
-
-        for item in &items {
-            let expected_output = item["expected_outputs_json"]
-                .as_str()
-                .map(|value| value.chars().take(500).collect::<String>());
-            let task = self.create_task(
-                item["title"].as_str().unwrap_or("Orchestration task"),
-                item["body"].as_str(),
-                item["priority"].as_i64().unwrap_or(0),
-                item["risk_level"].as_i64().unwrap_or(1),
-                Some(run_id),
-                item["id"].as_str(),
-                item["assigned_role"].as_str(),
-                expected_output.as_deref(),
+        if items.is_empty() {
+            let existing_tasks = self.query_json(
+                "SELECT id, orchestration_plan_item_id FROM tasks WHERE orchestration_run_id=?1",
+                &[&run_id],
             )?;
-            let task_id = task["id"].as_str().unwrap_or_default().to_string();
-            plan_to_task.insert(
-                item["id"].as_str().unwrap_or_default().to_string(),
-                task_id.clone(),
-            );
+            if !existing_tasks.is_empty() {
+                let mut created_tasks = BTreeMap::new();
+                for task in existing_tasks {
+                    if let (Some(plan_item_id), Some(task_id)) = (
+                        task["orchestration_plan_item_id"].as_str(),
+                        task["id"].as_str(),
+                    ) {
+                        created_tasks.insert(plan_item_id.to_string(), task_id.to_string());
+                    }
+                }
+                self.emit_event(
+                    "orchestration_plan_adoption_reused",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        orchestration_run_id: Some(run_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"task_count": created_tasks.len()}),
+                )?;
+                return Ok(api_ok_warnings(
+                    json!({"run_id": run_id, "status": "adopted", "created_tasks": created_tasks, "reused": true}),
+                    vec!["Existing adopted orchestration tasks reused.".to_string()],
+                ));
+            }
+            return Err("No proposed orchestration plan items are available to adopt.".to_string());
+        }
+
+        self.begin_immediate_transaction("adopt orchestration plan")?;
+        let result = (|| -> Result<BTreeMap<String, String>, String> {
+            let mut plan_to_task = BTreeMap::new();
+
+            for item in &items {
+                let expected_output = item["expected_outputs_json"]
+                    .as_str()
+                    .map(|value| value.chars().take(500).collect::<String>());
+                let task = self.create_task(
+                    item["title"].as_str().unwrap_or("Orchestration task"),
+                    item["body"].as_str(),
+                    item["priority"].as_i64().unwrap_or(0),
+                    item["risk_level"].as_i64().unwrap_or(1),
+                    Some(run_id),
+                    item["id"].as_str(),
+                    item["assigned_role"].as_str(),
+                    expected_output.as_deref(),
+                )?;
+                let task_id = task["id"].as_str().unwrap_or_default().to_string();
+                plan_to_task.insert(
+                    item["id"].as_str().unwrap_or_default().to_string(),
+                    task_id.clone(),
+                );
+                self.conn
+                    .execute(
+                        "UPDATE orchestration_plan_items SET task_id=?1, status='task_created', updated_at=?2 WHERE id=?3 AND status='proposed'",
+                        params![task_id, now_rfc3339(), item["id"].as_str()],
+                    )
+                    .map_err(|error| format!("Unable to mark plan item adopted: {error}"))?;
+                self.emit_event(
+                    "orchestration_task_generated",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: Some(task_id),
+                        orchestration_run_id: Some(run_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"plan_item_id": item["id"]}),
+                )?;
+            }
+
+            for item in &items {
+                let Some(task_id) = item["id"]
+                    .as_str()
+                    .and_then(|id| plan_to_task.get(id))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let depends = item["depends_on_json"]
+                    .as_str()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default();
+                for dependency in depends {
+                    let dependency_key = dependency.as_str().unwrap_or_default();
+                    let dependency_task_id =
+                        plan_to_task.get(dependency_key).cloned().or_else(|| {
+                            items
+                                .iter()
+                                .find(|candidate| {
+                                    candidate["title"].as_str() == Some(dependency_key)
+                                })
+                                .and_then(|candidate| candidate["id"].as_str())
+                                .and_then(|id| plan_to_task.get(id))
+                                .cloned()
+                        });
+                    let Some(depends_on_task_id) = dependency_task_id else {
+                        return Err(format!(
+                            "Orchestration dependency '{dependency_key}' did not match a generated task."
+                        ));
+                    };
+                    self.insert_task_dependency_checked(
+                        &task_id,
+                        &depends_on_task_id,
+                        "finish_before_start",
+                        "kernel",
+                        REPO_ID,
+                    )?;
+                }
+            }
+
             self.conn
                 .execute(
-                    "UPDATE orchestration_plan_items SET task_id=?1, status='task_created', updated_at=?2 WHERE id=?3",
-                    params![task_id, now_rfc3339(), item["id"].as_str()],
+                    "UPDATE orchestration_runs SET status='adopted', updated_at=?1 WHERE id=?2",
+                    params![now_rfc3339(), run_id],
                 )
-                .map_err(|error| format!("Unable to mark plan item adopted: {error}"))?;
+                .map_err(|error| format!("Unable to mark orchestration run adopted: {error}"))?;
             self.emit_event(
-                "orchestration_task_generated",
+                "orchestration_plan_adopted",
                 "kernel",
                 REPO_ID,
                 EventRefs {
-                    task_id: Some(task_id),
                     orchestration_run_id: Some(run_id.to_string()),
                     ..EventRefs::default()
                 },
-                json!({"plan_item_id": item["id"]}),
+                json!({"task_count": plan_to_task.len()}),
             )?;
-        }
-
-        for item in &items {
-            let Some(task_id) = item["id"]
-                .as_str()
-                .and_then(|id| plan_to_task.get(id))
-                .cloned()
-            else {
-                continue;
-            };
-            let depends = item["depends_on_json"]
-                .as_str()
-                .and_then(|value| serde_json::from_str::<Value>(value).ok())
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            for dependency in depends {
-                let dependency_key = dependency.as_str().unwrap_or_default();
-                let dependency_task_id = plan_to_task.get(dependency_key).cloned().or_else(|| {
-                    items
-                        .iter()
-                        .find(|candidate| candidate["title"].as_str() == Some(dependency_key))
-                        .and_then(|candidate| candidate["id"].as_str())
-                        .and_then(|id| plan_to_task.get(id))
-                        .cloned()
-                });
-                if let Some(depends_on_task_id) = dependency_task_id {
-                    self.conn
-                        .execute(
-                            "INSERT OR IGNORE INTO task_dependencies(task_id, depends_on_task_id, dependency_kind, created_at)
-                             VALUES(?1, ?2, 'finish_before_start', ?3)",
-                            params![task_id, depends_on_task_id, now_rfc3339()],
-                        )
-                        .map_err(|error| format!("Unable to create task dependency: {error}"))?;
-                }
-            }
-        }
-
-        self.conn
-            .execute(
-                "UPDATE orchestration_runs SET status='adopted', updated_at=?1 WHERE id=?2",
-                params![now_rfc3339(), run_id],
-            )
-            .map_err(|error| format!("Unable to mark orchestration run adopted: {error}"))?;
-        self.emit_event(
-            "orchestration_plan_adopted",
-            "kernel",
-            REPO_ID,
-            EventRefs {
-                orchestration_run_id: Some(run_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({"task_count": plan_to_task.len()}),
-        )?;
+            Ok(plan_to_task)
+        })();
+        let plan_to_task = self.finish_transaction(result, "adopt orchestration plan")?;
         Ok(api_ok(
             json!({"run_id": run_id, "status": "adopted", "created_tasks": plan_to_task}),
         ))
     }
 
     pub fn propose_agent_assignments(&self, run_id: &str) -> Result<Value, String> {
+        let _ = self.query_one(
+            "SELECT id FROM orchestration_runs WHERE id=?1",
+            &[&run_id],
+            "Orchestration run does not exist.",
+        )?;
         let items = self.query_json(
             "SELECT * FROM orchestration_plan_items WHERE run_id=?1 ORDER BY priority DESC, created_at ASC",
             &[&run_id],
         )?;
-        let mut created = Vec::new();
         let mut seen = HashSet::new();
-        for item in items {
-            let role = item["assigned_role"].as_str().unwrap_or("coding_agent");
-            let key = format!("{}:{}", item["id"].as_str().unwrap_or_default(), role);
-            if !seen.insert(key) {
-                continue;
+        self.begin_immediate_transaction("propose agent assignments")?;
+        let result = (|| -> Result<Vec<String>, String> {
+            let mut created = Vec::new();
+            let mut reused_count = 0usize;
+            for item in items {
+                let role = item["assigned_role"].as_str().unwrap_or("coding_agent");
+                let plan_item_id = item["id"].as_str().unwrap_or_default();
+                let key = format!("{plan_item_id}:{role}");
+                if !seen.insert(key) {
+                    continue;
+                }
+                if let Some(existing) = self
+                    .query_json(
+                        "SELECT id FROM orchestration_agent_assignments
+                         WHERE run_id=?1 AND plan_item_id=?2 AND role=?3 AND status IN ('proposed', 'accepted')
+                         ORDER BY created_at DESC
+                         LIMIT 1",
+                        &[&run_id, &plan_item_id, &role],
+                    )?
+                    .into_iter()
+                    .next()
+                {
+                    if let Some(id) = existing["id"].as_str() {
+                        created.push(id.to_string());
+                        reused_count += 1;
+                    }
+                    continue;
+                }
+                let id = uuid();
+                self.conn
+                    .execute(
+                        "INSERT INTO orchestration_agent_assignments(
+                            id, run_id, plan_item_id, task_id, requested_agent_kind, requested_agent_name,
+                            role, status, created_at, updated_at
+                        ) VALUES(?1, ?2, ?3, ?4, 'coding_agent', ?5, ?6, 'proposed', ?7, ?7)",
+                        params![
+                            id,
+                            run_id,
+                            plan_item_id,
+                            item["task_id"].as_str(),
+                            format!("{} agent", role),
+                            role,
+                            now_rfc3339()
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to propose agent assignment: {error}"))?;
+                created.push(id);
             }
-            let id = uuid();
-            self.conn
-                .execute(
-                    "INSERT INTO orchestration_agent_assignments(
-                        id, run_id, plan_item_id, task_id, requested_agent_kind, requested_agent_name,
-                        role, status, created_at, updated_at
-                    ) VALUES(?1, ?2, ?3, ?4, 'coding_agent', ?5, ?6, 'proposed', ?7, ?7)",
-                    params![
-                        id,
-                        run_id,
-                        item["id"].as_str(),
-                        item["task_id"].as_str(),
-                        format!("{} agent", role),
-                        role,
-                        now_rfc3339()
-                    ],
-                )
-                .map_err(|error| format!("Unable to propose agent assignment: {error}"))?;
-            created.push(id);
-        }
-        self.emit_event(
-            "orchestration_assignments_proposed",
-            "kernel",
-            REPO_ID,
-            EventRefs {
-                orchestration_run_id: Some(run_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({"assignment_count": created.len()}),
-        )?;
+            self.emit_event(
+                "orchestration_assignments_proposed",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    orchestration_run_id: Some(run_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({"assignment_count": created.len(), "reused_count": reused_count}),
+            )?;
+            if reused_count > 0 {
+                self.emit_event(
+                    "orchestration_assignments_reused",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        orchestration_run_id: Some(run_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"reused_count": reused_count}),
+                )?;
+            }
+            Ok(created)
+        })();
+        let created = self.finish_transaction(result, "propose agent assignments")?;
         Ok(api_ok(json!({"assignment_ids": created})))
     }
 
@@ -3564,6 +6324,31 @@ impl CoordinationKernel {
             &[&assignment_id],
             "Assignment does not exist.",
         )?;
+        if assignment["status"].as_str() == Some("accepted") {
+            if let Some(agent_id) = assignment["assigned_agent_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.emit_event(
+                    "orchestration_assignment_reused",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        orchestration_run_id: assignment["run_id"].as_str().map(str::to_string),
+                        task_id: assignment["task_id"].as_str().map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({"assignment_id": assignment_id, "status": "accepted"}),
+                )?;
+                return Ok(api_ok(json!({
+                    "assignment_id": assignment_id,
+                    "agent_id": agent_id,
+                    "status": "accepted",
+                    "reused": true,
+                })));
+            }
+        }
         let role = assignment["role"].as_str().unwrap_or("coding_agent");
         let agent =
             self.create_or_get_agent(&format!("{role} agent"), "coding_agent", Some(role))?;
@@ -3693,6 +6478,14 @@ impl CoordinationKernel {
         Ok(api_ok(json!({
             "run": run,
             "tasks": self.query_json("SELECT * FROM tasks WHERE orchestration_run_id=?1 ORDER BY priority DESC, created_at ASC", &[&run_id])?,
+            "task_dependencies": self.query_json(
+                "SELECT d.*
+                 FROM task_dependencies d
+                 JOIN tasks t ON t.id = d.task_id
+                 WHERE t.orchestration_run_id=?1
+                 ORDER BY d.created_at ASC",
+                &[&run_id],
+            )?,
             "plan_items": self.query_json("SELECT * FROM orchestration_plan_items WHERE run_id=?1 ORDER BY priority DESC, created_at ASC", &[&run_id])?,
             "assignments": self.query_json("SELECT * FROM orchestration_agent_assignments WHERE run_id=?1 ORDER BY created_at ASC", &[&run_id])?,
             "contracts": self.query_json("SELECT * FROM memories WHERE orchestration_run_id=?1 AND memory_kind='contract' ORDER BY created_at DESC", &[&run_id])?,
@@ -3726,9 +6519,13 @@ impl CoordinationKernel {
             "agents": if let Some(agent_id) = agent_id { self.query_json("SELECT * FROM agents WHERE id=?1", &[&agent_id])? } else { Vec::new() },
             "sessions": session,
             "task": task,
+            "task_dependencies": if let Some(task_id) = task_id { self.list_task_dependencies(Some(task_id))?["data"].clone() } else { Value::Null },
             "orchestration": if let Some(run_id) = orchestration_run_id { self.get_orchestration_brief(run_id)?["data"].clone() } else { Value::Null },
             "active_leases": self.list_active_leases_internal(task_id, agent_id, None)?,
             "repo_policy": self.repo_policy()?,
+            "pending_approvals": if let Some(task_id) = task_id { self.query_json("SELECT * FROM approvals WHERE task_id=?1 AND status='pending' ORDER BY created_at DESC", &[&task_id])? } else { Vec::new() },
+            "db_change_requests": if let Some(task_id) = task_id { self.query_json("SELECT * FROM db_change_requests WHERE task_id=?1 ORDER BY updated_at DESC", &[&task_id])? } else { Vec::new() },
+            "workspace_changes": self.list_workspace_changes(task_id, agent_id, session_id, None, None, Some(100))?["data"]["changes"].clone(),
             "open_workspace_violations": self.list_workspace_violations(task_id, agent_id, session_id, None, Some("open"))?["data"]["violations"].clone(),
             "recent_events": self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 50", &[])?,
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 20", &[])?,
@@ -3740,18 +6537,39 @@ impl CoordinationKernel {
     pub fn get_snapshot(&self) -> Result<Value, String> {
         Ok(api_ok(json!({
             "tasks": self.query_json("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "task_dependencies": self.list_task_dependencies(None)?["data"]["dependencies"].clone(),
             "agent_slots": self.query_json("SELECT * FROM agent_slots ORDER BY slot_key ASC LIMIT 200", &[])?,
             "mcp_configs": self.query_json("SELECT * FROM mcp_configs ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "mcp_health_events": self.query_json("SELECT * FROM events WHERE event_type='mcp_health_checked' ORDER BY seq DESC LIMIT 50", &[])?,
+            "mcp_client_mounts": self.mcp_client_mount_summary()?,
             "sessions": self.query_json("SELECT * FROM agent_sessions ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "resources": self.query_json("SELECT * FROM resources ORDER BY updated_at DESC LIMIT 200", &[])?,
             "active_leases": self.list_active_leases_internal(None, None, None)?,
             "events": self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 200", &[])?,
             "worktrees": self.query_json("SELECT * FROM worktrees ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "file_watchers": self.query_json("SELECT * FROM file_watchers ORDER BY updated_at DESC LIMIT 50", &[])?,
+            "workspace_changes": self.query_json("SELECT * FROM workspace_changes ORDER BY created_at DESC LIMIT 200", &[])?,
             "open_workspace_violations": self.query_json("SELECT * FROM workspace_violations WHERE status='open' ORDER BY created_at DESC LIMIT 200", &[])?,
             "patch_validations": self.query_json("SELECT * FROM patch_validations ORDER BY updated_at DESC LIMIT 200", &[])?,
-            "patches": self.query_json("SELECT * FROM patches ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "patches": self.query_json(
+                "SELECT p.*, v.status AS validation_status
+                 FROM patches p
+                 LEFT JOIN patch_validations v ON v.id = p.validation_id
+                 ORDER BY p.updated_at DESC LIMIT 200",
+                &[],
+            )?,
             "merge_jobs": self.query_json("SELECT * FROM merge_jobs ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "artifacts": self.query_json("SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 200", &[])?,
+            "artifact_storage_logs": self.query_json("SELECT * FROM artifact_storage_logs ORDER BY created_at DESC LIMIT 200", &[])?,
+            "approvals": self.query_json("SELECT * FROM approvals ORDER BY created_at DESC LIMIT 200", &[])?,
+            "approval_gate_logs": self.query_json("SELECT * FROM approval_gate_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "repo_policy": self.repo_policy()?,
             "sql_policy": self.db_get_mode()?["data"].clone(),
+            "db_change_requests": self.query_json("SELECT * FROM db_change_requests ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "db_change_request_resources": self.query_json("SELECT * FROM db_change_request_resources ORDER BY created_at DESC LIMIT 200", &[])?,
+            "db_migrations": self.query_json("SELECT * FROM db_migrations ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "ui_surface_logs": self.query_json("SELECT * FROM coordination_ui_surface_logs ORDER BY created_at DESC LIMIT 200", &[])?,
+            "bloat_audits": self.query_json("SELECT * FROM coordination_bloat_audits ORDER BY created_at DESC LIMIT 50", &[])?,
             "memories": self.query_json("SELECT id, memory_kind, trust_level, title, summary, task_id, orchestration_run_id, created_at, updated_at FROM memories ORDER BY updated_at DESC LIMIT 200", &[])?,
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 100", &[])?,
             "handoff_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='handoff' ORDER BY updated_at DESC LIMIT 100", &[])?,
@@ -3775,8 +6593,69 @@ impl CoordinationKernel {
             "SELECT * FROM worktrees ORDER BY updated_at DESC LIMIT 200",
             &[],
         )?;
+        let active_watcher_targets = self.active_file_watcher_targets()?;
+        let file_watchers = self.query_json(
+            "SELECT * FROM file_watchers ORDER BY updated_at DESC LIMIT 50",
+            &[],
+        )?;
+        let file_watcher_events = self.query_json(
+            "SELECT * FROM events WHERE event_type LIKE 'file_watcher_%' ORDER BY seq DESC LIMIT 200",
+            &[],
+        )?;
+        let resources = self.query_json(
+            "SELECT * FROM resources ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let artifacts = self.query_json(
+            "SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let artifact_storage_logs = self.query_json(
+            "SELECT * FROM artifact_storage_logs ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let artifact_storage_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('artifact_stored', 'artifact_storage_logged', 'artifact_storage_reused', 'artifact_storage_failed') ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let memories = self.query_json(
+            "SELECT * FROM memories ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let memory_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('memory_written', 'contract_memory_written', 'handoff_memory_written', 'memory_certified', 'memory_write_rejected', 'memory_searched') ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let lease_conflict_rows = self.query_json(
+            "SELECT * FROM lease_conflicts ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let lease_conflict_detector_events = self.query_json(
+            "SELECT * FROM events WHERE event_type='lease_conflict_detected' ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
         let open_violations = self.query_json(
             "SELECT * FROM workspace_violations WHERE status='open' ORDER BY created_at DESC LIMIT 200",
+            &[],
+        )?;
+        let all_workspace_violations = self.query_json(
+            "SELECT * FROM workspace_violations ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let workspace_resolution_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('workspace_violation_resolved', 'workspace_violation_resolution_rejected') ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let workspace_changes = self.query_json(
+            "SELECT * FROM workspace_changes ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let file_changed_events = self.query_json(
+            "SELECT * FROM events WHERE event_type='file_changed' ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let change_scan_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('change_scan_started', 'change_scan_finished') ORDER BY seq DESC LIMIT 100",
             &[],
         )?;
         let patch_rows = self.query_json(
@@ -3796,6 +6675,80 @@ impl CoordinationKernel {
              ORDER BY m.updated_at DESC LIMIT 200",
             &[],
         )?;
+        let task_dependencies = self.list_task_dependencies(None)?["data"]["dependencies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let approvals = self.query_json(
+            "SELECT * FROM approvals ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let approval_gate_logs = self.query_json(
+            "SELECT * FROM approval_gate_logs ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let approval_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('approval_requested', 'approval_request_reused', 'approval_request_rejected', 'approval_granted', 'approval_denied', 'approval_resolution_rejected', 'db_change_approval_required') ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let db_change_requests = self.query_json(
+            "SELECT * FROM db_change_requests ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let db_change_request_resources = self.query_json(
+            "SELECT * FROM db_change_request_resources ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let db_migrations = self.query_json(
+            "SELECT * FROM db_migrations ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let db_coordination_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('db_change_requested', 'db_change_request_rejected', 'db_migration_proposed', 'db_change_approval_required') ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let orchestration_runs = self.query_json(
+            "SELECT * FROM orchestration_runs ORDER BY updated_at DESC LIMIT 200",
+            &[],
+        )?;
+        let orchestration_plan_items = self.query_json(
+            "SELECT * FROM orchestration_plan_items ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let orchestration_assignments = self.query_json(
+            "SELECT * FROM orchestration_agent_assignments ORDER BY updated_at DESC LIMIT 500",
+            &[],
+        )?;
+        let orchestration_events = self.query_json(
+            "SELECT * FROM events WHERE event_type LIKE 'orchestration_%' ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let ui_surface_logs = self.query_json(
+            "SELECT * FROM coordination_ui_surface_logs ORDER BY created_at DESC LIMIT 500",
+            &[],
+        )?;
+        let ui_surface_events = self.query_json(
+            "SELECT * FROM events WHERE event_type='ui_surface_logged' ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let bloat_audits = self.query_json(
+            "SELECT * FROM coordination_bloat_audits ORDER BY created_at DESC LIMIT 100",
+            &[],
+        )?;
+        let bloat_events = self.query_json(
+            "SELECT * FROM events WHERE event_type IN ('coordination_bloat_audit_started', 'coordination_bloat_audit_finished') ORDER BY seq DESC LIMIT 200",
+            &[],
+        )?;
+        let mcp_health_events = self.query_json(
+            "SELECT * FROM events WHERE event_type='mcp_health_checked' ORDER BY seq DESC LIMIT 50",
+            &[],
+        )?;
+        let mcp_client_mounts = self.mcp_client_mount_summary()?;
+        let task_ids = self
+            .query_json("SELECT id FROM tasks", &[])?
+            .into_iter()
+            .filter_map(|task| task["id"].as_str().map(str::to_string))
+            .collect::<HashSet<_>>();
 
         record_alignment_check(
             &self.paths.repo_path,
@@ -3887,6 +6840,711 @@ impl CoordinationKernel {
             json!({
                 "sql_mcp_default": policy["sql_mcp_default"].clone(),
                 "raw_sql_mcp_allowed": value_i64(&policy, "raw_sql_mcp_allowed")
+            }),
+        );
+        let mcp_tools = crate::coordination::mcp::TOOL_NAMES;
+        let request_merge_listed = mcp_tools.contains(&"request_merge");
+        let violation_resolver_listed = mcp_tools.contains(&"resolve_workspace_violation");
+        let apply_merge_listed = mcp_tools.contains(&"apply_merge");
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "mcp.agent_tool_surface",
+            if request_merge_listed && !violation_resolver_listed && !apply_merge_listed {
+                "aligned"
+            } else {
+                "violation"
+            },
+            if !request_merge_listed {
+                "request_merge is not listed as an agent-callable MCP tool, so the fast merge-request path is not discoverable."
+            } else if violation_resolver_listed {
+                "resolve_workspace_violation is exposed to agents; violation resolution must remain trusted UI/human-only."
+            } else if apply_merge_listed {
+                "apply_merge is exposed to agents; merge application must remain trusted UI/human-only."
+            } else {
+                "MCP tools/list exposes request_merge intentionally and keeps violation resolution plus merge application off the agent surface."
+            },
+            json!({
+                "request_merge_listed": request_merge_listed,
+                "resolve_workspace_violation_listed": violation_resolver_listed,
+                "apply_merge_listed": apply_merge_listed,
+                "tool_count": mcp_tools.len(),
+            }),
+        );
+        let latest_mcp_health = mcp_health_events.first();
+        let latest_mcp_health_payload = latest_mcp_health
+            .map(|event| event["payload_json"].clone())
+            .unwrap_or(Value::Null);
+        let latest_mcp_health_status = latest_mcp_health_payload["health"]["status"]
+            .as_str()
+            .unwrap_or("missing");
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "mcp.always_on_runtime_health",
+            if latest_mcp_health_status == "healthy" {
+                "aligned"
+            } else {
+                "warning"
+            },
+            if latest_mcp_health.is_none() {
+                "No MCP runtime health check has been recorded yet; open the MCP workspace view or run the workspace MCP status check."
+            } else if latest_mcp_health_status == "healthy" {
+                "Always-on coordination MCP config was generated and the local stdio server responded to initialize plus tools/list."
+            } else {
+                "Always-on coordination MCP config exists, but the latest runtime probe did not prove a healthy stdio server."
+            },
+            json!({
+                "health_event_count": mcp_health_events.len(),
+                "latest_health": latest_mcp_health_payload,
+            }),
+        );
+        let mcp_client_mount_status = mcp_client_mounts["status"].as_str().unwrap_or("not_seen");
+        let active_mcp_session_count = mcp_client_mounts["active_session_count"]
+            .as_u64()
+            .unwrap_or(0);
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "mcp.agent_client_mount",
+            if active_mcp_session_count == 0 || mcp_client_mount_status == "confirmed" {
+                "aligned"
+            } else {
+                "warning"
+            },
+            if active_mcp_session_count == 0 {
+                "No active agent sessions need agent-client MCP mount proof."
+            } else if mcp_client_mount_status == "confirmed" {
+                "Every active agent session has agent-scoped MCP tools/list or tool-call evidence."
+            } else if mcp_client_mount_status == "partial" {
+                "Some active agent sessions have MCP mount evidence, but at least one active session has not listed or called tools yet."
+            } else if mcp_client_mount_status == "initialized_only" {
+                "An agent-scoped MCP client initialized, but no tools/list or tool-call proof has been logged yet."
+            } else if mcp_client_mount_status == "server_started_only" {
+                "An agent-scoped MCP server process started, but client initialize/tools-list evidence has not been logged yet."
+            } else {
+                "Active agent sessions exist, but no agent-scoped MCP client mount events have been recorded."
+            },
+            json!({
+                "mount_status": mcp_client_mount_status,
+                "active_session_count": active_mcp_session_count,
+                "confirmed_session_count": mcp_client_mounts["confirmed_session_count"].clone(),
+                "initialized_session_count": mcp_client_mounts["initialized_session_count"].clone(),
+                "server_started_only_count": mcp_client_mounts["server_started_only_count"].clone(),
+                "event_count": mcp_client_mounts["event_count"].clone(),
+                "mounts": mcp_client_mounts["mounts"].clone(),
+            }),
+        );
+        let unknown_resource_count = resources
+            .iter()
+            .filter(|resource| {
+                resource["resource_type"].as_str() == Some("unknown")
+                    || !resource["resource_key"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(':')
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "resources.registry_integrity",
+            if unknown_resource_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if unknown_resource_count > 0 {
+                "Resource registry contains unknown or untyped resources, so leases may be bypassed by key variants."
+            } else {
+                "Resource registry contains normalized typed resource keys."
+            },
+            json!({
+                "resource_count": resources.len(),
+                "unknown_resource_count": unknown_resource_count,
+            }),
+        );
+
+        let logged_artifact_ids = artifact_storage_logs
+            .iter()
+            .filter_map(|log| log["artifact_id"].as_str())
+            .collect::<HashSet<_>>();
+        let mut artifact_missing_file_count = 0usize;
+        let mut artifact_path_escape_count = 0usize;
+        let mut artifact_hash_mismatch_count = 0usize;
+        for artifact in &artifacts {
+            let path = artifact["path"].as_str().unwrap_or_default();
+            if !path_text_under_path(path, &self.paths.artifacts_root) {
+                artifact_path_escape_count += 1;
+                continue;
+            }
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                artifact_missing_file_count += 1;
+                continue;
+            }
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    if artifact["content_hash"].as_str().unwrap_or_default() != sha256_hex(&bytes) {
+                        artifact_hash_mismatch_count += 1;
+                    }
+                }
+                Err(_) => artifact_missing_file_count += 1,
+            }
+        }
+        let artifact_missing_log_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["id"]
+                    .as_str()
+                    .map(|id| !logged_artifact_ids.contains(id))
+                    .unwrap_or(true)
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "artifact_storage.integrity",
+            if artifact_path_escape_count > 0
+                || artifact_missing_file_count > 0
+                || artifact_hash_mismatch_count > 0
+            {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if artifact_path_escape_count > 0 {
+                "One or more artifact rows point outside .agents/artifacts."
+            } else if artifact_missing_file_count > 0 {
+                "One or more artifact rows point at missing or unreadable files."
+            } else if artifact_hash_mismatch_count > 0 {
+                "One or more artifact files no longer match their stored content hashes."
+            } else {
+                "Artifact rows point at rooted files with matching content hashes."
+            },
+            json!({
+                "artifact_count": artifacts.len(),
+                "path_escape_count": artifact_path_escape_count,
+                "missing_file_count": artifact_missing_file_count,
+                "hash_mismatch_count": artifact_hash_mismatch_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "artifact_storage.logs",
+            if artifact_missing_log_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if artifact_missing_log_count > 0 {
+                "Some artifact rows do not have artifact_storage_logs; newer writes include durable storage audit evidence."
+            } else {
+                "Artifact storage attempts are represented in durable artifact_storage_logs and append-only events."
+            },
+            json!({
+                "artifact_count": artifacts.len(),
+                "artifact_storage_log_count": artifact_storage_logs.len(),
+                "artifact_storage_event_count": artifact_storage_events.len(),
+                "artifact_missing_log_count": artifact_missing_log_count,
+            }),
+        );
+
+        let mut memory_body_missing_count = 0usize;
+        let mut memory_body_escape_count = 0usize;
+        let mut certified_without_evidence_count = 0usize;
+        let mut memory_evidence_missing_count = 0usize;
+        for memory in &memories {
+            let body_path = memory["body_path"].as_str().unwrap_or_default();
+            if !path_text_under_path(body_path, &self.paths.memory_root) {
+                memory_body_escape_count += 1;
+            } else if !PathBuf::from(body_path).exists() {
+                memory_body_missing_count += 1;
+            }
+
+            let trust_level = memory["trust_level"].as_str().unwrap_or_default();
+            let evidence_artifact_id = memory["evidence_artifact_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty());
+            let certified_by = memory["certified_by"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty());
+            if trust_level == "certified" {
+                if evidence_artifact_id.is_none()
+                    && !certified_by
+                        .map(is_trusted_memory_certifier)
+                        .unwrap_or(false)
+                {
+                    certified_without_evidence_count += 1;
+                }
+                if let Some(artifact_id) = evidence_artifact_id {
+                    if self.get_artifact(artifact_id).is_err() {
+                        memory_evidence_missing_count += 1;
+                    }
+                }
+            }
+        }
+        let memory_write_event_count = memory_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["event_type"].as_str(),
+                    Some("memory_written" | "contract_memory_written" | "handoff_memory_written")
+                )
+            })
+            .count();
+        let memory_missing_event_count = memories.len().saturating_sub(memory_write_event_count);
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "memory.body_files",
+            if memory_body_escape_count > 0 || memory_body_missing_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if memory_body_escape_count > 0 {
+                "One or more memory rows point outside .agents/memory."
+            } else if memory_body_missing_count > 0 {
+                "One or more memory body markdown files are missing."
+            } else {
+                "Coordination memory rows point at rooted markdown body files."
+            },
+            json!({
+                "memory_count": memories.len(),
+                "body_escape_count": memory_body_escape_count,
+                "body_missing_count": memory_body_missing_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "memory.certification",
+            if certified_without_evidence_count > 0 || memory_evidence_missing_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if certified_without_evidence_count > 0 {
+                "Certified memory exists without evidence artifact or trusted certifier."
+            } else if memory_evidence_missing_count > 0 {
+                "Certified memory references missing evidence artifacts."
+            } else {
+                "Certified memory has evidence artifacts or trusted certifier attribution."
+            },
+            json!({
+                "certified_without_evidence_count": certified_without_evidence_count,
+                "missing_evidence_artifact_count": memory_evidence_missing_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "memory.logs",
+            if memory_missing_event_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if memory_missing_event_count > 0 {
+                "Some memory rows do not have matching memory-written events; newer writes include memory audit events."
+            } else {
+                "Memory writes/searches/rejections/certifications are represented in append-only events."
+            },
+            json!({
+                "memory_count": memories.len(),
+                "memory_event_count": memory_events.len(),
+                "memory_write_event_count": memory_write_event_count,
+                "memory_missing_event_count": memory_missing_event_count,
+            }),
+        );
+
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "leases.conflict_detector_logs",
+            if lease_conflict_rows.len() > lease_conflict_detector_events.len() {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if lease_conflict_rows.len() > lease_conflict_detector_events.len() {
+                "Some historical lease_conflicts do not have matching lease_conflict_detected events; newer conflicts include detector evidence."
+            } else {
+                "Lease conflicts have detector events with mode/resource overlap reasons."
+            },
+            json!({
+                "lease_conflict_count": lease_conflict_rows.len(),
+                "lease_conflict_detector_event_count": lease_conflict_detector_events.len(),
+            }),
+        );
+        let missing_dependency_count = task_dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency["task_status"].is_null() || dependency["depends_on_status"].is_null()
+            })
+            .count();
+        let mut cyclic_dependency_count = 0;
+        for dependency in &task_dependencies {
+            if let (Some(task_id), Some(depends_on_task_id)) = (
+                dependency["task_id"].as_str(),
+                dependency["depends_on_task_id"].as_str(),
+            ) {
+                if self.task_dependency_would_cycle(task_id, depends_on_task_id)? {
+                    cyclic_dependency_count += 1;
+                }
+            }
+        }
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "task_dependencies.graph_integrity",
+            if missing_dependency_count > 0 || cyclic_dependency_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if cyclic_dependency_count > 0 {
+                "Task dependency graph contains a cycle, so dependency ordering is not trustworthy."
+            } else if missing_dependency_count > 0 {
+                "Task dependency rows reference missing tasks."
+            } else {
+                "Task dependencies reference existing tasks and no cycles were detected."
+            },
+            json!({
+                "dependency_count": task_dependencies.len(),
+                "missing_dependency_count": missing_dependency_count,
+                "cyclic_dependency_count": cyclic_dependency_count,
+            }),
+        );
+
+        let resolved_by_untrusted_count = approvals
+            .iter()
+            .filter(|approval| {
+                matches!(
+                    approval["status"].as_str(),
+                    Some("approved" | "denied" | "rejected")
+                ) && !approval["approved_by"]
+                    .as_str()
+                    .map(is_trusted_memory_certifier)
+                    .unwrap_or(false)
+            })
+            .count();
+        let logged_approval_ids = approval_gate_logs
+            .iter()
+            .filter_map(|log| log["approval_id"].as_str())
+            .collect::<HashSet<_>>();
+        let approval_missing_log_count = approvals
+            .iter()
+            .filter(|approval| {
+                approval["id"]
+                    .as_str()
+                    .map(|id| !logged_approval_ids.contains(id))
+                    .unwrap_or(true)
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "approval_gate.trusted_resolution",
+            if resolved_by_untrusted_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if resolved_by_untrusted_count > 0 {
+                "Resolved approval rows exist without trusted local UI/human actors."
+            } else {
+                "Approval decisions are restricted to trusted local UI/human actors."
+            },
+            json!({
+                "approval_count": approvals.len(),
+                "resolved_by_untrusted_count": resolved_by_untrusted_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "approval_gate.logs",
+            if approval_missing_log_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if approval_missing_log_count > 0 {
+                "Some historical approval rows do not have approval_gate_logs; newer request/reuse/reject/resolve paths log durable evidence."
+            } else {
+                "Approval requests, reuses, rejections, and resolutions have durable gate logs and append-only events."
+            },
+            json!({
+                "approval_count": approvals.len(),
+                "approval_gate_log_count": approval_gate_logs.len(),
+                "approval_event_count": approval_events.len(),
+                "approval_missing_log_count": approval_missing_log_count,
+            }),
+        );
+
+        let db_request_ids_with_resources = db_change_request_resources
+            .iter()
+            .filter_map(|resource| resource["db_change_request_id"].as_str())
+            .collect::<HashSet<_>>();
+        let db_requests_missing_resources = db_change_requests
+            .iter()
+            .filter(|request| {
+                request["id"]
+                    .as_str()
+                    .map(|id| !db_request_ids_with_resources.contains(id))
+                    .unwrap_or(true)
+            })
+            .count();
+        let db_authority_violations = db_change_requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["status"].as_str(),
+                    Some("approved" | "applied_externally" | "rolled_back_externally")
+                ) && request["approval_id"]
+                    .as_str()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+            })
+            .count();
+        let db_migration_request_ids = db_change_requests
+            .iter()
+            .filter_map(|request| request["migration_id"].as_str())
+            .collect::<HashSet<_>>();
+        let migration_missing_request_count = db_migrations
+            .iter()
+            .filter(|migration| {
+                migration["id"]
+                    .as_str()
+                    .map(|id| !db_migration_request_ids.contains(id))
+                    .unwrap_or(true)
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "production_sql.coordination_records",
+            if db_requests_missing_resources > 0 || migration_missing_request_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if db_requests_missing_resources > 0 {
+                "One or more DB change requests lack resource rows, so production SQL collision scope is unclear."
+            } else if migration_missing_request_count > 0 {
+                "Some historical DB migration proposals do not have linked DB change request records."
+            } else {
+                "Production SQL work is represented as local DB change requests, resource rows, and migration metadata only."
+            },
+            json!({
+                "db_change_request_count": db_change_requests.len(),
+                "db_change_request_resource_count": db_change_request_resources.len(),
+                "db_migration_count": db_migrations.len(),
+                "requests_missing_resources": db_requests_missing_resources,
+                "migrations_missing_request_count": migration_missing_request_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "production_sql.no_execution_authority",
+            if db_authority_violations > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if db_authority_violations > 0 {
+                "DB change requests reached approved/applied states without linked human approval."
+            } else {
+                "Production SQL coordination stores requests/proposals only; execution and approval remain outside agent MCP tools."
+            },
+            json!({
+                "db_authority_violation_count": db_authority_violations,
+                "db_coordination_event_count": db_coordination_events.len(),
+                "raw_sql_mcp_allowed": value_i64(&policy, "raw_sql_mcp_allowed"),
+                "sql_mcp_default": policy["sql_mcp_default"].clone(),
+            }),
+        );
+
+        let plan_items_missing_tasks = orchestration_plan_items
+            .iter()
+            .filter(|item| {
+                item["status"].as_str() == Some("task_created")
+                    && item["task_id"]
+                        .as_str()
+                        .map(|id| !task_ids.contains(id))
+                        .unwrap_or(true)
+            })
+            .count();
+        let accepted_assignments_missing_agent = orchestration_assignments
+            .iter()
+            .filter(|assignment| {
+                assignment["status"].as_str() == Some("accepted")
+                    && assignment["assigned_agent_id"]
+                        .as_str()
+                        .map(|id| id.trim().is_empty())
+                        .unwrap_or(true)
+            })
+            .count();
+        let orchestration_log_gap = (!orchestration_runs.is_empty()
+            || !orchestration_plan_items.is_empty()
+            || !orchestration_assignments.is_empty())
+            && orchestration_events.is_empty();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "local_orchestration.kernel_authority",
+            if plan_items_missing_tasks > 0 || accepted_assignments_missing_agent > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if plan_items_missing_tasks > 0 {
+                "Adopted orchestration plan items reference missing local tasks."
+            } else if accepted_assignments_missing_agent > 0 {
+                "Accepted orchestration assignments are missing local agent records."
+            } else {
+                "Local orchestration adopts plans into local tasks and agent records instead of bypassing kernel authority."
+            },
+            json!({
+                "orchestration_run_count": orchestration_runs.len(),
+                "plan_item_count": orchestration_plan_items.len(),
+                "assignment_count": orchestration_assignments.len(),
+                "plan_items_missing_tasks": plan_items_missing_tasks,
+                "accepted_assignments_missing_agent": accepted_assignments_missing_agent,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "local_orchestration.logs",
+            if orchestration_log_gap {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if orchestration_log_gap {
+                "Orchestration rows exist without orchestration_* events; newer run/import/adopt/reuse/assignment paths emit events."
+            } else {
+                "Local orchestration has append-only events for run creation, imports, adoptions, reuses, and assignments."
+            },
+            json!({
+                "orchestration_event_count": orchestration_events.len(),
+                "orchestration_run_count": orchestration_runs.len(),
+                "plan_item_count": orchestration_plan_items.len(),
+                "assignment_count": orchestration_assignments.len(),
+            }),
+        );
+
+        let ui_surface_log_gap =
+            ui_surface_logs.is_empty() || ui_surface_events.len() < ui_surface_logs.len();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "tauri_ui.surface_logs",
+            if ui_surface_log_gap {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if ui_surface_logs.is_empty() {
+                "No UI surface logs have been recorded yet; opening the Coordination panel should write refresh/audit events."
+            } else if ui_surface_events.len() < ui_surface_logs.len() {
+                "Some UI surface rows do not have matching append-only ui_surface_logged events."
+            } else {
+                "Tauri/UI surface actions are durably recorded and mirrored into append-only events."
+            },
+            json!({
+                "ui_surface_log_count": ui_surface_logs.len(),
+                "ui_surface_event_count": ui_surface_events.len(),
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "tauri_ui.snapshot_debug_surface",
+            "aligned",
+            "Coordination snapshot exposes UI logs, bloat audits, approvals, DB requests, orchestration rows, leases, violations, and events.",
+            json!({
+                "snapshot_sections": [
+                    "ui_surface_logs",
+                    "mcp_health_events",
+                    "mcp_client_mounts",
+                    "bloat_audits",
+                    "approval_gate_logs",
+                    "db_change_requests",
+                    "orchestration_runs",
+                    "workspace_changes",
+                    "open_workspace_violations",
+                    "events"
+                ]
+            }),
+        );
+
+        let latest_bloat_audit = bloat_audits.first();
+        let bloat_attention_count = bloat_audits
+            .iter()
+            .filter(|audit| audit["status"].as_str() == Some("attention_required"))
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "cleanup_bloat.audit_logs",
+            if bloat_audits.is_empty() {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if bloat_audits.is_empty() {
+                "No cleanup/bloat audit has been run yet; run the dry-run audit from the Coordination panel."
+            } else {
+                "Cleanup/bloat dry-run audits are durably recorded and mirrored into append-only events."
+            },
+            json!({
+                "bloat_audit_count": bloat_audits.len(),
+                "bloat_event_count": bloat_events.len(),
+                "attention_required_count": bloat_attention_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "cleanup_bloat.no_automatic_delete",
+            "aligned",
+            "Cleanup/bloat handling is audit-only here; unknown MCP files and worktrees are not deleted automatically.",
+            json!({
+                "latest_audit_id": latest_bloat_audit.and_then(|audit| audit["id"].as_str()),
+                "latest_status": latest_bloat_audit.and_then(|audit| audit["status"].as_str()),
+                "latest_unexpected_mcp_file_count": latest_bloat_audit
+                    .and_then(|audit| audit["unexpected_mcp_file_count"].as_i64())
+                    .unwrap_or(0),
+                "latest_unexpected_worktree_dir_count": latest_bloat_audit
+                    .and_then(|audit| audit["unexpected_worktree_dir_count"].as_i64())
+                    .unwrap_or(0),
             }),
         );
         record_alignment_check(
@@ -4132,6 +7790,164 @@ impl CoordinationKernel {
                 "root_repo_write_count": root_repo_violations,
             }),
         );
+        let untrusted_resolved_violation_count = all_workspace_violations
+            .iter()
+            .filter(|violation| {
+                matches!(
+                    violation["status"].as_str(),
+                    Some("resolved" | "overridden")
+                ) && !violation["details_json"]["human_actor"]
+                    .as_str()
+                    .map(is_trusted_memory_certifier)
+                    .unwrap_or(false)
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "violations.resolution_authority",
+            if untrusted_resolved_violation_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if untrusted_resolved_violation_count > 0 {
+                "Resolved or overridden workspace violations exist without trusted local UI/human attribution."
+            } else {
+                "Workspace violation resolution is restricted to trusted local UI/human actors and logged."
+            },
+            json!({
+                "workspace_violation_count": all_workspace_violations.len(),
+                "workspace_resolution_event_count": workspace_resolution_events.len(),
+                "untrusted_resolved_violation_count": untrusted_resolved_violation_count,
+            }),
+        );
+
+        let unleased_change_count = workspace_changes
+            .iter()
+            .filter(|change| change["lease_status"].as_str() == Some("unleased"))
+            .count();
+        let unleased_without_violation_count = workspace_changes
+            .iter()
+            .filter(|change| {
+                change["lease_status"].as_str() == Some("unleased")
+                    && change["violation_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+            })
+            .count();
+        let missing_change_event_count = workspace_changes
+            .len()
+            .saturating_sub(file_changed_events.len());
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "change_tracking.durable_logs",
+            if missing_change_event_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if missing_change_event_count > 0 {
+                "Some durable workspace_changes rows do not have matching recent file_changed events; inspect historical migrations or external writes."
+            } else {
+                "Workspace changes are recorded durably and mirrored into append-only file_changed events."
+            },
+            json!({
+                "workspace_change_count": workspace_changes.len(),
+                "file_changed_event_count": file_changed_events.len(),
+                "recent_scan_event_count": change_scan_events.len(),
+                "missing_change_event_count": missing_change_event_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "change_tracking.unleased_visibility",
+            if unleased_without_violation_count > 0 {
+                "violation"
+            } else {
+                "aligned"
+            },
+            if unleased_without_violation_count > 0 {
+                "One or more unleased workspace changes lack a linked workspace violation, so patch risk would be harder to debug."
+            } else if unleased_change_count > 0 {
+                "Unleased workspace changes are visible and linked to workspace violations."
+            } else {
+                "No unleased workspace changes are currently recorded."
+            },
+            json!({
+                "unleased_change_count": unleased_change_count,
+                "unleased_without_violation_count": unleased_without_violation_count,
+            }),
+        );
+
+        let running_watcher_count = file_watchers
+            .iter()
+            .filter(|watcher| watcher["status"].as_str() == Some("running"))
+            .count();
+        let watcher_error_count = file_watchers
+            .iter()
+            .filter(|watcher| {
+                watcher["status"].as_str() == Some("error")
+                    || watcher["last_error"]
+                        .as_str()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .count();
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "file_watcher.runtime",
+            if watcher_error_count > 0 {
+                "violation"
+            } else if !active_watcher_targets.is_empty() && running_watcher_count == 0 {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if watcher_error_count > 0 {
+                "The file watcher has an error state; unleased writes may only be detected by manual scans."
+            } else if !active_watcher_targets.is_empty() && running_watcher_count == 0 {
+                "Active worktree sessions exist, but no running file watcher is recorded."
+            } else if active_watcher_targets.is_empty() {
+                "No active worktree sessions need live file watching."
+            } else {
+                "A running file watcher is recorded for active worktree sessions."
+            },
+            json!({
+                "active_target_count": active_watcher_targets.len(),
+                "running_watcher_count": running_watcher_count,
+                "watcher_error_count": watcher_error_count,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "file_watcher.logs",
+            if file_watchers.is_empty() && file_watcher_events.is_empty() {
+                "warning"
+            } else {
+                "aligned"
+            },
+            if file_watchers.is_empty() && file_watcher_events.is_empty() {
+                "No file watcher runtime logs have been recorded yet; start the watcher or run a watcher scan to establish evidence."
+            } else {
+                "File watcher state and append-only file_watcher_* events are available for debugging."
+            },
+            json!({
+                "file_watcher_state_count": file_watchers.len(),
+                "file_watcher_event_count": file_watcher_events.len(),
+            }),
+        );
 
         for patch in &patch_rows {
             let status = patch["status"].as_str().unwrap_or("unknown");
@@ -4195,19 +8011,19 @@ impl CoordinationKernel {
             );
         }
 
-        let aligned_count = checks
+        let mut aligned_count = checks
             .iter()
             .filter(|check| check["status"].as_str() == Some("aligned"))
             .count();
-        let warning_count = checks
+        let mut warning_count = checks
             .iter()
             .filter(|check| check["status"].as_str() == Some("warning"))
             .count();
-        let violation_count = checks
+        let mut violation_count = checks
             .iter()
             .filter(|check| check["status"].as_str() == Some("violation"))
             .count();
-        let overall_status = if violation_count > 0 {
+        let mut overall_status = if violation_count > 0 {
             "violation"
         } else if warning_count > 0 {
             "warning"
@@ -4216,6 +8032,69 @@ impl CoordinationKernel {
         };
         let recent_events =
             self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 60", &[])?;
+
+        if let Err(error) = alignment::write_lifecycle(
+            &self.paths.repo_path,
+            context,
+            "alignment.report_generated",
+            overall_status,
+            "Alignment report generated for local coordination kernel audit.",
+            json!({
+                "aligned": aligned_count,
+                "warnings": warning_count,
+                "violations": violation_count,
+                "active_session_count": sessions.len(),
+                "worktree_count": worktrees.len(),
+                "file_watcher_count": file_watchers.len(),
+                "resource_count": resources.len(),
+                "artifact_count": artifacts.len(),
+                "artifact_storage_log_count": artifact_storage_logs.len(),
+                "memory_count": memories.len(),
+                "lease_conflict_count": lease_conflict_rows.len(),
+                "workspace_change_count": workspace_changes.len(),
+                "open_workspace_violation_count": open_violations.len(),
+                "task_dependency_count": task_dependencies.len(),
+                "approval_count": approvals.len(),
+                "approval_gate_log_count": approval_gate_logs.len(),
+                "db_change_request_count": db_change_requests.len(),
+                "db_migration_count": db_migrations.len(),
+                "orchestration_run_count": orchestration_runs.len(),
+                "orchestration_event_count": orchestration_events.len(),
+                "ui_surface_log_count": ui_surface_logs.len(),
+                "mcp_health_event_count": mcp_health_events.len(),
+                "mcp_client_mount_status": mcp_client_mounts["status"].clone(),
+                "bloat_audit_count": bloat_audits.len(),
+                "patch_count": patch_rows.len(),
+                "merge_job_count": merge_rows.len(),
+            }),
+        ) {
+            checks.push(alignment::check_entry(
+                context,
+                "alignment.report_log_write",
+                "warning",
+                format!("Unable to write alignment report lifecycle log: {error}"),
+                json!({"error": error}),
+            ));
+            aligned_count = checks
+                .iter()
+                .filter(|check| check["status"].as_str() == Some("aligned"))
+                .count();
+            warning_count = checks
+                .iter()
+                .filter(|check| check["status"].as_str() == Some("warning"))
+                .count();
+            violation_count = checks
+                .iter()
+                .filter(|check| check["status"].as_str() == Some("violation"))
+                .count();
+            overall_status = if violation_count > 0 {
+                "violation"
+            } else if warning_count > 0 {
+                "warning"
+            } else {
+                "aligned"
+            };
+        }
 
         Ok(api_ok(json!({
             "summary": {
@@ -4232,7 +8111,28 @@ impl CoordinationKernel {
             "cloud": cloud,
             "sessions": sessions,
             "worktrees": worktrees,
+            "file_watchers": file_watchers,
+            "active_file_watcher_targets": active_watcher_targets,
+            "resources": resources,
+            "artifacts": artifacts,
+            "artifact_storage_logs": artifact_storage_logs,
+            "memories": memories,
+            "lease_conflicts": lease_conflict_rows,
+            "workspace_changes": workspace_changes,
             "open_workspace_violations": open_violations,
+            "task_dependencies": task_dependencies,
+            "approvals": approvals,
+            "approval_gate_logs": approval_gate_logs,
+            "db_change_requests": db_change_requests,
+            "db_change_request_resources": db_change_request_resources,
+            "db_migrations": db_migrations,
+            "orchestration_runs": orchestration_runs,
+            "orchestration_plan_items": orchestration_plan_items,
+            "orchestration_assignments": orchestration_assignments,
+            "ui_surface_logs": ui_surface_logs,
+            "mcp_health_events": mcp_health_events,
+            "mcp_client_mounts": mcp_client_mounts,
+            "bloat_audits": bloat_audits,
             "patches": patch_rows,
             "merge_jobs": merge_rows,
             "events": recent_events,
@@ -4378,8 +8278,48 @@ impl CoordinationKernel {
         if !matches!(resolution, "resolved" | "overridden") {
             return Err("Resolution must be resolved or overridden.".to_string());
         }
-        if resolution == "overridden" && human_actor.trim().is_empty() {
-            return Err("Override requires a human_actor.".to_string());
+        let human_actor = non_empty(human_actor, "Human actor")?;
+        if !is_trusted_memory_certifier(human_actor) {
+            let _ = self.emit_event(
+                "workspace_violation_resolution_rejected",
+                "agent",
+                human_actor,
+                EventRefs::default(),
+                json!({
+                    "violation_id": violation_id,
+                    "resolution": resolution,
+                    "reason": "untrusted_actor"
+                }),
+            );
+            return Err(
+                "Workspace violation resolution requires a trusted local UI/human actor."
+                    .to_string(),
+            );
+        }
+        let violation = self.query_one(
+            "SELECT * FROM workspace_violations WHERE id=?1",
+            &[&violation_id],
+            "Workspace violation does not exist.",
+        )?;
+        if violation["status"].as_str() != Some("open") {
+            self.emit_event(
+                "workspace_violation_resolution_rejected",
+                "human",
+                human_actor,
+                EventRefs {
+                    task_id: violation["task_id"].as_str().map(str::to_string),
+                    agent_id: violation["agent_id"].as_str().map(str::to_string),
+                    session_id: violation["session_id"].as_str().map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "violation_id": violation_id,
+                    "resolution": resolution,
+                    "reason": "not_open",
+                    "existing_status": violation["status"].clone()
+                }),
+            )?;
+            return Err("Only open workspace violations can be resolved.".to_string());
         }
         self.conn
             .execute(
@@ -4391,7 +8331,12 @@ impl CoordinationKernel {
             "workspace_violation_resolved",
             "human",
             human_actor,
-            EventRefs::default(),
+            EventRefs {
+                task_id: violation["task_id"].as_str().map(str::to_string),
+                agent_id: violation["agent_id"].as_str().map(str::to_string),
+                session_id: violation["session_id"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
             json!({"violation_id": violation_id, "resolution": resolution, "reason": reason}),
         )?;
         Ok(api_ok(
@@ -4523,6 +8468,118 @@ impl CoordinationKernel {
         Ok(())
     }
 
+    fn mark_invalid_worktree_sessions_interrupted(&self) -> Result<(), String> {
+        let sessions = self.query_json(
+            "SELECT * FROM agent_sessions
+             WHERE status='active' AND enforcement_mode='worktree_required'",
+            &[],
+        )?;
+        for session in sessions {
+            let Some(session_id) = session["id"].as_str() else {
+                continue;
+            };
+            let Some(problem) = self.session_worktree_isolation_problem(&session)? else {
+                continue;
+            };
+            let _ = self.create_workspace_violation(
+                session["task_id"].as_str(),
+                session["agent_id"].as_str(),
+                Some(session_id),
+                session["worktree_id"].as_str(),
+                "invalid_worktree_isolation",
+                problem["path"].as_str(),
+                None,
+                "error",
+                json!({
+                    "reason": problem["reason"].clone(),
+                    "details": problem,
+                    "recovery_action": "session_interrupted",
+                }),
+            )?;
+            let _ = self.interrupt_session(session_id, "invalid_worktree_isolation_recovered")?;
+        }
+        Ok(())
+    }
+
+    fn session_worktree_isolation_problem(&self, session: &Value) -> Result<Option<Value>, String> {
+        let session_id = session["id"].as_str().unwrap_or("unknown");
+        let worktree_id = match session["worktree_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => value,
+            None => {
+                return Ok(Some(json!({
+                    "reason": "missing_worktree_id",
+                    "session_id": session_id,
+                    "path": session["write_root"].as_str(),
+                })));
+            }
+        };
+        let write_root = session["write_root"].as_str().unwrap_or("");
+        if write_root.trim().is_empty() {
+            return Ok(Some(json!({
+                "reason": "missing_write_root",
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+            })));
+        }
+        if same_path_text(write_root, &process_path_text(&self.paths.repo_path)) {
+            return Ok(Some(json!({
+                "reason": "write_root_is_control_repo",
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "path": write_root,
+            })));
+        }
+        if !path_text_under_path(write_root, &self.paths.worktrees_root) {
+            return Ok(Some(json!({
+                "reason": "write_root_outside_worktrees_root",
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "path": write_root,
+                "expected_root": process_path_text(&self.paths.worktrees_root),
+            })));
+        }
+        let worktree = match self.get_worktree(worktree_id) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                return Ok(Some(json!({
+                    "reason": "missing_worktree_record",
+                    "session_id": session_id,
+                    "worktree_id": worktree_id,
+                    "path": write_root,
+                    "error": error,
+                })));
+            }
+        };
+        let worktree_path = worktree["path"].as_str().unwrap_or("");
+        if !same_path_text(write_root, worktree_path) {
+            return Ok(Some(json!({
+                "reason": "session_write_root_mismatches_worktree_record",
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "path": write_root,
+                "recorded_path": worktree_path,
+            })));
+        }
+        let worktree_path = PathBuf::from(worktree_path);
+        match self.validate_git_worktree_path(
+            &worktree_path,
+            worktree["branch_name"].as_str().unwrap_or(""),
+        ) {
+            Ok(_) => Ok(None),
+            Err(error) => Ok(Some(json!({
+                "reason": "invalid_git_worktree",
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "path": process_path_text(&worktree_path),
+                "expected_branch": worktree["branch_name"].as_str(),
+                "error": error,
+            }))),
+        }
+    }
+
     fn ensure_agent_exists(&self, agent_id: &str) -> Result<(), String> {
         let exists: i64 = self
             .conn
@@ -4568,6 +8625,21 @@ impl CoordinationKernel {
         Ok(())
     }
 
+    fn ensure_session_owns_task(&self, session_id: &str, task_id: &str) -> Result<(), String> {
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        match task["claimed_session_id"].as_str() {
+            Some(claimed) if !claimed.is_empty() && claimed == session_id => Ok(()),
+            Some(claimed) if !claimed.is_empty() => {
+                Err("Task is claimed by another session.".to_string())
+            }
+            _ => Err("Task must be claimed by this session first.".to_string()),
+        }
+    }
+
     pub fn create_or_reuse_worktree_for_slot(&self, agent_slot_id: &str) -> Result<Value, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
@@ -4579,8 +8651,9 @@ impl CoordinationKernel {
         let base_sha = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
-        let branch = format!("agent/{slot_key}");
-        let path = self.paths.worktrees_root.join(slot_key);
+        let mut branch = format!("agent/{slot_key}");
+        let stable_path = self.paths.worktrees_root.join(slot_key);
+        let mut path = stable_path.clone();
 
         if let Some(existing_id) = slot["worktree_id"]
             .as_str()
@@ -4588,13 +8661,13 @@ impl CoordinationKernel {
         {
             if let Ok(existing) = self.get_worktree(existing_id) {
                 let existing_path = PathBuf::from(existing["path"].as_str().unwrap_or_default());
-                if !same_path_text(
-                    &process_path_text(&existing_path),
-                    &process_path_text(&path),
-                ) || !path_text_under_path(
-                    &process_path_text(&existing_path),
-                    &self.paths.worktrees_root,
-                ) {
+                let existing_path_text = process_path_text(&existing_path);
+                let existing_branch = existing["branch_name"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(branch.as_str())
+                    .to_string();
+                if !path_text_under_path(&existing_path_text, &self.paths.worktrees_root) {
                     self.emit_event(
                         "worktree_reuse_failed",
                         "kernel",
@@ -4607,51 +8680,62 @@ impl CoordinationKernel {
                         json!({
                             "slot_key": slot_key,
                             "recorded_path": existing["path"],
-                            "expected_path": process_path_text(&path),
-                            "reason": "recorded_worktree_path_is_not_slot_stable"
+                            "expected_root": process_path_text(&self.paths.worktrees_root),
+                            "reason": "recorded_worktree_path_escapes_worktrees_root"
                         }),
                     )?;
-                    return Err(format!(
-                        "Recorded worktree path for slot {slot_key} is not the stable slot path: {}",
-                        existing_path.display()
-                    ));
-                }
-                if existing_path.exists() {
-                    self.conn
-                        .execute(
-                            "UPDATE worktrees SET status='active', current_sha=?1, updated_at=?2 WHERE id=?3",
-                            params![base_sha, now_rfc3339(), existing_id],
-                        )
-                        .map_err(|error| format!("Unable to refresh worktree: {error}"))?;
-                    self.emit_event(
-                        "worktree_reused",
-                        "kernel",
-                        REPO_ID,
-                        EventRefs {
-                            agent_id: Some(agent_id.to_string()),
-                            agent_slot_id: Some(agent_slot_id.to_string()),
-                            ..EventRefs::default()
-                        },
-                        json!({"slot_key": slot_key, "worktree_id": existing_id, "path": existing["path"]}),
-                    )?;
-                    return Ok(json!({
-                        "id": existing_id,
-                        "agentId": agent_id,
-                        "agentSlotId": agent_slot_id,
-                        "slotKey": slot_key,
-                        "path": existing["path"],
-                        "branchName": existing["branch_name"],
-                        "baseSha": existing["base_sha"],
-                        "status": "active",
-                    }));
-                }
-            }
-        }
-
-        if path.exists() {
-            match run_git(&path, &["rev-parse", "--is-inside-work-tree"]) {
-                Ok(value) if value.trim() == "true" => {}
-                _ => {
+                } else if existing_path.exists() {
+                    if let Err(error) =
+                        self.validate_git_worktree_path(&existing_path, &existing_branch)
+                    {
+                        self.emit_event(
+                            "worktree_reuse_failed",
+                            "kernel",
+                            REPO_ID,
+                            EventRefs {
+                                agent_id: Some(agent_id.to_string()),
+                                agent_slot_id: Some(agent_slot_id.to_string()),
+                                ..EventRefs::default()
+                            },
+                            json!({
+                                "slot_key": slot_key,
+                                "worktree_id": existing_id,
+                                "path": process_path_text(&existing_path),
+                                "branch_name": existing_branch.clone(),
+                                "reason": "recorded_worktree_path_is_not_valid",
+                                "error": error,
+                            }),
+                        )?;
+                    } else {
+                        self.conn
+                            .execute(
+                                "UPDATE worktrees SET status='active', current_sha=?1, updated_at=?2 WHERE id=?3",
+                                params![base_sha, now_rfc3339(), existing_id],
+                            )
+                            .map_err(|error| format!("Unable to refresh worktree: {error}"))?;
+                        self.emit_event(
+                            "worktree_reused",
+                            "kernel",
+                            REPO_ID,
+                            EventRefs {
+                                agent_id: Some(agent_id.to_string()),
+                                agent_slot_id: Some(agent_slot_id.to_string()),
+                                ..EventRefs::default()
+                            },
+                            json!({"slot_key": slot_key, "worktree_id": existing_id, "path": existing["path"], "branch_name": existing_branch.clone()}),
+                        )?;
+                        return Ok(json!({
+                            "id": existing_id,
+                            "agentId": agent_id,
+                            "agentSlotId": agent_slot_id,
+                            "slotKey": slot_key,
+                            "path": existing["path"],
+                            "branchName": existing_branch,
+                            "baseSha": existing["base_sha"],
+                            "status": "active",
+                        }));
+                    }
+                } else {
                     self.emit_event(
                         "worktree_reuse_failed",
                         "kernel",
@@ -4661,15 +8745,56 @@ impl CoordinationKernel {
                             agent_slot_id: Some(agent_slot_id.to_string()),
                             ..EventRefs::default()
                         },
-                        json!({"slot_key": slot_key, "path": process_path_text(&path), "reason": "stable_path_exists_but_is_not_git_worktree"}),
+                        json!({
+                            "slot_key": slot_key,
+                            "worktree_id": existing_id,
+                            "path": process_path_text(&existing_path),
+                            "branch_name": existing_branch,
+                            "reason": "recorded_worktree_path_missing"
+                        }),
                     )?;
-                    return Err(format!(
-                        "Stable worktree path already exists but is not a usable git worktree: {}",
-                        path.display()
-                    ));
+                    self.prune_stale_git_worktrees_for_slot(
+                        slot_key,
+                        &agent_id,
+                        agent_slot_id,
+                        "recorded_worktree_path_missing",
+                    )?;
                 }
             }
-        } else {
+        }
+
+        if path.exists() {
+            if let Err(error) = self.validate_git_worktree_path(&path, &branch) {
+                self.emit_event(
+                    "worktree_reuse_failed",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: Some(agent_slot_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "slot_key": slot_key,
+                        "path": process_path_text(&path),
+                        "branch_name": branch.clone(),
+                        "reason": "stable_path_exists_but_is_not_valid_slot_worktree",
+                        "error": error,
+                    }),
+                )?;
+                let replacement = self.next_isolated_worktree_target(slot_key)?;
+                path = replacement.0;
+                branch = replacement.1;
+            }
+        }
+
+        if !path.exists() {
+            self.prune_stale_git_worktrees_for_slot(
+                slot_key,
+                &agent_id,
+                agent_slot_id,
+                "before_worktree_add",
+            )?;
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("Unable to create worktree root: {error}"))?;
@@ -4690,9 +8815,52 @@ impl CoordinationKernel {
                         agent_slot_id: Some(agent_slot_id.to_string()),
                         ..EventRefs::default()
                     },
-                    json!({"slot_key": slot_key, "path": path_string, "branch_name": branch, "error": error}),
+                    json!({
+                        "slot_key": slot_key,
+                        "path": path_string,
+                        "branch_name": branch.clone(),
+                        "error": error.clone(),
+                        "will_retry_after_prune": true
+                    }),
                 )?;
-                return Err(error);
+                self.prune_stale_git_worktrees_for_slot(
+                    slot_key,
+                    &agent_id,
+                    agent_slot_id,
+                    "worktree_add_failed_retry_prune",
+                )?;
+                if let Err(retry_error) = run_git(&self.paths.repo_path, &args) {
+                    self.emit_event(
+                        "worktree_create_failed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: Some(agent_slot_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "slot_key": slot_key,
+                            "path": path_string,
+                            "branch_name": branch,
+                            "first_error": error,
+                            "retry_error": retry_error,
+                            "reason": "retry_after_prune_failed"
+                        }),
+                    )?;
+                    return Err(retry_error);
+                }
+                self.emit_event(
+                    "worktree_create_recovered_after_prune",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: Some(agent_slot_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({"slot_key": slot_key, "path": path_string, "branch_name": branch}),
+                )?;
             }
         }
         let canonical_worktree = path.canonicalize().unwrap_or(path);
@@ -4794,6 +8962,50 @@ impl CoordinationKernel {
         }))
     }
 
+    fn next_isolated_worktree_target(&self, slot_key: &str) -> Result<(PathBuf, String), String> {
+        for _ in 0..32 {
+            let suffix = uuid()
+                .chars()
+                .filter(|ch| *ch != '-')
+                .take(8)
+                .collect::<String>();
+            let path = self.paths.worktrees_root.join(format!("{slot_key}-{suffix}"));
+            let branch = format!("agent/{slot_key}-{suffix}");
+            if path.exists() || self.branch_exists(&branch)? {
+                continue;
+            }
+            return Ok((path, branch));
+        }
+
+        Err(format!(
+            "Unable to allocate a free isolated worktree path for slot {slot_key}."
+        ))
+    }
+
+    fn prune_stale_git_worktrees_for_slot(
+        &self,
+        slot_key: &str,
+        agent_id: &str,
+        agent_slot_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        run_git(&self.paths.repo_path, &["worktree", "prune"]).map_err(|error| {
+            format!("Unable to prune stale git worktree metadata before isolated launch: {error}")
+        })?;
+        self.emit_event(
+            "worktree_stale_registry_pruned",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: Some(agent_slot_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({"slot_key": slot_key, "reason": reason}),
+        )?;
+        Ok(())
+    }
+
     pub fn create_worktree_for_session(
         &self,
         agent_id: &str,
@@ -4848,17 +9060,80 @@ impl CoordinationKernel {
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, String> {
+        let safe_directory = format!(
+            "safe.directory={}",
+            git_safe_directory_value(&self.paths.repo_path)
+        );
+        let branch_ref = format!("refs/heads/{branch}");
         let status = Command::new("git")
             .current_dir(PathBuf::from(process_path_text(&self.paths.repo_path)))
             .args([
+                "-c",
+                safe_directory.as_str(),
                 "show-ref",
                 "--verify",
                 "--quiet",
-                &format!("refs/heads/{branch}"),
+                branch_ref.as_str(),
             ])
             .status()
             .map_err(|error| format!("Unable to inspect git branches: {error}"))?;
         Ok(status.success())
+    }
+
+    fn validate_git_worktree_path(
+        &self,
+        worktree_path: &Path,
+        expected_branch: &str,
+    ) -> Result<(), String> {
+        if !worktree_path.exists() {
+            return Err(format!(
+                "Recorded worktree path is missing: {}",
+                worktree_path.display()
+            ));
+        }
+        let canonical_worktree = worktree_path.canonicalize().map_err(|error| {
+            format!(
+                "Unable to canonicalize worktree path {}: {error}",
+                worktree_path.display()
+            )
+        })?;
+        let canonical_worktrees_root = self
+            .paths
+            .worktrees_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.paths.worktrees_root.clone());
+        if !canonical_worktree.starts_with(&canonical_worktrees_root) {
+            return Err(format!(
+                "Worktree path escapes .agents/worktrees: {}",
+                canonical_worktree.display()
+            ));
+        }
+        let inside = run_git(&canonical_worktree, &["rev-parse", "--is-inside-work-tree"])?;
+        if inside.trim() != "true" {
+            return Err(format!(
+                "Worktree path is not inside a git worktree: {}",
+                canonical_worktree.display()
+            ));
+        }
+        let top_level = run_git(&canonical_worktree, &["rev-parse", "--show-toplevel"])?;
+        if !same_path_text(top_level.trim(), &process_path_text(&canonical_worktree)) {
+            return Err(format!(
+                "Git top-level {} does not match recorded worktree path {}.",
+                top_level.trim(),
+                canonical_worktree.display()
+            ));
+        }
+        let expected_branch = expected_branch.trim();
+        if !expected_branch.is_empty() {
+            let actual_branch = run_git(&canonical_worktree, &["branch", "--show-current"])?;
+            if actual_branch.trim() != expected_branch {
+                return Err(format!(
+                    "Worktree branch mismatch: expected {expected_branch}, found {}.",
+                    actual_branch.trim()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn get_worktree(&self, worktree_id: &str) -> Result<Value, String> {
@@ -4904,35 +9179,320 @@ impl CoordinationKernel {
         bytes: &[u8],
         metadata: Value,
     ) -> Result<String, String> {
-        let safe_relative = relative_path.replace('\\', "/");
-        reject_path_escape(&safe_relative)?;
-        let path = self.paths.artifacts_root.join(&safe_relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Unable to create artifact directory: {error}"))?;
-        }
-        fs::write(&path, bytes)
-            .map_err(|error| format!("Unable to write artifact {}: {error}", path.display()))?;
         let id = uuid();
         let hash = sha256_hex(bytes);
-        self.conn
-            .execute(
-                "INSERT INTO artifacts(id, task_id, agent_id, artifact_kind, path, content_hash, size_bytes, metadata_json, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    id,
+        let agent_slot_id = agent_id
+            .and_then(|value| self.artifact_agent_slot_id(value).ok())
+            .flatten();
+        let path = match self.artifact_target_path(relative_path, &hash) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = self.record_artifact_storage_log(ArtifactStorageLogInput {
+                    artifact_id: None,
                     task_id,
                     agent_id,
+                    agent_slot_id: agent_slot_id.as_deref(),
                     artifact_kind,
-                    path.display().to_string(),
-                    hash,
-                    bytes.len() as i64,
-                    metadata.to_string(),
-                    now_rfc3339()
+                    requested_path: relative_path,
+                    stored_path: None,
+                    content_hash: Some(&hash),
+                    size_bytes: Some(bytes.len() as i64),
+                    status: "rejected",
+                    action: "path_rejected",
+                    error: Some(&error),
+                    metadata: metadata.clone(),
+                });
+                return Err(error);
+            }
+        };
+        let wrote_file = !path.exists();
+        if wrote_file {
+            if let Err(error) = write_bytes_atomic(&path, bytes) {
+                let _ = self.record_artifact_storage_log(ArtifactStorageLogInput {
+                    artifact_id: None,
+                    task_id,
+                    agent_id,
+                    agent_slot_id: agent_slot_id.as_deref(),
+                    artifact_kind,
+                    requested_path: relative_path,
+                    stored_path: Some(&path),
+                    content_hash: Some(&hash),
+                    size_bytes: Some(bytes.len() as i64),
+                    status: "failed",
+                    action: "file_write_failed",
+                    error: Some(&error),
+                    metadata: metadata.clone(),
+                });
+                return Err(error);
+            }
+        } else {
+            let existing = match fs::read(&path) {
+                Ok(existing) => existing,
+                Err(error) => {
+                    let error = format!(
+                        "Unable to read existing artifact {}: {error}",
+                        path.display()
+                    );
+                    let _ = self.record_artifact_storage_log(ArtifactStorageLogInput {
+                        artifact_id: None,
+                        task_id,
+                        agent_id,
+                        agent_slot_id: agent_slot_id.as_deref(),
+                        artifact_kind,
+                        requested_path: relative_path,
+                        stored_path: Some(&path),
+                        content_hash: Some(&hash),
+                        size_bytes: Some(bytes.len() as i64),
+                        status: "failed",
+                        action: "existing_read_failed",
+                        error: Some(&error),
+                        metadata: metadata.clone(),
+                    });
+                    return Err(error);
+                }
+            };
+            if sha256_hex(&existing) != hash {
+                let error = "Existing artifact path has different content.".to_string();
+                let _ = self.record_artifact_storage_log(ArtifactStorageLogInput {
+                    artifact_id: None,
+                    task_id,
+                    agent_id,
+                    agent_slot_id: agent_slot_id.as_deref(),
+                    artifact_kind,
+                    requested_path: relative_path,
+                    stored_path: Some(&path),
+                    content_hash: Some(&hash),
+                    size_bytes: Some(bytes.len() as i64),
+                    status: "failed",
+                    action: "existing_hash_mismatch",
+                    error: Some(&error),
+                    metadata: metadata.clone(),
+                });
+                return Err(error);
+            }
+        }
+
+        self.begin_immediate_transaction("store artifact")?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "INSERT INTO artifacts(
+                        id, task_id, agent_id, agent_slot_id, artifact_kind, path,
+                        content_hash, size_bytes, metadata_json, created_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        id,
+                        task_id,
+                        agent_id,
+                        agent_slot_id.as_deref(),
+                        artifact_kind,
+                        path.display().to_string(),
+                        hash,
+                        bytes.len() as i64,
+                        metadata.to_string(),
+                        now_rfc3339()
+                    ],
+                )
+                .map_err(|error| format!("Unable to record artifact: {error}"))?;
+            self.record_artifact_storage_log(ArtifactStorageLogInput {
+                artifact_id: Some(&id),
+                task_id,
+                agent_id,
+                agent_slot_id: agent_slot_id.as_deref(),
+                artifact_kind,
+                requested_path: relative_path,
+                stored_path: Some(&path),
+                content_hash: Some(&hash),
+                size_bytes: Some(bytes.len() as i64),
+                status: "stored",
+                action: if wrote_file {
+                    "file_written"
+                } else {
+                    "file_reused"
+                },
+                error: None,
+                metadata: metadata.clone(),
+            })?;
+            self.emit_event(
+                "artifact_stored",
+                if agent_id.is_some() { "agent" } else { "kernel" },
+                agent_id.unwrap_or(REPO_ID),
+                EventRefs {
+                    task_id: task_id.map(str::to_string),
+                    agent_id: agent_id.map(str::to_string),
+                    agent_slot_id: agent_slot_id.clone(),
+                    artifact_id: Some(id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({"artifact_kind": artifact_kind, "path": path.display().to_string(), "content_hash": hash, "size_bytes": bytes.len()}),
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = self.finish_transaction(result, "store artifact") {
+            if wrote_file {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(error);
+        }
+
+        Ok(id)
+    }
+
+    fn record_artifact_storage_log(
+        &self,
+        input: ArtifactStorageLogInput<'_>,
+    ) -> Result<String, String> {
+        let id = uuid();
+        let stored_path_text = input.stored_path.map(process_path_text);
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO artifact_storage_logs(
+                    id, artifact_id, repo_id, task_id, agent_id, agent_slot_id, artifact_kind,
+                    requested_path, stored_path, content_hash, size_bytes, status, action,
+                    error, metadata_json, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    id,
+                    input.artifact_id,
+                    REPO_ID,
+                    input.task_id,
+                    input.agent_id,
+                    input.agent_slot_id,
+                    input.artifact_kind,
+                    input.requested_path,
+                    stored_path_text.as_deref(),
+                    input.content_hash,
+                    input.size_bytes,
+                    input.status,
+                    input.action,
+                    input.error,
+                    input.metadata.to_string(),
+                    now
                 ],
             )
-            .map_err(|error| format!("Unable to record artifact: {error}"))?;
+            .map_err(|error| format!("Unable to record artifact storage log: {error}"))?;
+        let event_type = match input.status {
+            "stored" if input.action == "file_reused" => "artifact_storage_reused",
+            "stored" => "artifact_storage_logged",
+            "rejected" | "failed" => "artifact_storage_failed",
+            _ => "artifact_storage_logged",
+        };
+        self.emit_event(
+            event_type,
+            if input.agent_id.is_some() {
+                "agent"
+            } else {
+                "kernel"
+            },
+            input.agent_id.unwrap_or(REPO_ID),
+            EventRefs {
+                task_id: input.task_id.map(str::to_string),
+                agent_id: input.agent_id.map(str::to_string),
+                agent_slot_id: input.agent_slot_id.map(str::to_string),
+                artifact_id: input.artifact_id.map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "artifact_storage_log_id": id.clone(),
+                "artifact_id": input.artifact_id,
+                "artifact_kind": input.artifact_kind,
+                "requested_path": input.requested_path,
+                "stored_path": stored_path_text,
+                "content_hash": input.content_hash,
+                "size_bytes": input.size_bytes,
+                "status": input.status,
+                "action": input.action,
+                "error": input.error,
+            }),
+        )?;
         Ok(id)
+    }
+
+    fn artifact_target_path(
+        &self,
+        relative_path: &str,
+        content_hash: &str,
+    ) -> Result<PathBuf, String> {
+        let safe_relative = relative_path.replace('\\', "/");
+        reject_path_escape(&safe_relative)?;
+        let requested = self.paths.artifacts_root.join(&safe_relative);
+        if !path_text_under_path(&process_path_text(&requested), &self.paths.artifacts_root) {
+            return Err("Artifact path escapes .agents/artifacts.".to_string());
+        }
+        if requested.is_dir() {
+            return Err("Artifact path points to a directory.".to_string());
+        }
+        if !requested.exists() {
+            return Ok(requested);
+        }
+
+        let existing = fs::read(&requested).map_err(|error| {
+            format!(
+                "Unable to read existing artifact {}: {error}",
+                requested.display()
+            )
+        })?;
+        if sha256_hex(&existing) == content_hash {
+            return Ok(requested);
+        }
+
+        for _ in 0..32 {
+            let candidate = suffixed_path(&requested, &uuid()[..8]);
+            if !candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Err("Unable to allocate unique artifact path.".to_string())
+    }
+
+    fn artifact_agent_slot_id(&self, agent_id: &str) -> Result<Option<String>, String> {
+        let rows = self.query_json(
+            "SELECT agent_slot_id
+             FROM agent_sessions
+             WHERE agent_id=?1 AND status='active' AND agent_slot_id IS NOT NULL
+             ORDER BY updated_at DESC
+             LIMIT 2",
+            &[&agent_id],
+        )?;
+        if rows.len() == 1 {
+            return Ok(rows[0]["agent_slot_id"].as_str().map(str::to_string));
+        }
+        Ok(None)
+    }
+
+    fn begin_immediate_transaction(&self, context: &str) -> Result<(), String> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| format!("Unable to begin {context} transaction: {error}"))
+    }
+
+    fn commit_transaction(&self, context: &str) -> Result<(), String> {
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("Unable to commit {context} transaction: {error}"))
+    }
+
+    fn rollback_transaction_quiet(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
+    fn finish_transaction<T>(&self, result: Result<T, String>, context: &str) -> Result<T, String> {
+        match result {
+            Ok(value) => {
+                if let Err(error) = self.commit_transaction(context) {
+                    self.rollback_transaction_quiet();
+                    Err(error)
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(error) => {
+                self.rollback_transaction_quiet();
+                Err(error)
+            }
+        }
     }
 
     fn query_one(
@@ -5039,6 +9599,48 @@ struct ChangedFile {
     untracked: bool,
 }
 
+fn is_coordination_owned_root_status_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".gitignore"
+        || normalized == ".agents"
+        || normalized.starts_with(".agents/")
+        || normalized == "logs"
+        || normalized.starts_with("logs/")
+        || normalized == "logs/coordination-alignment.jsonl"
+}
+
+struct WorkspaceChangeInput<'a> {
+    task_id: Option<&'a str>,
+    agent_id: Option<&'a str>,
+    agent_slot_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    worktree_id: Option<&'a str>,
+    change_source: &'a str,
+    path: &'a str,
+    resource_key: &'a str,
+    change_kind: &'a str,
+    lease: Option<&'a Value>,
+    violation_id: Option<&'a str>,
+    summary: Option<&'a str>,
+    details: Value,
+}
+
+struct ArtifactStorageLogInput<'a> {
+    artifact_id: Option<&'a str>,
+    task_id: Option<&'a str>,
+    agent_id: Option<&'a str>,
+    agent_slot_id: Option<&'a str>,
+    artifact_kind: &'a str,
+    requested_path: &'a str,
+    stored_path: Option<&'a Path>,
+    content_hash: Option<&'a str>,
+    size_bytes: Option<i64>,
+    status: &'a str,
+    action: &'a str,
+    error: Option<&'a str>,
+    metadata: Value,
+}
+
 fn non_empty<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -5087,6 +9689,144 @@ fn is_retryable_event_insert_error(error: &rusqlite::Error) -> bool {
     }
 }
 
+fn mcp_command_can_be_spawned(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return false;
+    }
+    let path = Path::new(command);
+    if path.is_absolute() || command.contains('/') || command.contains('\\') {
+        path.exists()
+    } else {
+        true
+    }
+}
+
+fn probe_mcp_stdio(command: &str, args: &[String]) -> Value {
+    if command.trim().is_empty() {
+        return json!({
+            "responded": false,
+            "status": "missing_command",
+            "error": "MCP command is empty.",
+            "tool_count": 0,
+        });
+    }
+
+    let mut child = match Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return json!({
+                "responded": false,
+                "status": "spawn_failed",
+                "error": error.to_string(),
+                "tool_count": 0,
+            });
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let request = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+        );
+        if let Err(error) = stdin.write_all(request.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return json!({
+                "responded": false,
+                "status": "write_failed",
+                "error": error.to_string(),
+                "tool_count": 0,
+            });
+        }
+    }
+
+    let started_at = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started_at.elapsed() < Duration::from_secs(3) => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return json!({
+                    "responded": false,
+                    "status": "timeout",
+                    "error": "MCP stdio probe timed out.",
+                    "tool_count": 0,
+                });
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return json!({
+                    "responded": false,
+                    "status": "wait_failed",
+                    "error": error.to_string(),
+                    "tool_count": 0,
+                });
+            }
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            return json!({
+                "responded": false,
+                "status": "read_failed",
+                "error": error.to_string(),
+                "tool_count": 0,
+            });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut initialize_responded = false;
+    let mut tools_list_responded = false;
+    let mut tool_count = 0usize;
+
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match message["id"].as_i64() {
+            Some(1) if message["result"]["serverInfo"]["name"].as_str().is_some() => {
+                initialize_responded = true;
+            }
+            Some(2) => {
+                tools_list_responded = message["result"]["tools"].as_array().is_some();
+                tool_count = message["result"]["tools"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    let responded = initialize_responded && tools_list_responded && tool_count > 0;
+    json!({
+        "responded": responded,
+        "status": if responded { "responded" } else { "invalid_response" },
+        "initialize_responded": initialize_responded,
+        "tools_list_responded": tools_list_responded,
+        "tool_count": tool_count,
+        "exit_code": output.status.code(),
+        "stderr": if stderr.is_empty() { Value::Null } else { Value::String(stderr) },
+    })
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let bytes = run_git_bytes(cwd, args)?;
     String::from_utf8(bytes).map_err(|error| format!("Git output was not UTF-8: {error}"))
@@ -5099,9 +9839,14 @@ fn repo_has_git(repo_path: &Path) -> bool {
 }
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let safe_directory = format!("safe.directory={}", git_safe_directory_value(cwd));
+    let mut git_args = Vec::with_capacity(args.len() + 2);
+    git_args.push("-c".to_string());
+    git_args.push(safe_directory);
+    git_args.extend(args.iter().map(|arg| (*arg).to_string()));
     let output = Command::new("git")
         .current_dir(PathBuf::from(process_path_text(cwd)))
-        .args(args)
+        .args(&git_args)
         .output()
         .map_err(|error| format!("Unable to run git {}: {error}", args.join(" ")))?;
 
@@ -5114,6 +9859,11 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+fn git_safe_directory_value(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    process_path_text(&canonical).replace('\\', "/")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -5313,6 +10063,38 @@ fn slug(value: &str) -> String {
     }
 }
 
+fn normalize_task_dependency_kind(value: Option<&str>) -> String {
+    let normalized = value.map(safe_id).unwrap_or_default();
+    match normalized.as_str() {
+        "" | "finish-before-start" => "finish_before_start".to_string(),
+        "blocks" => "blocks".to_string(),
+        "requires" => "requires".to_string(),
+        "review-before-start" => "review_before_start".to_string(),
+        _ => normalized.replace('-', "_"),
+    }
+}
+
+fn task_dependency_satisfied_status(status: &str) -> bool {
+    matches!(
+        status,
+        "done" | "completed" | "merged" | "cancelled" | "skipped"
+    )
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    let filename = if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        format!("{stem}_{suffix}.{extension}")
+    } else {
+        format!("{stem}_{suffix}")
+    };
+    parent.join(filename)
+}
+
 fn normalize_memory_kind(value: &str) -> String {
     match value {
         "decision" | "contract" | "handoff" | "bug" | "migration" | "qa" | "run_summary" => {
@@ -5326,6 +10108,45 @@ fn normalize_memory_kind(value: &str) -> String {
         "runs" => "run_summary".to_string(),
         _ => "decision".to_string(),
     }
+}
+
+fn normalize_trust_level(value: Option<&str>) -> Result<String, String> {
+    let trust_level = value.unwrap_or("draft").trim().to_ascii_lowercase();
+    match trust_level.as_str() {
+        "" | "draft" => Ok("draft".to_string()),
+        "certified" => Ok("certified".to_string()),
+        _ => Err("Memory trust_level must be draft or certified.".to_string()),
+    }
+}
+
+fn is_trusted_memory_certifier(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value == "local" || value.starts_with("ui:") || value.starts_with("human:")
+}
+
+fn db_change_kind_destructive(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "remove_table"
+            | "drop_table"
+            | "remove_column"
+            | "drop_column"
+            | "remove_index"
+            | "drop_index"
+            | "remove_constraint"
+            | "drop_constraint"
+            | "remove_enum"
+            | "drop_enum"
+            | "remove_view"
+            | "drop_view"
+            | "remove_function"
+            | "drop_function"
+            | "rename_table"
+            | "rename_column"
+            | "rollback"
+            | "truncate"
+            | "delete_data"
+    )
 }
 
 fn memory_directory(kind: &str) -> &'static str {
@@ -5419,6 +10240,24 @@ fn normalize_path_for_compare(value: &str) -> String {
     }
 }
 
+fn normalize_change_path(value: &str) -> Result<String, String> {
+    reject_path_escape(value)?;
+    let normalized = value.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err("Changed path escapes the worktree root.".to_string()),
+            _ => parts.push(part),
+        }
+    }
+    let path = parts.join("/");
+    if path.is_empty() {
+        return Err("Changed path is required.".to_string());
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, process::Command};
@@ -5489,6 +10328,64 @@ mod tests {
     }
 
     #[test]
+    fn storage_and_schema_migration_logging_is_persisted() {
+        let repo = temp_repo("storage_logging");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let storage_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='kernel_storage_opened'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(storage_events.len(), 1);
+        let payload = &storage_events[0]["payload_json"];
+        assert_eq!(payload["wal_enabled"].as_bool(), Some(true));
+        assert_eq!(payload["foreign_keys_enabled"].as_bool(), Some(true));
+        assert_eq!(payload["busy_timeout_ms"].as_i64(), Some(30_000));
+        assert!(
+            payload["paths"]["ensured_directory_count"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(payload["migrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|migration| migration["name"].as_str() == Some("coordination_kernel_initial")));
+
+        let migration_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('schema_migration_applied', 'schema_migration_checked', 'schema_migration_ensured')",
+                &[],
+            )
+            .unwrap();
+        assert!(migration_events
+            .iter()
+            .any(|event| event["payload_json"]["name"].as_str()
+                == Some("coordination_kernel_runtime_guards")));
+
+        let migration_rows = kernel
+            .query_json("SELECT * FROM schema_migrations ORDER BY version", &[])
+            .unwrap();
+        assert!(migration_rows
+            .iter()
+            .any(|row| row["version"].as_i64() == Some(1)));
+        assert!(migration_rows
+            .iter()
+            .any(|row| row["version"].as_i64() == Some(3)));
+        assert!(migration_rows
+            .iter()
+            .any(|row| row["version"].as_i64() == Some(5)));
+
+        if alignment::is_enabled() {
+            let log = fs::read_to_string(alignment::log_path(&repo)).unwrap();
+            assert!(log.contains("\"event\":\"kernel.initialized\""));
+        }
+    }
+
+    #[test]
     fn repo_policy_gate_rejects_unsafe_downgrades() {
         let repo = temp_repo("policy_gate");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -5550,6 +10447,13 @@ mod tests {
         );
 
         assert!(second.unwrap_err().contains("slot_busy"));
+        let busy_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='agent_slot_busy'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(busy_events.len(), 1);
         let active = kernel
             .query_json(
                 "SELECT * FROM agent_sessions WHERE agent_slot_id=?1 AND status='active'",
@@ -5557,6 +10461,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn slot_busy_repairs_missing_active_session_pointer() {
+        let repo = init_git_repo("slot_busy_pointer_repair");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .create_session_for_slot_key(
+                "codex-01",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("workspace-terminal-test-0-codex"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let slot_id = first["agentSlotId"].as_str().unwrap();
+        let session_id = first["id"].as_str().unwrap();
+        kernel
+            .conn
+            .execute(
+                "UPDATE agent_slots SET active_session_id=NULL WHERE id=?1",
+                params![slot_id],
+            )
+            .unwrap();
+
+        let second = kernel.create_session_for_slot_key(
+            "codex-01",
+            "Codex",
+            "codex",
+            None,
+            None,
+            Some("workspace-terminal-test-1-codex"),
+            true,
+            None,
+            None,
+        );
+        assert!(second.unwrap_err().contains("slot_busy"));
+        let slot = kernel.get_agent_slot_by_id(slot_id).unwrap();
+        assert_eq!(slot["active_session_id"].as_str(), Some(session_id));
     }
 
     #[test]
@@ -5627,6 +10574,8 @@ mod tests {
             let log_path =
                 PathBuf::from(report["data"]["summary"]["log"]["path"].as_str().unwrap());
             assert!(log_path.exists());
+            let log = fs::read_to_string(log_path).unwrap();
+            assert!(log.contains("\"event\":\"alignment.report_generated\""));
         }
     }
 
@@ -5673,6 +10622,7 @@ mod tests {
             "db_classify_sql",
             "db_request_approval",
             "request_approval",
+            "request_merge",
         ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
@@ -5680,7 +10630,6 @@ mod tests {
         }
         for prompt_gated_tool in [
             "submit_patch",
-            "request_merge",
             "resolve_workspace_violation",
             "db_query_readonly",
             "db_propose_migration",
@@ -5694,6 +10643,86 @@ mod tests {
                 "[mcp_servers.coordination-kernel.tools.{prompt_gated_tool}]"
             )));
         }
+    }
+
+    #[test]
+    fn local_mcp_surface_lists_request_merge_and_keeps_violation_resolution_trusted() {
+        let repo = temp_repo("mcp_surface");
+        let _kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let tools = crate::coordination::mcp::TOOL_NAMES;
+        assert!(tools.contains(&"request_merge"));
+        assert!(!tools.contains(&"resolve_workspace_violation"));
+        assert!(!tools.contains(&"apply_merge"));
+
+        let response = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext::default(),
+            "resolve_workspace_violation",
+            json!({
+                "repo_path": process_path_text(&repo),
+                "violation_id": "v1",
+                "resolution": "resolved",
+                "human_actor": "human:test"
+            }),
+        );
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(response["error"]["code"].as_str(), Some("unknown_tool"));
+        let allowed = response["error"]["details"]["allowed_tools"]
+            .as_array()
+            .unwrap();
+        assert!(allowed
+            .iter()
+            .any(|tool| tool.as_str() == Some("request_merge")));
+        assert!(!allowed
+            .iter()
+            .any(|tool| tool.as_str() == Some("resolve_workspace_violation")));
+    }
+
+    #[test]
+    fn agent_mcp_tool_call_records_client_mount_proof() {
+        let repo = temp_repo("mcp_client_mount");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
+        let slot_key = session["slotKey"].as_str().map(str::to_string);
+
+        let initial = kernel.mcp_client_mount_summary().unwrap();
+        assert_eq!(initial["status"].as_str(), Some("not_seen"));
+
+        let response = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id.clone()),
+                agent_slot_id,
+                slot_key,
+                session_id: Some(session_id.clone()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "get_brief",
+            json!({}),
+        );
+        assert_eq!(response["ok"].as_bool(), Some(true));
+
+        let summary = kernel.mcp_client_mount_summary().unwrap();
+        assert_eq!(summary["status"].as_str(), Some("confirmed"));
+        assert_eq!(summary["confirmed_session_count"].as_u64(), Some(1));
+        assert_eq!(summary["mounts"][0]["status"].as_str(), Some("confirmed"));
+
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='mcp_agent_tool_called' AND session_id=?1",
+                &[&session_id],
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["payload_json"]["details"]["tool"].as_str(),
+            Some("get_brief")
+        );
     }
 
     #[test]
@@ -5712,6 +10741,474 @@ mod tests {
         let task_id = task["id"].as_str().unwrap();
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
         assert!(kernel.claim_task(task_id, agent_id, session_id).is_err());
+    }
+
+    #[test]
+    fn task_dependencies_block_claim_until_satisfied_and_log() {
+        let repo = temp_repo("task_dependencies");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let prerequisite = kernel
+            .create_task("Prerequisite", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let dependent = kernel
+            .create_task("Dependent", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let prerequisite_id = prerequisite["id"].as_str().unwrap();
+        let dependent_id = dependent["id"].as_str().unwrap();
+
+        kernel
+            .add_task_dependency(dependent_id, prerequisite_id, None)
+            .unwrap();
+        let blocked = kernel
+            .claim_task(dependent_id, agent_id, session_id)
+            .unwrap();
+        assert_eq!(blocked["ok"].as_bool(), Some(false));
+        assert_eq!(blocked["error"]["code"].as_str(), Some("task_blocked"));
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&dependent_id],
+                "missing task",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("blocked"));
+        assert!(
+            !kernel.list_task_dependencies(Some(dependent_id)).unwrap()["data"]
+                ["blocking_dependencies"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        kernel
+            .conn
+            .execute(
+                "UPDATE tasks SET status='merged', updated_at=?1 WHERE id=?2",
+                params![now_rfc3339(), prerequisite_id],
+            )
+            .unwrap();
+        kernel.refresh_dependent_tasks(prerequisite_id).unwrap();
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&dependent_id],
+                "missing task",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("ready"));
+        let claimed = kernel
+            .claim_task(dependent_id, agent_id, session_id)
+            .unwrap();
+        assert_eq!(claimed["status"].as_str(), Some("claimed"));
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('task_dependency_created', 'task_blocked', 'task_dependency_satisfied', 'task_unblocked')",
+                &[],
+            )
+            .unwrap();
+        for event_type in [
+            "task_dependency_created",
+            "task_blocked",
+            "task_dependency_satisfied",
+            "task_unblocked",
+        ] {
+            assert!(events
+                .iter()
+                .any(|event| event["event_type"].as_str() == Some(event_type)));
+        }
+    }
+
+    #[test]
+    fn task_dependency_cycles_are_rejected_and_logged() {
+        let repo = temp_repo("task_dependency_cycle");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .create_task("First", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let second = kernel
+            .create_task("Second", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+
+        kernel
+            .add_task_dependency(first_id, second_id, Some("requires"))
+            .unwrap();
+        let reused = kernel
+            .add_task_dependency(first_id, second_id, Some("requires"))
+            .unwrap();
+        assert_eq!(reused["reused"].as_bool(), Some(true));
+        assert!(kernel
+            .add_task_dependency(second_id, first_id, Some("requires"))
+            .is_err());
+        let rejected = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='task_dependency_rejected'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rejected.len(), 1);
+        let report = kernel.get_alignment_report().unwrap();
+        assert!(report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |check| check["check"].as_str() == Some("task_dependencies.graph_integrity")
+                    && check["status"].as_str() == Some("aligned")
+            ));
+    }
+
+    #[test]
+    fn task_scoped_changes_require_session_claim() {
+        let repo = temp_repo("task_scope");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+
+        assert!(kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .is_err());
+        assert!(kernel
+            .announce_change(
+                task_id,
+                agent_id,
+                session_id,
+                vec!["src/a.js".to_string()],
+                None
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn announce_change_records_durable_changes_events_and_unleased_violations() {
+        let repo = temp_repo("change_tracking_manual");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Track changes", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/leased.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+
+        let response = kernel
+            .announce_change(
+                task_id,
+                agent_id,
+                session_id,
+                vec!["src/leased.js".to_string(), "src/unleased.js".to_string()],
+                Some("manual progress update"),
+            )
+            .unwrap();
+        assert_eq!(response["ok"].as_bool(), Some(true));
+        assert_eq!(response["warnings"].as_array().unwrap().len(), 1);
+
+        let changes = kernel
+            .list_workspace_changes(
+                Some(task_id),
+                Some(agent_id),
+                Some(session_id),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let rows = changes["data"]["changes"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|change| {
+            change["path"].as_str() == Some("src/leased.js")
+                && change["lease_status"].as_str() == Some("covered")
+        }));
+        assert!(rows.iter().any(|change| {
+            change["path"].as_str() == Some("src/unleased.js")
+                && change["lease_status"].as_str() == Some("unleased")
+                && change["violation_id"].as_str().is_some()
+        }));
+
+        let file_changed_events = kernel
+            .query_json("SELECT * FROM events WHERE event_type='file_changed'", &[])
+            .unwrap();
+        assert_eq!(file_changed_events.len(), 2);
+        let violations = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations WHERE violation_kind='unleased_write'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(violations.len(), 1);
+
+        let report = kernel.get_alignment_report().unwrap();
+        assert!(report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| {
+                check["check"].as_str() == Some("change_tracking.unleased_visibility")
+                    && check["status"].as_str() == Some("aligned")
+            }));
+    }
+
+    #[test]
+    fn workspace_violation_resolution_requires_trusted_actor_and_logs() {
+        let repo = temp_repo("violation_resolution");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let violation_id = kernel
+            .create_workspace_violation(
+                None,
+                None,
+                None,
+                None,
+                "manual_block",
+                Some("src.txt"),
+                Some("file:src.txt"),
+                "error",
+                json!({}),
+            )
+            .unwrap();
+
+        assert!(kernel
+            .resolve_workspace_violation(
+                &violation_id,
+                "resolved",
+                "Agent attempted to resolve.",
+                "agent:codex",
+            )
+            .is_err());
+        let rejected_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='workspace_violation_resolution_rejected'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rejected_events.len(), 1);
+        let still_open = kernel
+            .query_one(
+                "SELECT status FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(still_open["status"].as_str(), Some("open"));
+
+        let resolved = kernel
+            .resolve_workspace_violation(
+                &violation_id,
+                "resolved",
+                "Reviewed in local UI.",
+                "human:reviewer",
+            )
+            .unwrap();
+        assert_eq!(resolved["data"]["status"].as_str(), Some("resolved"));
+        let row = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(row["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            row["details_json"]["human_actor"].as_str(),
+            Some("human:reviewer")
+        );
+        assert!(kernel
+            .resolve_workspace_violation(
+                &violation_id,
+                "overridden",
+                "Already handled.",
+                "human:reviewer",
+            )
+            .is_err());
+        let report = kernel.get_alignment_report().unwrap();
+        assert!(report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| {
+                check["check"].as_str() == Some("violations.resolution_authority")
+                    && check["status"].as_str() == Some("aligned")
+            }));
+    }
+
+    #[test]
+    fn scan_workspace_changes_records_git_status_changes_and_scan_logs() {
+        let repo = init_git_repo("change_tracking_scan");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, Some("pty-change-scan"), true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Scan changes", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        fs::write(write_root.join("src.txt"), "changed\n").unwrap();
+
+        let scan = kernel.scan_workspace_changes().unwrap();
+        assert_eq!(scan["ok"].as_bool(), Some(true));
+        assert_eq!(scan["data"]["scanner"].as_str(), Some("git_status"));
+        assert!(!scan["data"]["changes"].as_array().unwrap().is_empty());
+
+        let changes = kernel
+            .query_json(
+                "SELECT * FROM workspace_changes WHERE change_source='watcher_scan'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["path"].as_str(), Some("src.txt"));
+        assert_eq!(changes[0]["lease_status"].as_str(), Some("unleased"));
+        assert!(changes[0]["violation_id"].as_str().is_some());
+        let scan_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('change_scan_started', 'change_scan_finished')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(scan_events.len(), 2);
+    }
+
+    #[test]
+    fn file_watcher_runtime_start_stop_and_manual_scan_are_logged() {
+        let repo = init_git_repo("file_watcher_runtime");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, Some("pty-file-watcher"), true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Watch changes", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        let started = crate::coordination::watcher::start_file_watcher(
+            &kernel,
+            Some(json!({"debounce_ms": 100, "refresh_ms": 1000})),
+        )
+        .unwrap();
+        assert_eq!(started["data"]["status"].as_str(), Some("running"));
+        assert!(!started["data"]["watched_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let status = crate::coordination::watcher::file_watcher_status(&kernel).unwrap();
+        assert_eq!(
+            status["data"]["runtime"]["status"].as_str(),
+            Some("running")
+        );
+        let manual_scan = crate::coordination::watcher::scan_known_violations(&kernel).unwrap();
+        assert_eq!(manual_scan["ok"].as_bool(), Some(true));
+
+        let stopped = crate::coordination::watcher::stop_file_watcher(&kernel).unwrap();
+        assert_eq!(stopped["data"]["status"].as_str(), Some("stopped"));
+        let watcher_rows = kernel
+            .query_json("SELECT * FROM file_watchers", &[])
+            .unwrap();
+        assert_eq!(watcher_rows.len(), 1);
+        assert_eq!(watcher_rows[0]["status"].as_str(), Some("stopped"));
+
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type LIKE 'file_watcher_%'",
+                &[],
+            )
+            .unwrap();
+        for event_type in [
+            "file_watcher_started",
+            "file_watcher_manual_scan_started",
+            "file_watcher_manual_scan_finished",
+            "file_watcher_stopped",
+        ] {
+            assert!(events
+                .iter()
+                .any(|event| event["event_type"].as_str() == Some(event_type)));
+        }
+    }
+
+    #[test]
+    fn lease_rejects_path_escape_and_unknown_mode() {
+        let repo = temp_repo("lease_validation");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        assert!(kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:../secret.txt",
+                "write",
+                Some(100),
+                None,
+            )
+            .is_err());
+        assert!(kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/a.js",
+                "pretend_write",
+                Some(100),
+                None,
+            )
+            .is_err());
     }
 
     #[test]
@@ -5758,6 +11255,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session["status"].as_str(), Some("interrupted"));
+    }
+
+    #[test]
+    fn recovery_interrupts_active_session_with_missing_worktree_path() {
+        let repo = init_git_repo("missing_worktree_recovery");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(
+                agent_id,
+                None,
+                Some("pty-missing-worktree"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let worktree_path = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        fs::remove_dir_all(&worktree_path).unwrap();
+        drop(kernel);
+
+        let recovered = CoordinationKernel::init(&repo, None).unwrap();
+        let session = recovered
+            .query_one(
+                "SELECT status FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(session["status"].as_str(), Some("interrupted"));
+        let violations = recovered
+            .query_json(
+                "SELECT * FROM workspace_violations WHERE session_id=?1 AND violation_kind='invalid_worktree_isolation'",
+                &[&session_id],
+            )
+            .unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["severity"].as_str(), Some("error"));
+        let events = recovered
+            .query_json(
+                "SELECT * FROM events WHERE event_type='agent_interrupted' AND session_id=?1",
+                &[&session_id],
+            )
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event["payload_json"]["reason"].as_str()
+                == Some("invalid_worktree_isolation_recovered")));
     }
 
     #[test]
@@ -5910,6 +11457,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(conflict["ok"].as_bool(), Some(false));
+        let blockers = conflict["error"]["details"]["blockers"].as_array().unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(
+            blockers[0]["mode_conflict_reason"].as_str(),
+            Some("write_like_modes_conflict")
+        );
+        assert_eq!(
+            blockers[0]["resource_conflict_reason"].as_str(),
+            Some("glob_covers_file")
+        );
+        let conflict_rows = kernel
+            .query_json("SELECT * FROM lease_conflicts", &[])
+            .unwrap();
+        assert_eq!(conflict_rows.len(), 1);
+        let detector_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='lease_conflict_detected'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(detector_events.len(), 1);
+        assert_eq!(
+            detector_events[0]["payload_json"]["resource_conflict_reason"].as_str(),
+            Some("glob_covers_file")
+        );
+        let resources = kernel.list_resources(None, None).unwrap();
+        assert!(resources["data"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["resource_key"].as_str() == Some("file:src/a.js")));
     }
 
     #[test]
@@ -5934,15 +11512,530 @@ mod tests {
         let run_id = run["data"]["run_id"].as_str().unwrap();
         let plan = json!({"items": [{"title": "Slice A", "role": "architect"}]});
         kernel.import_orchestration_plan(run_id, &plan).unwrap();
+        let second_import = kernel.import_orchestration_plan(run_id, &plan).unwrap();
+        assert_eq!(second_import["data"]["reused"].as_bool(), Some(true));
+        assert_eq!(
+            kernel
+                .query_json(
+                    "SELECT * FROM orchestration_plan_items WHERE run_id=?1",
+                    &[&run_id]
+                )
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(kernel
             .query_json("SELECT * FROM tasks", &[])
             .unwrap()
             .is_empty());
         kernel.adopt_orchestration_plan(run_id).unwrap();
+        let second_adopt = kernel.adopt_orchestration_plan(run_id).unwrap();
+        assert_eq!(second_adopt["data"]["reused"].as_bool(), Some(true));
         assert_eq!(
             kernel.query_json("SELECT * FROM tasks", &[]).unwrap().len(),
             1
         );
+        let first_assignments = kernel.propose_agent_assignments(run_id).unwrap();
+        let second_assignments = kernel.propose_agent_assignments(run_id).unwrap();
+        assert_eq!(
+            first_assignments["data"]["assignment_ids"],
+            second_assignments["data"]["assignment_ids"]
+        );
+        assert_eq!(
+            kernel
+                .query_json(
+                    "SELECT * FROM orchestration_agent_assignments WHERE run_id=?1",
+                    &[&run_id]
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let adopted_assignment_id = first_assignments["data"]["assignment_ids"][0]
+            .as_str()
+            .unwrap();
+        kernel
+            .adopt_agent_assignment(adopted_assignment_id)
+            .unwrap();
+        let reused_assignment = kernel
+            .adopt_agent_assignment(adopted_assignment_id)
+            .unwrap();
+        assert_eq!(reused_assignment["data"]["reused"].as_bool(), Some(true));
+        let orchestration_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN (
+                    'orchestration_run_created',
+                    'orchestration_plan_imported',
+                    'orchestration_plan_reused',
+                    'orchestration_plan_adopted',
+                    'orchestration_plan_adoption_reused',
+                    'orchestration_assignments_proposed',
+                    'orchestration_assignments_reused',
+                    'orchestration_assignment_adopted',
+                    'orchestration_assignment_reused'
+                )",
+                &[],
+            )
+            .unwrap();
+        assert!(orchestration_events.len() >= 9);
+        let report = kernel.get_alignment_report().unwrap();
+        for check_name in [
+            "local_orchestration.kernel_authority",
+            "local_orchestration.logs",
+        ] {
+            assert!(report["data"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| {
+                    check["check"].as_str() == Some(check_name)
+                        && check["status"].as_str() == Some("aligned")
+                }));
+        }
+    }
+
+    #[test]
+    fn artifact_storage_is_rooted_and_does_not_overwrite_different_content() {
+        let repo = temp_repo("artifact_storage");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        assert!(kernel
+            .write_artifact(None, None, "test", "../escape.txt", b"nope", json!({}))
+            .is_err());
+
+        let first_id = kernel
+            .write_artifact(None, None, "test", "runs/evidence.txt", b"one", json!({}))
+            .unwrap();
+        let second_id = kernel
+            .write_artifact(None, None, "test", "runs/evidence.txt", b"two", json!({}))
+            .unwrap();
+        let first = kernel.get_artifact(&first_id).unwrap();
+        let second = kernel.get_artifact(&second_id).unwrap();
+        let first_path = PathBuf::from(first["path"].as_str().unwrap());
+        let second_path = PathBuf::from(second["path"].as_str().unwrap());
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(fs::read(&first_path).unwrap(), b"one");
+        assert_eq!(fs::read(&second_path).unwrap(), b"two");
+        let storage_logs = kernel
+            .query_json(
+                "SELECT * FROM artifact_storage_logs ORDER BY created_at ASC",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(storage_logs.len(), 3);
+        assert!(storage_logs.iter().any(|log| {
+            log["status"].as_str() == Some("rejected")
+                && log["action"].as_str() == Some("path_rejected")
+        }));
+        assert_eq!(
+            storage_logs
+                .iter()
+                .filter(|log| log["status"].as_str() == Some("stored"))
+                .count(),
+            2
+        );
+        let storage_events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('artifact_storage_logged', 'artifact_storage_failed')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(storage_events.len(), 3);
+        let report = kernel.get_alignment_report().unwrap();
+        assert!(report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| {
+                check["check"].as_str() == Some("artifact_storage.logs")
+                    && check["status"].as_str() == Some("aligned")
+            }));
+    }
+
+    #[test]
+    fn certified_memory_requires_evidence_or_trusted_ui_certifier() {
+        let repo = temp_repo("memory_certification");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        assert!(kernel
+            .write_memory(
+                "decision",
+                "No proof",
+                "body",
+                Some("certified"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(kernel
+            .write_memory(
+                "decision",
+                "Bad proof",
+                "body",
+                Some("certified"),
+                None,
+                Some("missing-artifact"),
+                None,
+                None,
+                None,
+            )
+            .is_err());
+
+        let artifact_id = kernel
+            .write_artifact(
+                None,
+                None,
+                "evidence",
+                "memory/evidence.txt",
+                b"proof",
+                json!({}),
+            )
+            .unwrap();
+        let memory = kernel
+            .write_memory(
+                "decision",
+                "With proof",
+                "Certified body",
+                Some("certified"),
+                None,
+                Some(&artifact_id),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(memory["data"]["memory_kind"].as_str(), Some("decision"));
+        let ui_memory = kernel
+            .write_memory(
+                "decision",
+                "UI proof",
+                "Certified by UI",
+                Some("certified"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:reviewer"),
+            )
+            .unwrap();
+        assert_eq!(ui_memory["ok"].as_bool(), Some(true));
+        let rejected = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='memory_write_rejected'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rejected.len(), 2);
+        let certified = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type='memory_certified'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(certified.len(), 2);
+        let memories = kernel
+            .query_json("SELECT * FROM memories ORDER BY created_at ASC", &[])
+            .unwrap();
+        assert_eq!(memories.len(), 2);
+        for memory in &memories {
+            assert!(PathBuf::from(memory["body_path"].as_str().unwrap()).exists());
+        }
+        let report = kernel.get_alignment_report().unwrap();
+        for check_name in ["memory.body_files", "memory.certification", "memory.logs"] {
+            assert!(report["data"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| {
+                    check["check"].as_str() == Some(check_name)
+                        && check["status"].as_str() == Some("aligned")
+                }));
+        }
+    }
+
+    #[test]
+    fn approval_gate_requires_claim_and_trusted_resolution() {
+        let repo = temp_repo("approval_gate");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Needs approval", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        assert!(kernel
+            .request_approval(task_id, agent_id, None, "merge", "please", None)
+            .is_err());
+
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        let approval = kernel
+            .request_approval(
+                task_id,
+                agent_id,
+                Some(session_id),
+                "merge",
+                "please",
+                Some("safe after review"),
+            )
+            .unwrap();
+        let reused = kernel
+            .request_approval(
+                task_id,
+                agent_id,
+                Some(session_id),
+                "merge",
+                "please again",
+                None,
+            )
+            .unwrap();
+        assert_eq!(reused["data"]["reused"].as_bool(), Some(true));
+
+        let approval_id = approval["data"]["approval_id"].as_str().unwrap();
+        assert!(kernel
+            .resolve_approval(approval_id, "approved", "agent-fake", None)
+            .is_err());
+        let resolved = kernel
+            .resolve_approval(approval_id, "approved", "human:reviewer", None)
+            .unwrap();
+        assert_eq!(resolved["data"]["status"].as_str(), Some("approved"));
+        assert!(kernel
+            .resolve_approval(approval_id, "denied", "human:reviewer", None)
+            .is_err());
+        let logs = kernel
+            .query_json("SELECT * FROM approval_gate_logs", &[])
+            .unwrap();
+        assert!(logs.iter().any(|log| {
+            log["action"].as_str() == Some("request") && log["status"].as_str() == Some("rejected")
+        }));
+        assert!(logs.iter().any(|log| {
+            log["approval_id"].as_str() == Some(approval_id)
+                && log["action"].as_str() == Some("request")
+                && log["status"].as_str() == Some("pending")
+        }));
+        assert!(logs.iter().any(|log| {
+            log["approval_id"].as_str() == Some(approval_id)
+                && log["action"].as_str() == Some("resolve")
+                && log["status"].as_str() == Some("approved")
+        }));
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('approval_request_rejected', 'approval_request_reused', 'approval_resolution_rejected', 'approval_granted')",
+                &[],
+            )
+            .unwrap();
+        assert!(events.len() >= 4);
+    }
+
+    #[test]
+    fn ui_surface_and_cleanup_bloat_logs_are_durable() {
+        let repo = temp_repo("ui_cleanup_logs");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let ui_log = kernel
+            .log_ui_surface_event(&json!({
+                "surface": "coordination_workspace",
+                "action": "refresh",
+                "status": "succeeded",
+                "command_name": "coordination_get_snapshot",
+                "details": {"taskCount": 0}
+            }))
+            .unwrap();
+        assert_eq!(ui_log["ok"].as_bool(), Some(true));
+
+        fs::write(kernel.paths.mcp_root.join("session-123.json"), "{}").unwrap();
+        fs::create_dir_all(kernel.paths.worktrees_root.join("codex-01-session")).unwrap();
+        let audit = kernel.cleanup_bloat_dry_run().unwrap();
+        assert_eq!(audit["ok"].as_bool(), Some(true));
+        assert_eq!(audit["data"]["status"].as_str(), Some("attention_required"));
+        assert_eq!(
+            audit["data"]["unexpected_mcp_files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            audit["data"]["unexpected_worktree_dirs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            kernel
+                .query_json("SELECT * FROM coordination_ui_surface_logs", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            kernel
+                .query_json("SELECT * FROM coordination_bloat_audits", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('ui_surface_logged', 'coordination_bloat_audit_started', 'coordination_bloat_audit_finished')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        let snapshot = kernel.get_snapshot().unwrap();
+        assert_eq!(
+            snapshot["data"]["ui_surface_logs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            snapshot["data"]["bloat_audits"].as_array().unwrap().len(),
+            1
+        );
+
+        let report = kernel.get_alignment_report().unwrap();
+        for check_name in [
+            "tauri_ui.surface_logs",
+            "tauri_ui.snapshot_debug_surface",
+            "cleanup_bloat.audit_logs",
+            "cleanup_bloat.no_automatic_delete",
+        ] {
+            assert!(report["data"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| {
+                    check["check"].as_str() == Some(check_name)
+                        && check["status"].as_str() == Some("aligned")
+                }));
+        }
+    }
+
+    #[test]
+    fn production_sql_change_requests_require_db_leases_and_human_approval() {
+        let repo = temp_repo("prod_sql_coordination");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({
+                "repo_has_sql": true,
+                "sql_engine": "postgres",
+                "sql_mcp_default": "proposal_only"
+            }))
+            .unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Add timezone", None, 0, 2, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        let missing_lease = kernel
+            .db_request_change(&json!({
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "change_kind": "add_column",
+                "title": "Add users.timezone",
+                "summary": "Add nullable timezone column.",
+                "resources": [{"resource_key": "db:table:users", "operation": "alter"}]
+            }))
+            .unwrap();
+        assert_eq!(missing_lease["ok"].as_bool(), Some(false));
+        assert_eq!(
+            missing_lease["error"]["code"].as_str(),
+            Some("db_lease_required")
+        );
+
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "db:table:users",
+                "db_plan",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        let request = kernel
+            .db_request_change(&json!({
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "change_kind": "add_column",
+                "title": "Add users.timezone",
+                "summary": "Add nullable timezone column.",
+                "resources": [
+                    {"resource_key": "db:table:users", "operation": "alter"},
+                    {"resource_key": "db:column:users.timezone", "operation": "add"}
+                ],
+                "production_impact": "No expected downtime.",
+                "rollback_summary": "Drop the column before use."
+            }))
+            .unwrap();
+        assert_eq!(request["ok"].as_bool(), Some(true));
+        let request_id = request["data"]["db_change_request_id"].as_str().unwrap();
+        assert_eq!(request["data"]["destructive"].as_bool(), Some(false));
+
+        let approval = kernel
+            .db_request_approval(
+                request_id,
+                agent_id,
+                Some(session_id),
+                Some("Please review additive SQL."),
+                None,
+            )
+            .unwrap();
+        let approval_id = approval["data"]["approval_id"].as_str().unwrap();
+        kernel
+            .resolve_approval(approval_id, "approved", "human:reviewer", None)
+            .unwrap();
+        let stored = kernel
+            .query_one(
+                "SELECT status, approval_id FROM db_change_requests WHERE id=?1",
+                &[&request_id],
+                "missing request",
+            )
+            .unwrap();
+        assert_eq!(stored["status"].as_str(), Some("approved"));
+        assert_eq!(stored["approval_id"].as_str(), Some(approval_id));
+
+        let events = kernel
+            .query_json(
+                "SELECT * FROM events WHERE event_type IN ('db_change_request_rejected', 'db_change_requested', 'db_change_review_requested', 'db_change_approved')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(events.len(), 4);
+        let report = kernel.get_alignment_report().unwrap();
+        for check_name in [
+            "production_sql.coordination_records",
+            "production_sql.no_execution_authority",
+            "approval_gate.trusted_resolution",
+            "approval_gate.logs",
+        ] {
+            assert!(report["data"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| {
+                    check["check"].as_str() == Some(check_name)
+                        && check["status"].as_str() == Some("aligned")
+                }));
+        }
     }
 
     #[test]
@@ -5980,6 +12073,62 @@ mod tests {
             response["error"]["code"].as_str(),
             Some("patch_validation_failed")
         );
+    }
+
+    #[test]
+    fn dirty_project_root_blocks_patch_submission() {
+        let repo = init_git_repo("dirty_root_blocks_patch");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src.txt",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(repo.join("src.txt"), "direct root change\n").unwrap();
+        fs::write(write_root.join("src.txt"), "branch change\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("dirty root"),
+            )
+            .unwrap();
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(
+            response["error"]["details"]["violations"][0]["violation_kind"].as_str(),
+            Some("direct_project_root_write")
+        );
+        let violations = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations WHERE violation_kind='direct_project_root_write'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(violations.len(), 1);
     }
 
     #[test]
@@ -6028,5 +12177,31 @@ mod tests {
             response["data"]["validation_status"].as_str(),
             Some("passed")
         );
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&task_id],
+                "missing task",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("patch_submitted"));
+
+        let patch_id = response["data"]["patch_id"].as_str().unwrap();
+        kernel
+            .create_workspace_violation(
+                Some(task_id),
+                Some(agent_id),
+                Some(session_id),
+                Some(worktree_id),
+                "manual_block",
+                Some("src.txt"),
+                Some("file:src.txt"),
+                "error",
+                json!({}),
+            )
+            .unwrap();
+        let merge = kernel.request_merge(patch_id, None, None).unwrap();
+        assert_eq!(merge["ok"].as_bool(), Some(false));
+        assert_eq!(merge["error"]["code"].as_str(), Some("merge_blocked"));
     }
 }

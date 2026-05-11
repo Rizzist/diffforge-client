@@ -63,6 +63,30 @@ impl TerminalCoordinationContext {
                 self.write_root.clone(),
             ),
             (
+                "COORDINATION_PROJECT_ROOT".to_string(),
+                self.repo_path.clone(),
+            ),
+            (
+                "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+                self.write_root.clone(),
+            ),
+            (
+                "COORDINATION_MERGE_TARGET_ROOT".to_string(),
+                self.repo_path.clone(),
+            ),
+            (
+                "COORDINATION_SHELL_CWD_POLICY".to_string(),
+                "project_root_visible_branch_root_editable".to_string(),
+            ),
+            (
+                "COORDINATION_SHELL_CWD_IS_PROJECT_ROOT".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "COORDINATION_DIRECT_PROJECT_ROOT_WRITES_POLICY".to_string(),
+                "block_patch_and_merge".to_string(),
+            ),
+            (
                 "COORDINATION_ENFORCEMENT_MODE".to_string(),
                 self.enforcement_mode.clone(),
             ),
@@ -158,8 +182,17 @@ impl TerminalCoordinationContext {
         let workspace = self.workspace_id.as_deref().unwrap_or("none");
         let slot = self.slot_key.as_deref().unwrap_or("none");
         let worktree = self.worktree_path.as_deref().unwrap_or(&self.write_root);
+        let branch = self
+            .slot_key
+            .as_deref()
+            .map(|slot_key| format!("agent/{slot_key}"))
+            .unwrap_or_else(|| "none".to_string());
         let mut banner = format!(
-            "COORDINATION ENABLED\nYou are in an isolated worktree.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nRole: {}\nOrchestration Run: {}\nMCP config: {}\nWorktree: {}\nThis slot reuses the same MCP config and worktree across sessions.\nCoordinator MCP: always on\nCloud Orchestrator: {}\nDo not edit the shared repo root directly.\nBefore editing:\n1. call get_brief\n2. claim_task\n3. search_memory for relevant decisions/contracts/handoffs\n4. post_plan\n5. acquire_lease for files/symbols/db resources\n6. edit only inside COORDINATION_WORKTREE_PATH\n7. write contract/handoff memory if another agent depends on your work\n8. submit_patch when done\nDo not merge directly. The kernel merge gate applies accepted patches.\n",
+            "COORDINATION ENABLED\nProject root: {}\nAgent branch: {}\nAgent branch root: {}\nMerge target root: {}\nShell cwd is the project root for orientation; the editable checkout is COORDINATION_AGENT_BRANCH_ROOT.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nRole: {}\nOrchestration Run: {}\nMCP config: {}\nThis slot reuses the same MCP config and branch root across sessions.\nCoordinator MCP: always on\nCloud Orchestrator: {}\nDo not edit the shared project root directly. Direct project-root writes are policy violations and block patch/merge.\nBefore editing:\n1. call get_brief immediately so the kernel records MCP client mount proof\n2. claim_task\n3. search_memory for relevant decisions/contracts/handoffs\n4. post_plan\n5. acquire_lease for files/symbols/db resources\n6. edit only inside COORDINATION_AGENT_BRANCH_ROOT\n7. write contract/handoff memory if another agent depends on your work\n8. submit_patch when done\nDo not merge directly. The user applies accepted patches through the local merge gate.\n",
+            self.repo_path,
+            branch,
+            worktree,
+            self.repo_path,
             self.agent_id,
             slot,
             self.session_id,
@@ -169,7 +202,6 @@ impl TerminalCoordinationContext {
             role,
             run,
             self.mcp_config_path,
-            worktree,
             cloud
         );
 

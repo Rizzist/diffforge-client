@@ -313,7 +313,7 @@ export default function VaultWorkspaceView({
             </PanelTopline>
             <MetricGrid>
               <Metric><span>Sessions</span><strong>{sessions.length}</strong></Metric>
-              <Metric><span>Worktrees</span><strong>{worktrees.length}</strong></Metric>
+              <Metric><span>Agent branches</span><strong>{worktrees.length}</strong></Metric>
               <Metric><span>Leases</span><strong>{leases.length}</strong></Metric>
               <Metric><span>Violations</span><strong>{violations.length}</strong></Metric>
               <Metric><span>Patches</span><strong>{patches.length}</strong></Metric>
@@ -327,7 +327,7 @@ export default function VaultWorkspaceView({
               <strong>{policy.unleased_write_policy || "reject_patch"}</strong>
             </PanelTopline>
             <PolicyRows>
-              <li><span>Worktrees</span><strong>{policy.agent_worktree_required ? "required" : "off"}</strong></li>
+              <li><span>Branch roots</span><strong>{policy.agent_worktree_required ? "required" : "off"}</strong></li>
               <li><span>Patch leases</span><strong>{policy.patch_lease_validation_required ? "required" : "off"}</strong></li>
               <li><span>Merge gate</span><strong>{policy.merge_gate_required ? "required" : "off"}</strong></li>
               <li><span>SQL</span><strong>{policy.sql_mcp_default || "off"}</strong></li>
@@ -352,7 +352,7 @@ export default function VaultWorkspaceView({
                 ))}
               </McpList>
             ) : (
-              <EmptyLine>No active worktree sessions to activate.</EmptyLine>
+              <EmptyLine>No active agent branch sessions to activate.</EmptyLine>
             )}
           </Panel>
 

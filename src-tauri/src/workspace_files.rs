@@ -130,6 +130,17 @@ enum WorkspaceAgentsGitignoreUpdate {
     NoAgentsDirectory,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceGitBootstrap {
+    repo_path: String,
+    branch: String,
+    head_sha: String,
+    initialized_repo: bool,
+    created_initial_commit: bool,
+    gitignore_update: String,
+}
+
 fn trim_gitignore_ascii(value: &[u8]) -> &[u8] {
     let mut start = 0usize;
     let mut end = value.len();
@@ -177,20 +188,17 @@ fn workspace_agents_gitignore_update_label(update: WorkspaceAgentsGitignoreUpdat
 
 fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitignoreUpdate, String> {
     let agents_path = root.join(".agents");
-    let agents_metadata = match fs::metadata(&agents_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    match fs::metadata(&agents_path) {
+        Ok(metadata) if !metadata.is_dir() => {
             return Ok(WorkspaceAgentsGitignoreUpdate::NoAgentsDirectory);
         }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
                 "Unable to inspect workspace .agents directory: {error}"
             ));
         }
-    };
-
-    if !agents_metadata.is_dir() {
-        return Ok(WorkspaceAgentsGitignoreUpdate::NoAgentsDirectory);
     }
 
     let gitignore_path = root.join(".gitignore");
@@ -310,6 +318,175 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
     }
 
     Ok(canonical)
+}
+
+fn ensure_workspace_git_ready_for_coordination(root: &Path) -> Result<WorkspaceGitBootstrap, String> {
+    let repo_key = root
+        .canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(root));
+    let mut initialized_repo = false;
+    let mut created_initial_commit = false;
+
+    if !root.join(".git").exists() {
+        let capture =
+            run_git_for_workspace(root, &["init"], Duration::from_secs(GIT_INIT_TIMEOUT_SECS))?;
+        ensure_git_success(&capture, "git init")?;
+        initialized_repo = true;
+    }
+
+    let gitignore_update = ensure_workspace_agents_gitignore(root)?;
+    let top_level = run_git_text(
+        root,
+        &["rev-parse", "--show-toplevel"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git rev-parse --show-toplevel",
+    )?;
+    let top_level_path = PathBuf::from(top_level.trim());
+    let top_level_key = top_level_path
+        .canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(&top_level_path));
+    if top_level_key != repo_key {
+        return Err(format!(
+            "Workspace Git preflight resolved {}, but coordination must use the selected workspace root {}.",
+            workspace_path_display(&top_level_path),
+            workspace_path_display(root)
+        ));
+    }
+
+    if run_git_text(
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git rev-parse --verify HEAD",
+    )
+    .is_err()
+    {
+        ensure_workspace_git_identity(root)?;
+        if root.join(".gitignore").exists() {
+            let capture = run_git_for_workspace(
+                root,
+                &["add", "--", ".gitignore"],
+                Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+            )?;
+            ensure_git_success(&capture, "git add .gitignore")?;
+        }
+        let capture = run_git_for_workspace(
+            root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initialize Diff Forge coordination workspace",
+            ],
+            Duration::from_secs(GIT_COMMIT_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&capture, "git commit --allow-empty")?;
+        created_initial_commit = true;
+    }
+
+    let head_sha = run_git_text(
+        root,
+        &["rev-parse", "HEAD"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git rev-parse HEAD",
+    )?;
+    let branch = run_git_text(
+        root,
+        &["branch", "--show-current"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git branch --show-current",
+    )
+    .unwrap_or_default();
+
+    Ok(WorkspaceGitBootstrap {
+        repo_path: workspace_path_display(root),
+        branch: branch.trim().to_string(),
+        head_sha: head_sha.trim().to_string(),
+        initialized_repo,
+        created_initial_commit,
+        gitignore_update: workspace_agents_gitignore_update_label(gitignore_update).to_string(),
+    })
+}
+
+fn ensure_workspace_git_identity(root: &Path) -> Result<(), String> {
+    let has_name = run_git_text(
+        root,
+        &["config", "--get", "user.name"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git config --get user.name",
+    )
+    .map(|value| !value.trim().is_empty())
+    .unwrap_or(false);
+    let has_email = run_git_text(
+        root,
+        &["config", "--get", "user.email"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git config --get user.email",
+    )
+    .map(|value| !value.trim().is_empty())
+    .unwrap_or(false);
+
+    if !has_name {
+        let capture = run_git_for_workspace(
+            root,
+            &["config", "user.name", "Diff Forge AI"],
+            Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&capture, "git config user.name")?;
+    }
+    if !has_email {
+        let capture = run_git_for_workspace(
+            root,
+            &["config", "user.email", "local@diffforge.ai"],
+            Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&capture, "git config user.email")?;
+    }
+    Ok(())
+}
+
+fn run_git_text(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    operation: &str,
+) -> Result<String, String> {
+    let capture = run_git_for_workspace(root, args, timeout)?;
+    ensure_git_success(&capture, operation)?;
+    Ok(capture.stdout.trim().to_string())
+}
+
+fn run_git_for_workspace(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
+    let safe_directory = format!("safe.directory={}", git_safe_directory_value(root));
+    let mut owned_args = Vec::with_capacity(args.len() + 2);
+    owned_args.push("-c".to_string());
+    owned_args.push(safe_directory);
+    owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_capture("git", &borrowed_args, None, timeout, Some(root))
+}
+
+fn ensure_git_success(capture: &CommandCapture, operation: &str) -> Result<(), String> {
+    if capture.exit_code == Some(0) {
+        return Ok(());
+    }
+    let output = command_output_text(&capture.stdout, &capture.stderr);
+    if output.is_empty() {
+        Err(format!("{operation} failed."))
+    } else {
+        Err(format!("{operation} failed: {output}"))
+    }
+}
+
+fn git_safe_directory_value(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    workspace_path_display(&canonical).replace('\\', "/")
 }
 
 fn clean_workspace_relative_path(value: &str) -> Result<PathBuf, String> {
@@ -771,6 +948,33 @@ fn read_workspace_file_diff_for(
 #[cfg(test)]
 mod workspace_files_tests {
     use super::*;
+
+    #[test]
+    fn git_preflight_initializes_selected_workspace_root_with_head() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-git-preflight-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let result = ensure_workspace_git_ready_for_coordination(&root).unwrap();
+
+        assert!(root.join(".git").exists());
+        assert!(root.join(".gitignore").exists());
+        assert!(result.initialized_repo);
+        assert!(result.created_initial_commit);
+        assert!(!result.head_sha.is_empty());
+        assert_eq!(
+            normalized_path_key(&PathBuf::from(&result.repo_path).canonicalize().unwrap()),
+            normalized_path_key(&root.canonicalize().unwrap())
+        );
+        assert!(fs::read_to_string(root.join(".gitignore"))
+            .unwrap()
+            .contains(".agents/"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[cfg(not(windows))]
     #[test]

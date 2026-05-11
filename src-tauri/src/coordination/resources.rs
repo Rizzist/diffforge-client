@@ -36,6 +36,10 @@ const KNOWN_LEASE_MODES: &[&str] = &[
     "prod_write",
 ];
 
+const KNOWN_RESOURCE_PREFIXES: &[&str] = &[
+    "file", "glob", "symbol", "route", "package", "env", "port", "contract", "db",
+];
+
 pub fn normalize_resource_key(value: &str) -> String {
     let trimmed = value.trim();
     let Some((prefix, rest)) = trimmed.split_once(':') else {
@@ -46,12 +50,12 @@ pub fn normalize_resource_key(value: &str) -> String {
 
     match prefix.as_str() {
         "file" | "glob" => format!("{prefix}:{}", normalize_resource_path(rest)),
-        "route" => format!(
-            "route:{}",
-            rest.split_whitespace().collect::<Vec<_>>().join(" ")
-        ),
-        "symbol" | "package" | "env" | "port" => format!("{prefix}:{rest}"),
-        "db" => format!("db:{}", rest.to_ascii_lowercase().replace('\\', "/")),
+        "route" => format!("route:{}", normalize_route_resource(rest)),
+        "env" => format!("env:{}", rest.to_ascii_uppercase()),
+        "package" | "contract" => format!("{prefix}:{}", rest.to_ascii_lowercase()),
+        "port" => format!("port:{}", rest.trim()),
+        "symbol" => format!("symbol:{}", rest.trim()),
+        "db" => format!("db:{}", normalize_db_resource_tail(rest)),
         _ => format!("{prefix}:{rest}"),
     }
 }
@@ -63,15 +67,37 @@ pub fn normalize_resource_key_checked(value: &str) -> Result<String, String> {
     }
 
     let Some((prefix, rest)) = trimmed.split_once(':') else {
-        return Ok(normalize_resource_key(trimmed));
+        return Err("Resource key must include a known prefix like file:, glob:, route:, package:, contract:, env:, port:, or db:.".to_string());
     };
     let prefix = prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
     if rest.is_empty() {
         return Err("Resource key value is required.".to_string());
     }
+    if !KNOWN_RESOURCE_PREFIXES.contains(&prefix.as_str()) {
+        return Err(format!("Unknown resource key prefix: {prefix}"));
+    }
     if matches!(prefix.as_str(), "file" | "glob") {
         reject_path_escape(rest)?;
+    }
+    if prefix == "port" {
+        let port = rest
+            .parse::<u16>()
+            .map_err(|_| "Port resource must be a number from 1 to 65535.".to_string())?;
+        if port == 0 {
+            return Err("Port resource must be a number from 1 to 65535.".to_string());
+        }
+    }
+    if prefix == "route" {
+        validate_route_resource(rest)?;
+    }
+    if prefix == "db" {
+        validate_db_resource_tail(rest)?;
+    }
+    if contains_secret_like_resource_value(rest) {
+        return Err(
+            "Resource key must not contain credentials, tokens, or connection strings.".to_string(),
+        );
     }
 
     Ok(normalize_resource_key(trimmed))
@@ -93,7 +119,13 @@ pub fn resource_type(resource_key: &str) -> String {
 }
 
 pub fn resource_risk_level(resource_key: &str, mode: &str) -> i64 {
-    if matches!(mode, "destructive" | "prod_write" | "security_policy") {
+    let mode = mode.trim().to_ascii_lowercase();
+    let resource_key = normalize_resource_key(resource_key);
+    if matches!(
+        mode.as_str(),
+        "db_destructive" | "db_exclusive" | "destructive" | "prod_write" | "security_policy"
+    ) || is_broad_db_resource(&resource_key)
+    {
         return 5;
     }
     if resource_key.starts_with("env:")
@@ -103,7 +135,7 @@ pub fn resource_risk_level(resource_key: &str, mode: &str) -> i64 {
         return 5;
     }
     if resource_key.starts_with("db:")
-        || matches!(mode, "migration_proposal" | "migration_exclusive")
+        || matches!(mode.as_str(), "migration_proposal" | "migration_exclusive")
     {
         return 4;
     }
@@ -111,27 +143,32 @@ pub fn resource_risk_level(resource_key: &str, mode: &str) -> i64 {
 }
 
 pub fn is_write_like(mode: &str) -> bool {
-    WRITE_LIKE_MODES.contains(&mode)
+    let mode = mode.trim().to_ascii_lowercase();
+    WRITE_LIKE_MODES.contains(&mode.as_str())
 }
 
 pub fn lease_modes_conflict(existing: &str, requested: &str) -> bool {
+    lease_mode_conflict_reason(existing, requested).is_some()
+}
+
+pub fn lease_mode_conflict_reason(existing: &str, requested: &str) -> Option<String> {
     let existing = existing.trim().to_ascii_lowercase();
     let requested = requested.trim().to_ascii_lowercase();
 
     if existing == "read" && requested == "read" {
-        return false;
+        return None;
     }
 
     if existing == "exclusive" || requested == "exclusive" {
-        return true;
+        return Some("exclusive_conflicts_with_all".to_string());
     }
 
     if is_db_mode(&existing) || is_db_mode(&requested) {
-        return db_modes_conflict(&existing, &requested);
+        return db_modes_conflict_reason(&existing, &requested);
     }
 
     if existing == "read" || requested == "read" {
-        return false;
+        return None;
     }
 
     if existing == "destructive"
@@ -139,34 +176,45 @@ pub fn lease_modes_conflict(existing: &str, requested: &str) -> bool {
         || existing == "prod_write"
         || requested == "prod_write"
     {
-        return true;
+        return Some("destructive_or_prod_write_conflict".to_string());
     }
 
-    is_write_like(&existing) && is_write_like(&requested)
+    if is_write_like(&existing) && is_write_like(&requested) {
+        return Some("write_like_modes_conflict".to_string());
+    }
+
+    None
 }
 
 pub fn resources_conflict(a: &str, b: &str) -> bool {
+    resource_conflict_reason(a, b).is_some()
+}
+
+pub fn resource_conflict_reason(a: &str, b: &str) -> Option<String> {
     let a = normalize_resource_key(a);
     let b = normalize_resource_key(b);
 
     if a == b {
-        return true;
+        return Some("exact_resource_match".to_string());
     }
 
     if let (Some(a_path), Some(b_path)) = (a.strip_prefix("file:"), b.strip_prefix("glob:")) {
-        return glob_covers_path(b_path, a_path);
+        return glob_covers_path(b_path, a_path).then(|| "glob_covers_file".to_string());
     }
     if let (Some(a_path), Some(b_path)) = (a.strip_prefix("glob:"), b.strip_prefix("file:")) {
-        return glob_covers_path(a_path, b_path);
+        return glob_covers_path(a_path, b_path).then(|| "glob_covers_file".to_string());
     }
     if let (Some(a_glob), Some(b_glob)) = (a.strip_prefix("glob:"), b.strip_prefix("glob:")) {
-        return globs_overlap(a_glob, b_glob);
+        return globs_overlap(a_glob, b_glob).then(|| "glob_overlap".to_string());
     }
     if a.starts_with("db:") && b.starts_with("db:") {
-        return db_resources_conflict(&a, &b);
+        return db_resources_conflict_reason(&a, &b);
+    }
+    if let (Some(a_route), Some(b_route)) = (a.strip_prefix("route:"), b.strip_prefix("route:")) {
+        return route_resources_conflict(a_route, b_route).then(|| "route_overlap".to_string());
     }
 
-    false
+    None
 }
 
 pub fn resource_covers(lease_key: &str, changed_key: &str) -> bool {
@@ -242,6 +290,77 @@ fn glob_covers_path(glob: &str, path: &str) -> bool {
     glob == path
 }
 
+fn normalize_route_resource(value: &str) -> String {
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    let (method, path) = if parts.len() >= 2 && looks_like_http_method(parts[0]) {
+        (Some(parts[0].to_ascii_uppercase()), parts[1])
+    } else {
+        (None, value.trim())
+    };
+    let mut path = path.replace('\\', "/");
+    while path.contains("//") {
+        path = path.replace("//", "/");
+    }
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    if path.len() > 1 {
+        path = path.trim_end_matches('/').to_string();
+    }
+    match method {
+        Some(method) => format!("{method} {path}"),
+        None => path,
+    }
+}
+
+fn validate_route_resource(value: &str) -> Result<(), String> {
+    let normalized = normalize_route_resource(value);
+    let path = normalized
+        .split_whitespace()
+        .last()
+        .unwrap_or(normalized.as_str());
+    if !path.starts_with('/') {
+        return Err("Route resource must include an absolute route path.".to_string());
+    }
+    if path.contains("..") {
+        return Err("Route resource cannot contain '..'.".to_string());
+    }
+    Ok(())
+}
+
+fn route_resources_conflict(a: &str, b: &str) -> bool {
+    let a = parse_route_resource(a);
+    let b = parse_route_resource(b);
+    a.path == b.path && (a.method.is_none() || b.method.is_none() || a.method == b.method)
+}
+
+struct ParsedRoute {
+    method: Option<String>,
+    path: String,
+}
+
+fn parse_route_resource(value: &str) -> ParsedRoute {
+    let normalized = normalize_route_resource(value);
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts.len() == 2 && looks_like_http_method(parts[0]) {
+        return ParsedRoute {
+            method: Some(parts[0].to_string()),
+            path: parts[1].to_string(),
+        };
+    }
+    ParsedRoute {
+        method: None,
+        path: normalized,
+    }
+}
+
+fn looks_like_http_method(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+    )
+}
+
 fn globs_overlap(a: &str, b: &str) -> bool {
     let a_prefix = a
         .strip_suffix("/**")
@@ -260,30 +379,40 @@ fn globs_overlap(a: &str, b: &str) -> bool {
 }
 
 fn db_resources_conflict(a: &str, b: &str) -> bool {
+    db_resources_conflict_reason(a, b).is_some()
+}
+
+fn db_resources_conflict_reason(a: &str, b: &str) -> Option<String> {
     if a == b {
-        return true;
+        return Some("exact_db_resource_match".to_string());
     }
 
     if a.starts_with("db:migration_stream:") || b.starts_with("db:migration_stream:") {
-        return true;
+        return Some("db_migration_stream_serializes_migrations".to_string());
     }
 
     if a.starts_with("db:database:") || b.starts_with("db:database:") {
-        return true;
+        return Some("db_database_resource_is_broad".to_string());
+    }
+
+    if a.starts_with("db:schema:") || b.starts_with("db:schema:") {
+        return Some("db_schema_resource_is_broad".to_string());
     }
 
     if is_broad_db_resource(a) || is_broad_db_resource(b) {
-        return true;
+        return Some("db_high_risk_broad_resource".to_string());
     }
 
     let Some(a_table) = db_table_name(a) else {
-        return a.starts_with("db:policy:") && b.starts_with("db:policy:");
+        return (a.starts_with("db:policy:") && b.starts_with("db:policy:"))
+            .then(|| "db_policy_resource_overlap".to_string());
     };
     let Some(b_table) = db_table_name(b) else {
-        return b.starts_with("db:policy:") && a.starts_with("db:policy:");
+        return (b.starts_with("db:policy:") && a.starts_with("db:policy:"))
+            .then(|| "db_policy_resource_overlap".to_string());
     };
 
-    a_table == b_table
+    (a_table == b_table).then(|| "db_same_table_family".to_string())
 }
 
 fn is_db_mode(mode: &str) -> bool {
@@ -299,7 +428,7 @@ fn is_db_mode(mode: &str) -> bool {
         )
 }
 
-fn db_modes_conflict(existing: &str, requested: &str) -> bool {
+fn db_modes_conflict_reason(existing: &str, requested: &str) -> Option<String> {
     if existing == "db_destructive"
         || requested == "db_destructive"
         || existing == "destructive"
@@ -311,10 +440,10 @@ fn db_modes_conflict(existing: &str, requested: &str) -> bool {
         || existing == "migration_exclusive"
         || requested == "migration_exclusive"
     {
-        return true;
+        return Some("db_destructive_or_exclusive_mode_conflict".to_string());
     }
 
-    matches!(
+    if matches!(
         (existing, requested),
         ("db_plan", "db_migration")
             | ("db_migration", "db_plan")
@@ -328,7 +457,11 @@ fn db_modes_conflict(existing: &str, requested: &str) -> bool {
             | (_, "data_backfill")
             | ("security_policy", _)
             | (_, "security_policy")
-    )
+    ) {
+        return Some("db_write_like_modes_conflict".to_string());
+    }
+
+    None
 }
 
 fn is_broad_db_resource(value: &str) -> bool {
@@ -364,6 +497,64 @@ fn db_table_name(value: &str) -> Option<String> {
     None
 }
 
+fn normalize_db_resource_tail(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase().replace('\\', "/");
+    let parts = normalized
+        .split(':')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.join(":")
+}
+
+fn validate_db_resource_tail(value: &str) -> Result<(), String> {
+    let normalized = normalize_db_resource_tail(value);
+    if normalized.contains("://") || normalized.contains('@') {
+        return Err("DB resource keys must not contain connection strings.".to_string());
+    }
+    let Some((kind, rest)) = normalized.split_once(':') else {
+        if is_broad_db_resource(&format!("db:{normalized}")) {
+            return Ok(());
+        }
+        return Err("DB resource key must include a supported DB resource kind.".to_string());
+    };
+    let supported = matches!(
+        kind,
+        "database"
+            | "schema"
+            | "table"
+            | "column"
+            | "index"
+            | "constraint"
+            | "enum"
+            | "view"
+            | "function"
+            | "data"
+            | "migration_stream"
+            | "foreign_key"
+            | "backfill"
+            | "policy"
+            | "prod_data"
+    );
+    if !supported {
+        return Err(format!("Unsupported DB resource kind: {kind}"));
+    }
+    if rest.trim().is_empty() {
+        return Err("DB resource key value is required.".to_string());
+    }
+    Ok(())
+}
+
+fn contains_secret_like_resource_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.contains("password=")
+        || lower.contains("passwd=")
+        || lower.contains("token=")
+        || lower.contains("api_key=")
+        || lower.contains("secret=")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +573,86 @@ mod tests {
             "db:column:users.email"
         ));
         assert!(resource_covers("db:table:users", "db:column:users.email"));
+    }
+
+    #[test]
+    fn checked_resource_keys_reject_file_path_escapes() {
+        assert!(normalize_resource_key_checked("file:../secret").is_err());
+        assert!(normalize_resource_key_checked("glob:src/../../secret/**").is_err());
+        assert!(normalize_resource_key_checked("unknown:thing").is_err());
+        assert!(normalize_resource_key_checked("src/main.rs").is_err());
+        assert!(normalize_resource_key_checked("db:postgres://prod.example/app").is_err());
+        assert_eq!(
+            normalize_resource_key_checked("file:src\\main.rs").unwrap(),
+            "file:src/main.rs"
+        );
+    }
+
+    #[test]
+    fn lease_modes_are_known_and_conflict_by_contract() {
+        assert!(validate_lease_mode("made_up_mode").is_err());
+        assert!(!lease_modes_conflict("read", "write"));
+        assert!(lease_modes_conflict("write", "write"));
+        assert!(lease_modes_conflict("contract", "contract"));
+        assert!(lease_modes_conflict("db_plan", "db_migration"));
+        assert!(lease_modes_conflict("db_destructive", "db_read"));
+    }
+
+    #[test]
+    fn resource_registry_normalizes_non_file_keys() {
+        assert_eq!(
+            normalize_resource_key_checked("env:node_env").unwrap(),
+            "env:NODE_ENV"
+        );
+        assert_eq!(
+            normalize_resource_key_checked("package:@APP/Auth").unwrap(),
+            "package:@app/auth"
+        );
+        assert_eq!(
+            normalize_resource_key_checked("contract:Auth/Login").unwrap(),
+            "contract:auth/login"
+        );
+        assert_eq!(
+            normalize_resource_key_checked("route:get //api/users/").unwrap(),
+            "route:GET /api/users"
+        );
+        assert_eq!(
+            normalize_resource_key_checked("port:3000").unwrap(),
+            "port:3000"
+        );
+        assert!(normalize_resource_key_checked("port:0").is_err());
+    }
+
+    #[test]
+    fn route_resources_overlap_by_path_and_method() {
+        assert!(resources_conflict(
+            "route:/api/users",
+            "route:GET /api/users"
+        ));
+        assert!(resources_conflict(
+            "route:GET /api/users",
+            "route:get //api/users/"
+        ));
+        assert!(!resources_conflict(
+            "route:POST /api/users",
+            "route:GET /api/users"
+        ));
+    }
+
+    #[test]
+    fn db_coordination_resources_overlap_broadly_where_expected() {
+        assert!(resources_conflict(
+            "db:migration_stream:main",
+            "db:table:users"
+        ));
+        assert!(resources_conflict("db:table:users", "db:data:users"));
+        assert!(resources_conflict(
+            "db:tenant_isolation",
+            "db:column:users.account_id"
+        ));
+        assert!(resources_conflict(
+            "db:schema:public",
+            "db:view:active_users"
+        ));
     }
 }

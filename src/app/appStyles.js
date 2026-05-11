@@ -2006,6 +2006,7 @@ export const TerminalDevMetric = styled.span`
 
 export const TerminalFrame = styled.section`
   position: relative;
+  z-index: 1;
   flex: 1 1 auto;
   width: 100%;
   height: 100%;
@@ -2027,6 +2028,7 @@ export const XtermSurface = styled.div`
   --terminal-scrollbar-pointer-events: none;
 
   position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -2034,7 +2036,7 @@ export const XtermSurface = styled.div`
   padding: 0;
   background: ${TERMINAL_THEME_BACKGROUND};
 
-  &[data-scrolling="true"][data-scrollbar-overflow="true"] {
+  &[data-scrollbar-platform="overlay"][data-scrolling="true"][data-scrollbar-overflow="true"] {
     --terminal-scrollbar-opacity: 1;
     --terminal-scrollbar-pointer-events: auto;
   }
@@ -2050,35 +2052,109 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND} !important;
   }
 
-  .xterm-viewport {
+  &[data-scrollbar-platform="overlay"] .xterm-viewport {
     scrollbar-width: none;
     -ms-overflow-style: none;
   }
 
-  .xterm-viewport::-webkit-scrollbar {
+  &[data-scrollbar-platform="overlay"] .xterm-viewport::-webkit-scrollbar {
     display: none;
     width: 0 !important;
     height: 0 !important;
   }
 
-  .xterm .xterm-scrollable-element > .scrollbar.vertical,
-  .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
-  .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible {
+  &[data-scrollbar-platform="windows"] .xterm-viewport {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  &[data-scrollbar-platform="windows"] .xterm-viewport::-webkit-scrollbar {
+    display: none;
+    width: 0 !important;
+    height: 0 !important;
+  }
+
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar,
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-visible,
+  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-invisible {
+    display: none !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-visible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-invisible {
+    opacity: var(--terminal-scrollbar-opacity) !important;
+    pointer-events: var(--terminal-scrollbar-pointer-events) !important;
+  }
+
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-visible,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-invisible {
     right: 1px !important;
     width: 7px !important;
     background: transparent !important;
-    opacity: var(--terminal-scrollbar-opacity) !important;
-    pointer-events: var(--terminal-scrollbar-pointer-events) !important;
     transition: opacity 180ms ease !important;
+    z-index: 80 !important;
   }
 
-  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider,
-  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider:hover,
-  .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider.active {
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider:hover,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider.active,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider:hover,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider.active,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .slider,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .slider:hover,
+  &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .xterm-scrollbar > .slider.active {
     left: 2px !important;
     width: 3px !important;
     border-radius: 999px !important;
     background: rgba(172, 185, 207, 0.34) !important;
+  }
+`;
+
+export const TerminalScrollRail = styled.div`
+  position: absolute;
+  top: 48px;
+  right: 4px;
+  bottom: 8px;
+  z-index: 70;
+  width: 8px;
+  border-radius: 999px;
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 150ms ease;
+`;
+
+export const TerminalScrollThumb = styled.div`
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 4px;
+  min-height: 28px;
+  border-radius: 999px;
+  background: rgba(172, 185, 207, 0.62);
+  box-shadow: 0 0 12px rgba(172, 185, 207, 0.12);
+  transition:
+    background 150ms ease,
+    width 150ms ease,
+    right 150ms ease;
+
+  ${TerminalScrollRail}:hover & {
+    right: 1px;
+    width: 6px;
+    background: rgba(192, 204, 224, 0.72);
   }
 `;
 
@@ -2173,7 +2249,7 @@ export const TerminalRestartPill = styled.div`
   position: absolute;
   top: 10px;
   left: 50%;
-  z-index: 4;
+  z-index: 80;
   display: inline-flex;
   max-width: calc(100% - 24px);
   min-height: 38px;
@@ -2248,6 +2324,12 @@ export const TerminalAgentIdBadge = styled.span`
     --agent-id-text: #ffd1a1;
   }
 
+  &[data-agent="generic"] {
+    --agent-id-bg: rgba(143, 157, 183, 0.12);
+    --agent-id-border: rgba(143, 157, 183, 0.34);
+    --agent-id-text: #dbe4ee;
+  }
+
   &[data-slot="1"] {
     --terminal-slot-accent: #ff9d48;
   }
@@ -2306,6 +2388,37 @@ export const TerminalAgentIdBadge = styled.span`
 
   &[data-slot="15"] {
     --terminal-slot-accent: #f0f4ff;
+  }
+`;
+
+export const TerminalProjectBadge = styled.div`
+  display: grid;
+  min-width: 120px;
+  max-width: min(360px, 52vw);
+  gap: 2px;
+  padding: 0 8px;
+  overflow: hidden;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    letter-spacing: 0;
+    line-height: 1.08;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: #f0f6ff;
+    font-size: 11px;
+    font-weight: 900;
+  }
+
+  span {
+    color: #9ca9ba;
+    font-size: 10px;
+    font-weight: 820;
   }
 `;
 
@@ -5676,11 +5789,68 @@ export const WorkspaceSettingsDialog = styled.aside`
 export const WorkspaceSettingsDialogHeader = styled.header`
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   padding: 2px 2px 10px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+`;
+
+export const WorkspaceSettingsHeaderMain = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+`;
+
+export const WorkspaceSettingsHeaderMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+`;
+
+export const WorkspaceSettingsHeaderActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  button {
+    min-height: 32px;
+  }
+`;
+
+export const WorkspaceSettingsMetaPill = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  padding: 4px 7px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 999px;
+  background: rgba(7, 9, 13, 0.5);
+  color: var(--forge-text-muted);
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 10px;
+    font-weight: 850;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+    text-transform: none;
+    white-space: nowrap;
+  }
 `;
 
 export const WorkspaceModalCloseButton = styled.button`
@@ -5732,13 +5902,49 @@ export const RootDirectoryInput = styled(WorkspaceSettingsInput)`
     Consolas,
     monospace;
   font-size: 12px;
+
+  &[readonly] {
+    color: var(--forge-text-soft);
+    cursor: default;
+  }
+`;
+
+export const WorkspaceSettingsTopGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(180px, 0.82fr) minmax(260px, 1.18fr);
+  gap: 10px;
+  min-width: 0;
+
+  @media (max-width: 720px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const WorkspaceRootChooser = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+`;
+
+export const WorkspaceRootActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+
+  button {
+    min-width: 118px;
+    min-height: 34px;
+  }
 `;
 
 export const WorkspaceSettingsSection = styled.section`
   display: grid;
   min-width: 0;
-  gap: 10px;
-  padding: 12px;
+  gap: 9px;
+  padding: 10px;
   border: 1px solid rgba(230, 236, 245, 0.09);
   border-radius: 8px;
   background:
@@ -5822,12 +6028,12 @@ export const WorkspacePathSummary = styled.div`
 
 export const TerminalCountGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 6px;
   min-width: 0;
 
   @media (max-width: 720px) {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   @media (max-width: 480px) {
@@ -5838,10 +6044,10 @@ export const TerminalCountGrid = styled.div`
 export const TerminalCountButton = styled.button`
   display: grid;
   min-width: 0;
-  min-height: 82px;
+  min-height: 54px;
   align-content: start;
-  gap: 7px;
-  padding: 8px;
+  gap: 5px;
+  padding: 6px;
   border: 1px solid rgba(230, 236, 245, 0.09);
   border-radius: 8px;
   color: var(--forge-text-soft);
@@ -5879,7 +6085,7 @@ export const TerminalCountMeta = styled.span`
 
   strong {
     color: inherit;
-    font-size: 16px;
+    font-size: 14px;
     font-weight: 900;
     line-height: 1;
   }
@@ -5898,7 +6104,7 @@ export const TerminalCountMeta = styled.span`
 export const TerminalLayoutPreview = styled.div`
   display: grid;
   min-width: 0;
-  height: 32px;
+  height: 22px;
   gap: 2px;
   overflow: hidden;
   padding: 3px;
@@ -5931,9 +6137,307 @@ export const TerminalLayoutPreviewCell = styled.span`
     background: rgba(98, 160, 255, 0.28);
   }
 
+  &[data-slot="codex"] {
+    border-color: rgba(98, 160, 255, 0.42);
+    background: rgba(98, 160, 255, 0.26);
+  }
+
   &[data-slot="orange"] {
     border-color: rgba(255, 154, 61, 0.32);
     background: rgba(255, 122, 24, 0.16);
+  }
+
+  &[data-slot="claude"] {
+    border-color: rgba(255, 154, 61, 0.34);
+    background: rgba(255, 122, 24, 0.18);
+  }
+
+  &[data-slot="generic"] {
+    border-color: rgba(143, 157, 183, 0.24);
+    background: rgba(143, 157, 183, 0.12);
+  }
+`;
+
+export const TerminalRoleSwitch = styled.div`
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  min-width: 92px;
+  padding: 3px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 999px;
+  background: rgba(7, 9, 13, 0.58);
+`;
+
+export const TerminalRoleSwitchButton = styled.button`
+  min-width: 0;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+
+  &:not(:disabled):hover {
+    color: var(--forge-text);
+    background: rgba(230, 236, 245, 0.07);
+  }
+
+  &[data-selected="true"] {
+    color: #fff;
+    border-color: rgba(98, 160, 255, 0.34);
+    background: rgba(98, 160, 255, 0.14);
+  }
+
+  &[data-role="claude"][data-selected="true"] {
+    border-color: rgba(255, 154, 61, 0.34);
+    background: rgba(255, 122, 24, 0.14);
+  }
+
+  &[data-role="generic"][data-selected="true"] {
+    border-color: rgba(143, 157, 183, 0.34);
+    background: rgba(143, 157, 183, 0.12);
+  }
+
+  &:disabled {
+    cursor: default;
+  }
+`;
+
+export const TerminalRestartMenu = styled.div`
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+`;
+
+export const TerminalRestartDropdown = styled.div`
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  display: grid;
+  min-width: 168px;
+  gap: 3px;
+  padding: 5px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
+    rgba(7, 9, 13, 0.98);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42);
+
+  &[data-open="false"] {
+    display: none;
+  }
+`;
+
+export const TerminalRestartOption = styled.button`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  text-align: left;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 11px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    flex: 0 0 auto;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(98, 160, 255, 0.22);
+    color: #fff;
+    background: rgba(98, 160, 255, 0.1);
+    outline: none;
+  }
+
+  &[data-role="claude"]:hover,
+  &[data-role="claude"]:focus-visible {
+    border-color: rgba(255, 154, 61, 0.26);
+    background: rgba(255, 122, 24, 0.11);
+  }
+
+  &[data-role="generic"]:hover,
+  &[data-role="generic"]:focus-visible {
+    border-color: rgba(143, 157, 183, 0.24);
+    background: rgba(143, 157, 183, 0.1);
+  }
+
+  &[data-selected="true"] span {
+    color: var(--forge-blue-soft);
+  }
+`;
+
+export const TerminalRoleSummary = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+`;
+
+export const TerminalRoleGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(146px, 1fr));
+  gap: 7px;
+  min-width: 0;
+`;
+
+export const TerminalRoleSliderGrid = styled.div`
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+`;
+
+export const TerminalRoleSliderRow = styled.label`
+  display: grid;
+  grid-template-columns: minmax(112px, 0.34fr) minmax(180px, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.42);
+
+  > span {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 12px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  em {
+    display: inline-flex;
+    min-width: 24px;
+    justify-content: center;
+    padding: 3px 6px;
+    border-radius: 999px;
+    color: #fff;
+    background: rgba(98, 160, 255, 0.14);
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  &[data-role="claude"] em {
+    background: rgba(255, 122, 24, 0.16);
+  }
+
+  &[data-role="generic"] em {
+    background: rgba(143, 157, 183, 0.14);
+  }
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const TerminalRoleRange = styled.input`
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--forge-blue-soft);
+
+  &[data-role="claude"] {
+    accent-color: #ff9d48;
+  }
+
+  &[data-role="generic"] {
+    accent-color: #8f9db7;
+  }
+`;
+
+export const TerminalRoleCard = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.42);
+`;
+
+export const TerminalRoleButtonGroup = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  min-width: 0;
+`;
+
+export const TerminalRoleButton = styled.button`
+  min-width: 0;
+  min-height: 28px;
+  overflow: hidden;
+  padding: 0 6px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 6px;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.46);
+  font-size: 10px;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+
+  &[data-selected="true"] {
+    color: #fff;
+    border-color: rgba(98, 160, 255, 0.38);
+    background: rgba(98, 160, 255, 0.14);
+  }
+
+  &[data-role="claude"][data-selected="true"] {
+    border-color: rgba(255, 154, 61, 0.34);
+    background: rgba(255, 122, 24, 0.14);
+  }
+
+  &[data-role="generic"][data-selected="true"] {
+    border-color: rgba(143, 157, 183, 0.34);
+    background: rgba(143, 157, 183, 0.12);
   }
 `;
 

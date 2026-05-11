@@ -39,6 +39,36 @@ pub fn check_entry(
     })
 }
 
+pub fn lifecycle_entry(
+    context: &str,
+    event: &str,
+    status: &str,
+    reason: impl Into<String>,
+    details: Value,
+) -> Value {
+    json!({
+        "created_at": now_rfc3339(),
+        "record_type": "lifecycle",
+        "context": context,
+        "event": event,
+        "status": status,
+        "reason": reason.into(),
+        "details": details,
+    })
+}
+
+pub fn write_lifecycle(
+    repo_path: &Path,
+    context: &str,
+    event: &str,
+    status: &str,
+    reason: impl Into<String>,
+    details: Value,
+) -> Result<(), String> {
+    let entry = lifecycle_entry(context, event, status, reason, details);
+    write_check(repo_path, &entry)
+}
+
 pub fn write_check(repo_path: &Path, entry: &Value) -> Result<(), String> {
     if !COORDINATION_ALIGNMENT_LOGGING_ENABLED {
         return Ok(());

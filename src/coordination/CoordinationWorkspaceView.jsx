@@ -4,6 +4,7 @@ import styled from "styled-components";
 
 import {
   ButtonCheckIcon,
+  ButtonDeleteIcon,
   ButtonHubIcon,
   ButtonRefreshIcon,
   ButtonTerminalIcon,
@@ -42,6 +43,14 @@ function unwrapData(response, fallback = {}) {
   }
 
   return response.data || response;
+}
+
+function commandData(response) {
+  if (response?.ok === false) {
+    const message = response.error?.message || "Coordination command failed.";
+    throw new Error(message);
+  }
+  return unwrapData(response);
 }
 
 function errorMessage(error) {
@@ -105,8 +114,25 @@ export default function CoordinationWorkspaceView({
   const [planJson, setPlanJson] = useState(DEFAULT_PLAN);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [message, setMessage] = useState("");
+  const [cleanupAudit, setCleanupAudit] = useState(null);
+  const [mergeActionId, setMergeActionId] = useState("");
 
   const commandBase = useMemo(() => ({ repoPath }), [repoPath]);
+
+  const logUiSurface = useCallback(
+    (action, statusValue, details = {}, commandName = null) =>
+      invoke("coordination_log_ui_surface_event", {
+        ...commandBase,
+        input: {
+          surface: "coordination_workspace",
+          action,
+          status: statusValue,
+          command_name: commandName,
+          details,
+        },
+      }).catch(() => {}),
+    [commandBase],
+  );
 
   const refresh = useCallback(async () => {
     if (!repoPath) {
@@ -117,14 +143,33 @@ export default function CoordinationWorkspaceView({
     setError("");
     try {
       await invoke("coordination_init", commandBase);
+      await logUiSurface("refresh", "started", { workspaceName }, "coordination_get_snapshot");
+      let auditData = null;
+      try {
+        const auditResponse = await invoke("coordination_cleanup_bloat_dry_run", commandBase);
+        auditData = unwrapData(auditResponse);
+        setCleanupAudit(auditData);
+      } catch (caughtAudit) {
+        await logUiSurface("cleanup_bloat_audit", "failed", { error: errorMessage(caughtAudit) }, "coordination_cleanup_bloat_dry_run");
+      }
       const response = await invoke("coordination_get_snapshot", commandBase);
       setSnapshot(unwrapData(response));
       setStatus("ready");
+      await logUiSurface(
+        "refresh",
+        "succeeded",
+        {
+          taskCount: unwrapData(response)?.tasks?.length || 0,
+          bloatStatus: auditData?.status || "not_run",
+        },
+        "coordination_get_snapshot",
+      );
     } catch (caught) {
       setError(errorMessage(caught));
       setStatus("error");
+      await logUiSurface("refresh", "failed", { error: errorMessage(caught) }, "coordination_get_snapshot");
     }
-  }, [commandBase, repoPath]);
+  }, [commandBase, logUiSurface, repoPath, workspaceName]);
 
   useEffect(() => {
     refresh();
@@ -241,15 +286,109 @@ export default function CoordinationWorkspaceView({
 
   const syncOnce = async () => {
     try {
+      await logUiSurface("orchestrator_sync_once", "started", { runId: selectedRunId || null }, "coordination_orchestrator_sync_once");
       const response = await invoke("coordination_orchestrator_sync_once", {
         ...commandBase,
         runId: selectedRunId || null,
       });
       const warnings = response?.warnings?.join(" ") || "";
       setMessage(warnings || "Cloud sync processed.");
+      await logUiSurface("orchestrator_sync_once", "succeeded", { runId: selectedRunId || null }, "coordination_orchestrator_sync_once");
       refresh();
     } catch (caught) {
       setError(errorMessage(caught));
+      await logUiSurface("orchestrator_sync_once", "failed", { error: errorMessage(caught) }, "coordination_orchestrator_sync_once");
+    }
+  };
+
+  const runCleanupAudit = async () => {
+    setError("");
+    setMessage("");
+    try {
+      await logUiSurface("cleanup_bloat_audit", "started", {}, "coordination_cleanup_bloat_dry_run");
+      const response = await invoke("coordination_cleanup_bloat_dry_run", commandBase);
+      const data = unwrapData(response);
+      setCleanupAudit(data);
+      setMessage(data.status === "clean" ? "Cleanup audit is clean." : "Cleanup audit found bloat candidates.");
+      await logUiSurface(
+        "cleanup_bloat_audit",
+        "succeeded",
+        {
+          status: data.status,
+          unexpectedMcp: data.unexpected_mcp_files?.length || 0,
+          unexpectedWorktrees: data.unexpected_worktree_dirs?.length || 0,
+          staleTemps: data.stale_temp_files?.length || 0,
+        },
+        "coordination_cleanup_bloat_dry_run",
+      );
+      const snapshotResponse = await invoke("coordination_get_snapshot", commandBase);
+      setSnapshot(unwrapData(snapshotResponse));
+    } catch (caught) {
+      setError(errorMessage(caught));
+      await logUiSurface("cleanup_bloat_audit", "failed", { error: errorMessage(caught) }, "coordination_cleanup_bloat_dry_run");
+    }
+  };
+
+  const queueMerge = async (patch) => {
+    if (!patch?.id) {
+      return;
+    }
+    setError("");
+    setMessage("");
+    setMergeActionId(`queue:${patch.id}`);
+    try {
+      await logUiSurface("manual_merge_queue", "started", { patchId: patch.id }, "coordination_request_merge");
+      const response = await invoke("coordination_request_merge", {
+        ...commandBase,
+        input: {
+          patch_id: patch.id,
+          strategy: "patch_apply",
+        },
+      });
+      const data = commandData(response);
+      setMessage(`Merge queued: ${data.merge_job_id || patch.id}`);
+      await logUiSurface(
+        "manual_merge_queue",
+        "succeeded",
+        { patchId: patch.id, mergeJobId: data.merge_job_id || null },
+        "coordination_request_merge",
+      );
+      refresh();
+    } catch (caught) {
+      setError(errorMessage(caught));
+      await logUiSurface("manual_merge_queue", "failed", { patchId: patch.id, error: errorMessage(caught) }, "coordination_request_merge");
+    } finally {
+      setMergeActionId("");
+    }
+  };
+
+  const applyMerge = async (job) => {
+    if (!job?.id) {
+      return;
+    }
+    setError("");
+    setMessage("");
+    setMergeActionId(`apply:${job.id}`);
+    try {
+      await logUiSurface("manual_merge_apply", "started", { mergeJobId: job.id, patchId: job.patch_id || null }, "coordination_apply_merge");
+      const response = await invoke("coordination_apply_merge", {
+        ...commandBase,
+        mergeJobId: job.id,
+      });
+      commandData(response);
+      setMessage(`Merge applied: ${job.id}`);
+      await logUiSurface("manual_merge_apply", "succeeded", { mergeJobId: job.id, patchId: job.patch_id || null }, "coordination_apply_merge");
+      refresh();
+    } catch (caught) {
+      setError(errorMessage(caught));
+      await logUiSurface(
+        "manual_merge_apply",
+        "failed",
+        { mergeJobId: job.id, patchId: job.patch_id || null, error: errorMessage(caught) },
+        "coordination_apply_merge",
+      );
+    } finally {
+      setMergeActionId("");
     }
   };
 
@@ -257,6 +396,16 @@ export default function CoordinationWorkspaceView({
   const sqlPolicy = snapshot?.sql_policy || {};
   const runs = snapshot?.orchestration_runs || [];
   const planItems = snapshot?.orchestration_plan_items || [];
+  const patches = snapshot?.patches || [];
+  const mcpClientMounts = snapshot?.mcp_client_mounts || {};
+  const mcpMountRows = mcpClientMounts.mounts || [];
+  const latestBloatAudit = cleanupAudit || snapshot?.bloat_audits?.[0] || null;
+  const latestBloatDetails = latestBloatAudit?.details_json || latestBloatAudit || {};
+  const bloatEntries = [
+    ...(latestBloatAudit?.unexpected_mcp_files || latestBloatDetails.unexpected_mcp_files || []),
+    ...(latestBloatAudit?.unexpected_worktree_dirs || latestBloatDetails.unexpected_worktree_dirs || []),
+    ...(latestBloatAudit?.stale_temp_files || latestBloatDetails.stale_temp_files || []),
+  ];
 
   return (
     <CoordinationSurface aria-label="Coordination kernel">
@@ -326,25 +475,52 @@ export default function CoordinationWorkspaceView({
               { key: "agent_id", label: "Agent" },
               { key: "status", label: "Status" },
               { key: "enforcement_mode", label: "Mode" },
-              { key: "write_root", label: "Write root" },
+              { key: "write_root", label: "Branch root" },
             ]}
             empty="No sessions."
             rows={snapshot?.sessions || []}
           />
         </Panel>
 
+        <Panel data-tone={["partial", "initialized_only", "server_started_only", "not_seen"].includes(mcpClientMounts.status) ? "warn" : "normal"}>
+          <PanelTopline>
+            <span>Agent MCP Mount</span>
+            <strong>{mcpClientMounts.status || "unknown"}</strong>
+          </PanelTopline>
+          <PolicyGrid>
+            <PolicyItem>
+              <span>Active</span>
+              <strong>{mcpClientMounts.active_session_count || 0}</strong>
+            </PolicyItem>
+            <PolicyItem>
+              <span>Confirmed</span>
+              <strong>{mcpClientMounts.confirmed_session_count || 0}</strong>
+            </PolicyItem>
+          </PolicyGrid>
+          <CompactTable
+            columns={[
+              { key: "slot_key", label: "Slot", render: (row) => row.slot_key || "none" },
+              { key: "status", label: "Mount" },
+              { key: "latest_event_type", label: "Latest" },
+              { key: "successful_tool_calls", label: "Calls" },
+            ]}
+            empty="No active agent MCP client evidence."
+            rows={mcpMountRows}
+          />
+        </Panel>
+
         <Panel>
           <PanelTopline>
-            <span>Worktrees</span>
+            <span>Agent branches</span>
             <strong>{snapshot?.worktrees?.length || 0}</strong>
           </PanelTopline>
           <CompactTable
             columns={[
               { key: "branch_name", label: "Branch" },
               { key: "status", label: "Status" },
-              { key: "path", label: "Path" },
+              { key: "path", label: "Branch root" },
             ]}
-            empty="No worktrees."
+            empty="No agent branch roots."
             rows={snapshot?.worktrees || []}
           />
         </Panel>
@@ -392,11 +568,40 @@ export default function CoordinationWorkspaceView({
             columns={[
               { key: "status", label: "Validation" },
               { key: "task_id", label: "Task" },
-              { key: "worktree_id", label: "Worktree" },
+              { key: "worktree_id", label: "Branch" },
               { key: "validation_summary", label: "Summary" },
             ]}
             empty="No patch validations."
             rows={snapshot?.patch_validations || []}
+          />
+        </Panel>
+
+        <Panel>
+          <PanelTopline>
+            <span>Patches</span>
+            <strong>{patches.length}</strong>
+          </PanelTopline>
+          <CompactTable
+            columns={[
+              { key: "status", label: "Status" },
+              { key: "validation_status", label: "Validation", render: (row) => row.validation_status || "missing" },
+              { key: "task_id", label: "Task" },
+              {
+                key: "manual_merge",
+                label: "Merge",
+                render: (row) => (
+                  <InlineActionButton
+                    disabled={row.status !== "submitted" || row.validation_status !== "passed" || mergeActionId === `queue:${row.id}`}
+                    onClick={() => queueMerge(row)}
+                    type="button"
+                  >
+                    {mergeActionId === `queue:${row.id}` ? "Queueing" : "Queue"}
+                  </InlineActionButton>
+                ),
+              },
+            ]}
+            empty="No submitted patches."
+            rows={patches}
           />
         </Panel>
 
@@ -411,6 +616,19 @@ export default function CoordinationWorkspaceView({
               { key: "strategy", label: "Strategy" },
               { key: "patch_id", label: "Patch" },
               { key: "error_message", label: "Error", render: (row) => row.error_message || "none" },
+              {
+                key: "manual_apply",
+                label: "Apply",
+                render: (row) => (
+                  <InlineActionButton
+                    disabled={!["queued", "checking"].includes(row.status) || mergeActionId === `apply:${row.id}`}
+                    onClick={() => applyMerge(row)}
+                    type="button"
+                  >
+                    {mergeActionId === `apply:${row.id}` ? "Applying" : "Apply"}
+                  </InlineActionButton>
+                ),
+              },
             ]}
             empty="No merge jobs."
             rows={snapshot?.merge_jobs || []}
@@ -424,7 +642,7 @@ export default function CoordinationWorkspaceView({
           </PanelTopline>
           <PolicyGrid>
             <PolicyItem>
-              <span>Worktrees</span>
+              <span>Branch roots</span>
               <strong>{snapshot?.repo_policy?.agent_worktree_required ? "required" : "optional"}</strong>
             </PolicyItem>
             <PolicyItem>
@@ -443,6 +661,61 @@ export default function CoordinationWorkspaceView({
           <SettingsHint>SQL execution is not configured; classifier and migration proposals stay local.</SettingsHint>
         </Panel>
 
+        <Panel data-tone={latestBloatAudit?.status === "attention_required" ? "warn" : "normal"}>
+          <PanelTopline>
+            <span>Cleanup Audit</span>
+            <strong>{latestBloatAudit?.status || "not run"}</strong>
+          </PanelTopline>
+          <PolicyGrid>
+            <PolicyItem>
+              <span>MCP files</span>
+              <strong>{latestBloatAudit?.unexpected_mcp_files?.length ?? latestBloatAudit?.unexpected_mcp_file_count ?? 0}</strong>
+            </PolicyItem>
+            <PolicyItem>
+              <span>Branch roots</span>
+              <strong>{latestBloatAudit?.unexpected_worktree_dirs?.length ?? latestBloatAudit?.unexpected_worktree_dir_count ?? 0}</strong>
+            </PolicyItem>
+            <PolicyItem>
+              <span>Temp files</span>
+              <strong>{latestBloatAudit?.stale_temp_files?.length ?? latestBloatAudit?.stale_temp_file_count ?? 0}</strong>
+            </PolicyItem>
+            <PolicyItem>
+              <span>Mode</span>
+              <strong>dry run</strong>
+            </PolicyItem>
+          </PolicyGrid>
+          <SecondaryButton disabled={!repoPath} onClick={runCleanupAudit} type="button">
+            <ButtonDeleteIcon aria-hidden="true" />
+            <span>Audit bloat</span>
+          </SecondaryButton>
+          <CompactTable
+            columns={[
+              { key: "kind", label: "Kind" },
+              { key: "path", label: "Path" },
+            ]}
+            empty="No bloat candidates recorded."
+            rows={bloatEntries}
+          />
+          <SettingsHint>Audit only. Unknown MCP files and branch roots are never deleted automatically.</SettingsHint>
+        </Panel>
+
+        <Panel>
+          <PanelTopline>
+            <span>UI Surface Logs</span>
+            <strong>{snapshot?.ui_surface_logs?.length || 0}</strong>
+          </PanelTopline>
+          <CompactTable
+            columns={[
+              { key: "surface", label: "Surface" },
+              { key: "action", label: "Action" },
+              { key: "status", label: "Status" },
+              { key: "command_name", label: "Command", render: (row) => row.command_name || "none" },
+            ]}
+            empty="No UI surface logs yet."
+            rows={snapshot?.ui_surface_logs || []}
+          />
+        </Panel>
+
         <Panel>
           <PanelTopline>
             <span>SQL Classifier</span>
@@ -455,7 +728,7 @@ export default function CoordinationWorkspaceView({
           </SecondaryButton>
           {sqlResult && (
             <ResultLine>
-              {sqlResult.classification} · risk {sqlResult.risk_level} · {sqlResult.blocked_by_default ? "blocked by default" : "allowed by policy"}
+              {sqlResult.classification} - risk {sqlResult.risk_level} - {sqlResult.blocked_by_default ? "blocked by default" : "allowed by policy"}
             </ResultLine>
           )}
         </Panel>
@@ -855,4 +1128,29 @@ const ButtonRow = styled.div`
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+`;
+
+const InlineActionButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(127, 177, 255, 0.34);
+  border-radius: 6px;
+  color: #dfeaff;
+  background: rgba(47, 128, 255, 0.12);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 850;
+  letter-spacing: 0;
+  cursor: pointer;
+
+  &:disabled {
+    border-color: rgba(148, 163, 184, 0.14);
+    color: #667386;
+    background: rgba(255, 255, 255, 0.03);
+    cursor: not-allowed;
+  }
 `;

@@ -49,6 +49,51 @@ pub fn coordination_get_snapshot(
 }
 
 #[tauri::command]
+pub fn coordination_log_ui_surface_event(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.log_ui_surface_event(&input))
+}
+
+#[tauri::command]
+pub fn coordination_cleanup_bloat_dry_run(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.cleanup_bloat_dry_run())
+}
+
+#[tauri::command]
+pub fn coordination_start_file_watcher(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Option<Value>,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    result(watcher::start_file_watcher(&kernel, input))
+}
+
+#[tauri::command]
+pub fn coordination_stop_file_watcher(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    result(watcher::stop_file_watcher(&kernel))
+}
+
+#[tauri::command]
+pub fn coordination_get_file_watcher_status(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    result(watcher::file_watcher_status(&kernel))
+}
+
+#[tauri::command]
 pub fn coordination_get_alignment_report(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -65,7 +110,7 @@ pub fn coordination_get_workspace_mcp_status(
 ) -> Result<Value, String> {
     result(
         kernel(repo_path, db_path)?
-            .ensure_workspace_mcp_config(
+            .get_workspace_mcp_status(
                 Some(req_text(&workspace_id, "workspace_id")?),
                 workspace_name.as_deref(),
             )
@@ -93,6 +138,32 @@ pub fn coordination_create_task(
             )
             .map(api_ok_from_data),
     )
+}
+
+#[tauri::command]
+pub fn coordination_add_task_dependency(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .add_task_dependency(
+                req(&input, "task_id")?,
+                req(&input, "depends_on_task_id")?,
+                input["dependency_kind"].as_str(),
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_list_task_dependencies(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.list_task_dependencies(input["task_id"].as_str()))
 }
 
 #[tauri::command]
@@ -226,6 +297,19 @@ pub fn coordination_list_active_leases(
         input["task_id"].as_str(),
         input["agent_id"].as_str(),
         input["resource_key"].as_str(),
+    ))
+}
+
+#[tauri::command]
+pub fn coordination_list_resources(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Option<Value>,
+) -> Result<Value, String> {
+    let input = input.unwrap_or_else(|| json!({}));
+    result(kernel(repo_path, db_path)?.list_resources(
+        input["resource_type"].as_str(),
+        input["min_risk_level"].as_i64(),
     ))
 }
 
@@ -386,6 +470,23 @@ pub fn coordination_list_workspace_violations(
 }
 
 #[tauri::command]
+pub fn coordination_list_workspace_changes(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Option<Value>,
+) -> Result<Value, String> {
+    let input = input.unwrap_or_else(|| json!({}));
+    result(kernel(repo_path, db_path)?.list_workspace_changes(
+        input["task_id"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input["worktree_id"].as_str(),
+        input["resource_key"].as_str(),
+        input["limit"].as_i64(),
+    ))
+}
+
+#[tauri::command]
 pub fn coordination_resolve_workspace_violation(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -414,6 +515,52 @@ pub fn coordination_db_get_mode(
     db_path: Option<String>,
 ) -> Result<Value, String> {
     result(kernel(repo_path, db_path)?.db_get_mode())
+}
+
+#[tauri::command]
+pub fn coordination_db_request_change(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.db_request_change(&input))
+}
+
+#[tauri::command]
+pub fn coordination_db_list_change_requests(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Option<Value>,
+) -> Result<Value, String> {
+    let input = input.unwrap_or_else(|| json!({}));
+    result(
+        kernel(repo_path, db_path)?
+            .db_list_change_requests(input["status"].as_str(), input["task_id"].as_str()),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_db_get_change_request(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    db_change_request_id: String,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.db_get_change_request(&db_change_request_id))
+}
+
+#[tauri::command]
+pub fn coordination_db_request_approval(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.db_request_approval(
+        req(&input, "db_change_request_id")?,
+        req(&input, "agent_id")?,
+        input["session_id"].as_str(),
+        input["reason"].as_str(),
+        input["risk_summary"].as_str(),
+    ))
 }
 
 #[tauri::command]
@@ -447,9 +594,24 @@ pub fn coordination_request_approval(
     result(kernel(repo_path, db_path)?.request_approval(
         req(&input, "task_id")?,
         req(&input, "agent_id")?,
+        input["session_id"].as_str(),
         req(&input, "approval_kind")?,
         req(&input, "reason")?,
         input["risk_summary"].as_str(),
+    ))
+}
+
+#[tauri::command]
+pub fn coordination_resolve_approval(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.resolve_approval(
+        req(&input, "approval_id")?,
+        req(&input, "decision")?,
+        input["human_actor"].as_str().unwrap_or("local"),
+        input["reason"].as_str(),
     ))
 }
 

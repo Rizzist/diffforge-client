@@ -39,20 +39,39 @@ const COORDINATION_TOOLS = [
   "acquire_lease",
   "renew_lease",
   "release_lease",
+  "list_resources",
   "list_active_leases",
+  "list_task_dependencies",
   "announce_change",
   "validate_patch",
   "submit_patch",
+  "request_merge",
   "list_workspace_violations",
+  "list_workspace_changes",
+  "file_watcher_status",
+  "watcher_scan",
   "get_slot_status",
   "search_memory",
   "write_memory",
   "db_get_mode",
   "db_classify_sql",
+  "db_request_change",
+  "db_list_change_requests",
+  "db_get_change_request",
   "db_attach_migration_proposal",
   "db_propose_migration",
   "db_request_approval",
   "request_approval",
+  "orchestrator_get_status",
+  "orchestrator_create_run",
+  "orchestrator_create_context_export",
+  "orchestrator_import_plan",
+  "orchestrator_adopt_plan",
+  "orchestrator_list_runs",
+  "orchestrator_get_brief",
+  "orchestrator_sync_once",
+  "orchestrator_propose_agent_assignments",
+  "orchestrator_adopt_agent_assignment",
 ];
 
 function unwrapData(response, fallback = {}) {
@@ -125,6 +144,12 @@ export default function McpsWorkspaceView({
 
   const isReady = status === "ready" && coordinator;
   const objectiveKey = coordinator?.objective_key || workspaceId;
+  const health = coordinator?.health || {};
+  const probe = health.spawn_probe || {};
+  const clientMountSummary = health.agent_client_mount_summary || {};
+  const clientMounts = clientMountSummary.mounts || [];
+  const isHealthy = health.status === "healthy";
+  const probeToolCount = Number(probe.tool_count || 0);
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
@@ -149,11 +174,11 @@ export default function McpsWorkspaceView({
         <McpStatsGrid>
           <SettingsIdentityItem>
             <span>Connected</span>
-            <strong>{isReady ? "1 server" : "0 servers"}</strong>
+            <strong>{isHealthy ? "1 healthy" : isReady ? "configured" : "0 servers"}</strong>
           </SettingsIdentityItem>
           <SettingsIdentityItem>
             <span>Coordinator MCP</span>
-            <strong>{isReady ? "Auto-on" : "Requires workspace UUID"}</strong>
+            <strong>{isHealthy ? "Auto-on healthy" : isReady ? "Probe warning" : "Requires workspace UUID"}</strong>
           </SettingsIdentityItem>
           <SettingsIdentityItem>
             <span>Objective key</span>
@@ -177,8 +202,8 @@ export default function McpsWorkspaceView({
                 <strong>Coordination Kernel</strong>
                 <span>{workspaceId ? "Built-in workspace MCP" : "Workspace UUID missing"}</span>
               </McpServerCopy>
-              <McpStatusBadge data-state={isReady ? "enabled" : "planned"}>
-                {isReady ? "Auto-on" : "Blocked"}
+              <McpStatusBadge data-state={isHealthy ? "enabled" : "planned"}>
+                {isHealthy ? "Healthy" : isReady ? "Check" : "Blocked"}
               </McpStatusBadge>
             </McpServerButton>
             <McpServerButton as="div">
@@ -203,8 +228,8 @@ export default function McpsWorkspaceView({
                 Always on for this workspace. The objective key is the server-backed workspace UUID.
               </PageSubline>
             </div>
-            <McpStatusBadge data-state={isReady ? "enabled" : "planned"}>
-              {isReady ? "Enabled" : "Needs UUID"}
+            <McpStatusBadge data-state={isHealthy ? "enabled" : "planned"}>
+              {isHealthy ? "Healthy" : isReady ? "Probe warning" : "Needs UUID"}
             </McpStatusBadge>
           </McpEditorHeader>
 
@@ -227,6 +252,18 @@ export default function McpsWorkspaceView({
             <SettingsIdentityItem>
               <span>Scope</span>
               <strong>{workspaceId || "Missing UUID"}</strong>
+            </SettingsIdentityItem>
+            <SettingsIdentityItem>
+              <span>Runtime probe</span>
+              <strong>{probe.status || "not checked"}</strong>
+            </SettingsIdentityItem>
+            <SettingsIdentityItem>
+              <span>Tools</span>
+              <strong>{probeToolCount || "unknown"}</strong>
+            </SettingsIdentityItem>
+            <SettingsIdentityItem>
+              <span>Agent clients</span>
+              <strong>{clientMountSummary.status || health.agent_client_mount || "unknown"}</strong>
             </SettingsIdentityItem>
           </McpScopePreview>
 
@@ -261,9 +298,36 @@ export default function McpsWorkspaceView({
                 Codex: {shortPath(coordinator?.codex_config_path)}
                 <br />
                 Claude: {shortPath(coordinator?.claude_config_path)}
+                <br />
+                Health: {health.status || "not checked"}
+                <br />
+                Client mount: {clientMountSummary.status || health.agent_client_mount || "unknown"}
               </McpEmptyAccess>
             </McpAccessPanel>
           </McpAccessGrid>
+
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonHubIcon aria-hidden="true" />
+                Agent client mounts
+              </span>
+              <McpStatusBadge data-state={clientMountSummary.status === "confirmed" || clientMountSummary.status === "idle" ? "enabled" : "planned"}>
+                {clientMountSummary.confirmed_session_count || 0}/{clientMountSummary.active_session_count || 0}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            <McpEmptyAccess>
+              {clientMounts.length
+                ? clientMounts.slice(0, 6).map((mount) => (
+                    <span key={mount.session_id || mount.slot_key}>
+                      {mount.slot_key || mount.agent_name || mount.session_id}: {mount.status}
+                      {mount.latest_event_type ? ` via ${mount.latest_event_type}` : ""}
+                      <br />
+                    </span>
+                  ))
+                : "No active agent sessions have reported MCP client events yet."}
+            </McpEmptyAccess>
+          </McpAccessPanel>
 
           <McpAccessPanel>
             <McpAccessTopline>

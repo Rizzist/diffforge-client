@@ -372,6 +372,10 @@ function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
 }
 
+function isWindowsPlatform() {
+  return typeof navigator !== "undefined" && /win/i.test(navigator.platform || "");
+}
+
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing";
@@ -507,7 +511,31 @@ function defaultPushToTalkShortcut() {
     return "Alt+KeyP";
   }
 
-  return "ContextMenu";
+  if (isWindowsPlatform()) {
+    return "ContextMenu";
+  }
+
+  return "Alt+KeyP";
+}
+
+function normalizeShortcutTokenForCompare(token) {
+  const compact = String(token || "").trim().replace(/[\s_-]+/g, "").toLowerCase();
+
+  if (["apps", "appkey", "application", "contextmenu", "menu"].includes(compact)) {
+    return "contextmenu";
+  }
+
+  return compact;
+}
+
+function normalizeKeyboardShortcutCode(value) {
+  const compact = String(value || "").trim().replace(/[\s_-]+/g, "").toLowerCase();
+
+  if (["apps", "appkey", "application", "contextmenu", "menu"].includes(compact)) {
+    return "ContextMenu";
+  }
+
+  return value;
 }
 
 function fallbackShortcutPermissions() {
@@ -548,13 +576,13 @@ function fallbackShortcutStatus() {
 function normalizeShortcutForCompare(value) {
   return String(value || "")
     .split("+")
-    .map((token) => token.trim().replace(/[\s_-]+/g, "").toLowerCase())
+    .map(normalizeShortcutTokenForCompare)
     .filter(Boolean)
     .join("+");
 }
 
 function shortcutFromKeyboardEvent(event) {
-  const code = event.code || event.key || "";
+  const code = normalizeKeyboardShortcutCode(event.code || event.key || "");
 
   if (!code) {
     return "";
@@ -605,7 +633,7 @@ function formatShortcutToken(token) {
   if (lower === "super" || lower === "command" || lower === "cmd" || lower === "meta") {
     return "Cmd/Win";
   }
-  if (lower === "contextmenu" || lower === "menu") {
+  if (lower === "apps" || lower === "appkey" || lower === "application" || lower === "contextmenu" || lower === "menu") {
     return "Menu";
   }
   if (lower === "metaright" || lower === "osright") {
@@ -821,10 +849,12 @@ export default function AudioWorkspaceView({
       }
 
       if (currentState !== "previewing") {
-        const nextState = hasAudioInputSetup() ? "ready" : "needs-access";
+        const inputSetupReady = hasAudioInputSetup();
+        const canAutoStartInput = !isMacPlatform() || inputSetupReady;
+        const nextState = canAutoStartInput ? "ready" : "needs-access";
         audioInputStateRef.current = nextState;
         setAudioInputState(nextState);
-        setAudioInputMessage(hasAudioInputSetup()
+        setAudioInputMessage(canAutoStartInput
           ? "Start monitoring to preview levels from the selected source."
           : "Enable input to open a native stream from the selected source.");
       }
@@ -1105,11 +1135,13 @@ export default function AudioWorkspaceView({
   }, [loadAudioInputDevices]);
 
   useEffect(() => {
+    const inputSetupReady = hasAudioInputSetup();
+    const needsManualMacInputEnable = isMacPlatform() && !inputSetupReady;
+
     if (
-      !isMacPlatform()
-      || audioInputAutoWarmAttemptedRef.current
+      audioInputAutoWarmAttemptedRef.current
       || audioInputAutoWarmSuppressedRef.current
-      || !hasAudioInputSetup()
+      || needsManualMacInputEnable
       || audioInputState !== "ready"
       || audioInputDevices.length === 0
     ) {
