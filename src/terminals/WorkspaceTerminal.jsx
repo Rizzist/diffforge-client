@@ -101,8 +101,6 @@ import {
   ResizePanelGroup,
   ResizePanel,
   ResizeHandle,
-  TerminalDevMetricsBar,
-  TerminalDevMetric,
   TerminalFrame,
   XtermSurface,
   TerminalScrollRail,
@@ -110,6 +108,12 @@ import {
   TerminalClosedSurface,
   TerminalClosedLabel,
   TerminalClosingOverlay,
+  TerminalParkedBar,
+  TerminalParkedSpinner,
+  TerminalParkedCopy,
+  TerminalParkedAgents,
+  TerminalParkedAgentBadge,
+  TerminalParkedCancelButton,
   TerminalRestartPill,
   TerminalAgentIdBadge,
   TerminalProjectBadge,
@@ -355,6 +359,10 @@ const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
 const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
+const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
+const TERMINAL_INPUT_BATCH_MS = 8;
+const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
+const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
 const TODO_DRAG_MIME = "application/x-diffforge-todo";
 const TODO_DROP_OVERLAY_STYLE = {
   position: "absolute",
@@ -1282,6 +1290,7 @@ export default function WorkspaceTerminal({
   const containerRef = useRef(null);
   const scrollRailRef = useRef(null);
   const scrollThumbRef = useRef(null);
+  const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
@@ -1289,6 +1298,7 @@ export default function WorkspaceTerminal({
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupRestartCountRef = useRef(0);
   const terminalClosingRef = useRef(false);
+  const parkedPromptRef = useRef(null);
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
   const [terminalError, setTerminalError] = useState("");
   const [restartKey, setRestartKey] = useState(0);
@@ -1296,6 +1306,7 @@ export default function WorkspaceTerminal({
   const [terminalClosing, setTerminalClosing] = useState(false);
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
+  const [parkedPrompt, setParkedPrompt] = useState(null);
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -1318,10 +1329,26 @@ export default function WorkspaceTerminal({
     : `${projectLabel} - edits are isolated until merge`;
 
   useEffect(() => {
+    parkedPromptRef.current = parkedPrompt;
+    const terminal = xtermRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    const isParked = Boolean(parkedPrompt);
+    terminal.options.disableStdin = isParked;
+    terminal.options.cursorBlink = !isParked;
+    if (isParked) {
+      terminal.blur?.();
+    }
+  }, [parkedPrompt]);
+
+  useEffect(() => {
     setTerminalClosed(false);
     terminalClosingRef.current = false;
     setTerminalClosing(false);
     setTerminalLaunchInfo(null);
+    setParkedPrompt(null);
     lastAgentLaunchEpochRef.current = 0;
     blankStartupRestartCountRef.current = 0;
   }, [agent?.id, terminalIndex, terminalRoleId, workspace?.id]);
@@ -1346,11 +1373,96 @@ export default function WorkspaceTerminal({
   }, [terminalCount]);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    listen(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
+      const payload = event.payload || {};
+      if (
+        payload.paneId !== paneId
+        || Number(payload.instanceId || 0) !== Number(terminalInstanceIdRef.current || 0)
+      ) {
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceIdRef.current || 0,
+          phase: "frontend.parked_prompt.ignored",
+          fields: {
+            payloadPaneId: payload.paneId || "",
+            payloadInstanceId: Number(payload.instanceId || 0),
+            currentInstanceId: Number(terminalInstanceIdRef.current || 0),
+            reason: "pane_or_instance_mismatch",
+          },
+        });
+        return;
+      }
+
+      if (payload.status === "parked") {
+        setParkedPrompt(payload);
+      } else {
+        setParkedPrompt(null);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [paneId]);
+
+  useEffect(() => {
+    if (terminalClosed || terminalClosing) {
+      return undefined;
+    }
+
+    let disposed = false;
+    const syncParkedPrompt = async () => {
+      const instanceId = Number(terminalInstanceIdRef.current || 0);
+      if (!instanceId || disposed) {
+        return;
+      }
+      try {
+        const payload = await invoke("terminal_get_parked_prompt", {
+          paneId,
+          instanceId,
+        });
+        if (disposed) {
+          return;
+        }
+        if (payload?.status === "parked") {
+          setParkedPrompt(payload);
+        } else {
+          setParkedPrompt(null);
+        }
+      } catch {
+        // Best-effort recovery path; the event listener remains the primary path.
+      }
+    };
+
+    syncParkedPrompt();
+    const intervalId = window.setInterval(syncParkedPrompt, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [paneId, terminalClosed, terminalClosing, terminalState, restartKey]);
+
+  useEffect(() => {
     if (!agent) {
       startAgentInPrewarmedTerminalRef.current = null;
       setTerminalState("blocked");
       setTerminalError("");
       setTerminalLaunchInfo(null);
+      setParkedPrompt(null);
       terminalClosingRef.current = false;
       setTerminalClosing(false);
       return undefined;
@@ -1360,6 +1472,7 @@ export default function WorkspaceTerminal({
       setTerminalState("closed");
       setTerminalError("");
       setTerminalLaunchInfo(null);
+      setParkedPrompt(null);
       terminalClosingRef.current = false;
       setTerminalClosing(false);
       return undefined;
@@ -1435,8 +1548,9 @@ export default function WorkspaceTerminal({
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: true,
-      cursorBlink: true,
+      cursorBlink: !parkedPromptRef.current,
       cursorStyle: "block",
+      disableStdin: Boolean(parkedPromptRef.current),
       fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
       fontSize: 12,
       lineHeight: 1.22,
@@ -1470,6 +1584,7 @@ export default function WorkspaceTerminal({
         scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
       },
     });
+    xtermRef.current = terminal;
 
     terminal.open(container);
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
@@ -2845,8 +2960,76 @@ export default function WorkspaceTerminal({
             setTerminalState("exited");
           }
         }));
+        let terminalInputBuffer = "";
+        let terminalInputFlushTimer = 0;
+        let terminalInputWriteChain = Promise.resolve();
+        const writeTerminalInputChunk = (data, reason) => {
+          terminalInputWriteChain = terminalInputWriteChain
+            .catch(() => {})
+            .then(() => invoke("terminal_write", {
+              paneId,
+              instanceId: terminalInstanceId,
+              data,
+            }))
+            .catch((error) => {
+              if (isTerminalSessionMissingError(error)) {
+                writeTerminalTelemetry({
+                  paneId,
+                  instanceId: terminalInstanceId,
+                  phase: "frontend.write.skip_missing_session",
+                });
+                return;
+              }
+
+              if (!isDisposed) {
+                setTerminalError(getErrorMessage(error, "Unable to write to terminal."));
+              }
+            });
+          if (data.length > 1) {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.input.batch_write",
+              fields: {
+                bytes: data.length,
+                reason,
+                terminalIndex,
+              },
+            });
+          }
+        };
+        const flushTerminalInput = (reason) => {
+          if (terminalInputFlushTimer) {
+            window.clearTimeout(terminalInputFlushTimer);
+            terminalInputFlushTimer = 0;
+          }
+          if (!terminalInputBuffer || !hasOpenPty || isDisposed) {
+            terminalInputBuffer = "";
+            return terminalInputWriteChain;
+          }
+          const queuedData = terminalInputBuffer;
+          terminalInputBuffer = "";
+          writeTerminalInputChunk(queuedData, reason);
+          return terminalInputWriteChain;
+        };
+        const scheduleTerminalInputFlush = (delayMs = TERMINAL_INPUT_BATCH_MS) => {
+          if (terminalInputFlushTimer) {
+            return;
+          }
+          terminalInputFlushTimer = window.setTimeout(() => {
+            terminalInputFlushTimer = 0;
+            flushTerminalInput("timer");
+          }, delayMs);
+        };
+        disposables.push(() => {
+          if (terminalInputFlushTimer) {
+            window.clearTimeout(terminalInputFlushTimer);
+            terminalInputFlushTimer = 0;
+          }
+          terminalInputBuffer = "";
+        });
         disposables.push(terminal.onData((data) => {
-          if (!hasOpenPty || isDisposed) {
+          if (!hasOpenPty || isDisposed || parkedPromptRef.current) {
             return;
           }
 
@@ -2856,25 +3039,101 @@ export default function WorkspaceTerminal({
             return;
           }
 
-          invoke("terminal_write", {
+          terminalInputBuffer += safeData;
+          const isDeleteInput = safeData === "\x7f"
+            || safeData === "\b"
+            || safeData === "\x1b[3~";
+          if (
+            safeData.includes("\r")
+            || safeData.includes("\n")
+            || terminalInputBuffer.length >= TERMINAL_INPUT_BATCH_MAX_CHARS
+          ) {
+            flushTerminalInput(
+              safeData.includes("\r") || safeData.includes("\n")
+                ? "submit"
+                : "buffer_limit",
+            );
+          } else {
+            scheduleTerminalInputFlush(
+              isDeleteInput ? TERMINAL_DELETE_INPUT_BATCH_MS : TERMINAL_INPUT_BATCH_MS,
+            );
+          }
+        }));
+        const handleTerminalSelectionDelete = (event) => {
+          if (
+            isGenericTerminal
+            || isDisposed
+            || !hasOpenPty
+            || parkedPromptRef.current
+            || event.defaultPrevented
+            || !["Backspace", "Delete"].includes(event.key)
+            || event.metaKey
+            || event.ctrlKey
+            || event.altKey
+            || event.shiftKey
+            || !terminal.hasSelection?.()
+          ) {
+            return;
+          }
+
+          const selection = terminal.getSelection?.() || "";
+          if (!selection.replace(/[\r\n]/g, "")) {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+          Promise.resolve(flushTerminalInput("selection_delete_flush_before"))
+            .then(() => invoke("terminal_delete_selection", {
+              paneId,
+              instanceId: terminalInstanceId,
+              selection,
+            }))
+            .then((result) => {
+              if (result?.deleted) {
+                terminal.clearSelection?.();
+              }
+            })
+            .catch((error) => {
+              if (!isDisposed) {
+                setTerminalError(getErrorMessage(error, "Unable to delete terminal selection."));
+              }
+            });
+        };
+        container.addEventListener("keydown", handleTerminalSelectionDelete, true);
+        disposables.push(() => {
+          container.removeEventListener("keydown", handleTerminalSelectionDelete, true);
+        });
+        const handleTerminalEscapeInterrupt = (event) => {
+          if (
+            isGenericTerminal
+            || isDisposed
+            || !hasOpenPty
+            || event.key !== "Escape"
+            || event.metaKey
+            || event.ctrlKey
+            || event.altKey
+            || event.shiftKey
+          ) {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+          invoke("terminal_interrupt_agent", {
             paneId,
             instanceId: terminalInstanceId,
-            data: safeData,
+            reason: "escape_key",
           }).catch((error) => {
-            if (isTerminalSessionMissingError(error)) {
-              writeTerminalTelemetry({
-                paneId,
-                instanceId: terminalInstanceId,
-                phase: "frontend.write.skip_missing_session",
-              });
-              return;
-            }
-
             if (!isDisposed) {
-              setTerminalError(getErrorMessage(error, "Unable to write to terminal."));
+              setTerminalError(getErrorMessage(error, "Unable to interrupt terminal agent."));
             }
           });
-        }));
+        };
+        container.addEventListener("keydown", handleTerminalEscapeInterrupt, true);
+        disposables.push(() => {
+          container.removeEventListener("keydown", handleTerminalEscapeInterrupt, true);
+        });
 
         const initialSize = await waitForTerminalSizeForOpen("terminal_open");
 
@@ -3138,6 +3397,9 @@ export default function WorkspaceTerminal({
       if (startAgentInPrewarmedTerminalRef.current === startAgentInCurrentPty) {
         startAgentInPrewarmedTerminalRef.current = null;
       }
+      if (xtermRef.current === terminal) {
+        xtermRef.current = null;
+      }
       onPreparedTerminalChange?.({
         agentId: agent?.id || "",
         instanceId: terminalInstanceId,
@@ -3259,6 +3521,24 @@ export default function WorkspaceTerminal({
       workspaceId: workspace?.id || "",
     });
   }, [onCloseTerminal, paneId, terminalClosed, terminalIndex, workspace?.id]);
+
+  const cancelParkedPrompt = useCallback(async () => {
+    if (!parkedPrompt?.taskId || terminalClosingRef.current) {
+      return;
+    }
+
+    setTerminalError("");
+    try {
+      await invoke("terminal_cancel_parked_task", {
+        paneId,
+        instanceId: parkedPrompt.instanceId,
+        taskId: parkedPrompt.taskId,
+      });
+      setParkedPrompt(null);
+    } catch (error) {
+      setTerminalError(getErrorMessage(error, "Unable to cancel parked task."));
+    }
+  }, [paneId, parkedPrompt]);
 
   const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
     if (terminalClosing) {
@@ -3416,6 +3696,7 @@ export default function WorkspaceTerminal({
           <>
             <XtermSurface
               data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
+              data-parked={parkedPrompt ? "true" : "false"}
               onDragEnter={isGenericTerminal ? undefined : handleTerminalTodoDragEnter}
               onDragLeave={isGenericTerminal ? undefined : handleTerminalTodoDragLeave}
               onDragOver={isGenericTerminal ? undefined : handleTerminalTodoDragOver}
@@ -3435,6 +3716,29 @@ export default function WorkspaceTerminal({
                   <span>Shutting it down...</span>
                 </div>
               </TerminalClosingOverlay>
+            )}
+            {parkedPrompt && (
+              <TerminalParkedBar aria-live="polite" role="status">
+                <TerminalParkedSpinner aria-hidden="true" />
+                <TerminalParkedCopy>
+                  <strong>Parked: {parkedPrompt.title || "Waiting for dependency"}</strong>
+                  <span>
+                    Waiting on{" "}
+                    <TerminalParkedAgents>
+                      {(parkedPrompt.waitingOn || []).length
+                        ? parkedPrompt.waitingOn.map((agent, index) => (
+                          <TerminalParkedAgentBadge key={`${agent.agentId || agent.agentLabel || "agent"}-${index}`}>
+                            {agent.agentLabel || agent.agentId || "agent"}
+                          </TerminalParkedAgentBadge>
+                        ))
+                        : <TerminalParkedAgentBadge>peer</TerminalParkedAgentBadge>}
+                    </TerminalParkedAgents>
+                  </span>
+                </TerminalParkedCopy>
+                <TerminalParkedCancelButton onClick={cancelParkedPrompt} type="button">
+                  Cancel task
+                </TerminalParkedCancelButton>
+              </TerminalParkedBar>
             )}
             {terminalDropActive && (
               <div style={TODO_DROP_OVERLAY_STYLE}>

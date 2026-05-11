@@ -246,6 +246,15 @@ import {
   WorkspaceSettingsHeaderActions,
   WorkspaceSettingsMetaPill,
   WorkspaceModalCloseButton,
+  CrashRecoveryOverlay,
+  CrashRecoveryDialog,
+  CrashRecoveryIntro,
+  CrashRecoveryList,
+  CrashRecoveryItem,
+  CrashRecoveryItemTitle,
+  CrashRecoveryItemBody,
+  CrashRecoveryMeta,
+  CrashRecoveryActions,
   WorkspaceSettingsForm,
   WorkspaceSettingsInput,
   RootDirectoryInput,
@@ -1556,6 +1565,7 @@ export default function App() {
   const [workspaceSettingsError, setWorkspaceSettingsError] = useState("");
   const [workspaceSettingsMessage, setWorkspaceSettingsMessage] = useState("");
   const [workspaceSettingsModalId, setWorkspaceSettingsModalId] = useState("");
+  const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
   const [authInitialized, setAuthInitialized] = useState(false);
@@ -1580,6 +1590,7 @@ export default function App() {
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
   const preparedTerminalsRef = useRef(new Map());
+  const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseAllowNativeRef = useRef(false);
@@ -2523,6 +2534,54 @@ export default function App() {
     try {
       const result = await invoke("list_workspaces", { token });
       const nextWorkspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
+      if (!crashRecoveryScanRef.current) {
+        crashRecoveryScanRef.current = true;
+        const localWorkspaceSettings = readWorkspaceSettings();
+        const recoveryRoots = Array.from(new Set(nextWorkspaces
+          .map((workspace) => getWorkspaceRootDirectory(localWorkspaceSettings, workspace.id))
+          .filter(Boolean)));
+        const recoveryStartedAt = performance.now();
+
+        try {
+          const recoveryReport = await invoke("terminal_recover_crashed_sessions", {
+            roots: recoveryRoots,
+          });
+          const interruptedTasks = Array.isArray(recoveryReport?.interruptedTasks)
+            ? recoveryReport.interruptedTasks
+            : [];
+
+          writeTerminalTelemetry({
+            phase: "frontend.crash_recovery.scan_done",
+            elapsedMs: performance.now() - recoveryStartedAt,
+            fields: {
+              interruptedTasks: interruptedTasks.length,
+              requestedRoots: recoveryRoots.length,
+              scannedSessions: recoveryReport?.scannedSessions ?? null,
+              idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted ?? null,
+              finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted ?? null,
+              errors: Array.isArray(recoveryReport?.errors) ? recoveryReport.errors.length : 0,
+            },
+          });
+
+          if (interruptedTasks.length > 0) {
+            setCrashRecoveryModal({
+              interruptedTasks,
+              idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted || 0,
+              finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted || 0,
+              scannedSessions: recoveryReport?.scannedSessions || 0,
+            });
+          }
+        } catch (error) {
+          writeTerminalTelemetry({
+            phase: "frontend.crash_recovery.scan_error",
+            elapsedMs: performance.now() - recoveryStartedAt,
+            fields: {
+              error: getErrorMessage(error, "Unable to recover crashed terminal sessions."),
+              requestedRoots: recoveryRoots.length,
+            },
+          });
+        }
+      }
       const currentSelectedId = selectedWorkspaceIdRef.current;
       const currentActivatedId = activatedWorkspaceIdRef.current;
       const configuredDefaultWorkspaceId = workspaceLifecycleSettingsRef.current.defaultWorkspaceId;
@@ -3302,11 +3361,13 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
+    setCrashRecoveryModal(null);
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
+    crashRecoveryScanRef.current = false;
     preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
     setStartupAgentUpdateMessage("");
@@ -3698,7 +3759,7 @@ export default function App() {
   const activatedWorkspaceVisibleTerminalCount = activatedWorkspaceTerminalIndexes.length;
   const activatedWorkspaceTerminalRoleEntries = useMemo(
     () => activatedWorkspaceTerminalIndexes.map((terminalIndex, index) => ({
-      role: activatedWorkspaceTerminalRoles[index] || activeAgent,
+      role: activatedWorkspaceTerminalRoles[terminalIndex] || activatedWorkspaceTerminalRoles[index] || activeAgent,
       terminalIndex,
     })),
     [activatedWorkspaceTerminalIndexes, activatedWorkspaceTerminalRoles, activeAgent],
@@ -3744,6 +3805,27 @@ export default function App() {
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
+  const chooseCrashRecoveryPath = useCallback((choice) => {
+    const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
+      ? crashRecoveryModal.interruptedTasks
+      : [];
+
+    writeTerminalTelemetry({
+      phase: "frontend.crash_recovery.choice",
+      fields: {
+        choice,
+        interruptedTasks: interruptedTasks.length,
+      },
+    });
+    setCrashRecoveryModal(null);
+
+    if (choice === "resume") {
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        telemetrySource: "crash_recovery_resume",
+        telemetryWorkspaceId: activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current,
+      });
+    }
+  }, [crashRecoveryModal, showView]);
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {
       openWorkspaceSettings(selectedWorkspace.id);
@@ -4970,6 +5052,70 @@ export default function App() {
                     {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
                   </WorkspaceSettingsDialog>
                 </WorkspaceSettingsOverlay>
+              )}
+              {crashRecoveryModal?.interruptedTasks?.length > 0 && (
+                <CrashRecoveryOverlay aria-label="Crash recovery modal">
+                  <CrashRecoveryDialog
+                    aria-labelledby="crash-recovery-title"
+                    aria-modal="true"
+                    role="dialog"
+                  >
+                    <WorkspaceSettingsDialogHeader>
+                      <WorkspaceSettingsHeaderMain>
+                        <div>
+                          <PanelKicker>Crash recovery</PanelKicker>
+                          <PanelHeading id="crash-recovery-title">Some agents were interrupted</PanelHeading>
+                        </div>
+                        <CrashRecoveryIntro>
+                          <p>
+                            Diff Forge found agent work that was still active when the desktop app stopped unexpectedly.
+                            Those sessions were marked <strong>interrupted</strong> so stale leases and worktrees do not block new work.
+                          </p>
+                          <p>
+                            Choose <strong>Resume agents</strong> to open the terminal workspace and continue manually.
+                            Nothing will be typed or submitted to an agent automatically.
+                          </p>
+                        </CrashRecoveryIntro>
+                      </WorkspaceSettingsHeaderMain>
+                    </WorkspaceSettingsDialogHeader>
+
+                    <CrashRecoveryList>
+                      {crashRecoveryModal.interruptedTasks.map((task) => {
+                        const taskBody = String(task.body || "");
+
+                        return (
+                          <CrashRecoveryItem key={`${task.sessionId || "session"}-${task.taskId || "task"}`}>
+                            <CrashRecoveryItemTitle>
+                              {task.title || "Interrupted agent task"}
+                            </CrashRecoveryItemTitle>
+                            {taskBody && (
+                              <CrashRecoveryItemBody>
+                                {taskBody.slice(0, 220)}
+                                {taskBody.length > 220 ? "..." : ""}
+                              </CrashRecoveryItemBody>
+                            )}
+                            <CrashRecoveryMeta>
+                              <span>{task.agentName || task.agentKind || "Agent"}</span>
+                              {task.slotKey && <span>{task.slotKey}</span>}
+                              {task.repoPath && <span>{task.repoPath}</span>}
+                              {task.previousTaskStatus && <span>was {task.previousTaskStatus}</span>}
+                            </CrashRecoveryMeta>
+                          </CrashRecoveryItem>
+                        );
+                      })}
+                    </CrashRecoveryList>
+
+                    <CrashRecoveryActions>
+                      <SecondaryButton onClick={() => chooseCrashRecoveryPath("fresh")} type="button">
+                        <span>Start fresh</span>
+                      </SecondaryButton>
+                      <PrimaryButton onClick={() => chooseCrashRecoveryPath("resume")} type="button">
+                        <ButtonTerminalIcon aria-hidden="true" />
+                        <span>Resume agents</span>
+                      </PrimaryButton>
+                    </CrashRecoveryActions>
+                  </CrashRecoveryDialog>
+                </CrashRecoveryOverlay>
               )}
               </DashboardShell>
               {isWorkspaceStartupOverlayVisible && (

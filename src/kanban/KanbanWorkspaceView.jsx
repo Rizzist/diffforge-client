@@ -9,6 +9,7 @@ const KANBAN_COLUMNS = [
   { id: "review", label: "Review", tone: "#fbbf24" },
   { id: "done", label: "Done", tone: "#a78bfa" },
   { id: "cancelled", label: "Cancelled", tone: "#94a3b8" },
+  { id: "interrupted", label: "Interrupted", tone: "#f97316" },
 ];
 
 function cleanText(value) {
@@ -99,6 +100,14 @@ function inferredStatus(task, fallback) {
   const title = text(field(task, "title", "summary"));
   const requested = text(meta.requested_status || meta.requestedStatus).toLowerCase();
   const combined = `${title} ${body} ${text(meta.block_reason || meta.blockReason)} ${text(meta.completion_gate || meta.completionGate)}`.toLowerCase();
+
+  if (status === "interrupted" || requested === "interrupted" || combined.includes("interrupted")) {
+    return "interrupted";
+  }
+
+  if (status === "cancelled" || requested === "cancelled" || combined.includes("cancelled")) {
+    return "cancelled";
+  }
 
   if (
     status === "blocked" ||

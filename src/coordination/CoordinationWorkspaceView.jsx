@@ -453,6 +453,40 @@ export default function CoordinationWorkspaceView({
           />
         </Panel>
 
+        <Panel>
+          <PanelTopline>
+            <span>Resource queues</span>
+            <strong>{snapshot?.resource_queues?.length || 0}</strong>
+          </PanelTopline>
+          <CompactTable
+            columns={[
+              { key: "resource_key", label: "Resource" },
+              { key: "active_count", label: "Active" },
+              { key: "queued_count", label: "Queued" },
+              { key: "queued_task_ids", label: "Waiting", render: (row) => row.queued_task_ids || "none" },
+            ]}
+            empty="No resource queues."
+            rows={snapshot?.resource_queues || []}
+          />
+        </Panel>
+
+        <Panel>
+          <PanelTopline>
+            <span>Task slices</span>
+            <strong>{snapshot?.task_resource_intents?.length || 0}</strong>
+          </PanelTopline>
+          <CompactTable
+            columns={[
+              { key: "resource_key", label: "Resource" },
+              { key: "status", label: "Status" },
+              { key: "task_id", label: "Task" },
+              { key: "depends_on_task_id", label: "Depends on", render: (row) => row.depends_on_task_id || "none" },
+            ]}
+            empty="No task resource slices."
+            rows={snapshot?.task_resource_intents || []}
+          />
+        </Panel>
+
         <Panel data-tone={(snapshot?.open_workspace_violations || []).length ? "warn" : "normal"}>
           <PanelTopline>
             <span>Violations</span>
@@ -546,6 +580,24 @@ export default function CoordinationWorkspaceView({
             ]}
             empty="No merge jobs."
             rows={snapshot?.merge_jobs || []}
+          />
+        </Panel>
+
+        <Panel>
+          <PanelTopline>
+            <span>Intent Resolver</span>
+            <strong>{snapshot?.integration_batches?.length || 0}</strong>
+          </PanelTopline>
+          <CompactTable
+            columns={[
+              { key: "status", label: "Status" },
+              { key: "strategy", label: "Strategy" },
+              { key: "merge_job_id", label: "Merge job", render: (row) => row.merge_job_id || "none" },
+              { key: "resolver_task_id", label: "Resolver task", render: (row) => row.resolver_task_id || "none" },
+              { key: "target_branch", label: "Target", render: (row) => row.target_branch || "integration" },
+            ]}
+            empty="No autonomous intent-resolution batches."
+            rows={snapshot?.integration_batches || []}
           />
         </Panel>
 

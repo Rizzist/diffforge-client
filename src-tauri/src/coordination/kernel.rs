@@ -53,6 +53,7 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "list_task_dependencies",
     "announce_change",
     "validate_patch",
+    "submit_patch",
     "list_workspace_violations",
     "list_workspace_changes",
     "file_watcher_status",
@@ -157,6 +158,11 @@ impl CoordinationKernel {
         kernel.mark_duplicate_pty_sessions_interrupted()?;
         kernel.mark_unsafe_coordination_only_sessions_interrupted()?;
         kernel.mark_invalid_worktree_sessions_interrupted()?;
+        let startup_lease_reset = if emit_recovery_event {
+            kernel.reset_active_leases_once_per_process_start()?
+        } else {
+            json!({"status": "skipped", "reason": "coordination_open_not_startup_init"})
+        };
         if emit_recovery_event {
             let storage_payload = storage_diagnostics.to_json();
             let lifecycle_event = if existed {
@@ -187,6 +193,7 @@ impl CoordinationKernel {
                     "repo_path": kernel.paths.repo_path.display().to_string(),
                     "db_path": kernel.paths.db_path.display().to_string(),
                     "storage": storage_payload,
+                    "startup_lease_reset": startup_lease_reset,
                 }),
             )?;
             kernel.write_alignment_lifecycle_log(
@@ -203,6 +210,151 @@ impl CoordinationKernel {
         }
 
         Ok(kernel)
+    }
+
+    fn reset_active_leases_once_per_process_start(&self) -> Result<Value, String> {
+        static RESET_DBS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<String>>,
+        > = std::sync::OnceLock::new();
+        let db_key = self.paths.db_path.display().to_string();
+        let should_reset = {
+            let reset_dbs = RESET_DBS.get_or_init(|| {
+                std::sync::Mutex::new(std::collections::HashSet::new())
+            });
+            let mut guard = reset_dbs
+                .lock()
+                .map_err(|_| "Startup lease reset guard is poisoned.".to_string())?;
+            guard.insert(db_key.clone())
+        };
+        if !should_reset {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "already_reset_this_process",
+                "db_path": db_key,
+            }));
+        }
+        self.reset_active_leases_for_startup("kernel_process_start")
+    }
+
+    fn reset_active_leases_for_startup(&self, reason: &str) -> Result<Value, String> {
+        let leases = self.query_json(
+            "SELECT l.id,
+                    l.task_id,
+                    l.agent_id,
+                    l.agent_slot_id,
+                    l.session_id,
+                    l.resource_id,
+                    l.fence_token,
+                    r.resource_key
+             FROM leases l
+             LEFT JOIN resources r ON r.id=l.resource_id
+             WHERE l.status='active'
+             ORDER BY l.acquired_at ASC",
+            &[],
+        )?;
+        if leases.is_empty() {
+            return Ok(json!({
+                "status": "clean",
+                "reason": reason,
+                "cleared_count": 0,
+            }));
+        }
+
+        let now = now_rfc3339();
+        let mut cleared = Vec::new();
+        for lease in &leases {
+            let Some(lease_id) = lease["id"].as_str() else {
+                continue;
+            };
+            self.conn
+                .execute(
+                    "UPDATE leases
+                     SET status='expired',
+                         expires_at=?1,
+                         released_at=?1,
+                         last_heartbeat_at=?1
+                     WHERE id=?2
+                       AND status='active'",
+                    params![now, lease_id],
+                )
+                .map_err(|error| format!("Unable to clear startup lease: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE task_resource_intents
+                     SET status='planned',
+                         lease_id=NULL,
+                         updated_at=?1
+                     WHERE lease_id=?2
+                       AND status='lease_granted'",
+                    params![now, lease_id],
+                )
+                .map_err(|error| format!("Unable to reset startup lease intent: {error}"))?;
+            self.emit_event(
+                "startup_active_lease_cleared",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: lease["task_id"].as_str().map(str::to_string),
+                    agent_id: lease["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: lease["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: lease["session_id"].as_str().map(str::to_string),
+                    resource_id: lease["resource_id"].as_str().map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "lease_id": lease_id,
+                    "fence_token": lease["fence_token"].clone(),
+                    "resource_key": lease["resource_key"].clone(),
+                    "reason": reason,
+                    "policy": "app_restart_resets_all_active_leases",
+                }),
+            )?;
+            cleared.push(json!({
+                "lease_id": lease_id,
+                "task_id": lease["task_id"].clone(),
+                "session_id": lease["session_id"].clone(),
+                "resource_key": lease["resource_key"].clone(),
+            }));
+        }
+
+        let mut dependent_refreshes = Vec::new();
+        for lease in &leases {
+            dependent_refreshes.push(
+                self.refresh_active_file_lease_dependents_after_release(lease)
+                    .unwrap_or_else(|error| {
+                        api_error(
+                            "startup_lease_dependent_refresh_failed",
+                            "Startup cleared an active lease, but dependent parked tasks could not be refreshed.",
+                            json!({
+                                "lease_id": lease["id"].clone(),
+                                "error": error,
+                            }),
+                        )
+                    }),
+            );
+        }
+
+        self.emit_event(
+            "kernel_startup_active_leases_cleared",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "reason": reason,
+                "cleared_count": cleared.len(),
+                "cleared": cleared.clone(),
+                "dependent_refreshes": dependent_refreshes.clone(),
+                "policy": "app_restart_resets_all_active_leases",
+            }),
+        )?;
+
+        Ok(json!({
+            "status": "cleared",
+            "reason": reason,
+            "cleared_count": cleared.len(),
+            "cleared": cleared,
+            "dependent_refreshes": dependent_refreshes,
+        }))
     }
 
     fn emit_schema_migration_log_event(
@@ -298,6 +450,7 @@ impl CoordinationKernel {
 
         for attempt in 0..12 {
             let id = uuid();
+            let created_at = now_rfc3339();
             match self.conn.execute(
                 "INSERT INTO events(
                     id, seq, event_type, actor_type, actor_id, task_id, agent_id, agent_slot_id, session_id,
@@ -320,10 +473,40 @@ impl CoordinationKernel {
                     artifact_id,
                     context_run_id,
                     payload_json,
-                    now_rfc3339()
+                    &created_at
                 ],
             ) {
-                Ok(_) => return Ok(id),
+                Ok(_) => {
+                    let log_dir = self.paths.repo_path.join("logs");
+                    if fs::create_dir_all(&log_dir).is_ok() {
+                        if let Ok(mut file) = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(log_dir.join("coordination-events.jsonl"))
+                        {
+                            let _ = writeln!(
+                                file,
+                                "{}",
+                                json!({
+                                    "id": id.clone(),
+                                    "event_type": event_type,
+                                    "actor_type": actor_type,
+                                    "actor_id": actor_id,
+                                    "task_id": task_id,
+                                    "agent_id": agent_id,
+                                    "agent_slot_id": agent_slot_id,
+                                    "session_id": session_id,
+                                    "resource_id": resource_id,
+                                    "artifact_id": artifact_id,
+                                    "context_run_id": context_run_id,
+                                    "payload": payload.clone(),
+                                    "created_at": created_at,
+                                })
+                            );
+                        }
+                    }
+                    return Ok(id);
+                }
                 Err(error) if is_retryable_event_insert_error(&error) && attempt < 11 => {
                     std::thread::sleep(Duration::from_millis(15 + attempt * 10));
                 }
@@ -338,6 +521,45 @@ impl CoordinationKernel {
         Err(format!(
             "Unable to append coordination event {event_type}: event sequence remained busy"
         ))
+    }
+
+    fn emit_task_event_once_per_task_update(
+        &self,
+        event_type: &str,
+        actor_type: &str,
+        actor_id: &str,
+        refs: EventRefs,
+        payload: Value,
+        task_updated_at: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let Some(task_id) = refs.task_id.as_deref() else {
+            return self
+                .emit_event(event_type, actor_type, actor_id, refs, payload)
+                .map(Some);
+        };
+        if let Some(marker) = task_updated_at.filter(|value| !value.trim().is_empty()) {
+            let existing_payload: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT payload_json
+                     FROM events
+                     WHERE event_type=?1 AND task_id=?2
+                     ORDER BY seq DESC
+                     LIMIT 1",
+                    params![event_type, task_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("Unable to inspect recent task event: {error}"))?;
+            if existing_payload
+                .as_deref()
+                .is_some_and(|payload_json| payload_json.contains(marker))
+            {
+                return Ok(None);
+            }
+        }
+        self.emit_event(event_type, actor_type, actor_id, refs, payload)
+            .map(Some)
     }
 
     pub fn create_or_get_agent(
@@ -595,6 +817,87 @@ impl CoordinationKernel {
         Ok(json!({"id": id, "title": title, "status": "ready"}))
     }
 
+    pub fn sync_task_cloud_context(
+        &self,
+        task_id: &str,
+        cloud_context_task_id: Option<&str>,
+        title: Option<&str>,
+        body: Option<&str>,
+        lane: Option<&str>,
+    ) -> Result<Value, String> {
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let clean_title = title
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                !matches!(
+                    *value,
+                    "Agent preparing requested work" | "Complete requested terminal task"
+                )
+            });
+        let clean_body = body
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                let lower = value.to_ascii_lowercase();
+                !lower.contains("has not named the task yet")
+                    && lower != "the agent is preparing the requested work and has not named the task yet."
+            });
+        let clean_lane = lane.map(str::trim).filter(|value| !value.is_empty());
+        let clean_cloud_context_task_id = cloud_context_task_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let now = now_rfc3339();
+
+        self.conn
+            .execute(
+                "UPDATE tasks
+                 SET title=COALESCE(?1, title),
+                     body=COALESCE(?2, body),
+                     assigned_role=COALESCE(?3, assigned_role),
+                     context_run_id=COALESCE(?4, context_run_id),
+                     updated_at=?5
+                 WHERE id=?6",
+                params![
+                    clean_title,
+                    clean_body,
+                    clean_lane,
+                    clean_cloud_context_task_id,
+                    now,
+                    task_id
+                ],
+            )
+            .map_err(|error| format!("Unable to sync local task with Cloud MCP context: {error}"))?;
+        self.emit_event(
+            "task_cloud_context_synced",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                context_run_id: clean_cloud_context_task_id.map(str::to_string).or_else(|| {
+                    task["context_run_id"].as_str().map(str::to_string)
+                }),
+                ..EventRefs::default()
+            },
+            json!({
+                "cloud_context_task_id": clean_cloud_context_task_id,
+                "title": clean_title,
+                "body_synced": clean_body.is_some(),
+                "lane": clean_lane,
+            }),
+        )?;
+
+        self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist after Cloud MCP sync.",
+        )
+    }
+
     pub fn add_task_dependency(
         &self,
         task_id: &str,
@@ -666,6 +969,67 @@ impl CoordinationKernel {
         })))
     }
 
+    pub fn mark_terminal_task_stopped(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        status: &str,
+        reason: &str,
+    ) -> Result<Value, String> {
+        let normalized_status = status.trim().to_ascii_lowercase();
+        let status = match normalized_status.as_str() {
+            "cancelled" => "cancelled".to_string(),
+            "interrupted" => "interrupted".to_string(),
+            _ => return Err("Stopped terminal task status must be cancelled or interrupted.".to_string()),
+        };
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        if task["claimed_session_id"].as_str().unwrap_or_default() != session_id {
+            return Err("Task is not owned by this terminal session.".to_string());
+        }
+
+        self.begin_immediate_transaction("mark terminal task stopped")?;
+        let result = (|| -> Result<Value, String> {
+            let now = now_rfc3339();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status=?1, updated_at=?2
+                     WHERE id=?3 AND claimed_session_id=?4
+                       AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted')",
+                    params![&status, now, task_id, session_id],
+                )
+                .map_err(|error| format!("Unable to mark task {status}: {error}"))?;
+            let released_leases = self.release_active_leases_for_task(task_id, &format!("task_{status}"))?;
+            self.emit_event(
+                if status == "cancelled" { "task_cancelled" } else { "task_interrupted" },
+                "terminal",
+                session_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "reason": reason,
+                    "released_leases": released_leases,
+                    "status": status.clone(),
+                }),
+            )?;
+            Ok(json!({
+                "task_id": task_id,
+                "session_id": session_id,
+                "status": status,
+                "released_leases": released_leases,
+            }))
+        })();
+
+        self.finish_transaction(result, "mark terminal task stopped")
+    }
+
     fn insert_task_dependency_checked(
         &self,
         task_id: &str,
@@ -733,6 +1097,79 @@ impl CoordinationKernel {
         }))
     }
 
+    fn upsert_task_resource_intent(
+        &self,
+        task_id: &str,
+        resource_key: &str,
+        status: &str,
+        intent_summary: Option<&str>,
+        lease_id: Option<&str>,
+        depends_on_task_id: Option<&str>,
+    ) -> Result<(), String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO task_resource_intents(
+                    id, task_id, resource_key, intent_summary, status, lease_id,
+                    depends_on_task_id, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(task_id, resource_key) DO UPDATE SET
+                    intent_summary=COALESCE(excluded.intent_summary, task_resource_intents.intent_summary),
+                    status=excluded.status,
+                    lease_id=COALESCE(excluded.lease_id, task_resource_intents.lease_id),
+                    depends_on_task_id=excluded.depends_on_task_id,
+                    updated_at=excluded.updated_at",
+                params![
+                    uuid(),
+                    task_id,
+                    resource_key,
+                    intent_summary,
+                    status,
+                    lease_id,
+                    depends_on_task_id,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record task resource intent: {error}"))?;
+        Ok(())
+    }
+
+    fn upsert_task_slice_dependency(
+        &self,
+        task_id: &str,
+        resource_key: &str,
+        depends_on_task_id: &str,
+        depends_on_resource_key: Option<&str>,
+        dependency_kind: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO task_slice_dependencies(
+                    id, task_id, resource_key, depends_on_task_id,
+                    depends_on_resource_key, dependency_kind, status, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(task_id, resource_key, depends_on_task_id) DO UPDATE SET
+                    depends_on_resource_key=excluded.depends_on_resource_key,
+                    dependency_kind=excluded.dependency_kind,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at",
+                params![
+                    uuid(),
+                    task_id,
+                    resource_key,
+                    depends_on_task_id,
+                    depends_on_resource_key,
+                    dependency_kind,
+                    status,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record task slice dependency: {error}"))?;
+        Ok(())
+    }
+
     pub fn claim_task(
         &self,
         task_id: &str,
@@ -760,7 +1197,7 @@ impl CoordinationKernel {
                          SET status='blocked', updated_at=?1
                          WHERE id=?2
                            AND (claimed_session_id IS NULL OR claimed_session_id='')
-                           AND status NOT IN ('done', 'completed', 'merged')",
+                           AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
                         params![now_rfc3339(), task_id],
                     )
                     .map_err(|error| format!("Unable to mark task blocked: {error}"))?;
@@ -795,7 +1232,7 @@ impl CoordinationKernel {
                      SET status='claimed', claimed_by_agent_id=?1, claimed_session_id=?2, updated_at=?3
                      WHERE id=?4
                        AND (claimed_session_id IS NULL OR claimed_session_id='')
-                       AND status NOT IN ('done', 'completed', 'merged')",
+                       AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
                     params![agent_id, session_id, now, task_id],
                 )
                 .map_err(|error| format!("Unable to claim task: {error}"))?;
@@ -840,19 +1277,47 @@ impl CoordinationKernel {
                     d.depends_on_task_id,
                     prerequisite.title AS depends_on_title,
                     prerequisite.status AS depends_on_status,
+                    prerequisite.claimed_by_agent_id AS depends_on_agent_id,
+                    prerequisite.claimed_session_id AS depends_on_session_id,
+                    prerequisite_session.agent_slot_id AS depends_on_agent_slot_id,
+                    prerequisite_slot.slot_key AS depends_on_slot_key,
                     d.dependency_kind,
+                    (
+                        SELECT i.resource_key
+                        FROM task_resource_intents i
+                        WHERE i.task_id=d.task_id
+                          AND i.depends_on_task_id=d.depends_on_task_id
+                        ORDER BY i.updated_at DESC
+                        LIMIT 1
+                    ) AS resource_key,
+                    (
+                        SELECT s.depends_on_resource_key
+                        FROM task_slice_dependencies s
+                        WHERE s.task_id=d.task_id
+                          AND s.depends_on_task_id=d.depends_on_task_id
+                        ORDER BY s.updated_at DESC
+                        LIMIT 1
+                    ) AS depends_on_resource_key,
                     d.created_at
              FROM task_dependencies d
              LEFT JOIN tasks dependent ON dependent.id = d.task_id
              LEFT JOIN tasks prerequisite ON prerequisite.id = d.depends_on_task_id
+             LEFT JOIN agent_sessions prerequisite_session ON prerequisite_session.id = prerequisite.claimed_session_id
+             LEFT JOIN agent_slots prerequisite_slot ON prerequisite_slot.id = prerequisite_session.agent_slot_id
              WHERE d.task_id=?1
              ORDER BY d.created_at ASC",
             &[&task_id],
         )?;
         for row in &mut rows {
             let status = row["depends_on_status"].as_str().unwrap_or("").to_string();
+            let dependency_kind = row["dependency_kind"].as_str().unwrap_or("");
             let dependency_exists = !status.is_empty();
-            let satisfied = dependency_exists && task_dependency_satisfied_status(&status);
+            let satisfied = if dependency_kind == "active_file_lease" && dependency_exists {
+                task_dependency_satisfied_status(&status)
+                    || self.active_file_lease_dependency_satisfied(row)?
+            } else {
+                dependency_exists && task_dependency_satisfied_status(&status)
+            };
             if let Some(object) = row.as_object_mut() {
                 object.insert(
                     "dependency_exists".to_string(),
@@ -862,6 +1327,37 @@ impl CoordinationKernel {
             }
         }
         Ok(rows)
+    }
+
+    fn active_file_lease_dependency_satisfied(&self, dependency: &Value) -> Result<bool, String> {
+        let Some(depends_on_task_id) = dependency["depends_on_task_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(false);
+        };
+        let resource_key = dependency["resource_key"]
+            .as_str()
+            .or_else(|| dependency["depends_on_resource_key"].as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if resource_key.is_empty() {
+            return Ok(false);
+        }
+        let active_leases = self.query_json(
+            "SELECT r.resource_key
+             FROM leases l
+             JOIN resources r ON r.id=l.resource_id
+             WHERE l.task_id=?1
+               AND l.status='active'",
+            &[&depends_on_task_id],
+        )?;
+        Ok(!active_leases.iter().any(|lease| {
+            let active_resource = lease["resource_key"].as_str().unwrap_or_default();
+            resource_covers(active_resource, &resource_key)
+                || resource_covers(&resource_key, active_resource)
+        }))
     }
 
     fn unsatisfied_dependency_details(&self, task_id: &str) -> Result<Vec<Value>, String> {
@@ -912,8 +1408,42 @@ impl CoordinationKernel {
             "Task does not exist.",
         )?;
         let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let blocked_slice_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM task_slice_dependencies d
+                 LEFT JOIN tasks dependency ON dependency.id = d.depends_on_task_id
+                 WHERE d.task_id=?1
+                   AND d.status='cycle_prevented'
+                   AND (dependency.status IS NULL
+                        OR dependency.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped'))",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to inspect blocked task slices: {error}"))?;
         let now = now_rfc3339();
-        if blockers.is_empty() {
+        if blockers.is_empty() && blocked_slice_count == 0 {
+            let resume_ready_intent_count = self
+                .conn
+                .execute(
+                    "UPDATE task_resource_intents
+                     SET status='resume_ready', updated_at=?1
+                     WHERE task_id=?2
+                       AND status IN ('parked', 'parked_cycle_prevented')",
+                    params![now, task_id],
+                )
+                .map_err(|error| format!("Unable to mark resource intents resume-ready: {error}"))?;
+            let satisfied_slice_count = self
+                .conn
+                .execute(
+                    "UPDATE task_slice_dependencies
+                     SET status='satisfied', updated_at=?1
+                     WHERE task_id=?2
+                       AND status IN ('parked', 'parked_cycle_prevented', 'cycle_prevented')",
+                    params![now, task_id],
+                )
+                .map_err(|error| format!("Unable to mark task slice dependencies satisfied: {error}"))?;
             let changed = self
                 .conn
                 .execute(
@@ -939,8 +1469,50 @@ impl CoordinationKernel {
                     },
                     json!({
                         "reason": "dependencies_satisfied",
-                        "worktree_refreshes": refreshes,
+                        "worktree_refreshes": refreshes.clone(),
+                        "resume_ready_intent_count": resume_ready_intent_count,
+                        "satisfied_slice_count": satisfied_slice_count,
                         "resume_policy": "refresh_context_then_resume_blocked_files",
+                    }),
+                )?;
+                self.emit_event(
+                    "task_resume_ready",
+                    actor_type,
+                    actor_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        session_id: task["claimed_session_id"].as_str().map(str::to_string),
+                        context_run_id: task["context_run_id"]
+                            .as_str()
+                            .map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": "dependencies_satisfied",
+                        "resume_ready_intent_count": resume_ready_intent_count,
+                        "satisfied_slice_count": satisfied_slice_count,
+                        "worktree_refreshes": refreshes,
+                        "resume_instruction": "Dependency is satisfied; terminal monitor should show or recover the parked banner and auto-resume the task.",
+                    }),
+                )?;
+            } else if resume_ready_intent_count > 0 || satisfied_slice_count > 0 {
+                self.emit_event(
+                    "task_resume_ready",
+                    actor_type,
+                    actor_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        session_id: task["claimed_session_id"].as_str().map(str::to_string),
+                        context_run_id: task["context_run_id"]
+                            .as_str()
+                            .map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": "dependency_markers_advanced",
+                        "resume_ready_intent_count": resume_ready_intent_count,
+                        "satisfied_slice_count": satisfied_slice_count,
+                        "resume_instruction": "Parked resource markers advanced to resume-ready; terminal monitor should recover and resume if the session is active.",
                     }),
                 )?;
             }
@@ -951,8 +1523,7 @@ impl CoordinationKernel {
                     "UPDATE tasks
                      SET status='blocked', updated_at=?1
                      WHERE id=?2
-                       AND (claimed_session_id IS NULL OR claimed_session_id='')
-                       AND status IN ('ready', 'created')",
+                       AND status IN ('ready', 'created', 'claimed')",
                     params![now, task_id],
                 )
                 .map_err(|error| format!("Unable to mark task blocked: {error}"))?;
@@ -971,6 +1542,7 @@ impl CoordinationKernel {
                     json!({
                         "reason": "dependency_added",
                         "blocking_dependencies": blockers,
+                        "blocked_slice_count": blocked_slice_count,
                     }),
                 )?;
             }
@@ -990,8 +1562,29 @@ impl CoordinationKernel {
             let Some(task_id) = dependent["task_id"].as_str() else {
                 continue;
             };
+                    self.emit_event(
+                        "task_dependency_satisfied",
+                        "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "depends_on_task_id": depends_on_task_id,
+                    "dependency_kind": dependent["dependency_kind"].clone(),
+                        }),
+                    )?;
+            self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
+            let refreshed_task = self
+                .query_one(
+                    "SELECT id, title, status, updated_at FROM tasks WHERE id=?1",
+                    &[&task_id],
+                    "Task does not exist after dependency refresh.",
+                )
+                .unwrap_or_else(|_| json!({}));
             self.emit_event(
-                "task_dependency_satisfied",
+                "task_dependency_refresh_completed",
                 "kernel",
                 REPO_ID,
                 EventRefs {
@@ -1001,9 +1594,11 @@ impl CoordinationKernel {
                 json!({
                     "depends_on_task_id": depends_on_task_id,
                     "dependency_kind": dependent["dependency_kind"].clone(),
+                    "task_status": refreshed_task["status"].clone(),
+                    "task_updated_at": refreshed_task["updated_at"].clone(),
+                    "resume_instruction": "Dependency was satisfied and dependent task status was refreshed for terminal resume monitoring.",
                 }),
             )?;
-            self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
         }
         Ok(())
     }
@@ -1021,8 +1616,82 @@ impl CoordinationKernel {
             "Session does not exist.",
         )?;
         let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let blocked_slices = self.query_json(
+            "SELECT d.task_id,
+                    d.resource_key,
+                    d.depends_on_task_id,
+                    d.depends_on_resource_key,
+                    d.dependency_kind,
+                    d.status,
+                    d.updated_at,
+                    dependency.title AS depends_on_title,
+                    dependency.status AS depends_on_status,
+                    dependency_session.agent_id AS depends_on_agent_id,
+                    dependency_slot.slot_key AS depends_on_slot_key,
+                    0 AS satisfied
+             FROM task_slice_dependencies d
+             LEFT JOIN tasks dependency ON dependency.id = d.depends_on_task_id
+             LEFT JOIN agent_sessions dependency_session
+               ON dependency_session.id = (
+                    SELECT s.id
+                    FROM agent_sessions s
+                    WHERE s.task_id = d.depends_on_task_id
+                    ORDER BY CASE WHEN s.status='active' THEN 0 ELSE 1 END,
+                             s.updated_at DESC,
+                             s.created_at DESC
+                    LIMIT 1
+                  )
+             LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
+             WHERE d.task_id=?1
+               AND d.status='cycle_prevented'
+             ORDER BY d.updated_at ASC",
+            &[&task_id],
+        )?;
+        let parked_resource_intents = self.query_json(
+            "SELECT i.task_id,
+                    i.resource_key,
+                    i.status,
+                    i.intent_summary,
+                    i.depends_on_task_id,
+                    i.lease_id,
+                    i.updated_at,
+                    dependency.title AS depends_on_title,
+                    dependency.status AS depends_on_status,
+                    dependency_session.agent_id AS depends_on_agent_id,
+                    dependency_slot.slot_key AS depends_on_slot_key
+             FROM task_resource_intents i
+             LEFT JOIN tasks dependency ON dependency.id = i.depends_on_task_id
+             LEFT JOIN agent_sessions dependency_session
+               ON dependency_session.id = (
+                    SELECT s.id
+                    FROM agent_sessions s
+                    WHERE s.task_id = i.depends_on_task_id
+                    ORDER BY CASE WHEN s.status='active' THEN 0 ELSE 1 END,
+                             s.updated_at DESC,
+                             s.created_at DESC
+                    LIMIT 1
+                  )
+             LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
+             WHERE i.task_id=?1
+               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+             ORDER BY i.updated_at ASC",
+            &[&task_id],
+        )?;
+        let active_lease_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM leases WHERE task_id=?1 AND status='active'",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to inspect task active leases: {error}"))?;
         let status = task["status"].as_str().unwrap_or_default();
+        let has_cycle_prevented_slices = !blocked_slices.is_empty();
+        let has_parked_resource_intents = !parked_resource_intents.is_empty();
+        let task_updated_at = task["updated_at"].as_str();
         let ready = blockers.is_empty()
+            && !has_cycle_prevented_slices
+            && active_lease_count == 0
             && matches!(status, "ready" | "claimed")
             && session["status"].as_str() == Some("active");
         let refreshes = if ready {
@@ -1030,8 +1699,64 @@ impl CoordinationKernel {
         } else {
             Value::Array(Vec::new())
         };
+        if !ready
+            && (!blockers.is_empty()
+                || has_cycle_prevented_slices
+                || has_parked_resource_intents
+                || active_lease_count > 0)
+        {
+            let _ = self.emit_task_event_once_per_task_update(
+                "task_resume_waiting",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: session["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "status": status,
+                    "session_status": session["status"].clone(),
+                    "blocking_dependency_count": blockers.len(),
+                    "blocked_slice_count": blocked_slices.len(),
+                    "parked_resource_intent_count": parked_resource_intents.len(),
+                    "active_lease_count": active_lease_count,
+                    "task_updated_at": task_updated_at,
+                    "resume_instruction": "Task is still parked or blocked; terminal monitor should keep the parked banner visible and wait for dependency clearance.",
+                }),
+                task_updated_at,
+            );
+        }
+        if has_parked_resource_intents {
+            let _ = self.emit_task_event_once_per_task_update(
+                "task_parked_resource_intents_visible",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: session["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "status": status,
+                    "ready": ready,
+                    "parked_resource_intents": parked_resource_intents.clone(),
+                    "task_updated_at": task_updated_at,
+                    "resume_instruction": if ready {
+                        "Parked resource intents are now dependency-clear; terminal monitor should auto-resume this task."
+                    } else {
+                        "Parked resource intents are still waiting on dependencies."
+                    },
+                }),
+                task_updated_at,
+            );
+        }
         if ready {
-            self.emit_event(
+            let _ = self.emit_task_event_once_per_task_update(
                 "task_resume_ready",
                 "kernel",
                 REPO_ID,
@@ -1045,16 +1770,295 @@ impl CoordinationKernel {
                 json!({
                     "status": status,
                     "worktree_refreshes": refreshes.clone(),
+                    "parked_resource_intent_count": parked_resource_intents.len(),
+                    "task_updated_at": task_updated_at,
                     "resume_instruction": "Dependency is satisfied; refresh context, inspect the target file, acquire leases, and continue the parked prompt.",
                 }),
-            )?;
+                task_updated_at,
+            );
         }
         Ok(api_ok(json!({
             "ready": ready,
             "task": task,
             "session": session,
             "blocking_dependencies": blockers,
+            "blocked_slices": blocked_slices,
+            "parked_resource_intents": parked_resource_intents,
+            "active_lease_count": active_lease_count,
             "worktree_refreshes": refreshes,
+        })))
+    }
+
+    pub fn recover_resume_ready_task_for_session(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<Value, String> {
+        let session = self.query_one(
+            "SELECT s.*,
+                    t.status AS current_task_status,
+                    t.title AS current_task_title,
+                    t.updated_at AS current_task_updated_at
+             FROM agent_sessions s
+             LEFT JOIN tasks t ON t.id = s.task_id
+             WHERE s.id=?1
+             LIMIT 1",
+            &[&session_id],
+            "Session does not exist.",
+        )?;
+        if session["status"].as_str() != Some("active") {
+            return Ok(api_ok(json!({
+                "recovered": false,
+                "reason": "session_not_active",
+                "session_id": session_id,
+                "session_status": session["status"].clone(),
+            })));
+        }
+
+        let current_task_id = session["task_id"].as_str().unwrap_or_default();
+        let current_task_status = session["current_task_status"]
+            .as_str()
+            .unwrap_or_default();
+        let agent_id = session["agent_id"].as_str().unwrap_or_default();
+        let agent_slot_id = session["agent_slot_id"].as_str().unwrap_or_default();
+        let write_root = session["write_root"].as_str().unwrap_or_default();
+        let can_replace_current_task = current_task_id.trim().is_empty()
+            || matches!(
+                current_task_status,
+                "done" | "completed" | "merged" | "cancelled" | "interrupted" | "skipped"
+            );
+        if !can_replace_current_task {
+            let orphaned_ready_count = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT t.id)
+                     FROM tasks t
+                     JOIN task_resource_intents i ON i.task_id = t.id
+                     LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
+                     WHERE t.status='ready'
+                       AND t.id != COALESCE(?3, '')
+                       AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+                       AND (
+                            t.claimed_session_id IS NULL
+                            OR t.claimed_session_id=''
+                            OR owner.status IS NULL
+                            OR owner.status!='active'
+                       )
+                       AND NOT EXISTS (
+                            SELECT 1
+                            FROM events close_event
+                            WHERE close_event.event_type='agent_interrupted'
+                              AND close_event.session_id = owner.id
+                              AND (
+                                    close_event.payload_json LIKE '%\"reason\":\"terminal_close\"%'
+                                    OR close_event.payload_json LIKE '%\"reason\":\"close_all\"%'
+                                    OR close_event.payload_json LIKE '%\"reason\":\"drop_fallback\"%'
+                              )
+                       )
+                       AND (
+                            (?1 != '' AND owner.agent_slot_id=?1)
+                            OR (?2 != '' AND owner.write_root=?2)
+                       )",
+                    params![agent_slot_id, write_root, current_task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            if orphaned_ready_count > 0 {
+                let _ = self.emit_task_event_once_per_task_update(
+                    "terminal_orphaned_resume_ready_task_recovery_deferred",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: Some(current_task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: if agent_slot_id.is_empty() {
+                            None
+                        } else {
+                            Some(agent_slot_id.to_string())
+                        },
+                        session_id: Some(session_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": reason,
+                        "deferred_reason": "current_task_still_active",
+                        "current_task_id": current_task_id,
+                        "current_task_status": current_task_status,
+                        "orphaned_ready_count": orphaned_ready_count,
+                        "resume_instruction": "Parked ready tasks exist for this slot/worktree, but the live terminal owns a nonterminal current task. The kernel will recover them when this session becomes idle/terminal or a fresh session starts.",
+                    }),
+                    session["current_task_updated_at"].as_str(),
+                );
+            }
+            return Ok(api_ok(json!({
+                "recovered": false,
+                "reason": "current_task_still_active",
+                "session_id": session_id,
+                "current_task_id": current_task_id,
+                "current_task_status": current_task_status,
+                "orphaned_ready_count": orphaned_ready_count,
+            })));
+        }
+
+        let candidates = self.query_json(
+            "SELECT t.id,
+                    t.title,
+                    t.status,
+                    t.claimed_session_id,
+                    t.updated_at,
+                    owner.status AS owner_session_status,
+                    owner.agent_id AS owner_agent_id,
+                    owner.agent_slot_id AS owner_agent_slot_id,
+                    owner.write_root AS owner_write_root,
+                    GROUP_CONCAT(DISTINCT i.resource_key) AS resource_keys,
+                    GROUP_CONCAT(DISTINCT i.status) AS intent_statuses
+             FROM tasks t
+             JOIN task_resource_intents i ON i.task_id = t.id
+             LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
+             WHERE t.status='ready'
+               AND t.id != COALESCE(?4, '')
+               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+               AND (
+                    t.claimed_session_id IS NULL
+                    OR t.claimed_session_id=''
+                    OR owner.status IS NULL
+                    OR owner.status!='active'
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM events close_event
+                    WHERE close_event.event_type='agent_interrupted'
+                      AND close_event.session_id = owner.id
+                      AND (
+                            close_event.payload_json LIKE '%\"reason\":\"terminal_close\"%'
+                            OR close_event.payload_json LIKE '%\"reason\":\"close_all\"%'
+                            OR close_event.payload_json LIKE '%\"reason\":\"drop_fallback\"%'
+                      )
+               )
+               AND (
+                    (?2 != '' AND owner.agent_slot_id=?2)
+                    OR (?3 != '' AND owner.write_root=?3)
+               )
+             GROUP BY t.id
+             ORDER BY t.updated_at DESC, t.created_at DESC
+             LIMIT 1",
+            &[&session_id, &agent_slot_id, &write_root, &current_task_id],
+        )?;
+        let Some(candidate) = candidates.first() else {
+            return Ok(api_ok(json!({
+                "recovered": false,
+                "reason": "no_orphaned_resume_ready_task_for_session_slot",
+                "session_id": session_id,
+                "agent_slot_id": agent_slot_id,
+                "write_root": write_root,
+            })));
+        };
+        let Some(recovered_task_id) = candidate["id"].as_str() else {
+            return Ok(api_ok(json!({
+                "recovered": false,
+                "reason": "candidate_missing_task_id",
+                "session_id": session_id,
+            })));
+        };
+
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE tasks
+                 SET claimed_session_id=?1, status='ready', updated_at=?2
+                 WHERE id=?3 AND status='ready'",
+                params![session_id, now, recovered_task_id],
+            )
+            .map_err(|error| format!("Unable to recover ready task to session: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET task_id=?1, updated_at=?2
+                 WHERE id=?3 AND status='active'",
+                params![recovered_task_id, now, session_id],
+            )
+            .map_err(|error| format!("Unable to attach recovered task to session: {error}"))?;
+        self.emit_event(
+            "terminal_orphaned_resume_ready_task_reattached",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(recovered_task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: if agent_slot_id.is_empty() {
+                    None
+                } else {
+                    Some(agent_slot_id.to_string())
+                },
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "reason": reason,
+                "previous_session_id": candidate["claimed_session_id"].clone(),
+                "previous_session_status": candidate["owner_session_status"].clone(),
+                "current_task_id_before_recovery": current_task_id,
+                "current_task_status_before_recovery": current_task_status,
+                "resource_keys": candidate["resource_keys"].clone(),
+                "intent_statuses": candidate["intent_statuses"].clone(),
+                "resume_instruction": "A parked ready task was stranded on an interrupted session; it has been reattached to this live terminal session so the parked banner and autoresume path can run.",
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "recovered": true,
+            "task_id": recovered_task_id,
+            "session_id": session_id,
+            "reason": reason,
+            "candidate": candidate,
+        })))
+    }
+
+    pub fn mark_task_resume_requested(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<Value, String> {
+        self.ensure_session_authorized_for_task(session_id, task_id)?;
+        let now = now_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE task_resource_intents
+                 SET status='resume_requested', updated_at=?1
+                 WHERE task_id=?2 AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                params![now, task_id],
+            )
+            .map_err(|error| format!("Unable to mark task resume requested: {error}"))?;
+        let session = self
+            .query_json(
+                "SELECT agent_id, agent_slot_id FROM agent_sessions WHERE id=?1 LIMIT 1",
+                &[&session_id],
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| json!({}));
+        self.emit_event(
+            "task_resume_requested",
+            "terminal",
+            session_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: session["agent_id"].as_str().map(str::to_string),
+                agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "reason": reason,
+                "updated_resource_intents": updated,
+                "resume_policy": "terminal_resume_prompt_written; suppress duplicate parked-banner recovery",
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "task_id": task_id,
+            "status": "resume_requested",
+            "updated_resource_intents": updated,
         })))
     }
 
@@ -1479,6 +2483,13 @@ impl CoordinationKernel {
             }),
         )?;
 
+        if task_id.is_none() {
+            let _ = self.recover_resume_ready_task_for_session(
+                &id,
+                "new_terminal_session_started_for_slot",
+            );
+        }
+
         let session = self.query_one(
             "SELECT * FROM agent_sessions WHERE id=?1",
             &[&id],
@@ -1633,6 +2644,78 @@ impl CoordinationKernel {
             )
             .map_err(|error| format!("Unable to release interrupted session slot: {error}"))?;
 
+        let close_discards_parked_task = matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
+        let mut discarded_parked_task = None;
+        if close_discards_parked_task {
+            if let Some(task_id) = session["task_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                let parked_intent_count: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(1)
+                         FROM task_resource_intents
+                         WHERE task_id=?1
+                           AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                        params![task_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if parked_intent_count > 0 {
+                    let task_updated = self
+                        .conn
+                        .execute(
+                            "UPDATE tasks
+                             SET status='interrupted', updated_at=?1
+                             WHERE id=?2
+                               AND claimed_session_id=?3
+                               AND status IN ('ready', 'blocked', 'claimed')",
+                            params![now, task_id, session_id],
+                        )
+                        .map_err(|error| format!("Unable to discard closed parked task: {error}"))?;
+                    if task_updated > 0 {
+                        let intent_updated = self
+                            .conn
+                            .execute(
+                                "UPDATE task_resource_intents
+                                 SET status='interrupted', updated_at=?1
+                                 WHERE task_id=?2
+                                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                                params![now, task_id],
+                            )
+                            .map_err(|error| {
+                                format!("Unable to discard closed parked task intents: {error}")
+                            })?;
+                        discarded_parked_task = Some(json!({
+                            "task_id": task_id,
+                            "parked_intent_count": parked_intent_count,
+                            "updated_resource_intents": intent_updated,
+                        }));
+                        self.emit_event(
+                            "terminal_parked_task_discarded_on_session_close",
+                            "kernel",
+                            REPO_ID,
+                            EventRefs {
+                                task_id: Some(task_id.to_string()),
+                                agent_id: session["agent_id"].as_str().map(str::to_string),
+                                agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                                session_id: Some(session_id.to_string()),
+                                context_run_id: session["context_run_id"].as_str().map(str::to_string),
+                                ..EventRefs::default()
+                            },
+                            json!({
+                                "reason": reason,
+                                "parked_intent_count": parked_intent_count,
+                                "updated_resource_intents": intent_updated,
+                                "resume_policy": "do_not_resurrect_closed_terminal_parked_tasks_on_app_restart",
+                            }),
+                        )?;
+                    }
+                }
+            }
+        }
+
         for lease in &active_leases {
             self.emit_event(
                 "lease_expired",
@@ -1670,6 +2753,7 @@ impl CoordinationKernel {
                 "reason": reason,
                 "expired_leases": active_leases.len(),
                 "interrupted_worktrees": active_worktrees.len(),
+                "discarded_parked_task": discarded_parked_task,
             }),
         )?;
 
@@ -1679,6 +2763,165 @@ impl CoordinationKernel {
             "interrupted": true,
             "expired_leases": active_leases.len(),
             "interrupted_worktrees": active_worktrees.len(),
+        }))
+    }
+
+    pub fn recover_crashed_terminal_sessions(&self) -> Result<Value, String> {
+        let sessions = self.query_json(
+            "SELECT s.id AS session_id,
+                    s.agent_id,
+                    s.agent_slot_id,
+                    s.task_id,
+                    s.pty_id,
+                    s.write_root,
+                    s.last_heartbeat_at,
+                    s.updated_at AS session_updated_at,
+                    a.name AS agent_name,
+                    a.kind AS agent_kind,
+                    slot.slot_key,
+                    t.title AS task_title,
+                    t.body AS task_body,
+                    t.status AS task_status,
+                    t.claimed_session_id
+             FROM agent_sessions s
+             LEFT JOIN agents a ON a.id=s.agent_id
+             LEFT JOIN agent_slots slot ON slot.id=s.agent_slot_id
+             LEFT JOIN tasks t ON t.id=s.task_id
+             WHERE s.status='active'
+             ORDER BY s.updated_at DESC",
+            &[],
+        )?;
+        let scanned_sessions = sessions.len();
+        let mut interrupted_tasks = Vec::new();
+        let mut idle_sessions_interrupted = 0usize;
+        let mut finished_sessions_interrupted = 0usize;
+
+        for session in sessions {
+            let Some(session_id) = session["session_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let task_id = session["task_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty());
+            let task_status = session["task_status"].as_str().unwrap_or("");
+            let claimed_session_id = session["claimed_session_id"].as_str().unwrap_or("");
+            let unfinished_task = task_id.is_some()
+                && claimed_session_id == session_id
+                && !matches!(
+                    task_status,
+                    "done" | "completed" | "merged" | "cancelled" | "interrupted" | "skipped"
+                );
+
+            if let Some(task_id) = task_id.filter(|_| unfinished_task) {
+                let task_title = session["task_title"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Interrupted agent task")
+                    .to_string();
+                let task_body = session["task_body"].as_str().unwrap_or("").to_string();
+                let interrupt_result = self.interrupt_session(session_id, "app_crash_recovery")?;
+                let now = now_rfc3339();
+                let task_updates = self
+                    .conn
+                    .execute(
+                        "UPDATE tasks
+                         SET status='interrupted', updated_at=?1
+                         WHERE id=?2
+                           AND claimed_session_id=?3
+                           AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                        params![now, task_id, session_id],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to mark crashed terminal task interrupted: {error}")
+                    })?;
+                let intent_updates = self
+                    .conn
+                    .execute(
+                        "UPDATE task_resource_intents
+                         SET status='interrupted', updated_at=?1
+                         WHERE task_id=?2
+                           AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                        params![now, task_id],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to mark crashed terminal task intents interrupted: {error}")
+                    })?;
+
+                self.emit_event(
+                    "terminal_crash_recovery_interrupted_task",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: session["agent_id"].as_str().map(str::to_string),
+                        agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                        session_id: Some(session_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "previous_task_status": task_status,
+                        "task_updated": task_updates > 0,
+                        "updated_resource_intents": intent_updates,
+                        "reason": "app_crash_recovery",
+                        "ui_policy": "show_manual_resume_modal_without_auto_input",
+                    }),
+                )?;
+
+                interrupted_tasks.push(json!({
+                    "sessionId": session_id,
+                    "agentId": session["agent_id"].as_str().unwrap_or_default(),
+                    "agentName": session["agent_name"].as_str().unwrap_or("Agent"),
+                    "agentKind": session["agent_kind"].as_str().unwrap_or("agent"),
+                    "agentSlotId": session["agent_slot_id"].as_str(),
+                    "slotKey": session["slot_key"].as_str(),
+                    "taskId": task_id,
+                    "title": task_title,
+                    "body": task_body,
+                    "previousTaskStatus": task_status,
+                    "ptyId": session["pty_id"].as_str(),
+                    "writeRoot": session["write_root"].as_str(),
+                    "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
+                    "sessionUpdatedAt": session["session_updated_at"].as_str(),
+                    "taskUpdated": task_updates > 0,
+                    "updatedResourceIntents": intent_updates,
+                    "interruptResult": interrupt_result,
+                }));
+            } else {
+                let cleanup_reason = if task_id.is_some() {
+                    finished_sessions_interrupted += 1;
+                    "app_crash_finished_session_cleanup"
+                } else {
+                    idle_sessions_interrupted += 1;
+                    "app_crash_idle_session_cleanup"
+                };
+                let _ = self.interrupt_session(session_id, cleanup_reason)?;
+            }
+        }
+
+        if scanned_sessions > 0 {
+            self.emit_event(
+                "terminal_crash_recovery_completed",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "scanned_sessions": scanned_sessions,
+                    "interrupted_tasks": interrupted_tasks.len(),
+                    "idle_sessions_interrupted": idle_sessions_interrupted,
+                    "finished_sessions_interrupted": finished_sessions_interrupted,
+                    "modal_policy": "only_show_when_unfinished_task_sessions_exist",
+                }),
+            )?;
+        }
+
+        Ok(json!({
+            "interruptedTasks": interrupted_tasks,
+            "idleSessionsInterrupted": idle_sessions_interrupted,
+            "finishedSessionsInterrupted": finished_sessions_interrupted,
+            "scannedSessions": scanned_sessions,
         }))
     }
 
@@ -2518,6 +3761,14 @@ impl CoordinationKernel {
                 },
                 json!({"resource_key": resource_key.clone(), "mode": mode.clone(), "reason": reason}),
             )?;
+            self.upsert_task_resource_intent(
+                task_id,
+                &resource_key,
+                "planned",
+                reason,
+                None,
+                None,
+            )?;
 
             if let Some(existing) = self.active_task_session_lease_for_resource(
                 task_id,
@@ -2543,6 +3794,14 @@ impl CoordinationKernel {
                         "mode": existing["mode"].clone(),
                         "reason": "same task/session already holds this resource lease",
                     }),
+                )?;
+                self.upsert_task_resource_intent(
+                    task_id,
+                    &resource_key,
+                    "lease_granted",
+                    reason,
+                    existing["id"].as_str(),
+                    None,
                 )?;
                 return Ok(api_ok(json!({
                     "lease_id": existing["id"].clone(),
@@ -2627,6 +3886,58 @@ impl CoordinationKernel {
                         if depends_on_task_id == task_id {
                             continue;
                         }
+                        let blocking_resource_key = blocker["resource_key"].as_str();
+                        if self.task_dependency_would_cycle(task_id, depends_on_task_id)? {
+                            self.upsert_task_resource_intent(
+                                task_id,
+                                &resource_key,
+                                "parked_cycle_prevented",
+                                reason,
+                                None,
+                                Some(depends_on_task_id),
+                            )?;
+                            self.upsert_task_slice_dependency(
+                                task_id,
+                                &resource_key,
+                                depends_on_task_id,
+                                blocking_resource_key,
+                                "cycle_prevented",
+                                "cycle_prevented",
+                            )?;
+                            self.emit_event(
+                                "task_dependency_cycle_prevented",
+                                "kernel",
+                                REPO_ID,
+                                EventRefs {
+                                    task_id: Some(task_id.to_string()),
+                                    agent_id: Some(agent_id.to_string()),
+                                    agent_slot_id: agent_slot_id.clone(),
+                                    session_id: Some(session_id.to_string()),
+                                    resource_id: Some(resource_id.clone()),
+                                    ..EventRefs::default()
+                                },
+                                json!({
+                                    "resource_key": resource_key.clone(),
+                                    "depends_on_task_id": depends_on_task_id,
+                                    "blocking_resource_key": blocking_resource_key,
+                                    "policy": "active_owner_keeps_resource; requester continues only non-overlapping slices",
+                                }),
+                            )?;
+                            self.refresh_task_dependency_blocked_status(
+                                task_id,
+                                "kernel",
+                                REPO_ID,
+                            )?;
+                            return Ok(api_error(
+                                "task_cycle_prevented",
+                                "This resource wait would create a circular dependency. The active owner keeps the resource; continue only non-overlapping slices.",
+                                json!({
+                                    "resource_key": resource_key.clone(),
+                                    "blocker": blocker,
+                                    "resume_policy": "continue_non_overlapping_slices_or_submit_current_patch",
+                                }),
+                            ));
+                        }
                         match self.insert_task_dependency_checked(
                             task_id,
                             depends_on_task_id,
@@ -2634,7 +3945,25 @@ impl CoordinationKernel {
                             "kernel",
                             REPO_ID,
                         ) {
-                            Ok(result) => dependency_results.push(result),
+                            Ok(result) => {
+                                self.upsert_task_resource_intent(
+                                    task_id,
+                                    &resource_key,
+                                    "parked",
+                                    reason,
+                                    None,
+                                    Some(depends_on_task_id),
+                                )?;
+                                self.upsert_task_slice_dependency(
+                                    task_id,
+                                    &resource_key,
+                                    depends_on_task_id,
+                                    blocking_resource_key,
+                                    "active_file_lease",
+                                    "parked",
+                                )?;
+                                dependency_results.push(result)
+                            }
                             Err(error) => dependency_results.push(json!({
                                 "depends_on_task_id": depends_on_task_id,
                                 "error": error,
@@ -2648,12 +3977,32 @@ impl CoordinationKernel {
                             "UPDATE tasks
                              SET status='blocked', updated_at=?1
                              WHERE id=?2
-                               AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')",
+                               AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
                             params![now_rfc3339(), task_id],
                         )
                         .map_err(|error| format!("Unable to queue task behind active lease: {error}"))?;
                     self.emit_event(
                         "task_queued_behind_active_file_lease",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            task_id: Some(task_id.to_string()),
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: agent_slot_id.clone(),
+                            session_id: Some(session_id.to_string()),
+                            resource_id: Some(resource_id.clone()),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "resource_key": resource_key.clone(),
+                            "mode": mode.clone(),
+                            "blockers": blockers.clone(),
+                            "dependencies": dependency_results.clone(),
+                            "resume_policy": "wait_for_dependency_patch_then_refresh_context",
+                        }),
+                    )?;
+                    self.emit_event(
+                        "task_parked_for_resource_queue",
                         "kernel",
                         REPO_ID,
                         EventRefs {
@@ -2667,9 +4016,11 @@ impl CoordinationKernel {
                         json!({
                             "resource_key": resource_key.clone(),
                             "mode": mode.clone(),
+                            "blocker_count": blockers.len(),
                             "blockers": blockers.clone(),
                             "dependencies": dependency_results.clone(),
-                            "resume_policy": "wait_for_dependency_patch_then_refresh_context",
+                            "terminal_policy": "show_parked_banner_and_auto_resume_after_dependency_merge",
+                            "resume_policy": "terminal_session_monitor_tracks_task_resume_state",
                         }),
                     )?;
                     return Ok(api_error(
@@ -2702,7 +4053,25 @@ impl CoordinationKernel {
                             "kernel",
                             REPO_ID,
                         ) {
-                            Ok(result) => dependency_results.push(result),
+                            Ok(result) => {
+                                self.upsert_task_resource_intent(
+                                    task_id,
+                                    &resource_key,
+                                    "parked",
+                                    reason,
+                                    None,
+                                    Some(depends_on_task_id),
+                                )?;
+                                self.upsert_task_slice_dependency(
+                                    task_id,
+                                    &resource_key,
+                                    depends_on_task_id,
+                                    Some(&resource_key),
+                                    "unmerged_patch",
+                                    "parked",
+                                )?;
+                                dependency_results.push(result)
+                            }
                             Err(error) => dependency_results.push(json!({
                                 "depends_on_task_id": depends_on_task_id,
                                 "error": error,
@@ -2712,7 +4081,7 @@ impl CoordinationKernel {
                 }
                 self.conn
                     .execute(
-                        "UPDATE tasks SET status='blocked', updated_at=?1 WHERE id=?2 AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')",
+                        "UPDATE tasks SET status='blocked', updated_at=?1 WHERE id=?2 AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
                         params![now_rfc3339(), task_id],
                     )
                     .map_err(|error| format!("Unable to queue task behind unmerged patch: {error}"))?;
@@ -2752,8 +4121,8 @@ impl CoordinationKernel {
                 .map_err(|error| format!("Unable to allocate lease fence token: {error}"))?;
             let lease_id = uuid();
             let now = now_rfc3339();
-            let expires_at =
-                rfc3339_after_seconds(ttl_seconds.unwrap_or(DEFAULT_LEASE_TTL_SECONDS));
+            let _requested_ttl_seconds = ttl_seconds;
+            let expires_at = "9999-12-31T23:59:59.999Z".to_string();
             self.conn
                 .execute(
                     "INSERT INTO leases(
@@ -2789,6 +4158,14 @@ impl CoordinationKernel {
                 },
                 json!({"lease_id": lease_id.clone(), "resource_key": resource_key.clone(), "mode": mode.clone(), "fence_token": fence_token, "expires_at": expires_at.clone()}),
             )?;
+            self.upsert_task_resource_intent(
+                task_id,
+                &resource_key,
+                "lease_granted",
+                reason,
+                Some(&lease_id),
+                None,
+            )?;
 
             Ok(api_ok(json!({
                 "lease_id": lease_id.clone(),
@@ -2810,9 +4187,10 @@ impl CoordinationKernel {
     ) -> Result<Vec<Value>, String> {
         let now = now_rfc3339();
         let active = self.query_json(
-            "SELECT l.*, r.resource_key, r.resource_type
+            "SELECT l.*, r.resource_key, r.resource_type, s.slot_key
              FROM leases l
              JOIN resources r ON r.id = l.resource_id
+             LEFT JOIN agent_slots s ON s.id = l.agent_slot_id
              WHERE l.status='active' AND l.expires_at >= ?1
              ORDER BY l.expires_at ASC",
             &[&now],
@@ -2872,7 +4250,7 @@ impl CoordinationKernel {
              LEFT JOIN tasks t ON t.id = p.task_id
              WHERE p.task_id <> ?1
                AND p.status IN ('submitted')
-               AND COALESCE(t.status, '') NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')
+               AND COALESCE(t.status, '') NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
              ORDER BY p.created_at ASC",
             &[&current_task_id],
         )?;
@@ -3014,7 +4392,8 @@ impl CoordinationKernel {
             return Err("Lease is expired and cannot be renewed.".to_string());
         }
 
-        let expires_at = rfc3339_after_seconds(ttl_seconds.unwrap_or(DEFAULT_LEASE_TTL_SECONDS));
+        let _requested_ttl_seconds = ttl_seconds;
+        let expires_at = "9999-12-31T23:59:59.999Z".to_string();
         self.conn
             .execute(
                 "UPDATE leases SET expires_at=?1, last_heartbeat_at=?2 WHERE id=?3",
@@ -3056,6 +4435,18 @@ impl CoordinationKernel {
                 params![now, lease_id],
             )
             .map_err(|error| format!("Unable to release lease: {error}"))?;
+        let released_intent_count = self
+            .conn
+            .execute(
+                "UPDATE task_resource_intents
+                 SET status='planned',
+                     lease_id=NULL,
+                     updated_at=?1
+                 WHERE lease_id=?2
+                   AND status='lease_granted'",
+                params![now, lease_id],
+            )
+            .map_err(|error| format!("Unable to clear released lease intent: {error}"))?;
         self.emit_event(
             "lease_released",
             "agent",
@@ -3068,10 +4459,220 @@ impl CoordinationKernel {
                 resource_id: lease["resource_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
             },
-            json!({"lease_id": lease_id, "fence_token": fence_token}),
+            json!({
+                "lease_id": lease_id,
+                "fence_token": fence_token,
+                "released_intent_count": released_intent_count,
+                "intent_release_policy": "lease_granted_intents_return_to_planned",
+            }),
         )?;
+        let released_dependents = self
+            .refresh_active_file_lease_dependents_after_release(&lease)
+            .unwrap_or_else(|error| {
+                api_error(
+                    "lease_dependent_refresh_failed",
+                    "Lease was released, but dependent parked tasks could not be refreshed.",
+                    json!({"lease_id": lease_id, "error": error}),
+                )
+            });
 
-        Ok(api_ok(json!({"lease_id": lease_id, "status": "released"})))
+        Ok(api_ok(json!({
+            "lease_id": lease_id,
+            "status": "released",
+            "released_intent_count": released_intent_count,
+            "released_dependents": released_dependents,
+        })))
+    }
+
+    fn lease_resource_key_from_row(&self, lease: &Value) -> Result<Option<String>, String> {
+        if let Some(resource_key) = lease["resource_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(resource_key.to_string()));
+        }
+        let Some(resource_id) = lease["resource_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .query_json(
+                "SELECT resource_key FROM resources WHERE id=?1 LIMIT 1",
+                &[&resource_id],
+            )?
+            .first()
+            .and_then(|row| row["resource_key"].as_str())
+            .map(str::to_string))
+    }
+
+    fn refresh_active_file_lease_dependents_after_release(
+        &self,
+        lease: &Value,
+    ) -> Result<Value, String> {
+        let Some(blocking_task_id) = lease["task_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(json!({"status": "skipped", "reason": "lease_missing_task"}));
+        };
+        let Some(released_resource_key) = self.lease_resource_key_from_row(lease)? else {
+            return Ok(json!({"status": "skipped", "reason": "lease_missing_resource"}));
+        };
+        let dependents = self.query_json(
+            "SELECT DISTINCT d.task_id,
+                    intent.resource_key AS intent_resource_key,
+                    slice.resource_key AS slice_resource_key,
+                    slice.depends_on_resource_key AS depends_on_resource_key
+             FROM task_dependencies d
+             LEFT JOIN task_resource_intents intent
+               ON intent.task_id=d.task_id
+              AND intent.depends_on_task_id=d.depends_on_task_id
+             LEFT JOIN task_slice_dependencies slice
+               ON slice.task_id=d.task_id
+              AND slice.depends_on_task_id=d.depends_on_task_id
+             WHERE d.depends_on_task_id=?1
+               AND d.dependency_kind='active_file_lease'
+             ORDER BY d.task_id ASC",
+            &[&blocking_task_id],
+        )?;
+        let mut refreshed = Vec::new();
+        let mut seen_tasks = Vec::new();
+        for dependent in dependents {
+            let Some(dependent_task_id) = dependent["task_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if seen_tasks.iter().any(|task| task == dependent_task_id) {
+                continue;
+            }
+            let dependency_resource = dependent["intent_resource_key"]
+                .as_str()
+                .or_else(|| dependent["slice_resource_key"].as_str())
+                .or_else(|| dependent["depends_on_resource_key"].as_str())
+                .unwrap_or_default();
+            if !dependency_resource.is_empty()
+                && !resource_covers(&released_resource_key, dependency_resource)
+                && !resource_covers(dependency_resource, &released_resource_key)
+            {
+                continue;
+            }
+            let dependent_resources = self.query_json(
+                "SELECT resource_key
+                 FROM task_resource_intents
+                 WHERE task_id=?1
+                   AND depends_on_task_id=?2
+                 UNION
+                 SELECT resource_key
+                 FROM task_slice_dependencies
+                 WHERE task_id=?1
+                   AND depends_on_task_id=?2
+                 UNION
+                 SELECT depends_on_resource_key AS resource_key
+                 FROM task_slice_dependencies
+                 WHERE task_id=?1
+                   AND depends_on_task_id=?2
+                   AND depends_on_resource_key IS NOT NULL",
+                &[&dependent_task_id, &blocking_task_id],
+            )?;
+            let active_blocking_leases = self.query_json(
+                "SELECT l.id, r.resource_key
+                 FROM leases l
+                 JOIN resources r ON r.id=l.resource_id
+                 WHERE l.task_id=?1
+                   AND l.status='active'",
+                &[&blocking_task_id],
+            )?;
+            let still_blocked = dependent_resources.iter().any(|resource| {
+                let resource_key = resource["resource_key"].as_str().unwrap_or_default();
+                !resource_key.is_empty()
+                    && active_blocking_leases.iter().any(|active| {
+                        let active_resource = active["resource_key"].as_str().unwrap_or_default();
+                        resource_covers(active_resource, resource_key)
+                            || resource_covers(resource_key, active_resource)
+                    })
+            });
+            if still_blocked {
+                continue;
+            }
+            let now = now_rfc3339();
+            let dependency_rows = self
+                .conn
+                .execute(
+                    "DELETE FROM task_dependencies
+                     WHERE task_id=?1
+                       AND depends_on_task_id=?2
+                       AND dependency_kind='active_file_lease'",
+                    params![dependent_task_id, blocking_task_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to clear released active-file lease dependency: {error}")
+                })?;
+            let intent_rows = self
+                .conn
+                .execute(
+                    "UPDATE task_resource_intents
+                     SET status='resume_ready', updated_at=?1
+                     WHERE task_id=?2
+                       AND depends_on_task_id=?3
+                       AND status IN ('parked', 'parked_cycle_prevented')",
+                    params![now, dependent_task_id, blocking_task_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to mark released active-file lease intents ready: {error}")
+                })?;
+            let slice_rows = self
+                .conn
+                .execute(
+                    "UPDATE task_slice_dependencies
+                     SET status='satisfied', updated_at=?1
+                     WHERE task_id=?2
+                       AND depends_on_task_id=?3
+                       AND dependency_kind='active_file_lease'
+                       AND status IN ('parked', 'parked_cycle_prevented', 'cycle_prevented')",
+                    params![now, dependent_task_id, blocking_task_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to mark released active-file lease slices satisfied: {error}")
+                })?;
+            self.refresh_task_dependency_blocked_status(dependent_task_id, "kernel", REPO_ID)?;
+            self.emit_event(
+                "active_file_lease_dependency_released",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(dependent_task_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "blocking_task_id": blocking_task_id,
+                    "released_resource_key": released_resource_key.clone(),
+                    "dependency_rows_removed": dependency_rows,
+                    "intent_rows_resume_ready": intent_rows,
+                    "slice_rows_satisfied": slice_rows,
+                    "resume_policy": "lease_release_unblocks_parked_active_file_waiters",
+                }),
+            )?;
+            refreshed.push(json!({
+                "task_id": dependent_task_id,
+                "dependency_rows_removed": dependency_rows,
+                "intent_rows_resume_ready": intent_rows,
+                "slice_rows_satisfied": slice_rows,
+            }));
+            seen_tasks.push(dependent_task_id.to_string());
+        }
+        Ok(json!({
+            "status": "completed",
+            "released_resource_key": released_resource_key.clone(),
+            "dependents": refreshed,
+        }))
     }
 
     pub fn release_lease_lenient(
@@ -3733,6 +5334,66 @@ impl CoordinationKernel {
                 validation.warnings,
             ));
         }
+        if validation.status == "warning" && validation.changed_files.is_empty() {
+            let session = self.ensure_session_active(session_id, agent_id)?;
+            let agent_slot_id = session["agent_slot_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            let now = now_rfc3339();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='skipped', updated_at=?1
+                     WHERE id=?2
+                       AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                    params![now, task_id],
+                )
+                .map_err(|error| format!("Unable to mark no-op task skipped: {error}"))?;
+            let released_leases = self.release_active_leases_for_task_with_event(
+                task_id,
+                "no_changed_files_submit",
+                "task_leases_released_after_noop",
+            )?;
+            self.refresh_dependent_tasks(task_id)?;
+            let validation_id = validation.validation_id.clone();
+            let validation_status = validation.status.clone();
+            let changed_files = validation.changed_files.clone();
+            let warnings = validation.warnings.clone();
+            self.emit_event(
+                "task_noop_submitted",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id,
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "validation_id": validation_id.clone(),
+                    "validation_status": validation_status.clone(),
+                    "changed_files": changed_files.clone(),
+                    "released_leases": released_leases.clone(),
+                    "task_status": "skipped",
+                    "reason": "no_changed_files",
+                    "terminal_policy": "submit_without_diff_completes_as_noop",
+                }),
+            )?;
+            return Ok(api_ok_warnings(
+                json!({
+                    "validation_id": validation_id,
+                    "validation_status": "warning",
+                    "task_status": "skipped",
+                    "changed_files": [],
+                    "released_leases": released_leases,
+                    "noop": true,
+                    "reason": "no_changed_files",
+                }),
+                warnings,
+            ));
+        }
 
         Ok(api_error(
             "patch_validation_failed",
@@ -3742,10 +5403,48 @@ impl CoordinationKernel {
     }
 
     fn auto_apply_submitted_patch(&self, patch_id: &str) -> Result<Value, String> {
+        if let Some(intent_risk) = self.intent_resolution_risk_for_patch(patch_id)? {
+            let resolution = match self.initialize_merge_resolution_inner(
+                patch_id,
+                None,
+                None,
+                None,
+                Some(intent_risk.clone()),
+            ) {
+                Ok(value) => value,
+                Err(resolution_error) => api_error(
+                    "autonomous_intent_resolution_failed",
+                    "Patch needs intent-aware resolution, and resolver initialization failed.",
+                    json!({
+                        "patch_id": patch_id,
+                        "intent_risk": intent_risk,
+                        "resolution_error": resolution_error,
+                    }),
+                ),
+            };
+            return Ok(json!({
+                "status": "resolution_required",
+                "stage": "intent_risk_detector",
+                "reason": "stale_same_file_or_semantic_overlap",
+                "intent_risk": intent_risk,
+                "smart_merge": resolution,
+            }));
+        }
+
         let queued = match self.request_merge(patch_id, None, Some("patch_apply")) {
             Ok(value) => value,
             Err(error) => {
-                let resolution = match self.initialize_merge_resolution(patch_id, None, None, None) {
+                let resolution = match self.initialize_merge_resolution_inner(
+                    patch_id,
+                    None,
+                    None,
+                    None,
+                    Some(json!({
+                        "kind": "git_apply_failed",
+                        "reason": "patch_did_not_apply_cleanly",
+                        "error": error.clone(),
+                    })),
+                ) {
                     Ok(value) => value,
                     Err(resolution_error) => api_error(
                         "smart_merge_resolution_failed",
@@ -3768,7 +5467,17 @@ impl CoordinationKernel {
         };
         if queued["ok"].as_bool() != Some(true) {
             let resolution = self
-                .initialize_merge_resolution(patch_id, None, None, None)
+                .initialize_merge_resolution_inner(
+                    patch_id,
+                    None,
+                    None,
+                    None,
+                    Some(json!({
+                        "kind": "merge_request_blocked",
+                        "reason": "request_merge_returned_not_ok",
+                        "merge": queued.clone(),
+                    })),
+                )
                 .unwrap_or_else(|error| api_error(
                     "smart_merge_resolution_failed",
                     "Merge was blocked, and merge-resolution initialization failed.",
@@ -3798,7 +5507,17 @@ impl CoordinationKernel {
         let smart_merge = if applied["ok"].as_bool() == Some(true) {
             Value::Null
         } else {
-            self.initialize_merge_resolution(patch_id, None, None, None)
+            self.initialize_merge_resolution_inner(
+                patch_id,
+                None,
+                None,
+                None,
+                Some(json!({
+                    "kind": "merge_apply_failed",
+                    "reason": "apply_merge_returned_not_ok",
+                    "apply": applied.clone(),
+                })),
+            )
                 .unwrap_or_else(|error| api_error(
                     "smart_merge_resolution_failed",
                     "Merge apply failed, and merge-resolution initialization failed.",
@@ -3812,6 +5531,62 @@ impl CoordinationKernel {
             "apply": applied,
             "smart_merge": smart_merge,
         }))
+    }
+
+    fn intent_resolution_risk_for_patch(&self, patch_id: &str) -> Result<Option<Value>, String> {
+        let patch = self.get_patch(patch_id)?;
+        let base_sha = patch["base_sha"].as_str().unwrap_or_default().trim();
+        if base_sha.is_empty() {
+            return Ok(None);
+        }
+        let integration = self.ensure_integration_worktree()?;
+        if base_sha == integration.head_sha {
+            return Ok(None);
+        }
+        let changed_files = self.patch_file_paths(patch_id)?;
+        if changed_files.is_empty() {
+            return Ok(None);
+        }
+        let base_commit = format!("{base_sha}^{{commit}}");
+        if run_git(&integration.path, &["cat-file", "-e", &base_commit]).is_err() {
+            return Ok(Some(json!({
+                "kind": "stale_base_unknown",
+                "reason": "patch_base_commit_not_found_in_integration_worktree",
+                "patch_id": patch_id,
+                "patch_base_sha": base_sha,
+                "current_integration_sha": integration.head_sha,
+                "changed_files": changed_files,
+                "resolver_policy": "autonomous_intent_resolver_validation_gated",
+            })));
+        }
+        let changed_since_base = run_git(
+            &integration.path,
+            &["diff", "--name-only", base_sha, "HEAD", "--"],
+        )
+        .unwrap_or_default()
+        .lines()
+        .map(|line| line.trim().replace('\\', "/"))
+        .filter(|line| !line.is_empty())
+        .collect::<HashSet<_>>();
+        let patch_files = changed_files.iter().cloned().collect::<HashSet<_>>();
+        let overlapping_files = patch_files
+            .intersection(&changed_since_base)
+            .cloned()
+            .collect::<Vec<_>>();
+        if overlapping_files.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "kind": "stale_same_file_overlap",
+            "reason": "patch_touches_files_changed_after_its_base_sha",
+            "patch_id": patch_id,
+            "patch_base_sha": base_sha,
+            "current_integration_sha": integration.head_sha,
+            "changed_files": changed_files,
+            "integration_changed_files_since_base": changed_since_base.into_iter().collect::<Vec<_>>(),
+            "overlapping_files": overlapping_files,
+            "resolver_policy": "autonomous_intent_resolver_validation_gated",
+        })))
     }
 
     pub fn validate_patch(
@@ -4032,6 +5807,7 @@ impl CoordinationKernel {
         let mut violations = Vec::new();
         let patch_id = if submit { Some(uuid()) } else { None };
         let mut patch_file_rows = Vec::new();
+        let mut lease_covered_resource_keys = Vec::new();
 
         for changed_file in &changed {
             reject_path_escape(&changed_file.path)?;
@@ -4081,6 +5857,7 @@ impl CoordinationKernel {
                             ],
                         )
                         .map_err(|error| format!("Unable to record patch file lease validation: {error}"))?;
+                    lease_covered_resource_keys.push(resource_key.clone());
                 }
                 None => {
                     self.conn
@@ -4131,7 +5908,12 @@ impl CoordinationKernel {
             patch_file_rows.push(changed_file.clone());
         }
 
-        let open_violations = self.open_blocking_violations(session_id, worktree_id)?;
+        let open_violations = self.open_blocking_violations(
+            session_id,
+            worktree_id,
+            Some(task_id),
+            &lease_covered_resource_keys,
+        )?;
         for violation in open_violations {
             violations.push(violation);
         }
@@ -4405,6 +6187,8 @@ impl CoordinationKernel {
         &self,
         session_id: &str,
         worktree_id: &str,
+        task_id: Option<&str>,
+        lease_covered_resource_keys: &[String],
     ) -> Result<Vec<Value>, String> {
         Ok(self
             .query_json(
@@ -4416,7 +6200,54 @@ impl CoordinationKernel {
             )?
             .into_iter()
             .filter(|violation| !workspace_violation_is_ignored_system_noise(violation))
+            .filter(|violation| {
+                !Self::workspace_violation_is_superseded_by_current_lease(
+                    violation,
+                    task_id,
+                    lease_covered_resource_keys,
+                )
+            })
             .collect())
+    }
+
+    fn workspace_violation_resource_key(violation: &Value) -> Option<String> {
+        violation["resource_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                violation["path"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(path_to_file_resource)
+            })
+    }
+
+    fn workspace_violation_is_superseded_by_current_lease(
+        violation: &Value,
+        task_id: Option<&str>,
+        lease_covered_resource_keys: &[String],
+    ) -> bool {
+        let Some(current_task_id) = task_id.filter(|value| !value.trim().is_empty()) else {
+            return false;
+        };
+        let violation_task_id = violation["task_id"].as_str().unwrap_or_default();
+        if violation_task_id == current_task_id {
+            return false;
+        }
+        let violation_kind = violation["violation_kind"].as_str().unwrap_or_default();
+        if !matches!(violation_kind, "patch_without_lease" | "unleased_write") {
+            return false;
+        }
+        let Some(violation_resource_key) = Self::workspace_violation_resource_key(violation) else {
+            return false;
+        };
+        lease_covered_resource_keys.iter().any(|covered_resource_key| {
+            resource_covers(covered_resource_key, &violation_resource_key)
+                || resource_covers(&violation_resource_key, covered_resource_key)
+        })
     }
 
     fn changed_files(&self, worktree_path: &Path) -> Result<Vec<ChangedFile>, String> {
@@ -4500,6 +6331,23 @@ impl CoordinationKernel {
         resolver_agent_id: Option<&str>,
         resolver_session_id: Option<&str>,
         target_branch: Option<&str>,
+    ) -> Result<Value, String> {
+        self.initialize_merge_resolution_inner(
+            patch_id,
+            resolver_agent_id,
+            resolver_session_id,
+            target_branch,
+            None,
+        )
+    }
+
+    fn initialize_merge_resolution_inner(
+        &self,
+        patch_id: &str,
+        resolver_agent_id: Option<&str>,
+        resolver_session_id: Option<&str>,
+        target_branch: Option<&str>,
+        intent_resolution_risk: Option<Value>,
     ) -> Result<Value, String> {
         self.expire_old_leases()?;
         let patch = self.get_patch(patch_id)?;
@@ -4625,7 +6473,7 @@ impl CoordinationKernel {
             ));
         }
 
-        if self.git_apply_check(&patch).is_ok() {
+        if intent_resolution_risk.is_none() && self.git_apply_check(&patch).is_ok() {
             let queued = self.request_merge(patch_id, target_branch, Some("patch_apply"))?;
             if queued["ok"].as_bool() == Some(true) {
                 return Ok(api_ok(json!({
@@ -4639,12 +6487,22 @@ impl CoordinationKernel {
             return Ok(queued);
         }
 
+        let resolution_reason = intent_resolution_risk
+            .as_ref()
+            .and_then(|risk| risk["reason"].as_str())
+            .unwrap_or("patch_did_not_apply_cleanly");
+        let resolution_message =
+            format!("Autonomous resolver initialized: {resolution_reason}.");
         let merge_job_id = self.create_merge_job(
             &patch,
             "resolution_initialized",
             target_branch,
-            "merge_resolution",
-            Some("Patch does not apply cleanly; resolver agent initialized."),
+            if intent_resolution_risk.is_some() {
+                "autonomous_intent_resolution"
+            } else {
+                "merge_resolution"
+            },
+            Some(&resolution_message),
         )?;
         let resolution_task = self.create_task(
             &format!("Resolve merge for patch {}", short_id(patch_id)),
@@ -4709,6 +6567,8 @@ impl CoordinationKernel {
                 "merge_job_id": merge_job_id.clone(),
                 "resolution_task_id": resolution_task_id.clone(),
                 "changed_files": changed_files.clone(),
+                "intent_resolution_risk": intent_resolution_risk.clone(),
+                "resolver_policy": "autonomous_intent_resolver_validation_gated",
             }
         });
         let resolver_prompt = merge_resolution_prompt(
@@ -4755,6 +6615,14 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to record merge resolution task: {error}"))?;
+        let integration_batch = self.record_integration_batch_for_resolution(
+            &patch,
+            &merge_job_id,
+            &resolution_task_id,
+            &changed_files,
+            intent_resolution_risk.as_ref(),
+            target_branch,
+        )?;
         self.emit_event(
             "merge_resolution_initialized",
             "kernel",
@@ -4776,6 +6644,7 @@ impl CoordinationKernel {
                 "released_prior_resolver_leases": released_leases,
                 "resolution_leases": resolution_leases,
                 "cloud_context": cloud_context,
+                "integration_batch": integration_batch,
             }),
         )?;
 
@@ -4792,8 +6661,112 @@ impl CoordinationKernel {
             "released_prior_resolver_leases": released_leases,
             "resolution_leases": resolution_leases,
             "cloud_context": cloud_context,
+            "integration_batch": integration_batch,
             "resolver_prompt": resolver_prompt,
         })))
+    }
+
+    fn record_integration_batch_for_resolution(
+        &self,
+        patch: &Value,
+        merge_job_id: &str,
+        resolution_task_id: &str,
+        changed_files: &[String],
+        intent_resolution_risk: Option<&Value>,
+        target_branch: Option<&str>,
+    ) -> Result<Value, String> {
+        let integration = self.ensure_integration_worktree()?;
+        let batch_id = uuid();
+        let item_id = uuid();
+        let now = now_rfc3339();
+        let strategy = if intent_resolution_risk.is_some() {
+            "semantic_intent_resolve"
+        } else {
+            "text_conflict_resolve"
+        };
+        let task_id = patch["task_id"].as_str().unwrap_or_default();
+        let intent_summary = self
+            .query_json("SELECT title, body FROM tasks WHERE id=?1", &[&task_id])?
+            .into_iter()
+            .next()
+            .map(|task| {
+                let title = task["title"].as_str().unwrap_or("Untitled task");
+                let body = task["body"].as_str().unwrap_or_default();
+                if body.trim().is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title}: {body}")
+                }
+            })
+            .or_else(|| patch["summary"].as_str().map(str::to_string));
+        let reason_json = intent_resolution_risk.cloned().unwrap_or_else(|| {
+            json!({
+                "kind": "text_conflict_or_git_apply_failure",
+                "reason": "patch_did_not_apply_cleanly",
+                "resolver_policy": "autonomous_intent_resolver_validation_gated",
+            })
+        });
+        self.conn
+            .execute(
+                "INSERT INTO integration_batches(
+                    id, repo_id, status, strategy, base_integration_sha, target_branch,
+                    merge_job_id, resolver_task_id, reason_json, created_at, updated_at
+                 ) VALUES(?1, ?2, 'resolving', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    batch_id,
+                    REPO_ID,
+                    strategy,
+                    integration.head_sha,
+                    target_branch.unwrap_or(INTEGRATION_BRANCH),
+                    merge_job_id,
+                    resolution_task_id,
+                    reason_json.to_string(),
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record integration batch: {error}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO integration_batch_items(
+                    id, batch_id, task_id, patch_id, agent_id, base_sha,
+                    changed_files_json, intent_summary, cloud_context_task_id,
+                    status, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'included', ?9, ?9)",
+                params![
+                    item_id,
+                    batch_id,
+                    task_id,
+                    patch["id"].as_str().unwrap_or_default(),
+                    patch["agent_id"].as_str().unwrap_or_default(),
+                    patch["base_sha"].as_str(),
+                    json!(changed_files).to_string(),
+                    intent_summary,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record integration batch item: {error}"))?;
+        self.emit_event(
+            "integration_batch_created",
+            "kernel",
+            REPO_ID,
+            EventRefs::from_patch(patch),
+            json!({
+                "batch_id": batch_id,
+                "merge_job_id": merge_job_id,
+                "resolution_task_id": resolution_task_id,
+                "strategy": strategy,
+                "changed_files": changed_files,
+                "reason": reason_json,
+            }),
+        )?;
+        Ok(json!({
+            "batch_id": batch_id,
+            "strategy": strategy,
+            "status": "resolving",
+            "merge_job_id": merge_job_id,
+            "resolution_task_id": resolution_task_id,
+            "changed_files": changed_files,
+        }))
     }
 
     pub fn request_merge(
@@ -4858,9 +6831,16 @@ impl CoordinationKernel {
             ));
         }
         self.verify_patch_artifact_hash(&patch)?;
+        let patch_resource_keys = self
+            .patch_file_paths(patch_id)?
+            .into_iter()
+            .map(|path| path_to_file_resource(&path))
+            .collect::<Vec<_>>();
         let blocking_violations = self.open_blocking_violations(
             patch["session_id"].as_str().unwrap_or_default(),
             patch["worktree_id"].as_str().unwrap_or_default(),
+            patch["task_id"].as_str(),
+            &patch_resource_keys,
         )?;
         if !blocking_violations.is_empty() {
             let job_id = self.create_merge_job(
@@ -4990,9 +6970,16 @@ impl CoordinationKernel {
                 json!({"merge_job_id": merge_job_id}),
             ));
         }
+        let patch_resource_keys = self
+            .patch_file_paths(patch_id)?
+            .into_iter()
+            .map(|path| path_to_file_resource(&path))
+            .collect::<Vec<_>>();
         let blocking_violations = self.open_blocking_violations(
             patch["session_id"].as_str().unwrap_or_default(),
             patch["worktree_id"].as_str().unwrap_or_default(),
+            patch["task_id"].as_str(),
+            &patch_resource_keys,
         )?;
         if !blocking_violations.is_empty() {
             self.update_merge_job(
@@ -5058,17 +7045,46 @@ impl CoordinationKernel {
                         params![now_rfc3339(), patch_id],
                     )
                     .map_err(|error| format!("Unable to mark patch merged: {error}"))?;
+                let task_has_parked_slices = if let Some(task_id) = patch["task_id"].as_str() {
+                    let count: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(1) FROM task_resource_intents
+                             WHERE task_id=?1 AND status IN ('parked', 'parked_cycle_prevented')",
+                            params![task_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| format!("Unable to inspect parked task slices: {error}"))?;
+                    count > 0
+                } else {
+                    false
+                };
                 self.conn
                     .execute(
-                        "UPDATE tasks SET status='merged', updated_at=?1 WHERE id=?2",
-                        params![now_rfc3339(), patch["task_id"].as_str()],
+                        "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3",
+                        params![
+                            if task_has_parked_slices { "blocked" } else { "merged" },
+                            now_rfc3339(),
+                            patch["task_id"].as_str()
+                        ],
                     )
-                    .map_err(|error| format!("Unable to mark task merged: {error}"))?;
+                    .map_err(|error| format!("Unable to update task after merge: {error}"))?;
                 let released_leases = if let Some(task_id) = patch["task_id"].as_str() {
+                    self.conn
+                        .execute(
+                            "UPDATE task_resource_intents
+                             SET status='done', updated_at=?1
+                             WHERE task_id=?2 AND status IN ('planned', 'lease_granted')",
+                            params![now_rfc3339(), task_id],
+                        )
+                        .map_err(|error| format!("Unable to mark task resource intents done: {error}"))?;
                     self.release_active_leases_for_task(task_id, "integration_merge_succeeded")?
                 } else {
                     json!({"released": []})
                 };
+                if let Some(task_id) = patch["task_id"].as_str().filter(|_| task_has_parked_slices) {
+                    let _ = self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID);
+                }
                 let root_fast_forward = self
                     .fast_forward_repo_root_to_integration()
                     .unwrap_or_else(|error| {
@@ -5546,6 +7562,19 @@ impl CoordinationKernel {
     }
 
     fn release_active_leases_for_task(&self, task_id: &str, reason: &str) -> Result<Value, String> {
+        self.release_active_leases_for_task_with_event(
+            task_id,
+            reason,
+            "task_leases_released_after_merge",
+        )
+    }
+
+    fn release_active_leases_for_task_with_event(
+        &self,
+        task_id: &str,
+        reason: &str,
+        event_type: &str,
+    ) -> Result<Value, String> {
         let leases = self.query_json(
             "SELECT id, fence_token
              FROM leases
@@ -5565,13 +7594,13 @@ impl CoordinationKernel {
                 self.release_lease(lease_id, fence_token)
                     .unwrap_or_else(|error| api_error(
                         "lease_release_failed",
-                        "Unable to release lease after integration merge.",
+                        "Unable to release active task lease.",
                         json!({"lease_id": lease_id, "error": error}),
                     )),
             );
         }
         self.emit_event(
-            "task_leases_released_after_merge",
+            event_type,
             "kernel",
             REPO_ID,
             EventRefs {
@@ -5659,7 +7688,16 @@ impl CoordinationKernel {
             let task_status = row["task_status"].as_str().unwrap_or_default();
             let refreshable_task_status = matches!(
                 task_status,
-                "" | "ready" | "claimed" | "blocked" | "created"
+                ""
+                    | "ready"
+                    | "claimed"
+                    | "blocked"
+                    | "created"
+                    | "merged"
+                    | "done"
+                    | "completed"
+                    | "review"
+                    | "skipped"
             );
             if active_lease_count > 0 || !refreshable_task_status {
                 let result = json!({
@@ -5912,6 +7950,24 @@ impl CoordinationKernel {
                     params![resolved_diff_artifact_id, now, merge_job_id],
                 )
                 .map_err(|error| format!("Unable to update merge job after resolution submit: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE integration_batches
+                     SET status='resolved_patch_submitted', updated_at=?1
+                     WHERE merge_job_id=?2 OR resolver_task_id=?3",
+                    params![now, merge_job_id, task_id],
+                )
+                .map_err(|error| format!("Unable to update integration batch after resolution submit: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE integration_batch_items
+                     SET status='resolved', updated_at=?1
+                     WHERE batch_id IN (
+                       SELECT id FROM integration_batches WHERE merge_job_id=?2 OR resolver_task_id=?3
+                     )",
+                    params![now, merge_job_id, task_id],
+                )
+                .map_err(|error| format!("Unable to update integration batch items after resolution submit: {error}"))?;
             self.emit_event(
                 "merge_resolution_patch_submitted",
                 "agent",
@@ -7572,6 +9628,22 @@ impl CoordinationKernel {
         Ok(api_ok(json!({
             "tasks": self.query_json("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
             "task_dependencies": self.list_task_dependencies(None)?["data"]["dependencies"].clone(),
+            "task_resource_intents": self.query_json("SELECT * FROM task_resource_intents ORDER BY updated_at DESC LIMIT 400", &[])?,
+            "task_slice_dependencies": self.query_json("SELECT * FROM task_slice_dependencies ORDER BY updated_at DESC LIMIT 400", &[])?,
+            "resource_queues": self.query_json(
+                "SELECT resource_key,
+                        GROUP_CONCAT(CASE WHEN status='lease_granted' THEN task_id END) AS active_task_ids,
+                        GROUP_CONCAT(CASE WHEN status IN ('parked', 'parked_cycle_prevented') THEN task_id END) AS queued_task_ids,
+                        SUM(CASE WHEN status='lease_granted' THEN 1 ELSE 0 END) AS active_count,
+                        SUM(CASE WHEN status IN ('parked', 'parked_cycle_prevented') THEN 1 ELSE 0 END) AS queued_count,
+                        MAX(updated_at) AS updated_at
+                 FROM task_resource_intents
+                 WHERE status IN ('lease_granted', 'parked', 'parked_cycle_prevented')
+                 GROUP BY resource_key
+                 ORDER BY updated_at DESC
+                 LIMIT 200",
+                &[],
+            )?,
             "agent_slots": self.query_json("SELECT * FROM agent_slots ORDER BY slot_key ASC LIMIT 200", &[])?,
             "mcp_configs": self.query_json("SELECT * FROM mcp_configs ORDER BY updated_at DESC LIMIT 200", &[])?,
             "mcp_health_events": self.query_json("SELECT * FROM events WHERE event_type='mcp_health_checked' ORDER BY seq DESC LIMIT 50", &[])?,
@@ -7602,6 +9674,8 @@ impl CoordinationKernel {
                 &[],
             )?,
             "merge_resolution_tasks": self.query_json("SELECT * FROM merge_resolution_tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "integration_batches": self.query_json("SELECT * FROM integration_batches ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "integration_batch_items": self.query_json("SELECT * FROM integration_batch_items ORDER BY updated_at DESC LIMIT 400", &[])?,
             "artifacts": self.query_json("SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 200", &[])?,
             "artifact_storage_logs": self.query_json("SELECT * FROM artifact_storage_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "approvals": self.query_json("SELECT * FROM approvals ORDER BY created_at DESC LIMIT 200", &[])?,
@@ -11032,11 +13106,13 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 4. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Report blocked/parked to Cloud MCP, then stop; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 5. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
 6. When Rust resumes a parked task, call `coordination-kernel.get_brief` again, inspect the refreshed target file/context first, then acquire the lease and continue.\n\
-7. When finished, call `coordination-kernel.submit_patch` first. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe. Only report `done` to Cloud MCP after submit_patch reports an applied auto_merge; otherwise report `review` or `blocked`.\n\
-8. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+7. Before installing, updating, or uninstalling repo dependencies, CLIs, tools, packages, runtimes, or generated lockfiles, publish a `cloud_agent_heartbeat` that names the package/tool and scope, acquire leases for package manifests/lockfiles or related config, then publish a `cloud_subtask_checkpoint` after the change with changed files and install/uninstall outcome. Never silently change dependency state.\n\
+8. When finished, call `coordination-kernel.submit_patch` first. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe. Only report `done` to Cloud MCP after submit_patch reports an applied auto_merge; otherwise report `review` or `blocked`.\n\
+9. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Local coordination remains authoritative\n\n\
 - Use the local coordination kernel for leases, memory, patch submission, and merge safety.\n\
 - Edit only inside the assigned agent worktree/branch root when one is provided.\n\
+- Autonomous intent-resolution tasks should fetch Cloud MCP merge context first, treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch.\n\
 - Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
 - Cloud MCP and merge context packs are shared context and activity memory; it is not permission to bypass local file safety.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
@@ -11140,9 +13216,9 @@ fn merge_resolution_prompt(
     let cloud_context_text =
         serde_json::to_string_pretty(cloud_context).unwrap_or_else(|_| cloud_context.to_string());
     format!(
-        "Merge-resolution task initialized by the local coordination kernel.\n\n\
+        "Autonomous intent-resolution task initialized by the local coordination kernel.\n\n\
 Goal:\n\
-Resolve the submitted patch against the current target branch in your isolated worktree, then submit the resolved result as a new patch.\n\n\
+Resolve the submitted patch against the current integration branch in your isolated worktree, preserving every compatible user intent from the original task, Cloud MCP context, and current integration state. Do not ask the user; make the safest intent-preserving decision and submit the resolved result as a new patch through the normal validation gate.\n\n\
 IDs:\n\
 - Patch: {patch_id}\n\
 - Merge job: {merge_job_id}\n\
@@ -11153,6 +13229,10 @@ Required first step:\n\
 Fetch Cloud MCP context using this context-pack seed so you know what other agents changed and why:\n\
 ```json\n{cloud_context_text}\n```\n\n\
 Rules:\n\
+- Current integration is the source of truth. Adapt stale patch intent onto current files instead of reverting newer accepted work.\n\
+- Preserve all compatible intents. If one patch renamed a symbol and another used the old symbol, adapt the newer intent to the accepted name.\n\
+- Prefer additive/preserving resolutions over deletion unless deletion is clearly part of the task intent.\n\
+- If package manifests or lockfiles are involved, keep them consistent and record the package/tooling outcome in Cloud MCP.\n\
 - Stay inside the leased files above unless the local kernel grants more leases.\n\
 - Do not call or attempt apply_merge.\n\
 - Do not write directly to the shared project root.\n\
@@ -11859,6 +13939,7 @@ mod tests {
             "claim_task",
             "acquire_lease",
             "validate_patch",
+            "submit_patch",
             "get_slot_status",
             "db_classify_sql",
             "db_request_approval",
@@ -11869,7 +13950,6 @@ mod tests {
             )));
         }
         for prompt_gated_tool in [
-            "submit_patch",
             "resolve_workspace_violation",
             "db_query_readonly",
             "db_propose_migration",

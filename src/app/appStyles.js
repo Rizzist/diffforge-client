@@ -2080,6 +2080,119 @@ export const TerminalFrame = styled.section`
   }
 `;
 
+export const TerminalParkedBar = styled.div`
+  position: absolute;
+  right: 12px;
+  bottom: clamp(42px, 6vh, 72px);
+  left: 12px;
+  z-index: 85;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.32);
+  border-radius: 14px;
+  padding: 9px 10px;
+  background:
+    linear-gradient(90deg, rgba(251, 191, 36, 0.16), rgba(56, 189, 248, 0.08)),
+    rgba(4, 8, 16, 0.92);
+  color: rgba(239, 246, 255, 0.94);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(14px);
+`;
+
+export const TerminalParkedSpinner = styled.span`
+  position: relative;
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  overflow: hidden;
+  border: 1px solid rgba(251, 191, 36, 0.36);
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.08);
+
+  &::before {
+    position: absolute;
+    inset: 3px;
+    border-radius: inherit;
+    background:
+      conic-gradient(from 0deg, rgba(251, 191, 36, 0), rgba(251, 191, 36, 0.95), rgba(56, 189, 248, 0.45), rgba(251, 191, 36, 0));
+    animation: ${loadingOrangeSweep} 980ms linear infinite;
+    content: "";
+  }
+
+  &::after {
+    position: absolute;
+    inset: 8px;
+    border-radius: inherit;
+    background: rgba(4, 8, 16, 0.96);
+    content: "";
+  }
+`;
+
+export const TerminalParkedCopy = styled.div`
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+
+  strong {
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: rgba(203, 213, 225, 0.82);
+    font-size: 11px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const TerminalParkedAgents = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+`;
+
+export const TerminalParkedAgentBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(56, 189, 248, 0.36);
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: rgba(56, 189, 248, 0.1);
+  color: #67e8f9;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+`;
+
+export const TerminalParkedCancelButton = styled.button`
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+
+  &:hover {
+    background: rgba(185, 28, 28, 0.42);
+    color: #fff;
+  }
+`;
+
 export const XtermSurface = styled.div`
   --terminal-scrollbar-opacity: 0;
   --terminal-scrollbar-pointer-events: none;
@@ -2107,6 +2220,16 @@ export const XtermSurface = styled.div`
   .xterm-viewport,
   .xterm-screen {
     background: ${TERMINAL_THEME_BACKGROUND} !important;
+  }
+
+  &[data-parked="true"] .xterm-cursor,
+  &[data-parked="true"] .xterm-cursor-layer {
+    display: none !important;
+    opacity: 0 !important;
+  }
+
+  &[data-parked="true"] .xterm-helper-textarea {
+    pointer-events: none !important;
   }
 
   &[data-scrollbar-platform="overlay"] .xterm-viewport {
@@ -5851,6 +5974,84 @@ export const WorkspaceSettingsDialogHeader = styled.header`
   gap: 12px;
   padding: 2px 2px 10px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+`;
+
+export const CrashRecoveryOverlay = styled(WorkspaceSettingsOverlay)`
+  z-index: 32;
+`;
+
+export const CrashRecoveryDialog = styled(WorkspaceSettingsDialog)`
+  width: min(780px, 100%);
+`;
+
+export const CrashRecoveryIntro = styled.div`
+  display: grid;
+  gap: 8px;
+  color: var(--forge-text-soft);
+  font-size: 13px;
+  line-height: 1.5;
+
+  p {
+    margin: 0;
+  }
+
+  strong {
+    color: var(--forge-text);
+  }
+`;
+
+export const CrashRecoveryList = styled.div`
+  display: grid;
+  gap: 9px;
+  max-height: min(280px, 34vh);
+  min-height: 0;
+  overflow: auto;
+`;
+
+export const CrashRecoveryItem = styled.article`
+  display: grid;
+  gap: 7px;
+  padding: 11px;
+  border: 1px solid rgba(251, 191, 36, 0.22);
+  border-radius: 9px;
+  background:
+    linear-gradient(135deg, rgba(251, 191, 36, 0.07), rgba(96, 165, 250, 0.045)),
+    rgba(12, 18, 28, 0.72);
+`;
+
+export const CrashRecoveryItemTitle = styled.strong`
+  color: var(--forge-text);
+  font-size: 13px;
+  line-height: 1.35;
+`;
+
+export const CrashRecoveryItemBody = styled.p`
+  margin: 0;
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  line-height: 1.45;
+`;
+
+export const CrashRecoveryMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+
+  span {
+    max-width: min(100%, 420px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const CrashRecoveryActions = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
 `;
 
 export const WorkspaceSettingsHeaderMain = styled.div`

@@ -20,7 +20,6 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
-import { TerminalDevMetrics } from "./terminalTelemetry.jsx";
 import WorkspaceTerminal, { getTerminalPaneMinSizePercent } from "./WorkspaceTerminal.jsx";
 
 const TerminalWorkspaceWithCloudDock = styled.div`
@@ -555,7 +554,6 @@ export default function TerminalView({
   shouldPrewarmWorkspaceTerminals,
   shouldShowWorkspaceSetup,
   showSettingsView,
-  terminalMetrics,
   terminalPanelRows,
   viewMotion,
   workspaceAgentLaunchEpoch,
@@ -694,7 +692,6 @@ export default function TerminalView({
           <CloudMcpTerminalDock workingDirectory={terminalWorkspaceWorkingDirectory} />
         </TerminalWorkspaceWithCloudDock>
       )}
-      {!shouldShowWorkspaceSetup && <TerminalDevMetrics metrics={terminalMetrics} />}
     </ForgeWorkspace>
   );
 }

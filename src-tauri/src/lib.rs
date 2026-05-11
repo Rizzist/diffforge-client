@@ -65,6 +65,8 @@ const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const TERMINAL_OUTPUT_FRAME_MICROS: u64 = 16_667;
+const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
+const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
@@ -80,7 +82,7 @@ const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
-const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = false;
+const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = true;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
@@ -89,6 +91,7 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
+const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
 #[cfg(target_os = "macos")]
@@ -196,6 +199,7 @@ const WM_SETICON: u32 = 0x0080;
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
@@ -299,6 +303,7 @@ struct TerminalInstance {
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
     input_gate: Arc<Mutex<TerminalInputGate>>,
+    active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
 }
 
@@ -309,6 +314,46 @@ struct TerminalCoordinationSession {
     agent_id: String,
     session_id: String,
     env_vars: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct TerminalActiveTask {
+    task_id: String,
+    title: String,
+}
+
+#[derive(Clone)]
+struct TerminalParkedPrompt {
+    pane_id: String,
+    instance_id: u64,
+    task_id: String,
+    title: String,
+    prompt: String,
+    waiting_on: Vec<TerminalParkedWaitingOn>,
+    coordination: TerminalCoordinationSession,
+    working_directory: PathBuf,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TerminalParkedWaitingOn {
+    agent_id: Option<String>,
+    agent_label: Option<String>,
+    task_id: Option<String>,
+    task_title: Option<String>,
+    resource_key: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalParkedPromptPayload {
+    pane_id: String,
+    instance_id: u64,
+    task_id: String,
+    title: String,
+    status: String,
+    waiting_on: Vec<TerminalParkedWaitingOn>,
+    reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -351,6 +396,7 @@ impl TerminalInstance {
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
                 input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
+                active_task: Arc::new(Mutex::new(None)),
                 coordination,
             },
             reader,
@@ -1230,6 +1276,7 @@ pub fn run() {
     builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
@@ -1327,6 +1374,7 @@ pub fn run() {
             note_main_window_minimize_requested,
             terminal_telemetry_log,
             terminal_telemetry_log_many,
+            terminal_recover_crashed_sessions,
             cloud_mcp_connect,
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
@@ -1340,6 +1388,10 @@ pub fn run() {
             terminal_start_agent_many,
             set_terminal_audio_input_target,
             terminal_write,
+            terminal_delete_selection,
+            terminal_get_parked_prompt,
+            terminal_cancel_parked_task,
+            terminal_interrupt_agent,
             resize_terminal,
             terminal_resize,
             terminal_close,

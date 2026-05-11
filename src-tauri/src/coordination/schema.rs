@@ -102,6 +102,32 @@ CREATE TABLE IF NOT EXISTS task_dependencies(
   PRIMARY KEY(task_id, depends_on_task_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_resource_intents(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  intent_summary TEXT,
+  status TEXT NOT NULL,
+  lease_id TEXT,
+  depends_on_task_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(task_id, resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_slice_dependencies(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  depends_on_task_id TEXT NOT NULL,
+  depends_on_resource_key TEXT,
+  dependency_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(task_id, resource_key, depends_on_task_id)
+);
+
 CREATE TABLE IF NOT EXISTS resources(
   id TEXT PRIMARY KEY,
   resource_key TEXT NOT NULL UNIQUE,
@@ -314,6 +340,35 @@ CREATE TABLE IF NOT EXISTS merge_resolution_tasks(
   changed_files_json TEXT NOT NULL,
   cloud_context_json TEXT,
   resolver_prompt TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS integration_batches(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  base_integration_sha TEXT,
+  target_branch TEXT,
+  merge_job_id TEXT,
+  resolver_task_id TEXT,
+  reason_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS integration_batch_items(
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  patch_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  base_sha TEXT,
+  changed_files_json TEXT NOT NULL,
+  intent_summary TEXT,
+  cloud_context_task_id TEXT,
+  status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -593,6 +648,10 @@ WHERE status='active' AND agent_slot_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_pty
 ON agent_sessions(pty_id)
 WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
+CREATE INDEX IF NOT EXISTS idx_task_resource_intents_task ON task_resource_intents(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_resource_intents_resource ON task_resource_intents(resource_key, status);
+CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_task ON task_slice_dependencies(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_resource ON task_slice_dependencies(resource_key, status);
 CREATE INDEX IF NOT EXISTS idx_leases_resource_status ON leases(resource_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
@@ -605,6 +664,9 @@ CREATE INDEX IF NOT EXISTS idx_violations_status ON workspace_violations(status)
 CREATE INDEX IF NOT EXISTS idx_patches_status ON patches(status);
 CREATE INDEX IF NOT EXISTS idx_merge_jobs_status ON merge_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_merge_resolution_tasks_patch ON merge_resolution_tasks(patch_id, status);
+CREATE INDEX IF NOT EXISTS idx_integration_batches_status ON integration_batches(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_integration_batch_items_batch ON integration_batch_items(batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_integration_batch_items_patch ON integration_batch_items(patch_id);
 CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_artifact ON artifact_storage_logs(artifact_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_status ON artifact_storage_logs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(memory_kind, trust_level);

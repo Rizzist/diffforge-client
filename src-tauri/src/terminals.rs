@@ -543,6 +543,7 @@ fn cleanup_terminal_instance_with_context(
         working_directory,
         agent_started,
         input_gate,
+        active_task,
         coordination,
     } = instance;
 
@@ -578,6 +579,7 @@ fn cleanup_terminal_instance_with_context(
         drop(working_directory);
         drop(agent_started);
         drop(input_gate);
+        drop(active_task);
         drop(coordination);
         log_terminal_event(
             "terminal.cleanup.no_child",
@@ -637,6 +639,8 @@ fn cleanup_terminal_instance_with_context(
     drop(size);
     drop(working_directory);
     drop(agent_started);
+    drop(input_gate);
+    drop(active_task);
     drop(coordination);
 }
 
@@ -1507,6 +1511,7 @@ async fn terminal_open(
     let terminal_coordination = coordination_context
         .as_ref()
         .map(terminal_coordination_session_from_context);
+    let terminal_coordination_for_monitor = terminal_coordination.clone();
 
     log_terminal_event(
         if is_prewarm_pty {
@@ -1580,6 +1585,18 @@ async fn terminal_open(
         output_channel,
         reader,
     );
+    if let Some(coordination) = terminal_coordination_for_monitor {
+        spawn_terminal_session_parking_monitor(
+            app.clone(),
+            cloud_mcp_state.inner().clone(),
+            state.terminals.clone(),
+            state.parked_prompts.clone(),
+            pane_id.clone(),
+            instance_id,
+            coordination,
+            "terminal_open",
+        );
+    }
     log_terminal_event(
         if is_prewarm_pty {
             "terminal.open.prewarm_ready"
@@ -1668,7 +1685,106 @@ fn terminal_telemetry_log_many(requests: Vec<TerminalTelemetryLogRequest>) -> Re
 }
 
 #[tauri::command]
+async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result<Value, String> {
+    let recovery_started_at = Instant::now();
+    let mut requested_roots = roots.unwrap_or_default();
+
+    if requested_roots.is_empty() {
+        requested_roots.push(String::new());
+    }
+
+    let mut seen_roots = HashSet::new();
+    let mut workspace_reports = Vec::new();
+    let mut interrupted_tasks = Vec::new();
+    let mut errors = Vec::new();
+    let mut scanned_sessions = 0u64;
+    let mut idle_sessions_interrupted = 0u64;
+    let mut finished_sessions_interrupted = 0u64;
+
+    for root in requested_roots {
+        let root_option = if root.trim().is_empty() {
+            None
+        } else {
+            Some(root.as_str())
+        };
+        let working_directory = match resolve_workspace_root_directory(root_option) {
+            Ok(directory) => directory,
+            Err(error) => {
+                errors.push(json!({
+                    "root": clean_terminal_telemetry_text(&root),
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+                continue;
+            }
+        };
+        let root_key = workspace_path_display(&working_directory);
+
+        if !seen_roots.insert(root_key.clone()) {
+            continue;
+        }
+
+        match crate::coordination::CoordinationKernel::init(&working_directory, None)
+            .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
+        {
+            Ok(mut report) => {
+                scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
+                idle_sessions_interrupted +=
+                    report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
+                finished_sessions_interrupted +=
+                    report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
+
+                if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
+                    for task in tasks.iter_mut() {
+                        if let Some(object) = task.as_object_mut() {
+                            object.insert("repoPath".to_string(), json!(root_key.clone()));
+                        }
+                        interrupted_tasks.push(task.clone());
+                    }
+                }
+
+                if let Some(object) = report.as_object_mut() {
+                    object.insert("repoPath".to_string(), json!(root_key));
+                }
+                workspace_reports.push(report);
+            }
+            Err(error) => {
+                errors.push(json!({
+                    "root": root_key,
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+            }
+        }
+    }
+
+    log_terminal_event(
+        "terminal.crash_recovery.scan_completed",
+        None,
+        None,
+        Some(recovery_started_at.elapsed()),
+        json!({
+            "workspace_count": workspace_reports.len(),
+            "scanned_sessions": scanned_sessions,
+            "interrupted_tasks": interrupted_tasks.len(),
+            "idle_sessions_interrupted": idle_sessions_interrupted,
+            "finished_sessions_interrupted": finished_sessions_interrupted,
+            "errors": errors.len(),
+            "modal_policy": "frontend_modal_only_for_interrupted_tasks_no_auto_input",
+        }),
+    );
+
+    Ok(json!({
+        "interruptedTasks": interrupted_tasks,
+        "idleSessionsInterrupted": idle_sessions_interrupted,
+        "finishedSessionsInterrupted": finished_sessions_interrupted,
+        "scannedSessions": scanned_sessions,
+        "workspaceReports": workspace_reports,
+        "errors": errors,
+    }))
+}
+
+#[tauri::command]
 async fn terminal_start_agent(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
@@ -1803,6 +1919,18 @@ async fn terminal_start_agent(
 
     write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch")?;
     *agent_started = true;
+    if let Some(coordination) = instance.coordination.clone() {
+        spawn_terminal_session_parking_monitor(
+            app,
+            cloud_mcp_state.inner().clone(),
+            state.terminals.clone(),
+            state.parked_prompts.clone(),
+            pane_id.clone(),
+            instance.id,
+            coordination,
+            "terminal_start_agent",
+        );
+    }
     log_terminal_event(
         "terminal.agent_start.write",
         Some(&pane_id),
@@ -1822,7 +1950,10 @@ async fn terminal_start_agent(
 }
 
 async fn start_terminal_agent_in_prepared_pty(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     request: TerminalStartAgentRequest,
 ) -> TerminalStartAgentPaneResult {
     let pane_id = request.pane_id;
@@ -2010,6 +2141,18 @@ async fn start_terminal_agent_in_prepared_pty(
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
             Ok(()) => {
                 *agent_started_guard = true;
+                if let Some(coordination) = instance.coordination.clone() {
+                    spawn_terminal_session_parking_monitor(
+                        app,
+                        cloud_mcp_state,
+                        Arc::clone(&terminals),
+                        parked_prompts,
+                        pane_id.clone(),
+                        instance.id,
+                        coordination,
+                        "terminal_start_agent_many",
+                    );
+                }
                 log_terminal_event(
                     "terminal.agent_start_many.write_done",
                     Some(&pane_id),
@@ -2078,6 +2221,7 @@ async fn start_terminal_agent_in_prepared_pty(
 
 #[tauri::command]
 async fn terminal_start_agent_many(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     requests: Vec<TerminalStartAgentRequest>,
@@ -2129,9 +2273,21 @@ async fn terminal_start_agent_many(
 
     for request in requests {
         let terminals = Arc::clone(&state.terminals);
+        let parked_prompts = Arc::clone(&state.parked_prompts);
+        let app = app.clone();
+        let cloud_mcp_state = cloud_mcp_state.inner().clone();
 
         join_set
-            .spawn(async move { start_terminal_agent_in_prepared_pty(terminals, request).await });
+            .spawn(async move {
+                start_terminal_agent_in_prepared_pty(
+                    app,
+                    cloud_mcp_state,
+                    terminals,
+                    parked_prompts,
+                    request,
+                )
+                .await
+            });
     }
 
     let mut results = Vec::new();
@@ -2293,7 +2449,15 @@ fn terminal_prompt_task_title(prompt: &str) -> String {
     }
 
     let lower = cleaned.to_ascii_lowercase();
-    let action = if lower.contains("test") {
+    let action = if lower.contains("pricing") && (lower.contains("half") || lower.contains("halve")) {
+        "Halve pricing values"
+    } else if lower.contains("pricing") && lower.contains("double") {
+        "Double pricing values"
+    } else if lower.contains("pricing") && (lower.contains("redesign") || lower.contains("style")) {
+        "Redesign pricing page"
+    } else if lower.contains("pricing") || lower.contains("price") {
+        "Update pricing page"
+    } else if lower.contains("test") {
         "Write tests"
     } else if lower.contains("fix") || lower.contains("bug") {
         "Fix requested issue"
@@ -2325,17 +2489,583 @@ fn terminal_prompt_task_title(prompt: &str) -> String {
     format!("{action}{subject}{qualifier}")
 }
 
+fn terminal_placeholder_task_title(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "Agent preparing requested work" | "Complete requested terminal task"
+    )
+}
+
+fn terminal_placeholder_task_body(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower.contains("has not named the task yet")
+        || lower == "the agent is preparing the requested work and has not named the task yet."
+}
+
 struct TerminalPreparedCoordinationTask {
     task_id: String,
     title: String,
     parked: bool,
+    partial: bool,
     parking_details: Value,
     intent_resources: Vec<String>,
+    runnable_resources: Vec<String>,
+    parked_resources: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TerminalParkingSnapshot {
+    task_id: String,
+    title: String,
+    prompt: String,
+    task_status: String,
+    session_status: String,
+    ready: bool,
+    terminal: bool,
+    waiting_on: Vec<TerminalParkedWaitingOn>,
+}
+
+fn terminal_parking_snapshot_signature(snapshot: &TerminalParkingSnapshot) -> String {
+    let waiting_on = snapshot
+        .waiting_on
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}:{}",
+                item.task_id.as_deref().unwrap_or(""),
+                item.agent_label.as_deref().or(item.agent_id.as_deref()).unwrap_or(""),
+                item.resource_key.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        snapshot.task_id,
+        snapshot.task_status,
+        snapshot.session_status,
+        snapshot.ready,
+        snapshot.terminal,
+        waiting_on
+    )
+}
+
+fn terminal_parked_prompt_key(pane_id: &str, instance_id: u64, task_id: &str) -> String {
+    format!("{pane_id}:{instance_id}:{task_id}")
+}
+
+fn terminal_waiting_agent_label(agent_id: &str) -> String {
+    let short = agent_id
+        .split('-')
+        .next()
+        .unwrap_or(agent_id)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(3)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if short.is_empty() {
+        "AGT".to_string()
+    } else {
+        short
+    }
+}
+
+fn terminal_waiting_slot_label(slot_key: &str) -> String {
+    let lower = slot_key.trim().to_ascii_lowercase();
+    if let Some(number) = lower.strip_prefix("codex-").and_then(|value| value.parse::<u8>().ok()) {
+        if (1..=26).contains(&number) {
+            return format!("CX{}", (b'A' + number - 1) as char);
+        }
+    }
+    slot_key.to_ascii_uppercase()
+}
+
+fn terminal_parked_waiting_on_from_details(details: &Value) -> Vec<TerminalParkedWaitingOn> {
+    let mut waiting_on = Vec::new();
+    let Some(items) = details.as_array() else {
+        return waiting_on;
+    };
+    for item in items {
+        let resource_key = item["error"]["details"]["resource_key"]
+            .as_str()
+            .or_else(|| item["resource_key"].as_str())
+            .map(str::to_string);
+        let mut blockers = item["error"]["details"]["blockers"]
+            .as_array()
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let single_blocker = item["error"]["details"]["blocker"]
+            .as_object()
+            .map(|blocker| Value::Object(blocker.clone()));
+        if let Some(blocker) = single_blocker.as_ref() {
+            blockers.push(blocker);
+        }
+        for blocker in blockers {
+            let agent_id = blocker["agent_id"].as_str().map(str::to_string);
+            let agent_label = blocker["agent_label"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| blocker["slot_key"].as_str().map(terminal_waiting_slot_label))
+                .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label));
+            terminal_push_unique_waiting_on(
+                &mut waiting_on,
+                TerminalParkedWaitingOn {
+                    agent_id,
+                    agent_label,
+                    task_id: blocker["task_id"].as_str().map(str::to_string),
+                    task_title: blocker["task_title"]
+                        .as_str()
+                        .or_else(|| blocker["title"].as_str())
+                        .map(str::to_string),
+                    resource_key: resource_key.clone(),
+                },
+            );
+        }
+    }
+    waiting_on
+}
+
+fn terminal_push_unique_waiting_on(
+    waiting_on: &mut Vec<TerminalParkedWaitingOn>,
+    next: TerminalParkedWaitingOn,
+) {
+    let next_key = (
+        next.task_id.clone(),
+        next.agent_id.clone(),
+        next.agent_label.clone(),
+    );
+    if waiting_on.iter().any(|existing| {
+        (
+            existing.task_id.clone(),
+            existing.agent_id.clone(),
+            existing.agent_label.clone(),
+        ) == next_key
+    }) {
+        return;
+    }
+    waiting_on.push(next);
+}
+
+fn terminal_parked_waiting_on_from_blocking_dependencies(
+    dependencies: &Value,
+) -> Vec<TerminalParkedWaitingOn> {
+    let mut waiting_on = Vec::new();
+    let Some(items) = dependencies.as_array() else {
+        return waiting_on;
+    };
+    for item in items {
+        if item["satisfied"].as_bool() == Some(true) {
+            continue;
+        }
+        let agent_id = item["depends_on_agent_id"].as_str().map(str::to_string);
+        let agent_label = item["depends_on_slot_key"]
+            .as_str()
+            .map(terminal_waiting_slot_label)
+            .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label));
+        terminal_push_unique_waiting_on(
+            &mut waiting_on,
+            TerminalParkedWaitingOn {
+                agent_id,
+                agent_label,
+                task_id: item["depends_on_task_id"].as_str().map(str::to_string),
+                task_title: item["depends_on_title"].as_str().map(str::to_string),
+                resource_key: item["resource_key"].as_str().map(str::to_string),
+            },
+        );
+    }
+    waiting_on
+}
+
+fn terminal_parked_waiting_on_from_resume_state(state: &Value) -> Vec<TerminalParkedWaitingOn> {
+    let mut waiting_on = terminal_parked_waiting_on_from_blocking_dependencies(
+        &state["data"]["blocking_dependencies"],
+    );
+    for blocker in terminal_parked_waiting_on_from_blocking_dependencies(
+        &state["data"]["blocked_slices"],
+    ) {
+        terminal_push_unique_waiting_on(&mut waiting_on, blocker);
+    }
+    for blocker in terminal_parked_waiting_on_from_blocking_dependencies(
+        &state["data"]["parked_resource_intents"],
+    ) {
+        terminal_push_unique_waiting_on(&mut waiting_on, blocker);
+    }
+    waiting_on
+}
+
+fn terminal_task_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "merged" | "done" | "completed" | "cancelled" | "interrupted" | "skipped"
+    )
+}
+
+fn terminal_resume_state_has_parked_intents(state: &Value) -> bool {
+    state["data"]["parked_resource_intents"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+}
+
+fn terminal_parking_snapshot_from_kernel(
+    coordination: &TerminalCoordinationSession,
+) -> Result<Option<TerminalParkingSnapshot>, String> {
+    let kernel = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    )?;
+    let _ = kernel.recover_resume_ready_task_for_session(
+        &coordination.session_id,
+        "terminal_parking_snapshot_poll",
+    );
+    let session_rows = kernel.query_json(
+        "SELECT s.task_id,
+                s.status AS session_status,
+                t.title,
+                t.body,
+                t.status AS task_status
+         FROM agent_sessions s
+         LEFT JOIN tasks t ON t.id = s.task_id
+         WHERE s.id=?1
+         LIMIT 1",
+        &[&coordination.session_id],
+    )?;
+    let Some(session_row) = session_rows.first() else {
+        return Ok(None);
+    };
+    let Some(task_id) = session_row["task_id"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let raw_title = session_row["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Parked Diff Forge task")
+        .to_string();
+    let raw_body = session_row["body"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Continue the queued work now that the dependency has cleared.")
+        .to_string();
+    let body = if terminal_placeholder_task_body(&raw_body) {
+        "Continue the queued work now that the dependency has cleared.".to_string()
+    } else {
+        raw_body
+    };
+    let title = if terminal_placeholder_task_title(&raw_title) {
+        terminal_prompt_task_title(&body)
+    } else {
+        raw_title
+    };
+    let task_status = session_row["task_status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let session_status = session_row["session_status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let terminal = terminal_task_status_is_terminal(&task_status);
+    let active_lease_count = kernel
+        .query_json(
+            "SELECT COUNT(1) AS active_lease_count
+             FROM leases
+             WHERE task_id=?1 AND status='active'",
+            &[&task_id],
+        )?
+        .first()
+        .and_then(|row| row["active_lease_count"].as_i64())
+        .unwrap_or(0);
+
+    let blocking_dependencies = kernel.query_json(
+        "SELECT d.task_id,
+                d.depends_on_task_id,
+                d.dependency_kind,
+                d.created_at,
+                dependency.title AS depends_on_title,
+                dependency.status AS depends_on_status,
+                dependency_session.agent_id AS depends_on_agent_id,
+                dependency_slot.slot_key AS depends_on_slot_key,
+                intent.resource_key AS resource_key,
+                0 AS satisfied
+         FROM task_dependencies d
+         LEFT JOIN tasks dependency ON dependency.id = d.depends_on_task_id
+         LEFT JOIN agent_sessions dependency_session
+           ON dependency_session.id = (
+                SELECT s.id
+                FROM agent_sessions s
+                WHERE s.task_id = d.depends_on_task_id
+                ORDER BY CASE WHEN s.status='active' THEN 0 ELSE 1 END,
+                         s.updated_at DESC,
+                         s.created_at DESC
+                LIMIT 1
+              )
+         LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
+         LEFT JOIN task_resource_intents intent
+           ON intent.task_id = d.task_id
+          AND intent.depends_on_task_id = d.depends_on_task_id
+         WHERE d.task_id=?1
+           AND (dependency.status IS NULL OR dependency.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped'))
+         ORDER BY d.created_at ASC",
+        &[&task_id],
+    )?;
+    let parked_resource_intents = kernel.query_json(
+        "SELECT i.task_id,
+                i.resource_key,
+                i.status,
+                i.intent_summary,
+                i.depends_on_task_id,
+                i.lease_id,
+                i.updated_at,
+                dependency.title AS depends_on_title,
+                dependency.status AS depends_on_status,
+                dependency_session.agent_id AS depends_on_agent_id,
+                dependency_slot.slot_key AS depends_on_slot_key,
+                0 AS satisfied
+         FROM task_resource_intents i
+         LEFT JOIN tasks dependency ON dependency.id = i.depends_on_task_id
+         LEFT JOIN agent_sessions dependency_session
+           ON dependency_session.id = (
+                SELECT s.id
+                FROM agent_sessions s
+                WHERE s.task_id = i.depends_on_task_id
+                ORDER BY CASE WHEN s.status='active' THEN 0 ELSE 1 END,
+                         s.updated_at DESC,
+                         s.created_at DESC
+                LIMIT 1
+              )
+         LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
+         WHERE i.task_id=?1
+           AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+         ORDER BY i.updated_at ASC",
+        &[&task_id],
+    )?;
+
+    let mut waiting_on = terminal_parked_waiting_on_from_blocking_dependencies(
+        &Value::Array(blocking_dependencies.clone()),
+    );
+    for blocker in terminal_parked_waiting_on_from_blocking_dependencies(&Value::Array(
+        parked_resource_intents.clone(),
+    )) {
+        terminal_push_unique_waiting_on(&mut waiting_on, blocker);
+    }
+
+    let ready = !terminal
+        && blocking_dependencies.is_empty()
+        && !parked_resource_intents.is_empty()
+        && active_lease_count == 0
+        && matches!(task_status.as_str(), "ready" | "claimed")
+        && session_status == "active";
+
+    Ok(Some(TerminalParkingSnapshot {
+        task_id,
+        title: title.clone(),
+        prompt: body,
+        task_status,
+        session_status,
+        ready,
+        terminal,
+        waiting_on,
+    }))
+}
+
+fn terminal_resume_state_prompt(state: &Value) -> String {
+    let raw_title = state["data"]["task"]["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Parked Diff Forge task");
+    let raw_body = state["data"]["task"]["body"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Continue the queued work now that the dependency has cleared.");
+    let body = if terminal_placeholder_task_body(raw_body) {
+        "Continue the queued work now that the dependency has cleared."
+    } else {
+        raw_body
+    };
+    if terminal_placeholder_task_title(raw_title) {
+        body.to_string()
+    } else {
+        format!("{raw_title}\n\n{body}")
+    }
+}
+
+fn emit_terminal_parked_prompt_event(
+    app: &AppHandle,
+    parked: &TerminalParkedPrompt,
+    status: &str,
+    reason: Option<&str>,
+) {
+    let _ = app.emit(
+        TERMINAL_PARKED_PROMPT_EVENT,
+        TerminalParkedPromptPayload {
+            pane_id: parked.pane_id.clone(),
+            instance_id: parked.instance_id,
+            task_id: parked.task_id.clone(),
+            title: parked.title.clone(),
+            status: status.to_string(),
+            waiting_on: parked.waiting_on.clone(),
+            reason: reason.map(str::to_string),
+        },
+    );
+}
+
+async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
+    cloud_mcp_state: &CloudMcpState,
+    parked: &TerminalParkedPrompt,
+    status: &str,
+    body: &str,
+) {
+    cloud_mcp_mark_terminal_task_lifecycle(
+        cloud_mcp_state,
+        &parked.pane_id,
+        parked.instance_id,
+        &parked.working_directory,
+        Some(&parked.coordination),
+        Some(&parked.task_id),
+        Some(&parked.title),
+        status,
+        "terminal-agent",
+        body,
+    )
+    .await;
+}
+
+fn emit_terminal_monitor_coordination_event(
+    coordination: &TerminalCoordinationSession,
+    event_type: &str,
+    pane_id: &str,
+    instance_id: u64,
+    task_id: Option<&str>,
+    payload: Value,
+) {
+    log_terminal_event(
+        "terminal.coordination_monitor_event",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "event_type": clean_terminal_telemetry_text(event_type),
+            "task_id": task_id.map(clean_terminal_telemetry_text),
+            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+            "source": "terminal_parking_supervisor",
+            "payload": payload.clone(),
+        }),
+    );
+    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    ) {
+        let _ = kernel.emit_event(
+            event_type,
+            "terminal",
+            &coordination.session_id,
+            crate::coordination::kernel::EventRefs {
+                task_id: task_id.map(str::to_string),
+                agent_id: Some(coordination.agent_id.clone()),
+                session_id: Some(coordination.session_id.clone()),
+                ..crate::coordination::kernel::EventRefs::default()
+            },
+            json!({
+                "pane_id": pane_id,
+                "instance_id": instance_id,
+                "source": "terminal_parking_supervisor",
+                "payload": payload,
+            }),
+        );
+    }
+}
+
+fn spawn_terminal_session_parking_monitor(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
+    pane_id: String,
+    instance_id: u64,
+    coordination: TerminalCoordinationSession,
+    source: &'static str,
+) {
+    emit_terminal_monitor_coordination_event(
+        &coordination,
+        "terminal_session_parking_monitor_spawned",
+        &pane_id,
+        instance_id,
+        None,
+        json!({
+            "source": source,
+            "session_id": coordination.session_id.clone(),
+        }),
+    );
+    tauri::async_runtime::spawn(terminal_monitor_session_parking(
+        app,
+        cloud_mcp_state,
+        terminals,
+        parked_prompts,
+        pane_id,
+        instance_id,
+        coordination,
+    ));
 }
 
 fn terminal_prompt_intent_resource_keys(prompt: &str) -> Vec<String> {
     let lower = prompt.to_ascii_lowercase();
     let mut resources = Vec::new();
+    for token in prompt.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}')) {
+        let cleaned = token
+            .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '<' | '>' | '.' | '!' | '?'))
+            .replace('\\', "/");
+        if cleaned.starts_with('/')
+            || cleaned.starts_with("http")
+            || cleaned.starts_with('@')
+            || cleaned.contains("..")
+        {
+            continue;
+        }
+        let lower_token = cleaned.to_ascii_lowercase();
+        let looks_like_path = cleaned.contains('/')
+            || lower_token.ends_with(".html")
+            || lower_token.ends_with(".css")
+            || lower_token.ends_with(".js")
+            || lower_token.ends_with(".jsx")
+            || lower_token.ends_with(".ts")
+            || lower_token.ends_with(".tsx")
+            || lower_token.ends_with(".json")
+            || lower_token.ends_with(".md")
+            || lower_token.ends_with(".rs")
+            || lower_token.ends_with(".py")
+            || lower_token.ends_with(".go")
+            || lower_token.ends_with(".toml")
+            || lower_token.ends_with(".lock");
+        if looks_like_path && !cleaned.is_empty() {
+            resources.push(format!("file:{cleaned}"));
+        }
+    }
+    for manifest in [
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "Cargo.toml",
+        "Cargo.lock",
+        "requirements.txt",
+        "pyproject.toml",
+    ] {
+        if prompt.contains(manifest) {
+            resources.push(format!("file:{manifest}"));
+        }
+    }
     if lower.contains("index.html") {
         resources.push("file:index.html".to_string());
     }
@@ -2352,9 +3082,44 @@ fn terminal_prompt_intent_resource_keys(prompt: &str) -> Vec<String> {
     {
         resources.push("file:index.html".to_string());
     }
+    if lower.contains("pricing") || (lower.contains("price") && lower.contains("page")) {
+        resources.push("file:pricing.html".to_string());
+    }
     resources.sort();
     resources.dedup();
     resources
+}
+
+fn terminal_partial_parking_prompt(
+    prompt: &str,
+    runnable_resources: &[String],
+    parked_resources: &[String],
+) -> String {
+    let runnable = if runnable_resources.is_empty() {
+        "- none".to_string()
+    } else {
+        runnable_resources
+            .iter()
+            .map(|resource| format!("- {resource}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let parked = if parked_resources.is_empty() {
+        "- none".to_string()
+    } else {
+        parked_resources
+            .iter()
+            .map(|resource| format!("- {resource}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Diff Forge scheduler partially parked this task.\n\n\
+Work only on these granted resources now:\n{runnable}\n\n\
+Do not edit these parked resources yet:\n{parked}\n\n\
+When the runnable slice is complete, call coordination-kernel.submit_patch. Rust will resume this terminal later for the parked resources after their queue/resolver dependencies clear.\n\n\
+Original request:\n{prompt}\r"
+    )
 }
 
 fn terminal_prepare_coordination_task_for_prompt(
@@ -2384,6 +3149,8 @@ fn terminal_prepare_coordination_task_for_prompt(
     kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
     let intent_resources = terminal_prompt_intent_resource_keys(prompt);
     let mut parked = false;
+    let mut runnable_resources = Vec::new();
+    let mut parked_resources = Vec::new();
     let mut parking_details = Vec::new();
     for resource_key in &intent_resources {
         match kernel.acquire_lease(
@@ -2398,11 +3165,17 @@ fn terminal_prepare_coordination_task_for_prompt(
             Ok(value) => {
                 if value["ok"].as_bool() == Some(false) {
                     let code = value["error"]["code"].as_str().unwrap_or_default();
-                    if code.contains("queued") || code.contains("lease_conflict") {
+                    if code.contains("queued") || code.contains("lease_conflict") || code.contains("cycle_prevented") {
                         parked = true;
+                        parked_resources.push(resource_key.clone());
+                    }
+                    let mut value = value;
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("resource_key".to_string(), json!(resource_key));
                     }
                     parking_details.push(value);
                 } else {
+                    runnable_resources.push(resource_key.clone());
                     parking_details.push(json!({
                         "resource_key": resource_key,
                         "status": "intent_lease_acquired",
@@ -2434,20 +3207,29 @@ fn terminal_prepare_coordination_task_for_prompt(
             "title": clean_terminal_telemetry_text(&title),
             "intent_resources": intent_resources.clone(),
             "parked": parked,
+            "partial": parked && !runnable_resources.is_empty(),
+            "runnable_resources": runnable_resources.clone(),
+            "parked_resources": parked_resources.clone(),
             "parking_details": parking_details.clone(),
         }),
     );
     Ok(Some(TerminalPreparedCoordinationTask {
         task_id,
         title,
-        parked,
+        parked: parked && runnable_resources.is_empty(),
+        partial: parked && !runnable_resources.is_empty(),
         parking_details: Value::Array(parking_details),
         intent_resources,
+        runnable_resources,
+        parked_resources,
     }))
 }
 
 async fn terminal_resume_parked_prompt_when_ready(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     pane_id: String,
     instance_id: u64,
     coordination: TerminalCoordinationSession,
@@ -2455,6 +3237,8 @@ async fn terminal_resume_parked_prompt_when_ready(
     title: String,
     prompt: String,
 ) {
+    let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
+    let mut last_resume_snapshot_signature: Option<String> = None;
     log_terminal_event(
         "terminal.prompt.parked",
         Some(&pane_id),
@@ -2468,23 +3252,107 @@ async fn terminal_resume_parked_prompt_when_ready(
     );
     for _ in 0..7200 {
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        let state = match crate::coordination::CoordinationKernel::open(
+        let still_parked = {
+            let guard = parked_prompts.read().await;
+            guard.contains_key(&parked_key)
+        };
+        if !still_parked {
+            log_terminal_event(
+                "terminal.prompt.parked_resume_abandoned",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "reason": "parked_task_removed",
+                }),
+            );
+            return;
+        }
+        let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
+            Ok(Some(snapshot)) if snapshot.task_id == task_id => snapshot,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        let resume_snapshot_signature = terminal_parking_snapshot_signature(&snapshot);
+        if last_resume_snapshot_signature.as_deref() != Some(resume_snapshot_signature.as_str()) {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_snapshot",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "task_status": snapshot.task_status.clone(),
+                    "session_status": snapshot.session_status.clone(),
+                    "ready": snapshot.ready,
+                    "terminal": snapshot.terminal,
+                    "waiting_on_count": snapshot.waiting_on.len(),
+                    "waiting_on": snapshot.waiting_on.clone(),
+                    "signature": resume_snapshot_signature.clone(),
+                }),
+            );
+            last_resume_snapshot_signature = Some(resume_snapshot_signature);
+        }
+        if !snapshot.ready {
+            let waiting_on = snapshot.waiting_on;
+            if !waiting_on.is_empty() {
+                let parked_update = {
+                    let mut guard = parked_prompts.write().await;
+                    if let Some(parked) = guard.get_mut(&parked_key) {
+                        if parked.waiting_on != waiting_on {
+                            parked.waiting_on = waiting_on;
+                            Some(parked.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(parked) = parked_update {
+                    emit_terminal_parked_prompt_event(
+                        &app,
+                        &parked,
+                        "parked",
+                        Some("waiting_for_dependency"),
+                    );
+                }
+            }
+            continue;
+        }
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_resume_ready_to_write",
+            &pane_id,
+            instance_id,
+            Some(&task_id),
+            json!({
+                "title": clean_terminal_telemetry_text(&title),
+                "prompt_bytes": prompt.len(),
+                "resume_input_policy": "submit_original_parked_request_to_existing_terminal",
+            }),
+        );
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
             &coordination.repo_path,
             Some(PathBuf::from(&coordination.db_path)),
         ) {
-            Ok(kernel) => kernel.task_resume_state(&task_id, &coordination.session_id),
-            Err(error) => Err(error),
-        };
-        let Ok(state) = state else {
-            continue;
-        };
-        if state["data"]["ready"].as_bool() != Some(true) {
-            continue;
+            let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
         }
         let Some(instance) = ({
             let guard = terminals.read().await;
             guard.get(&pane_id).cloned()
         }) else {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_abandoned",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "reason": "terminal_missing",
+                }),
+            );
             log_terminal_event(
                 "terminal.prompt.parked_resume_abandoned",
                 Some(&pane_id),
@@ -2495,9 +3363,30 @@ async fn terminal_resume_parked_prompt_when_ready(
                     "reason": "terminal_missing",
                 }),
             );
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                mark_terminal_parked_prompt_lifecycle_in_cloud(
+                    &cloud_mcp_state,
+                    &parked,
+                    "interrupted",
+                    "Interrupted while parked: the terminal disappeared before the task could resume.",
+                )
+                .await;
+                emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("terminal_missing"));
+            }
             return;
         };
         if instance.id != instance_id {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_abandoned",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "reason": "terminal_replaced",
+                    "current_instance_id": instance.id,
+                }),
+            );
             log_terminal_event(
                 "terminal.prompt.parked_resume_abandoned",
                 Some(&pane_id),
@@ -2509,13 +3398,47 @@ async fn terminal_resume_parked_prompt_when_ready(
                     "current_instance_id": instance.id,
                 }),
             );
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                mark_terminal_parked_prompt_lifecycle_in_cloud(
+                    &cloud_mcp_state,
+                    &parked,
+                    "interrupted",
+                    "Interrupted while parked: the terminal session was replaced before the task could resume.",
+                )
+                .await;
+                emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("terminal_replaced"));
+            }
             return;
         }
-        let resume_input = format!(
-            "Dependency is ready. Continue the parked Diff Forge task now.\nTask: {}\nOriginal request: {}\r",
-            title, prompt
-        );
-        if resume_input.len() > MAX_TERMINAL_WRITE_BYTES {
+        let compact_title = clean_terminal_telemetry_text(&title)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let compact_prompt = clean_terminal_telemetry_text(&prompt)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let resume_request = if terminal_placeholder_task_body(&compact_prompt)
+            || compact_prompt.eq_ignore_ascii_case("Continue the queued work now that the dependency has cleared.")
+        {
+            compact_title
+        } else {
+            compact_prompt
+        };
+        let resume_input_bytes =
+            resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
+        if resume_input_bytes > MAX_TERMINAL_WRITE_BYTES {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_abandoned",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "reason": "resume_input_too_large",
+                    "bytes": resume_input_bytes,
+                }),
+            );
             log_terminal_event(
                 "terminal.prompt.parked_resume_abandoned",
                 Some(&pane_id),
@@ -2524,13 +3447,134 @@ async fn terminal_resume_parked_prompt_when_ready(
                 json!({
                     "task_id": clean_terminal_telemetry_text(&task_id),
                     "reason": "resume_input_too_large",
-                    "bytes": resume_input.len(),
+                    "bytes": resume_input_bytes,
                 }),
             );
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                mark_terminal_parked_prompt_lifecycle_in_cloud(
+                    &cloud_mcp_state,
+                    &parked,
+                    "interrupted",
+                    "Interrupted while parked: the resume prompt was too large to send safely.",
+                )
+                .await;
+                emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_input_too_large"));
+            }
             return;
         }
+        {
+            let mut writer = instance.writer.lock().await;
+            if let Err(error) = writer.write_all(resume_request.as_bytes()) {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_parked_resume_write_failed",
+                    &pane_id,
+                    instance_id,
+                    Some(&task_id),
+                    json!({
+                        "stage": "text",
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+                log_terminal_event(
+                    "terminal.prompt.parked_resume_write_failed",
+                    Some(&pane_id),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "task_id": clean_terminal_telemetry_text(&task_id),
+                        "stage": "text",
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+                if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                    mark_terminal_parked_prompt_lifecycle_in_cloud(
+                        &cloud_mcp_state,
+                        &parked,
+                        "interrupted",
+                        "Interrupted while parked: the terminal write failed when resuming the task.",
+                    )
+                    .await;
+                    emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_write_failed"));
+                }
+                return;
+            }
+            if let Err(error) = writer.flush() {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_parked_resume_write_failed",
+                    &pane_id,
+                    instance_id,
+                    Some(&task_id),
+                    json!({
+                        "stage": "text_flush",
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+                log_terminal_event(
+                    "terminal.prompt.parked_resume_write_failed",
+                    Some(&pane_id),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "task_id": clean_terminal_telemetry_text(&task_id),
+                        "stage": "text_flush",
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+                if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                    mark_terminal_parked_prompt_lifecycle_in_cloud(
+                        &cloud_mcp_state,
+                        &parked,
+                        "interrupted",
+                        "Interrupted while parked: the terminal write failed when resuming the task.",
+                    )
+                    .await;
+                    emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_write_failed"));
+                }
+                return;
+            }
+        }
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_resume_text_written",
+            &pane_id,
+            instance_id,
+            Some(&task_id),
+            json!({
+                "title": clean_terminal_telemetry_text(&title),
+                "text_bytes": resume_request.len(),
+                "submit_delay_ms": TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+                "submit_policy": "split_text_then_enter",
+            }),
+        );
+        log_terminal_event(
+            "terminal.prompt.parked_resume_text_written",
+            Some(&pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "task_id": clean_terminal_telemetry_text(&task_id),
+                "title": clean_terminal_telemetry_text(&title),
+                "text_bytes": resume_request.len(),
+                "submit_delay_ms": TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+                "submit_policy": "split_text_then_enter",
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS)).await;
         let mut writer = instance.writer.lock().await;
-        if let Err(error) = writer.write_all(resume_input.as_bytes()) {
+        if let Err(error) = writer.write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes()) {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_write_failed",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "stage": "submit",
+                    "error": clean_terminal_telemetry_text(&error.to_string()),
+                }),
+            );
             log_terminal_event(
                 "terminal.prompt.parked_resume_write_failed",
                 Some(&pane_id),
@@ -2538,12 +3582,89 @@ async fn terminal_resume_parked_prompt_when_ready(
                 None,
                 json!({
                     "task_id": clean_terminal_telemetry_text(&task_id),
+                    "stage": "submit",
                     "error": clean_terminal_telemetry_text(&error.to_string()),
                 }),
             );
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                mark_terminal_parked_prompt_lifecycle_in_cloud(
+                    &cloud_mcp_state,
+                    &parked,
+                    "interrupted",
+                    "Interrupted while parked: the terminal write failed when resuming the task.",
+                )
+                .await;
+                emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_write_failed"));
+            }
             return;
         }
-        let _ = writer.flush();
+        if let Err(error) = writer.flush() {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_resume_write_failed",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "stage": "submit_flush",
+                    "error": clean_terminal_telemetry_text(&error.to_string()),
+                }),
+            );
+            log_terminal_event(
+                "terminal.prompt.parked_resume_write_failed",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "stage": "submit_flush",
+                    "error": clean_terminal_telemetry_text(&error.to_string()),
+                }),
+            );
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                mark_terminal_parked_prompt_lifecycle_in_cloud(
+                    &cloud_mcp_state,
+                    &parked,
+                    "interrupted",
+                    "Interrupted while parked: the terminal write failed when resuming the task.",
+                )
+                .await;
+                emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_write_failed"));
+            }
+            return;
+        }
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+            &coordination.repo_path,
+            Some(PathBuf::from(&coordination.db_path)),
+        ) {
+            let _ = kernel.mark_task_resume_requested(
+                &task_id,
+                &coordination.session_id,
+                "dependency_ready_original_request_submitted",
+            );
+        }
+        if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+            mark_terminal_parked_prompt_lifecycle_in_cloud(
+                &cloud_mcp_state,
+                &parked,
+                "active",
+                "Dependency completed; the parked task is resuming in the terminal.",
+            )
+            .await;
+            emit_terminal_parked_prompt_event(&app, &parked, "resumed", Some("dependency_ready"));
+        }
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_resume_sent",
+            &pane_id,
+            instance_id,
+            Some(&task_id),
+            json!({
+                "title": clean_terminal_telemetry_text(&title),
+                "resume_input_bytes": resume_input_bytes,
+                "submit_policy": "split_text_then_enter",
+            }),
+        );
         log_terminal_event(
             "terminal.prompt.parked_resume_sent",
             Some(&pane_id),
@@ -2552,10 +3673,23 @@ async fn terminal_resume_parked_prompt_when_ready(
             json!({
                 "task_id": clean_terminal_telemetry_text(&task_id),
                 "title": clean_terminal_telemetry_text(&title),
+                "resume_input_bytes": resume_input_bytes,
+                "submit_policy": "split_text_then_enter",
             }),
         );
         return;
     }
+    emit_terminal_monitor_coordination_event(
+        &coordination,
+        "terminal_parked_resume_timeout",
+        &pane_id,
+        instance_id,
+        Some(&task_id),
+        json!({
+            "title": clean_terminal_telemetry_text(&title),
+            "reason": "dependency_did_not_become_ready_before_timeout",
+        }),
+    );
     log_terminal_event(
         "terminal.prompt.parked_resume_timeout",
         Some(&pane_id),
@@ -2566,10 +3700,500 @@ async fn terminal_resume_parked_prompt_when_ready(
             "title": clean_terminal_telemetry_text(&title),
         }),
     );
+    if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+        mark_terminal_parked_prompt_lifecycle_in_cloud(
+            &cloud_mcp_state,
+            &parked,
+            "interrupted",
+            "Interrupted while parked: the dependency did not become ready before the resume timeout.",
+        )
+        .await;
+        emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("resume_timeout"));
+    }
+}
+
+async fn terminal_monitor_active_task_for_late_parking(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
+    pane_id: String,
+    instance_id: u64,
+    coordination: TerminalCoordinationSession,
+    task_id: String,
+    title: String,
+    prompt: String,
+) {
+    let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
+    for _ in 0..1800 {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if parked_prompts.read().await.contains_key(&parked_key) {
+            return;
+        }
+        let Some(instance) = ({
+            let guard = terminals.read().await;
+            guard.get(&pane_id).cloned()
+        }) else {
+            return;
+        };
+        if instance.id != instance_id {
+            return;
+        }
+        let active_task_matches = {
+            let active_task = instance.active_task.lock().await;
+            active_task
+                .as_ref()
+                .is_some_and(|active| active.task_id == task_id)
+        };
+        if !active_task_matches {
+            return;
+        }
+        let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
+            Ok(Some(snapshot)) if snapshot.task_id == task_id => snapshot,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        if snapshot.terminal {
+            return;
+        }
+        if snapshot.waiting_on.is_empty() && !snapshot.ready {
+            continue;
+        }
+
+        let parked = TerminalParkedPrompt {
+            pane_id: pane_id.clone(),
+            instance_id,
+            task_id: task_id.clone(),
+            title: title.clone(),
+            prompt: prompt.clone(),
+            waiting_on: snapshot.waiting_on,
+            coordination: coordination.clone(),
+            working_directory: instance.working_directory.as_ref().clone(),
+        };
+        parked_prompts
+            .write()
+            .await
+            .insert(parked_key.clone(), parked.clone());
+        emit_terminal_parked_prompt_event(&app, &parked, "parked", Some("late_mcp_lease_block"));
+        mark_terminal_parked_prompt_lifecycle_in_cloud(
+            &cloud_mcp_state,
+            &parked,
+            "blocked",
+            "Parked: the agent hit a local coordination lease block after the prompt was already running.",
+        )
+        .await;
+        log_terminal_event(
+            "terminal.prompt.late_parked_from_kernel_state",
+            Some(&pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "task_id": clean_terminal_telemetry_text(&task_id),
+                "title": clean_terminal_telemetry_text(&title),
+                "task_status": snapshot.task_status,
+                "session_status": snapshot.session_status,
+                "ready": snapshot.ready,
+            }),
+        );
+        tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
+            app,
+            cloud_mcp_state,
+            terminals,
+            parked_prompts,
+            pane_id,
+            instance_id,
+            coordination,
+            task_id,
+            title,
+            prompt,
+        ));
+        return;
+    }
+}
+
+async fn terminal_monitor_session_parking(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
+    pane_id: String,
+    mut instance_id: u64,
+    coordination: TerminalCoordinationSession,
+) {
+    log_terminal_event(
+        "terminal.prompt.session_parking_monitor_started",
+        Some(&pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+        }),
+    );
+    emit_terminal_monitor_coordination_event(
+        &coordination,
+        "terminal_session_parking_monitor_started",
+        &pane_id,
+        instance_id,
+        None,
+        json!({
+            "session_id": coordination.session_id.clone(),
+            "agent_id": coordination.agent_id.clone(),
+        }),
+    );
+
+    let mut registered_parked_keys = HashSet::new();
+    let mut missing_pane_ticks = 0usize;
+    let mut last_observed_task_id: Option<String> = None;
+    let mut last_snapshot_signature: Option<String> = None;
+    let mut last_skip_signature: Option<String> = None;
+
+    for tick in 0..7200 {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let Some(instance) = ({
+            let guard = terminals.read().await;
+            guard.get(&pane_id).cloned()
+        }) else {
+            missing_pane_ticks += 1;
+            if missing_pane_ticks >= 10 {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_stopped",
+                    &pane_id,
+                    instance_id,
+                    None,
+                    json!({
+                        "reason": "pane_missing",
+                        "missing_ticks": missing_pane_ticks,
+                    }),
+                );
+                return;
+            }
+            continue;
+        };
+        missing_pane_ticks = 0;
+        if instance.id != instance_id {
+            let same_session = instance
+                .coordination
+                .as_ref()
+                .is_some_and(|active| active.session_id == coordination.session_id);
+            if same_session {
+                let previous_instance_id = instance_id;
+                instance_id = instance.id;
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_rebound_instance",
+                    &pane_id,
+                    instance_id,
+                    None,
+                    json!({
+                        "previous_instance_id": previous_instance_id,
+                        "current_instance_id": instance_id,
+                        "reason": "same_session_new_terminal_instance",
+                    }),
+                );
+            } else {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_stopped",
+                    &pane_id,
+                    instance_id,
+                    None,
+                    json!({
+                        "reason": "terminal_instance_replaced_by_different_session",
+                        "current_instance_id": instance.id,
+                        "current_session_id": instance.coordination.as_ref().map(|active| active.session_id.clone()),
+                    }),
+                );
+                return;
+            }
+        }
+
+        let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                let skip_signature = format!("no_snapshot:{tick}");
+                if tick < 5 || tick % 30 == 0 {
+                    emit_terminal_monitor_coordination_event(
+                        &coordination,
+                        "terminal_session_parking_monitor_no_snapshot",
+                        &pane_id,
+                        instance_id,
+                        None,
+                        json!({
+                            "reason": "session_has_no_attached_task_or_missing_task",
+                            "tick": tick,
+                            "session_id": coordination.session_id.clone(),
+                        }),
+                    );
+                    last_skip_signature = Some(skip_signature);
+                }
+                continue;
+            }
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.prompt.session_parking_monitor_error",
+                    Some(&pane_id),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_snapshot_error",
+                    &pane_id,
+                    instance_id,
+                    None,
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "tick": tick,
+                    }),
+                );
+                continue;
+            }
+        };
+
+        let task_id = snapshot.task_id.clone();
+        let snapshot_signature = terminal_parking_snapshot_signature(&snapshot);
+        if last_snapshot_signature.as_deref() != Some(snapshot_signature.as_str()) {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_session_parking_monitor_snapshot",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "tick": tick,
+                    "task_status": snapshot.task_status.clone(),
+                    "session_status": snapshot.session_status.clone(),
+                    "ready": snapshot.ready,
+                    "terminal": snapshot.terminal,
+                    "waiting_on_count": snapshot.waiting_on.len(),
+                    "waiting_on": snapshot.waiting_on.clone(),
+                    "signature": snapshot_signature.clone(),
+                }),
+            );
+            last_snapshot_signature = Some(snapshot_signature.clone());
+        }
+        if last_observed_task_id.as_deref() != Some(task_id.as_str()) {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_session_parking_monitor_task_observed",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "previous_task_id": last_observed_task_id.clone(),
+                    "task_id": task_id.clone(),
+                    "task_status": snapshot.task_status.clone(),
+                    "session_status": snapshot.session_status.clone(),
+                }),
+            );
+            last_observed_task_id = Some(task_id.clone());
+        }
+        let title = snapshot.title.clone();
+        let task_status = snapshot.task_status.clone();
+        let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
+
+        if snapshot.terminal {
+            let skip_signature = format!("terminal:{snapshot_signature}");
+            if last_skip_signature.as_deref() != Some(skip_signature.as_str()) {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_skip",
+                    &pane_id,
+                    instance_id,
+                    Some(&task_id),
+                    json!({
+                        "reason": "task_status_is_terminal",
+                        "task_status": task_status.clone(),
+                        "session_status": snapshot.session_status.clone(),
+                        "ready": snapshot.ready,
+                        "waiting_on_count": snapshot.waiting_on.len(),
+                    }),
+                );
+                last_skip_signature = Some(skip_signature);
+            }
+            if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
+                emit_terminal_parked_prompt_event(&app, &parked, "resumed", Some("task_terminal"));
+            }
+            let mut active_task = instance.active_task.lock().await;
+            if active_task
+                .as_ref()
+                .is_some_and(|task| task.task_id == task_id)
+            {
+                *active_task = None;
+            }
+            continue;
+        }
+
+        {
+            let mut active_task = instance.active_task.lock().await;
+            if !active_task
+                .as_ref()
+                .is_some_and(|task| task.task_id == task_id)
+            {
+                *active_task = Some(TerminalActiveTask {
+                    task_id: task_id.clone(),
+                    title: title.clone(),
+                });
+            }
+        }
+
+        let waiting_on = snapshot.waiting_on.clone();
+        let ready = snapshot.ready;
+        let should_register_parked_prompt = !waiting_on.is_empty() || ready;
+        if !should_register_parked_prompt {
+            let skip_signature = format!("empty:{snapshot_signature}");
+            if last_skip_signature.as_deref() != Some(skip_signature.as_str()) {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parking_monitor_skip",
+                    &pane_id,
+                    instance_id,
+                    Some(&task_id),
+                    json!({
+                        "reason": "no_waiting_on_and_not_ready",
+                        "task_status": task_status.clone(),
+                        "session_status": snapshot.session_status.clone(),
+                        "ready": ready,
+                        "terminal": snapshot.terminal,
+                        "waiting_on_count": snapshot.waiting_on.len(),
+                    }),
+                );
+                last_skip_signature = Some(skip_signature);
+            }
+            continue;
+        }
+
+        let mut inserted = None;
+        let mut updated = None;
+        {
+            let mut guard = parked_prompts.write().await;
+            if let Some(existing) = guard.get_mut(&parked_key) {
+                if existing.waiting_on != waiting_on {
+                    existing.waiting_on = waiting_on;
+                    updated = Some(existing.clone());
+                }
+            } else if registered_parked_keys.contains(&parked_key) {
+                emit_terminal_monitor_coordination_event(
+                    &coordination,
+                    "terminal_session_parked_prompt_duplicate_suppressed",
+                    &pane_id,
+                    instance_id,
+                    Some(&task_id),
+                    json!({
+                        "reason": "registered_key_already_seen_without_in_memory_prompt",
+                        "ready": ready,
+                        "task_status": task_status.clone(),
+                        "session_status": snapshot.session_status.clone(),
+                        "waiting_on_count": snapshot.waiting_on.len(),
+                    }),
+                );
+                continue;
+            } else {
+                let parked = TerminalParkedPrompt {
+                    pane_id: pane_id.clone(),
+                    instance_id,
+                    task_id: task_id.clone(),
+                    title: title.clone(),
+                    prompt: snapshot.prompt.clone(),
+                    waiting_on,
+                    coordination: coordination.clone(),
+                    working_directory: instance.working_directory.as_ref().clone(),
+                };
+                guard.insert(parked_key.clone(), parked.clone());
+                registered_parked_keys.insert(parked_key.clone());
+                inserted = Some(parked);
+            }
+        }
+
+        if let Some(parked) = updated {
+            emit_terminal_parked_prompt_event(
+                &app,
+                &parked,
+                "parked",
+                Some("session_blocker_list_updated"),
+            );
+        }
+
+        if let Some(parked) = inserted {
+            let reason = if ready {
+                "missed_ready_parked_task_recovered"
+            } else {
+                "session_task_blocked"
+            };
+            emit_terminal_parked_prompt_event(&app, &parked, "parked", Some(reason));
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_session_parked_prompt_registered",
+                &pane_id,
+                instance_id,
+                Some(&task_id),
+                json!({
+                    "reason": reason,
+                    "ready": ready,
+                    "task_status": task_status,
+                    "session_status": snapshot.session_status,
+                    "waiting_on": parked.waiting_on.clone(),
+                }),
+            );
+            mark_terminal_parked_prompt_lifecycle_in_cloud(
+                &cloud_mcp_state,
+                &parked,
+                if ready { "active" } else { "blocked" },
+                if ready {
+                    "Dependency completed; the parked task is being resumed automatically."
+                } else {
+                    "Parked: waiting for another agent's accepted patch before continuing."
+                },
+            )
+            .await;
+            log_terminal_event(
+                "terminal.prompt.session_parked_from_kernel_state",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "title": clean_terminal_telemetry_text(&title),
+                    "task_status": task_status,
+                    "ready": ready,
+                    "reason": reason,
+                }),
+            );
+            tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
+                app.clone(),
+                cloud_mcp_state.clone(),
+                terminals.clone(),
+                parked_prompts.clone(),
+                pane_id.clone(),
+                instance_id,
+                coordination.clone(),
+                task_id,
+                title,
+                parked.prompt,
+            ));
+        }
+    }
+
+    log_terminal_event(
+        "terminal.prompt.session_parking_monitor_timeout",
+        Some(&pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+        }),
+    );
 }
 
 #[tauri::command]
 async fn terminal_write(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
@@ -2588,6 +4212,7 @@ async fn terminal_write(
         );
         return Ok(());
     };
+    let mut data_to_write = data.clone();
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
         if *instance.agent_started.lock().await {
@@ -2622,6 +4247,31 @@ async fn terminal_write(
             let working_directory = instance.working_directory.as_ref().clone();
             let coordination = instance.coordination.clone();
             let terminal_instance_id = instance.id;
+            if let Some(task) = prepared_coordination_task.as_ref() {
+                let mut active_task = instance.active_task.lock().await;
+                *active_task = Some(TerminalActiveTask {
+                    task_id: task.task_id.clone(),
+                    title: task.title.clone(),
+                });
+                if task.partial {
+                    data_to_write = terminal_partial_parking_prompt(
+                        &prompt,
+                        &task.runnable_resources,
+                        &task.parked_resources,
+                    );
+                    log_terminal_event(
+                        "terminal.prompt.partial_park",
+                        Some(&pane_id),
+                        Some(instance.id),
+                        None,
+                        json!({
+                            "task_id": clean_terminal_telemetry_text(&task.task_id),
+                            "runnable_resources": task.runnable_resources.clone(),
+                            "parked_resources": task.parked_resources.clone(),
+                        }),
+                    );
+                }
+            }
             let local_task_id = prepared_coordination_task
                 .as_ref()
                 .map(|task| task.task_id.clone());
@@ -2629,12 +4279,13 @@ async fn terminal_write(
                 .as_ref()
                 .map(|task| task.title.clone());
             let parked_task = prepared_coordination_task.as_ref().and_then(|task| {
-                task.parked.then(|| {
+                (task.parked || task.partial).then(|| {
                     (
                         task.task_id.clone(),
                         task.title.clone(),
                         task.parking_details.clone(),
                         task.intent_resources.clone(),
+                        task.parked,
                     )
                 })
             });
@@ -2652,9 +4303,62 @@ async fn terminal_write(
                 )
                 .await;
             });
-            if let (Some(coordination), Some((task_id, title, parking_details, intent_resources))) =
+            if let (Some(coordination), Some(task)) =
+                (instance.coordination.clone(), prepared_coordination_task.as_ref())
+            {
+                if !task.parked && !task.partial {
+                    tauri::async_runtime::spawn(terminal_monitor_active_task_for_late_parking(
+                        app.clone(),
+                        cloud_mcp_state.inner().clone(),
+                        state.terminals.clone(),
+                        state.parked_prompts.clone(),
+                        pane_id.clone(),
+                        instance.id,
+                        coordination,
+                        task.task_id.clone(),
+                        task.title.clone(),
+                        prompt.clone(),
+                    ));
+                }
+            }
+            if let (Some(coordination), Some((task_id, title, parking_details, intent_resources, fully_parked))) =
                 (instance.coordination.clone(), parked_task)
             {
+                let waiting_on = terminal_parked_waiting_on_from_details(&parking_details);
+                let parked = TerminalParkedPrompt {
+                    pane_id: pane_id.clone(),
+                    instance_id: instance.id,
+                    task_id: task_id.clone(),
+                    title: title.clone(),
+                    prompt: prompt.clone(),
+                    waiting_on,
+                    coordination: coordination.clone(),
+                    working_directory: instance.working_directory.as_ref().clone(),
+                };
+                let parked_key = terminal_parked_prompt_key(&pane_id, instance.id, &task_id);
+                state
+                    .parked_prompts
+                    .write()
+                    .await
+                    .insert(parked_key, parked.clone());
+                emit_terminal_parked_prompt_event(&app, &parked, "parked", Some("waiting_for_dependency"));
+                let cloud_state_for_parked = cloud_mcp_state.inner().clone();
+                let parked_for_cloud = parked.clone();
+                tauri::async_runtime::spawn(async move {
+                    cloud_mcp_mark_terminal_task_lifecycle(
+                        &cloud_state_for_parked,
+                        &parked_for_cloud.pane_id,
+                        parked_for_cloud.instance_id,
+                        &parked_for_cloud.working_directory,
+                        Some(&parked_for_cloud.coordination),
+                        Some(&parked_for_cloud.task_id),
+                        Some(&parked_for_cloud.title),
+                        "blocked",
+                        "terminal-agent",
+                        "Parked: waiting for another agent's accepted patch before continuing.",
+                    )
+                    .await;
+                });
                 log_terminal_event(
                     "terminal.prompt.write_parked",
                     Some(&pane_id),
@@ -2668,7 +4372,10 @@ async fn terminal_write(
                     }),
                 );
                 tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
+                    app.clone(),
+                    cloud_mcp_state.inner().clone(),
                     state.terminals.clone(),
+                    state.parked_prompts.clone(),
                     pane_id.clone(),
                     instance.id,
                     coordination,
@@ -2676,7 +4383,9 @@ async fn terminal_write(
                     title,
                     prompt,
                 ));
-                return Ok(());
+                if fully_parked {
+                    return Ok(());
+                }
             }
         }
     }
@@ -2685,11 +4394,487 @@ async fn terminal_write(
         &state,
         &pane_id,
         instance_id,
-        &data,
+        &data_to_write,
         "terminal.write.skipped_stale_or_missing",
     )
     .await
     .map(|_| ())
+}
+
+#[tauri::command]
+async fn terminal_delete_selection(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    selection: String,
+) -> Result<Value, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let selected_text = selection
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect::<String>();
+
+    if selected_text.is_empty() {
+        return Ok(json!({
+            "deleted": false,
+            "reason": "empty_selection",
+        }));
+    }
+
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        log_terminal_event(
+            "terminal.selection_delete.skipped_stale_or_missing",
+            Some(&pane_id),
+            instance_id,
+            None,
+            json!({ "selected_chars": selected_text.chars().count() }),
+        );
+        return Ok(json!({
+            "deleted": false,
+            "reason": "stale_or_missing_terminal",
+        }));
+    };
+
+    let mut gate = instance.input_gate.lock().await;
+    let current_line = gate.current_line.clone();
+    let Some(start) = current_line.rfind(&selected_text) else {
+        log_terminal_event(
+            "terminal.selection_delete.selection_not_in_current_input",
+            Some(&pane_id),
+            Some(instance.id),
+            None,
+            json!({
+                "current_line_chars": current_line.chars().count(),
+                "selected_chars": selected_text.chars().count(),
+            }),
+        );
+        return Ok(json!({
+            "deleted": false,
+            "reason": "selection_not_in_current_input",
+        }));
+    };
+
+    let end = start + selected_text.len();
+    let mut next_line = current_line;
+    next_line.replace_range(start..end, "");
+    let rewrite_input = format!("\u{15}{next_line}");
+    if rewrite_input.len() > MAX_TERMINAL_WRITE_BYTES {
+        return Err("Terminal rewrite input is too large.".to_string());
+    }
+
+    {
+        let mut writer = instance.writer.lock().await;
+        writer
+            .write_all(rewrite_input.as_bytes())
+            .map_err(|error| format!("Unable to write terminal selection delete: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("Unable to flush terminal selection delete: {error}"))?;
+    }
+
+    gate.current_line = next_line;
+    gate.current_line_user_touched = true;
+    log_terminal_event(
+        "terminal.selection_delete.applied",
+        Some(&pane_id),
+        Some(instance.id),
+        None,
+        json!({
+            "remaining_chars": gate.current_line.chars().count(),
+            "removed_chars": selected_text.chars().count(),
+        }),
+    );
+
+    Ok(json!({
+        "deleted": true,
+        "remaining_chars": gate.current_line.chars().count(),
+        "removed_chars": selected_text.chars().count(),
+    }))
+}
+
+#[tauri::command]
+async fn terminal_cancel_parked_task(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    pane_id: String,
+    instance_id: u64,
+    task_id: String,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
+    let Some(parked) = state.parked_prompts.write().await.remove(&parked_key) else {
+        return Ok(());
+    };
+
+    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &parked.coordination.repo_path,
+        Some(PathBuf::from(&parked.coordination.db_path)),
+    ) {
+        let _ = kernel.mark_terminal_task_stopped(
+            &parked.task_id,
+            &parked.coordination.session_id,
+            "cancelled",
+            "parked_task_cancel_button",
+        );
+    }
+
+    if let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, Some(instance_id)).await? {
+        let mut active_task = instance.active_task.lock().await;
+        if active_task
+            .as_ref()
+            .is_some_and(|task| task.task_id == parked.task_id)
+        {
+            *active_task = None;
+        }
+    }
+
+    cloud_mcp_mark_terminal_task_lifecycle(
+        cloud_mcp_state.inner(),
+        &parked.pane_id,
+        parked.instance_id,
+        &parked.working_directory,
+        Some(&parked.coordination),
+        Some(&parked.task_id),
+        Some(&parked.title),
+        "cancelled",
+        "terminal-agent",
+        "Cancelled before resuming: the parked task was cancelled from the terminal bar.",
+    )
+    .await;
+    emit_terminal_parked_prompt_event(&app, &parked, "cancelled", Some("cancel_button"));
+    log_terminal_event(
+        "terminal.prompt.parked_cancelled",
+        Some(&pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "task_id": clean_terminal_telemetry_text(&task_id),
+        }),
+    );
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn terminal_get_parked_prompt(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+) -> Result<Option<TerminalParkedPromptPayload>, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    if let Some(existing) = {
+        let guard = state.parked_prompts.read().await;
+        guard
+            .values()
+            .find(|parked| {
+                parked.pane_id == pane_id
+                    && instance_id.map_or(true, |expected| expected == parked.instance_id)
+            })
+            .cloned()
+    } {
+        emit_terminal_monitor_coordination_event(
+            &existing.coordination,
+            "terminal_parked_prompt_poll_existing",
+            &existing.pane_id,
+            existing.instance_id,
+            Some(&existing.task_id),
+            json!({
+                "reason": "existing_backend_prompt",
+                "waiting_on_count": existing.waiting_on.len(),
+                "waiting_on": existing.waiting_on.clone(),
+                "requested_instance_id": instance_id,
+            }),
+        );
+        return Ok(Some(TerminalParkedPromptPayload {
+            pane_id: existing.pane_id,
+            instance_id: existing.instance_id,
+            task_id: existing.task_id,
+            title: existing.title,
+            status: "parked".to_string(),
+            waiting_on: existing.waiting_on,
+            reason: Some("existing_backend_prompt".to_string()),
+        }));
+    }
+
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(coordination) = instance.coordination.clone() else {
+        return Ok(None);
+    };
+    emit_terminal_monitor_coordination_event(
+        &coordination,
+        "terminal_parked_prompt_poll_invoked",
+        &pane_id,
+        instance.id,
+        None,
+        json!({
+            "requested_instance_id": instance_id,
+            "session_id": coordination.session_id.clone(),
+            "agent_id": coordination.agent_id.clone(),
+        }),
+    );
+    let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_prompt_poll_skip",
+                &pane_id,
+                instance.id,
+                None,
+                json!({
+                    "reason": "no_snapshot",
+                    "session_id": coordination.session_id.clone(),
+                }),
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            emit_terminal_monitor_coordination_event(
+                &coordination,
+                "terminal_parked_prompt_poll_error",
+                &pane_id,
+                instance.id,
+                None,
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+    };
+
+    let task_id = snapshot.task_id.clone();
+    let title = snapshot.title.clone();
+    let task_status = snapshot.task_status.clone();
+    let session_status = snapshot.session_status.clone();
+    if snapshot.terminal {
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_prompt_poll_skip",
+            &pane_id,
+            instance.id,
+            Some(&task_id),
+            json!({
+                "reason": "task_status_is_terminal",
+                "task_status": task_status,
+                "session_status": session_status,
+                "ready": snapshot.ready,
+                "waiting_on_count": snapshot.waiting_on.len(),
+            }),
+        );
+        return Ok(None);
+    }
+
+    let waiting_on = snapshot.waiting_on.clone();
+    let ready = snapshot.ready;
+    if waiting_on.is_empty() && !ready {
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_prompt_poll_skip",
+            &pane_id,
+            instance.id,
+            Some(&task_id),
+            json!({
+                "reason": "no_waiting_on_and_not_ready",
+                "task_status": task_status,
+                "session_status": session_status,
+                "ready": ready,
+                "waiting_on_count": waiting_on.len(),
+                "signature": terminal_parking_snapshot_signature(&snapshot),
+            }),
+        );
+        return Ok(None);
+    }
+
+    let parked = TerminalParkedPrompt {
+        pane_id: pane_id.clone(),
+        instance_id: instance.id,
+        task_id: task_id.clone(),
+        title: title.clone(),
+        prompt: snapshot.prompt.clone(),
+        waiting_on: waiting_on.clone(),
+        coordination: coordination.clone(),
+        working_directory: instance.working_directory.as_ref().clone(),
+    };
+    let parked_key = terminal_parked_prompt_key(&pane_id, instance.id, &task_id);
+    let inserted = {
+        let mut guard = state.parked_prompts.write().await;
+        if guard.contains_key(&parked_key) {
+            false
+        } else {
+            guard.insert(parked_key, parked.clone());
+            true
+        }
+    };
+    if inserted {
+        emit_terminal_parked_prompt_event(
+            &app,
+            &parked,
+            "parked",
+            Some("frontend_poll_recovered"),
+        );
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_session_parked_prompt_recovered_by_poll",
+            &pane_id,
+            instance.id,
+            Some(&task_id),
+            json!({
+                "ready": ready,
+                "task_status": task_status,
+                "session_status": session_status,
+                "waiting_on": waiting_on.clone(),
+            }),
+        );
+        tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
+            app.clone(),
+            cloud_mcp_state.inner().clone(),
+            state.terminals.clone(),
+            state.parked_prompts.clone(),
+            pane_id.clone(),
+            instance.id,
+            coordination.clone(),
+            task_id.clone(),
+            title.clone(),
+            parked.prompt.clone(),
+        ));
+    } else {
+        emit_terminal_monitor_coordination_event(
+            &coordination,
+            "terminal_parked_prompt_poll_existing_after_race",
+            &pane_id,
+            instance.id,
+            Some(&task_id),
+            json!({
+                "ready": ready,
+                "task_status": task_status,
+                "session_status": session_status,
+                "waiting_on_count": waiting_on.len(),
+            }),
+        );
+    }
+
+    Ok(Some(TerminalParkedPromptPayload {
+        pane_id,
+        instance_id: instance.id,
+        task_id,
+        title,
+        status: "parked".to_string(),
+        waiting_on,
+        reason: Some("frontend_poll".to_string()),
+    }))
+}
+
+#[tauri::command]
+async fn terminal_interrupt_agent(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    reason: Option<String>,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        return Ok(());
+    };
+    let reason = reason.unwrap_or_else(|| "escape_key".to_string());
+
+    {
+        let mut writer = instance.writer.lock().await;
+        writer
+            .write_all(b"\x1b")
+            .map_err(|error| format!("Unable to send terminal interrupt: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("Unable to flush terminal interrupt: {error}"))?;
+    }
+
+    let active_task = instance.active_task.lock().await.clone();
+    if let (Some(coordination), Some(active_task)) = (instance.coordination.as_ref(), active_task.as_ref()) {
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+            &coordination.repo_path,
+            Some(PathBuf::from(&coordination.db_path)),
+        ) {
+            let _ = kernel.mark_terminal_task_stopped(
+                &active_task.task_id,
+                &coordination.session_id,
+                "interrupted",
+                &reason,
+            );
+        }
+        cloud_mcp_mark_terminal_task_lifecycle(
+            cloud_mcp_state.inner(),
+            &pane_id,
+            instance.id,
+            instance.working_directory.as_ref(),
+            Some(coordination),
+            Some(&active_task.task_id),
+            Some(&active_task.title),
+            "interrupted",
+            "terminal-agent",
+            "Interrupted by Escape; the terminal remains open for follow-up instructions.",
+        )
+        .await;
+        let mut stored_active_task = instance.active_task.lock().await;
+        if stored_active_task
+            .as_ref()
+            .is_some_and(|task| task.task_id == active_task.task_id)
+        {
+            *stored_active_task = None;
+        }
+    }
+
+    let parked_to_interrupt = {
+        let mut parked = state.parked_prompts.write().await;
+        let matching_keys = parked
+            .iter()
+            .filter_map(|(key, value)| {
+                (value.pane_id == pane_id && value.instance_id == instance.id).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        matching_keys
+            .into_iter()
+            .filter_map(|key| parked.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    for parked in parked_to_interrupt {
+        cloud_mcp_mark_terminal_task_lifecycle(
+            cloud_mcp_state.inner(),
+            &parked.pane_id,
+            parked.instance_id,
+            &parked.working_directory,
+            Some(&parked.coordination),
+            Some(&parked.task_id),
+            Some(&parked.title),
+            "interrupted",
+            "terminal-agent",
+            "Interrupted by Escape while parked; the task was not marked cancelled.",
+        )
+        .await;
+        emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("escape_key"));
+    }
+
+    log_terminal_event(
+        "terminal.agent_interrupted_by_escape",
+        Some(&pane_id),
+        Some(instance.id),
+        None,
+        json!({
+            "reason": clean_terminal_telemetry_text(&reason),
+            "task_id": active_task.as_ref().map(|task| clean_terminal_telemetry_text(&task.task_id)),
+        }),
+    );
+
+    Ok(())
 }
 
 async fn resize_terminal_instance(

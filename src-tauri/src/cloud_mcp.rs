@@ -1390,6 +1390,105 @@ async fn cloud_mcp_update_terminal_context_task(
     }
 }
 
+pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
+    local_task_id: Option<&str>,
+    title: Option<&str>,
+    status: &str,
+    lane: &str,
+    brief: &str,
+) -> Option<String> {
+    if cloud_mcp_connected_or_connect(state, "terminal_task_lifecycle").await.is_err() {
+        return None;
+    }
+
+    let agent_id = cloud_mcp_terminal_agent_id(pane_id, instance_id, coordination);
+    let repo_id = cloud_mcp_terminal_repo_id(working_directory, coordination);
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let mut context_task_id = {
+        let runtime = state.inner.lock().await;
+        runtime
+            .terminal_contexts
+            .get(&terminal_key)
+            .and_then(|entry| entry.context_task_id.clone())
+    };
+
+    if context_task_id.is_none() {
+        if let Some(local_task_id) = local_task_id {
+            context_task_id = cloud_mcp_sync_terminal_context_task_from_cloud(
+                state,
+                &repo_id,
+                &agent_id,
+                lane,
+                pane_id,
+                instance_id,
+                working_directory,
+                Some(local_task_id),
+            )
+            .await;
+        }
+    }
+
+    if context_task_id.is_none() {
+        let payload = json!({
+            "source": "rust-diffforge-terminal",
+            "repo_id": repo_id.clone(),
+            "run_id": local_task_id,
+            "agent_id": agent_id.clone(),
+            "self_agent_id": agent_id.clone(),
+            "current_agent_id": agent_id.clone(),
+            "title": title.unwrap_or("Terminal task"),
+            "body": brief,
+            "status": status,
+            "lane": lane,
+            "metadata": {
+                "terminal_id": pane_id,
+                "terminal_instance_id": instance_id,
+                "workspace_root": workspace_path_display(working_directory),
+                "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+                "local_coordination_task_id": local_task_id,
+                "coordination_task_id": local_task_id,
+                "managed_by": "rust-diffforge",
+                "title_source": "rust_lifecycle",
+            },
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        if let Ok(response) = cloud_mcp_post_json_endpoint(state, "/v1/context/tasks", &payload).await {
+            let data = cloud_mcp_response_data(&response);
+            context_task_id = data["task"]["id"].as_str().map(str::to_string);
+        }
+    }
+
+    if let Some(task_id) = context_task_id.as_deref() {
+        cloud_mcp_update_terminal_context_task(
+            state,
+            &repo_id,
+            &agent_id,
+            task_id,
+            status,
+            lane,
+            title,
+            Some("rust_lifecycle"),
+            brief,
+            &[],
+            working_directory,
+            Some(pane_id),
+        )
+        .await;
+        let mut runtime = state.inner.lock().await;
+        if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+            entry.context_task_id = Some(task_id.to_string());
+            entry.lane = lane.to_string();
+        }
+    }
+
+    context_task_id
+}
+
 async fn cloud_mcp_sync_terminal_context_task_from_cloud(
     state: &CloudMcpState,
     repo_id: &str,
@@ -2653,7 +2752,10 @@ fn cloud_mcp_proxy_sync_after_task_created(
     tool_name: &str,
     response: &str,
 ) {
-    if !matches!(tool_name, "cloud_create_context_task" | "cloud_get_context_pack") {
+    if !matches!(
+        tool_name,
+        "cloud_create_context_task" | "cloud_update_context_task" | "cloud_get_context_pack"
+    ) {
         return;
     }
     let Some(task_id) = cloud_mcp_proxy_context_task_id_from_response(response) else {
@@ -2746,10 +2848,6 @@ fn cloud_mcp_proxy_sync_local_task_from_cloud(
     let repo_path = identity.repo_path.as_ref()?;
     let agent_id = identity.agent_id.as_deref()?;
     let session_id = identity.session_id.as_deref()?;
-    if let Some(existing) = cloud_mcp_proxy_current_local_task_id(identity) {
-        return Some(existing);
-    }
-
     let cloud_task = serde_json::from_str::<Value>(response)
         .ok()
         .and_then(|value| cloud_mcp_proxy_context_task_from_value(&value))?;
@@ -2761,17 +2859,25 @@ fn cloud_mcp_proxy_sync_local_task_from_cloud(
         .as_str()
         .or_else(|| cloud_task["description"].as_str())
         .or_else(|| cloud_task["source_prompt"].as_str());
+    let lane = cloud_task["lane"]
+        .as_str()
+        .or_else(|| cloud_task["status_lane"].as_str());
+    let cloud_task_id = cloud_task["id"].as_str();
     let risk_level = cloud_task["risk_level"].as_i64().unwrap_or(1);
     let kernel = crate::coordination::CoordinationKernel::open(repo_path, Some(db_path.clone())).ok()?;
+    if let Some(existing) = cloud_mcp_proxy_current_local_task_id(identity) {
+        let _ = kernel.sync_task_cloud_context(&existing, cloud_task_id, Some(title), body, lane);
+        return Some(existing);
+    }
     let task = kernel
         .create_task(
             title,
             body,
             0,
             risk_level,
-            cloud_task["id"].as_str(),
+            cloud_task_id,
             None,
-            Some("cloud-mcp"),
+            lane.or(Some("cloud-mcp")),
             Some("Synced from Cloud MCP context task for local lease coordination."),
         )
         .ok()?;
