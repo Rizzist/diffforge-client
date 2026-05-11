@@ -3009,6 +3009,7 @@ export default function WorkspaceTerminal({
             kind: openKind,
             provider: openProvider,
             model: "",
+            plainShell: isGenericTerminal,
             workingDirectory: workingDirectory || "",
             workspaceId: workspace?.id || "",
             workspaceName: workspace?.name || "",

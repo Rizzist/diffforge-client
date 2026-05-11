@@ -8969,7 +8969,10 @@ impl CoordinationKernel {
                 .filter(|ch| *ch != '-')
                 .take(8)
                 .collect::<String>();
-            let path = self.paths.worktrees_root.join(format!("{slot_key}-{suffix}"));
+            let path = self
+                .paths
+                .worktrees_root
+                .join(format!("{slot_key}-{suffix}"));
             let branch = format!("agent/{slot_key}-{suffix}");
             if path.exists() || self.branch_exists(&branch)? {
                 continue;
@@ -9887,11 +9890,13 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
     }
-    let tmp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
+    let tmp_path = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or("swap")
+            .unwrap_or("atomic-write"),
+        std::process::id(),
+        uuid()
     ));
     {
         let mut file = fs::File::create(&tmp_path)
@@ -10260,7 +10265,12 @@ fn normalize_change_path(value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::{
+        fs,
+        process::Command,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use serde_json::json;
 
@@ -10306,6 +10316,39 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn atomic_text_writes_use_isolated_temp_files_under_concurrency() {
+        let repo = temp_repo("atomic_text_concurrency");
+        let path = repo.join("coordination.codex.toml");
+        let writers = 16;
+        let barrier = Arc::new(Barrier::new(writers));
+        let handles = (0..writers)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    write_text_file_atomic(&path, &format!("writer-{index}\n"))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let final_body = fs::read_to_string(&path).unwrap();
+        assert!(final_body.starts_with("writer-"));
+        let temp_files = fs::read_dir(&repo)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("tmp")
+            })
+            .count();
+        assert_eq!(temp_files, 0);
     }
 
     #[test]

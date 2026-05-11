@@ -1096,6 +1096,28 @@ fn write_agent_start_input_to_writer(
         .map_err(|error| format!("Unable to flush {context}: {error}"))
 }
 
+fn terminal_request_is_plain_shell(
+    kind: &str,
+    provider: Option<&str>,
+    plain_shell: Option<bool>,
+) -> bool {
+    if let Some(plain_shell) = plain_shell {
+        return plain_shell;
+    }
+
+    let has_provider = provider
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if has_provider {
+        return false;
+    }
+
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "shell" | "plain-shell" | "plain_shell" | "generic" | "generic-shell" | "generic_shell"
+    )
+}
+
 #[tauri::command]
 async fn terminal_open(
     app: AppHandle,
@@ -1115,6 +1137,11 @@ async fn terminal_open(
     let provider = request.provider;
     let provider_for_coordination = provider.clone();
     let model = request.model;
+    let plain_shell = terminal_request_is_plain_shell(
+        &kind,
+        provider.as_deref(),
+        request.plain_shell,
+    );
     let working_directory_request = request.working_directory;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
@@ -1127,6 +1154,7 @@ async fn terminal_open(
         json!({
             "kind": clean_terminal_telemetry_text(&kind),
             "provider": provider.as_deref().map(clean_terminal_telemetry_text),
+            "plain_shell": plain_shell,
             "cols": requested_cols,
             "rows": requested_rows,
             "has_working_directory": working_directory_request
@@ -1140,38 +1168,50 @@ async fn terminal_open(
         }),
     );
 
-    let cloud_gate_started_at = Instant::now();
-    match require_cloud_mcp_terminal_gate(
-        cloud_mcp_state.inner(),
-        working_directory_request.as_deref(),
-        workspace_id.as_deref(),
-        workspace_name.as_deref(),
-    )
-    .await
-    {
-        Ok(status) => log_terminal_event(
-            "terminal.open.cloud_mcp_gate_ready",
+    if plain_shell {
+        log_terminal_event(
+            "terminal.open.cloud_mcp_gate_skipped_plain_shell",
             Some(&pane_id),
             request.instance_id,
-            Some(cloud_gate_started_at.elapsed()),
+            None,
             json!({
-                "base_url": clean_terminal_telemetry_text(&status.base_url),
-                "registered_workspace_count": status.registered_workspace_count,
                 "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
             }),
-        ),
-        Err(error) => {
-            log_terminal_event(
-                "terminal.open.cloud_mcp_gate_blocked",
+        );
+    } else {
+        let cloud_gate_started_at = Instant::now();
+        match require_cloud_mcp_terminal_gate(
+            cloud_mcp_state.inner(),
+            working_directory_request.as_deref(),
+            workspace_id.as_deref(),
+            workspace_name.as_deref(),
+        )
+        .await
+        {
+            Ok(status) => log_terminal_event(
+                "terminal.open.cloud_mcp_gate_ready",
                 Some(&pane_id),
                 request.instance_id,
                 Some(cloud_gate_started_at.elapsed()),
                 json!({
-                    "error": clean_terminal_telemetry_text(&error),
+                    "base_url": clean_terminal_telemetry_text(&status.base_url),
+                    "registered_workspace_count": status.registered_workspace_count,
                     "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
                 }),
-            );
-            return Err(error);
+            ),
+            Err(error) => {
+                log_terminal_event(
+                    "terminal.open.cloud_mcp_gate_blocked",
+                    Some(&pane_id),
+                    request.instance_id,
+                    Some(cloud_gate_started_at.elapsed()),
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
+                    }),
+                );
+                return Err(error);
+            }
         }
     }
 
@@ -1213,7 +1253,7 @@ async fn terminal_open(
         Some(resolve_started_at.elapsed()),
         json!({ "working_directory": workspace_path_display(&working_directory) }),
     );
-    let mut process_working_directory = workspace_path_for_process(&working_directory);
+    let process_working_directory = workspace_path_for_process(&working_directory);
     let mut coordination_context = None;
 
     let command_started_at = Instant::now();
@@ -1223,7 +1263,7 @@ async fn terminal_open(
     } else {
         terminal_launch(&kind, provider, model)?
     };
-    if !is_prewarm_pty {
+    if !is_prewarm_pty && !plain_shell {
         let git_started_at = Instant::now();
         let git_bootstrap = match ensure_workspace_git_ready_for_coordination(&working_directory) {
             Ok(result) => result,
@@ -1272,7 +1312,6 @@ async fn terminal_open(
             }) {
             Ok(context) => {
                 let write_root = workspace_path_for_process(&PathBuf::from(&context.write_root));
-                process_working_directory = write_root.clone();
                 log_terminal_event(
                     "terminal.open.coordination_ready",
                     Some(&pane_id),
@@ -1287,7 +1326,7 @@ async fn terminal_open(
                         "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
                         "write_root": workspace_path_display(&write_root),
                         "launch_cwd": workspace_path_display(&process_working_directory),
-                        "cwd_policy": "isolated_worktree_cwd",
+                        "cwd_policy": "project_root_visible_branch_root_editable",
                     }),
                 );
                 if context.enforcement_mode == "coordination_only"
@@ -1458,7 +1497,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "isolated_worktree_cwd"
+                "project_root_visible_branch_root_editable"
             } else {
                 "plain_project_root"
             },
@@ -1525,7 +1564,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "isolated_worktree_cwd"
+                "project_root_visible_branch_root_editable"
             } else {
                 "plain_project_root"
             },
@@ -2218,6 +2257,14 @@ async fn terminal_capture_submitted_prompt(
     submitted
 }
 
+async fn terminal_instance_requires_cloud_prompt_gate(instance: &TerminalInstance) -> bool {
+    if instance.coordination.is_none() {
+        return false;
+    }
+
+    *instance.agent_started.lock().await
+}
+
 #[tauri::command]
 async fn terminal_write(
     state: State<'_, TerminalState>,
@@ -2241,7 +2288,10 @@ async fn terminal_write(
 
     if let Some(submitted) = terminal_capture_submitted_prompt(&instance, &data).await {
         let prompt = submitted.prompt;
-        if !submitted.bypass_cloud_plan && terminal_prompt_requires_cloud_plan(&prompt) {
+        if terminal_instance_requires_cloud_prompt_gate(&instance).await
+            && !submitted.bypass_cloud_plan
+            && terminal_prompt_requires_cloud_plan(&prompt)
+        {
             match cloud_mcp_require_prompt_plan_accepted(
                 cloud_mcp_state.inner(),
                 instance.working_directory.as_ref(),

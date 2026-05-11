@@ -463,6 +463,11 @@ fn is_terminal_prewarm_kind(kind: &str) -> bool {
     matches!(
         kind.trim().to_ascii_lowercase().as_str(),
         "shell"
+            | "plain-shell"
+            | "plain_shell"
+            | "generic"
+            | "generic-shell"
+            | "generic_shell"
             | "prewarm"
             | "prewarm-shell"
             | "prewarm_shell"

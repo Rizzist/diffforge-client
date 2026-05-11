@@ -696,6 +696,7 @@ struct TerminalOpenRequest {
     kind: String,
     provider: Option<String>,
     model: Option<String>,
+    plain_shell: Option<bool>,
     working_directory: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,

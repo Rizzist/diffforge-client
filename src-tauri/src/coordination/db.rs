@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use rusqlite::{Connection, Error as SqliteError, ErrorCode};
@@ -482,6 +482,8 @@ fn ensure_column(
 }
 
 fn clean_stale_mcp_temp_files(mcp_root: &Path) -> Result<Vec<String>, String> {
+    const MCP_TEMP_FILE_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+
     let mut removed = Vec::new();
     for directory in [mcp_root.to_path_buf(), mcp_root.join("agents")] {
         let Ok(entries) = fs::read_dir(&directory) else {
@@ -496,6 +498,21 @@ fn clean_stale_mcp_temp_files(mcp_root: &Path) -> Result<Vec<String>, String> {
             })?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) == Some("tmp") {
+                let modified_at = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|error| {
+                        format!(
+                            "Unable to inspect MCP temp file {} metadata: {error}",
+                            path.display()
+                        )
+                    })?;
+                let age = SystemTime::now()
+                    .duration_since(modified_at)
+                    .unwrap_or_else(|_| Duration::from_secs(0));
+                if age < MCP_TEMP_FILE_STALE_AFTER {
+                    continue;
+                }
                 fs::remove_file(&path).map_err(|error| {
                     format!(
                         "Unable to remove stale MCP temp file {}: {error}",
@@ -546,11 +563,38 @@ fn is_lock_error(error: &SqliteError) -> bool {
 mod tests {
     #[cfg(not(windows))]
     use super::*;
+    #[cfg(not(windows))]
+    use std::fs;
 
     #[cfg(not(windows))]
     #[test]
     fn canonical_repo_path_rejects_filesystem_root() {
         let error = canonical_repo_path("/").unwrap_err();
         assert!(error.contains("filesystem root"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn mcp_temp_cleanup_leaves_fresh_temp_files_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge_mcp_temp_cleanup_{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents = root.join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        let root_temp = root.join("coordination.codex.toml.123.fresh.tmp");
+        let agent_temp = agents.join("agent.json.123.fresh.tmp");
+        fs::write(&root_temp, "active").unwrap();
+        fs::write(&agent_temp, "active").unwrap();
+
+        let removed = clean_stale_mcp_temp_files(&root).unwrap();
+
+        assert!(removed.is_empty());
+        assert!(root_temp.exists());
+        assert!(agent_temp.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
