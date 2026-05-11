@@ -36,7 +36,6 @@ pub fn coordination_init(
         "repo_path": kernel.paths.repo_path.display().to_string(),
         "db_path": kernel.paths.db_path.display().to_string(),
         "agents_root": kernel.paths.agents_root.display().to_string(),
-        "cloud": kernel.get_cloud_orchestrator_status()?,
     })))
 }
 
@@ -131,8 +130,8 @@ pub fn coordination_create_task(
                 input["body"].as_str(),
                 input["priority"].as_i64().unwrap_or(0),
                 input["risk_level"].as_i64().unwrap_or(1),
-                input["orchestration_run_id"].as_str(),
-                input["orchestration_plan_item_id"].as_str(),
+                input["context_run_id"].as_str(),
+                input["source_plan_item_id"].as_str(),
                 input["assigned_role"].as_str(),
                 input["expected_output"].as_str(),
             )
@@ -204,8 +203,8 @@ pub fn coordination_create_session(
                     input["task_id"].as_str(),
                     input["pty_id"].as_str(),
                     input["write_enabled"].as_bool().unwrap_or(true),
-                    input["orchestration_run_id"].as_str(),
-                    input["orchestration_role"].as_str(),
+                    input["context_run_id"].as_str(),
+                    input["context_role"].as_str(),
                 )
                 .map(api_ok_from_data),
         );
@@ -228,8 +227,8 @@ pub fn coordination_create_session(
                 input["task_id"].as_str(),
                 input["pty_id"].as_str(),
                 input["write_enabled"].as_bool().unwrap_or(true),
-                input["orchestration_run_id"].as_str(),
-                input["orchestration_role"].as_str(),
+                input["context_run_id"].as_str(),
+                input["context_role"].as_str(),
             )
             .map(api_ok_from_data),
     )
@@ -326,7 +325,7 @@ pub fn coordination_write_memory(
         input["trust_level"].as_str(),
         input["task_id"].as_str(),
         input["evidence_artifact_id"].as_str(),
-        input["orchestration_run_id"].as_str(),
+        input["context_run_id"].as_str(),
         input["agent_id"].as_str(),
         input["certified_by"].as_str(),
     ))
@@ -441,6 +440,20 @@ pub fn coordination_request_merge(
         req(&input, "patch_id")?,
         input["target_branch"].as_str(),
         input["strategy"].as_str(),
+    ))
+}
+
+#[tauri::command]
+pub fn coordination_initialize_merge_resolution(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.initialize_merge_resolution(
+        req(&input, "patch_id")?,
+        input["resolver_agent_id"].as_str(),
+        input["resolver_session_id"].as_str(),
+        input["target_branch"].as_str(),
     ))
 }
 
@@ -615,120 +628,6 @@ pub fn coordination_resolve_approval(
     ))
 }
 
-#[tauri::command]
-pub fn coordination_get_cloud_orchestrator_status(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?
-            .get_cloud_orchestrator_status()
-            .map(api_ok_from_data),
-    )
-}
-
-#[tauri::command]
-pub fn coordination_update_cloud_orchestrator_config(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.update_cloud_orchestrator_config(&input))
-}
-
-#[tauri::command]
-pub fn coordination_create_orchestration_run(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?
-            .create_orchestration_run(req(&input, "objective")?, input.get("constraints").cloned()),
-    )
-}
-
-#[tauri::command]
-pub fn coordination_create_cloud_context_export(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?.create_cloud_context_export(
-            input["run_id"].as_str(),
-            input["export_kind"]
-                .as_str()
-                .unwrap_or("full_redacted_brief"),
-        ),
-    )
-}
-
-#[tauri::command]
-pub fn coordination_import_orchestration_plan(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.import_orchestration_plan(
-        req(&input, "run_id")?,
-        input.get("plan_json").unwrap_or(&input),
-    ))
-}
-
-#[tauri::command]
-pub fn coordination_adopt_orchestration_plan(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    run_id: String,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.adopt_orchestration_plan(&run_id))
-}
-
-#[tauri::command]
-pub fn coordination_list_orchestration_runs(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    status: Option<String>,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.list_orchestration_runs(status.as_deref()))
-}
-
-#[tauri::command]
-pub fn coordination_get_orchestration_brief(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    run_id: String,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.get_orchestration_brief(&run_id))
-}
-
-#[tauri::command]
-pub fn coordination_orchestrator_sync_once(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    run_id: Option<String>,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.cloud_sync_once(run_id.as_deref()))
-}
-
-#[tauri::command]
-pub fn coordination_propose_agent_assignments(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    run_id: String,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.propose_agent_assignments(&run_id))
-}
-
-#[tauri::command]
-pub fn coordination_adopt_agent_assignment(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    assignment_id: String,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.adopt_agent_assignment(&assignment_id))
-}
 
 #[tauri::command]
 pub fn coordination_scan_workspace_violations(

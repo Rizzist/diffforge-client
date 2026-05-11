@@ -113,6 +113,7 @@ import {
   WorkspaceAccent,
   WorkspaceMuted,
   RailFooter,
+  RailGlobalActions,
   RailActionButton,
   WorkspaceViewStack,
   WorkspaceViewPane,
@@ -350,6 +351,7 @@ import {
 import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
+import KanbanWorkspaceView from "../kanban/KanbanWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import CoordinationWorkspaceView from "../coordination/CoordinationWorkspaceView.jsx";
 
@@ -4253,20 +4255,20 @@ export default function App() {
                     <span>Files</span>
                   </RailActionButton>
                   <RailActionButton
+                    data-active={activeView === "kanban"}
+                    onClick={() => showView("kanban")}
+                    type="button"
+                  >
+                    <ButtonForgeIcon aria-hidden="true" />
+                    <span>Kanban</span>
+                  </RailActionButton>
+                  <RailActionButton
                     data-active={activeView === "vault"}
                     onClick={() => showView("vault")}
                     type="button"
                   >
                     <ButtonKeyIcon aria-hidden="true" />
                     <span>Vault</span>
-                  </RailActionButton>
-                  <RailActionButton
-                    data-active={activeView === "audio"}
-                    onClick={() => showView("audio")}
-                    type="button"
-                  >
-                    <ButtonMicIcon aria-hidden="true" />
-                    <span>Audio</span>
                   </RailActionButton>
                   <RailActionButton
                     data-active={activeView === "mcps"}
@@ -4284,18 +4286,30 @@ export default function App() {
                     <ButtonForgeIcon aria-hidden="true" />
                     <span>Coordination</span>
                   </RailActionButton>
-                  <RailActionButton
-                    data-active={activeView === "settings"}
-                    onClick={() => showView("settings")}
-                    type="button"
-                  >
-                    <ButtonSettingsIcon aria-hidden="true" />
-                    <span>Settings</span>
-                  </RailActionButton>
-                  <RailActionButton onClick={logout} type="button">
-                    <ButtonLogoutIcon aria-hidden="true" />
-                    <span>Sign out</span>
-                  </RailActionButton>
+                  <RailGlobalActions aria-label="Global controls">
+                    <RailActionButton
+                      data-active={activeView === "audio"}
+                      data-scope="global"
+                      onClick={() => showView("audio")}
+                      type="button"
+                    >
+                      <ButtonMicIcon aria-hidden="true" />
+                      <span>Audio</span>
+                    </RailActionButton>
+                    <RailActionButton
+                      data-active={activeView === "settings"}
+                      data-scope="global"
+                      onClick={() => showView("settings")}
+                      type="button"
+                    >
+                      <ButtonSettingsIcon aria-hidden="true" />
+                      <span>Settings</span>
+                    </RailActionButton>
+                    <RailActionButton data-scope="global" data-variant="signout" onClick={logout} type="button">
+                      <ButtonLogoutIcon aria-hidden="true" />
+                      <span>Sign out</span>
+                    </RailActionButton>
+                  </RailGlobalActions>
                 </RailFooter>
               </WorkspaceRail>
 
@@ -4718,6 +4732,14 @@ export default function App() {
                       workspaceError={workspaceError}
                     />
                   )}
+                </ForgeWorkspace>
+              ) : visibleView === "kanban" ? (
+                <ForgeWorkspace aria-label="Workspace Kanban" data-motion={viewMotion}>
+                  <KanbanWorkspaceView
+                    defaultWorkingDirectory={defaultWorkingDirectory}
+                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
+                    workspace={selectedWorkspace}
+                  />
                 </ForgeWorkspace>
               ) : visibleView === "vault" ? (
                 <ForgeWorkspace aria-label="Workspace vault" data-motion={viewMotion}>

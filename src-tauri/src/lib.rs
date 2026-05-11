@@ -308,6 +308,7 @@ struct TerminalCoordinationSession {
     db_path: String,
     agent_id: String,
     session_id: String,
+    env_vars: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -319,6 +320,9 @@ struct TerminalInputGate {
     control_command_bypass_submits: usize,
     ansi_escape_active: bool,
     ansi_csi_active: bool,
+    ansi_osc_active: bool,
+    ansi_osc_escape_pending: bool,
+    ansi_ss3_active: bool,
 }
 
 impl TerminalInstance {
@@ -1327,12 +1331,10 @@ pub fn run() {
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
-            cloud_mcp_get_policy,
-            cloud_mcp_decide_policy,
-            cloud_mcp_prepare_task_plan,
-            cloud_mcp_decide_plan,
             cloud_mcp_get_todo,
             cloud_mcp_save_todo,
+            cloud_mcp_get_activity,
+            cloud_mcp_get_kanban,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,
@@ -1372,6 +1374,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_validate_patch,
             coordination::tauri_commands::coordination_submit_patch,
             coordination::tauri_commands::coordination_request_merge,
+            coordination::tauri_commands::coordination_initialize_merge_resolution,
             coordination::tauri_commands::coordination_apply_merge,
             coordination::tauri_commands::coordination_list_workspace_violations,
             coordination::tauri_commands::coordination_list_workspace_changes,
@@ -1385,17 +1388,6 @@ pub fn run() {
             coordination::tauri_commands::coordination_db_propose_migration,
             coordination::tauri_commands::coordination_request_approval,
             coordination::tauri_commands::coordination_resolve_approval,
-            coordination::tauri_commands::coordination_get_cloud_orchestrator_status,
-            coordination::tauri_commands::coordination_update_cloud_orchestrator_config,
-            coordination::tauri_commands::coordination_create_orchestration_run,
-            coordination::tauri_commands::coordination_create_cloud_context_export,
-            coordination::tauri_commands::coordination_import_orchestration_plan,
-            coordination::tauri_commands::coordination_adopt_orchestration_plan,
-            coordination::tauri_commands::coordination_list_orchestration_runs,
-            coordination::tauri_commands::coordination_get_orchestration_brief,
-            coordination::tauri_commands::coordination_orchestrator_sync_once,
-            coordination::tauri_commands::coordination_propose_agent_assignments,
-            coordination::tauri_commands::coordination_adopt_agent_assignment,
             coordination::tauri_commands::coordination_scan_workspace_violations,
             close_app_after_terminal_shutdown
         ])

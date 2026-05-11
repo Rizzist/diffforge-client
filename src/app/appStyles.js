@@ -1634,6 +1634,16 @@ export const RailFooter = styled.div`
   animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
 `;
 
+export const RailGlobalActions = styled.div`
+  display: grid;
+  gap: 2px;
+  margin-top: 7px;
+  padding: 4px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 8px;
+  background: rgba(230, 236, 245, 0.018);
+`;
+
 export const RailActionButton = styled.button`
   position: relative;
   display: inline-flex;
@@ -1706,6 +1716,53 @@ export const RailActionButton = styled.button`
   &[data-active="true"] svg,
   &:hover svg {
     color: var(--forge-blue-soft);
+  }
+
+  &[data-scope="global"] {
+    min-height: 34px;
+    padding-left: 8px;
+    border-color: transparent;
+    color: #98a3b1;
+    background: transparent;
+  }
+
+  &[data-scope="global"]::before {
+    display: none;
+  }
+
+  &[data-scope="global"] svg {
+    color: #8994a3;
+  }
+
+  &[data-scope="global"]:hover,
+  &[data-scope="global"][data-active="true"] {
+    border-color: rgba(230, 236, 245, 0.08);
+    color: #d8dee7;
+    background: rgba(230, 236, 245, 0.045);
+  }
+
+  &[data-scope="global"]:hover svg,
+  &[data-scope="global"][data-active="true"] svg {
+    color: #c7d0dc;
+  }
+
+  &[data-variant="signout"] {
+    color: #9b9fa8;
+    background: transparent;
+  }
+
+  &[data-variant="signout"] svg {
+    color: #a68e91;
+  }
+
+  &[data-variant="signout"]:hover {
+    border-color: rgba(239, 107, 107, 0.18);
+    color: #e6d1d1;
+    background: rgba(239, 107, 107, 0.055);
+  }
+
+  &[data-variant="signout"]:hover svg {
+    color: #d7a4a4;
   }
 `;
 

@@ -168,7 +168,6 @@ export default function VaultWorkspaceView({
   const checks = report?.checks || [];
   const sortedChecks = sortChecks(checks);
   const summary = report?.summary || {};
-  const cloud = report?.cloud || snapshot?.cloud_orchestrator || {};
   const policy = report?.policy || snapshot?.repo_policy || {};
   const sessions = report?.sessions || snapshot?.sessions || [];
   const worktrees = report?.worktrees || snapshot?.worktrees || [];
@@ -206,9 +205,9 @@ export default function VaultWorkspaceView({
       status: mergeJobs.length ? statusFor(checks, "merge.gate_authority") : "idle",
     },
     {
-      label: "Cloud",
-      detail: cloud.enabled ? cloud.mode || "enabled" : "local-only",
-      status: statusFor(checks, "cloud.disabled_or_advisory"),
+      label: "Context",
+      detail: "context pack",
+      status: "aligned",
     },
   ];
 
@@ -264,8 +263,8 @@ export default function VaultWorkspaceView({
             <strong>{log.enabled ? "on" : "off"}</strong>
           </SummaryItem>
           <SummaryItem>
-            <span>Cloud</span>
-            <strong>{cloud.enabled ? cloud.mode || "enabled" : "disabled"}</strong>
+            <span>Context</span>
+            <strong>pack</strong>
           </SummaryItem>
         </SummaryStrip>
 
@@ -331,7 +330,6 @@ export default function VaultWorkspaceView({
               <li><span>Patch leases</span><strong>{policy.patch_lease_validation_required ? "required" : "off"}</strong></li>
               <li><span>Merge gate</span><strong>{policy.merge_gate_required ? "required" : "off"}</strong></li>
               <li><span>SQL</span><strong>{policy.sql_mcp_default || "off"}</strong></li>
-              <li><span>Cloud export</span><strong>{cloud.context_export_policy || "local_only"}</strong></li>
             </PolicyRows>
             <CompactRows empty="Policy checks have not run yet." rows={policyChecks.slice(0, 5)} />
           </Panel>
@@ -404,18 +402,18 @@ export default function VaultWorkspaceView({
 
           <Panel>
             <PanelTopline>
-              <span>Cloud boundary</span>
-              <strong>{cloud.enabled ? "advisory" : "local-only"}</strong>
+              <span>Context boundary</span>
+              <strong>metadata-only</strong>
             </PanelTopline>
             <CloudLine>
               <ButtonTerminalIcon aria-hidden="true" />
-              <span>{cloud.message || "Cloud orchestrator disabled; local kernel remains authoritative."}</span>
+              <span>Cloud MCP stores context-pack metadata; the local kernel remains execution authority.</span>
             </CloudLine>
             <PolicyRows>
-              <li><span>Code export</span><strong>{cloud.allow_code_export ? "allowed" : "blocked"}</strong></li>
-              <li><span>Log export</span><strong>{cloud.allow_terminal_log_export ? "allowed" : "blocked"}</strong></li>
-              <li><span>Patch export</span><strong>{cloud.allow_patch_export ? "allowed" : "blocked"}</strong></li>
-              <li><span>Auto merge</span><strong>{cloud.auto_merge ? "on" : "blocked"}</strong></li>
+              <li><span>Code export</span><strong>blocked</strong></li>
+              <li><span>Log export</span><strong>blocked</strong></li>
+              <li><span>Patch export</span><strong>blocked</strong></li>
+              <li><span>Auto merge</span><strong>blocked</strong></li>
             </PolicyRows>
           </Panel>
 

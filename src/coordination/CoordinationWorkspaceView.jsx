@@ -7,8 +7,6 @@ import {
   ButtonDeleteIcon,
   ButtonHubIcon,
   ButtonRefreshIcon,
-  ButtonTerminalIcon,
-  ButtonForgeIcon,
   FormMessage,
   PanelHeading,
   PanelKicker,
@@ -17,25 +15,6 @@ import {
   SettingsHint,
   SettingsLabel,
 } from "../app/appStyles";
-
-const DEFAULT_PLAN = `{
-  "objective": "Coordinate local agents",
-  "summary": "Mock/local plan import",
-  "items": [
-    {
-      "title": "Prepare implementation slice",
-      "body": "Claim, lease resources, implement, and submit through the kernel.",
-      "role": "architect",
-      "priority": 10,
-      "risk_level": 1,
-      "depends_on": [],
-      "required_resources": ["glob:src/**"],
-      "expected_outputs": ["Validated patch"]
-    }
-  ],
-  "contracts": [],
-  "qa_checks": ["cargo check", "npm run build:web"]
-}`;
 
 function unwrapData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
@@ -110,9 +89,6 @@ export default function CoordinationWorkspaceView({
   const [memoryResults, setMemoryResults] = useState([]);
   const [sqlText, setSqlText] = useState("SELECT * FROM users LIMIT 5;");
   const [sqlResult, setSqlResult] = useState(null);
-  const [objective, setObjective] = useState("");
-  const [planJson, setPlanJson] = useState(DEFAULT_PLAN);
-  const [selectedRunId, setSelectedRunId] = useState("");
   const [message, setMessage] = useState("");
   const [cleanupAudit, setCleanupAudit] = useState(null);
   const [mergeActionId, setMergeActionId] = useState("");
@@ -228,79 +204,6 @@ export default function CoordinationWorkspaceView({
     }
   };
 
-  const createRun = async (event) => {
-    event.preventDefault();
-    if (!objective.trim()) {
-      return;
-    }
-    setError("");
-    try {
-      const response = await invoke("coordination_create_orchestration_run", {
-        ...commandBase,
-        input: { objective: objective.trim(), constraints: { localOnly: true } },
-      });
-      const runId = unwrapData(response).run_id;
-      setSelectedRunId(runId || "");
-      setObjective("");
-      setMessage("Local orchestration run created.");
-      refresh();
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  };
-
-  const importPlan = async () => {
-    if (!selectedRunId) {
-      setError("Select or create an orchestration run first.");
-      return;
-    }
-    try {
-      const parsed = JSON.parse(planJson);
-      await invoke("coordination_import_orchestration_plan", {
-        ...commandBase,
-        input: { run_id: selectedRunId, plan_json: parsed },
-      });
-      setMessage("Plan imported as proposed items.");
-      refresh();
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  };
-
-  const adoptPlan = async () => {
-    if (!selectedRunId) {
-      setError("Select a run before adopting a plan.");
-      return;
-    }
-    try {
-      await invoke("coordination_adopt_orchestration_plan", {
-        ...commandBase,
-        runId: selectedRunId,
-      });
-      setMessage("Plan adopted into local authoritative tasks.");
-      refresh();
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  };
-
-  const syncOnce = async () => {
-    try {
-      await logUiSurface("orchestrator_sync_once", "started", { runId: selectedRunId || null }, "coordination_orchestrator_sync_once");
-      const response = await invoke("coordination_orchestrator_sync_once", {
-        ...commandBase,
-        runId: selectedRunId || null,
-      });
-      const warnings = response?.warnings?.join(" ") || "";
-      setMessage(warnings || "Cloud sync processed.");
-      await logUiSurface("orchestrator_sync_once", "succeeded", { runId: selectedRunId || null }, "coordination_orchestrator_sync_once");
-      refresh();
-    } catch (caught) {
-      setError(errorMessage(caught));
-      await logUiSurface("orchestrator_sync_once", "failed", { error: errorMessage(caught) }, "coordination_orchestrator_sync_once");
-    }
-  };
-
   const runCleanupAudit = async () => {
     setError("");
     setMessage("");
@@ -329,34 +232,47 @@ export default function CoordinationWorkspaceView({
     }
   };
 
-  const queueMerge = async (patch) => {
+  const initializeMergeResolution = async (patch) => {
     if (!patch?.id) {
       return;
     }
     setError("");
     setMessage("");
-    setMergeActionId(`queue:${patch.id}`);
+    setMergeActionId(`resolve:${patch.id}`);
     try {
-      await logUiSurface("manual_merge_queue", "started", { patchId: patch.id }, "coordination_request_merge");
-      const response = await invoke("coordination_request_merge", {
+      await logUiSurface("manual_merge_resolution_init", "started", { patchId: patch.id }, "coordination_initialize_merge_resolution");
+      const response = await invoke("coordination_initialize_merge_resolution", {
         ...commandBase,
         input: {
           patch_id: patch.id,
-          strategy: "patch_apply",
         },
       });
       const data = commandData(response);
-      setMessage(`Merge queued: ${data.merge_job_id || patch.id}`);
+      if (data.resolution_needed === false) {
+        setMessage(`Patch applies cleanly; merge queued: ${data.merge_job_id || patch.id}`);
+      } else {
+        setMessage(`Merge resolution initialized: ${data.resolution_task_id || data.merge_job_id || patch.id}`);
+      }
       await logUiSurface(
-        "manual_merge_queue",
+        "manual_merge_resolution_init",
         "succeeded",
-        { patchId: patch.id, mergeJobId: data.merge_job_id || null },
-        "coordination_request_merge",
+        {
+          patchId: patch.id,
+          mergeJobId: data.merge_job_id || null,
+          resolutionTaskId: data.resolution_task_id || null,
+          resolutionNeeded: data.resolution_needed !== false,
+        },
+        "coordination_initialize_merge_resolution",
       );
       refresh();
     } catch (caught) {
       setError(errorMessage(caught));
-      await logUiSurface("manual_merge_queue", "failed", { patchId: patch.id, error: errorMessage(caught) }, "coordination_request_merge");
+      await logUiSurface(
+        "manual_merge_resolution_init",
+        "failed",
+        { patchId: patch.id, error: errorMessage(caught) },
+        "coordination_initialize_merge_resolution",
+      );
     } finally {
       setMergeActionId("");
     }
@@ -392,10 +308,7 @@ export default function CoordinationWorkspaceView({
     }
   };
 
-  const cloud = snapshot?.cloud_orchestrator || {};
   const sqlPolicy = snapshot?.sql_policy || {};
-  const runs = snapshot?.orchestration_runs || [];
-  const planItems = snapshot?.orchestration_plan_items || [];
   const patches = snapshot?.patches || [];
   const mcpClientMounts = snapshot?.mcp_client_mounts || {};
   const mcpMountRows = mcpClientMounts.mounts || [];
@@ -421,9 +334,7 @@ export default function CoordinationWorkspaceView({
           </div>
         </HeaderTitle>
         <HeaderActions>
-          <StatusPill data-state={cloud.enabled ? "enabled" : "disabled"}>
-            Cloud {cloud.enabled ? cloud.mode : "local-only"}
-          </StatusPill>
+          <StatusPill data-state="enabled">Kernel local</StatusPill>
           <SecondaryButton disabled={!repoPath || status === "loading"} onClick={refresh} type="button">
             <ButtonRefreshIcon aria-hidden="true" />
             <span>{status === "loading" ? "Refreshing" : "Refresh"}</span>
@@ -588,14 +499,14 @@ export default function CoordinationWorkspaceView({
               { key: "task_id", label: "Task" },
               {
                 key: "manual_merge",
-                label: "Merge",
+                label: "Resolution",
                 render: (row) => (
                   <InlineActionButton
-                    disabled={row.status !== "submitted" || row.validation_status !== "passed" || mergeActionId === `queue:${row.id}`}
-                    onClick={() => queueMerge(row)}
+                    disabled={row.status !== "submitted" || row.validation_status !== "passed" || mergeActionId === `resolve:${row.id}`}
+                    onClick={() => initializeMergeResolution(row)}
                     type="button"
                   >
-                    {mergeActionId === `queue:${row.id}` ? "Queueing" : "Queue"}
+                    {mergeActionId === `resolve:${row.id}` ? "Initializing" : "Initialize"}
                   </InlineActionButton>
                 ),
               },
@@ -615,6 +526,9 @@ export default function CoordinationWorkspaceView({
               { key: "status", label: "Status" },
               { key: "strategy", label: "Strategy" },
               { key: "patch_id", label: "Patch" },
+              { key: "resolution_task_id", label: "Resolution task", render: (row) => row.resolution_task_id || "none" },
+              { key: "resolved_patch_id", label: "Resolved patch", render: (row) => row.resolved_patch_id || "none" },
+              { key: "resolver_agent_id", label: "Resolver", render: (row) => row.resolver_agent_id || "none" },
               { key: "error_message", label: "Error", render: (row) => row.error_message || "none" },
               {
                 key: "manual_apply",
@@ -756,90 +670,6 @@ export default function CoordinationWorkspaceView({
             ]}
             empty="No memory results."
             rows={memoryResults.length ? memoryResults : snapshot?.memories || []}
-          />
-        </Panel>
-
-        <Panel>
-          <PanelTopline>
-            <span>Cloud Orchestrator</span>
-            <strong>{cloud.mode || "disabled"}</strong>
-          </PanelTopline>
-          <CloudNote>
-            <ButtonTerminalIcon aria-hidden="true" />
-            <span>{cloud.message || "Cloud disabled; local kernel is authoritative."}</span>
-          </CloudNote>
-          <PolicyGrid>
-            <PolicyItem>
-              <span>Export</span>
-              <strong>{cloud.context_export_policy || "local_only"}</strong>
-            </PolicyItem>
-            <PolicyItem>
-              <span>Code</span>
-              <strong>{cloud.allow_code_export ? "allowed" : "blocked"}</strong>
-            </PolicyItem>
-            <PolicyItem>
-              <span>Logs</span>
-              <strong>{cloud.allow_terminal_log_export ? "allowed" : "blocked"}</strong>
-            </PolicyItem>
-            <PolicyItem>
-              <span>Auto merge</span>
-              <strong>blocked</strong>
-            </PolicyItem>
-          </PolicyGrid>
-          <SecondaryButton onClick={syncOnce} type="button">
-            <ButtonRefreshIcon aria-hidden="true" />
-            <span>Sync once</span>
-          </SecondaryButton>
-        </Panel>
-
-        <Panel>
-          <PanelTopline>
-            <span>Orchestration</span>
-            <strong>{runs.length}</strong>
-          </PanelTopline>
-          <TaskForm onSubmit={createRun}>
-            <Field>
-              <SettingsLabel>Objective</SettingsLabel>
-              <Textarea value={objective} onChange={(event) => setObjective(event.target.value)} rows={3} placeholder="Coordinate a multi-agent implementation" />
-            </Field>
-            <PrimaryButton disabled={!objective.trim()} type="submit">
-              <ButtonForgeIcon aria-hidden="true" />
-              <span>Create run</span>
-            </PrimaryButton>
-          </TaskForm>
-          <Select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>
-            <option value="">Select run</option>
-            {runs.map((run) => (
-              <option key={run.id} value={run.id}>{run.objective || run.id}</option>
-            ))}
-          </Select>
-          <Textarea value={planJson} onChange={(event) => setPlanJson(event.target.value)} rows={10} />
-          <ButtonRow>
-            <SecondaryButton onClick={importPlan} type="button">
-              <ButtonHubIcon aria-hidden="true" />
-              <span>Import plan</span>
-            </SecondaryButton>
-            <PrimaryButton onClick={adoptPlan} type="button">
-              <ButtonCheckIcon aria-hidden="true" />
-              <span>Adopt plan</span>
-            </PrimaryButton>
-          </ButtonRow>
-        </Panel>
-
-        <Panel>
-          <PanelTopline>
-            <span>Plan Items</span>
-            <strong>{planItems.length}</strong>
-          </PanelTopline>
-          <CompactTable
-            columns={[
-              { key: "title", label: "Item" },
-              { key: "assigned_role", label: "Role" },
-              { key: "status", label: "Status" },
-              { key: "task_id", label: "Task", render: (row) => row.task_id || "proposed" },
-            ]}
-            empty="No plan items."
-            rows={planItems}
           />
         </Panel>
 

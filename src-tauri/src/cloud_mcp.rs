@@ -18,7 +18,26 @@ struct CloudMcpRuntime {
     last_error: String,
     last_connected_ms: Option<u64>,
     registered_workspaces: HashMap<String, CloudMcpWorkspaceStatus>,
-    plan_gates: HashMap<String, CloudMcpPlanGate>,
+    terminal_contexts: HashMap<String, CloudMcpTerminalContextState>,
+}
+
+#[derive(Clone)]
+struct CloudMcpTerminalContextState {
+    last_prompt: String,
+    repo_id: String,
+    agent_id: String,
+    lane: String,
+    working_directory: PathBuf,
+    created_ms: u64,
+    last_changed_hash: String,
+    last_checkpoint_ms: u64,
+    context_task_id: Option<String>,
+    reported_change: bool,
+    stable_change_cycles: u8,
+    saw_agent_activity: bool,
+    work_brief: String,
+    work_brief_reported: bool,
+    done_reported: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -31,8 +50,6 @@ struct CloudMcpStatus {
     last_connected_ms: Option<u64>,
     registered_workspace_count: usize,
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
-    pending_plan_count: usize,
-    accepted_plan_count: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -83,67 +100,6 @@ struct CloudMcpWorkspaceRegistrationResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CloudMcpPolicyResult {
-    status: CloudMcpStatus,
-    policy_graph: Value,
-    proposals: Value,
-    orchestration: Value,
-    alignment_report: Value,
-    server_status: Value,
-    proposal_id: String,
-    message: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudMcpPlanGate {
-    root: String,
-    prompt_hash: String,
-    prompt_preview: String,
-    run_id: String,
-    local_run_id: String,
-    status: String,
-    plan: Value,
-    cloud_response: Value,
-    created_at_ms: u64,
-    accepted_at_ms: Option<u64>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudMcpPlanResult {
-    status: CloudMcpStatus,
-    run_id: String,
-    prompt_hash: String,
-    cloud_response: Value,
-    message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudMcpPlanDecisionResult {
-    status: CloudMcpStatus,
-    decision: String,
-    run_id: String,
-    server_response: Value,
-    local_adoption: Value,
-    recorded_at_ms: u64,
-    message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudMcpDecisionResult {
-    status: CloudMcpStatus,
-    decision: String,
-    proposal_id: String,
-    server_response: Value,
-    recorded_at_ms: u64,
-    message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudMcpTodoResult {
     status: CloudMcpStatus,
     text: String,
@@ -167,7 +123,7 @@ impl CloudMcpState {
                 last_error: String::new(),
                 last_connected_ms: None,
                 registered_workspaces: HashMap::new(),
-                plan_gates: HashMap::new(),
+                terminal_contexts: HashMap::new(),
             })),
             client,
         }
@@ -206,6 +162,10 @@ fn cloud_mcp_short_hash(value: &str) -> String {
     format!("{digest:x}").chars().take(12).collect()
 }
 
+fn cloud_mcp_repo_id_for_root(root: &Path) -> String {
+    format!("repo-{}", cloud_mcp_short_hash(&workspace_path_display(root)))
+}
+
 fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
     let mut registered_workspaces = runtime
         .registered_workspaces
@@ -213,17 +173,6 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         .cloned()
         .collect::<Vec<_>>();
     registered_workspaces.sort_by(|left, right| left.root.cmp(&right.root));
-    let pending_plan_count = runtime
-        .plan_gates
-        .values()
-        .filter(|gate| gate.status == "pending")
-        .count();
-    let accepted_plan_count = runtime
-        .plan_gates
-        .values()
-        .filter(|gate| gate.status == "accepted")
-        .count();
-
     CloudMcpStatus {
         base_url: runtime.base_url.clone(),
         connected: runtime.connected,
@@ -232,8 +181,6 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         last_connected_ms: runtime.last_connected_ms,
         registered_workspace_count: registered_workspaces.len(),
         registered_workspaces,
-        pending_plan_count,
-        accepted_plan_count,
     }
 }
 
@@ -350,7 +297,7 @@ async fn cloud_mcp_connected_or_connect(
 }
 
 async fn require_cloud_mcp_connected_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
-    cloud_mcp_connected_or_connect(state, "terminal_gate").await
+    Ok(cloud_mcp_status_snapshot(state).await)
 }
 
 fn cloud_mcp_workspace_control_dir(root: &Path) -> PathBuf {
@@ -363,55 +310,6 @@ fn cloud_mcp_workspace_log_path(root: &Path) -> PathBuf {
 
 fn cloud_mcp_workspace_todo_path(root: &Path) -> PathBuf {
     cloud_mcp_workspace_control_dir(root).join("todo-queue.md")
-}
-
-fn cloud_mcp_workspace_plan_dir(root: &Path) -> PathBuf {
-    cloud_mcp_workspace_control_dir(root).join("plans")
-}
-
-fn cloud_mcp_plan_gate_path(root: &Path, run_id: &str) -> PathBuf {
-    cloud_mcp_workspace_plan_dir(root).join(format!("{run_id}.json"))
-}
-
-fn cloud_mcp_write_plan_gate(root: &Path, gate: &CloudMcpPlanGate) -> Result<(), String> {
-    let dir = cloud_mcp_workspace_plan_dir(root);
-    fs::create_dir_all(&dir).map_err(|error| {
-        format!(
-            "Unable to create Cloud MCP plan gate directory {}: {error}",
-            dir.display()
-        )
-    })?;
-    let path = cloud_mcp_plan_gate_path(root, &gate.run_id);
-    let body = serde_json::to_vec_pretty(gate)
-        .map_err(|error| format!("Unable to serialize Cloud MCP plan gate: {error}"))?;
-    fs::write(&path, body).map_err(|error| {
-        format!(
-            "Unable to write Cloud MCP plan gate {}: {error}",
-            path.display()
-        )
-    })
-}
-
-fn cloud_mcp_read_plan_gate(root: &Path, run_id: &str) -> Option<CloudMcpPlanGate> {
-    let path = cloud_mcp_plan_gate_path(root, run_id);
-    let body = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
-}
-
-fn cloud_mcp_find_plan_gate_for_prompt(root: &Path, prompt_hash: &str) -> Option<CloudMcpPlanGate> {
-    let dir = cloud_mcp_workspace_plan_dir(root);
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let body = fs::read_to_string(path).ok()?;
-        let gate = serde_json::from_str::<CloudMcpPlanGate>(&body).ok()?;
-        if gate.prompt_hash == prompt_hash {
-            return Some(gate);
-        }
-    }
-    None
 }
 
 fn cloud_mcp_workspace_log(
@@ -430,6 +328,12 @@ fn cloud_mcp_workspace_log(
     })?;
 
     let path = cloud_mcp_workspace_log_path(root);
+    static CLOUD_MCP_WORKSPACE_LOG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _guard = CLOUD_MCP_WORKSPACE_LOG_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| "Cloud MCP workspace log lock is poisoned.".to_string())?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -729,25 +633,220 @@ async fn cloud_mcp_post_json_endpoint(
         runtime.base_url.clone()
     };
     let url = format!("{base_url}{endpoint}");
-    let response = state
+    let log_context = cloud_mcp_post_log_context(endpoint, payload);
+    if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+        let _ = cloud_mcp_workspace_log(
+            root,
+            "cloud_mcp.http.start",
+            workspace_id,
+            workspace_name,
+            fields.clone(),
+        );
+    }
+
+    let response = match state
         .client
         .post(&url)
         .timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS))
         .json(payload)
         .send()
         .await
-        .map_err(|error| format!("Unable to POST {endpoint} to Cloud MCP: {error}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+                let mut fields = fields.clone();
+                fields["error"] = json!(error.to_string());
+                let _ = cloud_mcp_workspace_log(
+                    root,
+                    "cloud_mcp.http.error",
+                    workspace_id,
+                    workspace_name,
+                    fields,
+                );
+            }
+            return Err(format!("Unable to POST {endpoint} to Cloud MCP: {error}"));
+        }
+    };
 
     if response.status().is_success() {
-        return Ok(response.json::<Value>().await.unwrap_or(Value::Null));
+        let value = response.json::<Value>().await.unwrap_or(Value::Null);
+        if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+            let _ = cloud_mcp_workspace_log(
+                root,
+                "cloud_mcp.http.done",
+                workspace_id,
+                workspace_name,
+                fields.clone(),
+            );
+        }
+        return Ok(value);
     }
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+        let mut fields = fields.clone();
+        fields["status"] = json!(status.as_u16());
+        fields["error"] = json!(clean_terminal_telemetry_text(&body));
+        let _ = cloud_mcp_workspace_log(
+            root,
+            "cloud_mcp.http.error",
+            workspace_id,
+            workspace_name,
+            fields,
+        );
+    }
     Err(format!(
         "Cloud MCP {endpoint} returned HTTP {status}: {}",
         clean_terminal_telemetry_text(&body)
     ))
+}
+
+fn cloud_mcp_post_log_context(
+    endpoint: &str,
+    payload: &Value,
+) -> Option<(PathBuf, String, String, Value)> {
+    let repo_path = cloud_mcp_payload_text(payload, &["repo_path"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["workspace_root"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_path"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_root"]))?;
+    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
+        .unwrap_or_default();
+    let workspace_name = cloud_mcp_payload_text(payload, &["workspace_name"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_name"]))
+        .unwrap_or_default();
+    let agent_id = cloud_mcp_payload_text(payload, &["agent_id"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "agent_id"]))
+        .unwrap_or_else(|| "rust-diffforge".to_string());
+    let pane_id = cloud_mcp_payload_text(payload, &["terminal_id"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["pane_id"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "terminal_id"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "pane_id"]));
+    let terminal_instance_id = payload
+        .get("terminal_instance_id")
+        .or_else(|| payload.get("instance_id"))
+        .or_else(|| payload.get("payload").and_then(|payload| payload.get("terminal_instance_id")))
+        .or_else(|| payload.get("payload").and_then(|payload| payload.get("instance_id")))
+        .cloned();
+    let tool = match endpoint {
+        "/v1/context/pack" => "cloud_get_context_pack",
+        "/v1/context/subtasks/checkpoint" => "cloud_subtask_checkpoint",
+        "/v1/context/history/events" => "cloud_record_history_event",
+        "/v1/context/agents/claim-lane" => "cloud_claim_lane",
+        "/v1/context/agents/release-lane" => "cloud_release_lane",
+        _ => "cloud_mcp_http",
+    };
+    let mut fields = json!({
+        "endpoint": endpoint,
+        "tool": tool,
+        "agentId": agent_id,
+        "repoPath": repo_path,
+    });
+    if let Some(pane_id) = pane_id {
+        fields["paneId"] = json!(pane_id);
+    }
+    if let Some(terminal_instance_id) = terminal_instance_id {
+        fields["terminalInstanceId"] = terminal_instance_id;
+    }
+
+    Some((
+        root,
+        workspace_id,
+        workspace_name,
+        fields,
+    ))
+}
+
+fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn cloud_mcp_register_prepared_workspace(
+    state: &CloudMcpState,
+    prepared: CloudMcpPreparedWorkspace,
+    reason: &str,
+) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
+    let now_ms = cloud_mcp_now_ms();
+    let repo_id = format!("repo-{}", cloud_mcp_short_hash(&prepared.root_display));
+    let policy_graph_detected = prepared.policy_graph.is_some();
+    let workspace_status = CloudMcpWorkspaceStatus {
+        root: prepared.root_display.clone(),
+        workspace_id: prepared.workspace_id.clone(),
+        workspace_name: prepared.workspace_name.clone(),
+        last_registered_ms: if reason == "workspace_registration" {
+            Some(now_ms)
+        } else {
+            None
+        },
+        last_synced_ms: Some(now_ms),
+        last_error: String::new(),
+        file_count: prepared.filetree.len(),
+        policy_graph_detected,
+        policy_graph_path: prepared.policy_graph_path.clone(),
+    };
+    let payload = json!({
+        "source": "rust-diffforge",
+        "repo_id": repo_id.clone(),
+        "agent_id": "rust-diffforge",
+        "event_kind": reason,
+        "summary": format!("Workspace {} synced into the Cloud MCP context ledger.", prepared.workspace_name),
+        "payload": {
+            "reason": reason,
+            "workspace_id": prepared.workspace_id,
+            "workspace_name": prepared.workspace_name,
+            "workspace_root": prepared.root_display,
+            "file_count": workspace_status.file_count,
+            "filetree_truncated": prepared.filetree_truncated,
+            "policy_graph_detected": policy_graph_detected,
+            "policy_graph_path": workspace_status.policy_graph_path,
+            "todo_queue_bytes": prepared.todo_queue.len(),
+            "context_pack_model": true,
+        }
+    });
+    let server_response =
+        cloud_mcp_post_json_endpoint(state, "/v1/context/history/events", &payload).await?;
+    let log_path = cloud_mcp_workspace_log(
+        &prepared.root,
+        reason,
+        &workspace_status.workspace_id,
+        &workspace_status.workspace_name,
+        json!({
+            "repo_id": repo_id,
+            "file_count": workspace_status.file_count,
+            "filetree_truncated": prepared.filetree_truncated,
+            "policy_graph_detected": policy_graph_detected,
+            "synced": true,
+        }),
+    )?;
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime
+            .registered_workspaces
+            .insert(workspace_status.root.clone(), workspace_status.clone());
+        runtime.connected = true;
+        runtime.status = "connected".to_string();
+        runtime.last_error.clear();
+        runtime.last_connected_ms = Some(now_ms);
+    }
+    let status = cloud_mcp_status_snapshot(state).await;
+    Ok(CloudMcpWorkspaceRegistrationResult {
+        status,
+        workspace: workspace_status,
+        server_response,
+        synced: true,
+        log_path: workspace_path_display(&log_path),
+        message: "Workspace synced to Cloud MCP context ledger.".to_string(),
+    })
 }
 
 async fn cloud_mcp_get_json_endpoint(state: &CloudMcpState, endpoint: &str) -> Result<Value, String> {
@@ -786,490 +885,1082 @@ fn cloud_mcp_response_data(value: &Value) -> Value {
     value.get("data").cloned().unwrap_or_else(|| value.clone())
 }
 
-fn cloud_mcp_plan_key(root: &str, prompt_hash: &str) -> String {
-    format!("{root}::{prompt_hash}")
+fn cloud_mcp_terminal_key(pane_id: &str, instance_id: u64) -> String {
+    format!("{pane_id}::{instance_id}")
 }
 
-fn cloud_mcp_prompt_hash(prompt: &str) -> String {
-    cloud_mcp_short_hash(prompt.trim())
+fn cloud_mcp_terminal_agent_id(
+    pane_id: &str,
+    instance_id: u64,
+    coordination: Option<&TerminalCoordinationSession>,
+) -> String {
+    coordination
+        .map(|coordination| coordination.agent_id.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{pane_id}-{instance_id}"))
 }
 
-fn cloud_mcp_prompt_preview(prompt: &str) -> String {
-    clean_terminal_telemetry_text(prompt)
-        .chars()
-        .take(180)
-        .collect()
+fn cloud_mcp_terminal_repo_id(
+    working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
+) -> String {
+    coordination
+        .map(|coordination| coordination.repo_path.clone())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(&value)))
+        .unwrap_or_else(|| format!("repo-{}", cloud_mcp_short_hash(&workspace_path_display(working_directory))))
 }
 
-fn cloud_mcp_prompt_excerpt(value: &str, max_chars: usize) -> String {
-    value
+fn cloud_mcp_strip_terminal_sequences(value: &str) -> String {
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+        Ss3,
+    }
+
+    let mut state = State::Ground;
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match state {
+            State::Ground => {
+                if character == '\u{1b}' {
+                    state = State::Escape;
+                } else {
+                    output.push(character);
+                }
+            }
+            State::Escape => {
+                state = match character {
+                    '[' => State::Csi,
+                    ']' | 'P' | '^' | '_' | 'X' => State::Osc,
+                    'O' => State::Ss3,
+                    _ => State::Ground,
+                };
+            }
+            State::Csi => {
+                let code = character as u32;
+                if (0x40..=0x7e).contains(&code) {
+                    state = State::Ground;
+                }
+            }
+            State::Osc => {
+                if character == '\u{1b}' {
+                    state = State::OscEscape;
+                } else if character == '\u{7}' {
+                    state = State::Ground;
+                }
+            }
+            State::OscEscape => {
+                state = State::Ground;
+            }
+            State::Ss3 => {
+                state = State::Ground;
+            }
+        }
+    }
+    output
+}
+
+fn cloud_mcp_strip_terminal_residue(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '[' && index + 1 < chars.len() {
+            let next = chars[index + 1];
+            if next == '?' || next.is_ascii_digit() {
+                let mut end = index + 1;
+                while end < chars.len() && end.saturating_sub(index) <= 48 {
+                    let code = chars[end] as u32;
+                    if (0x40..=0x7e).contains(&code) {
+                        end += 1;
+                        break;
+                    }
+                    end += 1;
+                }
+                if end > index + 1 && end <= chars.len() {
+                    output.push(' ');
+                    index = end;
+                    continue;
+                }
+            }
+            if matches!(next, 'O' | 'I') {
+                output.push(' ');
+                index += 2;
+                continue;
+            }
+        }
+        if character == ']' && index + 2 < chars.len() && chars[index + 1].is_ascii_digit() {
+            let mut end = index + 1;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == ';' {
+                end += 1;
+                while end < chars.len() && !chars[end].is_whitespace() {
+                    if chars[end] == '\\' {
+                        end += 1;
+                        break;
+                    }
+                    end += 1;
+                }
+                output.push(' ');
+                index = end;
+                continue;
+            }
+        }
+        output.push(character);
+        index += 1;
+    }
+    output
+}
+
+fn cloud_mcp_clean_prompt_text(prompt: &str) -> String {
+    cloud_mcp_strip_terminal_residue(&cloud_mcp_strip_terminal_sequences(prompt))
         .replace(|character: char| character.is_control(), " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn cloud_mcp_prompt_summary(prompt: &str) -> String {
+    let cleaned = cloud_mcp_clean_prompt_text(prompt);
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .chars()
-        .take(max_chars)
+        .take(220)
         .collect()
 }
 
-fn cloud_mcp_plan_array_text(value: &Value, max_items: usize, max_chars: usize) -> String {
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .take(max_items)
-                .filter_map(|item| item.as_str())
-                .map(|item| cloud_mcp_prompt_excerpt(item, max_chars))
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .unwrap_or_default()
+fn cloud_mcp_extract_agent_work_brief(text: &str) -> Option<String> {
+    let cleaned = cloud_mcp_clean_prompt_text(text);
+    let lower = cleaned.to_ascii_lowercase();
+    let markers = ["i'll ", "i’ll ", "i will ", "i'm ", "i’m ", "i am "];
+    let (start, _) = markers
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)?;
+    let mut brief = cleaned[start..].trim().to_string();
+    if let Some(index) = brief.find(". ") {
+        brief.truncate(index + 1);
+    }
+    let brief = brief
+        .trim_matches(|character: char| character == '•' || character == '-' || character.is_whitespace())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if brief.len() < 18 {
+        None
+    } else {
+        Some(brief.chars().take(280).collect())
+    }
 }
 
-fn cloud_mcp_enhanced_prompt(original_prompt: &str, gate: &CloudMcpPlanGate) -> String {
-    let mut lines = vec![
-        "Use this accepted Cloud MCP plan as the execution contract.".to_string(),
-        String::new(),
-        "Original user request:".to_string(),
-        cloud_mcp_prompt_excerpt(original_prompt, 900),
-        String::new(),
-        format!("Cloud run id: {}", gate.run_id),
-    ];
-    if !gate.local_run_id.trim().is_empty() {
-        lines.push(format!("Local coordination run id: {}", gate.local_run_id));
-    }
-    if let Some(summary) = gate.plan["summary"].as_str() {
-        lines.push(format!(
-            "Plan summary: {}",
-            cloud_mcp_prompt_excerpt(summary, 900)
-        ));
-    }
-
-    let items = gate.plan["items"].as_array().cloned().unwrap_or_default();
-    if !items.is_empty() {
-        lines.push(String::new());
-        lines.push("Accepted plan tasks:".to_string());
-        for (index, item) in items.iter().take(8).enumerate() {
-            let title = item["title"]
-                .as_str()
-                .map(|value| cloud_mcp_prompt_excerpt(value, 160))
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "Untitled task".to_string());
-            let role = item["role"]
-                .as_str()
-                .or_else(|| item["assigned_role"].as_str())
-                .map(|value| cloud_mcp_prompt_excerpt(value, 80))
-                .unwrap_or_else(|| "coding_agent".to_string());
-            lines.push(format!("{}. {} [{}]", index + 1, title, role));
-            if let Some(body) = item["body"].as_str() {
-                lines.push(format!("   Scope: {}", cloud_mcp_prompt_excerpt(body, 420)));
-            }
-            let required = cloud_mcp_plan_array_text(&item["required_resources"], 8, 120);
-            if !required.is_empty() {
-                lines.push(format!("   Required resources: {required}"));
-            }
-            let outputs = cloud_mcp_plan_array_text(&item["expected_outputs"], 8, 140);
-            if !outputs.is_empty() {
-                lines.push(format!("   Expected outputs: {outputs}"));
-            }
-            let depends = cloud_mcp_plan_array_text(&item["depends_on"], 8, 120);
-            if !depends.is_empty() {
-                lines.push(format!("   Depends on: {depends}"));
-            }
+fn cloud_mcp_work_title_from_brief(brief: &str) -> String {
+    let mut title = brief.trim().to_string();
+    for prefix in ["I'll ", "I’ll ", "I will ", "I'm ", "I’m ", "I am "] {
+        if title.starts_with(prefix) {
+            title = title[prefix.len()..].trim().to_string();
+            break;
         }
     }
-
-    let qa_checks = cloud_mcp_plan_array_text(&gate.plan["qa_checks"], 8, 160);
-    if !qa_checks.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("QA checks from plan: {qa_checks}"));
-    }
-
-    let contracts = gate.plan["contracts"].as_array().cloned().unwrap_or_default();
-    if !contracts.is_empty() {
-        lines.push(String::new());
-        lines.push("Plan contracts:".to_string());
-        for contract in contracts.iter().take(5) {
-            let title = contract["title"]
-                .as_str()
-                .map(|value| cloud_mcp_prompt_excerpt(value, 140))
-                .unwrap_or_else(|| "Contract".to_string());
-            let body = contract["body"]
-                .as_str()
-                .map(|value| cloud_mcp_prompt_excerpt(value, 360))
-                .unwrap_or_default();
-            lines.push(format!("- {title}: {body}"));
+    let lower = title.to_ascii_lowercase();
+    for delimiter in [" now by ", " by ", " so ", " until ", " and then "] {
+        if let Some(index) = lower.find(delimiter) {
+            title.truncate(index);
+            break;
         }
     }
-
-    lines.extend([
-        String::new(),
-        "Execution rules:".to_string(),
-        "- Follow AGENTS.md and the local policy-first workflow.".to_string(),
-        "- Use the coordination-kernel MCP before edits: get brief, claim/adopt the relevant task, acquire leases, and submit through patch/merge gates.".to_string(),
-        "- Do not bypass the accepted Cloud MCP plan; if repository evidence conflicts with it, stop and report the conflict.".to_string(),
-        "- Keep the change scoped to the accepted plan and preserve unrelated user changes.".to_string(),
-    ]);
-
-    let prompt = lines.join("\n");
-    prompt.chars().take(6_000).collect()
+    let title = title
+        .trim_matches(|character: char| character == '.' || character == ':' || character.is_whitespace())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "Agent working on requested task".to_string()
+    } else {
+        let mut characters = title.chars();
+        let first = characters
+            .next()
+            .map(|character| character.to_uppercase().collect::<String>())
+            .unwrap_or_default();
+        format!("{}{}", first, characters.collect::<String>())
+            .chars()
+            .take(160)
+            .collect()
+    }
 }
 
-fn cloud_mcp_workspace_name_for_root(root: &Path) -> String {
-    root.file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Local workspace".to_string())
+fn cloud_mcp_work_subject(work_brief: &str) -> String {
+    if work_brief.trim().is_empty() {
+        "requested work".to_string()
+    } else {
+        cloud_mcp_work_title_from_brief(work_brief)
+    }
 }
 
-async fn cloud_mcp_prepare_task_plan_for_prompt(
+fn cloud_mcp_title_from_changed_files(changed_files: &[Value]) -> Option<String> {
+    if changed_files.is_empty() {
+        return None;
+    }
+    if changed_files.len() == 1 {
+        let file = &changed_files[0];
+        let path = file["path"].as_str().unwrap_or_default().trim();
+        if path.is_empty() {
+            return Some("Update one file".to_string());
+        }
+        let action = match file["change_kind"].as_str().unwrap_or_default() {
+            "added" => "Create",
+            "deleted" => "Remove",
+            "renamed" => "Rename",
+            "copied" => "Copy",
+            _ => "Update",
+        };
+        return Some(format!("{action} {path}").chars().take(160).collect());
+    }
+    Some(format!("Update {} files", changed_files.len()))
+}
+
+fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    let mut parts = output.stdout.split(|byte| *byte == 0).filter(|part| !part.is_empty());
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = String::from_utf8_lossy(&entry[0..2]).to_string();
+        let mut path = String::from_utf8_lossy(&entry[3..]).replace('\\', "/");
+        let change_kind = if status.starts_with('R') || status.starts_with('C') {
+            if let Some(next_path) = parts.next() {
+                path = String::from_utf8_lossy(next_path).replace('\\', "/");
+            }
+            if status.starts_with('R') {
+                "renamed"
+            } else {
+                "copied"
+            }
+        } else if status == "??" || status.contains('A') {
+            "added"
+        } else if status.contains('D') {
+            "deleted"
+        } else {
+            "modified"
+        };
+        if path.starts_with(".agents/") || path.starts_with(".git/") {
+            continue;
+        }
+        files.push(json!({
+            "path": path,
+            "change_kind": change_kind,
+            "untracked": status == "??",
+        }));
+        if files.len() >= 100 {
+            break;
+        }
+    }
+    files
+}
+
+async fn cloud_mcp_claim_terminal_lane(
     state: &CloudMcpState,
-    root: &Path,
+    repo_id: &str,
+    agent_id: &str,
+    lane: &str,
     prompt: &str,
-    reason: &str,
-) -> Result<CloudMcpPlanGate, String> {
-    let prompt = prompt.trim();
-    let root = root.to_path_buf();
-    let root_display = workspace_path_display(&root);
-    let prompt_hash = cloud_mcp_prompt_hash(prompt);
-    let key = cloud_mcp_plan_key(&root_display, &prompt_hash);
+    working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
+) {
+    if lane.trim().is_empty() {
+        return;
+    }
+    let payload = json!({
+        "source": "rust-diffforge-terminal",
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "lane": lane,
+        "reason": format!("Starting terminal task: {}", cloud_mcp_prompt_summary(prompt)),
+        "metadata": {
+            "workspace_root": workspace_path_display(working_directory),
+            "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+        },
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Err(error) = cloud_mcp_post_json_endpoint(state, "/v1/context/agents/claim-lane", &payload).await {
+        log_terminal_event(
+            "cloud_mcp.context_pack.claim_lane.error",
+            None,
+            None,
+            None,
+            json!({
+                "agent_id": clean_terminal_telemetry_text(agent_id),
+                "lane": clean_terminal_telemetry_text(lane),
+                "error": clean_terminal_telemetry_text(&error),
+            }),
+        );
+    }
+}
 
-    if let Some(existing) = {
-        let runtime = state.inner.lock().await;
-        runtime.plan_gates.get(&key).cloned()
-    } {
-        if existing.status != "rejected" {
-            return Ok(existing);
+async fn cloud_mcp_create_terminal_context_task(
+    state: &CloudMcpState,
+    repo_id: &str,
+    agent_id: &str,
+    lane: &str,
+    prompt: &str,
+    pane_id: &str,
+    instance_id: u64,
+    working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
+) -> Option<String> {
+    let title = "Agent preparing requested work";
+    let clean_prompt = cloud_mcp_clean_prompt_text(prompt);
+    let payload = json!({
+        "source": "rust-diffforge-terminal",
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "self_agent_id": agent_id,
+        "current_agent_id": agent_id,
+        "title": title,
+        "body": "Waiting for the agent to state its concrete work plan.",
+        "status": "active",
+        "lane": lane,
+        "source_prompt": clean_prompt,
+        "metadata": {
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
+            "workspace_root": workspace_path_display(working_directory),
+            "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+            "managed_by": "rust-diffforge",
+            "title_source": "placeholder",
+        },
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    match cloud_mcp_post_json_endpoint(state, "/v1/context/tasks", &payload).await {
+        Ok(response) => {
+            let data = cloud_mcp_response_data(&response);
+            let task_id = data["task"]["id"].as_str().map(str::to_string);
+            if let Some(task_id) = task_id.as_deref() {
+                let _ = cloud_mcp_workspace_log(
+                    working_directory,
+                    "cloud_mcp.task.created",
+                    "",
+                    "",
+                    json!({
+                        "activity": "created task",
+                        "detail": title,
+                        "agent_id": clean_terminal_telemetry_text(agent_id),
+                        "pane_id": clean_terminal_telemetry_text(pane_id),
+                        "task_id": clean_terminal_telemetry_text(task_id),
+                        "title": title,
+                    }),
+                );
+            }
+            task_id
+        }
+        Err(error) => {
+            let _ = cloud_mcp_workspace_log(
+                working_directory,
+                "cloud_mcp.context_pack.task_create_error",
+                "",
+                "",
+                json!({
+                    "agent_id": clean_terminal_telemetry_text(agent_id),
+                    "pane_id": clean_terminal_telemetry_text(pane_id),
+                    "repo_id": clean_terminal_telemetry_text(repo_id),
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            None
         }
     }
+}
 
-    let workspace_id = format!("local-{}", cloud_mcp_short_hash(&root_display));
-    let workspace_name = cloud_mcp_workspace_name_for_root(&root);
-    let prepared_root = root.clone();
-    let prepared_workspace_id = workspace_id.clone();
-    let prepared_workspace_name = workspace_name.clone();
-    let prepared = tauri::async_runtime::spawn_blocking(move || {
-        cloud_mcp_prepare_workspace_from_root(
-            prepared_root,
-            Some(prepared_workspace_id),
-            Some(prepared_workspace_name),
+async fn cloud_mcp_update_terminal_context_task(
+    state: &CloudMcpState,
+    repo_id: &str,
+    agent_id: &str,
+    task_id: &str,
+    status: &str,
+    lane: &str,
+    title: Option<&str>,
+    title_source: Option<&str>,
+    brief: &str,
+    changed_files: &[Value],
+    working_directory: &Path,
+    pane_id: Option<&str>,
+) {
+    if task_id.trim().is_empty() {
+        return;
+    }
+    let payload = json!({
+        "source": "rust-diffforge-terminal",
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "self_agent_id": agent_id,
+        "current_agent_id": agent_id,
+        "title": title,
+        "status": status,
+        "lane": lane,
+        "body": brief,
+        "metadata": {
+            "managed_by": "rust-diffforge",
+            "title_source": title_source,
+            "changed_file_count": changed_files.len(),
+            "changed_files": changed_files,
+        },
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let endpoint = format!("/v1/context/tasks/{task_id}");
+    if let Err(error) = cloud_mcp_post_json_endpoint(state, &endpoint, &payload).await {
+        let _ = cloud_mcp_workspace_log(
+            working_directory,
+            "cloud_mcp.context_pack.task_update_error",
+            "",
+            "",
+            json!({
+                "agent_id": clean_terminal_telemetry_text(agent_id),
+                "repo_id": clean_terminal_telemetry_text(repo_id),
+                "task_id": clean_terminal_telemetry_text(task_id),
+                "status": status,
+                "error": clean_terminal_telemetry_text(&error),
+            }),
+        );
+    } else {
+        let activity = if status == "done" {
+            "completed task"
+        } else if title.is_some() {
+            "named task"
+        } else if !changed_files.is_empty() {
+            "changed files"
+        } else {
+            "updated task"
+        };
+        let detail = title.unwrap_or(brief);
+        let _ = cloud_mcp_workspace_log(
+            working_directory,
+            match activity {
+                "completed task" => "cloud_mcp.task.completed",
+                "named task" => "cloud_mcp.task.named",
+                "changed files" => "cloud_mcp.task.changed_files",
+                _ => "cloud_mcp.task.updated",
+            },
+            "",
+            "",
+            json!({
+                "activity": activity,
+                "detail": clean_terminal_telemetry_text(detail),
+                "agent_id": clean_terminal_telemetry_text(agent_id),
+                "pane_id": pane_id.map(clean_terminal_telemetry_text),
+                "task_id": clean_terminal_telemetry_text(task_id),
+                "status": status,
+                "title_source": title_source,
+                "changed_file_count": changed_files.len(),
+            }),
+        );
+    }
+}
+
+fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains('•')
+        || lower.contains("called ")
+        || lower.contains("ran ")
+        || lower.contains("edited ")
+        || lower.contains("created ")
+        || lower.contains("updated ")
+        || lower.contains("modified ")
+        || lower.contains("i'll ")
+        || lower.contains("i’ll ")
+        || lower.contains("i will ")
+        || lower.contains("i'm ")
+        || lower.contains("i’m ")
+        || lower.contains("i am ")
+        || lower.contains("context refresh")
+}
+
+fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
+    text.contains("\n›")
+        || text.contains("\r›")
+        || text.contains("› ")
+        || text.contains("\n> ")
+        || text.contains("\r> ")
+}
+
+async fn cloud_mcp_observe_terminal_output(
+    state: CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    chunk: &[u8],
+) {
+    let text = String::from_utf8_lossy(chunk);
+    if !cloud_mcp_terminal_output_looks_active(&text) && !cloud_mcp_terminal_output_looks_ready(&text) {
+        return;
+    }
+
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let work_brief = cloud_mcp_extract_agent_work_brief(&text);
+    let (work_update, completion) = {
+        let mut runtime = state.inner.lock().await;
+        let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) else {
+            return;
+        };
+        if cloud_mcp_terminal_output_looks_active(&text) {
+            entry.saw_agent_activity = true;
+        }
+        let work_update = if let Some(brief) = work_brief.clone() {
+            if !entry.work_brief_reported && entry.work_brief.trim().is_empty() {
+                entry.work_brief = brief.clone();
+            }
+            if entry.work_brief_reported {
+                None
+            } else if let Some(task_id) = entry.context_task_id.clone() {
+                entry.work_brief_reported = true;
+                Some((
+                    task_id,
+                    entry.repo_id.clone(),
+                    entry.agent_id.clone(),
+                    entry.lane.clone(),
+                    brief,
+                    entry.working_directory.clone(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
+        let completion = if entry.saw_agent_activity
+            && !entry.done_reported
+            && old_enough
+            && cloud_mcp_terminal_output_looks_ready(&text)
+            && entry.context_task_id.is_some()
+        {
+            entry.done_reported = true;
+            entry.context_task_id.clone().map(|task_id| {
+                (
+                    task_id,
+                    entry.repo_id.clone(),
+                    entry.agent_id.clone(),
+                    entry.lane.clone(),
+                    entry.last_prompt.clone(),
+                    entry.work_brief.clone(),
+                    entry.working_directory.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        (work_update, completion)
+    };
+
+    if let Some((task_id, repo_id, agent_id, lane, brief, working_directory)) = work_update {
+        let title = cloud_mcp_work_title_from_brief(&brief);
+        cloud_mcp_update_terminal_context_task(
+            &state,
+            &repo_id,
+            &agent_id,
+            &task_id,
+            "active",
+            &lane,
+            Some(&title),
+            Some("terminal_status"),
+            &brief,
+            &[],
+            &working_directory,
+            Some(pane_id),
         )
+        .await;
+    }
+
+    let Some((task_id, repo_id, agent_id, lane, _prompt, work_brief, working_directory)) = completion else {
+        return;
+    };
+    let scan_root = working_directory.clone();
+    let changed_files = match tauri::async_runtime::spawn_blocking(move || {
+        cloud_mcp_git_changed_files(&scan_root)
     })
     .await
-    .map_err(|error| format!("Unable to prepare Cloud MCP prompt plan context: {error}"))??;
-    let _ = cloud_mcp_register_prepared_workspace(state, prepared, reason).await?;
-
-    let payload = json!({
-        "source": "rust-diffforge-terminal-gate",
-        "objective": prompt,
-        "request_text": prompt,
-        "workspace_id": workspace_id,
-        "workspace_name": workspace_name,
-        "repo_path": root_display,
-        "prompt_hash": prompt_hash,
-        "requires_local_acceptance": true,
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let cloud_response = cloud_mcp_post_json_endpoint(state, "/v1/orchestration/proposals", &payload).await?;
-    let data = cloud_mcp_response_data(&cloud_response);
-    let run_id = data["run_id"]
-        .as_str()
-        .or_else(|| data["proposal_id"].as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Cloud MCP plan proposal response did not include run_id.".to_string())?
-        .to_string();
-    let gate = CloudMcpPlanGate {
-        root: root_display.clone(),
-        prompt_hash: prompt_hash.clone(),
-        prompt_preview: cloud_mcp_prompt_preview(prompt),
-        run_id: run_id.clone(),
-        local_run_id: String::new(),
-        status: "pending".to_string(),
-        plan: data["plan"].clone(),
-        cloud_response: cloud_response.clone(),
-        created_at_ms: cloud_mcp_now_ms(),
-        accepted_at_ms: None,
-    };
-    cloud_mcp_write_plan_gate(&root, &gate)?;
     {
-        let mut runtime = state.inner.lock().await;
-        runtime.plan_gates.insert(key, gate.clone());
-    }
+        Ok(files) => files,
+        Err(_) => Vec::new(),
+    };
+    let brief = format!("Finished terminal task: {}", cloud_mcp_work_subject(&work_brief));
+    cloud_mcp_update_terminal_context_task(
+        &state,
+        &repo_id,
+        &agent_id,
+        &task_id,
+        "done",
+        &lane,
+        None,
+        None,
+        &brief,
+        &changed_files,
+        &working_directory,
+        Some(pane_id),
+    )
+    .await;
     let _ = cloud_mcp_workspace_log(
-        &root,
-        "cloud_mcp.plan.proposal_created",
+        &working_directory,
+        "cloud_mcp.context_pack.task_done",
         "",
         "",
         json!({
-            "run_id": run_id,
-            "prompt_hash": prompt_hash,
-            "reason": reason,
-            "status": "pending",
+            "agent_id": clean_terminal_telemetry_text(&agent_id),
+            "pane_id": clean_terminal_telemetry_text(pane_id),
+            "instance_id": instance_id,
+            "repo_id": clean_terminal_telemetry_text(&repo_id),
+            "task_id": clean_terminal_telemetry_text(&task_id),
+            "source": "terminal_prompt_ready",
+            "changed_file_count": changed_files.len(),
         }),
     );
-    Ok(gate)
+
+    let mut runtime = state.inner.lock().await;
+    runtime.terminal_contexts.remove(&terminal_key);
 }
 
-async fn cloud_mcp_require_prompt_plan_accepted(
-    state: &CloudMcpState,
-    root: &Path,
-    prompt: &str,
-) -> Result<String, String> {
-    let prompt = prompt.trim();
-    let root_display = workspace_path_display(root);
-    let prompt_hash = cloud_mcp_prompt_hash(prompt);
-    let key = cloud_mcp_plan_key(&root_display, &prompt_hash);
-
-    if let Some(gate) = {
-        let runtime = state.inner.lock().await;
-        runtime.plan_gates.get(&key).cloned()
+async fn cloud_mcp_terminal_context_pack_for_prompt(
+    state: CloudMcpState,
+    pane_id: String,
+    instance_id: u64,
+    working_directory: PathBuf,
+    coordination: Option<TerminalCoordinationSession>,
+    prompt: String,
+) {
+    let prompt = cloud_mcp_clean_prompt_text(&prompt);
+    if prompt.trim().is_empty() {
+        return;
     }
-    .or_else(|| cloud_mcp_find_plan_gate_for_prompt(root, &prompt_hash))
+    let started_at = Instant::now();
+    let agent_id = cloud_mcp_terminal_agent_id(&pane_id, instance_id, coordination.as_ref());
+    let repo_id = cloud_mcp_terminal_repo_id(&working_directory, coordination.as_ref());
+    let terminal_key = cloud_mcp_terminal_key(&pane_id, instance_id);
     {
-        return match gate.status.as_str() {
-            "accepted" => Ok(cloud_mcp_enhanced_prompt(prompt, &gate)),
-            "pending" => Err(format!(
-                "Cloud MCP created plan {} for this prompt. Accept or reject it in the Policy tab before code can run.",
-                gate.run_id
-            )),
-            "rejected" => Err(format!(
-                "Cloud MCP plan {} was rejected. Revise the request before running code.",
-                gate.run_id
-            )),
-            _ => Err(format!(
-                "Cloud MCP plan {} is {}. Accept it before running code.",
-                gate.run_id, gate.status
-            )),
-        };
+        let mut runtime = state.inner.lock().await;
+        runtime.terminal_contexts.insert(
+            terminal_key.clone(),
+            CloudMcpTerminalContextState {
+                last_prompt: prompt.clone(),
+                repo_id: repo_id.clone(),
+                agent_id: agent_id.clone(),
+                lane: String::new(),
+                working_directory: working_directory.clone(),
+                created_ms: cloud_mcp_now_ms(),
+                last_changed_hash: String::new(),
+                last_checkpoint_ms: 0,
+                context_task_id: None,
+                reported_change: false,
+                stable_change_cycles: 0,
+                saw_agent_activity: false,
+                work_brief: String::new(),
+                work_brief_reported: false,
+                done_reported: false,
+            },
+        );
     }
 
-    let gate = cloud_mcp_prepare_task_plan_for_prompt(state, root, prompt, "terminal_prompt_gate").await?;
-    Err(format!(
-        "Cloud MCP created plan {} for this prompt. Open the Policy tab, review it, then Accept before the terminal sends this to the agent.",
-        gate.run_id
-    ))
-}
+    if let Err(error) = cloud_mcp_connected_or_connect(&state, "terminal_context_pack").await {
+        let _ = cloud_mcp_workspace_log(
+            &working_directory,
+            "cloud_mcp.context_pack.error",
+            "",
+            "",
+            json!({
+                "agent_id": agent_id,
+                "pane_id": pane_id,
+                "instance_id": instance_id,
+                "error": clean_terminal_telemetry_text(&error),
+            }),
+        );
+        return;
+    }
 
-fn cloud_mcp_adopt_plan_locally(
-    root: &Path,
-    cloud_run_id: &str,
-    objective: &str,
-    plan: &Value,
-    endpoint_url: &str,
-) -> Result<Value, String> {
-    let kernel = crate::coordination::CoordinationKernel::init(root, None)?;
-    let _ = kernel.update_cloud_orchestrator_config(&json!({
-        "enabled": true,
-        "mode": "http_stub",
-        "endpoint_url": endpoint_url,
-        "context_export_policy": "redacted_summaries",
-        "auto_create_tasks": true,
-        "auto_assign_agents": true,
-        "auto_spawn_terminals": false,
-        "allow_code_export": false,
-        "allow_terminal_log_export": false,
-        "allow_patch_export": false,
-    }))?;
-    let local_run = kernel.create_orchestration_run(
-        objective,
-        Some(json!({
-            "source": "cloud_mcp",
-            "cloud_run_id": cloud_run_id,
-            "requires_human_acceptance": true,
+    let initial_lane = "general-implementation".to_string();
+    if let Some(context_task_id) = cloud_mcp_create_terminal_context_task(
+        &state,
+        &repo_id,
+        &agent_id,
+        &initial_lane,
+        &prompt,
+        &pane_id,
+        instance_id,
+        &working_directory,
+        coordination.as_ref(),
+    )
+    .await
+    {
+        let mut runtime = state.inner.lock().await;
+        if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+            entry.context_task_id = Some(context_task_id);
+            entry.lane = initial_lane;
+        }
+    }
+
+    let payload = json!({
+        "source": "rust-diffforge-terminal",
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "self_agent_id": agent_id,
+        "current_agent_id": agent_id,
+        "terminal_id": pane_id,
+        "terminal_instance_id": instance_id,
+        "prompt": prompt,
+        "record_prompt": true,
+        "workspace_root": workspace_path_display(&working_directory),
+        "coordination": coordination.as_ref().map(|coordination| json!({
+            "agent_id": coordination.agent_id.clone(),
+            "session_id": coordination.session_id.clone(),
+            "repo_path": coordination.repo_path.clone(),
         })),
-    )?;
-    let local_run_id = local_run["data"]["run_id"]
-        .as_str()
-        .ok_or_else(|| "Local orchestration run did not include run_id.".to_string())?
-        .to_string();
-    let imported = kernel.import_orchestration_plan(&local_run_id, plan)?;
-    let adopted = kernel.adopt_orchestration_plan(&local_run_id)?;
-    let assignments = kernel.propose_agent_assignments(&local_run_id)?;
-    Ok(json!({
-        "local_run_id": local_run_id,
-        "local_run": local_run,
-        "imported": imported,
-        "adopted": adopted,
-        "assignments": assignments,
-    }))
-}
-
-async fn cloud_mcp_post_sync(state: &CloudMcpState, payload: &Value) -> Result<Value, String> {
-    let mut last_error = String::new();
-    for endpoint in ["/v1/sync/push", "/v1/sync/once"] {
-        match cloud_mcp_post_json_endpoint(state, endpoint, payload).await {
-            Ok(value) => return Ok(value),
-            Err(error) => last_error = error,
-        }
-    }
-
-    Err(last_error)
-}
-
-async fn cloud_mcp_register_prepared_workspace(
-    state: &CloudMcpState,
-    prepared: CloudMcpPreparedWorkspace,
-    reason: &str,
-) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
-    cloud_mcp_connected_or_connect(state, reason).await?;
-    let register_started_at = Instant::now();
-    let policy_graph_detected = prepared.policy_graph.is_some();
-    let policy_graph_path = prepared.policy_graph_path.clone();
-    let file_count = prepared.filetree.len();
-    let log_path = cloud_mcp_workspace_log(
-        &prepared.root,
-        "cloud_mcp.workspace.registration.start",
-        &prepared.workspace_id,
-        &prepared.workspace_name,
-        json!({
-            "reason": reason,
-            "file_count": file_count,
-            "filetree_truncated": prepared.filetree_truncated,
-            "policy_graph_detected": policy_graph_detected,
-            "policy_graph_path": policy_graph_path,
-        }),
-    )?;
-
-    let payload = json!({
-        "source": "rust-diffforge",
-        "client_id": env::var("RUST_DIFFFORGE_CLIENT_ID").unwrap_or_else(|_| "rust-diffforge-local".to_string()),
-        "reason": reason,
-        "workspace_id": prepared.workspace_id.clone(),
-        "workspace_name": prepared.workspace_name.clone(),
-        "repo_path": prepared.root_display.clone(),
-        "workspace_root": prepared.root_display.clone(),
-        "directory": prepared.root_display.clone(),
-        "root": prepared.root_display.clone(),
-        "filetree": {
-            "root": prepared.root_display.clone(),
-            "entries": prepared.filetree.clone(),
-            "truncated": prepared.filetree_truncated,
-        },
-        "files": prepared.filetree.clone(),
-        "policy_graph_detected": policy_graph_detected,
-        "policy_graph_path": policy_graph_path.clone(),
-        "policy_graph": prepared.policy_graph.clone(),
-        "todo_queue": prepared.todo_queue.clone(),
         "ts_ms": cloud_mcp_now_ms(),
     });
 
-    let server_response = match cloud_mcp_post_sync(state, &payload).await {
-        Ok(value) => value,
-        Err(error) => {
-            let workspace = CloudMcpWorkspaceStatus {
-                root: prepared.root_display.clone(),
-                workspace_id: prepared.workspace_id.clone(),
-                workspace_name: prepared.workspace_name.clone(),
-                last_registered_ms: None,
-                last_synced_ms: None,
-                last_error: error.clone(),
-                file_count,
-                policy_graph_detected,
-                policy_graph_path: policy_graph_path.clone(),
-            };
-
-            {
-                let mut runtime = state.inner.lock().await;
-                runtime
-                    .registered_workspaces
-                    .insert(prepared.root_display.clone(), workspace);
-            }
-
+    match cloud_mcp_post_json_endpoint(&state, "/v1/context/pack", &payload).await {
+        Ok(response) => {
+            let data = cloud_mcp_response_data(&response);
+            let suggested_lane = data["suggested_lane"].as_str().unwrap_or_default().to_string();
+            let active_agent_count = data["snapshot"]["active_agents"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let lane_conflict_count = data["lane_conflicts"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
             let _ = cloud_mcp_workspace_log(
-                &prepared.root,
-                "cloud_mcp.workspace.registration.error",
-                &prepared.workspace_id,
-                &prepared.workspace_name,
+                &working_directory,
+                "cloud_mcp.context_pack.prompt_started",
+                "",
+                "",
                 json!({
-                    "reason": reason,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "elapsed_ms": register_started_at.elapsed().as_secs_f64() * 1000.0,
+                    "agent_id": agent_id,
+                    "pane_id": pane_id,
+                    "instance_id": instance_id,
+                    "repo_id": repo_id,
+                    "suggested_lane": suggested_lane,
+                    "active_agent_count": active_agent_count,
+                    "lane_conflict_count": lane_conflict_count,
+                    "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
                 }),
             );
-            log_terminal_event(
-                "cloud_mcp.workspace.registration.error",
-                None,
-                None,
-                Some(register_started_at.elapsed()),
-                json!({
-                    "root": clean_terminal_telemetry_text(&prepared.root_display),
-                    "workspace_id": clean_terminal_telemetry_text(&prepared.workspace_id),
-                    "reason": clean_terminal_telemetry_text(reason),
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-
-            return Err(format!(
-                "Cloud MCP workspace registration failed for {}: {error}",
-                prepared.root_display
-            ));
+            let context_task_id = {
+                let mut runtime = state.inner.lock().await;
+                if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+                    entry.lane = suggested_lane.clone();
+                    entry.context_task_id.clone()
+                } else {
+                    None
+                }
+            };
+            let context_task_id = if context_task_id.is_some() {
+                context_task_id
+            } else {
+                cloud_mcp_create_terminal_context_task(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    &suggested_lane,
+                    payload["prompt"].as_str().unwrap_or_default(),
+                    &pane_id,
+                    instance_id,
+                    &working_directory,
+                    coordination.as_ref(),
+                )
+                .await
+            };
+            if let Some(context_task_id) = context_task_id {
+                let pending_work_brief = {
+                    let mut runtime = state.inner.lock().await;
+                    if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+                        entry.context_task_id = Some(context_task_id.clone());
+                        entry.lane = suggested_lane.clone();
+                        if !entry.work_brief_reported && !entry.work_brief.trim().is_empty() {
+                            entry.work_brief_reported = true;
+                            Some(entry.work_brief.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(brief) = pending_work_brief {
+                    let title = cloud_mcp_work_title_from_brief(&brief);
+                    cloud_mcp_update_terminal_context_task(
+                        &state,
+                        &repo_id,
+                        &agent_id,
+                        &context_task_id,
+                        "active",
+                        &suggested_lane,
+                        Some(&title),
+                        Some("terminal_status"),
+                        &brief,
+                        &[],
+                        &working_directory,
+                        Some(&pane_id),
+                    )
+                    .await;
+                }
+            }
+            cloud_mcp_claim_terminal_lane(
+                &state,
+                &repo_id,
+                &agent_id,
+                &suggested_lane,
+                payload["prompt"].as_str().unwrap_or_default(),
+                &working_directory,
+                coordination.as_ref(),
+            )
+            .await;
+            let tracker_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                cloud_mcp_track_terminal_file_changes(
+                    tracker_state,
+                    terminal_key,
+                    pane_id,
+                    instance_id,
+                    working_directory,
+                    coordination,
+                    repo_id,
+                    agent_id,
+                    suggested_lane,
+                )
+                .await;
+            });
         }
-    };
+        Err(error) => {
+            let _ = cloud_mcp_workspace_log(
+                &working_directory,
+                "cloud_mcp.context_pack.prompt_error",
+                "",
+                "",
+                json!({
+                    "agent_id": agent_id,
+                    "pane_id": pane_id,
+                    "instance_id": instance_id,
+                    "repo_id": repo_id,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
+        }
+    }
+}
 
-    let now_ms = cloud_mcp_now_ms();
-    let workspace = CloudMcpWorkspaceStatus {
-        root: prepared.root_display.clone(),
-        workspace_id: prepared.workspace_id.clone(),
-        workspace_name: prepared.workspace_name.clone(),
-        last_registered_ms: Some(now_ms),
-        last_synced_ms: Some(now_ms),
-        last_error: String::new(),
-        file_count,
-        policy_graph_detected,
-        policy_graph_path: policy_graph_path.clone(),
-    };
-
-    let status = {
-        let mut runtime = state.inner.lock().await;
-        runtime.connected = true;
-        runtime.status = "connected".to_string();
-        runtime.last_error.clear();
-        runtime.last_connected_ms = Some(now_ms);
-        runtime
-            .registered_workspaces
-            .insert(prepared.root_display.clone(), workspace.clone());
-        cloud_mcp_snapshot(&runtime)
-    };
-
-    let _ = cloud_mcp_workspace_log(
-        &prepared.root,
-        "cloud_mcp.workspace.registration.done",
-        &prepared.workspace_id,
-        &prepared.workspace_name,
-        json!({
-            "reason": reason,
-            "file_count": file_count,
-            "filetree_truncated": prepared.filetree_truncated,
-            "policy_graph_detected": policy_graph_detected,
-            "policy_graph_path": policy_graph_path,
-            "elapsed_ms": register_started_at.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
-    log_terminal_event(
-        "cloud_mcp.workspace.registration.done",
-        None,
-        None,
-        Some(register_started_at.elapsed()),
-        json!({
-            "root": clean_terminal_telemetry_text(&prepared.root_display),
-            "workspace_id": clean_terminal_telemetry_text(&prepared.workspace_id),
-            "workspace_name": clean_terminal_telemetry_text(&prepared.workspace_name),
-            "reason": clean_terminal_telemetry_text(reason),
-            "file_count": file_count,
-            "policy_graph_detected": policy_graph_detected,
-        }),
-    );
-
-    Ok(CloudMcpWorkspaceRegistrationResult {
-        status,
-        workspace,
-        server_response,
-        synced: true,
-        log_path: workspace_path_display(&log_path),
-        message: format!("Cloud MCP registered and synced {}", prepared.root_display),
-    })
+async fn cloud_mcp_track_terminal_file_changes(
+    state: CloudMcpState,
+    terminal_key: String,
+    pane_id: String,
+    instance_id: u64,
+    working_directory: PathBuf,
+    coordination: Option<TerminalCoordinationSession>,
+    repo_id: String,
+    agent_id: String,
+    lane: String,
+) {
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let scan_root = working_directory.clone();
+        let changed_files = match tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_git_changed_files(&scan_root)
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(_) => Vec::new(),
+        };
+        let changed_hash = if changed_files.is_empty() {
+            String::new()
+        } else {
+            cloud_mcp_short_hash(&serde_json::to_string(&changed_files).unwrap_or_default())
+        };
+        let Some((should_report, should_complete, context_task_id, work_brief)) = ({
+            let mut runtime = state.inner.lock().await;
+            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+                let context_task_id = entry.context_task_id.clone();
+                let work_brief = entry.work_brief.clone();
+                if changed_hash.is_empty() {
+                    entry.last_changed_hash.clear();
+                    entry.stable_change_cycles = 0;
+                    Some((false, false, context_task_id, work_brief))
+                } else if entry.last_changed_hash == changed_hash {
+                    if entry.reported_change {
+                        entry.stable_change_cycles = entry.stable_change_cycles.saturating_add(1);
+                    }
+                    Some((
+                        false,
+                        entry.reported_change && !entry.done_reported && entry.stable_change_cycles >= 4,
+                        context_task_id,
+                        work_brief,
+                    ))
+                } else {
+                    entry.last_changed_hash = changed_hash.clone();
+                    entry.last_checkpoint_ms = cloud_mcp_now_ms();
+                    entry.reported_change = true;
+                    entry.stable_change_cycles = 0;
+                    Some((true, false, context_task_id, work_brief))
+                }
+            } else {
+                None
+            }
+        }) else {
+            break;
+        };
+        let work_subject = cloud_mcp_work_subject(&work_brief);
+        let fallback_title = if work_brief.trim().is_empty() {
+            cloud_mcp_title_from_changed_files(&changed_files)
+        } else {
+            None
+        };
+        if should_complete {
+            if let Some(task_id) = context_task_id.as_deref() {
+                let brief = format!(
+                    "Finished file changes for: {}",
+                    fallback_title.as_deref().unwrap_or(&work_subject)
+                );
+                cloud_mcp_update_terminal_context_task(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    task_id,
+                    "done",
+                    &lane,
+                    fallback_title.as_deref(),
+                    fallback_title.as_deref().map(|_| "file_change_fallback"),
+                    &brief,
+                    &changed_files,
+                    &working_directory,
+                    Some(&pane_id),
+                )
+                .await;
+                let _ = cloud_mcp_workspace_log(
+                    &working_directory,
+                    "cloud_mcp.context_pack.task_done",
+                    "",
+                    "",
+                    json!({
+                        "agent_id": agent_id,
+                        "pane_id": pane_id,
+                        "instance_id": instance_id,
+                        "repo_id": repo_id,
+                        "task_id": task_id,
+                        "changed_file_count": changed_files.len(),
+                    }),
+                );
+            }
+            let mut runtime = state.inner.lock().await;
+            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+                entry.done_reported = true;
+            }
+            runtime.terminal_contexts.remove(&terminal_key);
+            break;
+        }
+        if !should_report {
+            continue;
+        }
+        if cloud_mcp_connected_or_connect(&state, "terminal_subtask_checkpoint").await.is_err() {
+            continue;
+        }
+        let brief = format!(
+            "Updated {} file(s) while working on: {}",
+            changed_files.len(),
+            fallback_title.as_deref().unwrap_or(&work_subject)
+        );
+        let payload = json!({
+            "source": "rust-diffforge-terminal",
+            "repo_id": repo_id,
+            "agent_id": agent_id,
+            "self_agent_id": agent_id,
+            "current_agent_id": agent_id,
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
+            "task_id": context_task_id,
+            "subtask": work_subject,
+            "brief": brief,
+            "changed_files": changed_files,
+            "agent_status": "active",
+            "workspace_root": workspace_path_display(&working_directory),
+            "metadata": {
+                "session_id": coordination.as_ref().map(|coordination| coordination.session_id.clone()),
+                "change_hash": changed_hash,
+            },
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        match cloud_mcp_post_json_endpoint(&state, "/v1/context/subtasks/checkpoint", &payload).await {
+            Ok(response) => {
+                if let Some(task_id) = payload["task_id"].as_str() {
+                    cloud_mcp_update_terminal_context_task(
+                        &state,
+                        &repo_id,
+                        &agent_id,
+                        task_id,
+                        "active",
+                        &lane,
+                        fallback_title.as_deref(),
+                        fallback_title.as_deref().map(|_| "file_change_fallback"),
+                        &brief,
+                        payload["changed_files"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+                        &working_directory,
+                        Some(&pane_id),
+                    )
+                    .await;
+                }
+                let data = cloud_mcp_response_data(&response);
+                let other_agent_count = data["other_agents"].as_array().map(Vec::len).unwrap_or(0);
+                let lane_conflict_count = data["lane_conflicts"].as_array().map(Vec::len).unwrap_or(0);
+                let _ = cloud_mcp_workspace_log(
+                    &working_directory,
+                    "cloud_mcp.context_pack.subtask_checkpoint",
+                    "",
+                    "",
+                    json!({
+                        "agent_id": agent_id,
+                        "pane_id": pane_id,
+                        "instance_id": instance_id,
+                        "repo_id": repo_id,
+                        "changed_file_count": payload["changed_files"].as_array().map(Vec::len).unwrap_or(0),
+                        "other_agent_count": other_agent_count,
+                        "lane_conflict_count": lane_conflict_count,
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = cloud_mcp_workspace_log(
+                    &working_directory,
+                    "cloud_mcp.context_pack.subtask_checkpoint_error",
+                    "",
+                    "",
+                    json!({
+                        "agent_id": agent_id,
+                        "pane_id": pane_id,
+                        "instance_id": instance_id,
+                        "repo_id": repo_id,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+            }
+        }
+    }
 }
 
 async fn require_cloud_mcp_terminal_gate(
@@ -1278,42 +1969,10 @@ async fn require_cloud_mcp_terminal_gate(
     workspace_id: Option<&str>,
     workspace_name: Option<&str>,
 ) -> Result<CloudMcpStatus, String> {
-    let status = require_cloud_mcp_connected_state(state).await?;
-    let root = resolve_workspace_root_directory(working_directory)?;
-    let root_display = workspace_path_display(&root);
-    let already_registered = {
-        let runtime = state.inner.lock().await;
-        runtime
-            .registered_workspaces
-            .get(&root_display)
-            .is_some_and(|workspace| workspace.last_registered_ms.is_some() && workspace.last_error.is_empty())
-    };
-
-    if already_registered {
-        log_terminal_event(
-            "cloud_mcp.terminal_gate.reuse",
-            None,
-            None,
-            None,
-            json!({
-                "root": clean_terminal_telemetry_text(&root_display),
-                "workspace_id": workspace_id.map(clean_terminal_telemetry_text),
-            }),
-        );
-        return Ok(status);
-    }
-
-    let workspace_id = workspace_id.map(ToOwned::to_owned);
-    let workspace_name = workspace_name.map(ToOwned::to_owned);
-    let prepared = tauri::async_runtime::spawn_blocking(move || {
-        cloud_mcp_prepare_workspace_from_root(root, workspace_id, workspace_name)
-    })
-    .await
-    .map_err(|error| format!("Unable to prepare Cloud MCP workspace gate: {error}"))??;
-
-    cloud_mcp_register_prepared_workspace(state, prepared, "terminal_gate")
-        .await
-        .map(|result| result.status)
+    let _ = working_directory;
+    let _ = workspace_id;
+    let _ = workspace_name;
+    Ok(cloud_mcp_status_snapshot(state).await)
 }
 
 async fn require_cloud_mcp_terminal_gate_for_path(
@@ -1373,285 +2032,6 @@ async fn cloud_mcp_sync_workspace(
     cloud_mcp_register_prepared_workspace(state.inner(), prepared, "workspace_sync").await
 }
 
-fn cloud_mcp_extract_proposal_id(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for key in ["proposal_id", "proposalId", "activeProposalId", "active_proposal_id"] {
-                if let Some(id) = map.get(key).and_then(Value::as_str) {
-                    if !id.trim().is_empty() {
-                        return Some(id.trim().to_string());
-                    }
-                }
-            }
-
-            map.values().find_map(cloud_mcp_extract_proposal_id)
-        }
-        Value::Array(values) => values.iter().find_map(cloud_mcp_extract_proposal_id),
-        _ => None,
-    }
-}
-
-#[tauri::command]
-async fn cloud_mcp_get_policy(
-    state: State<'_, CloudMcpState>,
-    repo_path: Option<String>,
-    workspace_id: Option<String>,
-) -> Result<CloudMcpPolicyResult, String> {
-    let status = cloud_mcp_connected_or_connect(state.inner(), "policy_fetch").await?;
-    let policy_graph = cloud_mcp_get_json_optional(state.inner(), "/v1/policy/graph").await;
-    let proposals = cloud_mcp_get_json_optional(state.inner(), "/v1/policy/proposals").await;
-    let orchestration = cloud_mcp_get_json_optional(state.inner(), "/v1/orchestration/kanban").await;
-    let alignment_report = cloud_mcp_get_json_optional(state.inner(), "/v1/alignment/report").await;
-    let server_status = cloud_mcp_get_json_optional(state.inner(), "/v1/status").await;
-    let proposal_id = cloud_mcp_extract_proposal_id(&proposals)
-        .or_else(|| cloud_mcp_extract_proposal_id(&policy_graph))
-        .or_else(|| cloud_mcp_extract_proposal_id(&alignment_report))
-        .unwrap_or_default();
-
-    if let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) {
-        let workspace_id = workspace_id.unwrap_or_default();
-        let workspace_name = String::new();
-        if let Ok(root) = resolve_workspace_root_directory(Some(&repo_path)) {
-            let _ = cloud_mcp_workspace_log(
-                &root,
-                "cloud_mcp.policy.fetch",
-                &workspace_id,
-                &workspace_name,
-                json!({
-                    "proposal_id": proposal_id,
-                    "has_policy_graph": !policy_graph.is_null(),
-                    "has_policy_proposals": !proposals.is_null(),
-                    "has_orchestration": !orchestration.is_null(),
-                    "has_alignment_report": !alignment_report.is_null(),
-                }),
-            );
-        }
-    }
-
-    Ok(CloudMcpPolicyResult {
-        status,
-        policy_graph,
-        proposals,
-        orchestration,
-        alignment_report,
-        server_status,
-        proposal_id,
-        message: "Policy fetched from Cloud MCP.".to_string(),
-    })
-}
-
-#[tauri::command]
-async fn cloud_mcp_prepare_task_plan(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    objective: String,
-) -> Result<CloudMcpPlanResult, String> {
-    let root = tauri::async_runtime::spawn_blocking(move || {
-        resolve_workspace_root_directory(Some(&repo_path))
-    })
-    .await
-    .map_err(|error| format!("Unable to resolve Cloud MCP plan root: {error}"))??;
-    let gate = cloud_mcp_prepare_task_plan_for_prompt(
-        state.inner(),
-        &root,
-        &objective,
-        "manual_plan_request",
-    )
-    .await?;
-    let status = cloud_mcp_status_snapshot(state.inner()).await;
-    Ok(CloudMcpPlanResult {
-        status,
-        run_id: gate.run_id,
-        prompt_hash: gate.prompt_hash,
-        cloud_response: gate.cloud_response,
-        message: "Cloud MCP plan proposal created. Review it in Policy before agents run code."
-            .to_string(),
-    })
-}
-
-#[tauri::command]
-async fn cloud_mcp_decide_plan(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    decision: String,
-    run_id: String,
-) -> Result<CloudMcpPlanDecisionResult, String> {
-    let normalized_decision = decision.trim().to_ascii_lowercase();
-    if !matches!(normalized_decision.as_str(), "accept" | "reject") {
-        return Err("Cloud MCP plan decision must be accept or reject.".to_string());
-    }
-    let run_id = run_id.trim().to_string();
-    if run_id.is_empty() {
-        return Err("Cloud MCP plan run_id is required.".to_string());
-    }
-    let root = tauri::async_runtime::spawn_blocking(move || {
-        resolve_workspace_root_directory(Some(&repo_path))
-    })
-    .await
-    .map_err(|error| format!("Unable to resolve Cloud MCP plan decision root: {error}"))??;
-    let recorded_at_ms = cloud_mcp_now_ms();
-    let endpoint = if normalized_decision == "accept" {
-        format!("/v1/orchestration/runs/{run_id}/accept")
-    } else {
-        format!("/v1/orchestration/runs/{run_id}/reject")
-    };
-    let server_response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        &endpoint,
-        &json!({
-            "source": "rust-diffforge",
-            "decision": normalized_decision,
-            "reason": "User decision from rust-diffforge Cloud MCP dock.",
-            "ts_ms": recorded_at_ms,
-        }),
-    )
-    .await?;
-
-    let root_display = workspace_path_display(&root);
-    let mut gate = {
-        let runtime = state.inner.lock().await;
-        runtime
-            .plan_gates
-            .values()
-            .find(|gate| gate.root == root_display && gate.run_id == run_id)
-            .cloned()
-    }
-    .or_else(|| cloud_mcp_read_plan_gate(&root, &run_id))
-    .ok_or_else(|| {
-        format!(
-            "Cloud MCP plan {run_id} was not found locally. Recreate the plan from the terminal prompt before accepting."
-        )
-    })?;
-
-    let local_adoption = if normalized_decision == "accept" {
-        let base_url = {
-            let runtime = state.inner.lock().await;
-            runtime.base_url.clone()
-        };
-        let adoption = cloud_mcp_adopt_plan_locally(
-            &root,
-            &run_id,
-            &gate.prompt_preview,
-            &gate.plan,
-            &base_url,
-        )?;
-        gate.status = "accepted".to_string();
-        gate.accepted_at_ms = Some(recorded_at_ms);
-        gate.local_run_id = adoption["local_run_id"].as_str().unwrap_or_default().to_string();
-        adoption
-    } else {
-        gate.status = "rejected".to_string();
-        json!({"status": "rejected"})
-    };
-
-    cloud_mcp_write_plan_gate(&root, &gate)?;
-    {
-        let mut runtime = state.inner.lock().await;
-        let key = cloud_mcp_plan_key(&gate.root, &gate.prompt_hash);
-        runtime.plan_gates.insert(key, gate.clone());
-    }
-    let _ = cloud_mcp_workspace_log(
-        &root,
-        "cloud_mcp.plan.decision",
-        "",
-        "",
-        json!({
-            "run_id": run_id,
-            "decision": normalized_decision,
-            "status": gate.status,
-            "local_run_id": gate.local_run_id,
-        }),
-    );
-    let status = cloud_mcp_status_snapshot(state.inner()).await;
-    Ok(CloudMcpPlanDecisionResult {
-        status,
-        decision: normalized_decision.clone(),
-        run_id,
-        server_response,
-        local_adoption,
-        recorded_at_ms,
-        message: if normalized_decision == "accept" {
-            "Cloud MCP plan accepted and adopted into the local coordination kernel. The matching terminal prompt can now run.".to_string()
-        } else {
-            "Cloud MCP plan rejected. Revise the prompt before running code.".to_string()
-        },
-    })
-}
-
-#[tauri::command]
-async fn cloud_mcp_decide_policy(
-    state: State<'_, CloudMcpState>,
-    repo_path: Option<String>,
-    workspace_id: Option<String>,
-    decision: String,
-    proposal_id: Option<String>,
-) -> Result<CloudMcpDecisionResult, String> {
-    let normalized_decision = decision.trim().to_ascii_lowercase();
-    if !matches!(normalized_decision.as_str(), "accept" | "reject") {
-        return Err("Policy decision must be accept or reject.".to_string());
-    }
-
-    let status = cloud_mcp_connected_or_connect(state.inner(), "policy_decision").await?;
-    let proposal_id = proposal_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    let recorded_at_ms = cloud_mcp_now_ms();
-
-    let server_response = if proposal_id.is_empty() {
-        Value::Null
-    } else {
-        let endpoint = if normalized_decision == "accept" {
-            format!("/v1/policy/proposals/{proposal_id}/accept")
-        } else {
-            format!("/v1/policy/proposals/{proposal_id}/reject")
-        };
-        cloud_mcp_post_json_endpoint(
-            state.inner(),
-            &endpoint,
-            &json!({
-                "source": "rust-diffforge",
-                "decision": normalized_decision,
-                "workspace_id": workspace_id.clone(),
-                "repo_path": repo_path.clone(),
-                "ts_ms": recorded_at_ms,
-            }),
-        )
-        .await?
-    };
-
-    if let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) {
-        if let Ok(root) = resolve_workspace_root_directory(Some(&repo_path)) {
-            let _ = cloud_mcp_workspace_log(
-                &root,
-                "cloud_mcp.policy.decision",
-                workspace_id.as_deref().unwrap_or_default(),
-                "",
-                json!({
-                    "decision": normalized_decision,
-                    "proposal_id": proposal_id,
-                    "server_backed": !proposal_id.is_empty(),
-                }),
-            );
-        }
-    }
-
-    Ok(CloudMcpDecisionResult {
-        status,
-        decision: normalized_decision,
-        proposal_id: proposal_id.clone(),
-        server_response,
-        recorded_at_ms,
-        message: if proposal_id.is_empty() {
-            "Policy decision recorded locally; no server proposal id was present.".to_string()
-        } else {
-            "Policy decision sent to Cloud MCP.".to_string()
-        },
-    })
-}
-
 #[tauri::command]
 async fn cloud_mcp_get_todo(
     state: State<'_, CloudMcpState>,
@@ -1706,16 +2086,22 @@ async fn cloud_mcp_save_todo(
     if cloud_mcp_connected_or_connect(state.inner(), "todo_sync").await.is_ok() {
         let payload = json!({
             "source": "rust-diffforge",
-            "reason": "todo_queue_save",
-            "workspace_id": workspace_id.clone(),
-            "workspace_name": workspace_name.clone(),
-            "repo_path": root_display.clone(),
-            "workspace_root": root_display.clone(),
-            "todo_queue": text.clone(),
-            "ts_ms": saved_at_ms,
+            "repo_id": format!("repo-{}", cloud_mcp_short_hash(&root_display)),
+            "agent_id": "rust-diffforge",
+            "event_kind": "todo_queue_saved",
+            "summary": "Local To Do Queue saved from rust-diffforge.",
+            "payload": {
+                "reason": "todo_queue_save",
+                "workspace_id": workspace_id.clone(),
+                "workspace_name": workspace_name.clone(),
+                "repo_path": root_display.clone(),
+                "workspace_root": root_display.clone(),
+                "todo_queue": text.clone(),
+                "ts_ms": saved_at_ms,
+            }
         });
 
-        match cloud_mcp_post_sync(state.inner(), &payload).await {
+        match cloud_mcp_post_json_endpoint(state.inner(), "/v1/context/history/events", &payload).await {
             Ok(_) => synced = true,
             Err(error) => last_error = error,
         }
@@ -1730,5 +2116,596 @@ async fn cloud_mcp_save_todo(
         saved_at_ms: Some(saved_at_ms),
         synced,
         last_error,
+    })
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
+    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let log_path = root
+        .join(".agents")
+        .join("cloud-mcp")
+        .join("cloud-mcp.jsonl");
+
+    let mut entries: Vec<Value> = Vec::new();
+    if let Ok(file) = fs::File::open(&log_path) {
+        use std::io::BufRead as _;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().flatten() {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                entries.push(value);
+            }
+        }
+    }
+
+    let total = entries.len();
+    if entries.len() > 60 {
+        entries = entries.split_off(entries.len() - 60);
+    }
+    entries.reverse();
+
+    Ok(json!({
+        "ok": true,
+        "repoPath": root.to_string_lossy(),
+        "logPath": log_path.to_string_lossy(),
+        "total": total,
+        "entries": entries
+    }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_kanban(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let root_display = workspace_path_display(&root);
+    let repo_id = cloud_mcp_repo_id_for_root(&root);
+
+    cloud_mcp_connected_or_connect(state.inner(), "kanban_sync").await?;
+
+    let payload = json!({
+        "source": "rust-diffforge-kanban",
+        "repo_id": repo_id,
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "repo_path": root_display.clone(),
+        "workspace_root": root_display.clone(),
+        "workspace_id": workspace_id.clone(),
+        "workspace_name": workspace_name.clone(),
+        "prompt": "",
+        "record_prompt": false,
+        "history_limit": 40,
+        "task_limit": 250,
+        "agent_limit": 100,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    let response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/context/pack", &payload).await?;
+    let data = cloud_mcp_response_data(&response);
+    let snapshot = data.get("snapshot").cloned().unwrap_or_else(|| data.clone());
+
+    Ok(json!({
+        "ok": true,
+        "repoId": repo_id,
+        "repoPath": root_display,
+        "workspaceId": workspace_id,
+        "workspaceName": workspace_name,
+        "summary": data.get("summary").cloned().unwrap_or(Value::Null),
+        "taskBoard": snapshot.get("task_board").cloned().unwrap_or_else(|| json!({})),
+        "tasks": snapshot.get("tasks").cloned().unwrap_or_else(|| json!([])),
+        "activeAgents": snapshot.get("active_agents").cloned().unwrap_or_else(|| json!([])),
+        "laneClaims": snapshot.get("lane_claims").cloned().unwrap_or_else(|| json!([])),
+        "historyLedger": snapshot.get("history_ledger").cloned().unwrap_or_else(|| json!({})),
+        "sourceOfTruth": snapshot.get("source_of_truth").cloned().unwrap_or_else(|| json!({})),
+        "raw": data
+    }))
+}
+
+pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
+    let identity = CloudMcpProxyIdentity::from_args(&args);
+    let base_url = identity
+        .base_url
+        .clone()
+        .unwrap_or_else(|| CLOUD_MCP_DEFAULT_BASE_URL.to_string());
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+
+    loop {
+        let Some((body, framed)) = cloud_mcp_proxy_read_message(&mut reader)? else {
+            break;
+        };
+
+        let mut request = match serde_json::from_str::<Value>(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {
+                        "code": -32700,
+                        "message": format!("Cloud MCP proxy could not parse JSON-RPC request: {error}")
+                    }
+                })
+                .to_string();
+                cloud_mcp_proxy_write_message(&mut writer, &response, framed)?;
+                continue;
+            }
+        };
+
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let expects_response = request.get("id").is_some();
+        let tool_name = request
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(&method)
+            .to_string();
+
+        request = cloud_mcp_proxy_enrich_request(request, &identity);
+        identity.log("cloud_mcp.tool_call.start", &tool_name, json!({
+            "method": method,
+            "tool": tool_name,
+            "baseUrl": base_url
+        }));
+
+        match cloud_mcp_proxy_post_json(&base_url, &request.to_string()) {
+            Ok(response) => {
+                identity.log("cloud_mcp.tool_call.done", &tool_name, json!({
+                    "method": method,
+                    "tool": tool_name,
+                    "baseUrl": base_url
+                }));
+                if expects_response {
+                    cloud_mcp_proxy_write_message(&mut writer, &response, framed)?;
+                }
+            }
+            Err(error) => {
+                identity.log("cloud_mcp.tool_call.error", &tool_name, json!({
+                    "method": method,
+                    "tool": tool_name,
+                    "baseUrl": base_url,
+                    "error": error
+                }));
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!("Cloud MCP proxy could not reach Cloud MCP at {base_url}/mcp: {error}")
+                    }
+                })
+                .to_string();
+                if expects_response {
+                    cloud_mcp_proxy_write_message(&mut writer, &response, framed)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct CloudMcpProxyIdentity {
+    base_url: Option<String>,
+    repo_path: Option<PathBuf>,
+    repo_id: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    pane_id: Option<String>,
+    terminal_instance_id: Option<String>,
+    client_id: String,
+}
+
+impl CloudMcpProxyIdentity {
+    fn from_args(args: &[String]) -> Self {
+        let mut values = std::collections::HashMap::<String, String>::new();
+        let mut index = 0;
+        while index < args.len() {
+            if let Some(key) = args[index].strip_prefix("--") {
+                if let Some(value) = args.get(index + 1) {
+                    if !value.starts_with("--") {
+                        values.insert(key.to_string(), value.to_string());
+                        index += 2;
+                        continue;
+                    }
+                }
+                values.insert(key.to_string(), "true".to_string());
+            }
+            index += 1;
+        }
+
+        let repo_path = values
+            .get("repo-path")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_REPO_PATH").ok())
+            .or_else(|| env::current_dir().ok().map(|path| path.to_string_lossy().to_string()))
+            .map(PathBuf::from);
+
+        let repo_id = values
+            .get("repo-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_REPO_ID").ok());
+
+        let workspace_id = values
+            .get("workspace-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_WORKSPACE_ID").ok());
+
+        let workspace_name = values
+            .get("workspace-name")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_WORKSPACE_NAME").ok());
+
+        let agent_id = values
+            .get("agent-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_AGENT_ID").ok())
+            .or_else(|| env::var("DIFFFORGE_AGENT_ID").ok())
+            .or_else(|| env::var("COORDINATION_AGENT_ID").ok());
+
+        let session_id = values
+            .get("session-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_SESSION_ID").ok())
+            .or_else(|| env::var("DIFFFORGE_SESSION_ID").ok());
+
+        let pane_id = values
+            .get("pane-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_PANE_ID").ok())
+            .or_else(|| env::var("DIFFFORGE_PANE_ID").ok());
+
+        let terminal_instance_id = values
+            .get("terminal-instance-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_TERMINAL_INSTANCE_ID").ok())
+            .or_else(|| env::var("DIFFFORGE_TERMINAL_INSTANCE_ID").ok());
+
+        let base_url = values
+            .get("base-url")
+            .cloned()
+            .or_else(|| env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
+            .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok());
+
+        let client_id = values
+            .get("client-id")
+            .cloned()
+            .or_else(|| env::var("CLOUD_MCP_CLIENT_ID").ok())
+            .unwrap_or_else(|| "rust-diffforge-terminal".to_string());
+
+        Self {
+            base_url,
+            repo_path,
+            repo_id,
+            workspace_id,
+            workspace_name,
+            agent_id,
+            session_id,
+            pane_id,
+            terminal_instance_id,
+            client_id,
+        }
+    }
+
+    fn log(&self, phase: &str, tool_name: &str, fields: Value) {
+        let Some(repo_path) = self.repo_path.as_ref() else {
+            return;
+        };
+        let repo_path_text = repo_path.to_string_lossy().to_string();
+        let root = resolve_workspace_root_directory(Some(&repo_path_text))
+            .unwrap_or_else(|_| repo_path.clone());
+        let mut payload = serde_json::Map::new();
+        payload.insert("tool".to_string(), json!(tool_name));
+        payload.insert("clientId".to_string(), json!(self.client_id));
+        if let Some(repo_id) = self.repo_id.as_deref() {
+            payload.insert("repoId".to_string(), json!(repo_id));
+        }
+        if let Some(agent_id) = self.agent_id.as_deref() {
+            payload.insert("agentId".to_string(), json!(agent_id));
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            payload.insert("sessionId".to_string(), json!(session_id));
+        }
+        if let Some(pane_id) = self.pane_id.as_deref() {
+            payload.insert("paneId".to_string(), json!(pane_id));
+        }
+        if let Some(terminal_instance_id) = self.terminal_instance_id.as_deref() {
+            payload.insert("terminalInstanceId".to_string(), json!(terminal_instance_id));
+        }
+        if let Some(extra) = fields.as_object() {
+            for (key, value) in extra {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+
+        let _ = cloud_mcp_workspace_log(
+            &root,
+            phase,
+            self.workspace_id.as_deref().unwrap_or(""),
+            self.workspace_name.as_deref().unwrap_or(""),
+            Value::Object(payload),
+        );
+    }
+}
+
+fn cloud_mcp_proxy_read_message<R: std::io::BufRead>(
+    reader: &mut R,
+) -> Result<Option<(String, bool)>, String> {
+    use std::io::Read as _;
+
+    let mut first_line = String::new();
+    let bytes = reader
+        .read_line(&mut first_line)
+        .map_err(|error| format!("failed to read MCP stdin: {error}"))?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if first_line.trim().is_empty() {
+        return cloud_mcp_proxy_read_message(reader);
+    }
+
+    if !first_line.to_ascii_lowercase().starts_with("content-length:") {
+        return Ok(Some((first_line, false)));
+    }
+
+    let mut content_length = first_line
+        .split_once(':')
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .ok_or_else(|| "invalid MCP Content-Length header".to_string())?;
+
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .map_err(|error| format!("failed to read MCP header: {error}"))?;
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("content-length:") {
+            if let Some(length) = trimmed
+                .split_once(':')
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            {
+                content_length = length;
+            }
+        }
+    }
+
+    let mut body = vec![0_u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("failed to read MCP body: {error}"))?;
+    let body = String::from_utf8(body).map_err(|error| format!("invalid MCP UTF-8 body: {error}"))?;
+    Ok(Some((body, true)))
+}
+
+fn cloud_mcp_proxy_write_message<W: std::io::Write>(
+    writer: &mut W,
+    body: &str,
+    framed: bool,
+) -> Result<(), String> {
+    if framed {
+        write!(writer, "Content-Length: {}\r\n\r\n{}", body.as_bytes().len(), body)
+            .map_err(|error| format!("failed to write MCP response: {error}"))?;
+    } else {
+        writeln!(writer, "{body}").map_err(|error| format!("failed to write MCP response: {error}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("failed to flush MCP response: {error}"))
+}
+
+fn cloud_mcp_proxy_enrich_request(mut request: Value, identity: &CloudMcpProxyIdentity) -> Value {
+    if request.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return request;
+    }
+
+    if !request.get("params").map(Value::is_object).unwrap_or(false) {
+        request["params"] = json!({});
+    }
+
+    let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) else {
+        return request;
+    };
+    let arguments = params
+        .entry("arguments".to_string())
+        .or_insert_with(|| json!({}));
+    if !arguments.is_object() {
+        *arguments = json!({});
+    }
+
+    let Some(arguments) = arguments.as_object_mut() else {
+        return request;
+    };
+
+    cloud_mcp_proxy_insert_if_missing(arguments, "client_id", Some(identity.client_id.as_str()));
+    cloud_mcp_proxy_insert_if_missing(arguments, "repo_id", identity.repo_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "workspace_id", identity.workspace_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "workspace_name", identity.workspace_name.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "agent_id", identity.agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "self_agent_id", identity.agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "current_agent_id", identity.agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "actor", identity.agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "session_id", identity.session_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "desktop_session_id", identity.session_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "pane_id", identity.pane_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "paneId", identity.pane_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "terminal_id", identity.pane_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "terminal_instance_id", identity.terminal_instance_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "terminalInstanceId", identity.terminal_instance_id.as_deref());
+    if let Some(repo_path) = identity.repo_path.as_ref() {
+        let value = repo_path.to_string_lossy().to_string();
+        arguments
+            .entry("repo_path".to_string())
+            .or_insert_with(|| json!(value));
+    }
+
+    request
+}
+
+fn cloud_mcp_proxy_insert_if_missing(
+    arguments: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        arguments
+            .entry(key.to_string())
+            .or_insert_with(|| json!(value));
+    }
+}
+
+fn cloud_mcp_proxy_post_json(base_url: &str, body: &str) -> Result<String, String> {
+    use std::io::{Read as _, Write as _};
+
+    let endpoint = cloud_mcp_proxy_parse_http_url(base_url)?;
+    let mut stream = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let timeout = std::time::Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS as u64);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let mut headers = String::new();
+    if let Ok(token) = env::var("CLOUD_DIFFFORGE_DEV_TOKEN").or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN")) {
+        if !token.trim().is_empty() {
+            headers.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
+        }
+    }
+
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+        endpoint.path,
+        endpoint.host_header,
+        body.as_bytes().len(),
+        headers,
+        body
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write failed: {error}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read failed: {error}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response from Cloud MCP".to_string())?;
+    let head = String::from_utf8_lossy(&response[..header_end]).to_string();
+    let body = &response[header_end + 4..];
+    if !head.starts_with("HTTP/1.1 2") && !head.starts_with("HTTP/1.0 2") {
+        return Err(format!("Cloud MCP returned {}", head.lines().next().unwrap_or("non-2xx status")));
+    }
+    let body = if cloud_mcp_proxy_header_contains(&head, "transfer-encoding", "chunked") {
+        cloud_mcp_proxy_decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+    String::from_utf8(body).map_err(|error| format!("Cloud MCP returned invalid UTF-8: {error}"))
+}
+
+fn cloud_mcp_proxy_header_contains(head: &str, header_name: &str, expected_value: &str) -> bool {
+    let header_name = header_name.to_ascii_lowercase();
+    let expected_value = expected_value.to_ascii_lowercase();
+    head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case(&header_name)
+            && value.to_ascii_lowercase().contains(&expected_value)
+    })
+}
+
+fn cloud_mcp_proxy_decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut cursor = 0usize;
+    let mut decoded = Vec::new();
+
+    loop {
+        let line_end = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| "invalid chunked Cloud MCP response: missing chunk size".to_string())?;
+        let size_line = std::str::from_utf8(&body[cursor..line_end])
+            .map_err(|error| format!("invalid chunked Cloud MCP size line: {error}"))?;
+        let size_text = size_line
+            .split_once(';')
+            .map(|(size, _)| size)
+            .unwrap_or(size_line)
+            .trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|error| format!("invalid chunked Cloud MCP chunk size '{size_text}': {error}"))?;
+        cursor = line_end + 2;
+
+        if size == 0 {
+            break;
+        }
+        let chunk_end = cursor
+            .checked_add(size)
+            .ok_or_else(|| "invalid chunked Cloud MCP response: chunk size overflow".to_string())?;
+        if chunk_end + 2 > body.len() {
+            return Err("invalid chunked Cloud MCP response: chunk exceeds body".to_string());
+        }
+        decoded.extend_from_slice(&body[cursor..chunk_end]);
+        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err("invalid chunked Cloud MCP response: missing chunk terminator".to_string());
+        }
+        cursor = chunk_end + 2;
+    }
+
+    Ok(decoded)
+}
+
+#[derive(Clone, Debug)]
+struct CloudMcpProxyEndpoint {
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+fn cloud_mcp_proxy_parse_http_url(base_url: &str) -> Result<CloudMcpProxyEndpoint, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .ok_or_else(|| "Cloud MCP stdio proxy currently supports local http:// URLs only".to_string())?;
+    let (authority, prefix) = without_scheme
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((without_scheme, String::new()));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host.to_string(), port)))
+        .unwrap_or_else(|| (authority.to_string(), 80));
+    let path = format!("{}/mcp", prefix.trim_end_matches('/'));
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+
+    Ok(CloudMcpProxyEndpoint {
+        host,
+        host_header,
+        port,
+        path,
     })
 }

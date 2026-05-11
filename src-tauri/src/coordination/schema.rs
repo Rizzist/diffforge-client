@@ -6,7 +6,7 @@ pub const RUNTIME_GUARD_MIGRATION_VERSION: i64 = 3;
 pub const RUNTIME_GUARD_MIGRATION_NAME: &str = "coordination_kernel_runtime_guards";
 pub const APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION: i64 = 4;
 pub const APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME: &str =
-    "coordination_kernel_approval_sql_orchestration_alignment";
+    "coordination_kernel_approval_sql_context_pack_alignment";
 pub const MIGRATION_VERSION: i64 = 5;
 pub const MIGRATION_NAME: &str = "coordination_kernel_ui_cleanup_alignment";
 
@@ -59,8 +59,8 @@ CREATE TABLE IF NOT EXISTS agent_sessions(
   agent_id TEXT NOT NULL,
   agent_slot_id TEXT,
   task_id TEXT,
-  orchestration_run_id TEXT,
-  orchestration_role TEXT,
+  context_run_id TEXT,
+  context_role TEXT,
   pty_id TEXT,
   worktree_id TEXT,
   sandbox_db_id TEXT,
@@ -86,8 +86,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   claimed_by_agent_id TEXT,
   claimed_session_id TEXT,
   parent_task_id TEXT,
-  orchestration_run_id TEXT,
-  orchestration_plan_item_id TEXT,
+  context_run_id TEXT,
+  source_plan_item_id TEXT,
   assigned_role TEXT,
   expected_output TEXT,
   created_at TEXT NOT NULL,
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS events(
   session_id TEXT,
   resource_id TEXT,
   artifact_id TEXT,
-  orchestration_run_id TEXT,
+  context_run_id TEXT,
   payload_json TEXT,
   created_at TEXT NOT NULL
 );
@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS patches(
   status TEXT NOT NULL,
   risk_level INTEGER NOT NULL,
   validation_id TEXT,
-  orchestration_run_id TEXT,
+  context_run_id TEXT,
   diff_hash TEXT,
   summary TEXT,
   created_at TEXT NOT NULL,
@@ -301,6 +301,23 @@ CREATE TABLE IF NOT EXISTS merge_jobs(
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS merge_resolution_tasks(
+  id TEXT PRIMARY KEY,
+  merge_job_id TEXT NOT NULL,
+  patch_id TEXT NOT NULL,
+  resolution_task_id TEXT NOT NULL,
+  resolver_agent_id TEXT NOT NULL,
+  resolver_session_id TEXT NOT NULL,
+  resolver_worktree_id TEXT,
+  resolved_patch_id TEXT,
+  status TEXT NOT NULL,
+  changed_files_json TEXT NOT NULL,
+  cloud_context_json TEXT,
+  resolver_prompt TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifacts(
   id TEXT PRIMARY KEY,
   task_id TEXT,
@@ -345,7 +362,7 @@ CREATE TABLE IF NOT EXISTS memories(
   patch_id TEXT,
   db_change_request_id TEXT,
   migration_id TEXT,
-  orchestration_run_id TEXT,
+  context_run_id TEXT,
   created_by_agent_id TEXT,
   created_by_slot_id TEXT,
   certified_by TEXT,
@@ -379,8 +396,6 @@ CREATE TABLE IF NOT EXISTS repo_policies(
   no_git_write_policy TEXT NOT NULL DEFAULT 'coordination_only',
   merge_requires_clean_target INTEGER NOT NULL DEFAULT 1,
   merge_requires_human_for_unleased_override INTEGER NOT NULL DEFAULT 1,
-  cloud_orchestrator_enabled INTEGER NOT NULL DEFAULT 0,
-  cloud_orchestrator_mode TEXT NOT NULL DEFAULT 'disabled',
   cloud_context_export_policy TEXT NOT NULL DEFAULT 'local_only',
   cloud_allow_code_export INTEGER NOT NULL DEFAULT 0,
   cloud_allow_terminal_log_export INTEGER NOT NULL DEFAULT 0,
@@ -546,93 +561,6 @@ CREATE TABLE IF NOT EXISTS db_backfill_jobs(
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS cloud_orchestrator_configs(
-  id TEXT PRIMARY KEY,
-  repo_id TEXT NOT NULL,
-  enabled INTEGER NOT NULL DEFAULT 0,
-  mode TEXT NOT NULL DEFAULT 'disabled',
-  endpoint_url TEXT,
-  api_key_ref TEXT,
-  model_hint TEXT,
-  context_export_policy TEXT NOT NULL DEFAULT 'local_only',
-  allow_code_export INTEGER NOT NULL DEFAULT 0,
-  allow_terminal_log_export INTEGER NOT NULL DEFAULT 0,
-  allow_patch_export INTEGER NOT NULL DEFAULT 0,
-  auto_create_tasks INTEGER NOT NULL DEFAULT 0,
-  auto_assign_agents INTEGER NOT NULL DEFAULT 0,
-  auto_spawn_terminals INTEGER NOT NULL DEFAULT 0,
-  auto_merge INTEGER NOT NULL DEFAULT 0,
-  sync_interval_seconds INTEGER NOT NULL DEFAULT 0,
-  last_sync_at TEXT,
-  status TEXT NOT NULL DEFAULT 'disabled',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orchestration_runs(
-  id TEXT PRIMARY KEY,
-  repo_id TEXT NOT NULL,
-  objective TEXT NOT NULL,
-  status TEXT NOT NULL,
-  source TEXT NOT NULL,
-  cloud_run_id TEXT,
-  root_task_id TEXT,
-  context_snapshot_artifact_id TEXT,
-  plan_artifact_id TEXT,
-  summary TEXT,
-  created_by TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orchestration_plan_items(
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  parent_item_id TEXT,
-  task_id TEXT,
-  title TEXT NOT NULL,
-  body TEXT,
-  assigned_role TEXT,
-  priority INTEGER NOT NULL DEFAULT 0,
-  risk_level INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL,
-  required_resources_json TEXT,
-  expected_outputs_json TEXT,
-  depends_on_json TEXT,
-  contract_memory_ids_json TEXT,
-  qa_checks_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orchestration_agent_assignments(
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  plan_item_id TEXT,
-  task_id TEXT,
-  requested_agent_kind TEXT,
-  requested_agent_name TEXT,
-  assigned_agent_id TEXT,
-  session_id TEXT,
-  role TEXT NOT NULL,
-  status TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orchestration_messages(
-  id TEXT PRIMARY KEY,
-  run_id TEXT,
-  direction TEXT NOT NULL,
-  message_kind TEXT NOT NULL,
-  status TEXT NOT NULL,
-  redaction_level TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  artifact_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS cloud_context_exports(
   id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -676,6 +604,7 @@ CREATE INDEX IF NOT EXISTS idx_file_watchers_status ON file_watchers(status, upd
 CREATE INDEX IF NOT EXISTS idx_violations_status ON workspace_violations(status);
 CREATE INDEX IF NOT EXISTS idx_patches_status ON patches(status);
 CREATE INDEX IF NOT EXISTS idx_merge_jobs_status ON merge_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_merge_resolution_tasks_patch ON merge_resolution_tasks(patch_id, status);
 CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_artifact ON artifact_storage_logs(artifact_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifact_storage_logs_status ON artifact_storage_logs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(memory_kind, trust_level);

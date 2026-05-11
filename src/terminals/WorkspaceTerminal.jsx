@@ -3223,7 +3223,7 @@ export default function WorkspaceTerminal({
         data: `${prompt}\r`,
       });
     } catch (error) {
-      setTerminalError(getErrorMessage(error, "Cloud MCP needs this plan accepted before execution."));
+      setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
     }
   }, [paneId, terminalClosed, terminalClosing]);
 

@@ -25,7 +25,6 @@ pub const TOOL_NAMES: &[&str] = &[
     "announce_change",
     "validate_patch",
     "submit_patch",
-    "request_merge",
     "list_workspace_violations",
     "list_workspace_changes",
     "file_watcher_status",
@@ -42,16 +41,6 @@ pub const TOOL_NAMES: &[&str] = &[
     "db_propose_migration",
     "db_request_approval",
     "request_approval",
-    "orchestrator_get_status",
-    "orchestrator_create_run",
-    "orchestrator_create_context_export",
-    "orchestrator_import_plan",
-    "orchestrator_adopt_plan",
-    "orchestrator_list_runs",
-    "orchestrator_get_brief",
-    "orchestrator_sync_once",
-    "orchestrator_propose_agent_assignments",
-    "orchestrator_adopt_agent_assignment",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -67,8 +56,6 @@ pub struct McpContext {
     pub worktree_path: Option<String>,
     pub workspace_id: Option<String>,
     pub objective_key: Option<String>,
-    pub orchestration_run_id: Option<String>,
-    pub orchestration_role: Option<String>,
 }
 
 impl McpContext {
@@ -90,15 +77,49 @@ impl McpContext {
                 ("--worktree-path", Some(value)) => context.worktree_path = Some(value),
                 ("--workspace-id", Some(value)) => context.workspace_id = Some(value),
                 ("--objective-key", Some(value)) => context.objective_key = Some(value),
-                ("--orchestration-run-id", Some(value)) => {
-                    context.orchestration_run_id = Some(value)
-                }
-                ("--orchestration-role", Some(value)) => context.orchestration_role = Some(value),
                 _ => {}
             }
             index += 2;
         }
+        context.apply_env_defaults();
         context
+    }
+
+    fn apply_env_defaults(&mut self) {
+        set_default_from_env(&mut self.repo_path, &["COORDINATION_REPO_PATH", "DIFFFORGE_REPO_PATH"]);
+        set_default_from_env(&mut self.db_path, &["COORDINATION_DB_PATH"]);
+        set_default_from_env(
+            &mut self.agent_id,
+            &["COORDINATION_AGENT_ID", "DIFFFORGE_AGENT_ID", "CLOUD_MCP_AGENT_ID"],
+        );
+        set_default_from_env(&mut self.agent_slot_id, &["COORDINATION_AGENT_SLOT_ID"]);
+        set_default_from_env(&mut self.slot_key, &["COORDINATION_SLOT_KEY"]);
+        set_default_from_env(
+            &mut self.session_id,
+            &["COORDINATION_SESSION_ID", "DIFFFORGE_SESSION_ID", "CLOUD_MCP_SESSION_ID"],
+        );
+        set_default_from_env(&mut self.task_id, &["COORDINATION_TASK_ID"]);
+        set_default_from_env(&mut self.worktree_id, &["COORDINATION_WORKTREE_ID"]);
+        set_default_from_env(
+            &mut self.worktree_path,
+            &["COORDINATION_WORKTREE_PATH", "COORDINATION_AGENT_BRANCH_ROOT"],
+        );
+        set_default_from_env(&mut self.workspace_id, &["COORDINATION_WORKSPACE_ID", "CLOUD_MCP_WORKSPACE_ID"]);
+        set_default_from_env(&mut self.objective_key, &["COORDINATION_OBJECTIVE_KEY"]);
+    }
+}
+
+fn set_default_from_env(target: &mut Option<String>, keys: &[&str]) {
+    if target.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+        return;
+    }
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                *target = Some(value);
+                return;
+            }
+        }
     }
 }
 
@@ -342,7 +363,6 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
             agent_id: context.agent_id.clone(),
             agent_slot_id: context.agent_slot_id.clone(),
             session_id: context.session_id.clone(),
-            orchestration_run_id: context.orchestration_run_id.clone(),
             ..EventRefs::default()
         },
         json!({
@@ -351,7 +371,6 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
             "worktree_path": context.worktree_path.clone(),
             "workspace_id": context.workspace_id.clone(),
             "objective_key": context.objective_key.clone(),
-            "orchestration_role": context.orchestration_role.clone(),
             "details": details,
         }),
     );
@@ -398,7 +417,7 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
     result
 }
 
-fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Result<Value, String> {
+fn dispatch_tool_result(context: &McpContext, tool: &str, mut input: Value) -> Result<Value, String> {
     let Some(repo_path) = input["repo_path"].as_str().or(context.repo_path.as_deref()) else {
         return Ok(api_error(
             "missing_repo_path",
@@ -414,12 +433,13 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
         Ok(kernel) => kernel,
         Err(error) => return Ok(api_error("kernel_open_failed", error, json!({}))),
     };
+    apply_live_session_defaults(&kernel, &mut input);
     match tool {
         "get_brief" => kernel.get_brief(
             input["agent_id"].as_str(),
             input["session_id"].as_str(),
             input["task_id"].as_str(),
-            input["orchestration_run_id"].as_str(),
+            None,
         ),
         "claim_task" => kernel.claim_task(
             req(&input, "task_id")?,
@@ -484,11 +504,6 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             input["worktree_id"].as_str(),
             input["summary"].as_str(),
         ),
-        "request_merge" => kernel.request_merge(
-            req(&input, "patch_id")?,
-            input["target_branch"].as_str(),
-            input["strategy"].as_str(),
-        ),
         "list_workspace_violations" => kernel.list_workspace_violations(
             input["task_id"].as_str(),
             input["agent_id"].as_str(),
@@ -521,16 +536,12 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             input["trust_level"].as_str(),
             input["task_id"].as_str(),
             input["evidence_artifact_id"].as_str(),
-            input["orchestration_run_id"].as_str(),
+            input["context_run_id"].as_str(),
             input["agent_id"].as_str(),
             None,
         ),
-        "write_contract_memory" | "orchestrator_write_contract" => {
-            kernel.write_contract_memory(&input)
-        }
-        "write_handoff_memory" | "orchestrator_write_handoff" => {
-            kernel.write_handoff_memory(&input)
-        }
+        "write_contract_memory" => kernel.write_contract_memory(&input),
+        "write_handoff_memory" => kernel.write_handoff_memory(&input),
         "db_get_mode" => kernel.db_get_mode(),
         "db_classify_sql" => kernel.db_classify_sql(req(&input, "sql")?),
         "db_request_change" => kernel.db_request_change(&input),
@@ -569,29 +580,6 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, input: Value) -> Resul
             req(&input, "reason")?,
             input["risk_summary"].as_str(),
         ),
-        "orchestrator_get_status" => Ok(api_ok(kernel.get_cloud_orchestrator_status()?)),
-        "orchestrator_create_run" => kernel
-            .create_orchestration_run(req(&input, "objective")?, input.get("constraints").cloned()),
-        "orchestrator_create_context_export" => kernel.create_cloud_context_export(
-            input["run_id"].as_str(),
-            input["export_kind"]
-                .as_str()
-                .unwrap_or("full_redacted_brief"),
-        ),
-        "orchestrator_import_plan" => kernel.import_orchestration_plan(
-            req(&input, "run_id")?,
-            input.get("plan_json").unwrap_or(&input),
-        ),
-        "orchestrator_adopt_plan" => kernel.adopt_orchestration_plan(req(&input, "run_id")?),
-        "orchestrator_list_runs" => kernel.list_orchestration_runs(input["status"].as_str()),
-        "orchestrator_get_brief" => kernel.get_orchestration_brief(req(&input, "run_id")?),
-        "orchestrator_sync_once" => kernel.cloud_sync_once(input["run_id"].as_str()),
-        "orchestrator_propose_agent_assignments" => {
-            kernel.propose_agent_assignments(req(&input, "run_id")?)
-        }
-        "orchestrator_adopt_agent_assignment" => {
-            kernel.adopt_agent_assignment(req(&input, "assignment_id")?)
-        }
         _ => Ok(api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),
@@ -616,13 +604,65 @@ fn apply_context_defaults(context: &McpContext, input: &mut Value) {
         ("worktree_path", &context.worktree_path),
         ("workspace_id", &context.workspace_id),
         ("objective_key", &context.objective_key),
-        ("orchestration_run_id", &context.orchestration_run_id),
-        ("orchestration_role", &context.orchestration_role),
     ]);
     for (key, value) in defaults {
         if !object.contains_key(key) {
             if let Some(value) = value {
                 object.insert(key.to_string(), Value::String(value.clone()));
+            }
+        }
+    }
+}
+
+fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
+    let Some(object) = input.as_object_mut() else {
+        return;
+    };
+    let missing_task_id = object
+        .get("task_id")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    let missing_agent_id = object
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    let missing_session_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if !missing_task_id && !missing_agent_id && !missing_session_id {
+        return;
+    }
+
+    let session_rows = if let Some(session_id) = object.get("session_id").and_then(Value::as_str) {
+        kernel
+            .query_json(
+                "SELECT * FROM agent_sessions WHERE id=?1 ORDER BY updated_at DESC LIMIT 1",
+                &[&session_id],
+            )
+            .unwrap_or_default()
+    } else if let Some(agent_id) = object.get("agent_id").and_then(Value::as_str) {
+        kernel
+            .query_json(
+                "SELECT * FROM agent_sessions WHERE agent_id=?1 AND status='active' ORDER BY updated_at DESC LIMIT 1",
+                &[&agent_id],
+            )
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let Some(session) = session_rows.first() else {
+        return;
+    };
+    for key in ["agent_id", "session_id", "task_id", "worktree_id"] {
+        let missing = object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty());
+        if missing {
+            if let Some(value) = session[key].as_str().filter(|value| !value.trim().is_empty()) {
+                object.insert(key.to_string(), Value::String(value.to_string()));
             }
         }
     }

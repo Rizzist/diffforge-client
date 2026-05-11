@@ -480,6 +480,7 @@ fn terminal_coordination_session_from_context(
         db_path: context.db_path.clone(),
         agent_id: context.agent_id.clone(),
         session_id: context.session_id.clone(),
+        env_vars: context.env_vars(),
     }
 }
 
@@ -673,6 +674,7 @@ fn spawn_terminal_reader(
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     pane_id: String,
     instance_id: u64,
+    cloud_mcp_state: CloudMcpState,
     output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
 ) {
@@ -757,6 +759,18 @@ fn spawn_terminal_reader(
                     if !pending.is_empty() {
                         let bytes = pending.len();
                         let chunk = std::mem::take(&mut pending);
+                        let observer_state = cloud_mcp_state.clone();
+                        let observer_pane_id = pane_id.clone();
+                        let observer_chunk = chunk.clone();
+                        tauri::async_runtime::spawn(async move {
+                            cloud_mcp_observe_terminal_output(
+                                observer_state,
+                                &observer_pane_id,
+                                instance_id,
+                                &observer_chunk,
+                            )
+                            .await;
+                        });
 
                         if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
                             channel_failed = true;
@@ -1435,10 +1449,24 @@ async fn terminal_open(
             .as_ref()
             .map(|context| context.env_vars())
             .unwrap_or_default();
+        let launch_coordination = coordination_context
+            .as_ref()
+            .map(terminal_coordination_session_from_context);
+        let launch_provider_id = provider_for_coordination
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(kind.as_str());
+        let launch_args = terminal_args_with_codex_mcp_identity(
+            launch_provider_id,
+            &args,
+            launch_coordination.as_ref(),
+            &pane_id,
+            instance_id,
+        );
         let warm_pty = match create_agent_terminal_pty(
             size,
             &command_path,
-            &args,
+            &launch_args,
             &process_working_directory,
             coordination_env_vars.as_slice(),
             None,
@@ -1489,6 +1517,7 @@ async fn terminal_open(
         json!({
             "agent_started": agent_started,
             "arg_count": args.len(),
+            "launch_arg_count": if is_prewarm_pty { args.len() } else { terminal_args_with_codex_mcp_identity(provider_for_coordination.as_deref().unwrap_or(kind.as_str()), &args, terminal_coordination.as_ref(), &pane_id, instance_id).len() },
             "command": clean_terminal_telemetry_text(&command),
             "prewarm_pty": is_prewarm_pty,
             "repo_working_directory": workspace_path_display(&working_directory),
@@ -1544,6 +1573,7 @@ async fn terminal_open(
         Arc::clone(&state.terminals),
         pane_id.clone(),
         instance_id,
+        cloud_mcp_state.inner().clone(),
         output_channel,
         reader,
     );
@@ -1730,10 +1760,22 @@ async fn terminal_start_agent(
             return Err(error);
         }
     }
-    let input = terminal_agent_start_input_in_directory(
-        &command_path,
+    let launch_args = terminal_args_with_codex_mcp_identity(
+        definition.id,
         &args,
+        instance.coordination.as_ref(),
+        &pane_id,
+        instance.id,
+    );
+    let input = terminal_agent_start_input_with_env_in_directory(
+        &command_path,
+        &launch_args,
         instance.working_directory.as_ref(),
+        instance
+            .coordination
+            .as_ref()
+            .map(|coordination| coordination.env_vars.as_slice())
+            .unwrap_or(&[]),
     );
 
     if input.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -1767,6 +1809,7 @@ async fn terminal_start_agent(
             "provider": definition.id,
             "command": clean_terminal_telemetry_text(&command_path),
             "arg_count": args.len(),
+            "launch_arg_count": launch_args.len(),
             "bytes": input.len(),
             "working_directory": workspace_path_display(instance.working_directory.as_ref()),
         }),
@@ -1929,10 +1972,22 @@ async fn start_terminal_agent_in_prepared_pty(
                 ),
             };
         };
-        let input = terminal_agent_start_input_in_directory(
-            &command_path,
+        let launch_args = terminal_args_with_codex_mcp_identity(
+            definition.id,
             &args,
+            instance.coordination.as_ref(),
+            &pane_id,
+            instance.id,
+        );
+        let input = terminal_agent_start_input_with_env_in_directory(
+            &command_path,
+            &launch_args,
             instance.working_directory.as_ref(),
+            instance
+                .coordination
+                .as_ref()
+                .map(|coordination| coordination.env_vars.as_slice())
+                .unwrap_or(&[]),
         );
 
         if input.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -1961,6 +2016,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         "provider": definition.id,
                         "command": clean_terminal_telemetry_text(&command_path),
                         "arg_count": args.len(),
+                        "launch_arg_count": launch_args.len(),
                         "bytes": input.len(),
                         "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
                         "working_directory": workspace_path_display(instance.working_directory.as_ref()),
@@ -2122,228 +2178,76 @@ fn set_terminal_audio_input_target(
     set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
 }
 
-struct TerminalSubmittedPrompt {
-    prompt: String,
-    bypass_cloud_plan: bool,
-    stale_restored_prompt: bool,
-}
-
-fn terminal_normalize_prompt_for_gate(prompt: &str) -> String {
-    let mut normalized = prompt
-        .replace("[200~", "")
-        .replace("[201~", "")
-        .replace("\u{1b}[200~", "")
-        .replace("\u{1b}[201~", "");
-    normalized.retain(|character| !character.is_control());
-    let mut normalized = normalized.trim().to_string();
-
-    loop {
-        let next = normalized
-            .strip_prefix('>')
-            .or_else(|| normalized.strip_prefix('›'))
-            .or_else(|| normalized.strip_prefix('$'))
-            .or_else(|| normalized.strip_prefix('#'))
-            .map(str::trim_start);
-        let Some(next) = next else {
-            break;
-        };
-        normalized = next.to_string();
-    }
-
-    normalized
-}
-
-fn terminal_control_followup_bypass_count(prompt: &str) -> usize {
-    let prompt = terminal_normalize_prompt_for_gate(prompt);
-    let lower = prompt.to_ascii_lowercase();
-    if lower.starts_with("/model") {
-        return 0;
-    }
-
-    0
-}
-
-fn terminal_is_model_command(prompt: &str) -> bool {
-    terminal_normalize_prompt_for_gate(prompt)
-        .to_ascii_lowercase()
-        .starts_with("/model")
-}
-
-fn terminal_model_selector_token(prompt: &str) -> String {
-    terminal_normalize_prompt_for_gate(prompt)
-        .trim_start_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    '>' | '›' | '$' | '#' | '*' | '-' | '+' | '•' | '●' | '○' | '◉' | '▸'
-                        | '▹' | '→'
-                )
-        })
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|character: char| {
-            matches!(
-                character,
-                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '"' | '\''
-            )
-        })
-        .to_ascii_lowercase()
-}
-
-fn terminal_token_has_prefix_and_version(token: &str, prefix: &str) -> bool {
-    token
-        .strip_prefix(prefix)
-        .and_then(|suffix| suffix.chars().next())
-        .is_some_and(|character| character.is_ascii_digit() || matches!(character, '-' | '_' | '.'))
-}
-
-fn terminal_is_model_selector_prompt(prompt: &str) -> bool {
-    let token = terminal_model_selector_token(prompt);
-    if token.is_empty() {
-        return false;
-    }
-
-    if matches!(
-        token.as_str(),
-        "auto"
-            | "default"
-            | "fast"
-            | "balanced"
-            | "minimal"
-            | "low"
-            | "medium"
-            | "high"
-            | "xhigh"
-            | "max"
-            | "none"
-            | "sonnet"
-            | "opus"
-            | "haiku"
-    ) {
-        return true;
-    }
-
-    if token.contains("codex") {
-        return true;
-    }
-
-    [
-        "gpt",
-        "o1",
-        "o3",
-        "o4",
-        "o5",
-        "claude",
-        "gemini",
-        "grok",
-        "llama",
-        "mistral",
-        "qwen",
-        "deepseek",
-        "codestral",
-    ]
-    .iter()
-    .any(|prefix| terminal_token_has_prefix_and_version(&token, prefix))
-}
-
-fn terminal_is_control_prompt(prompt: &str) -> bool {
-    let prompt = terminal_normalize_prompt_for_gate(prompt);
-    if prompt.is_empty() {
-        return true;
-    }
-    if prompt.starts_with('/') {
-        return true;
-    }
-
-    matches!(
-        prompt.to_ascii_lowercase().as_str(),
-        "exit"
-            | "quit"
-            | "clear"
-            | "cls"
-            | "reset"
-            | "y"
-            | "yes"
-            | "n"
-            | "no"
-            | "cancel"
-    )
-}
-
-fn terminal_prompt_requires_cloud_plan(prompt: &str) -> bool {
-    let prompt = terminal_normalize_prompt_for_gate(prompt);
-    !terminal_is_control_prompt(&prompt)
-}
-
-fn terminal_capture_submitted_prompt_from_gate(
-    gate: &mut TerminalInputGate,
+async fn terminal_observe_submitted_prompt(
+    instance: &TerminalInstance,
     data: &str,
-) -> Option<TerminalSubmittedPrompt> {
+) -> Option<String> {
+    let mut gate = instance.input_gate.lock().await;
     let mut submitted = None;
 
     for character in data.chars() {
-        if gate.ansi_escape_active {
-            if gate.ansi_csi_active {
-                if ('@'..='~').contains(&character) {
+        if gate.ansi_osc_active {
+            if gate.ansi_osc_escape_pending {
+                gate.ansi_osc_escape_pending = false;
+                if character == '\\' {
+                    gate.ansi_osc_active = false;
                     gate.ansi_escape_active = false;
-                    gate.ansi_csi_active = false;
                 }
-            } else if character == '[' {
-                gate.ansi_csi_active = true;
-            } else {
+                continue;
+            }
+            if character == '\u{1b}' {
+                gate.ansi_osc_escape_pending = true;
+                continue;
+            }
+            if character == '\u{7}' {
+                gate.ansi_osc_active = false;
                 gate.ansi_escape_active = false;
+                continue;
+            }
+            continue;
+        }
+
+        if gate.ansi_csi_active {
+            let code = character as u32;
+            if (0x40..=0x7e).contains(&code) {
                 gate.ansi_csi_active = false;
+                gate.ansi_escape_active = false;
+            }
+            continue;
+        }
+
+        if gate.ansi_ss3_active {
+            gate.ansi_ss3_active = false;
+            gate.ansi_escape_active = false;
+            continue;
+        }
+
+        if gate.ansi_escape_active {
+            match character {
+                '[' => {
+                    gate.ansi_csi_active = true;
+                }
+                ']' | 'P' | '^' | '_' | 'X' => {
+                    gate.ansi_osc_active = true;
+                    gate.ansi_osc_escape_pending = false;
+                }
+                'O' => {
+                    gate.ansi_ss3_active = true;
+                }
+                _ => {
+                    gate.ansi_escape_active = false;
+                }
             }
             continue;
         }
 
         match character {
-            '\u{1b}' => {
-                gate.ansi_escape_active = true;
-                gate.ansi_csi_active = false;
-            }
             '\r' | '\n' => {
                 let prompt = gate.current_line.trim().to_string();
-                let normalized_prompt = terminal_normalize_prompt_for_gate(&prompt);
-                let line_user_touched = gate.current_line_user_touched;
-                let model_command = terminal_is_model_command(&prompt);
-                let model_selector_followup = gate.model_command_followup_pending
-                    && (!gate.model_command_empty_submit_seen
-                        || terminal_is_model_selector_prompt(&prompt));
-                let control_prompt = terminal_is_control_prompt(&prompt);
-                let bypass_followup = gate.control_command_bypass_submits > 0;
-                if bypass_followup {
-                    gate.control_command_bypass_submits =
-                        gate.control_command_bypass_submits.saturating_sub(1);
-                }
-                gate.control_command_bypass_submits =
-                    terminal_control_followup_bypass_count(&prompt);
                 gate.current_line.clear();
                 gate.current_line_user_touched = false;
-                if normalized_prompt.is_empty() {
-                    if gate.model_command_followup_pending {
-                        gate.model_command_empty_submit_seen = true;
-                    }
-                } else if model_command {
-                    gate.model_command_followup_pending = true;
-                    gate.model_command_empty_submit_seen = false;
-                } else if model_selector_followup && terminal_is_model_selector_prompt(&prompt) {
-                    gate.model_command_followup_pending = true;
-                    gate.model_command_empty_submit_seen = true;
-                } else {
-                    gate.model_command_followup_pending = false;
-                    gate.model_command_empty_submit_seen = false;
-                }
-                if !normalized_prompt.is_empty() {
-                    submitted = Some(TerminalSubmittedPrompt {
-                        prompt,
-                        bypass_cloud_plan: control_prompt
-                            || bypass_followup
-                            || model_selector_followup
-                            || !line_user_touched,
-                        stale_restored_prompt: !line_user_touched,
-                    });
+                if !prompt.is_empty() {
+                    submitted = Some(prompt);
                 }
             }
             '\u{7f}' | '\u{8}' => {
@@ -2353,6 +2257,13 @@ fn terminal_capture_submitted_prompt_from_gate(
             '\u{15}' => {
                 gate.current_line.clear();
                 gate.current_line_user_touched = true;
+            }
+            '\u{1b}' => {
+                gate.ansi_escape_active = true;
+                gate.ansi_csi_active = false;
+                gate.ansi_osc_active = false;
+                gate.ansi_osc_escape_pending = false;
+                gate.ansi_ss3_active = false;
             }
             character if character.is_control() => {}
             character => {
@@ -2369,119 +2280,59 @@ fn terminal_capture_submitted_prompt_from_gate(
     submitted
 }
 
-async fn terminal_capture_submitted_prompt(
-    instance: &TerminalInstance,
-    data: &str,
-) -> Option<TerminalSubmittedPrompt> {
-    let mut gate = instance.input_gate.lock().await;
-    terminal_capture_submitted_prompt_from_gate(&mut gate, data)
+fn terminal_prompt_task_title(prompt: &str) -> String {
+    let cleaned = clean_terminal_telemetry_text(prompt)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        "Direct terminal task".to_string()
+    } else {
+        format!(
+            "Direct terminal task: {}",
+            cleaned.chars().take(120).collect::<String>()
+        )
+    }
 }
 
-async fn terminal_instance_requires_cloud_prompt_gate(instance: &TerminalInstance) -> bool {
-    if instance.coordination.is_none() {
-        return false;
-    }
-
-    *instance.agent_started.lock().await
-}
-
-#[cfg(test)]
-mod terminal_input_gate_tests {
-    use super::*;
-
-    #[test]
-    fn empty_enter_does_not_submit_prompt() {
-        let mut gate = TerminalInputGate::default();
-
-        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r");
-
-        assert!(submitted.is_none());
-    }
-
-    #[test]
-    fn typed_prompt_submits_when_enter_arrives_separately() {
-        let mut gate = TerminalInputGate::default();
-
-        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "fix the bug").is_none());
-        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").unwrap();
-
-        assert_eq!(submitted.prompt, "fix the bug");
-        assert!(!submitted.bypass_cloud_plan);
-        assert!(!submitted.stale_restored_prompt);
-    }
-
-    #[test]
-    fn stale_restored_prompt_is_marked_on_blank_enter() {
-        let mut gate = TerminalInputGate {
-            current_line: "fix the bug".to_string(),
-            current_line_user_touched: false,
-            ..TerminalInputGate::default()
-        };
-
-        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").unwrap();
-
-        assert_eq!(submitted.prompt, "fix the bug");
-        assert!(submitted.bypass_cloud_plan);
-        assert!(submitted.stale_restored_prompt);
-        assert!(gate.current_line.is_empty());
-        assert!(!gate.current_line_user_touched);
-    }
-
-    #[test]
-    fn prompt_marker_only_input_does_not_submit_prompt() {
-        let mut gate = TerminalInputGate::default();
-
-        let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "$\r");
-
-        assert!(submitted.is_none());
-    }
-
-    #[test]
-    fn model_command_bypasses_model_selection_after_empty_picker_enter() {
-        let mut gate = TerminalInputGate::default();
-
-        let command = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
-        assert!(command.bypass_cloud_plan);
-        assert!(gate.model_command_followup_pending);
-
-        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").is_none());
-        assert!(gate.model_command_followup_pending);
-        assert!(gate.model_command_empty_submit_seen);
-
-        let selected =
-            terminal_capture_submitted_prompt_from_gate(&mut gate, "gpt-5.3-codex\r").unwrap();
-        assert_eq!(selected.prompt, "gpt-5.3-codex");
-        assert!(selected.bypass_cloud_plan);
-        assert!(!selected.stale_restored_prompt);
-    }
-
-    #[test]
-    fn model_command_does_not_bypass_next_real_prompt_after_empty_picker_enter() {
-        let mut gate = TerminalInputGate::default();
-
-        let _ = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
-        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").is_none());
-        let prompt = terminal_capture_submitted_prompt_from_gate(&mut gate, "fix the bug\r").unwrap();
-
-        assert_eq!(prompt.prompt, "fix the bug");
-        assert!(!prompt.bypass_cloud_plan);
-        assert!(!gate.model_command_followup_pending);
-    }
-
-    #[test]
-    fn model_command_bypasses_reasoning_followup_after_model_selection() {
-        let mut gate = TerminalInputGate::default();
-
-        let _ = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
-        let model =
-            terminal_capture_submitted_prompt_from_gate(&mut gate, "gpt-5.3-codex\r").unwrap();
-        assert!(model.bypass_cloud_plan);
-        assert!(gate.model_command_followup_pending);
-
-        let effort = terminal_capture_submitted_prompt_from_gate(&mut gate, "high\r").unwrap();
-        assert_eq!(effort.prompt, "high");
-        assert!(effort.bypass_cloud_plan);
-    }
+fn terminal_prepare_coordination_task_for_prompt(
+    coordination: &TerminalCoordinationSession,
+    prompt: &str,
+    pane_id: &str,
+    instance_id: u64,
+) -> Result<Option<String>, String> {
+    let kernel = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    )?;
+    let title = terminal_prompt_task_title(prompt);
+    let task = kernel.create_task(
+        &title,
+        Some(prompt),
+        0,
+        1,
+        None,
+        None,
+        Some("terminal-agent"),
+        Some("Complete the direct terminal prompt in the assigned agent worktree."),
+    )?;
+    let Some(task_id) = task["id"].as_str().map(str::to_string) else {
+        return Ok(None);
+    };
+    kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
+    log_terminal_event(
+        "terminal.prompt.coordination_task_ready",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+            "task_id": clean_terminal_telemetry_text(&task_id),
+            "title": clean_terminal_telemetry_text(&title),
+        }),
+    );
+    Ok(Some(task_id))
 }
 
 #[tauri::command]
@@ -2505,106 +2356,44 @@ async fn terminal_write(
         return Ok(());
     };
 
-    if let Some(submitted) = terminal_capture_submitted_prompt(&instance, &data).await {
-        let prompt = submitted.prompt;
-        if submitted.stale_restored_prompt {
-            log_terminal_event(
-                "terminal.write.stale_restored_prompt_enter_ignored",
-                Some(&pane_id),
-                Some(instance.id),
-                None,
-                json!({
-                    "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
-                    "bytes": data.len(),
-                }),
-            );
-            write_terminal_input(
-                &state,
-                &pane_id,
-                Some(instance.id),
-                "\u{15}",
-                "terminal.write.stale_restored_prompt_clear_skipped",
-            )
-            .await
-            .map(|_| ())?;
-            return Ok(());
-        }
-
-        if terminal_instance_requires_cloud_prompt_gate(&instance).await
-            && !submitted.bypass_cloud_plan
-            && terminal_prompt_requires_cloud_plan(&prompt)
-        {
-            match cloud_mcp_require_prompt_plan_accepted(
-                cloud_mcp_state.inner(),
-                instance.working_directory.as_ref(),
-                &prompt,
-            )
-            .await
-            {
-                Ok(enhanced_prompt) => {
-                    let enhanced_input = format!("\u{15}{enhanced_prompt}\r");
-                    if enhanced_input.len() > MAX_TERMINAL_WRITE_BYTES {
-                        return Err(
-                            "Enhanced Cloud MCP prompt is too large for terminal input.".to_string(),
-                        );
-                    }
+    if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
+        if *instance.agent_started.lock().await {
+            if let Some(coordination) = instance.coordination.as_ref() {
+                if let Err(error) = terminal_prepare_coordination_task_for_prompt(
+                    coordination,
+                    &prompt,
+                    &pane_id,
+                    instance.id,
+                ) {
                     log_terminal_event(
-                        "terminal.write.cloud_mcp_plan_accepted",
+                        "terminal.prompt.coordination_task_error",
                         Some(&pane_id),
                         Some(instance.id),
                         None,
                         json!({
-                            "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
-                            "original_bytes": data.len(),
-                            "enhanced_bytes": enhanced_input.len(),
-                        }),
-                    );
-                    write_terminal_input(
-                        &state,
-                        &pane_id,
-                        Some(instance.id),
-                        &enhanced_input,
-                        "terminal.write.enhanced_prompt_skipped_stale_or_missing",
-                    )
-                    .await
-                    .map(|_| ())?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    let data_without_submit = data
-                        .chars()
-                        .filter(|character| !matches!(character, '\r' | '\n'))
-                        .collect::<String>();
-                    if !data_without_submit.is_empty() {
-                        let _ = write_terminal_input(
-                            &state,
-                            &pane_id,
-                            Some(instance.id),
-                            &data_without_submit,
-                            "terminal.write.cloud_mcp_plan_echo_skipped",
-                        )
-                        .await;
-                    }
-                    {
-                        let mut gate = instance.input_gate.lock().await;
-                        if gate.current_line.trim().is_empty() {
-                            gate.current_line = prompt.clone();
-                            gate.current_line_user_touched = false;
-                        }
-                    }
-                    log_terminal_event(
-                        "terminal.write.cloud_mcp_plan_blocked",
-                        Some(&pane_id),
-                        Some(instance.id),
-                        None,
-                        json!({
-                            "prompt_hash": clean_terminal_telemetry_text(&cloud_mcp_prompt_hash(&prompt)),
+                            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
                             "error": clean_terminal_telemetry_text(&error),
                         }),
                     );
-                    return Err(error);
                 }
             }
+            let cloud_state = cloud_mcp_state.inner().clone();
+            let pane_id_for_context = pane_id.clone();
+            let working_directory = instance.working_directory.as_ref().clone();
+            let coordination = instance.coordination.clone();
+            let terminal_instance_id = instance.id;
+            tauri::async_runtime::spawn(async move {
+                cloud_mcp_terminal_context_pack_for_prompt(
+                    cloud_state,
+                    pane_id_for_context,
+                    terminal_instance_id,
+                    working_directory,
+                    coordination,
+                    prompt,
+                )
+                .await;
+            });
         }
     }
 

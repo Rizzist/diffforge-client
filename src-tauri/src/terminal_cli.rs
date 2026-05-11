@@ -539,6 +539,28 @@ fn terminal_agent_start_input_in_directory(
     )
 }
 
+#[cfg(windows)]
+fn terminal_agent_start_input_with_env_in_directory(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+) -> String {
+    let mut input = terminal_set_working_directory_input(working_directory);
+    for (key, value) in env_vars {
+        if key.trim().is_empty() {
+            continue;
+        }
+        input.push_str(&format!(
+            "$env:{} = {}\r",
+            key,
+            quote_powershell_literal(value)
+        ));
+    }
+    input.push_str(&terminal_agent_start_input(command_path, args));
+    input
+}
+
 #[cfg(not(windows))]
 fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
     let mut invocation = quote_shell_literal(command_path);
@@ -549,6 +571,108 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
     }
 
     format!("{invocation}\n")
+}
+
+fn terminal_args_with_codex_mcp_identity(
+    provider_id: &str,
+    args: &[String],
+    coordination: Option<&TerminalCoordinationSession>,
+    pane_id: &str,
+    instance_id: u64,
+) -> Vec<String> {
+    let mut next = args.to_vec();
+    if !provider_id.to_ascii_lowercase().contains("codex") {
+        return next;
+    }
+    let Some(coordination) = coordination else {
+        return next;
+    };
+
+    let env_value = |key: &str| -> Option<String> {
+        coordination
+            .env_vars
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key && !value.trim().is_empty()).then(|| value.clone()))
+    };
+    let base_url = env_value("CLOUD_MCP_BASE_URL")
+        .or_else(|| std::env::var("CLOUD_MCP_BASE_URL").ok())
+        .or_else(|| std::env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let repo_id = env_value("CLOUD_MCP_REPO_ID").unwrap_or_else(|| {
+        format!("repo-{}", cloud_mcp_short_hash(&coordination.repo_path))
+    });
+
+    let mut coordination_args = vec![
+        "--repo-path".to_string(),
+        coordination.repo_path.clone(),
+        "--db-path".to_string(),
+        coordination.db_path.clone(),
+        "--agent-id".to_string(),
+        coordination.agent_id.clone(),
+        "--session-id".to_string(),
+        coordination.session_id.clone(),
+    ];
+    for (env_key, arg_key) in [
+        ("COORDINATION_AGENT_SLOT_ID", "--agent-slot-id"),
+        ("COORDINATION_SLOT_KEY", "--slot-key"),
+        ("COORDINATION_TASK_ID", "--task-id"),
+        ("COORDINATION_WORKTREE_ID", "--worktree-id"),
+        ("COORDINATION_WORKTREE_PATH", "--worktree-path"),
+        ("COORDINATION_WORKSPACE_ID", "--workspace-id"),
+        ("COORDINATION_OBJECTIVE_KEY", "--objective-key"),
+    ] {
+        if let Some(value) = env_value(env_key) {
+            coordination_args.push(arg_key.to_string());
+            coordination_args.push(value);
+        }
+    }
+
+    let cloud_args = vec![
+        "--cloud-mcp-proxy".to_string(),
+        "--base-url".to_string(),
+        base_url,
+        "--repo-path".to_string(),
+        coordination.repo_path.clone(),
+        "--repo-id".to_string(),
+        repo_id,
+        "--client-id".to_string(),
+        "rust-diffforge-agent".to_string(),
+        "--agent-id".to_string(),
+        coordination.agent_id.clone(),
+        "--session-id".to_string(),
+        coordination.session_id.clone(),
+        "--pane-id".to_string(),
+        pane_id.to_string(),
+        "--terminal-instance-id".to_string(),
+        instance_id.to_string(),
+    ];
+
+    next.push("-c".to_string());
+    next.push(format!(
+        "mcp_servers.coordination-kernel.args={}",
+        terminal_toml_string_array(&coordination_args)
+    ));
+    next.push("-c".to_string());
+    next.push(format!(
+        "mcp_servers.cloud-diffforge.args={}",
+        terminal_toml_string_array(&cloud_args)
+    ));
+    next.push("-c".to_string());
+    next.push("shell_environment_policy.inherit=all".to_string());
+    next
+}
+
+fn terminal_toml_string_array(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("\"{}\"", terminal_toml_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+fn terminal_toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(not(windows))]
@@ -604,6 +728,28 @@ fn terminal_agent_start_input_in_directory(
         terminal_set_working_directory_input(working_directory),
         terminal_agent_start_input(command_path, args)
     )
+}
+
+#[cfg(not(windows))]
+fn terminal_agent_start_input_with_env_in_directory(
+    command_path: &str,
+    args: &[String],
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+) -> String {
+    let mut input = terminal_set_working_directory_input(working_directory);
+    for (key, value) in env_vars {
+        if key.trim().is_empty() {
+            continue;
+        }
+        input.push_str("export ");
+        input.push_str(key);
+        input.push('=');
+        input.push_str(&quote_shell_literal(value));
+        input.push('\n');
+    }
+    input.push_str(&terminal_agent_start_input(command_path, args));
+    input
 }
 
 fn default_terminal_working_directory() -> PathBuf {

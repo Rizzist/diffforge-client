@@ -11,6 +11,14 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--cloud-mcp-proxy") {
+        let proxy_args = args.drain(2..).collect::<Vec<_>>();
+        if let Err(error) = rust_diffforge_lib::run_cloud_mcp_stdio_proxy(proxy_args) {
+            eprintln!("cloud mcp proxy error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     rust_diffforge_lib::run()
 }

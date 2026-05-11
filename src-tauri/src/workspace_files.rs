@@ -156,7 +156,7 @@ fn trim_gitignore_ascii(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
-fn gitignore_pattern_ignores_agents(line: &[u8]) -> bool {
+fn gitignore_pattern_ignores_workspace_dir(line: &[u8], directory: &[u8]) -> bool {
     let mut pattern = trim_gitignore_ascii(line);
 
     if pattern.is_empty() || pattern.starts_with(b"#") || pattern.starts_with(b"!") {
@@ -175,7 +175,7 @@ fn gitignore_pattern_ignores_agents(line: &[u8]) -> bool {
         pattern = stripped;
     }
 
-    pattern == b".agents"
+    pattern == directory
 }
 
 fn workspace_agents_gitignore_update_label(update: WorkspaceAgentsGitignoreUpdate) -> &'static str {
@@ -212,10 +212,14 @@ fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitig
         }
     };
 
-    if existing
-        .split(|byte| *byte == b'\n')
-        .any(gitignore_pattern_ignores_agents)
-    {
+    let mut agents_ignored = false;
+    let mut logs_ignored = false;
+    for line in existing.split(|byte| *byte == b'\n') {
+        agents_ignored |= gitignore_pattern_ignores_workspace_dir(line, b".agents");
+        logs_ignored |= gitignore_pattern_ignores_workspace_dir(line, b"logs");
+    }
+
+    if agents_ignored && logs_ignored {
         return Ok(WorkspaceAgentsGitignoreUpdate::AlreadyIgnored);
     }
 
@@ -225,7 +229,13 @@ fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitig
         addition.push(b'\n');
     }
 
-    addition.extend_from_slice(b".agents/\n");
+    if !agents_ignored {
+        addition.extend_from_slice(b".agents/\n");
+    }
+
+    if !logs_ignored {
+        addition.extend_from_slice(b"/logs/\n");
+    }
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -969,9 +979,28 @@ mod workspace_files_tests {
             normalized_path_key(&PathBuf::from(&result.repo_path).canonicalize().unwrap()),
             normalized_path_key(&root.canonicalize().unwrap())
         );
-        assert!(fs::read_to_string(root.join(".gitignore"))
-            .unwrap()
-            .contains(".agents/"));
+        let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gitignore.contains(".agents/"));
+        assert!(gitignore.contains("/logs/"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_gitignore_adds_logs_when_agents_already_ignored() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-gitignore-logs-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".gitignore"), ".agents/\n").unwrap();
+
+        let update = ensure_workspace_agents_gitignore(&root).unwrap();
+
+        assert!(matches!(update, WorkspaceAgentsGitignoreUpdate::Added));
+        let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(gitignore, ".agents/\n/logs/\n");
 
         let _ = fs::remove_dir_all(root);
     }

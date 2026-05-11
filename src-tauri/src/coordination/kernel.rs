@@ -9,6 +9,7 @@ use std::{
 
 use rusqlite::{params, types::ValueRef, Connection, ErrorCode, OptionalExtension};
 use serde_json::{json, Value};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -55,7 +56,6 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "file_watcher_status",
     "search_memory",
     "get_slot_status",
-    "request_merge",
     "db_get_mode",
     "db_classify_sql",
     "db_request_change",
@@ -144,7 +144,6 @@ impl CoordinationKernel {
         let kernel = Self { paths, conn };
 
         kernel.insert_default_repo_policy()?;
-        kernel.insert_default_cloud_config()?;
         kernel.expire_old_leases()?;
         kernel.mark_stale_sessions_interrupted()?;
         kernel.mark_duplicate_pty_sessions_interrupted()?;
@@ -180,7 +179,6 @@ impl CoordinationKernel {
                     "repo_path": kernel.paths.repo_path.display().to_string(),
                     "db_path": kernel.paths.db_path.display().to_string(),
                     "storage": storage_payload,
-                    "cloud_orchestrator_enabled": false,
                 }),
             )?;
             kernel.write_alignment_lifecycle_log(
@@ -258,8 +256,7 @@ impl CoordinationKernel {
                     prod_requires_human, agent_worktree_required, patch_lease_validation_required,
                     merge_gate_required, root_repo_write_policy, unleased_write_policy,
                     no_git_write_policy, merge_requires_clean_target,
-                    merge_requires_human_for_unleased_override, cloud_orchestrator_enabled,
-                    cloud_orchestrator_mode, cloud_context_export_policy,
+                    merge_requires_human_for_unleased_override, cloud_context_export_policy,
                     cloud_allow_code_export, cloud_allow_terminal_log_export,
                     cloud_allow_patch_export, cloud_auto_create_tasks,
                     cloud_auto_assign_agents, cloud_auto_spawn_terminals,
@@ -267,28 +264,10 @@ impl CoordinationKernel {
                     created_at, updated_at
                 ) VALUES(?1, ?2, 0, NULL, 'off', 0, 1, 1, 1, 1, 1, 1,
                     'detect_and_reject_patch', 'reject_patch', 'coordination_only', 1, 1,
-                    0, 'disabled', 'local_only', 0, 0, 0, 0, 0, 0, 0, 1, NULL, ?3, ?3)",
+                    'local_only', 0, 0, 0, 0, 0, 0, 0, 1, NULL, ?3, ?3)",
                 params![REPO_ID, self.paths.repo_path.display().to_string(), now],
             )
             .map_err(|error| format!("Unable to create default repo policy: {error}"))?;
-        Ok(())
-    }
-
-    fn insert_default_cloud_config(&self) -> Result<(), String> {
-        let now = now_rfc3339();
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO cloud_orchestrator_configs(
-                    id, repo_id, enabled, mode, endpoint_url, api_key_ref, model_hint,
-                    context_export_policy, allow_code_export, allow_terminal_log_export,
-                    allow_patch_export, auto_create_tasks, auto_assign_agents,
-                    auto_spawn_terminals, auto_merge, sync_interval_seconds, last_sync_at,
-                    status, created_at, updated_at
-                ) VALUES('default', ?1, 0, 'disabled', NULL, NULL, NULL, 'local_only',
-                    0, 0, 0, 0, 0, 0, 0, 0, NULL, 'disabled', ?2, ?2)",
-                params![REPO_ID, now],
-            )
-            .map_err(|error| format!("Unable to create default cloud config: {error}"))?;
         Ok(())
     }
 
@@ -307,14 +286,14 @@ impl CoordinationKernel {
         let session_id = refs.session_id.as_deref();
         let resource_id = refs.resource_id.as_deref();
         let artifact_id = refs.artifact_id.as_deref();
-        let orchestration_run_id = refs.orchestration_run_id.as_deref();
+        let context_run_id = refs.context_run_id.as_deref();
 
         for attempt in 0..12 {
             let id = uuid();
             match self.conn.execute(
                 "INSERT INTO events(
                     id, seq, event_type, actor_type, actor_id, task_id, agent_id, agent_slot_id, session_id,
-                    resource_id, artifact_id, orchestration_run_id, payload_json, created_at
+                    resource_id, artifact_id, context_run_id, payload_json, created_at
                 ) VALUES(
                     ?1,
                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM events),
@@ -331,7 +310,7 @@ impl CoordinationKernel {
                     session_id,
                     resource_id,
                     artifact_id,
-                    orchestration_run_id,
+                    context_run_id,
                     payload_json,
                     now_rfc3339()
                 ],
@@ -565,8 +544,8 @@ impl CoordinationKernel {
         body: Option<&str>,
         priority: i64,
         risk_level: i64,
-        orchestration_run_id: Option<&str>,
-        orchestration_plan_item_id: Option<&str>,
+        context_run_id: Option<&str>,
+        source_plan_item_id: Option<&str>,
         assigned_role: Option<&str>,
         expected_output: Option<&str>,
     ) -> Result<Value, String> {
@@ -576,8 +555,8 @@ impl CoordinationKernel {
         self.conn
             .execute(
                 "INSERT INTO tasks(
-                    id, title, body, status, priority, risk_level, orchestration_run_id,
-                    orchestration_plan_item_id, assigned_role, expected_output, created_at, updated_at
+                    id, title, body, status, priority, risk_level, context_run_id,
+                    source_plan_item_id, assigned_role, expected_output, created_at, updated_at
                 ) VALUES(?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     id,
@@ -585,8 +564,8 @@ impl CoordinationKernel {
                     body,
                     priority,
                     risk_level,
-                    orchestration_run_id,
-                    orchestration_plan_item_id,
+                    context_run_id,
+                    source_plan_item_id,
                     assigned_role,
                     expected_output,
                     now
@@ -599,7 +578,7 @@ impl CoordinationKernel {
             "local",
             EventRefs {
                 task_id: Some(id.clone()),
-                orchestration_run_id: orchestration_run_id.map(str::to_string),
+                context_run_id: context_run_id.map(str::to_string),
                 ..EventRefs::default()
             },
             json!({"title": title, "priority": priority, "risk_level": risk_level}),
@@ -725,7 +704,7 @@ impl CoordinationKernel {
             actor_id,
             EventRefs {
                 task_id: Some(task_id.to_string()),
-                orchestration_run_id: task["orchestration_run_id"].as_str().map(str::to_string),
+                context_run_id: task["context_run_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
             },
             json!({
@@ -945,7 +924,7 @@ impl CoordinationKernel {
                     actor_id,
                     EventRefs {
                         task_id: Some(task_id.to_string()),
-                        orchestration_run_id: task["orchestration_run_id"]
+                        context_run_id: task["context_run_id"]
                             .as_str()
                             .map(str::to_string),
                         ..EventRefs::default()
@@ -972,7 +951,7 @@ impl CoordinationKernel {
                     actor_id,
                     EventRefs {
                         task_id: Some(task_id.to_string()),
-                        orchestration_run_id: task["orchestration_run_id"]
+                        context_run_id: task["context_run_id"]
                             .as_str()
                             .map(str::to_string),
                         ..EventRefs::default()
@@ -1050,8 +1029,8 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         pty_id: Option<&str>,
         write_enabled: bool,
-        orchestration_run_id: Option<&str>,
-        orchestration_role: Option<&str>,
+        context_run_id: Option<&str>,
+        context_role: Option<&str>,
     ) -> Result<Value, String> {
         self.ensure_agent_exists(agent_id)?;
         let agent = self.get_agent_by_id(agent_id)?;
@@ -1062,8 +1041,8 @@ impl CoordinationKernel {
             task_id,
             pty_id,
             write_enabled,
-            orchestration_run_id,
-            orchestration_role,
+            context_run_id,
+            context_role,
         )
     }
 
@@ -1076,8 +1055,8 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         pty_id: Option<&str>,
         write_enabled: bool,
-        orchestration_run_id: Option<&str>,
-        orchestration_role: Option<&str>,
+        context_run_id: Option<&str>,
+        context_role: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
         self.create_session_for_slot(
@@ -1085,8 +1064,8 @@ impl CoordinationKernel {
             task_id,
             pty_id,
             write_enabled,
-            orchestration_run_id,
-            orchestration_role,
+            context_run_id,
+            context_role,
         )
     }
 
@@ -1096,8 +1075,8 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         pty_id: Option<&str>,
         write_enabled: bool,
-        orchestration_run_id: Option<&str>,
-        orchestration_role: Option<&str>,
+        context_run_id: Option<&str>,
+        context_role: Option<&str>,
     ) -> Result<Value, String> {
         let agent_id = required_string(slot, "agent_id")?;
         let agent_slot_id = required_string(slot, "id")?;
@@ -1139,8 +1118,8 @@ impl CoordinationKernel {
                                 task_id: task_id
                                     .or_else(|| existing["task_id"].as_str())
                                     .map(str::to_string),
-                                orchestration_run_id: orchestration_run_id
-                                    .or_else(|| existing["orchestration_run_id"].as_str())
+                                context_run_id: context_run_id
+                                    .or_else(|| existing["context_run_id"].as_str())
                                     .map(str::to_string),
                                 ..EventRefs::default()
                             },
@@ -1164,9 +1143,9 @@ impl CoordinationKernel {
                             task_id.or_else(|| existing["task_id"].as_str()),
                             existing["worktree_id"].as_str(),
                             worktree_path,
-                            orchestration_run_id
-                                .or_else(|| existing["orchestration_run_id"].as_str()),
-                            orchestration_role.or_else(|| existing["orchestration_role"].as_str()),
+                            context_run_id
+                                .or_else(|| existing["context_run_id"].as_str()),
+                            context_role.or_else(|| existing["context_role"].as_str()),
                         )?;
                         return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
                     }
@@ -1179,7 +1158,7 @@ impl CoordinationKernel {
                             agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(active_session_id.to_string()),
                             task_id: existing["task_id"].as_str().map(str::to_string),
-                            orchestration_run_id: existing["orchestration_run_id"]
+                            context_run_id: existing["context_run_id"]
                                 .as_str()
                                 .map(str::to_string),
                             ..EventRefs::default()
@@ -1239,8 +1218,8 @@ impl CoordinationKernel {
                     existing["worktree_id"]
                         .as_str()
                         .and_then(|_| existing["write_root"].as_str()),
-                    orchestration_run_id.or_else(|| existing["orchestration_run_id"].as_str()),
-                    orchestration_role.or_else(|| existing["orchestration_role"].as_str()),
+                    context_run_id.or_else(|| existing["context_run_id"].as_str()),
+                    context_role.or_else(|| existing["context_role"].as_str()),
                 )?;
                 self.emit_event(
                     "agent_session_reused",
@@ -1253,8 +1232,8 @@ impl CoordinationKernel {
                         task_id: task_id
                             .or_else(|| existing["task_id"].as_str())
                             .map(str::to_string),
-                        orchestration_run_id: orchestration_run_id
-                            .or_else(|| existing["orchestration_run_id"].as_str())
+                        context_run_id: context_run_id
+                            .or_else(|| existing["context_run_id"].as_str())
                             .map(str::to_string),
                         ..EventRefs::default()
                     },
@@ -1295,7 +1274,7 @@ impl CoordinationKernel {
                     agent_slot_id: Some(agent_slot_id.to_string()),
                     session_id: Some(existing_session_id.to_string()),
                     task_id: existing["task_id"].as_str().map(str::to_string),
-                    orchestration_run_id: existing["orchestration_run_id"]
+                    context_run_id: existing["context_run_id"]
                         .as_str()
                         .map(str::to_string),
                     ..EventRefs::default()
@@ -1341,7 +1320,7 @@ impl CoordinationKernel {
                             agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(id.clone()),
                             task_id: task_id.map(str::to_string),
-                            orchestration_run_id: orchestration_run_id.map(str::to_string),
+                            context_run_id: context_run_id.map(str::to_string),
                             ..EventRefs::default()
                         },
                         json!({"slot_key": slot_key, "worktree_id": worktree_id, "write_root": write_root, "enforcement_mode": enforcement_mode}),
@@ -1360,7 +1339,7 @@ impl CoordinationKernel {
                             agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(id.clone()),
                             task_id: task_id.map(str::to_string),
-                            orchestration_run_id: orchestration_run_id.map(str::to_string),
+                            context_run_id: context_run_id.map(str::to_string),
                             ..EventRefs::default()
                         },
                         json!({"violation_kind": "unknown_worktree_write", "severity": "warning", "error": error}),
@@ -1372,8 +1351,8 @@ impl CoordinationKernel {
         self.conn
             .execute(
                 "INSERT INTO agent_sessions(
-                    id, agent_id, agent_slot_id, task_id, orchestration_run_id,
-                    orchestration_role, pty_id, worktree_id, base_git_sha, current_git_sha,
+                    id, agent_id, agent_slot_id, task_id, context_run_id,
+                    context_role, pty_id, worktree_id, base_git_sha, current_git_sha,
                     status, write_root, enforcement_mode, last_heartbeat_at, created_at, updated_at
                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'active', ?10, ?11, ?12, ?12, ?12)",
                 params![
@@ -1381,8 +1360,8 @@ impl CoordinationKernel {
                     agent_id,
                     agent_slot_id,
                     task_id,
-                    orchestration_run_id,
-                    orchestration_role,
+                    context_run_id,
+                    context_role,
                     pty_id,
                     worktree_id,
                     base_git_sha,
@@ -1411,8 +1390,8 @@ impl CoordinationKernel {
             } else {
                 None
             },
-            orchestration_run_id,
-            orchestration_role,
+            context_run_id,
+            context_role,
         )?;
 
         self.emit_event(
@@ -1424,7 +1403,7 @@ impl CoordinationKernel {
                 agent_slot_id: Some(agent_slot_id.to_string()),
                 session_id: Some(id.clone()),
                 task_id: task_id.map(str::to_string),
-                orchestration_run_id: orchestration_run_id.map(str::to_string),
+                context_run_id: context_run_id.map(str::to_string),
                 ..EventRefs::default()
             },
             json!({
@@ -1454,12 +1433,12 @@ impl CoordinationKernel {
         workspace_id: Option<&str>,
         workspace_name: Option<&str>,
         task_id: Option<&str>,
-        orchestration_run_id: Option<&str>,
-        orchestration_role: Option<&str>,
+        context_run_id: Option<&str>,
+        context_role: Option<&str>,
     ) -> Result<TerminalCoordinationContext, String> {
         let objective_key = require_workspace_objective_key(workspace_id)?;
         let _workspace_mcp = self.ensure_workspace_mcp_config(workspace_id, workspace_name)?;
-        let agent = self.create_or_get_agent(agent_name, agent_kind, orchestration_role)?;
+        let agent = self.create_or_get_agent(agent_name, agent_kind, context_role)?;
         let agent_id = agent["id"]
             .as_str()
             .ok_or_else(|| "Unable to read created agent id.".to_string())?
@@ -1469,8 +1448,8 @@ impl CoordinationKernel {
             task_id,
             pty_id,
             true,
-            orchestration_run_id,
-            orchestration_role,
+            context_run_id,
+            context_role,
         )?;
         let session_id = session["id"]
             .as_str()
@@ -1490,8 +1469,6 @@ impl CoordinationKernel {
             .as_str()
             .unwrap_or("coordination_only")
             .to_string();
-        let cloud_status = self.get_cloud_orchestrator_status()?;
-        let cloud_enabled = cloud_status["enabled"].as_bool().unwrap_or(false);
         let warnings = session["warnings"]
             .as_array()
             .map(|items| {
@@ -1532,9 +1509,8 @@ impl CoordinationKernel {
             mcp_command: "coordination_mcp".to_string(),
             workspace_id: workspace_id.map(str::to_string),
             objective_key,
-            orchestration_run_id: orchestration_run_id.map(str::to_string),
-            orchestration_role: orchestration_role.map(str::to_string),
-            cloud_orchestrator_enabled: cloud_enabled,
+            context_run_id: context_run_id.map(str::to_string),
+            context_role: context_role.map(str::to_string),
             warnings,
         })
     }
@@ -1625,7 +1601,7 @@ impl CoordinationKernel {
                 agent_id: session["agent_id"].as_str().map(str::to_string),
                 agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
                 task_id: session["task_id"].as_str().map(str::to_string),
-                orchestration_run_id: session["orchestration_run_id"].as_str().map(str::to_string),
+                context_run_id: session["context_run_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
             },
             json!({
@@ -1662,6 +1638,8 @@ impl CoordinationKernel {
         if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
             args.extend(["--workspace-id".to_string(), value.to_string()]);
         }
+        let (cloud_command, cloud_args) =
+            self.cloud_mcp_command_spec(workspace_id, workspace_name, None, None);
 
         let generic_config = json!({
             "mcpServers": {
@@ -1685,6 +1663,26 @@ impl CoordinationKernel {
                         "toggleable": false,
                         "authority": "local_coordination_kernel"
                     }
+                },
+                "cloud-diffforge": {
+                    "command": cloud_command.clone(),
+                    "args": cloud_args.clone(),
+                    "env": {
+                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
+                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
+                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
+                        "CLOUD_MCP_WORKSPACE_ID": workspace_id,
+                        "CLOUD_MCP_WORKSPACE_NAME": workspace_name,
+                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
+                    },
+                    "diffforge": {
+                        "scope": "workspace",
+                        "workspaceId": workspace_id,
+                        "workspaceName": workspace_name,
+                        "alwaysOn": true,
+                        "toggleable": false,
+                        "authority": "cloud_context_pack"
+                    }
                 }
             }
         });
@@ -1692,8 +1690,19 @@ impl CoordinationKernel {
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
         write_json_file_atomic(&generic_path, &generic_config)?;
-        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+        write_text_file_atomic(
+            &codex_path,
+            &codex_config_toml(&command, &args, Some((&cloud_command, &cloud_args))),
+        )?;
         write_json_file_atomic(&claude_path, &generic_config)?;
+        self.write_agent_contract_files(&self.paths.repo_path)?;
+        let (repo_mcp_path, repo_codex_path) = self.write_repo_root_mcp_activation_files(
+            &generic_config,
+            &command,
+            &args,
+            &cloud_command,
+            &cloud_args,
+        )?;
 
         Ok(json!({
             "server_name": "coordination-kernel",
@@ -1711,6 +1720,8 @@ impl CoordinationKernel {
             "config_path": process_path_text(&generic_path),
             "codex_config_path": process_path_text(&codex_path),
             "claude_config_path": process_path_text(&claude_path),
+            "repo_mcp_path": process_path_text(&repo_mcp_path),
+            "repo_codex_config_path": process_path_text(&repo_codex_path),
         }))
     }
 
@@ -1908,8 +1919,8 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         worktree_id: Option<&str>,
         worktree_path: Option<&str>,
-        orchestration_run_id: Option<&str>,
-        orchestration_role: Option<&str>,
+        context_run_id: Option<&str>,
+        context_role: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
@@ -1938,12 +1949,8 @@ impl CoordinationKernel {
         if let Some(value) = worktree_path {
             args.extend(["--worktree-path".to_string(), value.to_string()]);
         }
-        if let Some(value) = orchestration_run_id {
-            args.extend(["--orchestration-run-id".to_string(), value.to_string()]);
-        }
-        if let Some(value) = orchestration_role {
-            args.extend(["--orchestration-role".to_string(), value.to_string()]);
-        }
+        let (cloud_command, cloud_args) =
+            self.cloud_mcp_command_spec(None, None, Some(agent_id), Some(session_id));
 
         let generic_config = json!({
             "mcpServers": {
@@ -1966,6 +1973,27 @@ impl CoordinationKernel {
                         "toggleable": false,
                         "authority": "local_coordination_kernel"
                     }
+                },
+                "cloud-diffforge": {
+                    "command": cloud_command.clone(),
+                    "args": cloud_args.clone(),
+                    "env": {
+                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
+                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
+                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
+                        "CLOUD_MCP_AGENT_ID": agent_id,
+                        "CLOUD_MCP_SESSION_ID": session_id,
+                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
+                    },
+                    "diffforge": {
+                        "scope": "agent",
+                        "slotKey": slot_key,
+                        "agentSlotId": agent_slot_id,
+                        "sessionId": session_id,
+                        "alwaysOn": true,
+                        "toggleable": false,
+                        "authority": "cloud_context_pack"
+                    }
                 }
             }
         });
@@ -1986,8 +2014,12 @@ impl CoordinationKernel {
             .join("agents")
             .join(format!("{slot_key}.claude.json"));
         write_json_file_atomic(&generic_path, &generic_config)?;
-        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+        write_text_file_atomic(
+            &codex_path,
+            &codex_config_toml(&command, &args, Some((&cloud_command, &cloud_args))),
+        )?;
         write_json_file_atomic(&claude_path, &claude_config)?;
+        self.write_repo_root_dynamic_mcp_activation_files()?;
         if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
             if !path_text_under_path(worktree_path, &self.paths.worktrees_root) {
                 return Err(format!(
@@ -1999,6 +2031,8 @@ impl CoordinationKernel {
                 &generic_config,
                 &command,
                 &args,
+                &cloud_command,
+                &cloud_args,
             )?;
         }
         let config_bytes = serde_json::to_vec(&generic_config)
@@ -2085,12 +2119,60 @@ impl CoordinationKernel {
         (exe_name.to_string(), Vec::new())
     }
 
+    fn cloud_mcp_command_spec(
+        &self,
+        workspace_id: Option<&str>,
+        workspace_name: Option<&str>,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> (String, Vec<String>) {
+        let command = std::env::current_exe()
+            .ok()
+            .filter(|path| path.exists())
+            .map(|path| process_path_text(&path))
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "rust-diffforge.exe".to_string()
+                } else {
+                    "rust-diffforge".to_string()
+                }
+            });
+        let repo_path = process_path_text(&self.paths.repo_path);
+        let repo_id = cloud_mcp_repo_id_for_path(&self.paths.repo_path);
+        let mut args = vec![
+            "--cloud-mcp-proxy".to_string(),
+            "--base-url".to_string(),
+            cloud_mcp_base_url_for_config(),
+            "--repo-path".to_string(),
+            repo_path,
+            "--repo-id".to_string(),
+            repo_id,
+            "--client-id".to_string(),
+            "rust-diffforge-agent".to_string(),
+        ];
+        if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--workspace-id".to_string(), value.to_string()]);
+        }
+        if let Some(value) = workspace_name.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--workspace-name".to_string(), value.to_string()]);
+        }
+        if let Some(value) = agent_id.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--agent-id".to_string(), value.to_string()]);
+        }
+        if let Some(value) = session_id.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--session-id".to_string(), value.to_string()]);
+        }
+        (command, args)
+    }
+
     fn write_worktree_mcp_activation_files(
         &self,
         worktree_path: &str,
         generic_config: &Value,
         command: &str,
         args: &[String],
+        cloud_command: &str,
+        cloud_args: &[String],
     ) -> Result<(), String> {
         let worktree = PathBuf::from(worktree_path);
         if !worktree.exists() {
@@ -2112,8 +2194,155 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         write_text_file_atomic(
             &codex_dir.join("config.toml"),
-            &codex_config_toml(command, args),
+            &codex_config_toml(command, args, Some((cloud_command, cloud_args))),
         )?;
+        self.write_agent_contract_files(&worktree)?;
+        Ok(())
+    }
+
+    fn write_repo_root_dynamic_mcp_activation_files(&self) -> Result<(PathBuf, PathBuf), String> {
+        let (command, mut args) = self.coordination_mcp_command_spec();
+        args.extend([
+            "--repo-path".to_string(),
+            process_path_text(&self.paths.repo_path),
+            "--db-path".to_string(),
+            process_path_text(&self.paths.db_path),
+        ]);
+
+        let (cloud_command, cloud_args) = self.cloud_mcp_command_spec(None, None, None, None);
+        let generic_config = json!({
+            "mcpServers": {
+                "coordination-kernel": {
+                    "command": command.clone(),
+                    "args": args.clone(),
+                    "env": {
+                        "COORDINATION_ENABLED": "1",
+                        "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
+                        "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
+                        "COORDINATION_MCP_ALWAYS_ON": "1"
+                    },
+                    "diffforge": {
+                        "scope": "repo-root-dynamic-agent",
+                        "alwaysOn": true,
+                        "toggleable": false,
+                        "identitySource": "terminal_environment",
+                        "authority": "local_coordination_kernel"
+                    }
+                },
+                "cloud-diffforge": {
+                    "command": cloud_command.clone(),
+                    "args": cloud_args.clone(),
+                    "env": {
+                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
+                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
+                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
+                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
+                    },
+                    "diffforge": {
+                        "scope": "repo-root-dynamic-agent",
+                        "alwaysOn": true,
+                        "toggleable": false,
+                        "identitySource": "terminal_environment",
+                        "authority": "cloud_context_pack"
+                    }
+                }
+            }
+        });
+
+        self.write_repo_root_mcp_activation_files(
+            &generic_config,
+            &command,
+            &args,
+            &cloud_command,
+            &cloud_args,
+        )
+    }
+
+    fn write_repo_root_mcp_activation_files(
+        &self,
+        generic_config: &Value,
+        command: &str,
+        args: &[String],
+        cloud_command: &str,
+        cloud_args: &[String],
+    ) -> Result<(PathBuf, PathBuf), String> {
+        self.ensure_repo_root_mcp_files_ignored()?;
+
+        let mcp_path = self.paths.repo_path.join(".mcp.json");
+        write_json_file_atomic(&mcp_path, generic_config)?;
+
+        let codex_dir = self.paths.repo_path.join(".codex");
+        fs::create_dir_all(&codex_dir)
+            .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
+        let codex_path = codex_dir.join("config.toml");
+        write_text_file_atomic(
+            &codex_path,
+            &codex_config_toml(command, args, Some((cloud_command, cloud_args))),
+        )?;
+        self.write_agent_contract_files(&self.paths.repo_path)?;
+
+        Ok((mcp_path, codex_path))
+    }
+
+    fn write_agent_contract_files(&self, root: &Path) -> Result<(), String> {
+        if !root.exists() {
+            return Ok(());
+        }
+        let contract = diffforge_agent_contract_markdown();
+        let mut generated = Vec::new();
+        if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
+            generated.push("AGENTS.md");
+        }
+        if write_or_update_generated_agent_contract(&root.join("CLAUDE.md"), &contract)? {
+            generated.push("CLAUDE.md");
+        }
+        if !generated.is_empty() {
+            ensure_git_info_exclude_entries(root, &generated)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_repo_root_mcp_files_ignored(&self) -> Result<(), String> {
+        let exclude_path_text = run_git(&self.paths.repo_path, &["rev-parse", "--git-path", "info/exclude"])?;
+        let exclude_path = {
+            let trimmed = exclude_path_text.trim();
+            let path = PathBuf::from(trimmed);
+            if path.is_absolute() {
+                path
+            } else {
+                self.paths.repo_path.join(path)
+            }
+        };
+        if let Some(parent) = exclude_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Unable to create git exclude directory {}: {error}", parent.display())
+            })?;
+        }
+        let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+        let mut additions = Vec::new();
+        if !existing.lines().any(|line| line.trim() == ".mcp.json") {
+            additions.push(".mcp.json");
+        }
+        if !existing.lines().any(|line| line.trim() == ".codex/config.toml") {
+            additions.push(".codex/config.toml");
+        }
+        if additions.is_empty() {
+            return Ok(());
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .map_err(|error| format!("Unable to open {}: {error}", exclude_path.display()))?;
+        if !existing.ends_with('\n') && !existing.is_empty() {
+            writeln!(file).map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+        }
+        writeln!(file, "# Diff Forge local MCP activation files")
+            .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+        for addition in additions {
+            writeln!(file, "{addition}")
+                .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+        }
         Ok(())
     }
 
@@ -3110,6 +3339,11 @@ impl CoordinationKernel {
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_string);
+            let merge_resolution = self.complete_merge_resolution_task(
+                task_id,
+                validation.patch_id.as_deref(),
+                validation.diff_artifact_id.as_deref(),
+            )?;
             self.conn
                 .execute(
                     "UPDATE tasks SET status='patch_submitted', updated_at=?1 WHERE id=?2",
@@ -3135,7 +3369,8 @@ impl CoordinationKernel {
                     "patch_id": validation.patch_id,
                     "validation_status": "passed",
                     "changed_files": validation.changed_files,
-                    "diff_artifact_id": validation.diff_artifact_id
+                    "diff_artifact_id": validation.diff_artifact_id,
+                    "merge_resolution": merge_resolution
                 }),
                 validation.warnings,
             ));
@@ -3821,6 +4056,306 @@ impl CoordinationKernel {
         run_git(worktree_path, &args).map(|_| ())
     }
 
+    pub fn initialize_merge_resolution(
+        &self,
+        patch_id: &str,
+        resolver_agent_id: Option<&str>,
+        resolver_session_id: Option<&str>,
+        target_branch: Option<&str>,
+    ) -> Result<Value, String> {
+        self.expire_old_leases()?;
+        let patch = self.get_patch(patch_id)?;
+        let validation = patch["validation_id"]
+            .as_str()
+            .ok_or_else(|| "Patch has no validation.".to_string())
+            .and_then(|id| self.get_patch_validation(id))?;
+        if validation["status"].as_str() != Some("passed")
+            || patch["status"].as_str() != Some("submitted")
+        {
+            return Ok(api_error(
+                "merge_resolution_blocked",
+                "Patch must be submitted with passed validation before merge resolution can be initialized.",
+                json!({
+                    "patch_id": patch_id,
+                    "patch_status": patch["status"].clone(),
+                    "validation_status": validation["status"].clone(),
+                }),
+            ));
+        }
+        self.verify_patch_artifact_hash(&patch)?;
+
+        let policy = self.repo_policy()?;
+        if policy["merge_gate_required"].as_i64().unwrap_or(1) != 1 {
+            let job_id = self.create_merge_job(
+                &patch,
+                "blocked",
+                target_branch,
+                "merge_resolution",
+                Some("The local merge gate is not enabled."),
+            )?;
+            return Ok(api_error(
+                "merge_resolution_blocked",
+                "The local merge gate must remain enabled before merge resolution can be initialized.",
+                json!({"merge_job_id": job_id, "patch_id": patch_id}),
+            ));
+        }
+        if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
+            && !self.repo_is_clean()?
+        {
+            let job_id = self.create_merge_job(
+                &patch,
+                "blocked",
+                target_branch,
+                "merge_resolution",
+                Some("Target repo root is dirty."),
+            )?;
+            self.create_workspace_violation(
+                patch["task_id"].as_str(),
+                patch["agent_id"].as_str(),
+                patch["session_id"].as_str(),
+                patch["worktree_id"].as_str(),
+                "dirty_target_repo",
+                None,
+                None,
+                "error",
+                json!({"patch_id": patch_id, "merge_resolution": true}),
+            )?;
+            return Ok(api_error(
+                "merge_resolution_blocked",
+                "Target repo root is dirty.",
+                json!({"merge_job_id": job_id, "patch_id": patch_id}),
+            ));
+        }
+
+        let changed_files = self.patch_file_paths(patch_id)?;
+        if changed_files.is_empty() {
+            return Ok(api_error(
+                "merge_resolution_blocked",
+                "Patch has no recorded changed files.",
+                json!({"patch_id": patch_id}),
+            ));
+        }
+
+        if let Some(existing) = self.existing_active_merge_resolution(patch_id)? {
+            return Ok(api_ok(json!({
+                "status": "already_initialized",
+                "merge_job_id": existing["merge_job_id"].clone(),
+                "resolution_task_id": existing["resolution_task_id"].clone(),
+                "resolver_agent_id": existing["resolver_agent_id"].clone(),
+                "resolver_session_id": existing["resolver_session_id"].clone(),
+                "resolver_prompt": existing["resolver_prompt"].clone(),
+                "changed_files": changed_files,
+            })));
+        }
+
+        let resolver_session =
+            self.select_merge_resolution_session(&patch, resolver_agent_id, resolver_session_id)?;
+        let actual_resolver_agent_id = resolver_session["agent_id"]
+            .as_str()
+            .ok_or_else(|| "Resolver session is missing agent_id.".to_string())?;
+        let actual_resolver_session_id = resolver_session["id"]
+            .as_str()
+            .ok_or_else(|| "Resolver session is missing id.".to_string())?;
+        let resolver_worktree_id = resolver_session["worktree_id"].as_str();
+
+        let active_blockers =
+            self.active_merge_resolution_blockers(&changed_files, actual_resolver_agent_id)?;
+        if !active_blockers.is_empty() {
+            let job_id = self.create_merge_job(
+                &patch,
+                "blocked",
+                target_branch,
+                "merge_resolution",
+                Some("Other active agents still hold file leases for this patch."),
+            )?;
+            self.emit_event(
+                "merge_resolution_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs::from_patch(&patch),
+                json!({
+                    "merge_job_id": job_id,
+                    "patch_id": patch_id,
+                    "reason": "active_file_leases",
+                    "blockers": active_blockers,
+                }),
+            )?;
+            return Ok(api_error(
+                "merge_resolution_blocked_active_leases",
+                "Another active agent still owns at least one changed file; wait for that lease to release before initializing resolution.",
+                json!({"merge_job_id": job_id, "patch_id": patch_id, "blockers": active_blockers}),
+            ));
+        }
+
+        if self.git_apply_check(&patch).is_ok() {
+            let queued = self.request_merge(patch_id, target_branch, Some("patch_apply"))?;
+            if queued["ok"].as_bool() == Some(true) {
+                return Ok(api_ok(json!({
+                    "status": "queued_without_resolution",
+                    "resolution_needed": false,
+                    "merge_job_id": queued["data"]["merge_job_id"].clone(),
+                    "patch_id": patch_id,
+                    "changed_files": changed_files,
+                })));
+            }
+            return Ok(queued);
+        }
+
+        let merge_job_id = self.create_merge_job(
+            &patch,
+            "resolution_initialized",
+            target_branch,
+            "merge_resolution",
+            Some("Patch does not apply cleanly; resolver agent initialized."),
+        )?;
+        let resolution_task = self.create_task(
+            &format!("Resolve merge for patch {}", short_id(patch_id)),
+            Some("Merge resolution is being initialized by the local coordination kernel."),
+            100,
+            3,
+            None,
+            None,
+            Some("merge_resolution"),
+            Some("Submit a resolved patch. Do not apply the merge."),
+        )?;
+        let resolution_task_id = resolution_task["id"]
+            .as_str()
+            .ok_or_else(|| "Resolution task response is missing id.".to_string())?
+            .to_string();
+        self.claim_task(
+            &resolution_task_id,
+            actual_resolver_agent_id,
+            actual_resolver_session_id,
+        )?;
+
+        let released_leases =
+            self.release_resolver_file_leases(&changed_files, actual_resolver_agent_id)?;
+        let mut resolution_leases = Vec::new();
+        for path in &changed_files {
+            let lease = self.acquire_lease(
+                &resolution_task_id,
+                actual_resolver_agent_id,
+                actual_resolver_session_id,
+                &path_to_file_resource(path),
+                "write",
+                Some(DEFAULT_LEASE_TTL_SECONDS),
+                Some("merge_resolution"),
+            )?;
+            if lease["ok"].as_bool() == Some(false) {
+                return Ok(api_error(
+                    "merge_resolution_lease_failed",
+                    "Unable to acquire one of the merge-resolution file leases.",
+                    json!({
+                        "patch_id": patch_id,
+                        "merge_job_id": merge_job_id,
+                        "resolution_task_id": resolution_task_id,
+                        "failed_path": path,
+                        "lease_response": lease,
+                    }),
+                ));
+            }
+            resolution_leases.push(lease["data"].clone());
+        }
+
+        let cloud_context = json!({
+            "tool": "cloud_get_context_pack",
+            "arguments": {
+                "agent_id": "$CLOUD_MCP_AGENT_ID",
+                "self_agent_id": "$CLOUD_MCP_AGENT_ID",
+                "repo_id": "$CLOUD_MCP_REPO_ID",
+                "lane": format!("merge-resolution:{patch_id}"),
+                "prompt": format!("Resolve merge for patch {patch_id}"),
+                "record_prompt": true,
+                "patch_id": patch_id,
+                "merge_job_id": merge_job_id.clone(),
+                "resolution_task_id": resolution_task_id.clone(),
+            }
+        });
+        let resolver_prompt = merge_resolution_prompt(
+            patch_id,
+            &merge_job_id,
+            &resolution_task_id,
+            &changed_files,
+            &cloud_context,
+        );
+        self.conn
+            .execute(
+                "UPDATE tasks
+                 SET body=?1, parent_task_id=?2, expected_output=?3, updated_at=?4
+                 WHERE id=?5",
+                params![
+                    resolver_prompt.clone(),
+                    patch["task_id"].as_str(),
+                    "Resolved patch submitted through submit_patch; no apply_merge from the agent.",
+                    now_rfc3339(),
+                    resolution_task_id
+                ],
+            )
+            .map_err(|error| format!("Unable to update merge resolution task: {error}"))?;
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO merge_resolution_tasks(
+                    id, merge_job_id, patch_id, resolution_task_id, resolver_agent_id,
+                    resolver_session_id, resolver_worktree_id, status, changed_files_json,
+                    cloud_context_json, resolver_prompt, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'initialized', ?8, ?9, ?10, ?11, ?11)",
+                params![
+                    uuid(),
+                    merge_job_id,
+                    patch_id,
+                    resolution_task_id,
+                    actual_resolver_agent_id,
+                    actual_resolver_session_id,
+                    resolver_worktree_id,
+                    json!(changed_files.clone()).to_string(),
+                    cloud_context.to_string(),
+                    resolver_prompt.clone(),
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to record merge resolution task: {error}"))?;
+        self.emit_event(
+            "merge_resolution_initialized",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(resolution_task_id.clone()),
+                agent_id: Some(actual_resolver_agent_id.to_string()),
+                session_id: Some(actual_resolver_session_id.to_string()),
+                artifact_id: patch["diff_artifact_id"].as_str().map(str::to_string),
+                ..EventRefs::from_patch(&patch)
+            },
+            json!({
+                "patch_id": patch_id,
+                "merge_job_id": merge_job_id,
+                "resolution_task_id": resolution_task_id,
+                "resolver_agent_id": actual_resolver_agent_id,
+                "resolver_session_id": actual_resolver_session_id,
+                "changed_files": changed_files,
+                "released_prior_resolver_leases": released_leases,
+                "resolution_leases": resolution_leases,
+                "cloud_context": cloud_context,
+            }),
+        )?;
+
+        Ok(api_ok(json!({
+            "status": "resolution_initialized",
+            "resolution_needed": true,
+            "patch_id": patch_id,
+            "merge_job_id": merge_job_id,
+            "resolution_task_id": resolution_task_id,
+            "resolver_agent_id": actual_resolver_agent_id,
+            "resolver_session_id": actual_resolver_session_id,
+            "resolver_worktree_id": resolver_worktree_id,
+            "changed_files": changed_files,
+            "released_prior_resolver_leases": released_leases,
+            "resolution_leases": resolution_leases,
+            "cloud_context": cloud_context,
+            "resolver_prompt": resolver_prompt,
+        })))
+    }
+
     pub fn request_merge(
         &self,
         patch_id: &str,
@@ -4204,6 +4739,227 @@ impl CoordinationKernel {
         )
     }
 
+    fn patch_file_paths(&self, patch_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .query_json(
+                "SELECT path FROM patch_files WHERE patch_id=?1 ORDER BY path ASC",
+                &[&patch_id],
+            )?
+            .into_iter()
+            .filter_map(|row| row["path"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    fn existing_active_merge_resolution(&self, patch_id: &str) -> Result<Option<Value>, String> {
+        let mut rows = self.query_json(
+            "SELECT mrt.*, mj.status AS merge_job_status
+             FROM merge_resolution_tasks mrt
+             LEFT JOIN merge_jobs mj ON mj.id=mrt.merge_job_id
+             WHERE mrt.patch_id=?1 AND mrt.status IN ('initialized', 'active')
+             ORDER BY mrt.updated_at DESC LIMIT 1",
+            &[&patch_id],
+        )?;
+        Ok(rows.pop())
+    }
+
+    fn select_merge_resolution_session(
+        &self,
+        patch: &Value,
+        resolver_agent_id: Option<&str>,
+        resolver_session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let agent_id = resolver_agent_id
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| patch["agent_id"].as_str())
+            .ok_or_else(|| {
+                "Patch is missing agent_id and no resolver_agent_id was provided.".to_string()
+            })?;
+        if let Some(session_id) = resolver_session_id.filter(|value| !value.trim().is_empty()) {
+            return self.ensure_session_active(session_id, agent_id);
+        }
+        if let Some(session_id) = patch["session_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            if let Ok(session) = self.ensure_session_active(session_id, agent_id) {
+                return Ok(session);
+            }
+        }
+        let mut sessions = self.query_json(
+            "SELECT * FROM agent_sessions
+             WHERE agent_id=?1 AND status='active'
+             ORDER BY updated_at DESC LIMIT 1",
+            &[&agent_id],
+        )?;
+        sessions.pop().ok_or_else(|| {
+            format!(
+                "No active resolver session exists for agent {agent_id}; open or restart that agent before initializing merge resolution."
+            )
+        })
+    }
+
+    fn active_merge_resolution_blockers(
+        &self,
+        changed_files: &[String],
+        resolver_agent_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let active = self.list_active_leases_internal(None, None, None)?;
+        let requested = changed_files
+            .iter()
+            .map(|path| (path.clone(), path_to_file_resource(path)))
+            .collect::<Vec<_>>();
+        let mut blockers = Vec::new();
+        for lease in active {
+            if lease["agent_id"].as_str() == Some(resolver_agent_id) {
+                continue;
+            }
+            if !is_write_like(lease["mode"].as_str().unwrap_or_default()) {
+                continue;
+            }
+            let existing_key = lease["resource_key"].as_str().unwrap_or_default();
+            for (path, resource_key) in &requested {
+                if resource_conflict_reason(existing_key, resource_key).is_some() {
+                    let mut blocker = lease.clone();
+                    if let Some(object) = blocker.as_object_mut() {
+                        object.insert("requested_path".to_string(), Value::String(path.clone()));
+                        object.insert(
+                            "requested_resource_key".to_string(),
+                            Value::String(resource_key.clone()),
+                        );
+                    }
+                    blockers.push(blocker);
+                    break;
+                }
+            }
+        }
+        Ok(blockers)
+    }
+
+    fn release_resolver_file_leases(
+        &self,
+        changed_files: &[String],
+        resolver_agent_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let active = self.list_active_leases_internal(None, Some(resolver_agent_id), None)?;
+        let requested = changed_files
+            .iter()
+            .map(|path| path_to_file_resource(path))
+            .collect::<Vec<_>>();
+        let now = now_rfc3339();
+        let mut released = Vec::new();
+        for lease in active {
+            if !is_write_like(lease["mode"].as_str().unwrap_or_default()) {
+                continue;
+            }
+            let existing_key = lease["resource_key"].as_str().unwrap_or_default();
+            if !requested
+                .iter()
+                .any(|resource_key| resource_conflict_reason(existing_key, resource_key).is_some())
+            {
+                continue;
+            }
+            let Some(lease_id) = lease["id"].as_str() else {
+                continue;
+            };
+            self.conn
+                .execute(
+                    "UPDATE leases SET status='released', released_at=?1 WHERE id=?2 AND status='active'",
+                    params![now, lease_id],
+                )
+                .map_err(|error| format!("Unable to release prior resolver lease: {error}"))?;
+            self.emit_event(
+                "lease_released_for_merge_resolution",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: lease["task_id"].as_str().map(str::to_string),
+                    agent_id: lease["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: lease["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: lease["session_id"].as_str().map(str::to_string),
+                    resource_id: lease["resource_id"].as_str().map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "lease_id": lease_id,
+                    "resource_key": lease["resource_key"].clone(),
+                    "reason": "same_agent_merge_resolution_transfer",
+                }),
+            )?;
+            released.push(lease);
+        }
+        Ok(released)
+    }
+
+    fn complete_merge_resolution_task(
+        &self,
+        task_id: &str,
+        resolved_patch_id: Option<&str>,
+        resolved_diff_artifact_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let rows = self.query_json(
+            "SELECT * FROM merge_resolution_tasks
+             WHERE resolution_task_id=?1 AND status IN ('initialized', 'active')
+             ORDER BY updated_at DESC",
+            &[&task_id],
+        )?;
+        if rows.is_empty() {
+            return Ok(Value::Null);
+        }
+        let now = now_rfc3339();
+        let mut completed = Vec::new();
+        for row in rows {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let merge_job_id = row["merge_job_id"].as_str().unwrap_or_default();
+            self.conn
+                .execute(
+                    "UPDATE merge_resolution_tasks
+                     SET status='resolved', resolved_patch_id=?1, updated_at=?2
+                     WHERE id=?3",
+                    params![resolved_patch_id, now, id],
+                )
+                .map_err(|error| format!("Unable to mark merge resolution resolved: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE merge_jobs
+                     SET status='resolution_submitted', result_artifact_id=COALESCE(?1, result_artifact_id), updated_at=?2
+                     WHERE id=?3",
+                    params![resolved_diff_artifact_id, now, merge_job_id],
+                )
+                .map_err(|error| format!("Unable to update merge job after resolution submit: {error}"))?;
+            self.emit_event(
+                "merge_resolution_patch_submitted",
+                "agent",
+                row["resolver_agent_id"].as_str().unwrap_or(REPO_ID),
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: row["resolver_agent_id"].as_str().map(str::to_string),
+                    session_id: row["resolver_session_id"].as_str().map(str::to_string),
+                    artifact_id: resolved_diff_artifact_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "merge_job_id": merge_job_id,
+                    "patch_id": row["patch_id"].clone(),
+                    "resolved_patch_id": resolved_patch_id,
+                    "resolution_task_id": task_id,
+                }),
+            )?;
+            completed.push(json!({
+                "merge_job_id": merge_job_id,
+                "patch_id": row["patch_id"].clone(),
+                "resolved_patch_id": resolved_patch_id,
+                "resolution_task_id": task_id,
+                "status": "resolved",
+            }));
+        }
+        Ok(json!({
+            "status": "resolved",
+            "items": completed,
+        }))
+    }
+
     fn get_patch_validation(&self, validation_id: &str) -> Result<Value, String> {
         self.query_one(
             "SELECT * FROM patch_validations WHERE id=?1",
@@ -4236,7 +4992,7 @@ impl CoordinationKernel {
         trust_level: Option<&str>,
         task_id: Option<&str>,
         evidence_artifact_id: Option<&str>,
-        orchestration_run_id: Option<&str>,
+        context_run_id: Option<&str>,
         created_by_agent_id: Option<&str>,
         certified_by: Option<&str>,
     ) -> Result<Value, String> {
@@ -4278,22 +5034,6 @@ impl CoordinationKernel {
                     Some(&trust_level),
                     &error,
                     json!({"reason": "missing_task", "task_id": task_id}),
-                );
-                return Err(error);
-            }
-        }
-        if let Some(run_id) = orchestration_run_id {
-            if let Err(error) = self.query_one(
-                "SELECT id FROM orchestration_runs WHERE id=?1",
-                &[&run_id],
-                "Orchestration run does not exist.",
-            ) {
-                self.log_memory_write_rejected(
-                    &memory_kind,
-                    title,
-                    Some(&trust_level),
-                    &error,
-                    json!({"reason": "missing_orchestration_run", "orchestration_run_id": run_id}),
                 );
                 return Err(error);
             }
@@ -4360,7 +5100,7 @@ impl CoordinationKernel {
                 .execute(
                     "INSERT INTO memories(
                         id, memory_kind, trust_level, title, body_path, summary, evidence_artifact_id,
-                        task_id, orchestration_run_id, created_by_agent_id, created_by_slot_id,
+                        task_id, context_run_id, created_by_agent_id, created_by_slot_id,
                         certified_by, created_at, updated_at
                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
                     params![
@@ -4372,7 +5112,7 @@ impl CoordinationKernel {
                         summary,
                         evidence_artifact_id,
                         task_id,
-                        orchestration_run_id,
+                        context_run_id,
                         created_by_agent_id,
                         created_by_slot_id.as_deref(),
                         certified_by,
@@ -4389,7 +5129,7 @@ impl CoordinationKernel {
                     agent_id: created_by_agent_id.map(str::to_string),
                     agent_slot_id: created_by_slot_id.clone(),
                     artifact_id: evidence_artifact_id.map(str::to_string),
-                    orchestration_run_id: orchestration_run_id.map(str::to_string),
+                    context_run_id: context_run_id.map(str::to_string),
                     ..EventRefs::default()
                 },
                 json!({
@@ -4417,7 +5157,7 @@ impl CoordinationKernel {
                         agent_id: created_by_agent_id.map(str::to_string),
                         agent_slot_id: created_by_slot_id.clone(),
                         artifact_id: evidence_artifact_id.map(str::to_string),
-                        orchestration_run_id: orchestration_run_id.map(str::to_string),
+                        context_run_id: context_run_id.map(str::to_string),
                         ..EventRefs::default()
                     },
                     json!({
@@ -4473,7 +5213,6 @@ impl CoordinationKernel {
             .or_else(|| input["agent_id"].as_str())
             .unwrap_or("local");
         let task_id = input["task_id"].as_str();
-        let run_id = input["orchestration_run_id"].as_str();
         let resources = input["resource_keys"]
             .as_array()
             .map(|items| {
@@ -4486,10 +5225,9 @@ impl CoordinationKernel {
             })
             .unwrap_or_default();
         let body = format!(
-            "# Contract: {contract_name}\n\nStatus: {}\nVersion: 1\nCreated By Agent: {agent_id}\nTask: {}\nOrchestration Run: {}\nProducer Role: {}\nConsumer Role: {}\nResource Keys:\n{}\n\n## Purpose\n\n{}\n\n## Interface\n\n{}\n\n## Inputs\n\n{}\n\n## Outputs\n\n{}\n\n## Invariants\n\n{}\n\n## Handoff Notes\n\n{}\n\n## Evidence\n\n{}\n\n## Breaking Change Policy\n\n{}\n",
+            "# Contract: {contract_name}\n\nStatus: {}\nVersion: 1\nCreated By Agent: {agent_id}\nTask: {}\nProducer Role: {}\nConsumer Role: {}\nResource Keys:\n{}\n\n## Purpose\n\n{}\n\n## Interface\n\n{}\n\n## Inputs\n\n{}\n\n## Outputs\n\n{}\n\n## Invariants\n\n{}\n\n## Handoff Notes\n\n{}\n\n## Evidence\n\n{}\n\n## Breaking Change Policy\n\n{}\n",
             input["status"].as_str().unwrap_or("draft"),
             task_id.unwrap_or("none"),
-            run_id.unwrap_or("none"),
             input["producer_role"].as_str().unwrap_or("unknown"),
             input["consumer_role"].as_str().unwrap_or("unknown"),
             if resources.is_empty() { "- none".to_string() } else { resources },
@@ -4510,7 +5248,7 @@ impl CoordinationKernel {
             Some("draft"),
             task_id,
             input["evidence_artifact_id"].as_str(),
-            run_id,
+            None,
             Some(agent_id),
             None,
         )
@@ -4533,13 +5271,11 @@ impl CoordinationKernel {
                     .join("\n")
             })
             .unwrap_or_else(|| "- none".to_string());
-        let run_id = input["orchestration_run_id"].as_str();
         let body = format!(
-            "# Handoff: {title}\n\nFrom Agent: {from_agent_id}\nFrom Task: {}\nTo Role: {}\nStatus: {}\nOrchestration Run: {}\n\n## Completed\n\n{}\n\n## Needed Next\n\n{}\n\n## Relevant Contracts\n\n{}\n\n## Relevant Resources\n\n{}\n\n## Risks\n\n{}\n\n## Evidence\n\n{}\n",
+            "# Handoff: {title}\n\nFrom Agent: {from_agent_id}\nFrom Task: {}\nTo Role: {}\nStatus: {}\n\n## Completed\n\n{}\n\n## Needed Next\n\n{}\n\n## Relevant Contracts\n\n{}\n\n## Relevant Resources\n\n{}\n\n## Risks\n\n{}\n\n## Evidence\n\n{}\n",
             from_task_id.unwrap_or("none"),
             input["to_role"].as_str().unwrap_or("unknown"),
             input["status"].as_str().unwrap_or("open"),
-            run_id.unwrap_or("none"),
             input["completed"].as_str().unwrap_or(""),
             input["needed_next"].as_str().unwrap_or(""),
             contracts,
@@ -4555,7 +5291,7 @@ impl CoordinationKernel {
             Some("draft"),
             from_task_id,
             input["evidence_artifact_id"].as_str(),
-            run_id,
+            None,
             Some(from_agent_id),
             None,
         )
@@ -5780,730 +6516,12 @@ impl CoordinationKernel {
         ))
     }
 
-    pub fn get_cloud_orchestrator_status(&self) -> Result<Value, String> {
-        let config = self.query_one(
-            "SELECT * FROM cloud_orchestrator_configs WHERE id='default'",
-            &[],
-            "Cloud orchestrator config does not exist.",
-        )?;
-        let recent_sync_jobs = self.query_json(
-            "SELECT * FROM cloud_sync_jobs ORDER BY created_at DESC LIMIT 10",
-            &[],
-        )?;
-        let recent_runs = self.query_json(
-            "SELECT * FROM orchestration_runs ORDER BY created_at DESC LIMIT 20",
-            &[],
-        )?;
-        Ok(json!({
-            "enabled": config["enabled"].as_i64().unwrap_or(0) == 1,
-            "mode": config["mode"],
-            "status": config["status"],
-            "endpoint_configured": config["endpoint_url"].as_str().map(|value| !value.is_empty()).unwrap_or(false),
-            "context_export_policy": config["context_export_policy"],
-            "allow_code_export": config["allow_code_export"].as_i64().unwrap_or(0) == 1,
-            "allow_terminal_log_export": config["allow_terminal_log_export"].as_i64().unwrap_or(0) == 1,
-            "allow_patch_export": config["allow_patch_export"].as_i64().unwrap_or(0) == 1,
-            "auto_create_tasks": config["auto_create_tasks"].as_i64().unwrap_or(0) == 1,
-            "auto_assign_agents": config["auto_assign_agents"].as_i64().unwrap_or(0) == 1,
-            "auto_spawn_terminals": config["auto_spawn_terminals"].as_i64().unwrap_or(0) == 1,
-            "auto_merge": false,
-            "last_sync_at": config["last_sync_at"],
-            "local_coordination_available": true,
-            "message": if config["enabled"].as_i64().unwrap_or(0) == 1 { "Cloud adapter is configured as advisory only." } else { "Cloud orchestrator disabled; local-only coordination is active." },
-            "recent_sync_jobs": recent_sync_jobs,
-            "recent_orchestration_runs": recent_runs,
-        }))
-    }
-
-    pub fn update_cloud_orchestrator_config(&self, input: &Value) -> Result<Value, String> {
-        let enabled = input["enabled"].as_bool().unwrap_or(false);
-        let mode = input["mode"]
-            .as_str()
-            .unwrap_or(if enabled { "mock" } else { "disabled" });
-        if !matches!(mode, "disabled" | "mock" | "http_stub") {
-            return Err(
-                "Cloud orchestrator mode must be disabled, mock, or http_stub.".to_string(),
-            );
-        }
-        if input["api_key"].as_str().is_some() {
-            return Err("Raw API keys must not be stored. Use api_key_ref.".to_string());
-        }
-        let policy = input["context_export_policy"]
-            .as_str()
-            .unwrap_or("local_only");
-        if !matches!(
-            policy,
-            "local_only" | "redacted_summaries" | "task_graph_only" | "full_with_explicit_approval"
-        ) {
-            return Err("Invalid cloud context export policy.".to_string());
-        }
-        let allow_code_export = input["allow_code_export"].as_bool().unwrap_or(false);
-        let allow_log_export = input["allow_terminal_log_export"]
-            .as_bool()
-            .unwrap_or(false);
-        let allow_patch_export = input["allow_patch_export"].as_bool().unwrap_or(false);
-        if policy != "full_with_explicit_approval"
-            && (allow_code_export || allow_log_export || allow_patch_export)
-        {
-            return Err("Raw code, terminal log, and patch export require full_with_explicit_approval policy.".to_string());
-        }
-        let now = now_rfc3339();
-        self.conn
-            .execute(
-                "UPDATE cloud_orchestrator_configs SET
-                    enabled=?1, mode=?2, endpoint_url=?3, api_key_ref=?4, model_hint=?5,
-                    context_export_policy=?6, allow_code_export=?7, allow_terminal_log_export=?8,
-                    allow_patch_export=?9, auto_create_tasks=?10, auto_assign_agents=?11,
-                    auto_spawn_terminals=?12, auto_merge=0, status=?13, updated_at=?14
-                 WHERE id='default'",
-                params![
-                    bool_i64(enabled),
-                    if enabled { mode } else { "disabled" },
-                    input["endpoint_url"].as_str(),
-                    input["api_key_ref"].as_str(),
-                    input["model_hint"].as_str(),
-                    policy,
-                    bool_i64(allow_code_export),
-                    bool_i64(allow_log_export),
-                    bool_i64(allow_patch_export),
-                    bool_i64(input["auto_create_tasks"].as_bool().unwrap_or(false)),
-                    bool_i64(input["auto_assign_agents"].as_bool().unwrap_or(false)),
-                    bool_i64(input["auto_spawn_terminals"].as_bool().unwrap_or(false)),
-                    if enabled { mode } else { "disabled" },
-                    now
-                ],
-            )
-            .map_err(|error| format!("Unable to update cloud orchestrator config: {error}"))?;
-        self.emit_event(
-            "cloud_orchestrator_config_updated",
-            "user",
-            "local",
-            EventRefs::default(),
-            json!({"enabled": enabled, "mode": mode, "context_export_policy": policy}),
-        )?;
-        Ok(api_ok(self.get_cloud_orchestrator_status()?))
-    }
-
-    pub fn create_orchestration_run(
-        &self,
-        objective: &str,
-        constraints: Option<Value>,
-    ) -> Result<Value, String> {
-        let id = uuid();
-        let now = now_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO orchestration_runs(id, repo_id, objective, status, source, summary, created_by, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, 'draft', 'local', ?4, 'user', ?5, ?5)",
-                params![id, REPO_ID, objective, constraints.as_ref().map(Value::to_string), now],
-            )
-            .map_err(|error| format!("Unable to create orchestration run: {error}"))?;
-        self.emit_event(
-            "orchestration_run_created",
-            "user",
-            "local",
-            EventRefs {
-                orchestration_run_id: Some(id.clone()),
-                ..EventRefs::default()
-            },
-            json!({"objective": objective, "constraints": constraints, "cloud_enabled": false}),
-        )?;
-        Ok(api_ok(
-            json!({"run_id": id, "status": "draft", "source": "local", "cloud": "disabled_or_advisory"}),
-        ))
-    }
-
-    pub fn create_cloud_context_export(
-        &self,
-        run_id: Option<&str>,
-        export_kind: &str,
-    ) -> Result<Value, String> {
-        let status = self.get_cloud_orchestrator_status()?;
-        let policy = status["context_export_policy"]
-            .as_str()
-            .unwrap_or("local_only");
-        let export = json!({
-            "repo_id": REPO_ID,
-            "run_id": run_id,
-            "export_kind": export_kind,
-            "redaction_policy": policy,
-            "source_code": "redacted",
-            "terminal_logs": "redacted",
-            "env_vars": "redacted",
-            "patches": "redacted",
-            "task_summary": self.query_json("SELECT id, title, status, priority, risk_level, assigned_role FROM tasks ORDER BY updated_at DESC LIMIT 50", &[])?,
-            "lease_summary": self.list_active_leases_internal(None, None, None)?,
-            "memory_summary": self.query_json("SELECT id, memory_kind, trust_level, title, summary FROM memories ORDER BY updated_at DESC LIMIT 50", &[])?,
-            "event_summary": self.query_json("SELECT seq, event_type, actor_type, actor_id, task_id, agent_id, session_id, created_at FROM events ORDER BY seq DESC LIMIT 80", &[])?,
-            "cloud_disabled": !status["enabled"].as_bool().unwrap_or(false),
-        });
-        let bytes = serde_json::to_vec_pretty(&export)
-            .map_err(|error| format!("Unable to serialize cloud context export: {error}"))?;
-        let artifact_id = self.write_artifact(
-            None,
-            None,
-            "cloud_context_export",
-            &format!("cloud/context-exports/{}_{}.json", export_kind, uuid()),
-            &bytes,
-            json!({"run_id": run_id, "export_kind": export_kind, "redaction_policy": policy}),
-        )?;
-        let artifact = self.get_artifact(&artifact_id)?;
-        let export_id = uuid();
-        self.conn
-            .execute(
-                "INSERT INTO cloud_context_exports(id, run_id, repo_id, export_kind, redaction_policy, artifact_id, content_hash, status, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8)",
-                params![export_id, run_id, REPO_ID, export_kind, policy, artifact_id, artifact["content_hash"].as_str(), now_rfc3339()],
-            )
-            .map_err(|error| format!("Unable to record cloud context export: {error}"))?;
-        self.emit_event(
-            "cloud_context_export_created",
-            "kernel",
-            REPO_ID,
-            EventRefs {
-                artifact_id: Some(artifact_id.clone()),
-                orchestration_run_id: run_id.map(str::to_string),
-                ..EventRefs::default()
-            },
-            json!({"export_id": export_id, "export_kind": export_kind, "redaction_policy": policy}),
-        )?;
-        Ok(api_ok(
-            json!({"export_id": export_id, "artifact_id": artifact_id, "redaction_policy": policy, "sent_to_cloud": false}),
-        ))
-    }
-
-    pub fn import_orchestration_plan(&self, run_id: &str, plan: &Value) -> Result<Value, String> {
-        let run = self.query_one(
-            "SELECT * FROM orchestration_runs WHERE id=?1",
-            &[&run_id],
-            "Orchestration run does not exist.",
-        )?;
-        let existing_items = self.query_json(
-            "SELECT id FROM orchestration_plan_items WHERE run_id=?1 ORDER BY created_at ASC",
-            &[&run_id],
-        )?;
-        if !existing_items.is_empty() || run["plan_artifact_id"].as_str().is_some() {
-            let plan_item_ids = existing_items
-                .iter()
-                .filter_map(|item| item["id"].as_str().map(str::to_string))
-                .collect::<Vec<_>>();
-            self.emit_event(
-                "orchestration_plan_reused",
-                "kernel",
-                REPO_ID,
-                EventRefs {
-                    orchestration_run_id: Some(run_id.to_string()),
-                    ..EventRefs::default()
-                },
-                json!({
-                    "plan_item_count": plan_item_ids.len(),
-                    "plan_artifact_id": run["plan_artifact_id"].clone(),
-                }),
-            )?;
-            return Ok(api_ok_warnings(
-                json!({"run_id": run_id, "plan_artifact_id": run["plan_artifact_id"], "plan_item_ids": plan_item_ids, "status": run["status"], "reused": true}),
-                vec!["Existing orchestration plan reused; duplicate import skipped.".to_string()],
-            ));
-        }
-        let items = plan["items"].as_array().cloned().unwrap_or_default();
-        if items.is_empty() {
-            return Err("Orchestration plan must include at least one item.".to_string());
-        }
-        let plan_bytes = serde_json::to_vec_pretty(plan)
-            .map_err(|error| format!("Unable to serialize orchestration plan: {error}"))?;
-        let artifact_id = self.write_artifact(
-            None,
-            None,
-            "orchestration_plan",
-            &format!("cloud/received-plans/{}_plan.json", run_id),
-            &plan_bytes,
-            json!({"run_id": run_id}),
-        )?;
-        let mut item_ids = Vec::new();
-        let mut title_to_id = HashMap::new();
-        for item in &items {
-            let id = uuid();
-            let title = item["title"].as_str().unwrap_or("Untitled plan item");
-            title_to_id.insert(title.to_string(), id.clone());
-            item_ids.push(id.clone());
-            self.conn
-                .execute(
-                    "INSERT INTO orchestration_plan_items(
-                        id, run_id, parent_item_id, title, body, assigned_role, priority, risk_level,
-                        status, required_resources_json, expected_outputs_json, depends_on_json,
-                        contract_memory_ids_json, qa_checks_json, created_at, updated_at
-                    ) VALUES(?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, 'proposed', ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
-                    params![
-                        id,
-                        run_id,
-                        title,
-                        item["body"].as_str(),
-                        item["role"].as_str().or_else(|| item["assigned_role"].as_str()),
-                        item["priority"].as_i64().unwrap_or(0),
-                        item["risk_level"].as_i64().unwrap_or(1),
-                        item.get("required_resources").map(Value::to_string),
-                        item.get("expected_outputs").map(Value::to_string),
-                        item.get("depends_on").map(Value::to_string),
-                        item.get("contracts").map(Value::to_string),
-                        plan.get("qa_checks").map(Value::to_string),
-                        now_rfc3339()
-                    ],
-                )
-                .map_err(|error| format!("Unable to store orchestration plan item: {error}"))?;
-        }
-        for contract in plan["contracts"].as_array().cloned().unwrap_or_default() {
-            let mut input = contract;
-            if input["title"].is_null() {
-                input["title"] = Value::String("Orchestration contract".to_string());
-            }
-            input["orchestration_run_id"] = Value::String(run_id.to_string());
-            let _ = self.write_contract_memory(&input)?;
-        }
-        self.conn
-            .execute(
-                "UPDATE orchestration_runs SET status='plan_received', plan_artifact_id=?1, summary=?2, updated_at=?3 WHERE id=?4",
-                params![artifact_id, plan["summary"].as_str(), now_rfc3339(), run_id],
-            )
-            .map_err(|error| format!("Unable to update orchestration run after import: {error}"))?;
-        self.emit_event(
-            "orchestration_plan_imported",
-            "kernel",
-            REPO_ID,
-            EventRefs {
-                artifact_id: Some(artifact_id.clone()),
-                orchestration_run_id: Some(run_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({"item_count": item_ids.len()}),
-        )?;
-        Ok(api_ok(
-            json!({"run_id": run_id, "plan_artifact_id": artifact_id, "plan_item_ids": item_ids, "status": "plan_received"}),
-        ))
-    }
-
-    pub fn adopt_orchestration_plan(&self, run_id: &str) -> Result<Value, String> {
-        let _ = self.query_one(
-            "SELECT id FROM orchestration_runs WHERE id=?1",
-            &[&run_id],
-            "Orchestration run does not exist.",
-        )?;
-        let items = self.query_json(
-            "SELECT * FROM orchestration_plan_items WHERE run_id=?1 AND status='proposed' ORDER BY priority DESC, created_at ASC",
-            &[&run_id],
-        )?;
-        if items.is_empty() {
-            let existing_tasks = self.query_json(
-                "SELECT id, orchestration_plan_item_id FROM tasks WHERE orchestration_run_id=?1",
-                &[&run_id],
-            )?;
-            if !existing_tasks.is_empty() {
-                let mut created_tasks = BTreeMap::new();
-                for task in existing_tasks {
-                    if let (Some(plan_item_id), Some(task_id)) = (
-                        task["orchestration_plan_item_id"].as_str(),
-                        task["id"].as_str(),
-                    ) {
-                        created_tasks.insert(plan_item_id.to_string(), task_id.to_string());
-                    }
-                }
-                self.emit_event(
-                    "orchestration_plan_adoption_reused",
-                    "kernel",
-                    REPO_ID,
-                    EventRefs {
-                        orchestration_run_id: Some(run_id.to_string()),
-                        ..EventRefs::default()
-                    },
-                    json!({"task_count": created_tasks.len()}),
-                )?;
-                return Ok(api_ok_warnings(
-                    json!({"run_id": run_id, "status": "adopted", "created_tasks": created_tasks, "reused": true}),
-                    vec!["Existing adopted orchestration tasks reused.".to_string()],
-                ));
-            }
-            return Err("No proposed orchestration plan items are available to adopt.".to_string());
-        }
-
-        self.begin_immediate_transaction("adopt orchestration plan")?;
-        let result = (|| -> Result<BTreeMap<String, String>, String> {
-            let mut plan_to_task = BTreeMap::new();
-
-            for item in &items {
-                let expected_output = item["expected_outputs_json"]
-                    .as_str()
-                    .map(|value| value.chars().take(500).collect::<String>());
-                let task = self.create_task(
-                    item["title"].as_str().unwrap_or("Orchestration task"),
-                    item["body"].as_str(),
-                    item["priority"].as_i64().unwrap_or(0),
-                    item["risk_level"].as_i64().unwrap_or(1),
-                    Some(run_id),
-                    item["id"].as_str(),
-                    item["assigned_role"].as_str(),
-                    expected_output.as_deref(),
-                )?;
-                let task_id = task["id"].as_str().unwrap_or_default().to_string();
-                plan_to_task.insert(
-                    item["id"].as_str().unwrap_or_default().to_string(),
-                    task_id.clone(),
-                );
-                self.conn
-                    .execute(
-                        "UPDATE orchestration_plan_items SET task_id=?1, status='task_created', updated_at=?2 WHERE id=?3 AND status='proposed'",
-                        params![task_id, now_rfc3339(), item["id"].as_str()],
-                    )
-                    .map_err(|error| format!("Unable to mark plan item adopted: {error}"))?;
-                self.emit_event(
-                    "orchestration_task_generated",
-                    "kernel",
-                    REPO_ID,
-                    EventRefs {
-                        task_id: Some(task_id),
-                        orchestration_run_id: Some(run_id.to_string()),
-                        ..EventRefs::default()
-                    },
-                    json!({"plan_item_id": item["id"]}),
-                )?;
-            }
-
-            for item in &items {
-                let Some(task_id) = item["id"]
-                    .as_str()
-                    .and_then(|id| plan_to_task.get(id))
-                    .cloned()
-                else {
-                    continue;
-                };
-                let depends = item["depends_on_json"]
-                    .as_str()
-                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
-                    .and_then(|value| value.as_array().cloned())
-                    .unwrap_or_default();
-                for dependency in depends {
-                    let dependency_key = dependency.as_str().unwrap_or_default();
-                    let dependency_task_id =
-                        plan_to_task.get(dependency_key).cloned().or_else(|| {
-                            items
-                                .iter()
-                                .find(|candidate| {
-                                    candidate["title"].as_str() == Some(dependency_key)
-                                })
-                                .and_then(|candidate| candidate["id"].as_str())
-                                .and_then(|id| plan_to_task.get(id))
-                                .cloned()
-                        });
-                    let Some(depends_on_task_id) = dependency_task_id else {
-                        return Err(format!(
-                            "Orchestration dependency '{dependency_key}' did not match a generated task."
-                        ));
-                    };
-                    self.insert_task_dependency_checked(
-                        &task_id,
-                        &depends_on_task_id,
-                        "finish_before_start",
-                        "kernel",
-                        REPO_ID,
-                    )?;
-                }
-            }
-
-            self.conn
-                .execute(
-                    "UPDATE orchestration_runs SET status='adopted', updated_at=?1 WHERE id=?2",
-                    params![now_rfc3339(), run_id],
-                )
-                .map_err(|error| format!("Unable to mark orchestration run adopted: {error}"))?;
-            self.emit_event(
-                "orchestration_plan_adopted",
-                "kernel",
-                REPO_ID,
-                EventRefs {
-                    orchestration_run_id: Some(run_id.to_string()),
-                    ..EventRefs::default()
-                },
-                json!({"task_count": plan_to_task.len()}),
-            )?;
-            Ok(plan_to_task)
-        })();
-        let plan_to_task = self.finish_transaction(result, "adopt orchestration plan")?;
-        Ok(api_ok(
-            json!({"run_id": run_id, "status": "adopted", "created_tasks": plan_to_task}),
-        ))
-    }
-
-    pub fn propose_agent_assignments(&self, run_id: &str) -> Result<Value, String> {
-        let _ = self.query_one(
-            "SELECT id FROM orchestration_runs WHERE id=?1",
-            &[&run_id],
-            "Orchestration run does not exist.",
-        )?;
-        let items = self.query_json(
-            "SELECT * FROM orchestration_plan_items WHERE run_id=?1 ORDER BY priority DESC, created_at ASC",
-            &[&run_id],
-        )?;
-        let mut seen = HashSet::new();
-        self.begin_immediate_transaction("propose agent assignments")?;
-        let result = (|| -> Result<Vec<String>, String> {
-            let mut created = Vec::new();
-            let mut reused_count = 0usize;
-            for item in items {
-                let role = item["assigned_role"].as_str().unwrap_or("coding_agent");
-                let plan_item_id = item["id"].as_str().unwrap_or_default();
-                let key = format!("{plan_item_id}:{role}");
-                if !seen.insert(key) {
-                    continue;
-                }
-                if let Some(existing) = self
-                    .query_json(
-                        "SELECT id FROM orchestration_agent_assignments
-                         WHERE run_id=?1 AND plan_item_id=?2 AND role=?3 AND status IN ('proposed', 'accepted')
-                         ORDER BY created_at DESC
-                         LIMIT 1",
-                        &[&run_id, &plan_item_id, &role],
-                    )?
-                    .into_iter()
-                    .next()
-                {
-                    if let Some(id) = existing["id"].as_str() {
-                        created.push(id.to_string());
-                        reused_count += 1;
-                    }
-                    continue;
-                }
-                let id = uuid();
-                self.conn
-                    .execute(
-                        "INSERT INTO orchestration_agent_assignments(
-                            id, run_id, plan_item_id, task_id, requested_agent_kind, requested_agent_name,
-                            role, status, created_at, updated_at
-                        ) VALUES(?1, ?2, ?3, ?4, 'coding_agent', ?5, ?6, 'proposed', ?7, ?7)",
-                        params![
-                            id,
-                            run_id,
-                            plan_item_id,
-                            item["task_id"].as_str(),
-                            format!("{} agent", role),
-                            role,
-                            now_rfc3339()
-                        ],
-                    )
-                    .map_err(|error| format!("Unable to propose agent assignment: {error}"))?;
-                created.push(id);
-            }
-            self.emit_event(
-                "orchestration_assignments_proposed",
-                "kernel",
-                REPO_ID,
-                EventRefs {
-                    orchestration_run_id: Some(run_id.to_string()),
-                    ..EventRefs::default()
-                },
-                json!({"assignment_count": created.len(), "reused_count": reused_count}),
-            )?;
-            if reused_count > 0 {
-                self.emit_event(
-                    "orchestration_assignments_reused",
-                    "kernel",
-                    REPO_ID,
-                    EventRefs {
-                        orchestration_run_id: Some(run_id.to_string()),
-                        ..EventRefs::default()
-                    },
-                    json!({"reused_count": reused_count}),
-                )?;
-            }
-            Ok(created)
-        })();
-        let created = self.finish_transaction(result, "propose agent assignments")?;
-        Ok(api_ok(json!({"assignment_ids": created})))
-    }
-
-    pub fn adopt_agent_assignment(&self, assignment_id: &str) -> Result<Value, String> {
-        let assignment = self.query_one(
-            "SELECT * FROM orchestration_agent_assignments WHERE id=?1",
-            &[&assignment_id],
-            "Assignment does not exist.",
-        )?;
-        if assignment["status"].as_str() == Some("accepted") {
-            if let Some(agent_id) = assignment["assigned_agent_id"]
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-            {
-                self.emit_event(
-                    "orchestration_assignment_reused",
-                    "kernel",
-                    REPO_ID,
-                    EventRefs {
-                        agent_id: Some(agent_id.to_string()),
-                        orchestration_run_id: assignment["run_id"].as_str().map(str::to_string),
-                        task_id: assignment["task_id"].as_str().map(str::to_string),
-                        ..EventRefs::default()
-                    },
-                    json!({"assignment_id": assignment_id, "status": "accepted"}),
-                )?;
-                return Ok(api_ok(json!({
-                    "assignment_id": assignment_id,
-                    "agent_id": agent_id,
-                    "status": "accepted",
-                    "reused": true,
-                })));
-            }
-        }
-        let role = assignment["role"].as_str().unwrap_or("coding_agent");
-        let agent =
-            self.create_or_get_agent(&format!("{role} agent"), "coding_agent", Some(role))?;
-        let agent_id = agent["id"].as_str().unwrap_or_default();
-        self.conn
-            .execute(
-                "UPDATE orchestration_agent_assignments SET assigned_agent_id=?1, status='accepted', updated_at=?2 WHERE id=?3",
-                params![agent_id, now_rfc3339(), assignment_id],
-            )
-            .map_err(|error| format!("Unable to adopt assignment: {error}"))?;
-        self.emit_event(
-            "orchestration_assignment_adopted",
-            "kernel",
-            REPO_ID,
-            EventRefs {
-                agent_id: Some(agent_id.to_string()),
-                orchestration_run_id: assignment["run_id"].as_str().map(str::to_string),
-                task_id: assignment["task_id"].as_str().map(str::to_string),
-                ..EventRefs::default()
-            },
-            json!({"assignment_id": assignment_id, "role": role}),
-        )?;
-        Ok(api_ok(
-            json!({"assignment_id": assignment_id, "agent_id": agent_id, "status": "accepted"}),
-        ))
-    }
-
-    pub fn cloud_sync_once(&self, run_id: Option<&str>) -> Result<Value, String> {
-        let status = self.get_cloud_orchestrator_status()?;
-        let enabled = status["enabled"].as_bool().unwrap_or(false);
-        let mode = status["mode"].as_str().unwrap_or("disabled");
-        if !enabled || mode == "disabled" {
-            self.emit_event(
-                "cloud_sync_skipped",
-                "kernel",
-                REPO_ID,
-                EventRefs {
-                    orchestration_run_id: run_id.map(str::to_string),
-                    ..EventRefs::default()
-                },
-                json!({"reason": "Cloud orchestrator disabled"}),
-            )?;
-            return Ok(api_ok_warnings(
-                json!({"status": "skipped", "enabled": false, "local_coordination_available": true}),
-                vec!["Cloud orchestrator disabled; no network call was made.".to_string()],
-            ));
-        }
-        if mode == "mock" {
-            let imported = self.import_mock_plans(run_id)?;
-            return Ok(api_ok(
-                json!({"status": "mock_processed", "imported": imported}),
-            ));
-        }
-        Ok(api_error(
-            "cloud_http_stub",
-            "http_stub mode is a placeholder and made no network call.",
-            json!({}),
-        ))
-    }
-
-    fn import_mock_plans(&self, run_id: Option<&str>) -> Result<Vec<Value>, String> {
-        let mut imported = Vec::new();
-        for entry in fs::read_dir(self.paths.cloud_root.join("mock-plans"))
-            .map_err(|error| format!("Unable to read mock plan directory: {error}"))?
-        {
-            let entry =
-                entry.map_err(|error| format!("Unable to read mock plan entry: {error}"))?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let body = fs::read_to_string(&path)
-                .map_err(|error| format!("Unable to read mock plan {}: {error}", path.display()))?;
-            let plan: Value = serde_json::from_str(&body).map_err(|error| {
-                format!("Unable to parse mock plan {}: {error}", path.display())
-            })?;
-            let actual_run_id = match run_id {
-                Some(value) => value.to_string(),
-                None => {
-                    let objective = plan["objective"]
-                        .as_str()
-                        .unwrap_or("Mock orchestration plan");
-                    let run = self.create_orchestration_run(objective, None)?;
-                    run["data"]["run_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string()
-                }
-            };
-            let result = self.import_orchestration_plan(&actual_run_id, &plan)?;
-            imported.push(json!({"path": path.display().to_string(), "result": result}));
-        }
-        Ok(imported)
-    }
-
-    pub fn list_orchestration_runs(&self, status: Option<&str>) -> Result<Value, String> {
-        let runs = if let Some(status) = status.filter(|value| !value.trim().is_empty()) {
-            self.query_json(
-                "SELECT * FROM orchestration_runs WHERE status=?1 ORDER BY created_at DESC",
-                &[&status],
-            )?
-        } else {
-            self.query_json(
-                "SELECT * FROM orchestration_runs ORDER BY created_at DESC",
-                &[],
-            )?
-        };
-        let plan_items = self.query_json(
-            "SELECT * FROM orchestration_plan_items ORDER BY created_at ASC",
-            &[],
-        )?;
-        let assignments = self.query_json(
-            "SELECT * FROM orchestration_agent_assignments ORDER BY created_at ASC",
-            &[],
-        )?;
-        Ok(api_ok(
-            json!({"runs": runs, "plan_items": plan_items, "assignments": assignments}),
-        ))
-    }
-
-    pub fn get_orchestration_brief(&self, run_id: &str) -> Result<Value, String> {
-        let run = self.query_one(
-            "SELECT * FROM orchestration_runs WHERE id=?1",
-            &[&run_id],
-            "Run does not exist.",
-        )?;
-        Ok(api_ok(json!({
-            "run": run,
-            "tasks": self.query_json("SELECT * FROM tasks WHERE orchestration_run_id=?1 ORDER BY priority DESC, created_at ASC", &[&run_id])?,
-            "task_dependencies": self.query_json(
-                "SELECT d.*
-                 FROM task_dependencies d
-                 JOIN tasks t ON t.id = d.task_id
-                 WHERE t.orchestration_run_id=?1
-                 ORDER BY d.created_at ASC",
-                &[&run_id],
-            )?,
-            "plan_items": self.query_json("SELECT * FROM orchestration_plan_items WHERE run_id=?1 ORDER BY priority DESC, created_at ASC", &[&run_id])?,
-            "assignments": self.query_json("SELECT * FROM orchestration_agent_assignments WHERE run_id=?1 ORDER BY created_at ASC", &[&run_id])?,
-            "contracts": self.query_json("SELECT * FROM memories WHERE orchestration_run_id=?1 AND memory_kind='contract' ORDER BY created_at DESC", &[&run_id])?,
-            "handoffs": self.query_json("SELECT * FROM memories WHERE orchestration_run_id=?1 AND memory_kind='handoff' ORDER BY created_at DESC", &[&run_id])?,
-            "recent_events": self.query_json("SELECT * FROM events WHERE orchestration_run_id=?1 ORDER BY seq DESC LIMIT 50", &[&run_id])?,
-            "open_blockers": self.query_json("SELECT * FROM workspace_violations WHERE status='open' ORDER BY created_at DESC LIMIT 50", &[])?,
-            "leases": self.list_active_leases_internal(None, None, None)?,
-            "patches": self.query_json("SELECT * FROM patches WHERE orchestration_run_id=?1 ORDER BY created_at DESC", &[&run_id])?,
-            "cloud": self.get_cloud_orchestrator_status()?,
-        })))
-    }
-
     pub fn get_brief(
         &self,
         agent_id: Option<&str>,
         session_id: Option<&str>,
         task_id: Option<&str>,
-        orchestration_run_id: Option<&str>,
+        context_run_id: Option<&str>,
     ) -> Result<Value, String> {
         let session = if let Some(session_id) = session_id {
             self.query_json("SELECT * FROM agent_sessions WHERE id=?1", &[&session_id])?
@@ -6520,7 +6538,6 @@ impl CoordinationKernel {
             "sessions": session,
             "task": task,
             "task_dependencies": if let Some(task_id) = task_id { self.list_task_dependencies(Some(task_id))?["data"].clone() } else { Value::Null },
-            "orchestration": if let Some(run_id) = orchestration_run_id { self.get_orchestration_brief(run_id)?["data"].clone() } else { Value::Null },
             "active_leases": self.list_active_leases_internal(task_id, agent_id, None)?,
             "repo_policy": self.repo_policy()?,
             "pending_approvals": if let Some(task_id) = task_id { self.query_json("SELECT * FROM approvals WHERE task_id=?1 AND status='pending' ORDER BY created_at DESC", &[&task_id])? } else { Vec::new() },
@@ -6530,7 +6547,6 @@ impl CoordinationKernel {
             "recent_events": self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 50", &[])?,
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 20", &[])?,
             "handoff_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='handoff' ORDER BY updated_at DESC LIMIT 20", &[])?,
-            "cloud_orchestrator": self.get_cloud_orchestrator_status()?,
         })))
     }
 
@@ -6558,7 +6574,16 @@ impl CoordinationKernel {
                  ORDER BY p.updated_at DESC LIMIT 200",
                 &[],
             )?,
-            "merge_jobs": self.query_json("SELECT * FROM merge_jobs ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "merge_jobs": self.query_json(
+                "SELECT m.*, mrt.resolution_task_id, mrt.resolver_agent_id, mrt.resolver_session_id,
+                        mrt.resolved_patch_id,
+                        mrt.resolver_worktree_id, mrt.status AS resolution_status
+                 FROM merge_jobs m
+                 LEFT JOIN merge_resolution_tasks mrt ON mrt.merge_job_id=m.id
+                 ORDER BY m.updated_at DESC LIMIT 200",
+                &[],
+            )?,
+            "merge_resolution_tasks": self.query_json("SELECT * FROM merge_resolution_tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
             "artifacts": self.query_json("SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 200", &[])?,
             "artifact_storage_logs": self.query_json("SELECT * FROM artifact_storage_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "approvals": self.query_json("SELECT * FROM approvals ORDER BY created_at DESC LIMIT 200", &[])?,
@@ -6570,13 +6595,9 @@ impl CoordinationKernel {
             "db_migrations": self.query_json("SELECT * FROM db_migrations ORDER BY updated_at DESC LIMIT 200", &[])?,
             "ui_surface_logs": self.query_json("SELECT * FROM coordination_ui_surface_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "bloat_audits": self.query_json("SELECT * FROM coordination_bloat_audits ORDER BY created_at DESC LIMIT 50", &[])?,
-            "memories": self.query_json("SELECT id, memory_kind, trust_level, title, summary, task_id, orchestration_run_id, created_at, updated_at FROM memories ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "memories": self.query_json("SELECT id, memory_kind, trust_level, title, summary, task_id, context_run_id, created_at, updated_at FROM memories ORDER BY updated_at DESC LIMIT 200", &[])?,
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 100", &[])?,
             "handoff_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='handoff' ORDER BY updated_at DESC LIMIT 100", &[])?,
-            "cloud_orchestrator": self.get_cloud_orchestrator_status()?,
-            "orchestration_runs": self.query_json("SELECT * FROM orchestration_runs ORDER BY updated_at DESC LIMIT 100", &[])?,
-            "orchestration_plan_items": self.query_json("SELECT * FROM orchestration_plan_items ORDER BY updated_at DESC LIMIT 200", &[])?,
-            "orchestration_assignments": self.query_json("SELECT * FROM orchestration_agent_assignments ORDER BY updated_at DESC LIMIT 200", &[])?,
         })))
     }
 
@@ -6584,7 +6605,6 @@ impl CoordinationKernel {
         let context = "vault_debug";
         let mut checks = Vec::new();
         let policy = self.repo_policy()?;
-        let cloud = self.get_cloud_orchestrator_status()?;
         let sessions = self.query_json(
             "SELECT * FROM agent_sessions WHERE status='active' ORDER BY updated_at DESC LIMIT 200",
             &[],
@@ -6705,22 +6725,6 @@ impl CoordinationKernel {
         )?;
         let db_coordination_events = self.query_json(
             "SELECT * FROM events WHERE event_type IN ('db_change_requested', 'db_change_request_rejected', 'db_migration_proposed', 'db_change_approval_required') ORDER BY seq DESC LIMIT 500",
-            &[],
-        )?;
-        let orchestration_runs = self.query_json(
-            "SELECT * FROM orchestration_runs ORDER BY updated_at DESC LIMIT 200",
-            &[],
-        )?;
-        let orchestration_plan_items = self.query_json(
-            "SELECT * FROM orchestration_plan_items ORDER BY updated_at DESC LIMIT 500",
-            &[],
-        )?;
-        let orchestration_assignments = self.query_json(
-            "SELECT * FROM orchestration_agent_assignments ORDER BY updated_at DESC LIMIT 500",
-            &[],
-        )?;
-        let orchestration_events = self.query_json(
-            "SELECT * FROM events WHERE event_type LIKE 'orchestration_%' ORDER BY seq DESC LIMIT 500",
             &[],
         )?;
         let ui_surface_logs = self.query_json(
@@ -6851,19 +6855,19 @@ impl CoordinationKernel {
             &mut checks,
             context,
             "mcp.agent_tool_surface",
-            if request_merge_listed && !violation_resolver_listed && !apply_merge_listed {
+            if !request_merge_listed && !violation_resolver_listed && !apply_merge_listed {
                 "aligned"
             } else {
                 "violation"
             },
-            if !request_merge_listed {
-                "request_merge is not listed as an agent-callable MCP tool, so the fast merge-request path is not discoverable."
+            if request_merge_listed {
+                "request_merge is exposed to agents; merge/resolution initialization must remain trusted UI/kernel-only."
             } else if violation_resolver_listed {
                 "resolve_workspace_violation is exposed to agents; violation resolution must remain trusted UI/human-only."
             } else if apply_merge_listed {
                 "apply_merge is exposed to agents; merge application must remain trusted UI/human-only."
             } else {
-                "MCP tools/list exposes request_merge intentionally and keeps violation resolution plus merge application off the agent surface."
+                "Agent MCP exposes submit_patch only; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
@@ -7384,78 +7388,6 @@ impl CoordinationKernel {
             }),
         );
 
-        let plan_items_missing_tasks = orchestration_plan_items
-            .iter()
-            .filter(|item| {
-                item["status"].as_str() == Some("task_created")
-                    && item["task_id"]
-                        .as_str()
-                        .map(|id| !task_ids.contains(id))
-                        .unwrap_or(true)
-            })
-            .count();
-        let accepted_assignments_missing_agent = orchestration_assignments
-            .iter()
-            .filter(|assignment| {
-                assignment["status"].as_str() == Some("accepted")
-                    && assignment["assigned_agent_id"]
-                        .as_str()
-                        .map(|id| id.trim().is_empty())
-                        .unwrap_or(true)
-            })
-            .count();
-        let orchestration_log_gap = (!orchestration_runs.is_empty()
-            || !orchestration_plan_items.is_empty()
-            || !orchestration_assignments.is_empty())
-            && orchestration_events.is_empty();
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "local_orchestration.kernel_authority",
-            if plan_items_missing_tasks > 0 || accepted_assignments_missing_agent > 0 {
-                "violation"
-            } else {
-                "aligned"
-            },
-            if plan_items_missing_tasks > 0 {
-                "Adopted orchestration plan items reference missing local tasks."
-            } else if accepted_assignments_missing_agent > 0 {
-                "Accepted orchestration assignments are missing local agent records."
-            } else {
-                "Local orchestration adopts plans into local tasks and agent records instead of bypassing kernel authority."
-            },
-            json!({
-                "orchestration_run_count": orchestration_runs.len(),
-                "plan_item_count": orchestration_plan_items.len(),
-                "assignment_count": orchestration_assignments.len(),
-                "plan_items_missing_tasks": plan_items_missing_tasks,
-                "accepted_assignments_missing_agent": accepted_assignments_missing_agent,
-            }),
-        );
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "local_orchestration.logs",
-            if orchestration_log_gap {
-                "warning"
-            } else {
-                "aligned"
-            },
-            if orchestration_log_gap {
-                "Orchestration rows exist without orchestration_* events; newer run/import/adopt/reuse/assignment paths emit events."
-            } else {
-                "Local orchestration has append-only events for run creation, imports, adoptions, reuses, and assignments."
-            },
-            json!({
-                "orchestration_event_count": orchestration_events.len(),
-                "orchestration_run_count": orchestration_runs.len(),
-                "plan_item_count": orchestration_plan_items.len(),
-                "assignment_count": orchestration_assignments.len(),
-            }),
-        );
-
         let ui_surface_log_gap =
             ui_surface_logs.is_empty() || ui_surface_events.len() < ui_surface_logs.len();
         record_alignment_check(
@@ -7486,7 +7418,7 @@ impl CoordinationKernel {
             context,
             "tauri_ui.snapshot_debug_surface",
             "aligned",
-            "Coordination snapshot exposes UI logs, bloat audits, approvals, DB requests, orchestration rows, leases, violations, and events.",
+            "Coordination snapshot exposes UI logs, bloat audits, approvals, DB requests, leases, violations, and events.",
             json!({
                 "snapshot_sections": [
                     "ui_surface_logs",
@@ -7495,7 +7427,6 @@ impl CoordinationKernel {
                     "bloat_audits",
                     "approval_gate_logs",
                     "db_change_requests",
-                    "orchestration_runs",
                     "workspace_changes",
                     "open_workspace_violations",
                     "events"
@@ -7547,68 +7478,6 @@ impl CoordinationKernel {
                     .unwrap_or(0),
             }),
         );
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "cloud.disabled_or_advisory",
-            if cloud["enabled"].as_bool().unwrap_or(false) {
-                "warning"
-            } else {
-                "aligned"
-            },
-            if cloud["enabled"].as_bool().unwrap_or(false) {
-                "Cloud orchestrator is enabled; it must remain advisory and local gates are still authoritative."
-            } else {
-                "Cloud orchestrator is disabled/local-only and no cloud sync is required for local coordination."
-            },
-            json!({
-                "enabled": cloud["enabled"].clone(),
-                "mode": cloud["mode"].clone(),
-                "context_export_policy": cloud["context_export_policy"].clone()
-            }),
-        );
-
-        let export_risk = cloud["allow_code_export"].as_bool().unwrap_or(false)
-            || cloud["allow_terminal_log_export"]
-                .as_bool()
-                .unwrap_or(false)
-            || cloud["allow_patch_export"].as_bool().unwrap_or(false);
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "cloud.export_policy",
-            if export_risk { "violation" } else { "aligned" },
-            if export_risk {
-                "Cloud export permits raw code, terminal logs, or patches; the optimized proposal blocks those by default."
-            } else {
-                "Cloud export policy does not allow raw code, terminal logs, or raw patch export."
-            },
-            json!({
-                "allow_code_export": cloud["allow_code_export"].clone(),
-                "allow_terminal_log_export": cloud["allow_terminal_log_export"].clone(),
-                "allow_patch_export": cloud["allow_patch_export"].clone()
-            }),
-        );
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "cloud.auto_merge",
-            if cloud["auto_merge"].as_bool().unwrap_or(false) {
-                "violation"
-            } else {
-                "aligned"
-            },
-            if cloud["auto_merge"].as_bool().unwrap_or(false) {
-                "Cloud auto-merge is enabled, which would violate the local merge authority invariant."
-            } else {
-                "Cloud auto-merge is disabled; merges must pass the local kernel gate."
-            },
-            json!({"auto_merge": cloud["auto_merge"].clone()}),
-        );
-
         for session in &sessions {
             let session_id = session["id"].as_str().unwrap_or("unknown");
             let enforcement_mode = session["enforcement_mode"].as_str().unwrap_or("unknown");
@@ -8058,8 +7927,6 @@ impl CoordinationKernel {
                 "approval_gate_log_count": approval_gate_logs.len(),
                 "db_change_request_count": db_change_requests.len(),
                 "db_migration_count": db_migrations.len(),
-                "orchestration_run_count": orchestration_runs.len(),
-                "orchestration_event_count": orchestration_events.len(),
                 "ui_surface_log_count": ui_surface_logs.len(),
                 "mcp_health_event_count": mcp_health_events.len(),
                 "mcp_client_mount_status": mcp_client_mounts["status"].clone(),
@@ -8108,7 +7975,6 @@ impl CoordinationKernel {
             },
             "checks": checks,
             "policy": policy,
-            "cloud": cloud,
             "sessions": sessions,
             "worktrees": worktrees,
             "file_watchers": file_watchers,
@@ -8126,9 +7992,6 @@ impl CoordinationKernel {
             "db_change_requests": db_change_requests,
             "db_change_request_resources": db_change_request_resources,
             "db_migrations": db_migrations,
-            "orchestration_runs": orchestration_runs,
-            "orchestration_plan_items": orchestration_plan_items,
-            "orchestration_assignments": orchestration_assignments,
             "ui_surface_logs": ui_surface_logs,
             "mcp_health_events": mcp_health_events,
             "mcp_client_mounts": mcp_client_mounts,
@@ -9572,7 +9435,7 @@ pub struct EventRefs {
     pub session_id: Option<String>,
     pub resource_id: Option<String>,
     pub artifact_id: Option<String>,
-    pub orchestration_run_id: Option<String>,
+    pub context_run_id: Option<String>,
 }
 
 struct SessionMcpConfigPaths {
@@ -9590,7 +9453,7 @@ impl EventRefs {
             session_id: patch["session_id"].as_str().map(str::to_string),
             resource_id: None,
             artifact_id: patch["diff_artifact_id"].as_str().map(str::to_string),
-            orchestration_run_id: patch["orchestration_run_id"].as_str().map(str::to_string),
+            context_run_id: patch["context_run_id"].as_str().map(str::to_string),
         }
     }
 }
@@ -9931,7 +9794,11 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn codex_config_toml(command: &str, args: &[String]) -> String {
+fn codex_config_toml(
+    command: &str,
+    args: &[String],
+    cloud: Option<(&str, &[String])>,
+) -> String {
     let args = args
         .iter()
         .map(|arg| format!("\"{}\"", toml_escape(arg)))
@@ -9951,11 +9818,193 @@ fn codex_config_toml(command: &str, args: &[String]) -> String {
         ));
     }
 
+    if let Some((cloud_command, cloud_args)) = cloud {
+        let cloud_args = cloud_args
+            .iter()
+            .map(|arg| format!("\"{}\"", toml_escape(arg)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        config.push_str(&format!(
+            "\n[mcp_servers.cloud-diffforge]\ncommand = \"{}\"\nargs = [{}]\ndefault_tools_approval_mode = \"prompt\"\n",
+            toml_escape(cloud_command),
+            cloud_args
+        ));
+        for tool in CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS {
+            config.push_str(&format!(
+                "\n[mcp_servers.cloud-diffforge.tools.{}]\napproval_mode = \"approve\"\n",
+                tool
+            ));
+        }
+    }
+
     config
+}
+
+const CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS: &[&str] = &[
+    "cloud_get_status",
+    "cloud_get_context_pack",
+    "cloud_get_workspace_snapshot",
+    "cloud_record_history_event",
+    "cloud_get_history_ledger",
+    "cloud_subtask_checkpoint",
+    "cloud_agent_heartbeat",
+    "cloud_claim_lane",
+    "cloud_release_lane",
+    "cloud_create_context_task",
+    "cloud_update_context_task",
+];
+
+fn cloud_mcp_base_url_for_config() -> String {
+    std::env::var("CLOUD_DIFFFORGE_BASE_URL")
+        .or_else(|_| std::env::var("CLOUD_MCP_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+fn cloud_mcp_repo_id_for_path(path: &Path) -> String {
+    let input = process_path_text(path);
+    let digest = Sha1::digest(input.as_bytes());
+    let hash = format!("{digest:x}").chars().take(12).collect::<String>();
+    format!("repo-{hash}")
+}
+
+const DIFFFORGE_AGENT_CONTRACT_BEGIN: &str = "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->";
+const DIFFFORGE_AGENT_CONTRACT_END: &str = "<!-- DIFFFORGE_AGENT_CONTRACT_END -->";
+
+fn diffforge_agent_contract_markdown() -> String {
+    format!(
+        "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
+# Diff Forge agent coordination contract\n\n\
+This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, but every app-launched coding agent must publish public coordination state through Cloud MCP so parallel agents can stay in their lanes.\n\n\
+## Required Cloud MCP flow for every user task\n\n\
+1. Before inspecting or editing files, call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your own concise `work_summary` or `task_title` describing what you are about to do.\n\
+2. As soon as you know the concrete task, call `cloud-diffforge.cloud_agent_heartbeat` with `status: \"active\"`, the current lane if known, and a public `progress_summary`.\n\
+3. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
+4. When finished, report completion with `cloud-diffforge.cloud_subtask_checkpoint` using `task_status: \"done\"` or update the active context task with `cloud-diffforge.cloud_update_context_task`.\n\
+5. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+## Local coordination remains authoritative\n\n\
+- Use the local coordination kernel for leases, memory, patch submission, and merge safety.\n\
+- Edit only inside the assigned agent worktree/branch root when one is provided.\n\
+- Cloud MCP is shared context and activity memory; it is not permission to bypass local file safety.\n\
+{DIFFFORGE_AGENT_CONTRACT_END}\n"
+    )
+}
+
+fn write_or_update_generated_agent_contract(path: &Path, contract: &str) -> Result<bool, String> {
+    if path.exists() {
+        let existing = fs::read_to_string(path)
+            .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+        let Some(start) = existing.find(DIFFFORGE_AGENT_CONTRACT_BEGIN) else {
+            return Ok(false);
+        };
+        let Some(end) = existing.find(DIFFFORGE_AGENT_CONTRACT_END) else {
+            return Ok(false);
+        };
+        if end < start {
+            return Ok(false);
+        }
+        let end_index = end + DIFFFORGE_AGENT_CONTRACT_END.len();
+        let next = format!("{}{}{}", &existing[..start], contract, &existing[end_index..]);
+        if next == existing {
+            return Ok(false);
+        }
+        write_text_file_atomic(path, &next)?;
+        return Ok(true);
+    }
+
+    write_text_file_atomic(path, contract)?;
+    Ok(true)
+}
+
+fn ensure_git_info_exclude_entries(root: &Path, additions: &[&str]) -> Result<(), String> {
+    let exclude_path_text = match run_git(root, &["rev-parse", "--git-path", "info/exclude"]) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let exclude_path = {
+        let trimmed = exclude_path_text.trim();
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create git exclude directory {}: {error}", parent.display()))?;
+    }
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let missing = additions
+        .iter()
+        .copied()
+        .filter(|addition| !existing.lines().any(|line| line.trim() == *addition))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude_path)
+        .map_err(|error| format!("Unable to open {}: {error}", exclude_path.display()))?;
+    if !existing.ends_with('\n') && !existing.is_empty() {
+        writeln!(file).map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+    }
+    writeln!(file, "# Diff Forge generated agent instruction files")
+        .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+    for addition in missing {
+        writeln!(file, "{addition}")
+            .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+    }
+    Ok(())
 }
 
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn short_id(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn merge_resolution_prompt(
+    patch_id: &str,
+    merge_job_id: &str,
+    resolution_task_id: &str,
+    changed_files: &[String],
+    cloud_context: &Value,
+) -> String {
+    let files = if changed_files.is_empty() {
+        "- none recorded".to_string()
+    } else {
+        changed_files
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let cloud_context_text =
+        serde_json::to_string_pretty(cloud_context).unwrap_or_else(|_| cloud_context.to_string());
+    format!(
+        "Merge-resolution task initialized by the local coordination kernel.\n\n\
+Goal:\n\
+Resolve the submitted patch against the current target branch in your isolated worktree, then submit the resolved result as a new patch.\n\n\
+IDs:\n\
+- Patch: {patch_id}\n\
+- Merge job: {merge_job_id}\n\
+- Resolution task: {resolution_task_id}\n\n\
+Changed files under your temporary resolution lease:\n\
+{files}\n\n\
+Required first step:\n\
+Fetch Cloud MCP context using this context-pack seed so you know what other agents changed and why:\n\
+```json\n{cloud_context_text}\n```\n\n\
+Rules:\n\
+- Stay inside the leased files above unless the local kernel grants more leases.\n\
+- Do not call or attempt apply_merge.\n\
+- Do not write directly to the shared project root.\n\
+- Reconcile intent, not just text conflicts: preserve the submitted patch behavior and account for newer workspace changes.\n\
+- When finished, call submit_patch for this resolution task.\n"
+    )
 }
 
 fn safe_id(value: &str) -> String {
@@ -10363,11 +10412,6 @@ mod tests {
             policy["unleased_write_policy"].as_str(),
             Some("reject_patch")
         );
-        assert_eq!(policy["cloud_orchestrator_enabled"].as_i64(), Some(0));
-        assert_eq!(
-            kernel.get_cloud_orchestrator_status().unwrap()["mode"].as_str(),
-            Some("disabled")
-        );
     }
 
     #[test]
@@ -10665,7 +10709,6 @@ mod tests {
             "db_classify_sql",
             "db_request_approval",
             "request_approval",
-            "request_merge",
         ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
@@ -10678,9 +10721,7 @@ mod tests {
             "db_propose_migration",
             "db_validate_shadow",
             "write_memory",
-            "orchestrator_get_status",
-            "orchestrator_create_context_export",
-            "orchestrator_sync_once",
+            "request_merge",
         ] {
             assert!(!config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{prompt_gated_tool}]"
@@ -10689,11 +10730,11 @@ mod tests {
     }
 
     #[test]
-    fn local_mcp_surface_lists_request_merge_and_keeps_violation_resolution_trusted() {
+    fn local_mcp_surface_keeps_merge_resolution_and_apply_trusted() {
         let repo = temp_repo("mcp_surface");
         let _kernel = CoordinationKernel::init(&repo, None).unwrap();
         let tools = crate::coordination::mcp::TOOL_NAMES;
-        assert!(tools.contains(&"request_merge"));
+        assert!(!tools.contains(&"request_merge"));
         assert!(!tools.contains(&"resolve_workspace_violation"));
         assert!(!tools.contains(&"apply_merge"));
 
@@ -10712,7 +10753,7 @@ mod tests {
         let allowed = response["error"]["details"]["allowed_tools"]
             .as_array()
             .unwrap();
-        assert!(allowed
+        assert!(!allowed
             .iter()
             .any(|tool| tool.as_str() == Some("request_merge")));
         assert!(!allowed
@@ -11534,7 +11575,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_and_cloud_local_run_work() {
+    fn memory_write_works() {
         let repo = temp_repo("memory");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let memory = kernel
@@ -11551,90 +11592,6 @@ mod tests {
             )
             .unwrap();
         assert!(PathBuf::from(memory["data"]["body_path"].as_str().unwrap()).exists());
-        let run = kernel.create_orchestration_run("Do a thing", None).unwrap();
-        let run_id = run["data"]["run_id"].as_str().unwrap();
-        let plan = json!({"items": [{"title": "Slice A", "role": "architect"}]});
-        kernel.import_orchestration_plan(run_id, &plan).unwrap();
-        let second_import = kernel.import_orchestration_plan(run_id, &plan).unwrap();
-        assert_eq!(second_import["data"]["reused"].as_bool(), Some(true));
-        assert_eq!(
-            kernel
-                .query_json(
-                    "SELECT * FROM orchestration_plan_items WHERE run_id=?1",
-                    &[&run_id]
-                )
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(kernel
-            .query_json("SELECT * FROM tasks", &[])
-            .unwrap()
-            .is_empty());
-        kernel.adopt_orchestration_plan(run_id).unwrap();
-        let second_adopt = kernel.adopt_orchestration_plan(run_id).unwrap();
-        assert_eq!(second_adopt["data"]["reused"].as_bool(), Some(true));
-        assert_eq!(
-            kernel.query_json("SELECT * FROM tasks", &[]).unwrap().len(),
-            1
-        );
-        let first_assignments = kernel.propose_agent_assignments(run_id).unwrap();
-        let second_assignments = kernel.propose_agent_assignments(run_id).unwrap();
-        assert_eq!(
-            first_assignments["data"]["assignment_ids"],
-            second_assignments["data"]["assignment_ids"]
-        );
-        assert_eq!(
-            kernel
-                .query_json(
-                    "SELECT * FROM orchestration_agent_assignments WHERE run_id=?1",
-                    &[&run_id]
-                )
-                .unwrap()
-                .len(),
-            1
-        );
-        let adopted_assignment_id = first_assignments["data"]["assignment_ids"][0]
-            .as_str()
-            .unwrap();
-        kernel
-            .adopt_agent_assignment(adopted_assignment_id)
-            .unwrap();
-        let reused_assignment = kernel
-            .adopt_agent_assignment(adopted_assignment_id)
-            .unwrap();
-        assert_eq!(reused_assignment["data"]["reused"].as_bool(), Some(true));
-        let orchestration_events = kernel
-            .query_json(
-                "SELECT * FROM events WHERE event_type IN (
-                    'orchestration_run_created',
-                    'orchestration_plan_imported',
-                    'orchestration_plan_reused',
-                    'orchestration_plan_adopted',
-                    'orchestration_plan_adoption_reused',
-                    'orchestration_assignments_proposed',
-                    'orchestration_assignments_reused',
-                    'orchestration_assignment_adopted',
-                    'orchestration_assignment_reused'
-                )",
-                &[],
-            )
-            .unwrap();
-        assert!(orchestration_events.len() >= 9);
-        let report = kernel.get_alignment_report().unwrap();
-        for check_name in [
-            "local_orchestration.kernel_authority",
-            "local_orchestration.logs",
-        ] {
-            assert!(report["data"]["checks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|check| {
-                    check["check"].as_str() == Some(check_name)
-                        && check["status"].as_str() == Some("aligned")
-                }));
-        }
     }
 
     #[test]

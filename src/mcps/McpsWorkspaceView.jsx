@@ -45,7 +45,6 @@ const COORDINATION_TOOLS = [
   "announce_change",
   "validate_patch",
   "submit_patch",
-  "request_merge",
   "list_workspace_violations",
   "list_workspace_changes",
   "file_watcher_status",
@@ -62,16 +61,6 @@ const COORDINATION_TOOLS = [
   "db_propose_migration",
   "db_request_approval",
   "request_approval",
-  "orchestrator_get_status",
-  "orchestrator_create_run",
-  "orchestrator_create_context_export",
-  "orchestrator_import_plan",
-  "orchestrator_adopt_plan",
-  "orchestrator_list_runs",
-  "orchestrator_get_brief",
-  "orchestrator_sync_once",
-  "orchestrator_propose_agent_assignments",
-  "orchestrator_adopt_agent_assignment",
 ];
 
 function unwrapData(response, fallback = {}) {
