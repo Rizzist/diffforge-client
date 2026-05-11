@@ -215,12 +215,17 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             spawn_npm_package_version_check(agent_definition(AgentProvider::Codex));
         let claude_package_version =
             spawn_npm_package_version_check(agent_definition(AgentProvider::Claude));
+        let opencode_package_version =
+            spawn_npm_package_version_check(agent_definition(AgentProvider::OpenCode));
         let codex_latest_version =
             spawn_npm_latest_package_version_check(agent_definition(AgentProvider::Codex));
         let claude_latest_version =
             spawn_npm_latest_package_version_check(agent_definition(AgentProvider::Claude));
+        let opencode_latest_version =
+            spawn_npm_latest_package_version_check(agent_definition(AgentProvider::OpenCode));
         let codex_runtime = thread::spawn(|| agent_runtime_status_for(AgentProvider::Codex));
         let claude_runtime = thread::spawn(|| agent_runtime_status_for(AgentProvider::Claude));
+        let opencode_runtime = thread::spawn(|| agent_runtime_status_for(AgentProvider::OpenCode));
 
         let codex_runtime = codex_runtime
             .join()
@@ -228,6 +233,9 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
         let claude_runtime = claude_runtime
             .join()
             .map_err(|_| "Claude Code status check failed.".to_string())?;
+        let opencode_runtime = opencode_runtime
+            .join()
+            .map_err(|_| "OpenCode status check failed.".to_string())?;
         let npm_version = npm_version_handle.join().ok().flatten();
         let npm_available = npm_version.is_some();
         let npm_version = npm_version.unwrap_or_else(|| "Not detected".to_string());
@@ -243,6 +251,12 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             claude_npm_latest_version,
             claude_npm_update_available,
         ) = resolve_npm_package_version(claude_package_version, claude_latest_version);
+        let (
+            opencode_npm_installed,
+            opencode_npm_package_version,
+            opencode_npm_latest_version,
+            opencode_npm_update_available,
+        ) = resolve_npm_package_version(opencode_package_version, opencode_latest_version);
 
         let codex_status = build_agent_status(
             AgentProvider::Codex,
@@ -292,7 +306,31 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             }),
         );
 
-        let statuses = vec![codex_status, claude_status];
+        let opencode_status = build_agent_status(
+            AgentProvider::OpenCode,
+            opencode_runtime,
+            npm_available,
+            &npm_version,
+            opencode_npm_installed,
+            opencode_npm_package_version,
+            opencode_npm_latest_version,
+            opencode_npm_update_available,
+        );
+        log_terminal_event(
+            "agent.status.done",
+            None,
+            None,
+            Some(started_at.elapsed()),
+            json!({
+                "authenticated": opencode_status.authenticated,
+                "installed": opencode_status.installed,
+                "npmInstalled": opencode_status.npm_installed,
+                "npmUpdateAvailable": opencode_status.npm_update_available,
+                "provider": opencode_status.id,
+            }),
+        );
+
+        let statuses = vec![codex_status, claude_status, opencode_status];
         log_terminal_event(
             "agent.statuses.done",
             None,

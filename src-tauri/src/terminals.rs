@@ -26,6 +26,38 @@ fn clean_terminal_telemetry_text(value: &str) -> String {
         .collect()
 }
 
+fn terminal_input_contains_escape(data: &str) -> bool {
+    data.as_bytes().contains(&0x1b)
+}
+
+fn terminal_input_debug_fields(data: &str) -> Value {
+    let bytes = data.as_bytes();
+    let control_byte_hex = bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte < 32 || *byte == 127)
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>();
+    let prefix_hex = bytes
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>();
+    let escape_count = bytes.iter().filter(|byte| **byte == 0x1b).count();
+
+    json!({
+        "bytes": bytes.len(),
+        "chars": data.chars().count(),
+        "controlByteHex": control_byte_hex,
+        "escapeCount": escape_count,
+        "hasEscape": escape_count > 0,
+        "isBareEscape": bytes == b"\x1b",
+        "prefixHex": prefix_hex,
+        "startsWithEscape": bytes.first().is_some_and(|byte| *byte == 0x1b),
+    })
+}
+
 fn write_terminal_telemetry_entries(entries: Vec<Value>) {
     if !TERMINAL_TELEMETRY_LOGGING_ENABLED || entries.is_empty() {
         return;
@@ -120,6 +152,7 @@ fn terminal_launch(
             .unwrap_or(AgentProvider::Codex),
         "codex" => AgentProvider::Codex,
         "claude" => AgentProvider::Claude,
+        "opencode" => AgentProvider::OpenCode,
         _ => {
             if let Some(provider) = provider {
                 parse_agent_provider(&provider)?
@@ -302,6 +335,17 @@ async fn write_terminal_input(
     skipped_phase: &str,
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
+    let has_escape = terminal_input_contains_escape(data);
+
+    if has_escape {
+        log_terminal_event(
+            "terminal.input.escape.write_start",
+            Some(pane_id),
+            instance_id,
+            None,
+            terminal_input_debug_fields(data),
+        );
+    }
 
     if data.is_empty() {
         return Ok(true);
@@ -313,6 +357,15 @@ async fn write_terminal_input(
 
     let Some(instance) = get_terminal_instance_if_current(state, pane_id, instance_id).await?
     else {
+        if has_escape {
+            log_terminal_event(
+                "terminal.input.escape.write_skipped_stale_or_missing",
+                Some(pane_id),
+                instance_id,
+                None,
+                terminal_input_debug_fields(data),
+            );
+        }
         log_terminal_event(
             skipped_phase,
             Some(pane_id),
@@ -330,6 +383,16 @@ async fn write_terminal_input(
     writer
         .flush()
         .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
+
+    if has_escape {
+        log_terminal_event(
+            "terminal.input.escape.write_done",
+            Some(pane_id),
+            instance_id,
+            None,
+            terminal_input_debug_fields(data),
+        );
+    }
 
     Ok(true)
 }
@@ -2337,6 +2400,54 @@ fn set_terminal_audio_input_target(
     set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
 }
 
+#[tauri::command]
+async fn terminal_write_to_audio_input_target(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    data: String,
+) -> Result<bool, String> {
+    let Some(target) = active_terminal_audio_input_target(&state)? else {
+        log_terminal_event(
+            "terminal.audio_input.write.skipped_no_target",
+            None,
+            None,
+            None,
+            json!({
+                "bytes": data.len(),
+                "has_escape": terminal_input_contains_escape(&data),
+            }),
+        );
+        return Ok(false);
+    };
+
+    if terminal_input_contains_escape(&data) {
+        log_terminal_event(
+            "terminal.audio_input.escape.command_received",
+            Some(&target.pane_id),
+            target.instance_id,
+            None,
+            terminal_input_debug_fields(&data),
+        );
+    }
+
+    let wrote = write_to_active_terminal_audio_input_target(&app, &state, &data).await?;
+
+    if terminal_input_contains_escape(&data) {
+        log_terminal_event(
+            "terminal.audio_input.escape.command_done",
+            Some(&target.pane_id),
+            target.instance_id,
+            None,
+            json!({
+                "wrote": wrote,
+                "bytes": data.len(),
+            }),
+        );
+    }
+
+    Ok(wrote)
+}
+
 async fn terminal_observe_submitted_prompt(
     instance: &TerminalInstance,
     data: &str,
@@ -4201,6 +4312,15 @@ async fn terminal_write(
     data: String,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
+    if terminal_input_contains_escape(&data) {
+        log_terminal_event(
+            "terminal.write.escape.command_received",
+            Some(&pane_id),
+            instance_id,
+            None,
+            terminal_input_debug_fields(&data),
+        );
+    }
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
         log_terminal_event(
@@ -4388,6 +4508,16 @@ async fn terminal_write(
                 }
             }
         }
+    }
+
+    if terminal_input_contains_escape(&data_to_write) {
+        log_terminal_event(
+            "terminal.write.escape.forward_to_pty",
+            Some(&pane_id),
+            instance_id,
+            None,
+            terminal_input_debug_fields(&data_to_write),
+        );
     }
 
     write_terminal_input(

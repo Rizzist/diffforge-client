@@ -584,6 +584,7 @@ struct UpdateWorkspaceRequest<'a> {
 enum AgentProvider {
     Codex,
     Claude,
+    OpenCode,
 }
 
 #[derive(Clone, Copy)]
@@ -1387,6 +1388,7 @@ pub fn run() {
             terminal_start_agent,
             terminal_start_agent_many,
             set_terminal_audio_input_target,
+            terminal_write_to_audio_input_target,
             terminal_write,
             terminal_delete_selection,
             terminal_get_parked_prompt,

@@ -2,6 +2,7 @@ fn parse_agent_provider(provider: &str) -> Result<AgentProvider, String> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "codex" => Ok(AgentProvider::Codex),
         "claude" | "claude-code" | "claude_code" => Ok(AgentProvider::Claude),
+        "opencode" | "open-code" | "open_code" => Ok(AgentProvider::OpenCode),
         _ => Err("Unknown terminal provider.".to_string()),
     }
 }
@@ -27,6 +28,16 @@ fn agent_definition(provider: AgentProvider) -> AgentDefinition {
             native_install_url: "https://code.claude.com/docs/en/quickstart",
             native_install_label: "Native install guide",
             connect_command: "claude",
+        },
+        AgentProvider::OpenCode => AgentDefinition {
+            id: "opencode",
+            label: "OpenCode",
+            binary: "opencode",
+            install_package: "opencode-ai",
+            install_command: "npm install -g opencode-ai",
+            native_install_url: "https://opencode.ai/docs/",
+            native_install_label: "Install script / package guide",
+            connect_command: "opencode auth login",
         },
     }
 }
@@ -345,7 +356,68 @@ fn agent_auth_status_for(provider: AgentProvider, definition: AgentDefinition) -
                 )
             }
         }
+        AgentProvider::OpenCode => {
+            let status = run_agent_command_capture(
+                definition,
+                &["auth", "list"],
+                None,
+                Duration::from_secs(AGENT_STATUS_TIMEOUT_SECS),
+                None,
+            );
+
+            match status {
+                Ok(capture) if capture.exit_code == Some(0) => {
+                    let output = command_output_text(&capture.stdout, &capture.stderr);
+                    if opencode_auth_list_has_credentials(&output) {
+                        (true, "OpenCode providers detected locally.".to_string())
+                    } else {
+                        (
+                            false,
+                            "Run opencode auth login to connect a provider.".to_string(),
+                        )
+                    }
+                }
+                Ok(capture) => {
+                    let message =
+                        first_output_line(&command_output_text(&capture.stdout, &capture.stderr));
+                    (
+                        false,
+                        if message.is_empty() {
+                            "Run opencode auth login to connect a provider.".to_string()
+                        } else {
+                            message
+                        },
+                    )
+                }
+                Err(error) => (false, error),
+            }
+        }
     }
+}
+
+fn opencode_auth_list_has_credentials(output: &str) -> bool {
+    let trimmed = output.trim();
+
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("no authenticated")
+        || lower.contains("no credentials")
+        || lower.contains("not logged")
+        || lower.contains("not authenticated")
+    {
+        return false;
+    }
+
+    trimmed.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty()
+            && !line.eq_ignore_ascii_case("provider")
+            && !line.starts_with("---")
+            && !line.starts_with("===")
+    })
 }
 
 fn npm_global_prefix() -> Option<PathBuf> {
@@ -1131,14 +1203,7 @@ fn agent_runtime_status_for(provider: AgentProvider) -> AgentRuntimeStatus {
 
     let version_started_at = Instant::now();
     let version_result = match provider {
-        AgentProvider::Codex => run_agent_command_capture(
-            definition,
-            &["--version"],
-            None,
-            Duration::from_secs(AGENT_STATUS_TIMEOUT_SECS),
-            None,
-        ),
-        AgentProvider::Claude => run_agent_command_capture(
+        AgentProvider::Codex | AgentProvider::Claude | AgentProvider::OpenCode => run_agent_command_capture(
             definition,
             &["--version"],
             None,
@@ -1330,6 +1395,7 @@ fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
     match provider {
         AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
         AgentProvider::Claude => run_login_terminal(definition.label, &binary, &[]),
+        AgentProvider::OpenCode => run_login_terminal(definition.label, &binary, &["auth", "login"]),
     }
 }
 
@@ -1338,6 +1404,7 @@ fn logout_agent_credentials(provider: AgentProvider) -> Result<AgentLogoutResult
     let args = match provider {
         AgentProvider::Codex => vec!["logout"],
         AgentProvider::Claude => vec!["auth", "logout"],
+        AgentProvider::OpenCode => vec!["auth", "logout"],
     };
     let capture = run_agent_command_capture(
         definition,
@@ -1909,6 +1976,25 @@ fn run_forge_prompt_for(request: ForgePromptRequest) -> Result<ForgeRunResult, S
             }
 
             args.push("-p".to_string());
+            args.push(prompt.to_string());
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+            run_agent_command_capture(
+                definition,
+                &arg_refs,
+                None,
+                Duration::from_secs(AGENT_RUN_TIMEOUT_SECS),
+                Some(&working_directory),
+            )
+        }
+        AgentProvider::OpenCode => {
+            let mut args = vec!["run".to_string()];
+
+            if let Some(model) = &model {
+                args.push("--model".to_string());
+                args.push(model.clone());
+            }
+
             args.push(prompt.to_string());
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 

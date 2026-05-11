@@ -1901,6 +1901,7 @@ export const ForgeWorkspace = styled.section`
 
 export const TerminalWorkspaceSurface = styled.section`
   position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -1915,6 +1916,28 @@ export const TerminalWorkspaceSurface = styled.section`
     linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     rgba(3, 5, 8, 0.14);
   background-size: 68px 68px, 68px 68px, auto;
+
+  &::after {
+    position: absolute;
+    inset: 0;
+    z-index: 120;
+    border: 0 solid transparent;
+    box-shadow: none;
+    pointer-events: none;
+    content: "";
+    transition:
+      border-color 140ms ease,
+      box-shadow 140ms ease;
+  }
+
+  &[data-focused="true"]::after {
+    border-width: 2px;
+    border-color: rgba(132, 157, 190, 0.58);
+    box-shadow:
+      inset 0 0 0 1px rgba(226, 232, 240, 0.18),
+      inset 0 0 14px rgba(132, 157, 190, 0.06),
+      0 0 12px rgba(132, 157, 190, 0.14);
+  }
 `;
 
 export const WorkspaceTerminalPanels = styled.div`
@@ -2502,6 +2525,12 @@ export const TerminalAgentIdBadge = styled.span`
     --agent-id-bg: rgba(255, 122, 24, 0.13);
     --agent-id-border: rgba(255, 157, 72, 0.44);
     --agent-id-text: #ffd1a1;
+  }
+
+  &[data-agent="opencode"] {
+    --agent-id-bg: rgba(37, 211, 154, 0.13);
+    --agent-id-border: rgba(67, 229, 176, 0.42);
+    --agent-id-text: #baf8df;
   }
 
   &[data-agent="generic"] {
@@ -6410,6 +6439,11 @@ export const TerminalLayoutPreviewCell = styled.span`
     background: rgba(255, 122, 24, 0.18);
   }
 
+  &[data-slot="opencode"] {
+    border-color: rgba(67, 229, 176, 0.34);
+    background: rgba(37, 211, 154, 0.17);
+  }
+
   &[data-slot="generic"] {
     border-color: rgba(143, 157, 183, 0.24);
     background: rgba(143, 157, 183, 0.12);
@@ -6463,6 +6497,11 @@ export const TerminalRoleSwitchButton = styled.button`
   &[data-role="generic"][data-selected="true"] {
     border-color: rgba(143, 157, 183, 0.34);
     background: rgba(143, 157, 183, 0.12);
+  }
+
+  &[data-role="opencode"][data-selected="true"] {
+    border-color: rgba(67, 229, 176, 0.34);
+    background: rgba(37, 211, 154, 0.14);
   }
 
   &:disabled {
@@ -6551,6 +6590,12 @@ export const TerminalRestartOption = styled.button`
     background: rgba(143, 157, 183, 0.1);
   }
 
+  &[data-role="opencode"]:hover,
+  &[data-role="opencode"]:focus-visible {
+    border-color: rgba(67, 229, 176, 0.26);
+    background: rgba(37, 211, 154, 0.1);
+  }
+
   &[data-selected="true"] span {
     color: var(--forge-blue-soft);
   }
@@ -6628,6 +6673,10 @@ export const TerminalRoleSliderRow = styled.label`
     background: rgba(143, 157, 183, 0.14);
   }
 
+  &[data-role="opencode"] em {
+    background: rgba(37, 211, 154, 0.15);
+  }
+
   @media (max-width: 620px) {
     grid-template-columns: 1fr;
   }
@@ -6644,6 +6693,10 @@ export const TerminalRoleRange = styled.input`
 
   &[data-role="generic"] {
     accent-color: #8f9db7;
+  }
+
+  &[data-role="opencode"] {
+    accent-color: #43e5b0;
   }
 `;
 
@@ -6696,6 +6749,11 @@ export const TerminalRoleButton = styled.button`
   &[data-role="generic"][data-selected="true"] {
     border-color: rgba(143, 157, 183, 0.34);
     background: rgba(143, 157, 183, 0.12);
+  }
+
+  &[data-role="opencode"][data-selected="true"] {
+    border-color: rgba(67, 229, 176, 0.34);
+    background: rgba(37, 211, 154, 0.14);
   }
 `;
 

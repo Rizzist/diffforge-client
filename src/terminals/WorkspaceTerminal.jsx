@@ -359,11 +359,32 @@ const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
 const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
+const TERMINAL_ACTIVE_PANE_EVENT = "forge-terminal-active-pane-change";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 const TERMINAL_INPUT_BATCH_MS = 8;
 const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
 const TODO_DRAG_MIME = "application/x-diffforge-todo";
+let activeTerminalKeyboardTarget = null;
+
+const terminalKeyboardTargetMatches = (paneId, instanceId) => (
+  activeTerminalKeyboardTarget?.paneId === paneId
+  && Number(activeTerminalKeyboardTarget?.instanceId || 0) === Number(instanceId || 0)
+);
+
+const setActiveTerminalKeyboardTarget = (paneId, instanceId) => {
+  activeTerminalKeyboardTarget = {
+    instanceId: Number(instanceId || 0),
+    paneId,
+  };
+};
+
+const clearActiveTerminalKeyboardTargetIfCurrent = (paneId, instanceId) => {
+  if (terminalKeyboardTargetMatches(paneId, instanceId)) {
+    activeTerminalKeyboardTarget = null;
+  }
+};
+
 const TODO_DROP_OVERLAY_STYLE = {
   position: "absolute",
   inset: "10px",
@@ -404,6 +425,7 @@ const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "codex", label: "Codex", shortLabel: "CX" },
   { id: "claude", label: "Claude Code", shortLabel: "CL" },
   { id: "generic", label: "Terminal", shortLabel: "SH" },
+  { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
 
 function getTerminalWheelScrollRows(event, terminal) {
@@ -487,6 +509,41 @@ function isTerminalSessionMissingError(error) {
     || message.includes("terminal session not running");
 }
 
+function getTerminalInputDebugFields(data) {
+  const text = String(data || "");
+  const bytes = Array.from(new TextEncoder().encode(text));
+
+  return {
+    bytes: bytes.length,
+    chars: Array.from(text).length,
+    controlByteHex: bytes
+      .filter((byte) => byte < 32 || byte === 127)
+      .slice(0, 12)
+      .map((byte) => byte.toString(16).padStart(2, "0")),
+    escapeCount: bytes.filter((byte) => byte === 0x1b).length,
+    hasEscape: bytes.includes(0x1b),
+    isBareEscape: bytes.length === 1 && bytes[0] === 0x1b,
+    prefixHex: bytes.slice(0, 16).map((byte) => byte.toString(16).padStart(2, "0")),
+    startsWithEscape: bytes[0] === 0x1b,
+  };
+}
+
+function getTerminalKeyDebugFields(event, extraFields = {}) {
+  return {
+    altKey: Boolean(event.altKey),
+    code: event.code || "",
+    ctrlKey: Boolean(event.ctrlKey),
+    defaultPrevented: Boolean(event.defaultPrevented),
+    isComposing: Boolean(event.isComposing),
+    key: event.key || "",
+    metaKey: Boolean(event.metaKey),
+    repeat: Boolean(event.repeat),
+    shiftKey: Boolean(event.shiftKey),
+    targetTag: event.target?.tagName || "",
+    ...extraFields,
+  };
+}
+
 let nextWorkspaceTerminalInstanceId = 1;
 
 function getSafePaneToken(value) {
@@ -512,6 +569,10 @@ function getTerminalAgentKind(agentId) {
     return "claude";
   }
 
+  if (normalizedAgentId.includes("opencode") || normalizedAgentId.includes("open-code")) {
+    return "opencode";
+  }
+
   if (normalizedAgentId.includes("codex")) {
     return "codex";
   }
@@ -534,17 +595,38 @@ function getAgentStatusSummary(agentStatuses) {
 
   const codex = agentStatuses.find((agent) => agent.id === "codex");
   const claude = agentStatuses.find((agent) => agent.id === "claude");
+  const opencode = agentStatuses.find((agent) => agent.id === "opencode");
 
-  return [codex, claude].filter(Boolean);
+  return [codex, claude, opencode].filter(Boolean);
 }
 
 function getTerminalAgentId(agentId, terminalIndex) {
   const kind = getTerminalAgentKind(agentId);
-  const prefix = kind === "claude" ? "CL" : kind === "codex" ? "CX" : kind === "generic" ? "SH" : "AG";
+  const prefix = kind === "claude"
+    ? "CL"
+    : kind === "opencode"
+      ? "OC"
+      : kind === "codex"
+        ? "CX"
+        : kind === "generic"
+          ? "SH"
+          : "AG";
   const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
   const suffix = TERMINAL_AGENT_ID_SUFFIXES[safeIndex % TERMINAL_AGENT_ID_SUFFIXES.length] || "A";
 
   return `${prefix}${suffix}`;
+}
+
+function getTerminalRoleSwitchOptions(agentStatuses) {
+  const installedAgentIds = new Set(
+    (Array.isArray(agentStatuses) ? agentStatuses : [])
+      .filter((agent) => agent.installed)
+      .map((agent) => agent.id),
+  );
+
+  return TERMINAL_ROLE_SWITCH_OPTIONS.filter((option) => (
+    option.id === "generic" || installedAgentIds.has(option.id)
+  ));
 }
 
 function getPathLeaf(value) {
@@ -1307,6 +1389,7 @@ export default function WorkspaceTerminal({
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
+  const [terminalFocused, setTerminalFocused] = useState(false);
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -1327,6 +1410,71 @@ export default function WorkspaceTerminal({
   const projectBadgeTitle = isGenericTerminal
     ? `${projectLabel} - generic shell with normal terminal controls`
     : `${projectLabel} - edits are isolated until merge`;
+  const selectTerminalPane = useCallback(() => {
+    const instanceId = terminalInstanceIdRef.current || 0;
+    setActiveTerminalKeyboardTarget(paneId, instanceId);
+    setTerminalFocused(true);
+    window.dispatchEvent(new CustomEvent(TERMINAL_ACTIVE_PANE_EVENT, {
+      detail: {
+        instanceId,
+        paneId,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      },
+    }));
+  }, [paneId, terminalIndex, workspace?.id]);
+  const requestTerminalAudioInputTarget = useCallback((active) => {
+    const instanceId = terminalInstanceIdRef.current || undefined;
+
+    if (active && !instanceId) {
+      clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
+      setTerminalFocused(false);
+      return Promise.resolve(false);
+    }
+
+    if (active) {
+      setActiveTerminalKeyboardTarget(paneId, instanceId);
+    }
+
+    return invoke("set_terminal_audio_input_target", {
+      active,
+      instanceId,
+      paneId,
+    })
+      .then(() => {
+        if (active) {
+          selectTerminalPane();
+        } else {
+          clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
+          setTerminalFocused(false);
+        }
+
+        return true;
+      })
+      .catch(() => {
+        if (active) {
+          clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
+          setTerminalFocused(false);
+        }
+
+        return false;
+      });
+  }, [paneId, selectTerminalPane]);
+
+  useEffect(() => {
+    const handleActivePaneChange = (event) => {
+      setTerminalFocused(
+        event.detail?.paneId === paneId
+        && Number(event.detail?.instanceId || 0) === Number(terminalInstanceIdRef.current || 0),
+      );
+    };
+
+    window.addEventListener(TERMINAL_ACTIVE_PANE_EVENT, handleActivePaneChange);
+
+    return () => {
+      window.removeEventListener(TERMINAL_ACTIVE_PANE_EVENT, handleActivePaneChange);
+    };
+  }, [paneId]);
 
   useEffect(() => {
     parkedPromptRef.current = parkedPrompt;
@@ -1596,17 +1744,6 @@ export default function WorkspaceTerminal({
       elapsedMs: performance.now() - lifecycleStartedAt,
     });
 
-    const setTerminalAudioInputTarget = (active) => {
-      if (active && isDisposed) {
-        return;
-      }
-
-      invoke("set_terminal_audio_input_target", {
-        active,
-        instanceId: terminalInstanceId,
-        paneId,
-      }).catch(() => {});
-    };
     let terminalFocusClearTimer = 0;
     const markTerminalAudioInputTarget = () => {
       if (terminalFocusClearTimer) {
@@ -1614,9 +1751,15 @@ export default function WorkspaceTerminal({
         terminalFocusClearTimer = 0;
       }
 
-      setTerminalAudioInputTarget(true);
+      if (!isDisposed) {
+        requestTerminalAudioInputTarget(true);
+      }
     };
-    const clearTerminalAudioInputTarget = () => setTerminalAudioInputTarget(false);
+    const clearTerminalAudioInputTarget = () => {
+      if (!isDisposed) {
+        requestTerminalAudioInputTarget(false);
+      }
+    };
     const clearTerminalAudioInputTargetIfAppUnfocused = () => {
       window.setTimeout(() => {
         Window.getFocusedWindow()
@@ -1635,15 +1778,21 @@ export default function WorkspaceTerminal({
 
       terminalFocusClearTimer = window.setTimeout(() => {
         terminalFocusClearTimer = 0;
-        if (!container.contains(document.activeElement)) {
+        if (!container.contains(document.activeElement) && document.hasFocus()) {
           clearTerminalAudioInputTarget();
         }
       }, 0);
+    };
+    const clearTerminalAudioInputTargetIfPointerOutside = (event) => {
+      if (!container.contains(event.target)) {
+        clearTerminalAudioInputTarget();
+      }
     };
 
     container.addEventListener("focusin", markTerminalAudioInputTarget, true);
     container.addEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
     container.addEventListener("pointerdown", markTerminalAudioInputTarget, true);
+    document.addEventListener("pointerdown", clearTerminalAudioInputTargetIfPointerOutside, true);
     window.addEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
     Window.getCurrent()
       .onFocusChanged((event) => {
@@ -2017,6 +2166,7 @@ export default function WorkspaceTerminal({
       container.removeEventListener("focusin", markTerminalAudioInputTarget, true);
       container.removeEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
       container.removeEventListener("pointerdown", markTerminalAudioInputTarget, true);
+      document.removeEventListener("pointerdown", clearTerminalAudioInputTargetIfPointerOutside, true);
       window.removeEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
       clearTerminalAudioInputTarget();
     });
@@ -2964,14 +3114,57 @@ export default function WorkspaceTerminal({
         let terminalInputFlushTimer = 0;
         let terminalInputWriteChain = Promise.resolve();
         const writeTerminalInputChunk = (data, reason) => {
+          const isEscapeInput = String(data || "").includes("\x1b");
+          const escapeDebugFields = isEscapeInput
+            ? {
+              reason,
+              terminalIndex,
+              ...getTerminalInputDebugFields(data),
+            }
+            : null;
+
           terminalInputWriteChain = terminalInputWriteChain
             .catch(() => {})
-            .then(() => invoke("terminal_write", {
-              paneId,
-              instanceId: terminalInstanceId,
-              data,
-            }))
+            .then(() => {
+              if (escapeDebugFields) {
+                writeTerminalTelemetry({
+                  paneId,
+                  instanceId: terminalInstanceId,
+                  phase: "frontend.input.escape.invoke_start",
+                  fields: escapeDebugFields,
+                });
+              }
+
+              return invoke("terminal_write", {
+                paneId,
+                instanceId: terminalInstanceId,
+                data,
+              }).then((result) => {
+                if (escapeDebugFields) {
+                  writeTerminalTelemetry({
+                    paneId,
+                    instanceId: terminalInstanceId,
+                    phase: "frontend.input.escape.invoke_done",
+                    fields: escapeDebugFields,
+                  });
+                }
+
+                return result;
+              });
+            })
             .catch((error) => {
+              if (escapeDebugFields) {
+                writeTerminalTelemetry({
+                  paneId,
+                  instanceId: terminalInstanceId,
+                  phase: "frontend.input.escape.invoke_error",
+                  fields: {
+                    ...escapeDebugFields,
+                    error: getErrorMessage(error, "Unable to write escape input."),
+                  },
+                });
+              }
+
               if (isTerminalSessionMissingError(error)) {
                 writeTerminalTelemetry({
                   paneId,
@@ -3036,6 +3229,21 @@ export default function WorkspaceTerminal({
           const safeData = isGenericTerminal ? data : data.replace(/\x03/g, "");
 
           if (!safeData) {
+            return;
+          }
+
+          if (safeData.startsWith("\x1b")) {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.xterm.on_data.escape",
+              fields: {
+                terminalIndex,
+                ...getTerminalInputDebugFields(safeData),
+              },
+            });
+            flushTerminalInput("escape_sequence_flush_before");
+            writeTerminalInputChunk(safeData, safeData === "\x1b" ? "escape" : "escape_sequence");
             return;
           }
 
@@ -3104,36 +3312,146 @@ export default function WorkspaceTerminal({
         disposables.push(() => {
           container.removeEventListener("keydown", handleTerminalSelectionDelete, true);
         });
-        const handleTerminalEscapeInterrupt = (event) => {
+        const handleTerminalEscapeKey = (event, source = "container_capture_keydown") => {
+          const isPlainEscape = event.key === "Escape"
+            && !event.metaKey
+            && !event.ctrlKey
+            && !event.altKey
+            && !event.shiftKey;
+          if (event.key === "Escape") {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.keydown.escape",
+              fields: getTerminalKeyDebugFields(event, {
+                hasOpenPty,
+                isDisposed,
+                isGenericTerminal,
+                parked: Boolean(parkedPromptRef.current),
+                source,
+                terminalIndex,
+                willInterceptParkedEscape: Boolean(
+                  !isGenericTerminal
+                  && !isDisposed
+                  && hasOpenPty
+                  && parkedPromptRef.current
+                  && !event.metaKey
+                  && !event.ctrlKey
+                  && !event.altKey
+                  && !event.shiftKey
+                ),
+                willManualWriteEscape: Boolean(
+                  !isDisposed
+                  && hasOpenPty
+                  && isPlainEscape
+                  && !parkedPromptRef.current
+                ),
+              }),
+            });
+          }
+
           if (
-            isGenericTerminal
+            !isPlainEscape
             || isDisposed
             || !hasOpenPty
-            || event.key !== "Escape"
-            || event.metaKey
-            || event.ctrlKey
-            || event.altKey
-            || event.shiftKey
           ) {
-            return;
+            return false;
           }
 
           event.preventDefault();
-          event.stopPropagation();
-          invoke("terminal_interrupt_agent", {
+          event.stopPropagation?.();
+          event.stopImmediatePropagation?.();
+
+          if (parkedPromptRef.current && !isGenericTerminal) {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.keydown.escape.interrupt_parked",
+              fields: getTerminalKeyDebugFields(event, {
+                source,
+                terminalIndex,
+              }),
+            });
+            invoke("terminal_interrupt_agent", {
+              paneId,
+              instanceId: terminalInstanceId,
+              reason: "escape_key",
+            }).catch((error) => {
+              if (!isDisposed) {
+                setTerminalError(getErrorMessage(error, "Unable to interrupt terminal agent."));
+              }
+            });
+            return true;
+          }
+
+          writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
-            reason: "escape_key",
-          }).catch((error) => {
-            if (!isDisposed) {
-              setTerminalError(getErrorMessage(error, "Unable to interrupt terminal agent."));
-            }
+            phase: "frontend.keydown.escape.manual_write",
+            fields: getTerminalKeyDebugFields(event, {
+              source,
+              terminalIndex,
+            }),
           });
+          flushTerminalInput("escape_keydown_flush_before");
+          writeTerminalInputChunk("\x1b", "escape_keydown");
+          return true;
+        };
+        const handleTerminalEscapeInterrupt = (event) => {
+          handleTerminalEscapeKey(event, "container_capture_keydown");
         };
         container.addEventListener("keydown", handleTerminalEscapeInterrupt, true);
         disposables.push(() => {
           container.removeEventListener("keydown", handleTerminalEscapeInterrupt, true);
         });
+        const handleWindowTerminalEscape = (event) => {
+          if (
+            event.key !== "Escape"
+            || !terminalKeyboardTargetMatches(paneId, terminalInstanceId)
+          ) {
+            return;
+          }
+
+          handleTerminalEscapeKey(event, "window_capture_keydown");
+        };
+        window.addEventListener("keydown", handleWindowTerminalEscape, true);
+        disposables.push(() => {
+          window.removeEventListener("keydown", handleWindowTerminalEscape, true);
+        });
+        const handleDocumentTerminalEscape = (event) => {
+          if (event.key !== "Escape") {
+            return;
+          }
+          const eventTarget = event.target;
+          const targetInsideContainer = eventTarget instanceof Node
+            && container.contains(eventTarget);
+          const activeInsideContainer = document.activeElement instanceof Node
+            && container.contains(document.activeElement);
+          const selectedKeyboardTarget = terminalKeyboardTargetMatches(paneId, terminalInstanceId);
+          if (!targetInsideContainer && !activeInsideContainer && !selectedKeyboardTarget) {
+            return;
+          }
+          handleTerminalEscapeKey(event, "document_capture_keydown");
+        };
+        document.addEventListener("keydown", handleDocumentTerminalEscape, true);
+        disposables.push(() => {
+          document.removeEventListener("keydown", handleDocumentTerminalEscape, true);
+        });
+        if (typeof terminal.attachCustomKeyEventHandler === "function") {
+          terminal.attachCustomKeyEventHandler((event) => {
+            if (event.key === "Escape" && handleTerminalEscapeKey(event, "xterm_custom_key_handler")) {
+              return false;
+            }
+            return true;
+          });
+          disposables.push(() => {
+            try {
+              terminal.attachCustomKeyEventHandler(() => true);
+            } catch (_) {
+              // Terminal may already be disposed during teardown.
+            }
+          });
+        }
 
         const initialSize = await waitForTerminalSizeForOpen("terminal_open");
 
@@ -3408,6 +3726,7 @@ export default function WorkspaceTerminal({
         terminalIndex,
         workspaceId: workspace?.id || "",
       });
+      clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceId);
       writeTerminalTelemetry({
         paneId,
         instanceId: terminalInstanceId,
@@ -3418,7 +3737,7 @@ export default function WorkspaceTerminal({
       invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
       terminal.dispose();
     };
-  }, [agent?.id, agent?.label, isGenericTerminal, onPreparedTerminalChange, paneId, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [agent?.id, agent?.label, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
 
@@ -3572,7 +3891,7 @@ export default function WorkspaceTerminal({
         <TerminalEmptyPanel>
           <TerminalEmptyCopy>
             <PanelKicker>Terminal readiness</PanelKicker>
-            <PanelHeading>Install and connect Codex or Claude Code</PanelHeading>
+            <PanelHeading>Install and connect Codex, Claude Code, or OpenCode</PanelHeading>
             <PageSubline>
               The workspace opens a live local PTY only after a provider CLI is installed and authenticated.
             </PageSubline>
@@ -3581,7 +3900,11 @@ export default function WorkspaceTerminal({
             {getAgentStatusSummary(agentStatuses).map((status) => (
               <TerminalAgentRow data-tone={getAgentTone(status)} key={status.id}>
                 <AgentIcon data-tone={getAgentTone(status)}>
-                  {status.id === "codex" ? <ButtonCodeIcon aria-hidden="true" /> : <ButtonBotIcon aria-hidden="true" />}
+                  {status.id === "codex" || status.id === "opencode" ? (
+                    <ButtonCodeIcon aria-hidden="true" />
+                  ) : (
+                    <ButtonBotIcon aria-hidden="true" />
+                  )}
                 </AgentIcon>
                 <div>
                   <strong>{status.label}</strong>
@@ -3608,7 +3931,13 @@ export default function WorkspaceTerminal({
   }
 
   return (
-    <TerminalWorkspaceSurface>
+    <TerminalWorkspaceSurface
+      data-focused={terminalFocused ? "true" : "false"}
+      data-pane-id={paneId}
+      data-terminal-index={terminalIndex}
+      onFocusCapture={() => requestTerminalAudioInputTarget(true)}
+      onPointerDownCapture={() => requestTerminalAudioInputTarget(true)}
+    >
       <TerminalRestartPill>
         <TerminalAgentIdBadge
           aria-label={terminalAgentTitle}
@@ -3644,7 +3973,7 @@ export default function WorkspaceTerminal({
             <ButtonRefreshIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
-            {TERMINAL_ROLE_SWITCH_OPTIONS.map((option) => (
+            {getTerminalRoleSwitchOptions(agentStatuses).map((option) => (
               <TerminalRestartOption
                 data-role={option.id}
                 data-selected={option.id === terminalAgentKind ? "true" : "false"}

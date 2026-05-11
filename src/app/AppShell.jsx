@@ -448,12 +448,14 @@ const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
 const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
+  { id: "opencode", label: "OpenCode", shortLabel: "OpenCode" },
 ];
 const WORKSPACE_TERMINAL_ROLE_GENERIC = "generic";
 const WORKSPACE_TERMINAL_ROLE_OPTIONS = [
   { id: "codex", label: "Codex", shortLabel: "CX" },
   { id: "claude", label: "Claude Code", shortLabel: "CL" },
   { id: WORKSPACE_TERMINAL_ROLE_GENERIC, label: "Terminal", shortLabel: "SH" },
+  { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
 const WORKSPACE_TERMINAL_ROLE_IDS = new Set(WORKSPACE_TERMINAL_ROLE_OPTIONS.map((role) => role.id));
 const GENERIC_TERMINAL_AGENT = {
@@ -481,6 +483,11 @@ const AGENT_INSTALL_GUIDES = {
     nativeInstallLabel: "Native install guide",
     installCommand: "npm install -g @anthropic-ai/claude-code",
   },
+  opencode: {
+    nativeInstallUrl: "https://opencode.ai/docs/",
+    nativeInstallLabel: "Install script / package guide",
+    installCommand: "npm install -g opencode-ai",
+  },
 };
 const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   ...provider,
@@ -499,7 +506,11 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   npmLatestVersion: "Not checked",
   npmUpdateAvailable: false,
   recommendNativeInstall: true,
-  connectCommand: provider.id === "codex" ? "codex login" : "claude",
+  connectCommand: provider.id === "codex"
+    ? "codex login"
+    : provider.id === "opencode"
+      ? "opencode auth login"
+      : "claude",
 }));
 
 function getDefaultAgentStatus(providerId) {
@@ -1061,8 +1072,9 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
 function getAgentStatusSummary(agentStatuses) {
   const codex = agentStatuses.find((agent) => agent.id === "codex");
   const claude = agentStatuses.find((agent) => agent.id === "claude");
+  const opencode = agentStatuses.find((agent) => agent.id === "opencode");
 
-  return [codex, claude].filter(Boolean);
+  return [codex, claude, opencode].filter(Boolean);
 }
 
 function getAgentUpdatesAvailable(agentStatuses) {
@@ -1151,26 +1163,68 @@ function normalizeWorkspaceTerminalCount(value) {
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
 }
 
-function normalizeWorkspaceTerminalRole(value, fallback = "codex") {
-  const roleId = String(value || "").toLowerCase().trim();
+function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
+  return new Set(roleOptions.map((role) => role.id));
+}
 
-  if (WORKSPACE_TERMINAL_ROLE_IDS.has(roleId)) {
+function getWorkspaceTerminalRoleOptions(agentStatuses = DEFAULT_AGENT_STATUSES) {
+  const installedAgentIds = new Set(
+    (Array.isArray(agentStatuses) ? agentStatuses : [])
+      .filter((agent) => agent.installed)
+      .map((agent) => agent.id),
+  );
+  const options = WORKSPACE_TERMINAL_ROLE_OPTIONS.filter((option) => (
+    option.id === WORKSPACE_TERMINAL_ROLE_GENERIC || installedAgentIds.has(option.id)
+  ));
+
+  return options.some((option) => option.id === WORKSPACE_TERMINAL_ROLE_GENERIC)
+    ? options
+    : WORKSPACE_TERMINAL_ROLE_OPTIONS.filter((option) => option.id === WORKSPACE_TERMINAL_ROLE_GENERIC);
+}
+
+function getWorkspaceTerminalFallbackRole(
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  fallback = "codex",
+) {
+  const roleIds = getWorkspaceTerminalRoleIds(roleOptions);
+  const fallbackRole = String(fallback || "").toLowerCase().trim();
+
+  if (roleIds.has(fallbackRole)) {
+    return fallbackRole;
+  }
+
+  return roleOptions.find((option) => option.id !== WORKSPACE_TERMINAL_ROLE_GENERIC)?.id
+    || WORKSPACE_TERMINAL_ROLE_GENERIC;
+}
+
+function normalizeWorkspaceTerminalRole(
+  value,
+  fallback = "codex",
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
+  const roleId = String(value || "").toLowerCase().trim();
+  const roleIds = getWorkspaceTerminalRoleIds(roleOptions);
+
+  if (roleIds.has(roleId)) {
     return roleId;
   }
 
-  return WORKSPACE_TERMINAL_ROLE_IDS.has(fallback)
-    ? fallback
-    : "codex";
+  return getWorkspaceTerminalFallbackRole(roleOptions, fallback);
 }
 
-function normalizeWorkspaceTerminalRoles(value, count, fallback = "codex") {
+function normalizeWorkspaceTerminalRoles(
+  value,
+  count,
+  fallback = "codex",
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
   const terminalCount = normalizeWorkspaceTerminalCount(count);
-  const fallbackRole = normalizeWorkspaceTerminalRole(fallback, "codex");
+  const fallbackRole = normalizeWorkspaceTerminalRole(fallback, "codex", roleOptions);
   const roles = Array.isArray(value) ? value : [];
 
   return Array.from(
     { length: terminalCount },
-    (_, index) => normalizeWorkspaceTerminalRole(roles[index], fallbackRole),
+    (_, index) => normalizeWorkspaceTerminalRole(roles[index], fallbackRole, roleOptions),
   );
 }
 
@@ -1182,31 +1236,36 @@ function areWorkspaceTerminalRolesEqual(leftRoles, rightRoles) {
   return leftRoles.every((role, index) => role === rightRoles[index]);
 }
 
-function getTerminalRoleOption(role) {
-  const roleId = normalizeWorkspaceTerminalRole(role, "codex");
+function getTerminalRoleOption(role, roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
+  const roleId = normalizeWorkspaceTerminalRole(role, "codex", roleOptions);
 
-  return WORKSPACE_TERMINAL_ROLE_OPTIONS.find((option) => option.id === roleId)
+  return roleOptions.find((option) => option.id === roleId)
+    || roleOptions[0]
     || WORKSPACE_TERMINAL_ROLE_OPTIONS[0];
 }
 
-function getWorkspaceTerminalRoleCounts(roles) {
-  return WORKSPACE_TERMINAL_ROLE_OPTIONS.map((option) => ({
+function getWorkspaceTerminalRoleCounts(roles, roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
+  return roleOptions.map((option) => ({
     ...option,
     count: roles.filter((role) => role === option.id).length,
   }));
 }
 
-function getWorkspaceTerminalRoleCountMap(roles) {
+function getWorkspaceTerminalRoleCountMap(roles, roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
   return Object.fromEntries(
-    getWorkspaceTerminalRoleCounts(roles).map((role) => [role.id, role.count]),
+    getWorkspaceTerminalRoleCounts(roles, roleOptions).map((role) => [role.id, role.count]),
   );
 }
 
-function buildWorkspaceTerminalRolesFromCounts(counts, count) {
+function buildWorkspaceTerminalRolesFromCounts(
+  counts,
+  count,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
   const terminalCount = normalizeWorkspaceTerminalCount(count);
   const nextRoles = [];
 
-  WORKSPACE_TERMINAL_ROLE_OPTIONS.forEach((option) => {
+  roleOptions.forEach((option) => {
     const roleCount = Math.max(0, Math.min(terminalCount, Number.parseInt(counts?.[option.id], 10) || 0));
 
     for (let index = 0; index < roleCount && nextRoles.length < terminalCount; index += 1) {
@@ -1221,10 +1280,19 @@ function buildWorkspaceTerminalRolesFromCounts(counts, count) {
   return nextRoles.slice(0, terminalCount);
 }
 
-function rebalanceWorkspaceTerminalRoleCounts(roles, targetRole, targetCount, count) {
+function rebalanceWorkspaceTerminalRoleCounts(
+  roles,
+  targetRole,
+  targetCount,
+  count,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
   const terminalCount = normalizeWorkspaceTerminalCount(count);
-  const roleId = normalizeWorkspaceTerminalRole(targetRole, "codex");
-  const counts = getWorkspaceTerminalRoleCountMap(normalizeWorkspaceTerminalRoles(roles, terminalCount));
+  const roleId = normalizeWorkspaceTerminalRole(targetRole, "codex", roleOptions);
+  const counts = getWorkspaceTerminalRoleCountMap(
+    normalizeWorkspaceTerminalRoles(roles, terminalCount, "codex", roleOptions),
+    roleOptions,
+  );
   const requestedCount = Math.max(0, Math.min(terminalCount, Number.parseInt(targetCount, 10) || 0));
   const previousCount = counts[roleId] || 0;
   const delta = requestedCount - previousCount;
@@ -1235,8 +1303,10 @@ function rebalanceWorkspaceTerminalRoleCounts(roles, targetRole, targetCount, co
     let remaining = delta;
     const drainOrder = [
       WORKSPACE_TERMINAL_ROLE_GENERIC,
-      "claude",
-      "codex",
+      ...roleOptions
+        .filter((option) => option.id !== WORKSPACE_TERMINAL_ROLE_GENERIC)
+        .map((option) => option.id)
+        .reverse(),
     ].filter((otherRole) => otherRole !== roleId);
 
     drainOrder.forEach((otherRole) => {
@@ -1251,18 +1321,20 @@ function rebalanceWorkspaceTerminalRoleCounts(roles, targetRole, targetCount, co
 
     counts[roleId] -= remaining;
   } else if (delta < 0) {
-    const recipientRole = roleId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "codex" : WORKSPACE_TERMINAL_ROLE_GENERIC;
+    const recipientRole = roleId === WORKSPACE_TERMINAL_ROLE_GENERIC
+      ? getWorkspaceTerminalFallbackRole(roleOptions, "codex")
+      : WORKSPACE_TERMINAL_ROLE_GENERIC;
     counts[recipientRole] = (counts[recipientRole] || 0) + Math.abs(delta);
   }
 
-  return buildWorkspaceTerminalRolesFromCounts(counts, terminalCount);
+  return buildWorkspaceTerminalRolesFromCounts(counts, terminalCount, roleOptions);
 }
 
-function getWorkspaceTerminalRoleSummaryText(roles) {
-  return getWorkspaceTerminalRoleCounts(roles)
+function getWorkspaceTerminalRoleSummaryText(roles, roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
+  return getWorkspaceTerminalRoleCounts(roles, roleOptions)
     .filter((role) => role.count > 0)
     .map((role) => `${role.shortLabel} ${role.count}`)
-    .join(" / ") || "CX 1";
+    .join(" / ") || `${getTerminalRoleOption("codex", roleOptions).shortLabel} 1`;
 }
 
 function getWorkspaceTerminalPaneAgentId(role) {
@@ -1279,9 +1351,10 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
   return getReadyAgent(agentStatuses, roleId);
 }
 
-function TerminalLayoutMiniature({ count, roles = [] }) {
+function TerminalLayoutMiniature({ count, roleOptions, roles = [] }) {
   const rows = getTerminalPanelRows(getDefaultTerminalIndexes(count));
-  const previewRoles = normalizeWorkspaceTerminalRoles(roles, count);
+  const fallbackRole = getWorkspaceTerminalFallbackRole(roleOptions);
+  const previewRoles = normalizeWorkspaceTerminalRoles(roles, count, fallbackRole, roleOptions);
 
   return (
     <TerminalLayoutPreview aria-hidden="true">
@@ -1302,7 +1375,7 @@ function TerminalLayoutMiniature({ count, roles = [] }) {
   );
 }
 
-function WorkspaceTerminalCountPicker({ onChange, roles, value }) {
+function WorkspaceTerminalCountPicker({ onChange, roleOptions, roles, value }) {
   const selectedCount = normalizeWorkspaceTerminalCount(value);
 
   return (
@@ -1320,17 +1393,23 @@ function WorkspaceTerminalCountPicker({ onChange, roles, value }) {
             <strong>{count}</strong>
             <span>{count === 1 ? "terminal" : "terminals"}</span>
           </TerminalCountMeta>
-          <TerminalLayoutMiniature count={count} roles={roles} />
+          <TerminalLayoutMiniature count={count} roleOptions={roleOptions} roles={roles} />
         </TerminalCountButton>
       ))}
     </TerminalCountGrid>
   );
 }
 
-function WorkspaceTerminalRolePicker({ count, onChange, value }) {
+function WorkspaceTerminalRolePicker({
+  count,
+  onChange,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  value,
+}) {
   const terminalCount = normalizeWorkspaceTerminalCount(count);
-  const roles = normalizeWorkspaceTerminalRoles(value, terminalCount);
-  const roleCounts = getWorkspaceTerminalRoleCounts(roles);
+  const fallbackRole = getWorkspaceTerminalFallbackRole(roleOptions);
+  const roles = normalizeWorkspaceTerminalRoles(value, terminalCount, fallbackRole, roleOptions);
+  const roleCounts = getWorkspaceTerminalRoleCounts(roles, roleOptions);
 
   return (
     <>
@@ -1360,6 +1439,7 @@ function WorkspaceTerminalRolePicker({ count, onChange, value }) {
                   role.id,
                   event.target.value,
                   terminalCount,
+                  roleOptions,
                 ));
               }}
               type="range"
@@ -1471,8 +1551,19 @@ function getWorkspaceTerminalCount(workspaceSettings, workspaceId) {
   return normalizeWorkspaceTerminalCount(workspaceSettings?.[workspaceId]?.terminalCount);
 }
 
-function getWorkspaceTerminalRoles(workspaceSettings, workspaceId, count, fallback = "codex") {
-  return normalizeWorkspaceTerminalRoles(workspaceSettings?.[workspaceId]?.terminalRoles, count, fallback);
+function getWorkspaceTerminalRoles(
+  workspaceSettings,
+  workspaceId,
+  count,
+  fallback = "codex",
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
+  return normalizeWorkspaceTerminalRoles(
+    workspaceSettings?.[workspaceId]?.terminalRoles,
+    count,
+    fallback,
+    roleOptions,
+  );
 }
 
 function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
@@ -1593,6 +1684,14 @@ export default function App() {
   const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
+  const workspaceTerminalRoleOptions = useMemo(
+    () => getWorkspaceTerminalRoleOptions(agentStatuses),
+    [agentStatuses],
+  );
+  const workspaceTerminalFallbackRole = getWorkspaceTerminalFallbackRole(
+    workspaceTerminalRoleOptions,
+    activeAgent,
+  );
   const workspaceCloseAllowNativeRef = useRef(false);
 
   useEffect(() => {
@@ -2735,7 +2834,12 @@ export default function App() {
     const token = authStore.getToken();
     const workspaceNameValue = workspaceNameDraft.replace(/[\u0000-\u001F\u007F]/g, "").trim();
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
-    const terminalRoles = normalizeWorkspaceTerminalRoles(workspaceTerminalRolesDraft, terminalCount, activeAgent);
+    const terminalRoles = normalizeWorkspaceTerminalRoles(
+      workspaceTerminalRolesDraft,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
     const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
@@ -2743,7 +2847,8 @@ export default function App() {
       workspaceSettings,
       selectedWorkspace.id,
       currentTerminalCount,
-      activeAgent,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
     );
     const terminalRolesChanged = !areWorkspaceTerminalRolesEqual(currentTerminalRoles, terminalRoles);
 
@@ -2935,6 +3040,8 @@ export default function App() {
     workspaceSettings,
     workspaceTerminalSlots,
     activeAgent,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
   ]);
 
   const closeWorkspaceTerminal = useCallback(({ workspaceId, terminalIndex }) => {
@@ -2943,7 +3050,13 @@ export default function App() {
     }
 
     const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
-    const currentTerminalRoles = getWorkspaceTerminalRoles(workspaceSettings, workspaceId, terminalCount, activeAgent);
+    const currentTerminalRoles = getWorkspaceTerminalRoles(
+      workspaceSettings,
+      workspaceId,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
     const currentIndexes = normalizeWorkspaceTerminalIndexes(
       workspaceTerminalSlots[workspaceId],
       terminalCount,
@@ -2962,7 +3075,7 @@ export default function App() {
     const nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => {
       const roleIndex = currentIndexes.indexOf(index);
-      return currentTerminalRoles[roleIndex] || activeAgent;
+      return currentTerminalRoles[roleIndex] || workspaceTerminalFallbackRole;
     });
 
     setWorkspaceTerminalSlots((slots) => ({
@@ -2983,14 +3096,24 @@ export default function App() {
       setWorkspaceTerminalCountDraft(String(nextTerminalCount));
       setWorkspaceTerminalRolesDraft(nextTerminalRoles);
     }
-  }, [activeAgent, workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
+  }, [
+    workspaceSettings,
+    workspaceSettingsModalId,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+    workspaceTerminalSlots,
+  ]);
 
   const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, workspaceId }) => {
     if (!workspaceId) {
       return;
     }
 
-    const nextRole = normalizeWorkspaceTerminalRole(role, activeAgent);
+    const nextRole = normalizeWorkspaceTerminalRole(
+      role,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
     const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
     const currentIndexes = normalizeWorkspaceTerminalIndexes(
       workspaceTerminalSlots[workspaceId],
@@ -3002,8 +3125,14 @@ export default function App() {
       return;
     }
 
-    const currentRoles = getWorkspaceTerminalRoles(workspaceSettings, workspaceId, terminalCount, activeAgent);
-    const previousRole = currentRoles[roleIndex] || activeAgent;
+    const currentRoles = getWorkspaceTerminalRoles(
+      workspaceSettings,
+      workspaceId,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const previousRole = currentRoles[roleIndex] || workspaceTerminalFallbackRole;
 
     if (previousRole === nextRole) {
       return;
@@ -3033,7 +3162,13 @@ export default function App() {
       terminalIndex,
       workspaceId,
     });
-  }, [activeAgent, workspaceSettings, workspaceSettingsModalId, workspaceTerminalSlots]);
+  }, [
+    workspaceSettings,
+    workspaceSettingsModalId,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+    workspaceTerminalSlots,
+  ]);
 
   const useDefaultWorkspaceRoot = useCallback(() => {
     setWorkspaceRootDraft(defaultWorkingDirectory);
@@ -3687,9 +3822,9 @@ export default function App() {
     : startupAgentGateState === "updating"
       ? "The workspace will open when the selected updates finish."
       : startupAgentGateState === "checking"
-        ? "Codex and Claude Code readiness are being checked while the workspace loads."
+        ? "Terminal CLI readiness is being checked while the workspace loads."
         : connectedAgentCount > 0
-          ? `${connectedAgentCount}/2 terminal CLIs ready.`
+          ? `${connectedAgentCount}/${AGENT_PROVIDERS.length} terminal CLIs ready.`
           : "No ready terminal CLIs found. Settings will open so you can install or connect one.";
   const startupAgentStatusState = startupAgentGateState === "choice"
     ? "update"
@@ -3715,28 +3850,52 @@ export default function App() {
   const selectedWorkspaceTerminalRoles = useMemo(
     () => (
       selectedWorkspace && !shouldShowWorkspaceSetup
-        ? getWorkspaceTerminalRoles(workspaceSettings, selectedWorkspace.id, selectedWorkspaceTerminalCount, activeAgent)
-        : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent)
+        ? getWorkspaceTerminalRoles(
+          workspaceSettings,
+          selectedWorkspace.id,
+          selectedWorkspaceTerminalCount,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        )
+        : normalizeWorkspaceTerminalRoles(
+          [],
+          MIN_WORKSPACE_TERMINAL_COUNT,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        )
     ),
     [
-      activeAgent,
       selectedWorkspace?.id,
       selectedWorkspaceTerminalCount,
       shouldShowWorkspaceSetup,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
       workspaceSettings,
     ],
   );
   const activatedWorkspaceTerminalRoles = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
-        ? getWorkspaceTerminalRoles(workspaceSettings, activatedWorkspace.id, activatedWorkspaceTerminalCount, activeAgent)
-        : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent)
+        ? getWorkspaceTerminalRoles(
+          workspaceSettings,
+          activatedWorkspace.id,
+          activatedWorkspaceTerminalCount,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        )
+        : normalizeWorkspaceTerminalRoles(
+          [],
+          MIN_WORKSPACE_TERMINAL_COUNT,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        )
     ),
     [
-      activeAgent,
       activatedWorkspace?.id,
       activatedWorkspaceTerminalCount,
       shouldShowWorkspaceSetup,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
       workspaceSettings,
     ],
   );
@@ -3759,10 +3918,19 @@ export default function App() {
   const activatedWorkspaceVisibleTerminalCount = activatedWorkspaceTerminalIndexes.length;
   const activatedWorkspaceTerminalRoleEntries = useMemo(
     () => activatedWorkspaceTerminalIndexes.map((terminalIndex, index) => ({
-      role: activatedWorkspaceTerminalRoles[terminalIndex] || activatedWorkspaceTerminalRoles[index] || activeAgent,
+      role: normalizeWorkspaceTerminalRole(
+        activatedWorkspaceTerminalRoles[index] || activatedWorkspaceTerminalRoles[terminalIndex],
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      ),
       terminalIndex,
     })),
-    [activatedWorkspaceTerminalIndexes, activatedWorkspaceTerminalRoles, activeAgent],
+    [
+      activatedWorkspaceTerminalIndexes,
+      activatedWorkspaceTerminalRoles,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    ],
   );
   const activatedWorkspaceTerminalAgentsByIndex = useMemo(() => (
     Object.fromEntries(activatedWorkspaceTerminalRoleEntries.map(({ role, terminalIndex }) => (
@@ -3771,17 +3939,37 @@ export default function App() {
   ), [activatedWorkspaceTerminalRoleEntries, agentStatuses]);
   const activatedWorkspaceTerminalRolesByIndex = useMemo(() => (
     Object.fromEntries(activatedWorkspaceTerminalRoleEntries.map(({ role, terminalIndex }) => (
-      [terminalIndex, normalizeWorkspaceTerminalRole(role, activeAgent)]
+      [terminalIndex, normalizeWorkspaceTerminalRole(
+        role,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      )]
     )))
-  ), [activatedWorkspaceTerminalRoleEntries, activeAgent]);
+  ), [
+    activatedWorkspaceTerminalRoleEntries,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
   const activatedWorkspaceAgentTerminalEntries = useMemo(() => (
     activatedWorkspaceTerminalRoleEntries.filter(({ role, terminalIndex }) => (
-      normalizeWorkspaceTerminalRole(role, activeAgent) !== WORKSPACE_TERMINAL_ROLE_GENERIC
+      normalizeWorkspaceTerminalRole(
+        role,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      ) !== WORKSPACE_TERMINAL_ROLE_GENERIC
       && Boolean(activatedWorkspaceTerminalAgentsByIndex[terminalIndex])
     ))
-  ), [activatedWorkspaceTerminalAgentsByIndex, activatedWorkspaceTerminalRoleEntries, activeAgent]);
+  ), [
+    activatedWorkspaceTerminalAgentsByIndex,
+    activatedWorkspaceTerminalRoleEntries,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
   const workspaceTerminalRenderAgent = activatedWorkspace
-    ? getReadyWorkspaceTerminalAgent(agentStatuses, activatedWorkspaceTerminalRoles[0] || activeAgent)
+    ? getReadyWorkspaceTerminalAgent(
+      agentStatuses,
+      activatedWorkspaceTerminalRoles[0] || workspaceTerminalFallbackRole,
+    )
     : null;
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && Boolean(activatedWorkspace)
@@ -3993,17 +4181,23 @@ export default function App() {
   useEffect(() => {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
     setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalCount : MIN_WORKSPACE_TERMINAL_COUNT));
-    setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalRoles : normalizeWorkspaceTerminalRoles([], MIN_WORKSPACE_TERMINAL_COUNT, activeAgent));
+    setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalRoles : normalizeWorkspaceTerminalRoles(
+      [],
+      MIN_WORKSPACE_TERMINAL_COUNT,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    ));
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
   }, [
-    activeAgent,
     selectedWorkspace?.id,
     selectedWorkspace?.name,
     selectedWorkspaceRootDirectory,
     selectedWorkspaceTerminalCount,
     selectedWorkspaceTerminalRoles,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
     workspaceSettingsModalId,
   ]);
 
@@ -4463,12 +4657,12 @@ export default function App() {
                     <PanelHeaderRow>
                       <div>
                         <PanelKicker>Terminal providers</PanelKicker>
-                        <PanelHeading>Codex and Claude Code</PanelHeading>
+                        <PanelHeading>Codex, Claude Code, and OpenCode</PanelHeading>
                       </div>
                       <AgentPanelActions>
                         <AgentReadyPill data-tone={connectedAgentCount > 0 ? "blue" : "orange"}>
                           <ButtonBotIcon aria-hidden="true" />
-                          <span>{connectedAgentCount}/2 ready</span>
+                          <span>{connectedAgentCount}/{AGENT_PROVIDERS.length} ready</span>
                         </AgentReadyPill>
                         <SecondaryButton disabled={agentStatusState === "checking"} onClick={refreshAgentStatuses} type="button">
                           <ButtonRefreshIcon aria-hidden="true" />
@@ -4522,7 +4716,11 @@ export default function App() {
                           <AgentCard data-tone={getAgentTone(agent)} key={agent.id}>
                             <AgentCardHeader>
                               <AgentIcon data-tone={getAgentTone(agent)}>
-                                {agent.id === "codex" ? <ButtonCodeIcon aria-hidden="true" /> : <ButtonBotIcon aria-hidden="true" />}
+                                {agent.id === "codex" || agent.id === "opencode" ? (
+                                  <ButtonCodeIcon aria-hidden="true" />
+                                ) : (
+                                  <ButtonBotIcon aria-hidden="true" />
+                                )}
                               </AgentIcon>
                               <div>
                                 <AgentName>{agent.label}</AgentName>
@@ -4904,8 +5102,10 @@ export default function App() {
                                   normalizeWorkspaceTerminalRoles(
                                     workspaceTerminalRolesDraft,
                                     normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft),
-                                    activeAgent,
+                                    workspaceTerminalFallbackRole,
+                                    workspaceTerminalRoleOptions,
                                   ),
+                                  workspaceTerminalRoleOptions,
                                 )}
                               </strong>
                             </WorkspaceSettingsMetaPill>
@@ -5014,18 +5214,24 @@ export default function App() {
                       <WorkspaceSettingsSection>
                         <div>
                           <PanelKicker>Terminal layout</PanelKicker>
-                          <SettingsHint>Choose the total, then distribute panes across Codex, Claude Code, and plain terminals.</SettingsHint>
+                          <SettingsHint>Choose the total, then distribute panes across installed agent CLIs and plain terminals.</SettingsHint>
                         </div>
                         <WorkspaceTerminalCountPicker
                           onChange={(count) => {
                             const nextCount = normalizeWorkspaceTerminalCount(count);
                             setWorkspaceTerminalCountDraft(count);
                             setWorkspaceTerminalRolesDraft((roles) => (
-                              normalizeWorkspaceTerminalRoles(roles, nextCount, activeAgent)
+                              normalizeWorkspaceTerminalRoles(
+                                roles,
+                                nextCount,
+                                workspaceTerminalFallbackRole,
+                                workspaceTerminalRoleOptions,
+                              )
                             ));
                             setWorkspaceSettingsError("");
                             setWorkspaceSettingsMessage("");
                           }}
+                          roleOptions={workspaceTerminalRoleOptions}
                           roles={workspaceTerminalRolesDraft}
                           value={workspaceTerminalCountDraft}
                         />
@@ -5036,6 +5242,7 @@ export default function App() {
                             setWorkspaceSettingsError("");
                             setWorkspaceSettingsMessage("");
                           }}
+                          roleOptions={workspaceTerminalRoleOptions}
                           value={workspaceTerminalRolesDraft}
                         />
                       </WorkspaceSettingsSection>

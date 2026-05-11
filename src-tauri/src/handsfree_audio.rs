@@ -448,6 +448,39 @@ fn audio_shortcut_is_bare_context_menu(shortcut: &str) -> bool {
     audio_shortcuts_conflict(shortcut, "ContextMenu")
 }
 
+fn audio_shortcut_has_explicit_modifier(shortcut: &str) -> bool {
+    shortcut.split('+').any(|token| {
+        matches!(
+            token.trim().replace([' ', '-', '_'], "").to_ascii_uppercase().as_str(),
+            "OPTION"
+                | "ALT"
+                | "CONTROL"
+                | "CTRL"
+                | "COMMAND"
+                | "CMD"
+                | "SUPER"
+                | "META"
+                | "SHIFT"
+                | "COMMANDORCONTROL"
+                | "COMMANDORCTRL"
+                | "CMDORCTRL"
+                | "CMDORCONTROL"
+        )
+    })
+}
+
+fn audio_cancel_shortcut_defers_global_registration(shortcut: &str) -> bool {
+    !audio_shortcut_has_explicit_modifier(shortcut)
+}
+
+fn deferred_audio_cancel_registration(shortcut: String) -> AudioShortcutRegistration {
+    AudioShortcutRegistration {
+        shortcut,
+        registered: true,
+        error: None,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_push_to_talk_shortcut_needs_modifier(shortcut: &str) -> bool {
     !shortcut.split('+').any(|token| {
@@ -661,11 +694,36 @@ fn unregister_audio_shortcut(app: &AppHandle, shortcut_text: &str) {
     }
 }
 
+fn register_deferred_audio_cancel_shortcut(app: &AppHandle) {
+    let manager = app.state::<AudioState>().shortcut_manager.clone();
+    let shortcut = manager.snapshot().cancel.shortcut;
+
+    if audio_cancel_shortcut_defers_global_registration(&shortcut) {
+        let _ = register_audio_shortcut_handler(app, AudioShortcutAction::Cancel, &shortcut);
+    }
+}
+
+fn unregister_deferred_audio_cancel_shortcut(app: &AppHandle) {
+    let manager = app.state::<AudioState>().shortcut_manager.clone();
+    let shortcut = manager.snapshot().cancel.shortcut;
+
+    if audio_cancel_shortcut_defers_global_registration(&shortcut) {
+        unregister_audio_shortcut(app, &shortcut);
+    }
+}
+
 fn register_audio_shortcut_registration(
     app: &AppHandle,
     action: AudioShortcutAction,
     shortcut: String,
 ) -> AudioShortcutRegistration {
+    if action == AudioShortcutAction::Cancel
+        && audio_cancel_shortcut_defers_global_registration(&shortcut)
+        && !AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire)
+    {
+        return deferred_audio_cancel_registration(shortcut);
+    }
+
     if audio_shortcut_uses_windows_context_menu_hook(action, &shortcut) {
         return match register_audio_context_menu_keyboard_hook(app) {
             Ok(()) => AudioShortcutRegistration {
@@ -940,6 +998,8 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                 return;
             }
 
+            register_deferred_audio_cancel_shortcut(&app);
+
             tauri::async_runtime::spawn(async move {
                 if !app_has_focused_audio_input_window(&app) {
                     let terminal_state = app.state::<TerminalState>();
@@ -966,6 +1026,8 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                 return;
             }
 
+            unregister_deferred_audio_cancel_shortcut(&app);
+
             tauri::async_runtime::spawn(async move {
                 emit_audio_push_to_talk_event(&app, "released", false, shortcut);
             });
@@ -979,6 +1041,7 @@ fn handle_audio_cancel_shortcut_state(app: AppHandle, state: ShortcutState, shor
     }
 
     AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
+    unregister_deferred_audio_cancel_shortcut(&app);
 
     tauri::async_runtime::spawn(async move {
         emit_audio_cancel_event(&app, shortcut);

@@ -28,6 +28,7 @@ import {
   writeDeepgramLanguage,
   writeSelectedAudioInputDeviceId,
 } from "./audioCapture";
+import { writeTerminalTelemetry } from "../terminals/terminalTelemetry.jsx";
 import {
   GlobalStyle,
   AppFrame,
@@ -2222,6 +2223,32 @@ export function AudioWidgetWindow() {
     resetWidgetToStartState();
   }, [closeWarmBuffer, resetWidgetToStartState]);
 
+  const forwardEscapeToActiveTerminal = useCallback((fields = {}) => {
+    writeTerminalTelemetry({
+      phase: "frontend.audio_widget.escape.forward_start",
+      fields,
+    });
+    invoke("terminal_write_to_audio_input_target", { data: "\x1b" })
+      .then((wrote) => {
+        writeTerminalTelemetry({
+          phase: "frontend.audio_widget.escape.forward_done",
+          fields: {
+            ...fields,
+            wrote: Boolean(wrote),
+          },
+        });
+      })
+      .catch((error) => {
+        writeTerminalTelemetry({
+          phase: "frontend.audio_widget.escape.forward_error",
+          fields: {
+            ...fields,
+            error: getErrorMessage(error, "Unable to forward Escape to active terminal."),
+          },
+        });
+      });
+  }, []);
+
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
   }, [stopRecording]);
@@ -2437,8 +2464,39 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     const onKeyDown = (event) => {
       if (shortcutMatchesEvent(widgetCancelShortcut, event)) {
+        const widgetStateValue = widgetStateRef.current;
+        const canCancelAudioRequest = pushToTalkDownRef.current
+          || widgetStateValue === "arming"
+          || widgetStateValue === "processing"
+          || widgetStateValue === "recording"
+          || widgetStateValue === "transcribing";
+        if (!canCancelAudioRequest) {
+          return;
+        }
+
+        const action = canCancelAudioRequest
+          ? "cancel_audio_and_forward_terminal"
+          : "forward_terminal";
+        const fields = {
+          action,
+          canCancelAudioRequest,
+          eventRepeat: Boolean(event.repeat),
+          pushToTalkDown: Boolean(pushToTalkDownRef.current),
+          shortcut: widgetCancelShortcut,
+          widgetState: widgetStateValue || "",
+        };
+
         event.preventDefault();
-        cancelRecording();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        writeTerminalTelemetry({
+          phase: "frontend.audio_widget.escape",
+          fields,
+        });
+        forwardEscapeToActiveTerminal(fields);
+        if (canCancelAudioRequest) {
+          cancelRecording();
+        }
         return;
       }
 
@@ -2459,13 +2517,13 @@ export function AudioWidgetWindow() {
       releasePushToTalk();
     };
 
-    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [cancelRecording, pressPushToTalk, releasePushToTalk, widgetCancelShortcut, widgetPushToTalkShortcut]);
+  }, [cancelRecording, forwardEscapeToActiveTerminal, pressPushToTalk, releasePushToTalk, widgetCancelShortcut, widgetPushToTalkShortcut]);
 
   useEffect(() => {
     const onContextMenu = (event) => {
