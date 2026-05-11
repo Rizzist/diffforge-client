@@ -2157,10 +2157,94 @@ fn terminal_control_followup_bypass_count(prompt: &str) -> usize {
     let prompt = terminal_normalize_prompt_for_gate(prompt);
     let lower = prompt.to_ascii_lowercase();
     if lower.starts_with("/model") {
-        return 1;
+        return 0;
     }
 
     0
+}
+
+fn terminal_is_model_command(prompt: &str) -> bool {
+    terminal_normalize_prompt_for_gate(prompt)
+        .to_ascii_lowercase()
+        .starts_with("/model")
+}
+
+fn terminal_model_selector_token(prompt: &str) -> String {
+    terminal_normalize_prompt_for_gate(prompt)
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '>' | '›' | '$' | '#' | '*' | '-' | '+' | '•' | '●' | '○' | '◉' | '▸'
+                        | '▹' | '→'
+                )
+        })
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '"' | '\''
+            )
+        })
+        .to_ascii_lowercase()
+}
+
+fn terminal_token_has_prefix_and_version(token: &str, prefix: &str) -> bool {
+    token
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(|character| character.is_ascii_digit() || matches!(character, '-' | '_' | '.'))
+}
+
+fn terminal_is_model_selector_prompt(prompt: &str) -> bool {
+    let token = terminal_model_selector_token(prompt);
+    if token.is_empty() {
+        return false;
+    }
+
+    if matches!(
+        token.as_str(),
+        "auto"
+            | "default"
+            | "fast"
+            | "balanced"
+            | "minimal"
+            | "low"
+            | "medium"
+            | "high"
+            | "xhigh"
+            | "max"
+            | "none"
+            | "sonnet"
+            | "opus"
+            | "haiku"
+    ) {
+        return true;
+    }
+
+    if token.contains("codex") {
+        return true;
+    }
+
+    [
+        "gpt",
+        "o1",
+        "o3",
+        "o4",
+        "o5",
+        "claude",
+        "gemini",
+        "grok",
+        "llama",
+        "mistral",
+        "qwen",
+        "deepseek",
+        "codestral",
+    ]
+    .iter()
+    .any(|prefix| terminal_token_has_prefix_and_version(&token, prefix))
 }
 
 fn terminal_is_control_prompt(prompt: &str) -> bool {
@@ -2223,6 +2307,10 @@ fn terminal_capture_submitted_prompt_from_gate(
                 let prompt = gate.current_line.trim().to_string();
                 let normalized_prompt = terminal_normalize_prompt_for_gate(&prompt);
                 let line_user_touched = gate.current_line_user_touched;
+                let model_command = terminal_is_model_command(&prompt);
+                let model_selector_followup = gate.model_command_followup_pending
+                    && (!gate.model_command_empty_submit_seen
+                        || terminal_is_model_selector_prompt(&prompt));
                 let control_prompt = terminal_is_control_prompt(&prompt);
                 let bypass_followup = gate.control_command_bypass_submits > 0;
                 if bypass_followup {
@@ -2233,10 +2321,27 @@ fn terminal_capture_submitted_prompt_from_gate(
                     terminal_control_followup_bypass_count(&prompt);
                 gate.current_line.clear();
                 gate.current_line_user_touched = false;
+                if normalized_prompt.is_empty() {
+                    if gate.model_command_followup_pending {
+                        gate.model_command_empty_submit_seen = true;
+                    }
+                } else if model_command {
+                    gate.model_command_followup_pending = true;
+                    gate.model_command_empty_submit_seen = false;
+                } else if model_selector_followup && terminal_is_model_selector_prompt(&prompt) {
+                    gate.model_command_followup_pending = true;
+                    gate.model_command_empty_submit_seen = true;
+                } else {
+                    gate.model_command_followup_pending = false;
+                    gate.model_command_empty_submit_seen = false;
+                }
                 if !normalized_prompt.is_empty() {
                     submitted = Some(TerminalSubmittedPrompt {
                         prompt,
-                        bypass_cloud_plan: control_prompt || bypass_followup || !line_user_touched,
+                        bypass_cloud_plan: control_prompt
+                            || bypass_followup
+                            || model_selector_followup
+                            || !line_user_touched,
                         stale_restored_prompt: !line_user_touched,
                     });
                 }
@@ -2329,6 +2434,53 @@ mod terminal_input_gate_tests {
         let submitted = terminal_capture_submitted_prompt_from_gate(&mut gate, "$\r");
 
         assert!(submitted.is_none());
+    }
+
+    #[test]
+    fn model_command_bypasses_model_selection_after_empty_picker_enter() {
+        let mut gate = TerminalInputGate::default();
+
+        let command = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
+        assert!(command.bypass_cloud_plan);
+        assert!(gate.model_command_followup_pending);
+
+        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").is_none());
+        assert!(gate.model_command_followup_pending);
+        assert!(gate.model_command_empty_submit_seen);
+
+        let selected =
+            terminal_capture_submitted_prompt_from_gate(&mut gate, "gpt-5.3-codex\r").unwrap();
+        assert_eq!(selected.prompt, "gpt-5.3-codex");
+        assert!(selected.bypass_cloud_plan);
+        assert!(!selected.stale_restored_prompt);
+    }
+
+    #[test]
+    fn model_command_does_not_bypass_next_real_prompt_after_empty_picker_enter() {
+        let mut gate = TerminalInputGate::default();
+
+        let _ = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
+        assert!(terminal_capture_submitted_prompt_from_gate(&mut gate, "\r").is_none());
+        let prompt = terminal_capture_submitted_prompt_from_gate(&mut gate, "fix the bug\r").unwrap();
+
+        assert_eq!(prompt.prompt, "fix the bug");
+        assert!(!prompt.bypass_cloud_plan);
+        assert!(!gate.model_command_followup_pending);
+    }
+
+    #[test]
+    fn model_command_bypasses_reasoning_followup_after_model_selection() {
+        let mut gate = TerminalInputGate::default();
+
+        let _ = terminal_capture_submitted_prompt_from_gate(&mut gate, "/model\r").unwrap();
+        let model =
+            terminal_capture_submitted_prompt_from_gate(&mut gate, "gpt-5.3-codex\r").unwrap();
+        assert!(model.bypass_cloud_plan);
+        assert!(gate.model_command_followup_pending);
+
+        let effort = terminal_capture_submitted_prompt_from_gate(&mut gate, "high\r").unwrap();
+        assert_eq!(effort.prompt, "high");
+        assert!(effort.bypass_cloud_plan);
     }
 }
 

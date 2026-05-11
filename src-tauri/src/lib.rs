@@ -314,6 +314,8 @@ struct TerminalCoordinationSession {
 struct TerminalInputGate {
     current_line: String,
     current_line_user_touched: bool,
+    model_command_followup_pending: bool,
+    model_command_empty_submit_seen: bool,
     control_command_bypass_submits: usize,
     ansi_escape_active: bool,
     ansi_csi_active: bool,
