@@ -32,6 +32,8 @@ use super::{
 
 const SESSION_STALE_SECONDS: i64 = 1800;
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 1800;
+const INTEGRATION_BRANCH: &str = "diff-forge/integration";
+const INTEGRATION_WORKTREE_NAME: &str = "diff-forge-integration";
 const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
     "mcp_agent_server_started",
     "mcp_agent_client_initialized",
@@ -122,6 +124,12 @@ pub fn api_error(code: &str, message: impl Into<String>, details: Value) -> Valu
 pub struct CoordinationKernel {
     pub paths: StoragePaths,
     pub conn: Connection,
+}
+
+struct IntegrationWorktree {
+    path: PathBuf,
+    branch: String,
+    head_sha: String,
 }
 
 impl CoordinationKernel {
@@ -912,12 +920,12 @@ impl CoordinationKernel {
                     "UPDATE tasks
                      SET status='ready', updated_at=?1
                      WHERE id=?2
-                       AND status='blocked'
-                       AND (claimed_session_id IS NULL OR claimed_session_id='')",
+                       AND status='blocked'",
                     params![now, task_id],
                 )
                 .map_err(|error| format!("Unable to mark task unblocked: {error}"))?;
             if changed > 0 {
+                let refreshes = self.refresh_task_worktrees_from_merge_target(task_id)?;
                 self.emit_event(
                     "task_unblocked",
                     actor_type,
@@ -929,7 +937,11 @@ impl CoordinationKernel {
                             .map(str::to_string),
                         ..EventRefs::default()
                     },
-                    json!({"reason": "dependencies_satisfied"}),
+                    json!({
+                        "reason": "dependencies_satisfied",
+                        "worktree_refreshes": refreshes,
+                        "resume_policy": "refresh_context_then_resume_blocked_files",
+                    }),
                 )?;
             }
         } else {
@@ -994,6 +1006,56 @@ impl CoordinationKernel {
             self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
         }
         Ok(())
+    }
+
+    pub fn task_resume_state(&self, task_id: &str, session_id: &str) -> Result<Value, String> {
+        let _ = self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID);
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let session = self.query_one(
+            "SELECT * FROM agent_sessions WHERE id=?1",
+            &[&session_id],
+            "Session does not exist.",
+        )?;
+        let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let status = task["status"].as_str().unwrap_or_default();
+        let ready = blockers.is_empty()
+            && matches!(status, "ready" | "claimed")
+            && session["status"].as_str() == Some("active");
+        let refreshes = if ready {
+            self.refresh_task_worktrees_from_merge_target(task_id)?
+        } else {
+            Value::Array(Vec::new())
+        };
+        if ready {
+            self.emit_event(
+                "task_resume_ready",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: session["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "status": status,
+                    "worktree_refreshes": refreshes.clone(),
+                    "resume_instruction": "Dependency is satisfied; refresh context, inspect the target file, acquire leases, and continue the parked prompt.",
+                }),
+            )?;
+        }
+        Ok(api_ok(json!({
+            "ready": ready,
+            "task": task,
+            "session": session,
+            "blocking_dependencies": blockers,
+            "worktree_refreshes": refreshes,
+        })))
     }
 
     pub fn post_plan(
@@ -2147,6 +2209,8 @@ impl CoordinationKernel {
             repo_path,
             "--repo-id".to_string(),
             repo_id,
+            "--db-path".to_string(),
+            process_path_text(&self.paths.db_path),
             "--client-id".to_string(),
             "rust-diffforge-agent".to_string(),
         ];
@@ -2455,6 +2519,42 @@ impl CoordinationKernel {
                 json!({"resource_key": resource_key.clone(), "mode": mode.clone(), "reason": reason}),
             )?;
 
+            if let Some(existing) = self.active_task_session_lease_for_resource(
+                task_id,
+                agent_id,
+                session_id,
+                &resource_key,
+            )? {
+                self.emit_event(
+                    "lease_reused_for_task_session",
+                    "agent",
+                    agent_id,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: agent_slot_id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        resource_id: existing["resource_id"].as_str().map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "lease_id": existing["id"].clone(),
+                        "resource_key": resource_key.clone(),
+                        "mode": existing["mode"].clone(),
+                        "reason": "same task/session already holds this resource lease",
+                    }),
+                )?;
+                return Ok(api_ok(json!({
+                    "lease_id": existing["id"].clone(),
+                    "resource_key": resource_key.clone(),
+                    "mode": existing["mode"].clone(),
+                    "fence_token": existing["fence_token"].clone(),
+                    "expires_at": existing["expires_at"].clone(),
+                    "status": "active",
+                    "reused": true,
+                })));
+            }
+
             let blockers = self.active_conflicting_leases(&resource_key, &mode)?;
             if !blockers.is_empty() {
                 let mut conflict_ids = Vec::new();
@@ -2510,7 +2610,7 @@ impl CoordinationKernel {
                         agent_id: Some(agent_id.to_string()),
                         agent_slot_id: agent_slot_id.clone(),
                         session_id: Some(session_id.to_string()),
-                        resource_id: Some(resource_id),
+                        resource_id: Some(resource_id.clone()),
                         ..EventRefs::default()
                     },
                     json!({
@@ -2521,10 +2621,124 @@ impl CoordinationKernel {
                         "detector": "resource_registry_overlap_v1",
                     }),
                 )?;
+                let mut dependency_results = Vec::new();
+                for blocker in &blockers {
+                    if let Some(depends_on_task_id) = blocker["task_id"].as_str() {
+                        if depends_on_task_id == task_id {
+                            continue;
+                        }
+                        match self.insert_task_dependency_checked(
+                            task_id,
+                            depends_on_task_id,
+                            "active_file_lease",
+                            "kernel",
+                            REPO_ID,
+                        ) {
+                            Ok(result) => dependency_results.push(result),
+                            Err(error) => dependency_results.push(json!({
+                                "depends_on_task_id": depends_on_task_id,
+                                "error": error,
+                            })),
+                        }
+                    }
+                }
+                if !dependency_results.is_empty() {
+                    self.conn
+                        .execute(
+                            "UPDATE tasks
+                             SET status='blocked', updated_at=?1
+                             WHERE id=?2
+                               AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')",
+                            params![now_rfc3339(), task_id],
+                        )
+                        .map_err(|error| format!("Unable to queue task behind active lease: {error}"))?;
+                    self.emit_event(
+                        "task_queued_behind_active_file_lease",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            task_id: Some(task_id.to_string()),
+                            agent_id: Some(agent_id.to_string()),
+                            agent_slot_id: agent_slot_id.clone(),
+                            session_id: Some(session_id.to_string()),
+                            resource_id: Some(resource_id),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "resource_key": resource_key.clone(),
+                            "mode": mode.clone(),
+                            "blockers": blockers.clone(),
+                            "dependencies": dependency_results.clone(),
+                            "resume_policy": "wait_for_dependency_patch_then_refresh_context",
+                        }),
+                    )?;
+                    return Ok(api_error(
+                        "task_queued_behind_active_lease",
+                        "Resource is owned by another active agent. This task was queued behind that task instead of editing a stale copy.",
+                        json!({
+                            "blockers": blockers,
+                            "dependencies": dependency_results,
+                            "resume_policy": "wait_for_dependency_patch_then_refresh_context",
+                        }),
+                    ));
+                }
                 return Ok(api_error(
                     "lease_conflict",
                     "Resource is already covered by an active conflicting lease.",
                     json!({"blockers": blockers}),
+                ));
+            }
+
+            let unmerged_patch_blockers =
+                self.unmerged_patch_blockers_for_resource(task_id, &resource_key)?;
+            if !unmerged_patch_blockers.is_empty() {
+                let mut dependency_results = Vec::new();
+                for blocker in &unmerged_patch_blockers {
+                    if let Some(depends_on_task_id) = blocker["task_id"].as_str() {
+                        match self.insert_task_dependency_checked(
+                            task_id,
+                            depends_on_task_id,
+                            "unmerged_patch",
+                            "kernel",
+                            REPO_ID,
+                        ) {
+                            Ok(result) => dependency_results.push(result),
+                            Err(error) => dependency_results.push(json!({
+                                "depends_on_task_id": depends_on_task_id,
+                                "error": error,
+                            })),
+                        }
+                    }
+                }
+                self.conn
+                    .execute(
+                        "UPDATE tasks SET status='blocked', updated_at=?1 WHERE id=?2 AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')",
+                        params![now_rfc3339(), task_id],
+                    )
+                    .map_err(|error| format!("Unable to queue task behind unmerged patch: {error}"))?;
+                self.emit_event(
+                    "lease_denied_unmerged_patch_dependency",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: Some(task_id.to_string()),
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: agent_slot_id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        resource_id: Some(resource_id),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "resource_key": resource_key.clone(),
+                        "mode": mode.clone(),
+                        "blockers": unmerged_patch_blockers.clone(),
+                        "dependencies": dependency_results.clone(),
+                    }),
+                )?;
+                return Ok(api_error(
+                    "task_queued_behind_unmerged_patch",
+                    "Resource has unmerged submitted work from another task; this task was queued behind that patch instead of recreating the file in another worktree.",
+                    json!({"blockers": unmerged_patch_blockers, "dependencies": dependency_results}),
                 ));
             }
 
@@ -2637,6 +2851,57 @@ impl CoordinationKernel {
             .collect())
     }
 
+    fn unmerged_patch_blockers_for_resource(
+        &self,
+        current_task_id: &str,
+        resource_key: &str,
+    ) -> Result<Vec<Value>, String> {
+        let rows = self.query_json(
+            "SELECT p.id AS patch_id,
+                    p.task_id,
+                    p.agent_id,
+                    p.agent_slot_id,
+                    p.status AS patch_status,
+                    p.created_at AS patch_created_at,
+                    t.title AS task_title,
+                    t.status AS task_status,
+                    pf.path,
+                    pf.change_kind
+             FROM patch_files pf
+             JOIN patches p ON p.id = pf.patch_id
+             LEFT JOIN tasks t ON t.id = p.task_id
+             WHERE p.task_id <> ?1
+               AND p.status IN ('submitted')
+               AND COALESCE(t.status, '') NOT IN ('done', 'completed', 'merged', 'cancelled', 'skipped')
+             ORDER BY p.created_at ASC",
+            &[&current_task_id],
+        )?;
+        let mut blockers = Vec::new();
+        for mut row in rows {
+            let path = row["path"].as_str().unwrap_or_default();
+            let blocker_resource = path_to_file_resource(path);
+            let Some(conflict_reason) = resource_conflict_reason(&blocker_resource, resource_key) else {
+                continue;
+            };
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "resource_key".to_string(),
+                    Value::String(blocker_resource),
+                );
+                object.insert(
+                    "requested_resource_key".to_string(),
+                    Value::String(resource_key.to_string()),
+                );
+                object.insert(
+                    "conflict_reason".to_string(),
+                    Value::String(conflict_reason),
+                );
+            }
+            blockers.push(row);
+        }
+        Ok(blockers)
+    }
+
     pub fn list_resources(
         &self,
         resource_type_filter: Option<&str>,
@@ -2704,6 +2969,31 @@ impl CoordinationKernel {
             )
             .map_err(|error| format!("Unable to create resource record: {error}"))?;
         Ok((id, true))
+    }
+
+    fn active_task_session_lease_for_resource(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        resource_key: &str,
+    ) -> Result<Option<Value>, String> {
+        let now = now_rfc3339();
+        let mut rows = self.query_json(
+            "SELECT l.*, r.resource_key, r.resource_type
+             FROM leases l
+             JOIN resources r ON r.id = l.resource_id
+             WHERE l.status='active'
+               AND l.expires_at >= ?1
+               AND l.task_id=?2
+               AND l.agent_id=?3
+               AND l.session_id=?4
+               AND r.resource_key=?5
+             ORDER BY l.acquired_at DESC
+             LIMIT 1",
+            &[&now, &task_id, &agent_id, &session_id, &resource_key],
+        )?;
+        Ok(rows.pop())
     }
 
     pub fn renew_lease(
@@ -2782,6 +3072,65 @@ impl CoordinationKernel {
         )?;
 
         Ok(api_ok(json!({"lease_id": lease_id, "status": "released"})))
+    }
+
+    pub fn release_lease_lenient(
+        &self,
+        lease_id: Option<&str>,
+        fence_token: Option<i64>,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        resource_key: Option<&str>,
+    ) -> Result<Value, String> {
+        self.expire_old_leases()?;
+        if let Some(lease_id) = lease_id.filter(|value| !value.trim().is_empty()) {
+            let lease = self.get_lease(lease_id)?;
+            let fence_token = fence_token
+                .or_else(|| lease["fence_token"].as_i64())
+                .ok_or_else(|| "Lease fence token could not be resolved.".to_string())?;
+            return self.release_lease(lease_id, fence_token);
+        }
+
+        let (Some(task_id), Some(agent_id), Some(session_id), Some(resource_key)) = (
+            task_id.filter(|value| !value.trim().is_empty()),
+            agent_id.filter(|value| !value.trim().is_empty()),
+            session_id.filter(|value| !value.trim().is_empty()),
+            resource_key.filter(|value| !value.trim().is_empty()),
+        ) else {
+            return Err(
+                "release_lease needs either lease_id, or task_id + agent_id + session_id + resource_key."
+                    .to_string(),
+            );
+        };
+
+        let mut rows = self.query_json(
+            "SELECT l.id, l.fence_token, r.resource_key
+             FROM leases l
+             JOIN resources r ON r.id = l.resource_id
+             WHERE l.status='active'
+               AND l.task_id=?1
+               AND l.agent_id=?2
+               AND l.session_id=?3
+               AND r.resource_key=?4
+             ORDER BY l.acquired_at DESC
+             LIMIT 1",
+            &[&task_id, &agent_id, &session_id, &resource_key],
+        )?;
+        let Some(lease) = rows.pop() else {
+            return Ok(api_ok(json!({
+                "status": "no_active_lease",
+                "message": "No active lease matched this task/session/resource; nothing needed release.",
+                "resource_key": resource_key,
+            })));
+        };
+        let lease_id = lease["id"]
+            .as_str()
+            .ok_or_else(|| "Matched lease has no id.".to_string())?;
+        let fence_token = lease["fence_token"]
+            .as_i64()
+            .ok_or_else(|| "Matched lease has no fence token.".to_string())?;
+        self.release_lease(lease_id, fence_token)
     }
 
     fn get_lease(&self, lease_id: &str) -> Result<Value, String> {
@@ -3364,13 +3713,22 @@ impl CoordinationKernel {
                 },
                 json!({"patch_id": validation.patch_id, "changed_files": validation.changed_files}),
             )?;
+            let auto_merge = if let Some(patch_id) = validation.patch_id.as_deref() {
+                self.auto_apply_submitted_patch(patch_id)?
+            } else {
+                json!({
+                    "status": "skipped",
+                    "reason": "patch_id_missing",
+                })
+            };
             return Ok(api_ok_warnings(
                 json!({
                     "patch_id": validation.patch_id,
                     "validation_status": "passed",
                     "changed_files": validation.changed_files,
                     "diff_artifact_id": validation.diff_artifact_id,
-                    "merge_resolution": merge_resolution
+                    "merge_resolution": merge_resolution,
+                    "auto_merge": auto_merge
                 }),
                 validation.warnings,
             ));
@@ -3381,6 +3739,79 @@ impl CoordinationKernel {
             "Patch rejected because changed files are not covered by valid leases or policy checks failed.",
             json!({"violations": validation.violations, "validation_id": validation.validation_id}),
         ))
+    }
+
+    fn auto_apply_submitted_patch(&self, patch_id: &str) -> Result<Value, String> {
+        let queued = match self.request_merge(patch_id, None, Some("patch_apply")) {
+            Ok(value) => value,
+            Err(error) => {
+                let resolution = match self.initialize_merge_resolution(patch_id, None, None, None) {
+                    Ok(value) => value,
+                    Err(resolution_error) => api_error(
+                        "smart_merge_resolution_failed",
+                        "Patch did not apply cleanly, and merge-resolution initialization failed.",
+                        json!({
+                            "patch_id": patch_id,
+                            "merge_error": error,
+                            "resolution_error": resolution_error,
+                        }),
+                    ),
+                };
+                return Ok(json!({
+                    "status": "resolution_required",
+                    "stage": "request_merge",
+                    "reason": "patch_did_not_apply_cleanly",
+                    "error": error,
+                    "smart_merge": resolution,
+                }));
+            }
+        };
+        if queued["ok"].as_bool() != Some(true) {
+            let resolution = self
+                .initialize_merge_resolution(patch_id, None, None, None)
+                .unwrap_or_else(|error| api_error(
+                    "smart_merge_resolution_failed",
+                    "Merge was blocked, and merge-resolution initialization failed.",
+                    json!({"patch_id": patch_id, "resolution_error": error}),
+                ));
+            return Ok(json!({
+                "status": "blocked",
+                "stage": "request_merge",
+                "merge": queued,
+                "smart_merge": resolution,
+            }));
+        }
+        let Some(merge_job_id) = queued["data"]["merge_job_id"].as_str() else {
+            return Ok(json!({
+                "status": "blocked",
+                "stage": "request_merge",
+                "reason": "merge_job_id_missing",
+                "merge": queued,
+            }));
+        };
+        let applied = self.apply_merge(merge_job_id)?;
+        let status = if applied["ok"].as_bool() == Some(true) {
+            "applied"
+        } else {
+            "blocked"
+        };
+        let smart_merge = if applied["ok"].as_bool() == Some(true) {
+            Value::Null
+        } else {
+            self.initialize_merge_resolution(patch_id, None, None, None)
+                .unwrap_or_else(|error| api_error(
+                    "smart_merge_resolution_failed",
+                    "Merge apply failed, and merge-resolution initialization failed.",
+                    json!({"patch_id": patch_id, "resolution_error": error}),
+                ))
+        };
+        Ok(json!({
+            "status": status,
+            "stage": "apply_merge",
+            "merge": queued,
+            "apply": applied,
+            "smart_merge": smart_merge,
+        }))
     }
 
     pub fn validate_patch(
@@ -3975,13 +4406,17 @@ impl CoordinationKernel {
         session_id: &str,
         worktree_id: &str,
     ) -> Result<Vec<Value>, String> {
-        self.query_json(
+        Ok(self
+            .query_json(
             "SELECT * FROM workspace_violations
              WHERE status='open'
                AND (session_id = ?1 OR worktree_id = ?2)
                AND (severity IN ('error', 'critical') OR violation_kind='unleased_write')",
             &[&session_id, &worktree_id],
-        )
+            )?
+            .into_iter()
+            .filter(|violation| !workspace_violation_is_ignored_system_noise(violation))
+            .collect())
     }
 
     fn changed_files(&self, worktree_path: &Path) -> Result<Vec<ChangedFile>, String> {
@@ -4023,6 +4458,9 @@ impl CoordinationKernel {
                 } else {
                     "modified"
                 };
+                if is_ignored_system_status_path(&path) {
+                    continue;
+                }
                 files.push(ChangedFile {
                     path,
                     change_kind: change_kind.to_string(),
@@ -4100,14 +4538,14 @@ impl CoordinationKernel {
             ));
         }
         if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
-            && !self.repo_is_clean()?
+            && !self.integration_worktree_is_clean()?
         {
             let job_id = self.create_merge_job(
                 &patch,
                 "blocked",
                 target_branch,
                 "merge_resolution",
-                Some("Target repo root is dirty."),
+                Some("Integration worktree is dirty."),
             )?;
             self.create_workspace_violation(
                 patch["task_id"].as_str(),
@@ -4122,7 +4560,7 @@ impl CoordinationKernel {
             )?;
             return Ok(api_error(
                 "merge_resolution_blocked",
-                "Target repo root is dirty.",
+                "Integration worktree is dirty.",
                 json!({"merge_job_id": job_id, "patch_id": patch_id}),
             ));
         }
@@ -4258,7 +4696,7 @@ impl CoordinationKernel {
         }
 
         let cloud_context = json!({
-            "tool": "cloud_get_context_pack",
+            "tool": "cloud_get_merge_context_pack",
             "arguments": {
                 "agent_id": "$CLOUD_MCP_AGENT_ID",
                 "self_agent_id": "$CLOUD_MCP_AGENT_ID",
@@ -4266,9 +4704,11 @@ impl CoordinationKernel {
                 "lane": format!("merge-resolution:{patch_id}"),
                 "prompt": format!("Resolve merge for patch {patch_id}"),
                 "record_prompt": true,
+                "merge_context": true,
                 "patch_id": patch_id,
                 "merge_job_id": merge_job_id.clone(),
                 "resolution_task_id": resolution_task_id.clone(),
+                "changed_files": changed_files.clone(),
             }
         });
         let resolver_prompt = merge_resolution_prompt(
@@ -4363,6 +4803,7 @@ impl CoordinationKernel {
         strategy: Option<&str>,
     ) -> Result<Value, String> {
         let strategy = strategy.unwrap_or("patch_apply");
+        let target_branch = target_branch.or(Some(INTEGRATION_BRANCH));
         if strategy != "patch_apply" {
             return Err("Only patch_apply merge strategy is implemented in this pass.".to_string());
         }
@@ -4443,14 +4884,14 @@ impl CoordinationKernel {
             ));
         }
         if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
-            && !self.repo_is_clean()?
+            && !self.integration_worktree_is_clean()?
         {
             let job_id = self.create_merge_job(
                 &patch,
                 "blocked",
                 target_branch,
                 strategy,
-                Some("Target repo root is dirty."),
+                Some("Integration worktree is dirty."),
             )?;
             self.create_workspace_violation(
                 patch["task_id"].as_str(),
@@ -4472,7 +4913,7 @@ impl CoordinationKernel {
             )?;
             return Ok(api_error(
                 "merge_blocked",
-                "Target repo root is dirty.",
+                "Integration worktree is dirty.",
                 json!({"merge_job_id": job_id}),
             ));
         }
@@ -4573,12 +5014,12 @@ impl CoordinationKernel {
             ));
         }
         if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
-            && !self.repo_is_clean()?
+            && !self.integration_worktree_is_clean()?
         {
-            self.update_merge_job(merge_job_id, "blocked", Some("Target repo root is dirty."))?;
+            self.update_merge_job(merge_job_id, "blocked", Some("Integration worktree is dirty."))?;
             return Ok(api_error(
                 "merge_blocked",
-                "Target repo root is dirty.",
+                "Integration worktree is dirty.",
                 json!({"merge_job_id": merge_job_id}),
             ));
         }
@@ -4593,11 +5034,23 @@ impl CoordinationKernel {
         )?;
         let artifact = self.get_artifact(patch["diff_artifact_id"].as_str().unwrap_or_default())?;
         let diff_path = PathBuf::from(artifact["path"].as_str().unwrap_or_default());
+        let integration = self.ensure_integration_worktree()?;
         match run_git(
-            &self.paths.repo_path,
+            &integration.path,
             &["apply", diff_path.to_str().unwrap_or_default()],
         ) {
             Ok(_) => {
+                let changed_files = self.patch_file_paths(patch_id)?;
+                self.stage_patch_files(&integration.path, &changed_files)?;
+                let commit = self.commit_integration_patch(&integration.path, &patch, &changed_files)?;
+                let source_worktree_refresh =
+                    self.reset_patch_source_worktree_to_integration(&patch).unwrap_or_else(|error| {
+                        json!({
+                            "status": "refresh_failed",
+                            "error": error,
+                            "resume_instruction": "Patch was committed to integration, but the source worktree did not reset. Restart or refresh the agent before continuing follow-up edits.",
+                        })
+                    });
                 self.update_merge_job(merge_job_id, "succeeded", None)?;
                 self.conn
                     .execute(
@@ -4611,18 +5064,57 @@ impl CoordinationKernel {
                         params![now_rfc3339(), patch["task_id"].as_str()],
                     )
                     .map_err(|error| format!("Unable to mark task merged: {error}"))?;
-                if let Some(task_id) = patch["task_id"].as_str() {
-                    self.refresh_dependent_tasks(task_id)?;
-                }
+                let released_leases = if let Some(task_id) = patch["task_id"].as_str() {
+                    self.release_active_leases_for_task(task_id, "integration_merge_succeeded")?
+                } else {
+                    json!({"released": []})
+                };
+                let root_fast_forward = self
+                    .fast_forward_repo_root_to_integration()
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "status": "deferred",
+                            "error": error,
+                            "resume_instruction": "Integration commit succeeded, but the visible repo root could not be fast-forwarded automatically.",
+                        })
+                    });
+                let post_merge_schedule = if let Some(task_id) = patch["task_id"].as_str() {
+                    self.post_integration_merge_schedule(
+                        task_id,
+                        patch["session_id"].as_str(),
+                        &changed_files,
+                    )?
+                } else {
+                    json!({"status": "skipped", "reason": "patch_missing_task_id"})
+                };
                 self.emit_event(
                     "merge_succeeded",
                     "kernel",
                     REPO_ID,
                     EventRefs::from_patch(&patch),
-                    json!({"merge_job_id": merge_job_id}),
+                    json!({
+                        "merge_job_id": merge_job_id,
+                        "integration_branch": INTEGRATION_BRANCH,
+                        "integration_worktree": process_path_text(&integration.path),
+                        "commit": commit.clone(),
+                        "source_worktree_refresh": source_worktree_refresh.clone(),
+                        "released_leases": released_leases.clone(),
+                        "root_fast_forward": root_fast_forward.clone(),
+                        "post_merge_schedule": post_merge_schedule.clone(),
+                    }),
                 )?;
                 Ok(api_ok(
-                    json!({"merge_job_id": merge_job_id, "status": "succeeded"}),
+                    json!({
+                        "merge_job_id": merge_job_id,
+                        "status": "succeeded",
+                        "integration_branch": INTEGRATION_BRANCH,
+                        "integration_worktree": process_path_text(&integration.path),
+                        "commit": commit,
+                        "source_worktree_refresh": source_worktree_refresh,
+                        "released_leases": released_leases,
+                        "root_fast_forward": root_fast_forward,
+                        "post_merge_schedule": post_merge_schedule,
+                    }),
                 ))
             }
             Err(error) => {
@@ -4696,19 +5188,213 @@ impl CoordinationKernel {
         Ok(self.repo_dirty_project_files()?.is_empty())
     }
 
+    fn integration_worktree_is_clean(&self) -> Result<bool, String> {
+        let integration = self.ensure_integration_worktree()?;
+        Ok(self
+            .changed_files(&integration.path)?
+            .into_iter()
+            .filter(|change| !is_coordination_owned_root_status_path(&change.path))
+            .filter(|change| !is_ignored_system_status_path(&change.path))
+            .collect::<Vec<_>>()
+            .is_empty())
+    }
+
+    fn fast_forward_repo_root_to_integration(&self) -> Result<Value, String> {
+        if !repo_has_git(&self.paths.repo_path) {
+            return Ok(json!({"status": "skipped", "reason": "repo_has_no_git"}));
+        }
+        let dirty = self.repo_dirty_project_files()?;
+        if !dirty.is_empty() {
+            let changed_files = dirty
+                .iter()
+                .map(|change| change.path.clone())
+                .collect::<Vec<_>>();
+            self.emit_event(
+                "repo_root_fast_forward_deferred",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "target_branch": INTEGRATION_BRANCH,
+                    "reason": "dirty_repo_root",
+                    "changed_files": changed_files,
+                }),
+            )?;
+            return Ok(json!({
+                "status": "deferred_dirty_repo_root",
+                "target_branch": INTEGRATION_BRANCH,
+                "changed_files": changed_files,
+                "resume_instruction": "Repo root has local edits; Diff Forge kept the accepted patch in the integration worktree instead of overwriting root files.",
+            }));
+        }
+        let before = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let output = run_git(&self.paths.repo_path, &["merge", "--ff-only", INTEGRATION_BRANCH])?;
+        let after = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        let status = if before == after {
+            "already_current"
+        } else {
+            "fast_forwarded"
+        };
+        self.emit_event(
+            "repo_root_fast_forwarded_to_integration",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "target_branch": INTEGRATION_BRANCH,
+                "status": status,
+                "before": before,
+                "after": after,
+                "output": output.trim(),
+            }),
+        )?;
+        Ok(json!({
+            "status": status,
+            "target_branch": INTEGRATION_BRANCH,
+            "before": before,
+            "after": after,
+            "output": output.trim(),
+        }))
+    }
+
+    fn ensure_integration_worktree(&self) -> Result<IntegrationWorktree, String> {
+        if !repo_has_git(&self.paths.repo_path) {
+            return Err("Repo has no .git; integration branch is unavailable.".to_string());
+        }
+        run_git(&self.paths.repo_path, &["rev-parse", "--show-toplevel"])?;
+        if !self.branch_exists(INTEGRATION_BRANCH)? {
+            run_git(&self.paths.repo_path, &["branch", INTEGRATION_BRANCH, "HEAD"])?;
+            self.emit_event(
+                "integration_branch_created",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({"branch": INTEGRATION_BRANCH}),
+            )?;
+        }
+
+        let path = self.paths.worktrees_root.join(INTEGRATION_WORKTREE_NAME);
+        let path_text = process_path_text(&path);
+        if path.exists() {
+            if let Err(error) = self.validate_git_worktree_path(&path, INTEGRATION_BRANCH) {
+                self.emit_event(
+                    "integration_worktree_validation_failed",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs::default(),
+                    json!({
+                        "branch": INTEGRATION_BRANCH,
+                        "path": path_text.clone(),
+                        "error": error,
+                        "recovery": "git_worktree_prune_then_revalidate_or_recreate",
+                    }),
+                )?;
+                run_git(&self.paths.repo_path, &["worktree", "prune"]).map_err(|prune_error| {
+                    format!("Unable to prune stale integration worktree registration: {prune_error}")
+                })?;
+                if path.exists() {
+                    self.validate_git_worktree_path(&path, INTEGRATION_BRANCH)?;
+                } else {
+                    run_git(
+                        &self.paths.repo_path,
+                        &["worktree", "add", &path_text, INTEGRATION_BRANCH],
+                    )?;
+                    self.emit_event(
+                        "integration_worktree_recreated_after_prune",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs::default(),
+                        json!({"branch": INTEGRATION_BRANCH, "path": path_text.clone()}),
+                    )?;
+                }
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Unable to create integration worktree root: {error}"))?;
+            }
+            if let Err(error) = run_git(
+                &self.paths.repo_path,
+                &["worktree", "add", &path_text, INTEGRATION_BRANCH],
+            ) {
+                self.emit_event(
+                    "integration_worktree_create_failed",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs::default(),
+                    json!({
+                        "branch": INTEGRATION_BRANCH,
+                        "path": path_text.clone(),
+                        "error": error.clone(),
+                        "will_retry_after_prune": true,
+                    }),
+                )?;
+                run_git(&self.paths.repo_path, &["worktree", "prune"]).map_err(|prune_error| {
+                    format!("Unable to prune stale integration worktree registration: {prune_error}")
+                })?;
+                if let Err(retry_error) = run_git(
+                    &self.paths.repo_path,
+                    &["worktree", "add", &path_text, INTEGRATION_BRANCH],
+                ) {
+                    self.emit_event(
+                        "integration_worktree_create_failed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs::default(),
+                        json!({
+                            "branch": INTEGRATION_BRANCH,
+                            "path": path_text.clone(),
+                            "first_error": error,
+                            "retry_error": retry_error.clone(),
+                            "reason": "retry_after_prune_failed",
+                        }),
+                    )?;
+                    return Err(retry_error);
+                }
+                self.emit_event(
+                    "integration_worktree_create_recovered_after_prune",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs::default(),
+                    json!({"branch": INTEGRATION_BRANCH, "path": path_text.clone()}),
+                )?;
+            }
+            self.emit_event(
+                "integration_worktree_created",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({"branch": INTEGRATION_BRANCH, "path": path_text}),
+            )?;
+        }
+        let head_sha = run_git(&path, &["rev-parse", "HEAD"])?.trim().to_string();
+        Ok(IntegrationWorktree {
+            path,
+            branch: INTEGRATION_BRANCH.to_string(),
+            head_sha,
+        })
+    }
+
     fn repo_dirty_project_files(&self) -> Result<Vec<ChangedFile>, String> {
         Ok(self
             .changed_files(&self.paths.repo_path)?
             .into_iter()
             .filter(|change| !is_coordination_owned_root_status_path(&change.path))
+            .filter(|change| !is_ignored_system_status_path(&change.path))
             .collect())
     }
 
     fn git_apply_check(&self, patch: &Value) -> Result<(), String> {
         let artifact = self.get_artifact(patch["diff_artifact_id"].as_str().unwrap_or_default())?;
         let diff_path = PathBuf::from(artifact["path"].as_str().unwrap_or_default());
+        let integration = self.ensure_integration_worktree()?;
         run_git(
-            &self.paths.repo_path,
+            &integration.path,
             &["apply", "--check", diff_path.to_str().unwrap_or_default()],
         )
         .map(|_| ())
@@ -4748,6 +5434,304 @@ impl CoordinationKernel {
             .into_iter()
             .filter_map(|row| row["path"].as_str().map(str::to_string))
             .collect())
+    }
+
+    fn stage_patch_files(&self, cwd: &Path, changed_files: &[String]) -> Result<(), String> {
+        let mut args = vec!["add".to_string(), "--all".to_string(), "--".to_string()];
+        if changed_files.is_empty() {
+            args.push(".".to_string());
+        } else {
+            args.extend(changed_files.iter().cloned());
+        }
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_git(cwd, &refs).map(|_| ())
+    }
+
+    fn commit_integration_patch(
+        &self,
+        cwd: &Path,
+        patch: &Value,
+        changed_files: &[String],
+    ) -> Result<Value, String> {
+        let staged = run_git(cwd, &["diff", "--cached", "--name-only"])?;
+        if staged.trim().is_empty() {
+            let head = run_git(cwd, &["rev-parse", "HEAD"])?.trim().to_string();
+            return Ok(json!({
+                "status": "noop",
+                "sha": head,
+                "message": "Patch produced no new integration diff.",
+            }));
+        }
+        let task_id = patch["task_id"].as_str().unwrap_or_default();
+        let task_title = self
+            .query_one("SELECT title FROM tasks WHERE id=?1", &[&task_id], "Task does not exist.")
+            .ok()
+            .and_then(|task| task["title"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("patch {}", short_id(patch["id"].as_str().unwrap_or_default())));
+        let file_summary = if changed_files.is_empty() {
+            "no recorded files".to_string()
+        } else {
+            changed_files
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let message = format!(
+            "diffforge: {}\n\nPatch: {}\nTask: {}\nFiles: {}",
+            task_title,
+            patch["id"].as_str().unwrap_or_default(),
+            task_id,
+            file_summary
+        );
+        run_git(
+            cwd,
+            &[
+                "-c",
+                "user.name=Diff Forge",
+                "-c",
+                "user.email=diff-forge@local",
+                "commit",
+                "-m",
+                &message,
+            ],
+        )?;
+        let sha = run_git(cwd, &["rev-parse", "HEAD"])?.trim().to_string();
+        Ok(json!({
+            "status": "committed",
+            "sha": sha,
+            "message": message,
+            "staged_files": staged.lines().collect::<Vec<_>>(),
+        }))
+    }
+
+    fn reset_patch_source_worktree_to_integration(&self, patch: &Value) -> Result<Value, String> {
+        let Some(worktree_id) = patch["worktree_id"].as_str().filter(|value| !value.trim().is_empty()) else {
+            return Ok(json!({"status": "skipped", "reason": "patch_missing_worktree_id"}));
+        };
+        let worktree = self.get_worktree(worktree_id)?;
+        let path = PathBuf::from(worktree["path"].as_str().unwrap_or_default());
+        if !path.exists() {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "source_worktree_missing",
+                "worktree_id": worktree_id,
+            }));
+        }
+        self.validate_git_worktree_path(&path, worktree["branch_name"].as_str().unwrap_or_default())?;
+        run_git(&path, &["reset", "--hard", INTEGRATION_BRANCH])?;
+        let current_sha = run_git(&path, &["rev-parse", "HEAD"])?.trim().to_string();
+        self.conn
+            .execute(
+                "UPDATE worktrees SET base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                params![current_sha.clone(), now_rfc3339(), worktree_id],
+            )
+            .map_err(|error| format!("Unable to update source worktree after integration reset: {error}"))?;
+        if let Some(session_id) = patch["session_id"].as_str().filter(|value| !value.trim().is_empty()) {
+            self.conn
+                .execute(
+                    "UPDATE agent_sessions SET base_git_sha=?1, current_git_sha=?1, updated_at=?2 WHERE id=?3",
+                    params![current_sha.clone(), now_rfc3339(), session_id],
+                )
+                .map_err(|error| format!("Unable to update source session after integration reset: {error}"))?;
+        }
+        Ok(json!({
+            "status": "reset_to_integration",
+            "worktree_id": worktree_id,
+            "path": process_path_text(&path),
+            "branch": INTEGRATION_BRANCH,
+            "current_sha": current_sha,
+        }))
+    }
+
+    fn release_active_leases_for_task(&self, task_id: &str, reason: &str) -> Result<Value, String> {
+        let leases = self.query_json(
+            "SELECT id, fence_token
+             FROM leases
+             WHERE task_id=?1 AND status='active'
+             ORDER BY acquired_at ASC",
+            &[&task_id],
+        )?;
+        let mut released = Vec::new();
+        for lease in leases {
+            let Some(lease_id) = lease["id"].as_str() else {
+                continue;
+            };
+            let Some(fence_token) = lease["fence_token"].as_i64() else {
+                continue;
+            };
+            released.push(
+                self.release_lease(lease_id, fence_token)
+                    .unwrap_or_else(|error| api_error(
+                        "lease_release_failed",
+                        "Unable to release lease after integration merge.",
+                        json!({"lease_id": lease_id, "error": error}),
+                    )),
+            );
+        }
+        self.emit_event(
+            "task_leases_released_after_merge",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "reason": reason,
+                "released": released.clone(),
+            }),
+        )?;
+        Ok(json!({"released": released}))
+    }
+
+    fn post_integration_merge_schedule(
+        &self,
+        merged_task_id: &str,
+        source_session_id: Option<&str>,
+        changed_files: &[String],
+    ) -> Result<Value, String> {
+        self.refresh_dependent_tasks(merged_task_id)?;
+        let peer_refreshes =
+            self.refresh_parked_or_idle_peer_worktrees(source_session_id, changed_files)?;
+        self.emit_event(
+            "post_integration_merge_scheduler_completed",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(merged_task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "changed_files": changed_files,
+                "peer_refreshes": peer_refreshes.clone(),
+                "resume_policy": "refresh_parked_or_idle_worktrees_then_resume_unblocked_tasks",
+            }),
+        )?;
+        Ok(json!({
+            "status": "completed",
+            "peer_refreshes": peer_refreshes,
+            "resume_policy": "refresh_parked_or_idle_worktrees_then_resume_unblocked_tasks",
+        }))
+    }
+
+    fn refresh_parked_or_idle_peer_worktrees(
+        &self,
+        source_session_id: Option<&str>,
+        changed_files: &[String],
+    ) -> Result<Value, String> {
+        let now = now_rfc3339();
+        let rows = self.query_json(
+            "SELECT DISTINCT s.id AS session_id,
+                    s.agent_id,
+                    s.agent_slot_id,
+                    s.task_id,
+                    s.worktree_id,
+                    t.status AS task_status,
+                    t.title AS task_title,
+                    w.path,
+                    w.branch_name,
+                    COALESCE(active_leases.count, 0) AS active_lease_count
+             FROM agent_sessions s
+             JOIN worktrees w ON w.id=s.worktree_id
+             LEFT JOIN tasks t ON t.id=s.task_id
+             LEFT JOIN (
+                SELECT session_id, COUNT(1) AS count
+                FROM leases
+                WHERE status='active' AND expires_at >= ?1
+                GROUP BY session_id
+             ) active_leases ON active_leases.session_id=s.id
+             WHERE s.status='active'
+               AND s.worktree_id IS NOT NULL
+             ORDER BY s.updated_at DESC",
+            &[&now],
+        )?;
+        let mut results = Vec::new();
+        for row in rows {
+            if source_session_id
+                .filter(|value| !value.trim().is_empty())
+                .is_some_and(|source| row["session_id"].as_str() == Some(source))
+            {
+                continue;
+            }
+            let active_lease_count = row["active_lease_count"].as_i64().unwrap_or(0);
+            let task_status = row["task_status"].as_str().unwrap_or_default();
+            let refreshable_task_status = matches!(
+                task_status,
+                "" | "ready" | "claimed" | "blocked" | "created"
+            );
+            if active_lease_count > 0 || !refreshable_task_status {
+                let result = json!({
+                    "status": "skipped_active_or_busy",
+                    "session_id": row["session_id"].clone(),
+                    "task_id": row["task_id"].clone(),
+                    "task_status": task_status,
+                    "active_lease_count": active_lease_count,
+                });
+                self.emit_event(
+                    "peer_worktree_refresh_skipped_after_integration_merge",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        task_id: row["task_id"].as_str().map(str::to_string),
+                        agent_id: row["agent_id"].as_str().map(str::to_string),
+                        agent_slot_id: row["agent_slot_id"].as_str().map(str::to_string),
+                        session_id: row["session_id"].as_str().map(str::to_string),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": "session_has_active_leases_or_non_idle_task_status",
+                        "active_lease_count": active_lease_count,
+                        "task_status": task_status,
+                        "changed_files": changed_files,
+                    }),
+                )?;
+                results.push(result);
+                continue;
+            }
+            let Some(path) = row["path"].as_str().filter(|value| !value.trim().is_empty()) else {
+                continue;
+            };
+            let worktree_path = PathBuf::from(path);
+            let mut refresh = self.refresh_agent_worktree_from_integration(&worktree_path)?;
+            if let Some(current_sha) = refresh["current_sha"].as_str() {
+                if let Some(worktree_id) = row["worktree_id"].as_str() {
+                    let _ = self.conn.execute(
+                        "UPDATE worktrees SET base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                        params![current_sha, now_rfc3339(), worktree_id],
+                    );
+                }
+                if let Some(session_id) = row["session_id"].as_str() {
+                    let _ = self.conn.execute(
+                        "UPDATE agent_sessions SET base_git_sha=?1, current_git_sha=?1, updated_at=?2 WHERE id=?3",
+                        params![current_sha, now_rfc3339(), session_id],
+                    );
+                }
+            }
+            if let Some(object) = refresh.as_object_mut() {
+                object.insert("session_id".to_string(), row["session_id"].clone());
+                object.insert("task_id".to_string(), row["task_id"].clone());
+                object.insert("task_status".to_string(), row["task_status"].clone());
+                object.insert("worktree_id".to_string(), row["worktree_id"].clone());
+                object.insert("changed_files".to_string(), json!(changed_files));
+            }
+            self.emit_event(
+                "peer_worktree_refreshed_after_integration_merge",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: row["task_id"].as_str().map(str::to_string),
+                    agent_id: row["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: row["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: row["session_id"].as_str().map(str::to_string),
+                    ..EventRefs::default()
+                },
+                refresh.clone(),
+            )?;
+            results.push(refresh);
+        }
+        Ok(Value::Array(results))
     }
 
     fn existing_active_merge_resolution(&self, patch_id: &str) -> Result<Option<Value>, String> {
@@ -5862,6 +6846,9 @@ impl CoordinationKernel {
                     .insert(normalize_path_for_compare(&process_path_text(&path)));
             }
         }
+        allowed_worktree_paths.insert(normalize_path_for_compare(&process_path_text(
+            &self.paths.worktrees_root.join(INTEGRATION_WORKTREE_NAME),
+        )));
 
         let mut unexpected_worktree_dirs = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.paths.worktrees_root) {
@@ -6538,6 +7525,7 @@ impl CoordinationKernel {
             "sessions": session,
             "task": task,
             "task_dependencies": if let Some(task_id) = task_id { self.list_task_dependencies(Some(task_id))?["data"].clone() } else { Value::Null },
+            "scheduler": if let Some(task_id) = task_id { self.scheduler_hints_for_task(task_id)? } else { Value::Null },
             "active_leases": self.list_active_leases_internal(task_id, agent_id, None)?,
             "repo_policy": self.repo_policy()?,
             "pending_approvals": if let Some(task_id) = task_id { self.query_json("SELECT * FROM approvals WHERE task_id=?1 AND status='pending' ORDER BY created_at DESC", &[&task_id])? } else { Vec::new() },
@@ -6548,6 +7536,36 @@ impl CoordinationKernel {
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 20", &[])?,
             "handoff_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='handoff' ORDER BY updated_at DESC LIMIT 20", &[])?,
         })))
+    }
+
+    fn scheduler_hints_for_task(&self, task_id: &str) -> Result<Value, String> {
+        let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        if !blockers.is_empty() {
+            return Ok(json!({
+                "state": "waiting",
+                "blocked_on": blockers,
+                "can_work_now": "Only non-overlapping files with successful leases.",
+                "must_wait": "Files covered by the blockers above.",
+                "resume_policy": "Wait for the dependency task to submit and apply, then refresh context before touching blocked files.",
+            }));
+        }
+        let status = task["status"].as_str().unwrap_or_default();
+        let refreshes = if status == "ready" {
+            self.refresh_task_worktrees_from_merge_target(task_id)?
+        } else {
+            Value::Array(Vec::new())
+        };
+        Ok(json!({
+            "state": if status == "ready" { "ready_after_dependency" } else { "clear" },
+            "blocked_on": [],
+            "worktree_refreshes": refreshes,
+            "resume_policy": "Acquire leases for the exact files you are about to edit; if the file was produced by another task, inspect the current file before editing.",
+        }))
     }
 
     pub fn get_snapshot(&self) -> Result<Value, String> {
@@ -8511,9 +9529,8 @@ impl CoordinationKernel {
             return Err("Repo has no .git; worktree isolation is unavailable.".to_string());
         }
         run_git(&self.paths.repo_path, &["rev-parse", "--show-toplevel"])?;
-        let base_sha = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_string();
+        let integration = self.ensure_integration_worktree()?;
+        let base_sha = integration.head_sha.clone();
         let mut branch = format!("agent/{slot_key}");
         let stable_path = self.paths.worktrees_root.join(slot_key);
         let mut path = stable_path.clone();
@@ -8570,10 +9587,15 @@ impl CoordinationKernel {
                             }),
                         )?;
                     } else {
+                        let refresh = self.refresh_agent_worktree_from_integration(&existing_path)?;
                         self.conn
                             .execute(
-                                "UPDATE worktrees SET status='active', current_sha=?1, updated_at=?2 WHERE id=?3",
-                                params![base_sha, now_rfc3339(), existing_id],
+                                "UPDATE worktrees SET status='active', base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                                params![
+                                    refresh["current_sha"].as_str().unwrap_or(base_sha.as_str()),
+                                    now_rfc3339(),
+                                    existing_id
+                                ],
                             )
                             .map_err(|error| format!("Unable to refresh worktree: {error}"))?;
                         self.emit_event(
@@ -8585,7 +9607,13 @@ impl CoordinationKernel {
                                 agent_slot_id: Some(agent_slot_id.to_string()),
                                 ..EventRefs::default()
                             },
-                            json!({"slot_key": slot_key, "worktree_id": existing_id, "path": existing["path"], "branch_name": existing_branch.clone()}),
+                            json!({
+                                "slot_key": slot_key,
+                                "worktree_id": existing_id,
+                                "path": existing["path"],
+                                "branch_name": existing_branch.clone(),
+                                "integration_refresh": refresh,
+                            }),
                         )?;
                         return Ok(json!({
                             "id": existing_id,
@@ -8594,7 +9622,7 @@ impl CoordinationKernel {
                             "slotKey": slot_key,
                             "path": existing["path"],
                             "branchName": existing_branch,
-                            "baseSha": existing["base_sha"],
+                            "baseSha": integration.head_sha,
                             "status": "active",
                         }));
                     }
@@ -8666,7 +9694,7 @@ impl CoordinationKernel {
             let args = if self.branch_exists(&branch)? {
                 vec!["worktree", "add", &path_string, &branch]
             } else {
-                vec!["worktree", "add", "-b", &branch, &path_string]
+                vec!["worktree", "add", "-b", &branch, &path_string, INTEGRATION_BRANCH]
             };
             if let Err(error) = run_git(&self.paths.repo_path, &args) {
                 self.emit_event(
@@ -8727,6 +9755,11 @@ impl CoordinationKernel {
             }
         }
         let canonical_worktree = path.canonicalize().unwrap_or(path);
+        let integration_refresh = self.refresh_agent_worktree_from_integration(&canonical_worktree)?;
+        let recorded_sha = integration_refresh["current_sha"]
+            .as_str()
+            .unwrap_or(base_sha.as_str())
+            .to_string();
         let worktree_path_text = process_path_text(&canonical_worktree);
         if !path_text_under_path(&worktree_path_text, &self.paths.worktrees_root) {
             self.emit_event(
@@ -8766,7 +9799,7 @@ impl CoordinationKernel {
                         agent_id,
                         worktree_path_text.clone(),
                         branch.clone(),
-                        base_sha.clone(),
+                        recorded_sha.clone(),
                         now,
                         id
                     ],
@@ -8785,7 +9818,7 @@ impl CoordinationKernel {
                         agent_id,
                         worktree_path_text.clone(),
                         branch.clone(),
-                        base_sha.clone(),
+                        recorded_sha.clone(),
                         now
                     ],
                 )
@@ -8810,7 +9843,14 @@ impl CoordinationKernel {
                 agent_slot_id: Some(agent_slot_id.to_string()),
                 ..EventRefs::default()
             },
-            json!({"slot_key": slot_key, "worktree_id": id, "path": worktree_path_text.clone(), "branch_name": branch.clone(), "base_sha": base_sha.clone()}),
+            json!({
+                "slot_key": slot_key,
+                "worktree_id": id,
+                "path": worktree_path_text.clone(),
+                "branch_name": branch.clone(),
+                "base_sha": recorded_sha.clone(),
+                "integration_refresh": integration_refresh,
+            }),
         )?;
 
         Ok(json!({
@@ -8820,7 +9860,7 @@ impl CoordinationKernel {
             "slotKey": slot_key,
             "path": worktree_path_text,
             "branchName": branch,
-            "baseSha": base_sha,
+            "baseSha": recorded_sha,
             "status": "active",
         }))
     }
@@ -9008,6 +10048,90 @@ impl CoordinationKernel {
             &[&worktree_id],
             "Worktree does not exist.",
         )
+    }
+
+    fn refresh_task_worktrees_from_merge_target(&self, task_id: &str) -> Result<Value, String> {
+        let rows = self.query_json(
+            "SELECT DISTINCT s.id AS session_id,
+                    s.agent_id,
+                    s.worktree_id,
+                    w.path,
+                    w.branch_name
+             FROM agent_sessions s
+             JOIN worktrees w ON w.id=s.worktree_id
+             WHERE s.task_id=?1
+               AND s.status='active'
+               AND s.worktree_id IS NOT NULL
+             ORDER BY s.updated_at DESC",
+            &[&task_id],
+        )?;
+        let target_branch = INTEGRATION_BRANCH.to_string();
+        let mut results = Vec::new();
+        for row in rows {
+            let worktree_id = row["worktree_id"].as_str().unwrap_or_default();
+            let path = row["path"].as_str().unwrap_or_default();
+            if path.trim().is_empty() {
+                continue;
+            }
+            let worktree_path = PathBuf::from(path);
+            let mut result = self.refresh_agent_worktree_from_integration(&worktree_path)?;
+            if let Some(object) = result.as_object_mut() {
+                object.insert("worktree_id".to_string(), json!(worktree_id));
+                object.insert("session_id".to_string(), row["session_id"].clone());
+                object.insert("target_branch".to_string(), json!(target_branch.clone()));
+            }
+            if let Some(current_sha) = result["current_sha"].as_str() {
+                let _ = self.conn.execute(
+                    "UPDATE worktrees SET base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                    params![current_sha, now_rfc3339(), worktree_id],
+                );
+                if let Some(session_id) = row["session_id"].as_str() {
+                    let _ = self.conn.execute(
+                        "UPDATE agent_sessions SET base_git_sha=?1, current_git_sha=?1, updated_at=?2 WHERE id=?3",
+                        params![current_sha, now_rfc3339(), session_id],
+                    );
+                }
+            }
+            results.push(result);
+        }
+        Ok(Value::Array(results))
+    }
+
+    fn refresh_agent_worktree_from_integration(&self, worktree_path: &Path) -> Result<Value, String> {
+        let dirty = self
+            .changed_files(worktree_path)
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .filter(|change| !is_coordination_owned_root_status_path(&change.path))
+                    .filter(|change| !is_ignored_system_status_path(&change.path))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !dirty.is_empty() {
+            return Ok(json!({
+                "status": "deferred_dirty_worktree",
+                "changed_files": dirty.iter().map(|change| change.path.clone()).collect::<Vec<_>>(),
+                "resume_instruction": "Worktree has local edits; fetch Cloud merge context and resolve against the accepted integration patch before continuing blocked files.",
+            }));
+        }
+        match run_git(worktree_path, &["merge", "--ff-only", INTEGRATION_BRANCH]) {
+            Ok(output) => {
+                let current_sha = run_git(worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
+                Ok(json!({
+                    "status": "refreshed",
+                    "target_branch": INTEGRATION_BRANCH,
+                    "current_sha": current_sha.trim(),
+                    "output": output.trim(),
+                }))
+            }
+            Err(error) => Ok(json!({
+                "status": "refresh_failed",
+                "target_branch": INTEGRATION_BRANCH,
+                "error": error,
+                "resume_instruction": "Refresh failed; fetch Cloud merge context and use merge-resolution flow before editing blocked files.",
+            })),
+        }
     }
 
     fn session_response(
@@ -9475,6 +10599,31 @@ fn is_coordination_owned_root_status_path(path: &str) -> bool {
         || normalized == "logs/coordination-alignment.jsonl"
 }
 
+fn is_ignored_system_status_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".DS_Store" || normalized.ends_with("/.DS_Store")
+}
+
+fn workspace_violation_is_ignored_system_noise(violation: &Value) -> bool {
+    if violation["violation_kind"].as_str() != Some("direct_project_root_write") {
+        return false;
+    }
+    let Some(details_text) = violation["details_json"].as_str() else {
+        return false;
+    };
+    let Ok(details) = serde_json::from_str::<Value>(details_text) else {
+        return false;
+    };
+    let Some(files) = details["changed_files"].as_array() else {
+        return false;
+    };
+    !files.is_empty()
+        && files
+            .iter()
+            .filter_map(Value::as_str)
+            .all(is_ignored_system_status_path)
+}
+
 struct WorkspaceChangeInput<'a> {
     task_id: Option<&'a str>,
     agent_id: Option<&'a str>,
@@ -9843,6 +10992,7 @@ fn codex_config_toml(
 const CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS: &[&str] = &[
     "cloud_get_status",
     "cloud_get_context_pack",
+    "cloud_get_merge_context_pack",
     "cloud_get_workspace_snapshot",
     "cloud_record_history_event",
     "cloud_get_history_ledger",
@@ -9876,15 +11026,19 @@ fn diffforge_agent_contract_markdown() -> String {
 # Diff Forge agent coordination contract\n\n\
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, but every app-launched coding agent must publish public coordination state through Cloud MCP so parallel agents can stay in their lanes.\n\n\
 ## Required Cloud MCP flow for every user task\n\n\
-1. Before inspecting or editing files, call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your own concise `work_summary` or `task_title` describing what you are about to do.\n\
-2. As soon as you know the concrete task, call `cloud-diffforge.cloud_agent_heartbeat` with `status: \"active\"`, the current lane if known, and a public `progress_summary`.\n\
-3. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
-4. When finished, report completion with `cloud-diffforge.cloud_subtask_checkpoint` using `task_status: \"done\"` or update the active context task with `cloud-diffforge.cloud_update_context_task`.\n\
-5. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+1. Call `coordination-kernel.get_brief` to read the current local task_id, branch root, and peer state. Rust creates and claims the local task when the prompt is submitted.\n\
+2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Kanban task. Do not copy the raw user prompt as the title.\n\
+3. Call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your concise `work_summary` or `task_title` describing what you are about to do.\n\
+4. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Report blocked/parked to Cloud MCP, then stop; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
+5. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
+6. When Rust resumes a parked task, call `coordination-kernel.get_brief` again, inspect the refreshed target file/context first, then acquire the lease and continue.\n\
+7. When finished, call `coordination-kernel.submit_patch` first. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe. Only report `done` to Cloud MCP after submit_patch reports an applied auto_merge; otherwise report `review` or `blocked`.\n\
+8. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Local coordination remains authoritative\n\n\
 - Use the local coordination kernel for leases, memory, patch submission, and merge safety.\n\
 - Edit only inside the assigned agent worktree/branch root when one is provided.\n\
-- Cloud MCP is shared context and activity memory; it is not permission to bypass local file safety.\n\
+- Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
+- Cloud MCP and merge context packs are shared context and activity memory; it is not permission to bypass local file safety.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }

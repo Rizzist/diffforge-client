@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::{
     db::REPO_ID,
-    kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
+    kernel::{api_error, CoordinationKernel, EventRefs},
     watcher,
 };
 
@@ -308,8 +308,8 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
                 "result": {
                     "tools": TOOL_NAMES.iter().map(|name| json!({
                         "name": name,
-                        "description": format!("Diffforge local coordination tool: {name}"),
-                        "inputSchema": {"type": "object", "additionalProperties": true}
+                        "description": tool_description(name),
+                        "inputSchema": tool_input_schema(name)
                     })).collect::<Vec<_>>()
                 }
             })
@@ -466,9 +466,13 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, mut input: Value) -> R
             input["fence_token"].as_i64().unwrap_or(0),
             input["ttl_seconds"].as_i64(),
         ),
-        "release_lease" => kernel.release_lease(
-            req(&input, "lease_id")?,
-            input["fence_token"].as_i64().unwrap_or(0),
+        "release_lease" => kernel.release_lease_lenient(
+            input["lease_id"].as_str(),
+            input["fence_token"].as_i64(),
+            input["task_id"].as_str(),
+            input["agent_id"].as_str(),
+            input["session_id"].as_str(),
+            input["resource_key"].as_str(),
         ),
         "list_resources" => kernel.list_resources(
             input["resource_type"].as_str(),
@@ -665,6 +669,58 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
                 object.insert(key.to_string(), Value::String(value.to_string()));
             }
         }
+    }
+}
+
+fn tool_description(name: &str) -> String {
+    match name {
+        "get_brief" => "Read the current local coordination task/session/lease brief. Call this before local leases so you know the assigned task_id.".to_string(),
+        "claim_task" => "Claim an already-created local coordination task by task_id. This does not create tasks.".to_string(),
+        "acquire_lease" => "Acquire a lease for an already-created task. Use resource_key such as file:index.html, glob:src/**, route:GET /api/users, or db:table:users.".to_string(),
+        "release_lease" => "Release a lease. Prefer resource_key; the current task/session/agent defaults are filled automatically. lease_id and fence_token also work.".to_string(),
+        _ => format!("Diffforge local coordination tool: {name}"),
+    }
+}
+
+fn tool_input_schema(name: &str) -> Value {
+    match name {
+        "get_brief" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Optional; defaults to the current session task when available."}
+            },
+            "additionalProperties": true
+        }),
+        "claim_task" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Existing local coordination task id from get_brief or COORDINATION_TASK_ID."}
+            },
+            "required": ["task_id"],
+            "additionalProperties": true
+        }),
+        "acquire_lease" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Existing local task id; defaults to the current session task when available."},
+                "resource_key": {"type": "string", "description": "Required normalized resource key, for example file:index.html or glob:src/**. Do not send paths[]."},
+                "mode": {"type": "string", "description": "Lease mode, usually write.", "default": "write"},
+                "ttl_seconds": {"type": "integer", "description": "Optional lease TTL."},
+                "reason": {"type": "string", "description": "Short public reason for the lease."}
+            },
+            "required": ["resource_key"],
+            "additionalProperties": true
+        }),
+        "release_lease" => json!({
+            "type": "object",
+            "properties": {
+                "resource_key": {"type": "string", "description": "Normalized resource key to release for the current task/session, for example file:index.html."},
+                "lease_id": {"type": "string", "description": "Optional explicit lease id."},
+                "fence_token": {"type": "integer", "description": "Optional fence token; resolved automatically when omitted for an active lease."}
+            },
+            "additionalProperties": true
+        }),
+        _ => json!({"type": "object", "additionalProperties": true}),
     }
 }
 

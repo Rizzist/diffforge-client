@@ -603,6 +603,7 @@ fn terminal_args_with_codex_mcp_identity(
     });
 
     let mut coordination_args = vec![
+        "--coordination-mcp".to_string(),
         "--repo-path".to_string(),
         coordination.repo_path.clone(),
         "--db-path".to_string(),
@@ -627,7 +628,7 @@ fn terminal_args_with_codex_mcp_identity(
         }
     }
 
-    let cloud_args = vec![
+    let mut cloud_args = vec![
         "--cloud-mcp-proxy".to_string(),
         "--base-url".to_string(),
         base_url,
@@ -635,6 +636,8 @@ fn terminal_args_with_codex_mcp_identity(
         coordination.repo_path.clone(),
         "--repo-id".to_string(),
         repo_id,
+        "--db-path".to_string(),
+        coordination.db_path.clone(),
         "--client-id".to_string(),
         "rust-diffforge-agent".to_string(),
         "--agent-id".to_string(),
@@ -646,6 +649,10 @@ fn terminal_args_with_codex_mcp_identity(
         "--terminal-instance-id".to_string(),
         instance_id.to_string(),
     ];
+    if let Some(slot_key) = env_value("COORDINATION_SLOT_KEY") {
+        cloud_args.push("--slot-key".to_string());
+        cloud_args.push(slot_key);
+    }
 
     next.push("-c".to_string());
     next.push(format!(

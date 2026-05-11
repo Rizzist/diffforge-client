@@ -39,6 +39,22 @@ function field(item, ...keys) {
   return "";
 }
 
+function jsonObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function metadata(task) {
+  return jsonObject(field(task, "metadata", "metadata_json", "metadataJson"));
+}
+
 function shortId(value) {
   const raw = String(value || "").trim();
   if (!raw) return "AGT";
@@ -59,6 +75,49 @@ function colorFor(value) {
   return palette[hash % palette.length];
 }
 
+function agentLabelFor(task, agentId) {
+  const meta = metadata(task);
+  const explicit = text(field(task, "agent_label", "agentLabel", "label") || meta.agent_label || meta.agentLabel);
+  if (explicit) return explicit.toUpperCase();
+
+  const slot = text(field(task, "slot_key", "slotKey") || meta.slot_key || meta.slotKey);
+  const match = slot.match(/^codex-(\d+)$/i);
+  if (match) {
+    const index = Number(match[1]);
+    if (Number.isFinite(index) && index > 0 && index <= 26) {
+      return `CX${String.fromCharCode(64 + index)}`;
+    }
+  }
+
+  return shortId(agentId);
+}
+
+function inferredStatus(task, fallback) {
+  const status = text(fallback, "todo").toLowerCase();
+  const meta = metadata(task);
+  const body = text(field(task, "body", "description"));
+  const title = text(field(task, "title", "summary"));
+  const requested = text(meta.requested_status || meta.requestedStatus).toLowerCase();
+  const combined = `${title} ${body} ${text(meta.block_reason || meta.blockReason)} ${text(meta.completion_gate || meta.completionGate)}`.toLowerCase();
+
+  if (
+    status === "blocked" ||
+    meta.completion_blocked_until_submit_patch ||
+    meta.completionBlockedUntilSubmitPatch ||
+    combined.includes("blocked by") ||
+    combined.startsWith("blocked:") ||
+    combined.includes("unable to apply") ||
+    combined.includes("unable to complete") ||
+    combined.includes("owned by another active") ||
+    combined.includes("peer lease")
+  ) {
+    return "blocked";
+  }
+
+  if (status === "review" && requested === "done") return "review";
+  return KANBAN_COLUMNS.some((column) => column.id === status) ? status : "todo";
+}
+
 function normalizeBoard(response) {
   const board = response?.taskBoard && typeof response.taskBoard === "object" ? response.taskBoard : {};
   const tasks = Array.isArray(response?.tasks) ? response.tasks : [];
@@ -66,13 +125,15 @@ function normalizeBoard(response) {
 
   for (const column of KANBAN_COLUMNS) {
     const items = Array.isArray(board[column.id]) ? board[column.id] : [];
-    byStatus[column.id] = items;
+    for (const item of items) {
+      const status = inferredStatus(item, column.id);
+      byStatus[status].push(item);
+    }
   }
 
   if (!Object.values(byStatus).some((items) => items.length) && tasks.length) {
     for (const task of tasks) {
-      const status = text(field(task, "status"), "todo");
-      if (!byStatus[status]) byStatus[status] = [];
+      const status = inferredStatus(task, field(task, "status"));
       byStatus[status].push(task);
     }
   }
@@ -114,7 +175,7 @@ export default function KanbanWorkspaceView({
 
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(refresh, 2500);
+    const timer = window.setInterval(refresh, 1000);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -140,6 +201,7 @@ export default function KanbanWorkspaceView({
                   const priority = field(task, "priority");
                   const title = text(field(task, "title", "summary"), "Untitled task");
                   const body = text(field(task, "body", "description"));
+                  const agentLabel = agentLabelFor(task, agentId);
                   return (
                     <TaskCard key={taskId}>
                       <TaskTitle>{title}</TaskTitle>
@@ -147,7 +209,7 @@ export default function KanbanWorkspaceView({
                         <TaskBody>{body}</TaskBody>
                       )}
                       <TaskMeta>
-                        {agentId && <TaskBadge $color={colorFor(agentId)}>{shortId(agentId)}</TaskBadge>}
+                        {agentId && <TaskBadge $color={colorFor(agentLabel || agentId)}>{agentLabel}</TaskBadge>}
                         {lane && <TaskBadge>{lane}</TaskBadge>}
                         {priority !== "" && <TaskBadge>p{priority}</TaskBadge>}
                       </TaskMeta>

@@ -1267,7 +1267,7 @@ async fn terminal_open(
         Some(resolve_started_at.elapsed()),
         json!({ "working_directory": workspace_path_display(&working_directory) }),
     );
-    let process_working_directory = workspace_path_for_process(&working_directory);
+    let mut process_working_directory = workspace_path_for_process(&working_directory);
     let mut coordination_context = None;
 
     let command_started_at = Instant::now();
@@ -1326,6 +1326,9 @@ async fn terminal_open(
             }) {
             Ok(context) => {
                 let write_root = workspace_path_for_process(&PathBuf::from(&context.write_root));
+                if context.enforcement_mode == "worktree_required" {
+                    process_working_directory = write_root.clone();
+                }
                 log_terminal_event(
                     "terminal.open.coordination_ready",
                     Some(&pane_id),
@@ -1340,7 +1343,7 @@ async fn terminal_open(
                         "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
                         "write_root": workspace_path_display(&write_root),
                         "launch_cwd": workspace_path_display(&process_working_directory),
-                        "cwd_policy": "project_root_visible_branch_root_editable",
+                        "cwd_policy": "assigned_worktree_only",
                     }),
                 );
                 if context.enforcement_mode == "coordination_only"
@@ -1526,7 +1529,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "project_root_visible_branch_root_editable"
+                "assigned_worktree_only"
             } else {
                 "plain_project_root"
             },
@@ -1594,7 +1597,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "project_root_visible_branch_root_editable"
+                "assigned_worktree_only"
             } else {
                 "plain_project_root"
             },
@@ -2286,13 +2289,72 @@ fn terminal_prompt_task_title(prompt: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if cleaned.is_empty() {
-        "Direct terminal task".to_string()
-    } else {
-        format!(
-            "Direct terminal task: {}",
-            cleaned.chars().take(120).collect::<String>()
-        )
+        return "Complete requested terminal task".to_string();
     }
+
+    let lower = cleaned.to_ascii_lowercase();
+    let action = if lower.contains("test") {
+        "Write tests"
+    } else if lower.contains("fix") || lower.contains("bug") {
+        "Fix requested issue"
+    } else if lower.contains("audit") || lower.contains("review") {
+        "Audit requested work"
+    } else if lower.contains("html") || lower.contains("landing") || lower.contains("splash") || lower.contains("slash page") {
+        "Create landing page"
+    } else if lower.contains("create") || lower.contains("make") || lower.contains("add") {
+        "Create requested implementation"
+    } else {
+        "Complete requested terminal task"
+    };
+    let subject = if lower.contains("black") && lower.contains("supercar") {
+        " for black supercar"
+    } else if lower.contains("supercar") {
+        " for supercar"
+    } else if lower.contains("car") {
+        " for car project"
+    } else if lower.contains("waitlist") || lower.contains("wishlist") {
+        " with list flow"
+    } else {
+        ""
+    };
+    let qualifier = if lower.contains("minimal") || lower.contains("simple") {
+        " minimally"
+    } else {
+        ""
+    };
+    format!("{action}{subject}{qualifier}")
+}
+
+struct TerminalPreparedCoordinationTask {
+    task_id: String,
+    title: String,
+    parked: bool,
+    parking_details: Value,
+    intent_resources: Vec<String>,
+}
+
+fn terminal_prompt_intent_resource_keys(prompt: &str) -> Vec<String> {
+    let lower = prompt.to_ascii_lowercase();
+    let mut resources = Vec::new();
+    if lower.contains("index.html") {
+        resources.push("file:index.html".to_string());
+    }
+    if lower.contains("html")
+        || lower.contains("landing")
+        || lower.contains("splash")
+        || lower.contains("slash page")
+        || lower.contains("wishlist")
+        || lower.contains("wish list")
+        || lower.contains("waitlist")
+        || lower.contains("front end")
+        || lower.contains("frontend")
+        || lower.contains("single page")
+    {
+        resources.push("file:index.html".to_string());
+    }
+    resources.sort();
+    resources.dedup();
+    resources
 }
 
 fn terminal_prepare_coordination_task_for_prompt(
@@ -2300,7 +2362,7 @@ fn terminal_prepare_coordination_task_for_prompt(
     prompt: &str,
     pane_id: &str,
     instance_id: u64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<TerminalPreparedCoordinationTask>, String> {
     let kernel = crate::coordination::CoordinationKernel::open(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
@@ -2320,6 +2382,46 @@ fn terminal_prepare_coordination_task_for_prompt(
         return Ok(None);
     };
     kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
+    let intent_resources = terminal_prompt_intent_resource_keys(prompt);
+    let mut parked = false;
+    let mut parking_details = Vec::new();
+    for resource_key in &intent_resources {
+        match kernel.acquire_lease(
+            &task_id,
+            &coordination.agent_id,
+            &coordination.session_id,
+            resource_key,
+            "write",
+            Some(900),
+            Some("Prompt intent lease: park later agents behind this likely target file until the accepted patch lands."),
+        ) {
+            Ok(value) => {
+                if value["ok"].as_bool() == Some(false) {
+                    let code = value["error"]["code"].as_str().unwrap_or_default();
+                    if code.contains("queued") || code.contains("lease_conflict") {
+                        parked = true;
+                    }
+                    parking_details.push(value);
+                } else {
+                    parking_details.push(json!({
+                        "resource_key": resource_key,
+                        "status": "intent_lease_acquired",
+                        "lease": value,
+                    }));
+                }
+            }
+            Err(error) => {
+                parking_details.push(json!({
+                    "resource_key": resource_key,
+                    "status": "intent_lease_error",
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+            }
+        }
+    }
+    if !parked {
+        let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
+    }
     log_terminal_event(
         "terminal.prompt.coordination_task_ready",
         Some(pane_id),
@@ -2330,9 +2432,140 @@ fn terminal_prepare_coordination_task_for_prompt(
             "session_id": clean_terminal_telemetry_text(&coordination.session_id),
             "task_id": clean_terminal_telemetry_text(&task_id),
             "title": clean_terminal_telemetry_text(&title),
+            "intent_resources": intent_resources.clone(),
+            "parked": parked,
+            "parking_details": parking_details.clone(),
         }),
     );
-    Ok(Some(task_id))
+    Ok(Some(TerminalPreparedCoordinationTask {
+        task_id,
+        title,
+        parked,
+        parking_details: Value::Array(parking_details),
+        intent_resources,
+    }))
+}
+
+async fn terminal_resume_parked_prompt_when_ready(
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pane_id: String,
+    instance_id: u64,
+    coordination: TerminalCoordinationSession,
+    task_id: String,
+    title: String,
+    prompt: String,
+) {
+    log_terminal_event(
+        "terminal.prompt.parked",
+        Some(&pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "task_id": clean_terminal_telemetry_text(&task_id),
+            "title": clean_terminal_telemetry_text(&title),
+            "resume_policy": "wait_for_dependency_then_refresh_worktree",
+        }),
+    );
+    for _ in 0..7200 {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let state = match crate::coordination::CoordinationKernel::open(
+            &coordination.repo_path,
+            Some(PathBuf::from(&coordination.db_path)),
+        ) {
+            Ok(kernel) => kernel.task_resume_state(&task_id, &coordination.session_id),
+            Err(error) => Err(error),
+        };
+        let Ok(state) = state else {
+            continue;
+        };
+        if state["data"]["ready"].as_bool() != Some(true) {
+            continue;
+        }
+        let Some(instance) = ({
+            let guard = terminals.read().await;
+            guard.get(&pane_id).cloned()
+        }) else {
+            log_terminal_event(
+                "terminal.prompt.parked_resume_abandoned",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "reason": "terminal_missing",
+                }),
+            );
+            return;
+        };
+        if instance.id != instance_id {
+            log_terminal_event(
+                "terminal.prompt.parked_resume_abandoned",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "reason": "terminal_replaced",
+                    "current_instance_id": instance.id,
+                }),
+            );
+            return;
+        }
+        let resume_input = format!(
+            "Dependency is ready. Continue the parked Diff Forge task now.\nTask: {}\nOriginal request: {}\r",
+            title, prompt
+        );
+        if resume_input.len() > MAX_TERMINAL_WRITE_BYTES {
+            log_terminal_event(
+                "terminal.prompt.parked_resume_abandoned",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "reason": "resume_input_too_large",
+                    "bytes": resume_input.len(),
+                }),
+            );
+            return;
+        }
+        let mut writer = instance.writer.lock().await;
+        if let Err(error) = writer.write_all(resume_input.as_bytes()) {
+            log_terminal_event(
+                "terminal.prompt.parked_resume_write_failed",
+                Some(&pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "task_id": clean_terminal_telemetry_text(&task_id),
+                    "error": clean_terminal_telemetry_text(&error.to_string()),
+                }),
+            );
+            return;
+        }
+        let _ = writer.flush();
+        log_terminal_event(
+            "terminal.prompt.parked_resume_sent",
+            Some(&pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "task_id": clean_terminal_telemetry_text(&task_id),
+                "title": clean_terminal_telemetry_text(&title),
+            }),
+        );
+        return;
+    }
+    log_terminal_event(
+        "terminal.prompt.parked_resume_timeout",
+        Some(&pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "task_id": clean_terminal_telemetry_text(&task_id),
+            "title": clean_terminal_telemetry_text(&title),
+        }),
+    );
 }
 
 #[tauri::command]
@@ -2358,31 +2591,54 @@ async fn terminal_write(
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
         if *instance.agent_started.lock().await {
-            if let Some(coordination) = instance.coordination.as_ref() {
-                if let Err(error) = terminal_prepare_coordination_task_for_prompt(
+            let prepared_coordination_task = if let Some(coordination) = instance.coordination.as_ref() {
+                match terminal_prepare_coordination_task_for_prompt(
                     coordination,
                     &prompt,
                     &pane_id,
                     instance.id,
                 ) {
-                    log_terminal_event(
-                        "terminal.prompt.coordination_task_error",
-                        Some(&pane_id),
-                        Some(instance.id),
-                        None,
-                        json!({
-                            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                            "error": clean_terminal_telemetry_text(&error),
-                        }),
-                    );
+                    Ok(task) => task,
+                    Err(error) => {
+                        log_terminal_event(
+                            "terminal.prompt.coordination_task_error",
+                            Some(&pane_id),
+                            Some(instance.id),
+                            None,
+                            json!({
+                                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                                "error": clean_terminal_telemetry_text(&error),
+                            }),
+                        );
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
             let cloud_state = cloud_mcp_state.inner().clone();
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
             let coordination = instance.coordination.clone();
             let terminal_instance_id = instance.id;
+            let local_task_id = prepared_coordination_task
+                .as_ref()
+                .map(|task| task.task_id.clone());
+            let local_task_title = prepared_coordination_task
+                .as_ref()
+                .map(|task| task.title.clone());
+            let parked_task = prepared_coordination_task.as_ref().and_then(|task| {
+                task.parked.then(|| {
+                    (
+                        task.task_id.clone(),
+                        task.title.clone(),
+                        task.parking_details.clone(),
+                        task.intent_resources.clone(),
+                    )
+                })
+            });
+            let prompt_for_cloud = prompt.clone();
             tauri::async_runtime::spawn(async move {
                 cloud_mcp_terminal_context_pack_for_prompt(
                     cloud_state,
@@ -2390,10 +2646,38 @@ async fn terminal_write(
                     terminal_instance_id,
                     working_directory,
                     coordination,
-                    prompt,
+                    local_task_id,
+                    local_task_title,
+                    prompt_for_cloud,
                 )
                 .await;
             });
+            if let (Some(coordination), Some((task_id, title, parking_details, intent_resources))) =
+                (instance.coordination.clone(), parked_task)
+            {
+                log_terminal_event(
+                    "terminal.prompt.write_parked",
+                    Some(&pane_id),
+                    Some(instance.id),
+                    None,
+                    json!({
+                        "task_id": clean_terminal_telemetry_text(&task_id),
+                        "title": clean_terminal_telemetry_text(&title),
+                        "intent_resources": intent_resources,
+                        "parking_details": parking_details,
+                    }),
+                );
+                tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
+                    state.terminals.clone(),
+                    pane_id.clone(),
+                    instance.id,
+                    coordination,
+                    task_id,
+                    title,
+                    prompt,
+                ));
+                return Ok(());
+            }
         }
     }
 
