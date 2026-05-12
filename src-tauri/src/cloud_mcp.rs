@@ -75,6 +75,8 @@ struct CloudMcpFileEntry {
     kind: String,
     size: Option<u64>,
     modified_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    references: Vec<String>,
 }
 
 struct CloudMcpPreparedWorkspace {
@@ -427,6 +429,93 @@ fn cloud_mcp_modified_ms(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
+fn cloud_mcp_reference_scan_candidate(path: &Path, size: Option<u64>) -> bool {
+    if size.is_some_and(|size| size > 256 * 1024) {
+        return false;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "css" | "html" | "js" | "jsx" | "mjs" | "ts" | "tsx" | "vue" | "svelte"
+    )
+}
+
+fn cloud_mcp_extract_quoted_references(line: &str, needles: &[&str], output: &mut Vec<String>) {
+    let lower = line.to_ascii_lowercase();
+    if !needles.iter().any(|needle| lower.contains(needle)) {
+        return;
+    }
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if quote != b'"' && quote != b'\'' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        if end <= bytes.len() {
+            if let Some(value) = line.get(start..end) {
+                let value = value.trim();
+                if cloud_mcp_reference_looks_local(value) {
+                    output.push(value.to_string());
+                }
+            }
+        }
+        index = end.saturating_add(1);
+    }
+}
+
+fn cloud_mcp_reference_looks_local(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('#')
+        && !value.starts_with("http://")
+        && !value.starts_with("https://")
+        && !value.starts_with("mailto:")
+        && !value.starts_with("data:")
+        && !value.starts_with("javascript:")
+}
+
+fn cloud_mcp_file_references(path: &Path, size: Option<u64>) -> Vec<String> {
+    if !cloud_mcp_reference_scan_candidate(path, size) {
+        return Vec::new();
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut references = Vec::new();
+    for line in text.lines().take(400) {
+        cloud_mcp_extract_quoted_references(
+            line,
+            &[
+                "import",
+                "export",
+                "require(",
+                " from ",
+                "src=",
+                "href=",
+                "@import",
+                "url(",
+            ],
+            &mut references,
+        );
+        if references.len() >= 80 {
+            break;
+        }
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
 fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
     let mut entries = Vec::new();
     let mut queue = VecDeque::new();
@@ -478,17 +567,20 @@ fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
                     kind: "directory".to_string(),
                     size: None,
                     modified_ms: entry.metadata().ok().and_then(|metadata| cloud_mcp_modified_ms(&metadata)),
+                    references: Vec::new(),
                 });
                 queue.push_back((path, depth + 1));
             } else if file_type.is_file() {
                 let metadata = entry.metadata().ok();
+                let size = metadata.as_ref().map(fs::Metadata::len);
                 entries.push(CloudMcpFileEntry {
                     relative_path,
                     kind: "file".to_string(),
-                    size: metadata.as_ref().map(fs::Metadata::len),
+                    size,
                     modified_ms: metadata
                         .as_ref()
                         .and_then(|metadata| cloud_mcp_modified_ms(metadata)),
+                    references: cloud_mcp_file_references(&path, size),
                 });
             }
         }
@@ -736,10 +828,12 @@ fn cloud_mcp_post_log_context(
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
+        "/v1/spec/graph" => "cloud_get_spec_graph",
         "/v1/spec/feature-matrix" => "cloud_get_feature_matrix",
         "/v1/spec/nodes" => "cloud_get_spec_node",
         "/v1/context/subtasks/checkpoint" => "cloud_subtask_checkpoint",
         "/v1/context/history/events" => "cloud_record_history_event",
+        "/v1/context/agents/heartbeat" => "cloud_agent_lifecycle",
         "/v1/context/agents/claim-lane" => "cloud_claim_lane",
         "/v1/context/agents/release-lane" => "cloud_release_lane",
         _ => "cloud_mcp_http",
@@ -820,6 +914,17 @@ async fn cloud_mcp_register_prepared_workspace(
     });
     let server_response =
         cloud_mcp_post_json_endpoint(state, "/v1/context/history/events", &payload).await?;
+    let filetree_response = cloud_mcp_push_filetree_snapshot(
+        state,
+        &repo_id,
+        &prepared.root,
+        Some(&prepared.workspace_id),
+        Some(&prepared.workspace_name),
+        prepared.filetree.clone(),
+        prepared.filetree_truncated,
+        reason,
+    )
+    .await;
     let log_path = cloud_mcp_workspace_log(
         &prepared.root,
         reason,
@@ -829,6 +934,11 @@ async fn cloud_mcp_register_prepared_workspace(
             "repo_id": repo_id,
             "file_count": workspace_status.file_count,
             "filetree_truncated": prepared.filetree_truncated,
+            "filetree_synced": filetree_response.is_ok(),
+            "filetree_sync_error": filetree_response
+                .as_ref()
+                .err()
+                .map(|error| clean_terminal_telemetry_text(error)),
             "policy_graph_detected": policy_graph_detected,
             "synced": true,
         }),
@@ -890,6 +1000,55 @@ fn cloud_mcp_response_data(value: &Value) -> Value {
     value.get("data").cloned().unwrap_or_else(|| value.clone())
 }
 
+async fn cloud_mcp_push_filetree_snapshot(
+    state: &CloudMcpState,
+    repo_id: &str,
+    workspace_root: &Path,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    filetree: Vec<CloudMcpFileEntry>,
+    filetree_truncated: bool,
+    reason: &str,
+) -> Result<Value, String> {
+    let payload = json!({
+        "source": "rust-diffforge-filetree",
+        "repo_id": repo_id,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "workspace_root": workspace_path_display(workspace_root),
+        "reason": reason,
+        "filetree": filetree,
+        "filetree_truncated": filetree_truncated,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_post_json_endpoint(state, "/v1/sync/push", &payload).await
+}
+
+async fn cloud_mcp_push_current_filetree_snapshot(
+    state: &CloudMcpState,
+    repo_id: &str,
+    workspace_root: &Path,
+    reason: &str,
+) -> Result<Value, String> {
+    let root = workspace_root.to_path_buf();
+    let (filetree, filetree_truncated) = tauri::async_runtime::spawn_blocking(move || {
+        cloud_mcp_collect_filetree(&root)
+    })
+    .await
+    .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
+    cloud_mcp_push_filetree_snapshot(
+        state,
+        repo_id,
+        workspace_root,
+        None,
+        None,
+        filetree,
+        filetree_truncated,
+        reason,
+    )
+    .await
+}
+
 fn cloud_mcp_terminal_key(pane_id: &str, instance_id: u64) -> String {
     format!("{pane_id}::{instance_id}")
 }
@@ -900,9 +1059,201 @@ fn cloud_mcp_terminal_agent_id(
     coordination: Option<&TerminalCoordinationSession>,
 ) -> String {
     coordination
-        .map(|coordination| coordination.agent_id.clone())
-        .filter(|value| !value.trim().is_empty())
+        .and_then(|coordination| cloud_mcp_stable_agent_id(Some(coordination.agent_id.as_str())))
         .unwrap_or_else(|| format!("{pane_id}-{instance_id}"))
+}
+
+fn cloud_mcp_stable_agent_id(agent_id: Option<&str>) -> Option<String> {
+    let agent_id = agent_id?.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    Some(agent_id.to_string())
+}
+
+fn cloud_mcp_short_agent_label(agent_id: &str) -> Option<String> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() || agent_id.starts_with("workspace-terminal-") {
+        return None;
+    }
+    let label = agent_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(3)
+        .collect::<String>();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn cloud_mcp_terminal_claimed_paths(
+    coordination: Option<&TerminalCoordinationSession>,
+    local_task_id: Option<&str>,
+) -> Vec<Value> {
+    let Some(coordination) = coordination else {
+        return Vec::new();
+    };
+    let conn = match rusqlite::Connection::open(&coordination.db_path) {
+        Ok(conn) => conn,
+        Err(_) => return Vec::new(),
+    };
+    let mut claimed_paths = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut statement = match conn.prepare(
+        "SELECT r.resource_key, l.mode, l.reason
+         FROM leases l
+         JOIN resources r ON r.id=l.resource_id
+         WHERE l.session_id=?1 AND l.status='active'
+         ORDER BY l.acquired_at DESC
+         LIMIT 50",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map(
+        rusqlite::params![coordination.session_id.as_str()],
+        |row| {
+            let resource_key: String = row.get(0)?;
+            let mode: String = row.get(1)?;
+            let reason: Option<String> = row.get(2)?;
+            let path = resource_key
+                .strip_prefix("file:")
+                .unwrap_or(resource_key.as_str())
+                .to_string();
+            Ok(json!({
+                "resource_key": resource_key,
+                "path": path,
+                "mode": mode,
+                "reason": reason,
+            }))
+        },
+    ) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    for row in rows.filter_map(Result::ok) {
+        let key = row["resource_key"]
+            .as_str()
+            .or_else(|| row["path"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if seen.insert(key) {
+            claimed_paths.push(row);
+        }
+    }
+    if let Some(local_task_id) = local_task_id.filter(|value| !value.trim().is_empty()) {
+        if let Ok(mut statement) = conn.prepare(
+            "SELECT resource_key, status, intent_summary
+             FROM task_resource_intents
+             WHERE task_id=?1
+               AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready')
+             ORDER BY updated_at DESC
+             LIMIT 50",
+        ) {
+            if let Ok(rows) = statement.query_map([local_task_id], |row| {
+                let resource_key: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let reason: Option<String> = row.get(2)?;
+                let path = resource_key
+                    .strip_prefix("file:")
+                    .unwrap_or(resource_key.as_str())
+                    .to_string();
+                Ok(json!({
+                    "resource_key": resource_key,
+                    "path": path,
+                    "mode": "write",
+                    "status": status,
+                    "reason": reason,
+                    "parked": true,
+                }))
+            }) {
+                for row in rows.filter_map(Result::ok) {
+                    let key = row["resource_key"]
+                        .as_str()
+                        .or_else(|| row["path"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if seen.insert(key) {
+                        claimed_paths.push(row);
+                    }
+                }
+            }
+        }
+    }
+    claimed_paths
+}
+
+fn cloud_mcp_terminal_patch_changed_files(
+    coordination: Option<&TerminalCoordinationSession>,
+    local_task_id: Option<&str>,
+) -> Vec<Value> {
+    let Some(coordination) = coordination else {
+        return Vec::new();
+    };
+    let Some(local_task_id) = local_task_id.filter(|value| !value.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let conn = match rusqlite::Connection::open(&coordination.db_path) {
+        Ok(conn) => conn,
+        Err(_) => return Vec::new(),
+    };
+    cloud_mcp_patch_changed_files_for_task(&conn, local_task_id)
+}
+
+fn cloud_mcp_terminal_changed_files_for_status(
+    coordination: Option<&TerminalCoordinationSession>,
+    local_task_id: Option<&str>,
+    working_directory: &Path,
+) -> Vec<Value> {
+    let patch_changed_files = cloud_mcp_terminal_patch_changed_files(coordination, local_task_id);
+    if !patch_changed_files.is_empty() {
+        return patch_changed_files;
+    }
+    let scopes = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
+    cloud_mcp_git_changed_files_for_scope(working_directory, &scopes)
+}
+
+fn cloud_mcp_patch_changed_files_for_task(
+    conn: &rusqlite::Connection,
+    local_task_id: &str,
+) -> Vec<Value> {
+    let patch_id = conn
+        .query_row(
+            "SELECT id FROM patches
+             WHERE task_id=?1 AND status='merged'
+             ORDER BY created_at DESC LIMIT 1",
+            [local_task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let Some(patch_id) = patch_id else {
+        return Vec::new();
+    };
+    let mut statement = match conn.prepare(
+        "SELECT path, change_kind
+         FROM patch_files
+         WHERE patch_id=?1
+         ORDER BY path ASC
+         LIMIT 200",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map([patch_id.as_str()], |row| {
+        let path: String = row.get(0)?;
+        let change_kind: Option<String> = row.get(1)?;
+        Ok(json!({
+            "path": path,
+            "change_kind": change_kind,
+            "patch_id": patch_id,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(Result::ok).collect()
 }
 
 fn cloud_mcp_terminal_repo_id(
@@ -1187,6 +1538,54 @@ fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
     files
 }
 
+fn cloud_mcp_path_from_file_scope(scope: &Value) -> Option<String> {
+    let value = scope["path"]
+        .as_str()
+        .or_else(|| scope["file"].as_str())
+        .or_else(|| scope["file_path"].as_str())
+        .or_else(|| scope["filePath"].as_str())
+        .or_else(|| scope["resource_key"].as_str())
+        .or_else(|| scope["resourceKey"].as_str())?;
+    let path = value
+        .trim()
+        .trim_start_matches("file:")
+        .trim_start_matches("./")
+        .replace('\\', "/");
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn cloud_mcp_filter_git_changed_files_by_scope(
+    changed_files: Vec<Value>,
+    scopes: &[Value],
+) -> Vec<Value> {
+    let scope_paths = scopes
+        .iter()
+        .filter_map(cloud_mcp_path_from_file_scope)
+        .collect::<std::collections::HashSet<_>>();
+    if scope_paths.is_empty() {
+        return changed_files;
+    }
+    changed_files
+        .into_iter()
+        .filter(|file| {
+            let path = file["path"].as_str().unwrap_or_default();
+            scope_paths.iter().any(|scope| {
+                path == scope
+                    || path.strip_prefix("./") == Some(scope.as_str())
+                    || scope.strip_prefix("./") == Some(path)
+            })
+        })
+        .collect()
+}
+
+fn cloud_mcp_git_changed_files_for_scope(root: &Path, scopes: &[Value]) -> Vec<Value> {
+    cloud_mcp_filter_git_changed_files_by_scope(cloud_mcp_git_changed_files(root), scopes)
+}
+
 async fn cloud_mcp_claim_terminal_lane(
     state: &CloudMcpState,
     repo_id: &str,
@@ -1199,13 +1598,17 @@ async fn cloud_mcp_claim_terminal_lane(
     if lane.trim().is_empty() {
         return;
     }
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
         "agent_id": agent_id,
+        "agent_label": agent_label,
         "lane": lane,
         "reason": format!("Starting terminal task: {}", cloud_mcp_prompt_summary(prompt)),
         "metadata": {
+            "agent_label": agent_label,
             "workspace_root": workspace_path_display(working_directory),
             "session_id": coordination.map(|coordination| coordination.session_id.clone()),
         },
@@ -1226,6 +1629,158 @@ async fn cloud_mcp_claim_terminal_lane(
     }
 }
 
+async fn cloud_mcp_release_terminal_lane(
+    state: &CloudMcpState,
+    repo_id: &str,
+    agent_id: &str,
+    lane: &str,
+    working_directory: &Path,
+    pane_id: &str,
+    instance_id: u64,
+    reason: &str,
+) {
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
+    let payload = json!({
+        "source": "rust-diffforge-terminal-lifecycle",
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "agent_label": agent_label,
+        "self_agent_id": agent_id,
+        "current_agent_id": agent_id,
+        "lane": lane,
+        "workspace_root": workspace_path_display(working_directory),
+        "terminal_id": pane_id,
+        "terminal_instance_id": instance_id,
+        "reason": reason,
+        "metadata": {
+            "agent_label": agent_label,
+            "reason": reason,
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
+        },
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Err(error) = cloud_mcp_post_json_endpoint(state, "/v1/context/agents/release-lane", &payload).await {
+        log_terminal_event(
+            "cloud_mcp.agent_lifecycle.release_lane_error",
+            Some(pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "agent_id": clean_terminal_telemetry_text(agent_id),
+                "repo_id": clean_terminal_telemetry_text(repo_id),
+                "lane": clean_terminal_telemetry_text(lane),
+                "reason": clean_terminal_telemetry_text(reason),
+                "error": clean_terminal_telemetry_text(&error),
+            }),
+        );
+    }
+}
+
+async fn cloud_mcp_sync_terminal_agent_status(
+    state: &CloudMcpState,
+    repo_id: &str,
+    agent_id: &str,
+    lane: &str,
+    status: &str,
+    current_prompt: Option<&str>,
+    progress_summary: &str,
+    working_directory: &Path,
+    pane_id: &str,
+    instance_id: u64,
+    coordination: Option<&TerminalCoordinationSession>,
+    local_task_id: Option<&str>,
+    context_task_id: Option<&str>,
+    reason: &str,
+) {
+    let claimed_paths = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
+    let has_claimed_paths = !claimed_paths.is_empty();
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
+    let payload = json!({
+        "source": "rust-diffforge-terminal-lifecycle",
+        "spec_source": if has_claimed_paths { "rust_terminal_lease_scope" } else { "rust_terminal_lifecycle" },
+        "record_spec_activity": has_claimed_paths,
+        "repo_id": repo_id,
+        "agent_id": agent_id,
+        "agent_label": agent_label,
+        "self_agent_id": agent_id,
+        "current_agent_id": agent_id,
+        "status": status,
+        "lane": lane,
+        "current_prompt": current_prompt,
+        "progress_summary": progress_summary,
+        "task_id": local_task_id,
+        "context_task_id": context_task_id,
+        "claimed_paths": claimed_paths,
+        "workspace_root": workspace_path_display(working_directory),
+        "terminal_id": pane_id,
+        "terminal_instance_id": instance_id,
+        "metadata": {
+            "agent_label": agent_label,
+            "managed_by": "rust-diffforge",
+            "reason": reason,
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
+            "workspace_root": workspace_path_display(working_directory),
+            "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+            "local_coordination_task_id": local_task_id,
+            "coordination_task_id": local_task_id,
+            "context_task_id": context_task_id,
+            "local_lease_file_evidence": has_claimed_paths,
+            "local_active_leases": claimed_paths,
+        },
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    match cloud_mcp_post_json_endpoint(state, "/v1/context/agents/heartbeat", &payload).await {
+        Ok(_) => {
+            log_terminal_event(
+                "cloud_mcp.agent_lifecycle.synced",
+                Some(pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "agent_id": clean_terminal_telemetry_text(agent_id),
+                    "repo_id": clean_terminal_telemetry_text(repo_id),
+                    "status": status,
+                    "lane": clean_terminal_telemetry_text(lane),
+                    "reason": clean_terminal_telemetry_text(reason),
+                    "context_task_id": context_task_id.map(clean_terminal_telemetry_text),
+                    "local_task_id": local_task_id.map(clean_terminal_telemetry_text),
+                }),
+            );
+        }
+        Err(error) => {
+            log_terminal_event(
+                "cloud_mcp.agent_lifecycle.sync_error",
+                Some(pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "agent_id": clean_terminal_telemetry_text(agent_id),
+                    "repo_id": clean_terminal_telemetry_text(repo_id),
+                    "status": status,
+                    "reason": clean_terminal_telemetry_text(reason),
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+        }
+    }
+}
+
+fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
+    match status {
+        "starting" => "starting",
+        "active" | "busy" => "active",
+        _ => "inactive",
+    }
+}
+
+fn cloud_mcp_lifecycle_status_releases_lane(status: &str) -> bool {
+    !matches!(status, "starting" | "active" | "busy")
+}
+
 async fn cloud_mcp_create_terminal_context_task(
     state: &CloudMcpState,
     repo_id: &str,
@@ -1239,15 +1794,19 @@ async fn cloud_mcp_create_terminal_context_task(
     local_task_id: Option<&str>,
     local_task_title: Option<&str>,
 ) -> Option<String> {
+    let clean_prompt = cloud_mcp_clean_prompt_text(prompt);
+    let fallback_title = cloud_mcp_prompt_summary(&clean_prompt);
     let title = local_task_title
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("Agent preparing requested work");
-    let clean_prompt = cloud_mcp_clean_prompt_text(prompt);
+        .unwrap_or(&fallback_title);
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
         "run_id": local_task_id,
         "agent_id": agent_id,
+        "agent_label": agent_label,
         "self_agent_id": agent_id,
         "current_agent_id": agent_id,
         "title": title,
@@ -1256,6 +1815,7 @@ async fn cloud_mcp_create_terminal_context_task(
         "lane": lane,
         "source_prompt": clean_prompt,
         "metadata": {
+            "agent_label": agent_label,
             "terminal_id": pane_id,
             "terminal_instance_id": instance_id,
             "workspace_root": workspace_path_display(working_directory),
@@ -1324,17 +1884,22 @@ async fn cloud_mcp_update_terminal_context_task(
     if task_id.trim().is_empty() {
         return;
     }
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
         "agent_id": agent_id,
+        "agent_label": agent_label,
         "self_agent_id": agent_id,
         "current_agent_id": agent_id,
         "title": title,
         "status": status,
         "lane": lane,
         "body": brief,
+        "changed_files": changed_files,
         "metadata": {
+            "agent_label": agent_label,
             "managed_by": "rust-diffforge",
             "title_source": title_source,
             "changed_file_count": changed_files.len(),
@@ -1389,6 +1954,30 @@ async fn cloud_mcp_update_terminal_context_task(
                 "changed_file_count": changed_files.len(),
             }),
         );
+        if matches!(status, "done" | "review") && !changed_files.is_empty() {
+            if let Err(error) = cloud_mcp_push_current_filetree_snapshot(
+                state,
+                repo_id,
+                working_directory,
+                "terminal_task_filetree_update",
+            )
+            .await
+            {
+                let _ = cloud_mcp_workspace_log(
+                    working_directory,
+                    "cloud_mcp.filetree.sync_error",
+                    "",
+                    "",
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(agent_id),
+                        "pane_id": pane_id.map(clean_terminal_telemetry_text),
+                        "task_id": clean_terminal_telemetry_text(task_id),
+                        "status": status,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+            }
+        }
     }
 }
 
@@ -1436,11 +2025,14 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     }
 
     if context_task_id.is_none() {
+        let agent_label = cloud_mcp_short_agent_label(&agent_id);
+        let agent_label = agent_label.as_deref();
         let payload = json!({
             "source": "rust-diffforge-terminal",
             "repo_id": repo_id.clone(),
             "run_id": local_task_id,
             "agent_id": agent_id.clone(),
+            "agent_label": agent_label,
             "self_agent_id": agent_id.clone(),
             "current_agent_id": agent_id.clone(),
             "title": title.unwrap_or("Terminal task"),
@@ -1448,6 +2040,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
             "status": status,
             "lane": lane,
             "metadata": {
+                "agent_label": agent_label,
                 "terminal_id": pane_id,
                 "terminal_instance_id": instance_id,
                 "workspace_root": workspace_path_display(working_directory),
@@ -1465,6 +2058,12 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
         }
     }
 
+    let lifecycle_changed_files = if matches!(status, "done" | "review" | "merged" | "completed") {
+        cloud_mcp_terminal_changed_files_for_status(coordination, local_task_id, working_directory)
+    } else {
+        Vec::new()
+    };
+
     if let Some(task_id) = context_task_id.as_deref() {
         cloud_mcp_update_terminal_context_task(
             state,
@@ -1476,7 +2075,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
             title,
             Some("rust_lifecycle"),
             brief,
-            &[],
+            &lifecycle_changed_files,
             working_directory,
             Some(pane_id),
         )
@@ -1488,7 +2087,161 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
         }
     }
 
+    let agent_status = cloud_mcp_agent_status_for_lifecycle_status(status);
+    cloud_mcp_sync_terminal_agent_status(
+        state,
+        &repo_id,
+        &agent_id,
+        lane,
+        agent_status,
+        None,
+        brief,
+        working_directory,
+        pane_id,
+        instance_id,
+        coordination,
+        local_task_id,
+        context_task_id.as_deref(),
+        "terminal_task_lifecycle",
+    )
+    .await;
+    if cloud_mcp_lifecycle_status_releases_lane(status) {
+        cloud_mcp_release_terminal_lane(
+            state,
+            &repo_id,
+            &agent_id,
+            lane,
+            working_directory,
+            pane_id,
+            instance_id,
+            status,
+        )
+        .await;
+        let mut runtime = state.inner.lock().await;
+        runtime.terminal_contexts.remove(&terminal_key);
+    }
+
     context_task_id
+}
+
+pub(crate) async fn cloud_mcp_mark_terminal_closed(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    instance: &TerminalInstance,
+    reason: &str,
+) {
+    if cloud_mcp_connected_or_connect(state, "terminal_closed").await.is_err() {
+        let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+        let mut runtime = state.inner.lock().await;
+        runtime.terminal_contexts.remove(&terminal_key);
+        return;
+    }
+
+    let coordination = instance.coordination.as_ref();
+    let working_directory = instance.working_directory.as_ref();
+    let agent_id = cloud_mcp_terminal_agent_id(pane_id, instance_id, coordination);
+    let repo_id = cloud_mcp_terminal_repo_id(working_directory, coordination);
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let active_task = instance.active_task.lock().await.clone();
+    let context_entry = {
+        let runtime = state.inner.lock().await;
+        runtime.terminal_contexts.get(&terminal_key).cloned()
+    };
+    let lane = context_entry
+        .as_ref()
+        .map(|entry| entry.lane.as_str())
+        .filter(|lane| !lane.trim().is_empty())
+        .unwrap_or("terminal-agent")
+        .to_string();
+    let local_task_id = active_task
+        .as_ref()
+        .map(|task| task.task_id.as_str())
+        .or_else(|| context_entry.as_ref().and_then(|entry| entry.local_task_id.as_deref()));
+    let title = active_task.as_ref().map(|task| task.title.as_str());
+    let context_task_id = context_entry
+        .as_ref()
+        .and_then(|entry| entry.context_task_id.as_deref());
+    let last_prompt = context_entry
+        .as_ref()
+        .map(|entry| entry.last_prompt.as_str())
+        .filter(|prompt| !prompt.trim().is_empty());
+    let work_subject = context_entry
+        .as_ref()
+        .map(|entry| cloud_mcp_work_subject(&entry.work_brief))
+        .unwrap_or_else(|| {
+            title
+                .map(str::to_string)
+                .unwrap_or_else(|| "terminal task".to_string())
+        });
+    let brief = format!(
+        "Terminal closed via {reason}; marking {} inactive.",
+        cloud_mcp_work_subject(&work_subject)
+    );
+
+    if let Some(context_task_id) = context_task_id {
+        cloud_mcp_update_terminal_context_task(
+            state,
+            &repo_id,
+            &agent_id,
+            context_task_id,
+            "interrupted",
+            &lane,
+            title,
+            title.map(|_| "rust_lifecycle"),
+            &brief,
+            &[],
+            working_directory,
+            Some(pane_id),
+        )
+        .await;
+    } else if let Some(active_task) = active_task.as_ref() {
+        cloud_mcp_mark_terminal_task_lifecycle(
+            state,
+            pane_id,
+            instance_id,
+            working_directory,
+            coordination,
+            Some(&active_task.task_id),
+            Some(&active_task.title),
+            "interrupted",
+            &lane,
+            &brief,
+        )
+        .await;
+    }
+
+    cloud_mcp_sync_terminal_agent_status(
+        state,
+        &repo_id,
+        &agent_id,
+        &lane,
+        "closed",
+        last_prompt,
+        &brief,
+        working_directory,
+        pane_id,
+        instance_id,
+        coordination,
+        local_task_id,
+        context_task_id,
+        reason,
+    )
+    .await;
+    cloud_mcp_release_terminal_lane(
+        state,
+        &repo_id,
+        &agent_id,
+        &lane,
+        working_directory,
+        pane_id,
+        instance_id,
+        reason,
+    )
+    .await;
+
+    let mut runtime = state.inner.lock().await;
+    runtime.terminal_contexts.remove(&terminal_key);
 }
 
 async fn cloud_mcp_sync_terminal_context_task_from_cloud(
@@ -1501,10 +2254,13 @@ async fn cloud_mcp_sync_terminal_context_task_from_cloud(
     working_directory: &Path,
     local_task_id: Option<&str>,
 ) -> Option<String> {
+    let agent_label = cloud_mcp_short_agent_label(agent_id);
+    let agent_label = agent_label.as_deref();
     let payload = json!({
         "source": "rust-diffforge-terminal-sync",
         "repo_id": repo_id,
         "agent_id": agent_id,
+        "agent_label": agent_label,
         "self_agent_id": agent_id,
         "current_agent_id": agent_id,
         "terminal_id": pane_id,
@@ -1516,6 +2272,7 @@ async fn cloud_mcp_sync_terminal_context_task_from_cloud(
         "task_limit": 100,
         "agent_limit": 50,
         "metadata": {
+            "agent_label": agent_label,
             "local_coordination_task_id": local_task_id,
             "sync_reason": "confirm_cloud_received_agent_task",
         },
@@ -1768,6 +2525,34 @@ async fn cloud_mcp_observe_terminal_output(
             "changed_file_count": changed_files.len(),
         }),
     );
+    cloud_mcp_sync_terminal_agent_status(
+        &state,
+        &repo_id,
+        &agent_id,
+        &lane,
+        "inactive",
+        None,
+        &brief,
+        &working_directory,
+        pane_id,
+        instance_id,
+        None,
+        None,
+        Some(&task_id),
+        "terminal_prompt_ready",
+    )
+    .await;
+    cloud_mcp_release_terminal_lane(
+        &state,
+        &repo_id,
+        &agent_id,
+        &lane,
+        &working_directory,
+        pane_id,
+        instance_id,
+        "terminal_prompt_ready",
+    )
+    .await;
 
     let mut runtime = state.inner.lock().await;
     runtime.terminal_contexts.remove(&terminal_key);
@@ -1832,6 +2617,24 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         return;
     }
 
+    cloud_mcp_sync_terminal_agent_status(
+        &state,
+        &repo_id,
+        &agent_id,
+        "terminal-agent",
+        "starting",
+        Some(&prompt),
+        "Terminal prompt submitted; preparing cloud task context.",
+        &working_directory,
+        &pane_id,
+        instance_id,
+        coordination.as_ref(),
+        local_task_id.as_deref(),
+        None,
+        "terminal_prompt_submitted",
+    )
+    .await;
+
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
@@ -1890,7 +2693,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                     None
                 }
             };
-            let context_task_id = if context_task_id.is_some() {
+            let mut context_task_id = if context_task_id.is_some() {
                 context_task_id
             } else {
                 cloud_mcp_sync_terminal_context_task_from_cloud(
@@ -1905,6 +2708,22 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 )
                 .await
             };
+            if context_task_id.is_none() {
+                context_task_id = cloud_mcp_create_terminal_context_task(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    &suggested_lane,
+                    payload["prompt"].as_str().unwrap_or_default(),
+                    &pane_id,
+                    instance_id,
+                    &working_directory,
+                    coordination.as_ref(),
+                    local_task_id.as_deref(),
+                    local_task_title.as_deref(),
+                )
+                .await;
+            }
             if let Some(context_task_id) = context_task_id {
                 let pending_work_brief = {
                     let mut runtime = state.inner.lock().await;
@@ -1939,6 +2758,23 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                     )
                     .await;
                 }
+                cloud_mcp_sync_terminal_agent_status(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    &suggested_lane,
+                    "active",
+                    payload["prompt"].as_str(),
+                    "Terminal task is active.",
+                    &working_directory,
+                    &pane_id,
+                    instance_id,
+                    coordination.as_ref(),
+                    local_task_id.as_deref(),
+                    Some(&context_task_id),
+                    "terminal_context_ready",
+                )
+                .await;
             }
             cloud_mcp_claim_terminal_lane(
                 &state,
@@ -2033,9 +2869,51 @@ async fn cloud_mcp_track_terminal_file_changes(
                 }
             }
         }
+        if let Some((context_task_id, local_task_id, work_brief)) = {
+            let runtime = state.inner.lock().await;
+            runtime.terminal_contexts.get(&terminal_key).map(|entry| {
+                (
+                    entry.context_task_id.clone(),
+                    entry.local_task_id.clone(),
+                    entry.work_brief.clone(),
+                )
+            })
+        } {
+            let heartbeat_brief = if work_brief.trim().is_empty() {
+                "Terminal task is active.".to_string()
+            } else {
+                format!("Working on: {}", cloud_mcp_work_subject(&work_brief))
+            };
+            cloud_mcp_sync_terminal_agent_status(
+                &state,
+                &repo_id,
+                &agent_id,
+                &lane,
+                "active",
+                None,
+                &heartbeat_brief,
+                &working_directory,
+                &pane_id,
+                instance_id,
+                coordination.as_ref(),
+                local_task_id.as_deref(),
+                context_task_id.as_deref(),
+                "rust_terminal_activity_watch",
+            )
+            .await;
+        }
+        let local_task_id_for_scope = {
+            let runtime = state.inner.lock().await;
+            runtime
+                .terminal_contexts
+                .get(&terminal_key)
+                .and_then(|entry| entry.local_task_id.clone())
+        };
+        let scopes =
+            cloud_mcp_terminal_claimed_paths(coordination.as_ref(), local_task_id_for_scope.as_deref());
         let scan_root = working_directory.clone();
         let changed_files = match tauri::async_runtime::spawn_blocking(move || {
-            cloud_mcp_git_changed_files(&scan_root)
+            cloud_mcp_git_changed_files_for_scope(&scan_root, &scopes)
         })
         .await
         {
@@ -2122,6 +3000,34 @@ async fn cloud_mcp_track_terminal_file_changes(
                         "changed_file_count": changed_files.len(),
                     }),
                 );
+                cloud_mcp_sync_terminal_agent_status(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    &lane,
+                    "inactive",
+                    None,
+                    &brief,
+                    &working_directory,
+                    &pane_id,
+                    instance_id,
+                    coordination.as_ref(),
+                    None,
+                    Some(task_id),
+                    "stable_file_changes_ready",
+                )
+                .await;
+                cloud_mcp_release_terminal_lane(
+                    &state,
+                    &repo_id,
+                    &agent_id,
+                    &lane,
+                    &working_directory,
+                    &pane_id,
+                    instance_id,
+                    "stable_file_changes_ready",
+                )
+                .await;
             }
             let mut runtime = state.inner.lock().await;
             if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
@@ -2409,7 +3315,7 @@ async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_kanban(
+async fn cloud_mcp_get_spec_graph(
     state: State<'_, CloudMcpState>,
     repo_path: String,
     workspace_id: Option<String>,
@@ -2419,10 +3325,10 @@ async fn cloud_mcp_get_kanban(
     let root_display = workspace_path_display(&root);
     let repo_id = cloud_mcp_repo_id_for_root(&root);
 
-    cloud_mcp_connected_or_connect(state.inner(), "kanban_sync").await?;
+    cloud_mcp_connected_or_connect(state.inner(), "spec_graph_sync").await?;
 
     let payload = json!({
-        "source": "rust-diffforge-kanban",
+        "source": "rust-diffforge-spec-graph",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": repo_id,
         "agent_id": "rust-diffforge",
@@ -2440,45 +3346,14 @@ async fn cloud_mcp_get_kanban(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
-    let feature_response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/feature-matrix", &payload).await;
-    if let Ok(response) = feature_response {
-        let data = cloud_mcp_response_data(&response);
-        return Ok(json!({
-            "ok": true,
-            "repoId": repo_id,
-            "repoPath": root_display,
-            "workspaceId": workspace_id,
-            "workspaceName": workspace_name,
-            "featureMatrix": data,
-            "specGraph": {
-                "nodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
-                "edges": data.get("edges").cloned().unwrap_or_else(|| json!([]))
-            },
-            "specNodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
-            "specEdges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
-            "specColumns": data.get("columns").cloned().unwrap_or_else(|| json!({})),
-            "specWorkSessions": data.get("work_sessions").cloned().unwrap_or_else(|| json!([])),
-            "recentSpecEvents": data.get("recent_events").cloned().unwrap_or_else(|| json!([])),
-            "compiler": data.get("compiler").cloned().unwrap_or_else(|| json!({})),
-            "taskBoard": data.get("columns").cloned().unwrap_or_else(|| json!({})),
-            "tasks": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
-            "activeAgents": data.get("work_sessions").cloned().unwrap_or_else(|| json!([])),
-            "laneClaims": json!([]),
-            "historyLedger": {
-                "events": data.get("recent_events").cloned().unwrap_or_else(|| json!([]))
-            },
-            "sourceOfTruth": {
-                "kind": "feature_matrix_spec_graph",
-                "repo_id": repo_id,
-                "markdown_backed": true
-            },
-            "raw": data
-        }));
-    }
-
-    let response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/context/pack", &payload).await?;
+    let response = match cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/graph", &payload).await {
+        Ok(response) => response,
+        Err(error) if error.contains("HTTP 404") => {
+            cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/feature-matrix", &payload).await?
+        }
+        Err(error) => return Err(error),
+    };
     let data = cloud_mcp_response_data(&response);
-    let snapshot = data.get("snapshot").cloned().unwrap_or_else(|| data.clone());
 
     Ok(json!({
         "ok": true,
@@ -2486,14 +3361,16 @@ async fn cloud_mcp_get_kanban(
         "repoPath": root_display,
         "workspaceId": workspace_id,
         "workspaceName": workspace_name,
-        "summary": data.get("summary").cloned().unwrap_or(Value::Null),
-        "taskBoard": snapshot.get("task_board").cloned().unwrap_or_else(|| json!({})),
-        "tasks": snapshot.get("tasks").cloned().unwrap_or_else(|| json!([])),
-        "activeAgents": snapshot.get("active_agents").cloned().unwrap_or_else(|| json!([])),
-        "laneClaims": snapshot.get("lane_claims").cloned().unwrap_or_else(|| json!([])),
-        "historyLedger": snapshot.get("history_ledger").cloned().unwrap_or_else(|| json!({})),
-        "sourceOfTruth": snapshot.get("source_of_truth").cloned().unwrap_or_else(|| json!({})),
-        "featureMatrixError": "Feature Matrix endpoint unavailable; showing legacy context board.",
+        "specGraph": data,
+        "specNodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
+        "specEdges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
+        "agentWork": data.get("agent_work").cloned().unwrap_or_else(|| json!({})),
+        "graphStats": data.get("graph_stats").cloned().unwrap_or_else(|| json!({})),
+        "sourceOfTruth": {
+            "kind": "spec_graph",
+            "repo_id": repo_id,
+            "markdown_backed": true
+        },
         "raw": data
     }))
 }
@@ -2698,7 +3575,7 @@ impl CloudMcpProxyIdentity {
             .get("agent-label")
             .cloned()
             .or_else(|| env::var("CLOUD_MCP_AGENT_LABEL").ok())
-            .or_else(|| slot_key.as_deref().and_then(cloud_mcp_proxy_label_for_slot_key));
+            .or_else(|| agent_id.as_deref().and_then(cloud_mcp_short_agent_label));
 
         let base_url = values
             .get("base-url")
@@ -2727,6 +3604,10 @@ impl CloudMcpProxyIdentity {
             agent_label,
             client_id,
         }
+    }
+
+    fn cloud_agent_id(&self) -> Option<String> {
+        cloud_mcp_stable_agent_id(self.agent_id.as_deref())
     }
 
     fn log(&self, phase: &str, tool_name: &str, fields: Value) {
@@ -2776,15 +3657,6 @@ impl CloudMcpProxyIdentity {
     }
 }
 
-fn cloud_mcp_proxy_label_for_slot_key(slot_key: &str) -> Option<String> {
-    let suffix = slot_key.strip_prefix("codex-")?;
-    let index = suffix.parse::<u8>().ok()?;
-    if index == 0 || index > 26 {
-        return None;
-    }
-    Some(format!("CX{}", (b'A' + index - 1) as char))
-}
-
 fn cloud_mcp_proxy_sync_after_task_created(
     identity: &CloudMcpProxyIdentity,
     base_url: &str,
@@ -2828,7 +3700,7 @@ fn cloud_mcp_proxy_sync_after_task_created(
     if let Some(workspace_name) = identity.workspace_name.as_deref() {
         arguments.insert("workspace_name".to_string(), json!(workspace_name));
     }
-    if let Some(agent_id) = identity.agent_id.as_deref() {
+    if let Some(agent_id) = identity.cloud_agent_id() {
         arguments.insert("agent_id".to_string(), json!(agent_id));
         arguments.insert("self_agent_id".to_string(), json!(agent_id));
         arguments.insert("current_agent_id".to_string(), json!(agent_id));
@@ -2902,10 +3774,24 @@ fn cloud_mcp_proxy_sync_local_task_from_cloud(
         .as_str()
         .or_else(|| cloud_task["status_lane"].as_str());
     let cloud_task_id = cloud_task["id"].as_str();
+    let cloud_status = cloud_task["status"].as_str();
     let risk_level = cloud_task["risk_level"].as_i64().unwrap_or(1);
     let kernel = crate::coordination::CoordinationKernel::open(repo_path, Some(db_path.clone())).ok()?;
     if let Some(existing) = cloud_mcp_proxy_current_local_task_id(identity) {
         let _ = kernel.sync_task_cloud_context(&existing, cloud_task_id, Some(title), body, lane);
+        if let Some(status) = cloud_status {
+            let _ = kernel.sync_task_status_from_cloud_context(&existing, status);
+            if matches!(status.to_ascii_lowercase().as_str(), "blocked" | "parked" | "waiting") {
+                cloud_mcp_proxy_try_backfill_blocked_resource_parking(
+                    identity,
+                    &kernel,
+                    &existing,
+                    agent_id,
+                    session_id,
+                    &cloud_task,
+                );
+            }
+        }
         return Some(existing);
     }
     let task = kernel
@@ -2924,7 +3810,122 @@ fn cloud_mcp_proxy_sync_local_task_from_cloud(
     if kernel.claim_task(&task_id, agent_id, session_id).is_err() {
         return None;
     }
+    if let Some(status) = cloud_status {
+        let _ = kernel.sync_task_status_from_cloud_context(&task_id, status);
+        if matches!(status.to_ascii_lowercase().as_str(), "blocked" | "parked" | "waiting") {
+            cloud_mcp_proxy_try_backfill_blocked_resource_parking(
+                identity,
+                &kernel,
+                &task_id,
+                agent_id,
+                session_id,
+                &cloud_task,
+            );
+        }
+    }
     Some(task_id)
+}
+
+fn cloud_mcp_proxy_try_backfill_blocked_resource_parking(
+    identity: &CloudMcpProxyIdentity,
+    kernel: &crate::coordination::CoordinationKernel,
+    local_task_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    cloud_task: &Value,
+) {
+    let Some(resource_key) = cloud_mcp_proxy_infer_blocked_resource_key(cloud_task) else {
+        identity.log("cloud_mcp.task.blocked_parking_skipped", "cloud_update_context_task", json!({
+            "localTaskId": local_task_id,
+            "reason": "no_target_resource_inferred",
+        }));
+        return;
+    };
+    let reason = cloud_task["body"]
+        .as_str()
+        .or_else(|| cloud_task["description"].as_str())
+        .or_else(|| cloud_task["title"].as_str())
+        .unwrap_or("Cloud MCP reported this task as blocked on a target file.");
+    let result = kernel.acquire_lease(
+        local_task_id,
+        agent_id,
+        session_id,
+        &resource_key,
+        "write",
+        Some(900),
+        Some(reason),
+    );
+    match result {
+        Ok(value) => {
+            let code = value["error"]["code"].as_str().unwrap_or("ok");
+            if code.contains("queued") || code.contains("unmerged_patch") {
+                identity.log("cloud_mcp.task.blocked_parking_backfilled", "cloud_update_context_task", json!({
+                    "localTaskId": local_task_id,
+                    "resourceKey": resource_key,
+                    "reason": code,
+                }));
+                return;
+            }
+            if let Some(lease_id) = value["data"]["lease_id"].as_str() {
+                let fence_token = value["data"]["fence_token"].as_i64();
+                let _ = kernel.release_lease_lenient(
+                    Some(lease_id),
+                    fence_token,
+                    Some(local_task_id),
+                    Some(agent_id),
+                    Some(session_id),
+                    Some(&resource_key),
+                );
+            }
+            identity.log("cloud_mcp.task.blocked_parking_no_blocker", "cloud_update_context_task", json!({
+                "localTaskId": local_task_id,
+                "resourceKey": resource_key,
+                "reason": "target_file_was_not_locally_blocked",
+            }));
+        }
+        Err(error) => {
+            identity.log("cloud_mcp.task.blocked_parking_error", "cloud_update_context_task", json!({
+                "localTaskId": local_task_id,
+                "resourceKey": resource_key,
+                "error": clean_terminal_telemetry_text(&error),
+            }));
+        }
+    }
+}
+
+fn cloud_mcp_proxy_infer_blocked_resource_key(cloud_task: &Value) -> Option<String> {
+    let mut text = String::new();
+    for key in ["title", "body", "description", "source_prompt", "sourcePrompt"] {
+        if let Some(value) = cloud_task[key].as_str() {
+            text.push(' ');
+            text.push_str(value);
+        }
+    }
+    if let Some(metadata) = cloud_task["metadata_json"].as_object() {
+        for key in ["changed_files", "changedFiles", "target_file", "targetFile"] {
+            if let Some(value) = metadata.get(key) {
+                text.push(' ');
+                text.push_str(&value.to_string());
+            }
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("pricing.html")
+        || lower.contains("pricing dot html")
+        || lower.contains("pricing page")
+        || lower.contains("pricing")
+    {
+        return Some("file:pricing.html".to_string());
+    }
+    if lower.contains("index.html")
+        || lower.contains("index dot html")
+        || lower.contains("homepage")
+        || lower.contains("home page")
+        || lower.contains("landing page")
+    {
+        return Some("file:index.html".to_string());
+    }
+    None
 }
 
 fn cloud_mcp_proxy_context_task_from_value(value: &Value) -> Option<Value> {
@@ -3093,14 +4094,15 @@ fn cloud_mcp_proxy_enrich_request(
         return request;
     };
 
+    let cloud_agent_id = identity.cloud_agent_id();
     cloud_mcp_proxy_insert_if_missing(arguments, "client_id", Some(identity.client_id.as_str()));
     cloud_mcp_proxy_insert_if_missing(arguments, "repo_id", identity.repo_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "workspace_id", identity.workspace_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "workspace_name", identity.workspace_name.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "agent_id", identity.agent_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "self_agent_id", identity.agent_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "current_agent_id", identity.agent_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "actor", identity.agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "agent_id", cloud_agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "self_agent_id", cloud_agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "current_agent_id", cloud_agent_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(arguments, "actor", cloud_agent_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "session_id", identity.session_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "desktop_session_id", identity.session_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "slot_key", identity.slot_key.as_deref());
@@ -3123,6 +4125,7 @@ fn cloud_mcp_proxy_enrich_request(
             .or_insert_with(|| json!(value));
     }
     cloud_mcp_proxy_insert_identity_metadata(arguments, identity);
+    cloud_mcp_proxy_insert_local_file_scope(arguments, identity, tool_name);
     cloud_mcp_proxy_insert_empty_task_defaults(arguments, identity, tool_name);
 
     request
@@ -3141,6 +4144,16 @@ fn cloud_mcp_proxy_insert_identity_metadata(
     let Some(metadata) = metadata.as_object_mut() else {
         return;
     };
+    if let Some(cloud_agent_id) = identity.cloud_agent_id() {
+        metadata
+            .entry("cloud_agent_id".to_string())
+            .or_insert_with(|| json!(cloud_agent_id));
+    }
+    if let Some(agent_id) = identity.agent_id.as_deref() {
+        metadata
+            .entry("local_agent_id".to_string())
+            .or_insert_with(|| json!(agent_id));
+    }
     if let Some(slot_key) = identity.slot_key.as_deref() {
         metadata
             .entry("slot_key".to_string())
@@ -3212,6 +4225,205 @@ fn cloud_mcp_proxy_insert_empty_task_defaults(
     }
 }
 
+fn cloud_mcp_proxy_insert_local_file_scope(
+    arguments: &mut serde_json::Map<String, Value>,
+    identity: &CloudMcpProxyIdentity,
+    tool_name: &str,
+) {
+    let (active_leases, parked_intents) = cloud_mcp_proxy_local_file_scope(identity);
+    let git_changed_files =
+        cloud_mcp_proxy_git_changed_files(identity, &active_leases, &parked_intents);
+    if active_leases.is_empty() && parked_intents.is_empty() && git_changed_files.is_empty() {
+        return;
+    }
+
+    let mut combined = Vec::new();
+    combined.extend(active_leases.iter().cloned());
+    combined.extend(parked_intents.iter().cloned());
+    if json_array_argument_empty(arguments, "claimed_paths")
+        && json_array_argument_empty(arguments, "claimedPaths")
+    {
+        arguments.insert("claimed_paths".to_string(), json!(combined));
+    }
+    if !git_changed_files.is_empty()
+        && json_array_argument_empty(arguments, "changed_files")
+        && json_array_argument_empty(arguments, "changedFiles")
+    {
+        arguments.insert("changed_files".to_string(), json!(git_changed_files.clone()));
+    }
+    if matches!(
+        tool_name,
+        "cloud_agent_heartbeat" | "cloud_update_context_task" | "cloud_subtask_checkpoint"
+    ) {
+        arguments
+            .entry("record_spec_activity".to_string())
+            .or_insert_with(|| json!(true));
+        arguments
+            .entry("spec_source".to_string())
+            .or_insert_with(|| {
+                if git_changed_files.is_empty() {
+                    json!("local_lease_scope")
+                } else {
+                    json!("local_git_worktree_changes")
+                }
+            });
+    }
+
+    let metadata = cloud_mcp_proxy_completion_metadata(arguments);
+    if !active_leases.is_empty() || !parked_intents.is_empty() {
+        metadata
+            .entry("local_lease_file_evidence".to_string())
+            .or_insert_with(|| json!(true));
+    }
+    if !active_leases.is_empty() {
+        metadata
+            .entry("local_active_leases".to_string())
+            .or_insert_with(|| json!(active_leases));
+    }
+    if !parked_intents.is_empty() {
+        metadata
+            .entry("local_parked_resource_intents".to_string())
+            .or_insert_with(|| json!(parked_intents));
+    }
+    if !git_changed_files.is_empty() {
+        metadata
+            .entry("local_git_changed_file_evidence".to_string())
+            .or_insert_with(|| json!(true));
+        metadata
+            .entry("local_git_changed_files".to_string())
+            .or_insert_with(|| json!(git_changed_files.clone()));
+        metadata
+            .entry("changed_files".to_string())
+            .or_insert_with(|| json!(git_changed_files));
+    }
+}
+
+fn cloud_mcp_proxy_local_file_scope(identity: &CloudMcpProxyIdentity) -> (Vec<Value>, Vec<Value>) {
+    let Some(db_path) = identity.coordination_db_path.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => conn,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let active_leases = identity
+        .session_id
+        .as_deref()
+        .map(|session_id| cloud_mcp_proxy_active_leases_for_session(&conn, session_id))
+        .unwrap_or_default();
+    let parked_intents = cloud_mcp_proxy_current_local_task_id(identity)
+        .map(|task_id| cloud_mcp_proxy_parked_intents_for_task(&conn, &task_id))
+        .unwrap_or_default();
+    (active_leases, parked_intents)
+}
+
+fn cloud_mcp_proxy_git_changed_files(
+    identity: &CloudMcpProxyIdentity,
+    active_leases: &[Value],
+    parked_intents: &[Value],
+) -> Vec<Value> {
+    let Some(repo_path) = identity.repo_path.as_ref() else {
+        return Vec::new();
+    };
+    let mut scopes = Vec::new();
+    scopes.extend(active_leases.iter().cloned());
+    scopes.extend(parked_intents.iter().cloned());
+    cloud_mcp_git_changed_files_for_scope(repo_path, &scopes)
+}
+
+fn cloud_mcp_proxy_active_leases_for_session(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Vec<Value> {
+    let mut statement = match conn.prepare(
+        "SELECT r.resource_key, l.mode, l.reason
+         FROM leases l
+         JOIN resources r ON r.id=l.resource_id
+         WHERE l.session_id=?1 AND l.status='active'
+         ORDER BY l.acquired_at DESC
+         LIMIT 50",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map([session_id], |row| {
+        let resource_key: String = row.get(0)?;
+        let mode: String = row.get(1)?;
+        let reason: Option<String> = row.get(2)?;
+        let path = resource_key
+            .strip_prefix("file:")
+            .unwrap_or(resource_key.as_str())
+            .to_string();
+        Ok(json!({
+            "resource_key": resource_key,
+            "path": path,
+            "mode": mode,
+            "reason": reason,
+            "lease_state": "active",
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+fn cloud_mcp_proxy_parked_intents_for_task(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Vec<Value> {
+    let mut statement = match conn.prepare(
+        "SELECT resource_key, status, intent_summary
+         FROM task_resource_intents
+         WHERE task_id=?1
+           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready')
+         ORDER BY updated_at DESC
+         LIMIT 50",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map([task_id], |row| {
+        let resource_key: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        let reason: Option<String> = row.get(2)?;
+        let path = resource_key
+            .strip_prefix("file:")
+            .unwrap_or(resource_key.as_str())
+            .to_string();
+        Ok(json!({
+            "resource_key": resource_key,
+            "path": path,
+            "mode": "write",
+            "status": status,
+            "reason": reason,
+            "parked": true,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+fn json_array_argument_empty(arguments: &serde_json::Map<String, Value>, key: &str) -> bool {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| values.is_empty())
+        .unwrap_or(true)
+}
+
+fn json_array_argument_values(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<Vec<Value>> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| values.to_vec())
+}
+
 fn cloud_mcp_proxy_apply_completion_guard(
     request: &mut Value,
     identity: &CloudMcpProxyIdentity,
@@ -3248,6 +4460,21 @@ fn cloud_mcp_proxy_apply_completion_guard(
         .map(|submission| submission.patch_submitted)
         == Some(true)
     {
+        let mut changed_files = submission
+            .as_ref()
+            .map(|submission| submission.changed_files.clone())
+            .unwrap_or_default();
+        if changed_files.is_empty() {
+            changed_files = json_array_argument_values(arguments, "changed_files")
+                .or_else(|| json_array_argument_values(arguments, "changedFiles"))
+                .unwrap_or_default();
+        }
+        if !changed_files.is_empty()
+            && json_array_argument_empty(arguments, "changed_files")
+            && json_array_argument_empty(arguments, "changedFiles")
+        {
+            arguments.insert("changed_files".to_string(), json!(changed_files.clone()));
+        }
         let metadata = cloud_mcp_proxy_completion_metadata(arguments);
         metadata
             .entry("local_patch_submitted".to_string())
@@ -3265,10 +4492,21 @@ fn cloud_mcp_proxy_apply_completion_guard(
                 .entry("local_patch_id".to_string())
                 .or_insert_with(|| json!(patch_id));
         }
+        if !changed_files.is_empty() {
+            metadata
+                .entry("local_patch_changed_files".to_string())
+                .or_insert_with(|| json!(changed_files.clone()));
+            metadata
+                .entry("changed_files".to_string())
+                .or_insert_with(|| json!(changed_files));
+        }
+        let local_task_id = submission
+            .as_ref()
+            .and_then(|value| value.task_id.clone());
         return Some(json!({
             "activity": "completion allowed",
             "reason": "local_patch_applied",
-            "localTaskId": submission.and_then(|value| value.task_id),
+            "localTaskId": local_task_id,
         }));
     }
 
@@ -3321,6 +4559,7 @@ struct CloudMcpProxyPatchSubmission {
     task_status: Option<String>,
     patch_id: Option<String>,
     patch_submitted: bool,
+    changed_files: Vec<Value>,
 }
 
 fn cloud_mcp_proxy_local_patch_submission(
@@ -3345,6 +4584,7 @@ fn cloud_mcp_proxy_local_patch_submission(
             |row| row.get::<_, String>(0),
         )
         .ok();
+    let changed_files = cloud_mcp_patch_changed_files_for_task(&conn, &task_id);
     let patch_submitted = patch_id.is_some()
         || matches!(
             task_status.as_deref(),
@@ -3355,6 +4595,7 @@ fn cloud_mcp_proxy_local_patch_submission(
         task_status,
         patch_id,
         patch_submitted,
+        changed_files,
     })
 }
 

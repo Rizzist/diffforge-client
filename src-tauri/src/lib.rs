@@ -67,6 +67,7 @@ const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const TERMINAL_OUTPUT_FRAME_MICROS: u64 = 16_667;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
+const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
@@ -86,7 +87,7 @@ const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = true;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
-const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = true;
+const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
@@ -795,6 +796,8 @@ struct TerminalOpenResult {
     command: String,
     working_directory: String,
     project_root: String,
+    agent_id: Option<String>,
+    session_id: Option<String>,
     agent_branch_root: Option<String>,
     agent_branch: Option<String>,
     slot_key: Option<String>,
@@ -1082,13 +1085,7 @@ fn install_app_panic_log_hook() {
                 "thread_name": clean_terminal_telemetry_text(&thread_name),
             });
 
-            log_terminal_event(
-                "app.panic",
-                None,
-                None,
-                None,
-                fields.clone(),
-            );
+            log_terminal_event("app.panic", None, None, None, fields.clone());
             log_audio_diagnostic_event("app.panic", fields);
             previous_hook(panic_info);
         }));
@@ -1435,7 +1432,7 @@ pub fn run() {
             cloud_mcp_get_todo,
             cloud_mcp_save_todo,
             cloud_mcp_get_activity,
-            cloud_mcp_get_kanban,
+            cloud_mcp_get_spec_graph,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,

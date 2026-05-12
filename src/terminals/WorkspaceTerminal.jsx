@@ -6,6 +6,11 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  collapseFunctionalRepoPathToCoreRepoPath,
+  createCoreRepoNameDisplayMasker,
+  getCoreRepoDisplayLabel,
+} from "./coreRepoNameDisplay";
+import {
   GlobalStyle,
   AppFrame,
   WindowTitleBar,
@@ -356,7 +361,6 @@ const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
 const TERMINAL_SCROLL_ANCHOR_SEARCH_RADIUS_ROWS = 180;
 const TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS = 360;
 const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
-const TERMINAL_AGENT_ID_SUFFIXES = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_ACTIVE_PANE_EVENT = "forge-terminal-active-pane-change";
@@ -364,6 +368,7 @@ const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 const TERMINAL_INPUT_BATCH_MS = 8;
 const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
+const TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const TODO_DRAG_MIME = "application/x-diffforge-todo";
 let activeTerminalKeyboardTarget = null;
 
@@ -544,6 +549,15 @@ function getTerminalKeyDebugFields(event, extraFields = {}) {
   };
 }
 
+function isPlainShiftEnterEvent(event) {
+  return event.key === "Enter"
+    && event.shiftKey
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.altKey
+    && !event.isComposing;
+}
+
 let nextWorkspaceTerminalInstanceId = 1;
 
 function getSafePaneToken(value) {
@@ -600,21 +614,20 @@ function getAgentStatusSummary(agentStatuses) {
   return [codex, claude, opencode].filter(Boolean);
 }
 
-function getTerminalAgentId(agentId, terminalIndex) {
-  const kind = getTerminalAgentKind(agentId);
-  const prefix = kind === "claude"
-    ? "CL"
-    : kind === "opencode"
-      ? "OC"
-      : kind === "codex"
-        ? "CX"
-        : kind === "generic"
-          ? "SH"
-          : "AG";
-  const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
-  const suffix = TERMINAL_AGENT_ID_SUFFIXES[safeIndex % TERMINAL_AGENT_ID_SUFFIXES.length] || "A";
+function getShortRealAgentId(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.replace(/[^a-z0-9]/gi, "").slice(0, 3);
+}
 
-  return `${prefix}${suffix}`;
+function getTerminalAgentId(agentId, realAgentId) {
+  const realId = getShortRealAgentId(realAgentId);
+  if (realId) return realId;
+
+  const kind = getTerminalAgentKind(agentId);
+  if (kind === "generic") return "sh";
+
+  return "...";
 }
 
 function getTerminalRoleSwitchOptions(agentStatuses) {
@@ -627,13 +640,6 @@ function getTerminalRoleSwitchOptions(agentStatuses) {
   return TERMINAL_ROLE_SWITCH_OPTIONS.filter((option) => (
     option.id === "generic" || installedAgentIds.has(option.id)
   ));
-}
-
-function getPathLeaf(value) {
-  const text = String(value || "").replace(/\\/g, "/").replace(/\/+$/g, "");
-  const parts = text.split("/").filter(Boolean);
-
-  return parts[parts.length - 1] || "";
 }
 
 function getTerminalAgentColorSlot(terminalIndex) {
@@ -1395,10 +1401,12 @@ export default function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
-  const terminalAgentId = getTerminalAgentId(paneAgentId, terminalIndex);
+  const terminalAgentId = getTerminalAgentId(paneAgentId, terminalLaunchInfo?.agentId);
   const terminalAgentTitle = `${isGenericTerminal ? "Generic shell" : agent?.label || "Agent"} terminal ${terminalAgentId}`;
-  const projectRoot = terminalLaunchInfo?.projectRoot || workingDirectory || "";
-  const projectLabel = getPathLeaf(projectRoot) || workspace?.name || "Project";
+  const projectRoot = collapseFunctionalRepoPathToCoreRepoPath(
+    terminalLaunchInfo?.projectRoot || terminalLaunchInfo?.workingDirectory || workingDirectory || "",
+  );
+  const projectLabel = getCoreRepoDisplayLabel(projectRoot, workspace?.name || "Project");
   const isolationLabel = isGenericTerminal
     ? "plain shell"
     : terminalLaunchInfo?.coordinationMode === "worktree_required"
@@ -1409,7 +1417,7 @@ export default function WorkspaceTerminal({
     : `${projectLabel} editing with isolated branch protection`;
   const projectBadgeTitle = isGenericTerminal
     ? `${projectLabel} - generic shell with normal terminal controls`
-    : `${projectLabel} - edits are isolated until merge`;
+    : `${projectLabel} - edits are isolated in the agent worktree until merge`;
   const selectTerminalPane = useCallback(() => {
     const instanceId = terminalInstanceIdRef.current || 0;
     setActiveTerminalKeyboardTarget(paneId, instanceId);
@@ -1703,6 +1711,8 @@ export default function WorkspaceTerminal({
       fontSize: 12,
       lineHeight: 1.22,
       macOptionIsMeta: true,
+      // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
+      reflowCursorLine: false,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       ...(TERMINAL_SCROLLBAR_PLATFORM === "windows" ? { windowsPty: { backend: "conpty" } } : {}),
       theme: {
@@ -3041,6 +3051,9 @@ export default function WorkspaceTerminal({
 
     async function startTerminal() {
       try {
+        const outputDisplayMasker = createCoreRepoNameDisplayMasker({
+          coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
+        });
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
@@ -3069,9 +3082,14 @@ export default function WorkspaceTerminal({
           });
           patchTerminalMetrics({ outputLagMs: 0 });
 
+          const displayData = outputDisplayMasker.maskBytes(data);
+          if (!displayData.byteLength) {
+            return;
+          }
+
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
-          outputBytes += data.byteLength;
+          outputBytes += displayData.byteLength;
 
           if (isFirstOutputChunk) {
             sawFirstOutput = true;
@@ -3081,14 +3099,14 @@ export default function WorkspaceTerminal({
               phase: "frontend.output.first_chunk",
               elapsedMs: performance.now() - lifecycleStartedAt,
               fields: {
-                bytes: data.byteLength,
+                bytes: displayData.byteLength,
                 transport: "binary_channel",
               },
             });
             scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
           }
 
-          writeTerminalOutput(data, {
+          writeTerminalOutput(displayData, {
             isFirstOutputChunk,
           });
         });
@@ -3221,6 +3239,34 @@ export default function WorkspaceTerminal({
           }
           terminalInputBuffer = "";
         });
+        const handleTerminalShiftEnterKey = (event, source = "xterm_custom_key_handler") => {
+          if (
+            !isPlainShiftEnterEvent(event)
+            || isGenericTerminal
+            || isDisposed
+            || !hasOpenPty
+            || parkedPromptRef.current
+          ) {
+            return false;
+          }
+
+          event.preventDefault();
+          event.stopPropagation?.();
+          event.stopImmediatePropagation?.();
+
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.keydown.shift_enter.manual_write",
+            fields: getTerminalKeyDebugFields(event, {
+              source,
+              terminalIndex,
+            }),
+          });
+          flushTerminalInput("shift_enter_flush_before");
+          writeTerminalInputChunk(TERMINAL_SHIFT_ENTER_SEQUENCE, "shift_enter");
+          return true;
+        };
         disposables.push(terminal.onData((data) => {
           if (!hasOpenPty || isDisposed || parkedPromptRef.current) {
             return;
@@ -3439,6 +3485,9 @@ export default function WorkspaceTerminal({
         });
         if (typeof terminal.attachCustomKeyEventHandler === "function") {
           terminal.attachCustomKeyEventHandler((event) => {
+            if (handleTerminalShiftEnterKey(event, "xterm_custom_key_handler")) {
+              return false;
+            }
             if (event.key === "Escape" && handleTerminalEscapeKey(event, "xterm_custom_key_handler")) {
               return false;
             }
@@ -3601,6 +3650,12 @@ export default function WorkspaceTerminal({
           return;
         }
 
+        outputDisplayMasker.setPaths({
+          coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(
+            openResult?.projectRoot || openResult?.workingDirectory || workingDirectory || "",
+          ),
+          functionalRepoPath: openResult?.workingDirectory || openResult?.agentBranchRoot || "",
+        });
         hasOpenPty = true;
         setTerminalLaunchInfo(openResult || null);
         runtimeTerminalState = shouldPrewarmShell ? "prewarmed" : "running";
@@ -4057,7 +4112,7 @@ export default function WorkspaceTerminal({
                       {(parkedPrompt.waitingOn || []).length
                         ? parkedPrompt.waitingOn.map((agent, index) => (
                           <TerminalParkedAgentBadge key={`${agent.agentId || agent.agentLabel || "agent"}-${index}`}>
-                            {agent.agentLabel || agent.agentId || "agent"}
+                            {agent.agentLabel || getShortRealAgentId(agent.agentId) || "agent"}
                           </TerminalParkedAgentBadge>
                         ))
                         : <TerminalParkedAgentBadge>peer</TerminalParkedAgentBadge>}

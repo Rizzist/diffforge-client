@@ -2,25 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import styled from "styled-components";
 
-const SPEC_COLUMNS = [
-  { id: "proposed", label: "Proposed", tone: "#38bdf8" },
-  { id: "active", label: "Active", tone: "#34d399" },
-  { id: "blocked", label: "Blocked", tone: "#fb7185" },
-  { id: "review", label: "Review", tone: "#fbbf24" },
-  { id: "verified", label: "Verified", tone: "#a78bfa" },
-  { id: "stale", label: "Stale", tone: "#94a3b8" },
-];
-
-const NODE_TYPE_TONES = {
-  feature: "#38bdf8",
-  flow: "#34d399",
-  behavior: "#fbbf24",
-  quirk: "#f97316",
-  platform: "#a78bfa",
-  guard: "#fb7185",
-  implementation_unit: "#94a3b8",
-};
-
 const GRAPH_NODE_SIZES = {
   main: 154,
   related: 108,
@@ -29,7 +10,6 @@ const GRAPH_NODE_SIZES = {
 const GRAPH_MIN_ZOOM = 0.48;
 const GRAPH_MAX_ZOOM = 1.8;
 const GRAPH_ZOOM_STEP = 0.16;
-const LIVE_AGENT_STATUSES = new Set(["", "active", "starting", "busy", "implementing", "working"]);
 const MAX_VISIBLE_AGENT_ORBITS = 6;
 
 function cleanText(value) {
@@ -72,6 +52,10 @@ function jsonObject(value) {
   }
 }
 
+function metadata(item) {
+  return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
+}
+
 function jsonArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value !== "string") return [];
@@ -83,80 +67,60 @@ function jsonArray(value) {
   }
 }
 
-function metadata(item) {
-  return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
+function isFileNodeType(nodeType) {
+  return nodeType === "file" || nodeType === "implementation_unit";
 }
 
-function shortId(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "AGT";
-  return (raw.split("-")[0] || raw)
-    .replace(/[^a-z0-9]/gi, "")
-    .slice(0, 3)
-    .padEnd(3, "x")
-    .toUpperCase();
-}
-
-function colorFor(value) {
-  const palette = ["#38bdf8", "#34d399", "#fbbf24", "#fb7185", "#a78bfa", "#2dd4bf", "#f97316"];
-  const raw = String(value || "feature");
-  let hash = 0;
-  for (let index = 0; index < raw.length; index += 1) {
-    hash = (hash * 31 + raw.charCodeAt(index)) >>> 0;
+function normalizeFreshnessState(value) {
+  switch (text(value).toLowerCase()) {
+    case "updated":
+    case "in_sync":
+    case "verified":
+    case "linked":
+      return "updated";
+    case "behind_code":
+    case "code_ahead":
+    case "needs_review":
+    case "review":
+    case "stale":
+      return "behind_code";
+    case "ahead_of_code":
+    case "spec_ahead":
+    case "candidate":
+    case "none":
+    case "unknown":
+    default:
+      return "ahead_of_code";
   }
-  return palette[hash % palette.length];
+}
+
+function freshnessLabel(value) {
+  switch (normalizeFreshnessState(value)) {
+    case "updated":
+      return "updated";
+    case "behind_code":
+      return "behind code";
+    case "ahead_of_code":
+    default:
+      return "ahead of code";
+  }
 }
 
 function freshnessTone(value) {
-  switch (value) {
-    case "in_sync":
+  switch (normalizeFreshnessState(value)) {
+    case "updated":
       return "#34d399";
-    case "spec_ahead":
-      return "#fbbf24";
-    case "code_ahead":
-      return "#f97316";
-    case "needs_review":
+    case "behind_code":
       return "#fb7185";
+    case "ahead_of_code":
     default:
-      return "#94a3b8";
+      return "#fbbf24";
   }
-}
-
-function agentLabelFor(agent) {
-  const explicit = text(field(agent, "agent_label", "agentLabel", "label"));
-  if (explicit) return explicit.toUpperCase();
-  return shortId(field(agent, "agent_id", "agentId", "id"));
-}
-
-function workStateFor(node) {
-  const activeAgents = jsonArray(field(node, "active_agents", "activeAgents"));
-  if (activeAgents.some((agent) => text(field(agent, "status")).toLowerCase() === "blocked")) {
-    return "blocked";
-  }
-  if (activeAgents.length) return "active";
-
-  const freshness = text(field(node, "freshness_state", "freshnessState")).toLowerCase();
-  if (["code_ahead", "spec_ahead", "needs_review"].includes(freshness)) return "stale";
-
-  const status = text(field(node, "work_state", "workState", "status"), "proposed").toLowerCase();
-  if (status === "todo") return "proposed";
-  if (status === "done" || status === "completed" || status === "passed") return "verified";
-  if (SPEC_COLUMNS.some((column) => column.id === status)) return status;
-  return "proposed";
-}
-
-function liveAgentCountFor(node) {
-  return liveAgentsFor(node).length;
 }
 
 function liveAgentsFor(node) {
-  const cached = Number(field(node, "live_agent_count", "liveAgentCount"));
-  const agents = jsonArray(field(node, "active_agents", "activeAgents")).filter((agent) => {
-    const status = text(field(agent, "status")).toLowerCase();
-    return LIVE_AGENT_STATUSES.has(status);
-  });
-  if (agents.length || !Number.isFinite(cached) || cached <= 0) return agents;
-  return Array.from({ length: cached }, (_, index) => ({ id: `live-agent-${index}`, status: "active" }));
+  const count = Number(field(node, "active_agent_count", "activeAgentCount", "live_agent_count", "liveAgentCount")) || 0;
+  return Array.from({ length: Math.max(0, count) }, (_, index) => ({ id: `live-agent-${index}`, status: "active" }));
 }
 
 function normalizeNode(raw, index = 0) {
@@ -164,69 +128,48 @@ function normalizeNode(raw, index = 0) {
   const id = text(field(raw, "id", "node_id", "nodeId", "task_id", "taskId"), `spec-${index}`);
   const title = text(field(raw, "title", "summary"), "Untitled spec");
   const nodeType = text(field(raw, "node_type", "nodeType", "type"), "feature").toLowerCase();
-  const area = text(field(raw, "feature_area", "featureArea", "lane", "resource_lane", "resourceLane"), "general");
   const summary = text(field(raw, "summary", "current_summary", "body", "description"), "");
   const purpose = text(field(raw, "purpose"), summary || "Intentional behavior captured from prompts, checkpoints, and patch history.");
   const rawMarkdown = field(raw, "markdown");
-  const activeAgents = jsonArray(field(raw, "active_agents", "activeAgents"));
-  const events = jsonArray(field(raw, "recent_events", "recentEvents", "events"));
-  const linkedFiles = jsonArray(field(raw, "linked_files", "linkedFiles"));
-  const candidateFiles = jsonArray(field(raw, "candidate_files", "candidateFiles"));
-  const relatedSpecs = jsonArray(field(raw, "related_specs", "relatedSpecs"));
-  const liveAgentCount = activeAgents.filter((agent) => {
-    const status = text(field(agent, "status")).toLowerCase();
-    return LIVE_AGENT_STATUSES.has(status);
-  }).length;
+  const freshnessState = normalizeFreshnessState(field(raw, "freshness_state", "freshnessState", "spec_state", "specState"));
+  const activeAgentCount = Math.max(
+    0,
+    Number(field(raw, "active_agent_count", "activeAgentCount", "live_agent_count", "liveAgentCount")) || 0,
+  );
+  const specs = jsonArray(field(raw, "specs"));
+  const activeSpecs = jsonArray(field(raw, "active_specs", "activeSpecs"));
+  const supersededSpecs = jsonArray(field(raw, "superseded_specs", "supersededSpecs"));
+  const agentRationale = jsonArray(field(raw, "agent_rationale", "agentRationale"));
   return {
     ...raw,
     id,
     title,
     node_type: nodeType,
-    feature_area: area,
     summary,
     purpose,
-    work_state: workStateFor({ ...raw, active_agents: activeAgents }),
-    intent_state: text(field(raw, "intent_state", "intentState"), "inferred"),
-    implementation_state: text(field(raw, "implementation_state", "implementationState"), "none"),
-    freshness_state: text(field(raw, "freshness_state", "freshnessState"), "unknown"),
-    confidence: Number(field(raw, "confidence")) || 0.35,
-    risk_level: Number(field(raw, "risk_level", "riskLevel")) || 1,
-    verification_state: text(field(raw, "verification_state", "verificationState"), "needed"),
+    freshness_state: freshnessState,
+    spec_state: freshnessState,
+    spec_state_label: freshnessLabel(freshnessState),
+    active_agent_count: activeAgentCount,
+    specs,
+    active_specs: activeSpecs,
+    superseded_specs: supersededSpecs,
+    agent_rationale: agentRationale,
     markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
       ? rawMarkdown
-      : fallbackMarkdown({ title, node_type: nodeType, feature_area: area, summary, purpose, metadata: meta }),
+      : fallbackMarkdown({ title, summary, purpose, freshness_state: freshnessState, metadata: meta }),
     markdown_path: text(field(raw, "markdown_path", "markdownPath")),
-    active_agents: activeAgents,
-    live_agent_count: liveAgentCount,
-    recent_events: events,
-    linked_files: linkedFiles,
-    candidate_files: candidateFiles,
-    related_specs: relatedSpecs,
     metadata: meta,
   };
 }
 
 function fallbackMarkdown(node) {
-  const guard = node.metadata?.regression_guard || "Do not regress accepted behavior without a superseding prompt or patch evidence.";
   return [
     `# ${node.title || "Spec Node"}`,
     "",
-    "## Purpose",
-    node.purpose || "Track intentional project behavior.",
+    node.summary || node.purpose || "No spec summary has been recorded yet.",
     "",
-    "## Current Behavior",
-    node.summary || "No durable behavior has been promoted yet.",
-    "",
-    "## Implementation State",
-    `- Intent: ${node.intent_state || "inferred"}`,
-    `- Implementation: ${node.implementation_state || "none"}`,
-    `- Freshness: ${node.freshness_state || "unknown"}`,
-    "",
-    "## Regression Guards",
-    `- ${guard}`,
-    "",
-    "## Evidence",
-    "- Waiting for prompt, heartbeat, checkpoint, or patch evidence.",
+    `Spec status: \`${freshnessLabel(node.freshness_state)}\``,
   ].join("\n");
 }
 
@@ -237,17 +180,14 @@ function legacyTaskToNode(task, index) {
     title: field(task, "title", "summary"),
     summary: field(task, "body", "description", "summary"),
     node_type: "feature",
-    feature_area: field(task, "lane") || "context-task",
     status: field(task, "status"),
-    active_agents: field(task, "agent_id", "agentId")
-      ? [{ agent_id: field(task, "agent_id", "agentId"), status: field(task, "status") || "active" }]
-      : [],
+    active_agent_count: field(task, "agent_id", "agentId") ? 1 : 0,
     metadata: meta,
   }, index);
 }
 
 function normalizeSnapshot(snapshot) {
-  const matrix = snapshot?.featureMatrix || snapshot?.raw || {};
+  const matrix = snapshot?.specGraph || snapshot?.raw || {};
   const specNodes = Array.isArray(snapshot?.specNodes)
     ? snapshot.specNodes
     : Array.isArray(matrix?.nodes)
@@ -264,12 +204,17 @@ function normalizeSnapshot(snapshot) {
       : [];
   const nodeIds = new Set(nodes.map((node) => node.id));
   let edges = edgeSource
-    .map((edge, index) => ({
-      id: text(field(edge, "id"), `edge-${index}`),
-      from: text(field(edge, "from_node_id", "fromNodeId", "from", "source")),
-      to: text(field(edge, "to_node_id", "toNodeId", "to", "target")),
-      kind: text(field(edge, "edge_kind", "edgeKind", "kind"), "related"),
-    }))
+    .map((edge, index) => {
+      const meta = metadata(edge);
+      if (meta.hidden || field(edge, "hidden") === true) return null;
+      return {
+        id: text(field(edge, "id"), `edge-${index}`),
+        from: text(field(edge, "from_node_id", "fromNodeId", "from", "source")),
+        to: text(field(edge, "to_node_id", "toNodeId", "to", "target")),
+        kind: text(field(edge, "edge_kind", "edgeKind", "kind"), "related"),
+      };
+    })
+    .filter(Boolean)
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
 
   if (!edges.length && nodes.length > 1) {
@@ -289,28 +234,9 @@ function normalizeSnapshot(snapshot) {
     matrix,
     nodes,
     edges,
-    sessions: Array.isArray(snapshot?.specWorkSessions)
-      ? snapshot.specWorkSessions
-      : Array.isArray(matrix?.work_sessions)
-        ? matrix.work_sessions
-        : [],
-    events: Array.isArray(snapshot?.recentSpecEvents)
-      ? snapshot.recentSpecEvents
-      : Array.isArray(matrix?.recent_events)
-        ? matrix.recent_events
-        : [],
-    compiler: snapshot?.compiler || matrix?.compiler || {},
+    agentWork: snapshot?.agentWork || matrix?.agent_work || {},
     graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
   };
-}
-
-function columnsFor(nodes) {
-  const columns = Object.fromEntries(SPEC_COLUMNS.map((column) => [column.id, []]));
-  for (const node of nodes) {
-    const target = columns[node.work_state] ? node.work_state : "proposed";
-    columns[target].push(node);
-  }
-  return columns;
 }
 
 function graphNodeSize(depth) {
@@ -340,25 +266,14 @@ function graphRootNode(nodes, edges) {
     const scoreFor = (node) => {
       const title = `${node.id} ${node.title}`.toLowerCase();
       const centralHint = title.includes("project") || title.includes("root") || title.includes("workspace") ? 140 : 0;
-      const activeHint = node.active_agents.length * 90;
-      const stateHint = node.work_state === "active"
-        ? 70
-        : node.work_state === "blocked"
-          ? 55
-          : node.work_state === "review"
-            ? 42
-            : 0;
-      const typeHint = node.node_type === "implementation_unit" ? -18 : 18;
-      const evidenceHint = (node.linked_files.length + node.candidate_files.length) * 7;
-      const freshnessHint = ["code_ahead", "spec_ahead", "needs_review"].includes(node.freshness_state) ? 18 : 0;
+      const activeHint = node.active_agent_count * 90;
+      const typeHint = isFileNodeType(node.node_type) ? -18 : 18;
+      const freshnessHint = node.freshness_state === "updated" ? 0 : 18;
       return centralHint
         + activeHint
-        + stateHint
         + typeHint
-        + evidenceHint
         + freshnessHint
-        + (degreeById.get(node.id) || 0) * 20
-        + node.confidence * 10;
+        + (degreeById.get(node.id) || 0) * 20;
     };
     const delta = scoreFor(right) - scoreFor(left);
     return delta || left.title.localeCompare(right.title);
@@ -448,7 +363,7 @@ function selectedFallback(nodes, selectedNodeId) {
   return nodes.find((node) => node.id === selectedNodeId) || nodes[0] || null;
 }
 
-export default function KanbanWorkspaceView({
+export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
   rootDirectory,
   workspace,
@@ -465,7 +380,7 @@ export default function KanbanWorkspaceView({
     refreshInFlightRef.current = true;
     setState((current) => (current === "idle" ? "loading" : current));
     try {
-      const next = await invoke("cloud_mcp_get_kanban", {
+      const next = await invoke("cloud_mcp_get_spec_graph", {
         repoPath,
         workspaceId: workspace?.id || null,
         workspaceName: workspace?.name || null,
@@ -487,32 +402,32 @@ export default function KanbanWorkspaceView({
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const featureMatrix = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
-  const selectedNode = selectedFallback(featureMatrix.nodes, selectedNodeId);
+  const specGraph = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
+  const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
 
   useEffect(() => {
-    if (!selectedNodeId && featureMatrix.nodes.length) {
-      setSelectedNodeId(featureMatrix.nodes[0].id);
+    if (!selectedNodeId && specGraph.nodes.length) {
+      setSelectedNodeId(specGraph.nodes[0].id);
     }
-  }, [featureMatrix.nodes, selectedNodeId]);
+  }, [specGraph.nodes, selectedNodeId]);
 
   return (
-    <FeatureMatrixSurface aria-label={`${workspace?.name || "Workspace"} Feature Matrix`} data-state={state}>
-      {error && <MatrixError>{error}</MatrixError>}
+    <SpecGraphSurface aria-label={`${workspace?.name || "Workspace"} Spec Graph`} data-state={state}>
+      {error && <SpecGraphError>{error}</SpecGraphError>}
 
-      <MatrixShell>
-        <MatrixMain>
+      <SpecGraphShell>
+        <SpecGraphMain>
           <GraphView
-            nodes={featureMatrix.nodes}
-            edges={featureMatrix.edges}
+            nodes={specGraph.nodes}
+            edges={specGraph.edges}
             selectedNodeId={selectedNode?.id}
             onSelect={setSelectedNodeId}
           />
-        </MatrixMain>
+        </SpecGraphMain>
 
         <SpecInspector node={selectedNode} />
-      </MatrixShell>
-    </FeatureMatrixSurface>
+      </SpecGraphShell>
+    </SpecGraphSurface>
   );
 }
 
@@ -664,7 +579,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
         </EdgeLayer>
         {nodes.map((node) => {
           const point = layout.byId[node.id] || { x: 20, y: 20, size: GRAPH_NODE_SIZES.distant, depth: 2 };
-          const tone = freshnessTone(node.freshness_state) || NODE_TYPE_TONES[node.node_type] || colorFor(node.node_type);
+          const tone = freshnessTone(node.freshness_state);
           const liveAgents = liveAgentsFor(node);
           const liveAgentCount = liveAgents.length;
           return (
@@ -681,9 +596,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
               $tone={tone}
               $active={node.id === selectedNodeId}
               $depth={point.depth}
-              $implementation={node.implementation_state}
               $freshness={node.freshness_state}
-              $nodeType={node.node_type}
               $live={liveAgentCount > 0}
               onClick={() => onSelect(node.id)}
             >
@@ -697,98 +610,13 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
                   $total={liveAgentCount}
                 />
               ))}
+              {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
               <NodeTitle $depth={point.depth}>{node.title}</NodeTitle>
             </GraphNodeButton>
           );
         })}
       </GraphCanvas>
     </GraphScroller>
-  );
-}
-
-function MatrixTable({ nodes, selectedNodeId, onSelect }) {
-  if (!nodes.length) return <EmptyState>No spec matrix rows yet.</EmptyState>;
-  return (
-    <TableWrap>
-      <SpecTable>
-        <thead>
-          <tr>
-            <th>Spec</th>
-            <th>Type</th>
-            <th>Area</th>
-            <th>Impl</th>
-            <th>Fresh</th>
-            <th>Files</th>
-            <th>Agents</th>
-            <th>Guard</th>
-          </tr>
-        </thead>
-        <tbody>
-          {nodes.map((node) => {
-            const guard = text(node.metadata?.regression_guard, "guard needed");
-            return (
-              <tr key={node.id} data-active={node.id === selectedNodeId} onClick={() => onSelect(node.id)}>
-                <td>
-                  <strong>{node.title}</strong>
-                  <small>{node.summary || node.purpose}</small>
-                </td>
-                <td>{node.node_type}</td>
-                <td>{node.feature_area}</td>
-                <td>{node.implementation_state}</td>
-                <td>{node.freshness_state}</td>
-                <td>{node.linked_files.length || node.candidate_files.length || "none"}</td>
-                <td>{node.active_agents.length || "idle"}</td>
-                <td>{guard}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </SpecTable>
-    </TableWrap>
-  );
-}
-
-function BoardView({ columns, selectedNodeId, onSelect }) {
-  return (
-    <BoardColumns>
-      {SPEC_COLUMNS.map((column) => {
-        const items = columns[column.id] || [];
-        return (
-          <BoardColumn key={column.id} $tone={column.tone}>
-            <ColumnHeader $tone={column.tone}>
-              <span>{column.label}</span>
-              <strong>{items.length}</strong>
-            </ColumnHeader>
-            <TaskStack>
-              {items.length ? items.map((node) => (
-                <SpecCardButton
-                  key={node.id}
-                  type="button"
-                  $active={node.id === selectedNodeId}
-                  onClick={() => onSelect(node.id)}
-                >
-                  <TaskTitle>{node.title}</TaskTitle>
-                  <TaskBody>{node.summary || node.purpose}</TaskBody>
-                  <TaskMeta>
-                    <TaskBadge>{node.node_type}</TaskBadge>
-                    <TaskBadge>{node.feature_area}</TaskBadge>
-                    <TaskBadge $color={freshnessTone(node.freshness_state)}>{node.freshness_state}</TaskBadge>
-                    <TaskBadge>{node.implementation_state}</TaskBadge>
-                    {node.active_agents.slice(0, 3).map((agent) => (
-                      <TaskBadge key={`${node.id}-${field(agent, "agent_id", "agentId", "id")}`} $color={colorFor(agentLabelFor(agent))}>
-                        {agentLabelFor(agent)}
-                      </TaskBadge>
-                    ))}
-                  </TaskMeta>
-                </SpecCardButton>
-              )) : (
-                <ColumnEmpty>Empty</ColumnEmpty>
-              )}
-            </TaskStack>
-          </BoardColumn>
-        );
-      })}
-    </BoardColumns>
   );
 }
 
@@ -805,15 +633,47 @@ function SpecInspector({ node }) {
     <Inspector>
       <InspectorHeader>
         <h2>{node.title}</h2>
+        <InspectorFacts>
+          <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
+          <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
+        </InspectorFacts>
       </InspectorHeader>
       <MarkdownPane>
         <pre>{node.markdown}</pre>
+        <SpecObjectList title="Active Specs" specs={node.active_specs} empty="No active specs recorded yet." />
+        <SpecObjectList
+          title="Superseded History"
+          specs={node.superseded_specs}
+          empty="No superseded specs yet."
+          historical
+        />
       </MarkdownPane>
     </Inspector>
   );
 }
 
-const FeatureMatrixSurface = styled.section`
+function SpecObjectList({ title, specs, empty, historical = false }) {
+  const visibleSpecs = Array.isArray(specs) ? specs : [];
+  return (
+    <SpecObjectsSection>
+      <h3>{title}</h3>
+      {visibleSpecs.length ? (
+        visibleSpecs.map((spec, index) => (
+          <SpecObjectCard key={field(spec, "id") || `${title}-${index}`} $historical={historical}>
+            <p>{text(field(spec, "statement"), "Unnamed spec")}</p>
+            {historical && text(field(spec, "supersession_reason")) && (
+              <small>Reason: {text(field(spec, "supersession_reason"))}</small>
+            )}
+          </SpecObjectCard>
+        ))
+      ) : (
+        <SpecObjectsEmpty>{empty}</SpecObjectsEmpty>
+      )}
+    </SpecObjectsSection>
+  );
+}
+
+const SpecGraphSurface = styled.section`
   width: 100%;
   height: 100%;
   min-height: 0;
@@ -828,7 +688,7 @@ const FeatureMatrixSurface = styled.section`
   gap: 10px;
 `;
 
-const MatrixError = styled.div`
+const SpecGraphError = styled.div`
   border: 1px solid rgba(248, 113, 113, 0.3);
   border-radius: 8px;
   background: rgba(127, 29, 29, 0.22);
@@ -836,7 +696,7 @@ const MatrixError = styled.div`
   padding: 10px;
 `;
 
-const MatrixShell = styled.div`
+const SpecGraphShell = styled.div`
   align-items: stretch;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 34%);
@@ -853,7 +713,7 @@ const MatrixShell = styled.div`
   }
 `;
 
-const MatrixMain = styled.main`
+const SpecGraphMain = styled.main`
   border: 1px solid rgba(230, 236, 245, 0.07);
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.58);
@@ -926,7 +786,7 @@ const EdgeLayer = styled.svg`
 
 const GraphNodeButton = styled.button`
   align-items: center;
-  border: 1px ${({ $implementation }) => ($implementation === "none" || $implementation === "candidate" ? "dashed" : "solid")} ${({ $active, $tone }) => ($active ? $tone : "rgba(230, 236, 245, 0.13)")};
+  border: 1px solid ${({ $active, $tone }) => ($active ? $tone : "rgba(230, 236, 245, 0.13)")};
   border-radius: 999px;
   background:
     radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}24`}, rgba(13, 17, 23, 0.86) 58%),
@@ -943,13 +803,31 @@ const GraphNodeButton = styled.button`
   padding: ${({ $depth }) => ($depth === 0 ? "18px" : $depth === 1 ? "13px" : "9px")};
   position: absolute;
   text-align: center;
-  opacity: ${({ $nodeType }) => ($nodeType === "implementation_unit" ? 0.88 : 1)};
   overflow: visible;
 
   &:hover {
     border-color: ${({ $tone }) => $tone || "#38bdf8"};
     transform: scale(1.025);
   }
+`;
+
+const AgentCountBadge = styled.span`
+  align-items: center;
+  background: rgba(7, 12, 19, 0.92);
+  border: 1px solid rgba(230, 236, 245, 0.16);
+  border-radius: 999px;
+  color: #f8fafc;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 900;
+  height: 22px;
+  justify-content: center;
+  min-width: 22px;
+  padding: 0 6px;
+  position: absolute;
+  right: -7px;
+  top: -7px;
+  z-index: 3;
 `;
 
 const ActiveAgentOrbit = styled.span`
@@ -1023,7 +901,7 @@ const Inspector = styled.aside`
 `;
 
 const InspectorHeader = styled.header`
-  align-items: center;
+  align-items: flex-start;
   border-bottom: 1px solid rgba(230, 236, 245, 0.07);
   display: flex;
   justify-content: space-between;
@@ -1037,6 +915,40 @@ const InspectorHeader = styled.header`
     line-height: 1.24;
     margin: 0;
     min-width: 0;
+  }
+`;
+
+const InspectorFacts = styled.div`
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 5px;
+
+  span {
+    border: 1px solid rgba(230, 236, 245, 0.12);
+    border-radius: 999px;
+    color: rgba(238, 245, 255, 0.82);
+    font-size: 10px;
+    font-weight: 820;
+    line-height: 1;
+    padding: 5px 8px;
+    text-transform: lowercase;
+  }
+
+  span[data-state="updated"] {
+    border-color: rgba(52, 211, 153, 0.3);
+    color: #86efac;
+  }
+
+  span[data-state="behind_code"] {
+    border-color: rgba(251, 113, 133, 0.3);
+    color: #fda4af;
+  }
+
+  span[data-state="ahead_of_code"] {
+    border-color: rgba(251, 191, 36, 0.3);
+    color: #fde68a;
   }
 `;
 
@@ -1058,205 +970,59 @@ const MarkdownPane = styled.div`
   }
 `;
 
+const SpecObjectsSection = styled.section`
+  border-top: 1px solid rgba(230, 236, 245, 0.07);
+  padding: 12px;
+
+  h3 {
+    color: rgba(238, 245, 255, 0.72);
+    font-size: 10px;
+    font-weight: 860;
+    letter-spacing: 0.08em;
+    margin: 0 0 8px;
+    text-transform: uppercase;
+  }
+`;
+
+const SpecObjectCard = styled.article`
+  border: 1px solid ${({ $historical }) => ($historical ? "rgba(148, 163, 184, 0.16)" : "rgba(52, 211, 153, 0.18)")};
+  border-radius: 8px;
+  background: ${({ $historical }) => ($historical ? "rgba(15, 23, 42, 0.38)" : "rgba(6, 78, 59, 0.14)")};
+  padding: 9px 10px;
+
+  & + & {
+    margin-top: 7px;
+  }
+
+  p {
+    color: rgba(229, 236, 246, ${({ $historical }) => ($historical ? 0.58 : 0.86)});
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1.45;
+    margin: 0;
+  }
+
+  small {
+    color: rgba(251, 191, 36, 0.82);
+    display: block;
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1.4;
+    margin-top: 7px;
+  }
+`;
+
+const SpecObjectsEmpty = styled.div`
+  color: rgba(219, 231, 247, 0.38);
+  font-size: 11px;
+  font-weight: 650;
+`;
+
 const InspectorEmpty = styled.div`
   color: rgba(219, 231, 247, 0.48);
   font-size: 12px;
   font-weight: 680;
   padding: 14px;
-`;
-
-const BoardColumns = styled.div`
-  display: grid;
-  gap: 6px;
-  grid-template-columns: repeat(6, minmax(170px, 1fr));
-  height: 100%;
-  min-height: 0;
-  overflow: auto;
-  padding: 6px;
-
-  @media (max-width: 1500px) {
-    grid-template-columns: repeat(3, minmax(190px, 1fr));
-  }
-
-  @media (max-width: 900px) {
-    grid-template-columns: 1fr;
-  }
-`;
-
-const BoardColumn = styled.section`
-  border: 1px solid rgba(230, 236, 245, 0.06);
-  border-radius: 8px;
-  background: rgba(13, 17, 23, 0.48);
-  min-height: 280px;
-  overflow: hidden;
-`;
-
-const ColumnHeader = styled.header`
-  align-items: center;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.06);
-  display: flex;
-  justify-content: space-between;
-  padding: 8px 9px;
-
-  span {
-    align-items: center;
-    color: rgba(219, 231, 247, 0.56);
-    display: inline-flex;
-    font-size: 10px;
-    font-weight: 800;
-    gap: 7px;
-    text-transform: uppercase;
-
-    &::before {
-      background: ${({ $tone }) => $tone || "#60a5fa"};
-      border-radius: 999px;
-      content: "";
-      height: 14px;
-      width: 3px;
-    }
-  }
-
-  strong {
-    border: 1px solid rgba(230, 236, 245, 0.08);
-    border-radius: 6px;
-    color: rgba(219, 231, 247, 0.62);
-    font-size: 10px;
-    font-weight: 800;
-    min-width: 20px;
-    padding: 2px 6px;
-    text-align: center;
-  }
-`;
-
-const TaskStack = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 6px;
-`;
-
-const SpecCardButton = styled.button`
-  border: 1px solid ${({ $active }) => ($active ? "rgba(56, 189, 248, 0.52)" : "rgba(230, 236, 245, 0.06)")};
-  border-radius: 8px;
-  background: ${({ $active }) => ($active ? "rgba(56, 189, 248, 0.11)" : "rgba(7, 9, 13, 0.56)")};
-  color: inherit;
-  cursor: pointer;
-  padding: 8px;
-  text-align: left;
-  width: 100%;
-`;
-
-const TaskTitle = styled.h2`
-  color: #eef5ff;
-  font-size: 12px;
-  font-weight: 760;
-  line-height: 1.28;
-  margin: 0;
-`;
-
-const TaskBody = styled.p`
-  color: rgba(219, 231, 247, 0.56);
-  font-size: 11px;
-  font-weight: 620;
-  line-height: 1.4;
-  margin: 5px 0 0;
-`;
-
-const TaskMeta = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
-`;
-
-const TaskBadge = styled.span`
-  border: 1px solid ${({ $color }) => $color || "rgba(230, 236, 245, 0.08)"};
-  border-radius: 6px;
-  background: rgba(230, 236, 245, 0.035);
-  color: ${({ $color }) => $color || "rgba(219, 231, 247, 0.68)"};
-  font-size: 10px;
-  font-weight: 800;
-  line-height: 1;
-  max-width: 100%;
-  overflow: hidden;
-  padding: 4px 6px;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-`;
-
-const ColumnEmpty = styled.div`
-  border: 1px dashed rgba(230, 236, 245, 0.08);
-  border-radius: 8px;
-  color: rgba(219, 231, 247, 0.42);
-  font-size: 11px;
-  font-weight: 650;
-  padding: 8px 9px;
-`;
-
-const TableWrap = styled.div`
-  height: 100%;
-  overflow: auto;
-`;
-
-const SpecTable = styled.table`
-  border-collapse: collapse;
-  min-width: 900px;
-  width: 100%;
-
-  th,
-  td {
-    border-bottom: 1px solid rgba(230, 236, 245, 0.06);
-    padding: 9px 10px;
-    text-align: left;
-    vertical-align: top;
-  }
-
-  th {
-    background: rgba(13, 17, 23, 0.92);
-    color: rgba(219, 231, 247, 0.5);
-    font-size: 10px;
-    font-weight: 850;
-    position: sticky;
-    text-transform: uppercase;
-    top: 0;
-    z-index: 1;
-  }
-
-  td {
-    color: rgba(219, 231, 247, 0.7);
-    font-size: 11px;
-    font-weight: 640;
-    line-height: 1.35;
-  }
-
-  tr {
-    cursor: pointer;
-  }
-
-  tr[data-active="true"] {
-    background: rgba(56, 189, 248, 0.09);
-  }
-
-  tr:hover {
-    background: rgba(230, 236, 245, 0.035);
-  }
-
-  strong {
-    color: #eef5ff;
-    display: block;
-    font-size: 12px;
-    font-weight: 760;
-  }
-
-  small {
-    color: rgba(219, 231, 247, 0.48);
-    display: block;
-    font-size: 10.5px;
-    font-weight: 620;
-    margin-top: 3px;
-    max-width: 420px;
-  }
 `;
 
 const EmptyState = styled.div`

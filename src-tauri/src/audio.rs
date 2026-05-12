@@ -3243,7 +3243,7 @@ async fn stop_deepgram_realtime_transcription(
     )
     .await
     .map_err(|_| "Deepgram realtime transcription timed out.".to_string())?
-    .map_err(|_| "Deepgram realtime transcription stopped before a result was returned.".to_string())?;
+    .map_err(|_| "Deepgram realtime transcription stopped before a result was returned.".to_string())??;
     log_audio_diagnostic_event(
         "audio.deepgram.stop.done",
         json!({

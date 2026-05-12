@@ -761,50 +761,6 @@ fn unregister_audio_shortcut(app: &AppHandle, shortcut_text: &str) {
     }
 }
 
-fn register_deferred_audio_cancel_shortcut(app: &AppHandle) {
-    let manager = app.state::<AudioState>().shortcut_manager.clone();
-    let shortcut = manager.snapshot().cancel.shortcut;
-
-    if audio_cancel_shortcut_defers_global_registration(&shortcut) {
-        log_audio_diagnostic_event(
-            "audio.ptt.cancel_shortcut.defer_register_start",
-            json!({
-                "shortcut": shortcut,
-            }),
-        );
-        match register_audio_shortcut_handler(app, AudioShortcutAction::Cancel, &shortcut) {
-            Ok(()) => log_audio_diagnostic_event(
-                "audio.ptt.cancel_shortcut.defer_register_done",
-                json!({
-                    "shortcut": shortcut,
-                }),
-            ),
-            Err(error) => log_audio_diagnostic_event(
-                "audio.ptt.cancel_shortcut.defer_register_error",
-                json!({
-                    "shortcut": shortcut,
-                    "error": clean_whisper_local_audio_log_text(&error),
-                }),
-            ),
-        }
-    }
-}
-
-fn unregister_deferred_audio_cancel_shortcut(app: &AppHandle) {
-    let manager = app.state::<AudioState>().shortcut_manager.clone();
-    let shortcut = manager.snapshot().cancel.shortcut;
-
-    if audio_cancel_shortcut_defers_global_registration(&shortcut) {
-        log_audio_diagnostic_event(
-            "audio.ptt.cancel_shortcut.defer_unregister",
-            json!({
-                "shortcut": shortcut,
-            }),
-        );
-        unregister_audio_shortcut(app, &shortcut);
-    }
-}
-
 fn register_audio_shortcut_registration(
     app: &AppHandle,
     action: AudioShortcutAction,
@@ -1279,13 +1235,7 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
             };
 
             if !widget_visible {
-                if AUDIO_PUSH_TO_TALK_IS_DOWN.swap(false, Ordering::AcqRel) {
-                    log_audio_diagnostic_event(
-                        "audio.ptt.handle.not_visible_cancel_down",
-                        json!({}),
-                    );
-                    unregister_deferred_audio_cancel_shortcut(&app);
-                }
+                AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
                 log_audio_diagnostic_event("audio.ptt.handle.ignored_not_visible", json!({}));
                 return false;
             }
@@ -1294,9 +1244,6 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                 log_audio_diagnostic_event("audio.ptt.handle.duplicate_press", json!({}));
                 return true;
             }
-
-            log_audio_diagnostic_event("audio.ptt.handle.register_cancel_shortcut", json!({}));
-            register_deferred_audio_cancel_shortcut(&app);
 
             log_audio_diagnostic_event("audio.ptt.handle.spawn_press_task", json!({}));
             tauri::async_runtime::spawn(async move {
@@ -1324,7 +1271,6 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
 
                 if !widget_visible {
                     AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
-                    unregister_deferred_audio_cancel_shortcut(&app);
                     log_audio_diagnostic_event(
                         "audio.ptt.press_task.ignored_not_visible",
                         json!({}),
@@ -1410,9 +1356,6 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                 return false;
             }
 
-            log_audio_diagnostic_event("audio.ptt.handle.unregister_cancel_shortcut", json!({}));
-            unregister_deferred_audio_cancel_shortcut(&app);
-
             log_audio_diagnostic_event("audio.ptt.handle.spawn_release_task", json!({}));
             tauri::async_runtime::spawn(async move {
                 log_audio_diagnostic_event("audio.ptt.release_task.emit_released", json!({}));
@@ -1442,7 +1385,6 @@ fn handle_audio_cancel_shortcut_state(app: AppHandle, state: ShortcutState, shor
     }
 
     AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
-    unregister_deferred_audio_cancel_shortcut(&app);
 
     tauri::async_runtime::spawn(async move {
         log_audio_diagnostic_event("audio.ptt.cancel_task.emit", json!({}));

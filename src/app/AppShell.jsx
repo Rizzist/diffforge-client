@@ -13,6 +13,7 @@ import "@xterm/xterm/css/xterm.css";
 import "@vscode/codicons/dist/codicon.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
+import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import { TerminalDevMetrics, addTerminalMetrics, getWorkspaceOpenTelemetryFields, patchTerminalMetrics, startWorkspaceOpenTelemetry, useTerminalDevMetrics, writeTerminalTelemetry } from "../terminals/terminalTelemetry.jsx";
 import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
@@ -360,7 +361,7 @@ import {
 import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import KanbanWorkspaceView from "../kanban/KanbanWorkspaceView.jsx";
+import SpecGraphWorkspaceView from "../kanban/KanbanWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import CoordinationWorkspaceView from "../coordination/CoordinationWorkspaceView.jsx";
 
@@ -1114,17 +1115,6 @@ function getAgentUpdateSummary(agents) {
   return updateLabels.join(" / ");
 }
 
-function collapseAgentWorktreeRootDirectory(value) {
-  const normalized = String(value || "").replace(/\\/g, "/");
-  const markerIndex = normalized.indexOf("/.agents/worktrees");
-
-  if (markerIndex <= 0) {
-    return value;
-  }
-
-  return value.slice(0, markerIndex).replace(/[\\/]+$/g, "");
-}
-
 function cleanWorkspaceRootDirectory(value) {
   if (typeof value !== "string") {
     return "";
@@ -1134,16 +1124,16 @@ function cleanWorkspaceRootDirectory(value) {
   const uncVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]UNC[\\/](.+)$/i);
 
   if (uncVerbatimMatch) {
-    return collapseAgentWorktreeRootDirectory(`\\\\${uncVerbatimMatch[1]}`.trim());
+    return collapseFunctionalRepoPathToCoreRepoPath(`\\\\${uncVerbatimMatch[1]}`.trim());
   }
 
   const driveVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]([a-z]:[\\/].*)$/i);
 
   if (driveVerbatimMatch) {
-    return collapseAgentWorktreeRootDirectory(driveVerbatimMatch[1].trim());
+    return collapseFunctionalRepoPathToCoreRepoPath(driveVerbatimMatch[1].trim());
   }
 
-  return collapseAgentWorktreeRootDirectory(cleaned);
+  return collapseFunctionalRepoPathToCoreRepoPath(cleaned);
 }
 
 function isWindowsSystemRootDirectory(value) {
@@ -4547,7 +4537,7 @@ export default function App() {
                     type="button"
                   >
                     <ButtonForgeIcon aria-hidden="true" />
-                    <span>Feature Matrix</span>
+                    <span>Spec Graph</span>
                   </RailActionButton>
                   <RailActionButton
                     data-active={activeView === "vault"}
@@ -5025,8 +5015,8 @@ export default function App() {
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "kanban" ? (
-                <ForgeWorkspace aria-label="Workspace Feature Matrix" data-motion={viewMotion}>
-                  <KanbanWorkspaceView
+                <ForgeWorkspace aria-label="Workspace Spec Graph" data-motion={viewMotion}>
+                  <SpecGraphWorkspaceView
                     defaultWorkingDirectory={defaultWorkingDirectory}
                     rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
                     workspace={selectedWorkspace}

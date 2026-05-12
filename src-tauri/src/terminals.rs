@@ -883,6 +883,20 @@ fn spawn_terminal_reader(
         if let Some(instance) = remove_terminal_instance_if_current(&terminals, &pane_id, instance_id)
             .await
         {
+            let notify_state = cloud_mcp_state.clone();
+            let notify_pane_id = pane_id.clone();
+            let notify_instance = instance.clone();
+            let notify_task = tauri::async_runtime::spawn(async move {
+                cloud_mcp_mark_terminal_closed(
+                    &notify_state,
+                    &notify_pane_id,
+                    instance_id,
+                    &notify_instance,
+                    "reader_exit",
+                )
+                .await;
+            });
+            let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
             cleanup_terminal_instance_async(
                 instance,
                 false,
@@ -905,6 +919,7 @@ fn spawn_terminal_reader(
 
 async fn close_terminal_session(
     state: &TerminalState,
+    cloud_mcp_state: Option<&CloudMcpState>,
     pane_id: &str,
     instance_id: Option<u64>,
 ) -> Result<bool, String> {
@@ -931,6 +946,22 @@ async fn close_terminal_session(
         let cleanup_started_at = Instant::now();
         let cleanup_instance_id = instance.id;
         let cleanup_pane_id = pane_id.to_string();
+        if let Some(cloud_mcp_state) = cloud_mcp_state {
+            let notify_state = cloud_mcp_state.clone();
+            let notify_instance = instance.clone();
+            let notify_pane_id = pane_id.to_string();
+            let notify_task = tauri::async_runtime::spawn(async move {
+                cloud_mcp_mark_terminal_closed(
+                    &notify_state,
+                    &notify_pane_id,
+                    cleanup_instance_id,
+                    &notify_instance,
+                    "terminal_close",
+                )
+                .await;
+            });
+            let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
+        }
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
             cleanup_terminal_instance_with_context(
                 instance,
@@ -976,6 +1007,7 @@ async fn close_terminal_session(
 async fn close_all_terminal_sessions(
     app: AppHandle,
     state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
 ) -> Result<usize, String> {
     let close_started_at = Instant::now();
     let instances = {
@@ -989,6 +1021,30 @@ async fn close_all_terminal_sessions(
     let closed = instances.len();
     let total = closed;
     let warm_total = warm_ptys.len();
+
+    let lifecycle_notifications = instances
+        .iter()
+        .map(|(pane_id, instance)| {
+            let notify_state = cloud_mcp_state.clone();
+            let notify_pane_id = pane_id.clone();
+            let notify_instance = instance.clone();
+            tauri::async_runtime::spawn(async move {
+                cloud_mcp_mark_terminal_closed(
+                    &notify_state,
+                    &notify_pane_id,
+                    notify_instance.id,
+                    &notify_instance,
+                    "close_all",
+                )
+                .await;
+            })
+        })
+        .collect::<Vec<_>>();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(2_000),
+        futures_util::future::join_all(lifecycle_notifications),
+    )
+    .await;
 
     emit_terminal_close_all_progress(&app, 0, total, None, None);
 
@@ -1297,7 +1353,7 @@ async fn terminal_open(
     }
 
     let close_started_at = Instant::now();
-    let closed_existing = close_terminal_session(&state, &pane_id, None)
+    let closed_existing = close_terminal_session(&state, Some(cloud_mcp_state.inner()), &pane_id, None)
         .await
         .unwrap_or(false);
     log_terminal_event(
@@ -1687,6 +1743,12 @@ async fn terminal_open(
         command,
         working_directory: workspace_path_display(&process_working_directory),
         project_root: workspace_path_display(&working_directory),
+        agent_id: coordination_context
+            .as_ref()
+            .map(|context| context.agent_id.clone()),
+        session_id: coordination_context
+            .as_ref()
+            .map(|context| context.session_id.clone()),
         agent_branch_root: coordination_context
             .as_ref()
             .map(|context| context.write_root.clone()),
@@ -2445,12 +2507,17 @@ async fn terminal_write_to_audio_input_target(
     Ok(wrote)
 }
 
-async fn terminal_observe_submitted_prompt(
-    instance: &TerminalInstance,
+fn terminal_observe_input_gate_submitted_prompt(
+    gate: &mut TerminalInputGate,
     data: &str,
 ) -> Option<String> {
-    let mut gate = instance.input_gate.lock().await;
     let mut submitted = None;
+
+    if data == TERMINAL_SHIFT_ENTER_SEQUENCE {
+        gate.current_line.push('\n');
+        gate.current_line_user_touched = true;
+        return None;
+    }
 
     for character in data.chars() {
         if gate.ansi_osc_active {
@@ -2547,6 +2614,15 @@ async fn terminal_observe_submitted_prompt(
     submitted
 }
 
+async fn terminal_observe_submitted_prompt(
+    instance: &TerminalInstance,
+    data: &str,
+) -> Option<String> {
+    let mut gate = instance.input_gate.lock().await;
+
+    terminal_observe_input_gate_submitted_prompt(&mut gate, data)
+}
+
 fn terminal_prompt_task_title(prompt: &str) -> String {
     let cleaned = clean_terminal_telemetry_text(prompt)
         .split_whitespace()
@@ -2632,6 +2708,7 @@ struct TerminalParkingSnapshot {
     ready: bool,
     terminal: bool,
     waiting_on: Vec<TerminalParkedWaitingOn>,
+    parked_resource_intents: Vec<Value>,
 }
 
 fn terminal_parking_snapshot_signature(snapshot: &TerminalParkingSnapshot) -> String {
@@ -2665,29 +2742,29 @@ fn terminal_parked_prompt_key(pane_id: &str, instance_id: u64, task_id: &str) ->
 
 fn terminal_waiting_agent_label(agent_id: &str) -> String {
     let short = agent_id
-        .split('-')
-        .next()
-        .unwrap_or(agent_id)
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .take(3)
-        .collect::<String>()
-        .to_ascii_uppercase();
+        .collect::<String>();
     if short.is_empty() {
-        "AGT".to_string()
+        "agt".to_string()
     } else {
         short
     }
 }
 
 fn terminal_waiting_slot_label(slot_key: &str) -> String {
-    let lower = slot_key.trim().to_ascii_lowercase();
-    if let Some(number) = lower.strip_prefix("codex-").and_then(|value| value.parse::<u8>().ok()) {
-        if (1..=26).contains(&number) {
-            return format!("CX{}", (b'A' + number - 1) as char);
-        }
+    let short = slot_key
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(3)
+        .collect::<String>();
+    if short.is_empty() {
+        "slot".to_string()
+    } else {
+        short
     }
-    slot_key.to_ascii_uppercase()
 }
 
 fn terminal_parked_waiting_on_from_details(details: &Value) -> Vec<TerminalParkedWaitingOn> {
@@ -2715,8 +2792,8 @@ fn terminal_parked_waiting_on_from_details(details: &Value) -> Vec<TerminalParke
             let agent_label = blocker["agent_label"]
                 .as_str()
                 .map(str::to_string)
-                .or_else(|| blocker["slot_key"].as_str().map(terminal_waiting_slot_label))
-                .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label));
+                .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label))
+                .or_else(|| blocker["slot_key"].as_str().map(terminal_waiting_slot_label));
             terminal_push_unique_waiting_on(
                 &mut waiting_on,
                 TerminalParkedWaitingOn {
@@ -2768,10 +2845,14 @@ fn terminal_parked_waiting_on_from_blocking_dependencies(
             continue;
         }
         let agent_id = item["depends_on_agent_id"].as_str().map(str::to_string);
-        let agent_label = item["depends_on_slot_key"]
-            .as_str()
-            .map(terminal_waiting_slot_label)
-            .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label));
+        let agent_label = agent_id
+            .as_deref()
+            .map(terminal_waiting_agent_label)
+            .or_else(|| {
+                item["depends_on_slot_key"]
+                    .as_str()
+                    .map(terminal_waiting_slot_label)
+            });
         terminal_push_unique_waiting_on(
             &mut waiting_on,
             TerminalParkedWaitingOn {
@@ -2936,6 +3017,10 @@ fn terminal_parking_snapshot_from_kernel(
                 dependency.status AS depends_on_status,
                 dependency_session.agent_id AS depends_on_agent_id,
                 dependency_slot.slot_key AS depends_on_slot_key,
+                dependency_lease.id AS depends_on_lease_id,
+                dependency_lease.status AS depends_on_lease_status,
+                dependency_lease.reason AS depends_on_lease_reason,
+                dependency_lease.released_at AS depends_on_lease_released_at,
                 0 AS satisfied
          FROM task_resource_intents i
          LEFT JOIN tasks dependency ON dependency.id = i.depends_on_task_id
@@ -2950,6 +3035,18 @@ fn terminal_parking_snapshot_from_kernel(
                 LIMIT 1
               )
          LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
+         LEFT JOIN leases dependency_lease
+           ON dependency_lease.id = (
+                SELECT l.id
+                FROM leases l
+                JOIN resources leased_resource ON leased_resource.id = l.resource_id
+                WHERE l.task_id = i.depends_on_task_id
+                  AND leased_resource.resource_key = i.resource_key
+                ORDER BY CASE WHEN l.status='active' THEN 0 ELSE 1 END,
+                         COALESCE(l.released_at, l.last_heartbeat_at, l.acquired_at) DESC,
+                         l.acquired_at DESC
+                LIMIT 1
+              )
          WHERE i.task_id=?1
            AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
          ORDER BY i.updated_at ASC",
@@ -2981,6 +3078,7 @@ fn terminal_parking_snapshot_from_kernel(
         ready,
         terminal,
         waiting_on,
+        parked_resource_intents,
     }))
 }
 
@@ -3005,6 +3103,222 @@ fn terminal_resume_state_prompt(state: &Value) -> String {
     } else {
         format!("{raw_title}\n\n{body}")
     }
+}
+
+fn terminal_resume_clean_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.replace('\r', "\n");
+    let mut lines = Vec::new();
+    for line in normalized.lines() {
+        let safe = line
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let compact = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !compact.is_empty() {
+            lines.push(compact);
+        }
+    }
+
+    let cleaned = lines.join("\n").trim().to_string();
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+
+    let take_chars = max_chars.saturating_sub(3);
+    format!("{}...", cleaned.chars().take(take_chars).collect::<String>())
+}
+
+fn terminal_resume_value_text(value: Option<&str>, fallback: &str, max_chars: usize) -> String {
+    let cleaned = value
+        .map(|value| terminal_resume_clean_text(value, max_chars))
+        .unwrap_or_default();
+    if cleaned.is_empty() {
+        terminal_resume_clean_text(fallback, max_chars)
+    } else {
+        cleaned
+    }
+}
+
+fn terminal_resume_resource_label(resource_key: &str) -> String {
+    let cleaned = terminal_resume_clean_text(resource_key, 120);
+    cleaned
+        .strip_prefix("file:")
+        .map(str::to_string)
+        .unwrap_or(cleaned)
+}
+
+fn terminal_resume_dependency_actor(intent: &Value) -> String {
+    if let Some(agent_id) = intent["depends_on_agent_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("agent {}", terminal_waiting_agent_label(agent_id));
+    }
+    if let Some(slot_key) = intent["depends_on_slot_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("agent {}", terminal_waiting_slot_label(slot_key));
+    }
+    "another agent".to_string()
+}
+
+fn terminal_resume_dependency_title(intent: &Value) -> String {
+    terminal_resume_value_text(
+        intent["depends_on_title"].as_str(),
+        "the blocking task",
+        180,
+    )
+}
+
+fn terminal_resume_original_task(
+    fallback_title: &str,
+    fallback_prompt: &str,
+    resume_state: Option<&Value>,
+) -> String {
+    let state_prompt = resume_state.map(terminal_resume_state_prompt);
+    let raw_prompt = state_prompt.as_deref().unwrap_or(fallback_prompt);
+    let prompt = terminal_resume_clean_text(raw_prompt, 1400);
+    let title = terminal_resume_clean_text(fallback_title, 300);
+    let prompt_is_generic = terminal_placeholder_task_body(&prompt)
+        || prompt.eq_ignore_ascii_case("Continue the queued work now that the dependency has cleared.");
+
+    if prompt_is_generic || prompt.is_empty() {
+        title
+    } else if title.is_empty()
+        || terminal_placeholder_task_title(&title)
+        || prompt.to_ascii_lowercase().contains(&title.to_ascii_lowercase())
+    {
+        prompt
+    } else {
+        format!("{title}\n{prompt}")
+    }
+}
+
+fn terminal_resume_park_reason_lines(snapshot: &TerminalParkingSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for intent in &snapshot.parked_resource_intents {
+        let resource = terminal_resume_resource_label(
+            intent["resource_key"]
+                .as_str()
+                .unwrap_or("the requested resource"),
+        );
+        let actor = terminal_resume_dependency_actor(intent);
+        let dependency_title = terminal_resume_dependency_title(intent);
+        let intent_summary = terminal_resume_value_text(intent["intent_summary"].as_str(), "", 180);
+        let blocker_reason =
+            terminal_resume_value_text(intent["depends_on_lease_reason"].as_str(), "", 180);
+        let key = format!("{resource}:{actor}:{dependency_title}:{intent_summary}:{blocker_reason}");
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let line = if !intent_summary.is_empty() && !blocker_reason.is_empty() {
+            format!(
+                "- {resource}: you needed this for \"{intent_summary}\", but {actor} had leased it for \"{blocker_reason}\"."
+            )
+        } else if !intent_summary.is_empty() {
+            format!(
+                "- {resource}: you needed this for \"{intent_summary}\" and were waiting on {actor}'s task \"{dependency_title}\"."
+            )
+        } else if !blocker_reason.is_empty() {
+            format!(
+                "- {resource}: parked because {actor} had leased it for \"{blocker_reason}\"."
+            )
+        } else {
+            format!("- {resource}: parked behind {actor}'s task \"{dependency_title}\".")
+        };
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        lines.push("- The task was parked behind a local coordination dependency that has now cleared.".to_string());
+    }
+    lines
+}
+
+fn terminal_resume_dependency_resolution_lines(snapshot: &TerminalParkingSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for intent in &snapshot.parked_resource_intents {
+        let resource = terminal_resume_resource_label(
+            intent["resource_key"]
+                .as_str()
+                .unwrap_or("the requested resource"),
+        );
+        let actor = terminal_resume_dependency_actor(intent);
+        let dependency_title = terminal_resume_dependency_title(intent);
+        let task_status =
+            terminal_resume_value_text(intent["depends_on_status"].as_str(), "cleared", 60);
+        let lease_status =
+            terminal_resume_value_text(intent["depends_on_lease_status"].as_str(), "", 60);
+        let key = format!("{resource}:{actor}:{dependency_title}:{task_status}:{lease_status}");
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let status_note = if lease_status.is_empty() {
+            format!("task status is `{task_status}`")
+        } else {
+            format!("task status is `{task_status}` and lease status is `{lease_status}`")
+        };
+        lines.push(format!(
+            "- {actor}'s dependency \"{dependency_title}\" has cleared for {resource}; {status_note}."
+        ));
+    }
+
+    if lines.is_empty() {
+        lines.push("- The dependency monitor marked this parked task resume-ready.".to_string());
+    }
+    lines
+}
+
+fn terminal_resume_refresh_note(resume_state: Option<&Value>) -> Option<String> {
+    let refresh_count = resume_state
+        .and_then(|state| state["data"]["worktree_refreshes"].as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if refresh_count == 0 {
+        None
+    } else {
+        Some(format!(
+            "- Diff Forge requested a worktree refresh for {refresh_count} checked-out worktree(s) before resuming."
+        ))
+    }
+}
+
+fn terminal_rich_parked_resume_prompt(
+    snapshot: &TerminalParkingSnapshot,
+    fallback_title: &str,
+    fallback_prompt: &str,
+    resume_state: Option<&Value>,
+) -> String {
+    let original_task = terminal_resume_original_task(fallback_title, fallback_prompt, resume_state);
+    let parked_lines = terminal_resume_park_reason_lines(snapshot).join("\n");
+    let resolved_lines = terminal_resume_dependency_resolution_lines(snapshot).join("\n");
+    let refresh_note = terminal_resume_refresh_note(resume_state)
+        .map(|line| format!("\n\nContext refresh:\n{line}"))
+        .unwrap_or_default();
+
+    format!(
+        "Diff Forge parked task is ready to resume.\n\n\
+Original task:\n{original_task}\n\n\
+Why you were parked:\n{parked_lines}\n\n\
+Dependency now resolved:\n{resolved_lines}{refresh_note}\n\n\
+Continue now:\n\
+1. Call coordination-kernel.get_brief to refresh coordination state.\n\
+2. Inspect the current target file(s) before editing so you do not work from stale context.\n\
+3. Re-acquire the needed lease(s), continue the original task above, and submit the patch when finished."
+    )
 }
 
 fn emit_terminal_parked_prompt_event(
@@ -3459,15 +3773,17 @@ async fn terminal_resume_parked_prompt_when_ready(
             json!({
                 "title": clean_terminal_telemetry_text(&title),
                 "prompt_bytes": prompt.len(),
-                "resume_input_policy": "submit_original_parked_request_to_existing_terminal",
+                "resume_input_policy": "submit_structured_parked_resume_context_to_existing_terminal",
             }),
         );
-        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        let resume_state = if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
             &coordination.repo_path,
             Some(PathBuf::from(&coordination.db_path)),
         ) {
-            let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
-        }
+            kernel.task_resume_state(&task_id, &coordination.session_id).ok()
+        } else {
+            None
+        };
         let Some(instance) = ({
             let guard = terminals.read().await;
             guard.get(&pane_id).cloned()
@@ -3539,21 +3855,8 @@ async fn terminal_resume_parked_prompt_when_ready(
             }
             return;
         }
-        let compact_title = clean_terminal_telemetry_text(&title)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let compact_prompt = clean_terminal_telemetry_text(&prompt)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let resume_request = if terminal_placeholder_task_body(&compact_prompt)
-            || compact_prompt.eq_ignore_ascii_case("Continue the queued work now that the dependency has cleared.")
-        {
-            compact_title
-        } else {
-            compact_prompt
-        };
+        let resume_request =
+            terminal_rich_parked_resume_prompt(&snapshot, &title, &prompt, resume_state.as_ref());
         let resume_input_bytes =
             resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
         if resume_input_bytes > MAX_TERMINAL_WRITE_BYTES {
@@ -5161,6 +5464,7 @@ async fn terminal_resize(
 #[tauri::command]
 async fn terminal_close(
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
     instance_id: Option<u64>,
 ) -> Result<(), String> {
@@ -5175,7 +5479,7 @@ async fn terminal_close(
         json!({}),
     );
 
-    match close_terminal_session(&state, &pane_id, instance_id).await {
+    match close_terminal_session(&state, Some(cloud_mcp_state.inner()), &pane_id, instance_id).await {
         Ok(closed) => {
             log_terminal_event(
                 "terminal.close.done",
@@ -5204,10 +5508,11 @@ async fn terminal_close(
 async fn terminal_close_all(
     app: AppHandle,
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
 ) -> Result<TerminalCloseAllResult, String> {
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
-    let closed = close_all_terminal_sessions(app, &state).await?;
+    let closed = close_all_terminal_sessions(app, &state, cloud_mcp_state.inner()).await?;
 
     Ok(TerminalCloseAllResult { closed })
 }
@@ -5265,6 +5570,64 @@ mod terminal_tests {
         assert!(terminal_prompt_is_agent_command("/model"));
         assert!(terminal_prompt_is_agent_command(" /fast "));
         assert!(!terminal_prompt_is_agent_command("make /api docs page"));
+    }
+
+    #[test]
+    fn shift_enter_sequence_adds_line_break_without_prompt_submission() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "first line"),
+            None
+        );
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, TERMINAL_SHIFT_ENTER_SEQUENCE),
+            None
+        );
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "second line\r"),
+            Some("first line\nsecond line".to_string())
+        );
+    }
+
+    #[test]
+    fn parked_resume_prompt_includes_dependency_context() {
+        let snapshot = TerminalParkingSnapshot {
+            task_id: "task-resume".to_string(),
+            title: "Darken pricing page".to_string(),
+            prompt: "Nice redesign the pricing to be more dark tones.".to_string(),
+            task_status: "ready".to_string(),
+            session_status: "active".to_string(),
+            ready: true,
+            terminal: false,
+            waiting_on: Vec::new(),
+            parked_resource_intents: vec![json!({
+                "resource_key": "file:pricing.html",
+                "intent_summary": "Darken the pricing page visual treatment",
+                "depends_on_task_id": "task-pricing-create",
+                "depends_on_title": "Create ice cream pricing page",
+                "depends_on_status": "done",
+                "depends_on_agent_id": "90385961-4fb5-4ec2-9b63-8155a7e0e56b",
+                "depends_on_lease_status": "released",
+                "depends_on_lease_reason": "Create standalone pricing page for ice cream wishlist site",
+            })],
+        };
+
+        let prompt = terminal_rich_parked_resume_prompt(
+            &snapshot,
+            &snapshot.title,
+            &snapshot.prompt,
+            None,
+        );
+
+        assert!(prompt.contains("Diff Forge parked task is ready to resume."));
+        assert!(prompt.contains("Original task:"));
+        assert!(prompt.contains("Why you were parked:"));
+        assert!(prompt.contains("pricing.html"));
+        assert!(prompt.contains("Create standalone pricing page for ice cream wishlist site"));
+        assert!(prompt.contains("Dependency now resolved:"));
+        assert!(prompt.contains("Re-acquire the needed lease"));
+        assert!(!prompt.ends_with('\r'));
     }
 
     #[test]

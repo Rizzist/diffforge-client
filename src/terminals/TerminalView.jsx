@@ -261,13 +261,12 @@ function cloudMcpEntryField(entry, ...keys) {
 
 function cloudMcpThreeId(value) {
   const text = String(value || "").trim();
-  if (!text) return "AGT";
-  const firstSegment = text.split("-")[0] || text;
-  return firstSegment
+  if (!text) return "agt";
+  if (text.toLowerCase().startsWith("workspace-terminal-")) return "agt";
+  return text
     .replace(/[^a-z0-9]/gi, "")
     .slice(0, 3)
-    .padEnd(3, "x")
-    .toUpperCase();
+    || "agt";
 }
 
 function cloudMcpPaneLabel(value) {
@@ -275,13 +274,9 @@ function cloudMcpPaneLabel(value) {
   if (!text) return "";
   const match = text.match(/workspace-terminal-.+-(\d+)-([a-z0-9_-]+)$/i);
   if (!match) return "";
-  const index = Number.parseInt(match[1], 10);
   const provider = String(match[2] || "").toLowerCase();
-  const prefix = provider.includes("claude") ? "CL" : provider.includes("codex") ? "CX" : "AG";
-  if (!Number.isFinite(index) || index < 0) return prefix;
-  const letter = String.fromCharCode(65 + (index % 26));
-  const cycle = Math.floor(index / 26);
-  return `${prefix}${letter}${cycle > 0 ? cycle + 1 : ""}`;
+  if (provider.includes("generic") || provider.includes("shell")) return "sh";
+  return "";
 }
 
 function cloudMcpAgentColor(value) {
@@ -307,22 +302,24 @@ function cloudMcpActivitySource(entry) {
   const phase = String(entry?.phase || "").toLowerCase();
   const clientId = String(cloudMcpEntryField(entry, "clientId", "client_id")).toLowerCase();
   const agentId = cloudMcpEntryField(entry, "agentId", "agent_id", "actor");
+  const agentLabel = cloudMcpEntryField(entry, "agentLabel", "agent_label");
   const paneId = cloudMcpEntryField(entry, "paneId", "pane_id", "terminal_id", "terminalId");
   const paneLabel = cloudMcpPaneLabel(paneId);
   const viaAgentProxy = phase.startsWith("cloud_mcp.tool_call") || clientId.includes("agent");
 
-  if (paneLabel) {
+  if (agentId || agentLabel) {
+    const identity = agentId || agentLabel;
     return {
-      color: cloudMcpAgentColor(paneLabel),
-      label: paneLabel,
+      color: cloudMcpAgentColor(identity),
+      label: agentLabel || cloudMcpThreeId(identity),
     };
   }
 
   if (viaAgentProxy) {
-    const identity = agentId || clientId || "agent";
+    const identity = clientId || paneId || "agent";
     return {
       color: cloudMcpAgentColor(identity),
-      label: cloudMcpThreeId(identity),
+      label: paneLabel || "agt",
     };
   }
 
@@ -372,7 +369,9 @@ function inferCloudMcpPaneActivity(entries) {
 function cloudMcpActivityDetail(entry) {
   const phase = entry?.phase || entry?.kind || entry?.event || entry?.status || "completed";
   const paneLabel = cloudMcpPaneLabel(cloudMcpEntryField(entry, "paneId", "pane_id", "terminal_id", "terminalId"));
-  const agent = cloudMcpEntryField(entry, "inferredAgentId", "agentId", "agent_id", "actor");
+  const agentLabel = cloudMcpEntryField(entry, "agentLabel", "agent_label");
+  const rawAgent = cloudMcpEntryField(entry, "inferredAgentId", "agentId", "agent_id", "actor");
+  const agent = agentLabel || (rawAgent ? cloudMcpThreeId(rawAgent) : "");
   const workspace = cloudMcpEntryField(entry, "workspaceName", "workspace_name");
   const detail = cloudMcpEntryField(entry, "detail", "brief", "title", "summary");
   if (detail) {

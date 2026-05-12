@@ -64,6 +64,7 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "list_workspace_violations",
     "list_workspace_changes",
     "file_watcher_status",
+    "watcher_scan",
     "search_memory",
     "get_slot_status",
     "db_get_mode",
@@ -902,6 +903,57 @@ impl CoordinationKernel {
             "SELECT * FROM tasks WHERE id=?1",
             &[&task_id],
             "Task does not exist after Cloud MCP sync.",
+        )
+    }
+
+    pub fn sync_task_status_from_cloud_context(
+        &self,
+        task_id: &str,
+        cloud_status: &str,
+    ) -> Result<Value, String> {
+        let local_status = match cloud_status.trim().to_ascii_lowercase().as_str() {
+            "blocked" | "parked" | "waiting" => Some("blocked"),
+            "active" | "starting" | "busy" => None,
+            "review" => Some("review"),
+            _ => None,
+        };
+        let Some(local_status) = local_status else {
+            return self.query_one(
+                "SELECT * FROM tasks WHERE id=?1",
+                &[&task_id],
+                "Task does not exist.",
+            );
+        };
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE tasks
+                 SET status=?1,
+                     updated_at=?2
+                 WHERE id=?3
+                   AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                params![local_status, now, task_id],
+            )
+            .map_err(|error| {
+                format!("Unable to sync local task status with Cloud MCP context: {error}")
+            })?;
+        self.emit_event(
+            "task_cloud_status_synced",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "cloud_status": cloud_status,
+                "local_status": local_status,
+            }),
+        )?;
+        self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist after Cloud MCP status sync.",
         )
     }
 
@@ -2564,19 +2616,23 @@ impl CoordinationKernel {
     ) -> Result<TerminalCoordinationContext, String> {
         let objective_key = require_workspace_objective_key(workspace_id)?;
         let _workspace_mcp = self.ensure_workspace_mcp_config(workspace_id, workspace_name)?;
-        let agent = self.create_or_get_agent(agent_name, agent_kind, context_role)?;
-        let agent_id = agent["id"]
-            .as_str()
-            .ok_or_else(|| "Unable to read created agent id.".to_string())?
-            .to_string();
-        let session = self.create_session(
-            &agent_id,
+        let slot_key = derive_slot_key(agent_kind, pty_id, None)?;
+        let terminal_agent_name = terminal_agent_name_for_slot(agent_name, &slot_key);
+        let session = self.create_session_for_slot_key(
+            &slot_key,
+            &terminal_agent_name,
+            agent_kind,
+            context_role,
             task_id,
             pty_id,
             true,
             context_run_id,
             context_role,
         )?;
+        let agent_id = session["agentId"]
+            .as_str()
+            .ok_or_else(|| "Unable to read created terminal agent id.".to_string())?
+            .to_string();
         let session_id = session["id"]
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
@@ -6071,6 +6127,13 @@ impl CoordinationKernel {
             patch_file_rows.push(changed_file.clone());
         }
 
+        self.resolve_superseded_same_task_lease_violations(
+            task_id,
+            session_id,
+            worktree_id,
+            &lease_covered_resource_keys,
+        )?;
+
         let open_violations = self.open_blocking_violations(
             session_id,
             worktree_id,
@@ -6371,6 +6434,85 @@ impl CoordinationKernel {
                 )
             })
             .collect())
+    }
+
+    fn resolve_superseded_same_task_lease_violations(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        worktree_id: &str,
+        lease_covered_resource_keys: &[String],
+    ) -> Result<usize, String> {
+        if lease_covered_resource_keys.is_empty() {
+            return Ok(0);
+        }
+        let violations = self.query_json(
+            "SELECT * FROM workspace_violations
+             WHERE status='open'
+               AND task_id=?1
+               AND (session_id=?2 OR worktree_id=?3)
+               AND violation_kind IN ('patch_without_lease', 'unleased_write')",
+            &[&task_id, &session_id, &worktree_id],
+        )?;
+        let mut resolved_ids = Vec::new();
+        let now = now_rfc3339();
+        for violation in violations {
+            let Some(violation_resource_key) = Self::workspace_violation_resource_key(&violation)
+            else {
+                continue;
+            };
+            let covered = lease_covered_resource_keys
+                .iter()
+                .any(|covered_resource_key| {
+                    resource_covers(covered_resource_key, &violation_resource_key)
+                        || resource_covers(&violation_resource_key, covered_resource_key)
+                });
+            if !covered {
+                continue;
+            }
+            let violation_id = violation["id"].as_str().unwrap_or_default();
+            if violation_id.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "UPDATE workspace_violations
+                     SET status='resolved',
+                         resolved_at=?1,
+                         details_json=json_set(
+                             COALESCE(details_json, '{}'),
+                             '$.resolution_reason',
+                             'superseded_by_current_lease_validation',
+                             '$.resolved_by',
+                             'coordination_kernel'
+                         )
+                     WHERE id=?2 AND status='open'",
+                    params![&now, violation_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to auto-resolve superseded workspace violation: {error}")
+                })?;
+            resolved_ids.push(violation_id.to_string());
+        }
+        let resolved_count = resolved_ids.len();
+        if resolved_count > 0 {
+            self.emit_event(
+                "workspace_violations_auto_resolved",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "reason": "superseded_by_current_lease_validation",
+                    "resolved_violation_ids": resolved_ids,
+                    "resource_keys": lease_covered_resource_keys,
+                }),
+            )?;
+        }
+        Ok(resolved_count)
     }
 
     fn workspace_violation_resource_key(violation: &Value) -> Option<String> {
@@ -12236,8 +12378,11 @@ impl CoordinationKernel {
                             self.refresh_agent_worktree_from_integration(&existing_path)?;
                         self.conn
                             .execute(
-                                "UPDATE worktrees SET status='active', base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                                "UPDATE worktrees
+                                 SET agent_id=?1, status='active', base_sha=?2, current_sha=?2, updated_at=?3
+                                 WHERE id=?4",
                                 params![
+                                    agent_id,
                                     refresh["current_sha"].as_str().unwrap_or(base_sha.as_str()),
                                     now_rfc3339(),
                                     existing_id
@@ -13648,6 +13793,7 @@ const CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS: &[&str] = &[
     "cloud_get_context_pack",
     "cloud_get_merge_context_pack",
     "cloud_get_workspace_snapshot",
+    "cloud_get_spec_graph",
     "cloud_get_feature_matrix",
     "cloud_get_spec_node",
     "cloud_record_spec_activity",
@@ -13684,7 +13830,7 @@ fn diffforge_agent_contract_markdown() -> String {
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, but every app-launched coding agent must publish public coordination state through Cloud MCP so parallel agents can stay in their lanes.\n\n\
 ## Required Cloud MCP flow for every user task\n\n\
 1. Call `coordination-kernel.get_brief` to read the current local task_id, branch root, and peer state. Rust creates and claims the local task when the prompt is submitted.\n\
-2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Feature Matrix task. Do not copy the raw user prompt as the title.\n\
+2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Spec Graph task. Do not copy the raw user prompt as the title.\n\
 3. Call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your concise `work_summary` or `task_title` describing what you are about to do.\n\
 4. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Report blocked/parked to Cloud MCP, then stop; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 5. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
@@ -13882,6 +14028,15 @@ fn normalize_agent_slot_key(value: &str) -> Result<String, String> {
         return Err("Agent slot key must not be derived from a UUID or timestamp.".to_string());
     }
     Ok(normalized)
+}
+
+fn terminal_agent_name_for_slot(agent_name: &str, slot_key: &str) -> String {
+    let name = agent_name.trim();
+    let slot_key = slot_key.trim();
+    if name.is_empty() || slot_key.is_empty() || name.ends_with(slot_key) {
+        return name.to_string();
+    }
+    format!("{name} {slot_key}")
 }
 
 fn derive_slot_key(
@@ -14391,6 +14546,40 @@ mod tests {
     }
 
     #[test]
+    fn terminal_contexts_use_unique_slot_scoped_agent_ids() {
+        let repo = init_git_repo("terminal_context_agent_ids");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .prepare_terminal_context(
+                "Codex",
+                "codex",
+                Some("workspace-terminal-test-0-codex"),
+                Some("workspace-test"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let second = kernel
+            .prepare_terminal_context(
+                "Codex",
+                "codex",
+                Some("workspace-terminal-test-1-codex"),
+                Some("workspace-test"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(first.agent_id, second.agent_id);
+        assert_eq!(first.slot_key.as_deref(), Some("codex-01"));
+        assert_eq!(second.slot_key.as_deref(), Some("codex-02"));
+    }
+
+    #[test]
     fn slot_busy_repairs_missing_active_session_pointer() {
         let repo = init_git_repo("slot_busy_pointer_repair");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -14518,7 +14707,7 @@ mod tests {
 
     #[test]
     fn workspace_mcp_requires_server_workspace_id() {
-        let repo = temp_repo("workspace_mcp_required");
+        let repo = init_git_repo("workspace_mcp_required");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         assert!(kernel
             .ensure_workspace_mcp_config(None, Some("Missing"))
@@ -14542,7 +14731,7 @@ mod tests {
 
     #[test]
     fn codex_mcp_config_prompts_by_default_and_approves_safe_tools() {
-        let repo = temp_repo("codex_mcp_tool_approvals");
+        let repo = init_git_repo("codex_mcp_tool_approvals");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let status = kernel
             .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
@@ -14560,6 +14749,7 @@ mod tests {
             "db_classify_sql",
             "db_request_approval",
             "request_approval",
+            "watcher_scan",
         ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
@@ -16085,6 +16275,96 @@ mod tests {
             response["error"]["code"].as_str(),
             Some("patch_validation_failed")
         );
+    }
+
+    #[test]
+    fn patch_without_lease_resolves_after_late_lease_revalidation() {
+        let repo = init_git_repo("patch_late_lease_revalidation");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        fs::write(write_root.join("src.txt"), "changed before lease\n").unwrap();
+        kernel.scan_workspace_changes().unwrap();
+        let failed = kernel
+            .validate_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("no lease yet"),
+            )
+            .unwrap();
+        assert_eq!(failed["ok"].as_bool(), Some(false));
+        let open_before = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations
+                 WHERE task_id=?1
+                   AND session_id=?2
+                   AND status='open'
+                   AND violation_kind IN ('patch_without_lease', 'unleased_write')",
+                &[&task_id, &session_id],
+            )
+            .unwrap();
+        assert_eq!(open_before.len(), 2);
+
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src.txt",
+                "write",
+                Some(600),
+                Some("Recover after missed pre-edit lease"),
+            )
+            .unwrap();
+        let passed = kernel
+            .validate_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("lease acquired"),
+            )
+            .unwrap();
+        assert_eq!(passed["ok"].as_bool(), Some(true));
+        assert_eq!(passed["data"]["validation_status"].as_str(), Some("passed"));
+        let open_after = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations
+                 WHERE task_id=?1
+                   AND session_id=?2
+                   AND status='open'
+                   AND violation_kind IN ('patch_without_lease', 'unleased_write')",
+                &[&task_id, &session_id],
+            )
+            .unwrap();
+        assert!(open_after.is_empty());
+        let resolved = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations
+                 WHERE task_id=?1
+                   AND session_id=?2
+                   AND status='resolved'
+                   AND json_extract(details_json, '$.resolution_reason')='superseded_by_current_lease_validation'",
+                &[&task_id, &session_id],
+            )
+            .unwrap();
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]
