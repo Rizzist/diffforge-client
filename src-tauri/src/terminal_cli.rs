@@ -649,8 +649,8 @@ fn terminal_args_with_codex_mcp_identity(
     provider_id: &str,
     args: &[String],
     coordination: Option<&TerminalCoordinationSession>,
-    pane_id: &str,
-    instance_id: u64,
+    _pane_id: &str,
+    _instance_id: u64,
 ) -> Vec<String> {
     let mut next = args.to_vec();
     if !provider_id.to_ascii_lowercase().contains("codex") {
@@ -666,13 +666,6 @@ fn terminal_args_with_codex_mcp_identity(
             .iter()
             .find_map(|(candidate, value)| (candidate == key && !value.trim().is_empty()).then(|| value.clone()))
     };
-    let base_url = env_value("CLOUD_MCP_BASE_URL")
-        .or_else(|| std::env::var("CLOUD_MCP_BASE_URL").ok())
-        .or_else(|| std::env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let repo_id = env_value("CLOUD_MCP_REPO_ID").unwrap_or_else(|| {
-        format!("repo-{}", cloud_mcp_short_hash(&coordination.repo_path))
-    });
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
 
@@ -704,41 +697,10 @@ fn terminal_args_with_codex_mcp_identity(
         }
     }
 
-    let mut cloud_args = vec![
-        "--cloud-mcp-proxy".to_string(),
-        "--base-url".to_string(),
-        base_url,
-        "--repo-path".to_string(),
-        coordination.repo_path.clone(),
-        "--repo-id".to_string(),
-        repo_id,
-        "--db-path".to_string(),
-        coordination.db_path.clone(),
-        "--client-id".to_string(),
-        "rust-diffforge-agent".to_string(),
-        "--agent-id".to_string(),
-        coordination.agent_id.clone(),
-        "--session-id".to_string(),
-        coordination.session_id.clone(),
-        "--pane-id".to_string(),
-        pane_id.to_string(),
-        "--terminal-instance-id".to_string(),
-        instance_id.to_string(),
-    ];
-    if let Some(slot_key) = env_value("COORDINATION_SLOT_KEY") {
-        cloud_args.push("--slot-key".to_string());
-        cloud_args.push(slot_key);
-    }
-
     next.push("-c".to_string());
     next.push(format!(
         "mcp_servers.coordination-kernel.args={}",
         terminal_toml_string_array(&coordination_args)
-    ));
-    next.push("-c".to_string());
-    next.push(format!(
-        "mcp_servers.cloud-diffforge.args={}",
-        terminal_toml_string_array(&cloud_args)
     ));
     next.push("-c".to_string());
     next.push("shell_environment_policy.inherit=all".to_string());

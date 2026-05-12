@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import styled from "styled-components";
 
 const GRAPH_NODE_SIZES = {
@@ -11,6 +12,7 @@ const GRAPH_MIN_ZOOM = 0.48;
 const GRAPH_MAX_ZOOM = 1.8;
 const GRAPH_ZOOM_STEP = 0.16;
 const MAX_VISIBLE_AGENT_ORBITS = 6;
+const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 
 function cleanText(value) {
   return String(value || "")
@@ -373,40 +375,76 @@ export default function SpecGraphWorkspaceView({
   const [error, setError] = useState("");
   const [state, setState] = useState("idle");
   const [selectedNodeId, setSelectedNodeId] = useState("");
-  const refreshInFlightRef = useRef(false);
 
-  const refresh = useCallback(async () => {
-    if (!repoPath || refreshInFlightRef.current) return;
-    refreshInFlightRef.current = true;
-    setState((current) => (current === "idle" ? "loading" : current));
-    try {
-      const next = await invoke("cloud_mcp_get_spec_graph", {
-        repoPath,
-        workspaceId: workspace?.id || null,
-        workspaceName: workspace?.name || null,
-      });
-      setSnapshot(next);
-      setError("");
-      setState("ready");
-    } catch (nextError) {
-      setError(nextError?.message || String(nextError));
-      setState("error");
-    } finally {
-      refreshInFlightRef.current = false;
-    }
-  }, [repoPath, workspace?.id, workspace?.name]);
+  const applySnapshot = useCallback((next) => {
+    if (!next || typeof next !== "object") return;
+    setSnapshot(next);
+    setError(text(next.syncError || next.sync_error));
+    setState(text(next.syncState || next.sync_state, "ready"));
+  }, []);
 
   useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, 1500);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    if (!repoPath) return undefined;
+    let cancelled = false;
+    let unlistenCache = null;
+
+    setState((current) => (current === "idle" ? "loading" : current));
+
+    invoke("cloud_mcp_get_cached_spec_graph", {
+      repoPath,
+      workspaceId: workspace?.id || null,
+      workspaceName: workspace?.name || null,
+    })
+      .then((next) => {
+        if (!cancelled) applySnapshot(next);
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setError(nextError?.message || String(nextError));
+          setState("error");
+        }
+      });
+
+    listen(SPEC_GRAPH_CACHE_EVENT, (event) => {
+      const next = event?.payload;
+      if (!next || next.repoPath !== repoPath) return;
+      applySnapshot(next);
+    }).then((nextUnlisten) => {
+      if (cancelled) {
+        nextUnlisten();
+        return;
+      }
+      unlistenCache = nextUnlisten;
+    });
+
+    invoke("cloud_mcp_start_spec_graph_sync", {
+      repoPath,
+      workspaceId: workspace?.id || null,
+      workspaceName: workspace?.name || null,
+    })
+      .then((next) => {
+        if (!cancelled) applySnapshot(next);
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setError(nextError?.message || String(nextError));
+          setState("error");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (typeof unlistenCache === "function") {
+        unlistenCache();
+      }
+    };
+  }, [applySnapshot, repoPath, workspace?.id, workspace?.name]);
 
   const specGraph = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
 
   useEffect(() => {
-    if (!selectedNodeId && specGraph.nodes.length) {
+    if (specGraph.nodes.length && !specGraph.nodes.some((node) => node.id === selectedNodeId)) {
       setSelectedNodeId(specGraph.nodes[0].id);
     }
   }, [specGraph.nodes, selectedNodeId]);
@@ -422,6 +460,7 @@ export default function SpecGraphWorkspaceView({
             edges={specGraph.edges}
             selectedNodeId={selectedNode?.id}
             onSelect={setSelectedNodeId}
+            state={state}
           />
         </SpecGraphMain>
 
@@ -431,7 +470,7 @@ export default function SpecGraphWorkspaceView({
   );
 }
 
-function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
+function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
   const viewportRef = useRef(null);
   const dragRef = useRef(null);
   const centeredLayoutRef = useRef("");
@@ -526,7 +565,8 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
   }, [zoom, zoomAt]);
 
   if (!nodes.length) {
-    return <EmptyState>No spec graph nodes yet.</EmptyState>;
+    const isSyncing = ["loading", "syncing", "cached"].includes(state);
+    return <EmptyState>{isSyncing ? "Syncing spec graph..." : "No spec graph nodes yet."}</EmptyState>;
   }
 
   return (

@@ -9,7 +9,6 @@ use std::{
 
 use rusqlite::{params, types::ValueRef, Connection, ErrorCode, OptionalExtension};
 use serde_json::{json, Value};
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -42,39 +41,8 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
     "mcp_agent_tool_called",
     "mcp_agent_tool_failed",
 ];
-const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
-    "get_brief",
-    "claim_task",
-    "post_plan",
-    "acquire_lease",
-    "renew_lease",
-    "release_lease",
-    "create_dependency",
-    "list_dependencies",
-    "explain_blockers",
-    "reevaluate_dependencies",
-    "cancel_dependency",
-    "list_ready_tasks",
-    "list_resources",
-    "list_active_leases",
-    "list_task_dependencies",
-    "announce_change",
-    "validate_patch",
-    "submit_patch",
-    "list_workspace_violations",
-    "list_workspace_changes",
-    "file_watcher_status",
-    "watcher_scan",
-    "search_memory",
-    "get_slot_status",
-    "db_get_mode",
-    "db_classify_sql",
-    "db_request_change",
-    "db_list_change_requests",
-    "db_get_change_request",
-    "db_request_approval",
-    "request_approval",
-];
+const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] =
+    &["start_task", "acquire_lease", "submit_patch"];
 
 pub fn now_rfc3339() -> String {
     let duration = SystemTime::now()
@@ -3085,9 +3053,6 @@ impl CoordinationKernel {
         if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
             args.extend(["--workspace-id".to_string(), value.to_string()]);
         }
-        let (cloud_command, cloud_args) =
-            self.cloud_mcp_command_spec(workspace_id, workspace_name, None, None);
-
         let generic_config = json!({
             "mcpServers": {
                 "coordination-kernel": {
@@ -3110,26 +3075,6 @@ impl CoordinationKernel {
                         "toggleable": false,
                         "authority": "local_coordination_kernel"
                     }
-                },
-                "cloud-diffforge": {
-                    "command": cloud_command.clone(),
-                    "args": cloud_args.clone(),
-                    "env": {
-                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
-                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
-                        "CLOUD_MCP_WORKSPACE_ID": workspace_id,
-                        "CLOUD_MCP_WORKSPACE_NAME": workspace_name,
-                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
-                    },
-                    "diffforge": {
-                        "scope": "workspace",
-                        "workspaceId": workspace_id,
-                        "workspaceName": workspace_name,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "authority": "cloud_context_pack"
-                    }
                 }
             }
         });
@@ -3137,19 +3082,11 @@ impl CoordinationKernel {
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
         write_json_file_atomic(&generic_path, &generic_config)?;
-        write_text_file_atomic(
-            &codex_path,
-            &codex_config_toml(&command, &args, Some((&cloud_command, &cloud_args))),
-        )?;
+        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
         write_json_file_atomic(&claude_path, &generic_config)?;
         self.write_agent_contract_files(&self.paths.repo_path)?;
-        let (repo_mcp_path, repo_codex_path) = self.write_repo_root_mcp_activation_files(
-            &generic_config,
-            &command,
-            &args,
-            &cloud_command,
-            &cloud_args,
-        )?;
+        let (repo_mcp_path, repo_codex_path) =
+            self.write_repo_root_mcp_activation_files(&generic_config, &command, &args)?;
 
         Ok(json!({
             "server_name": "coordination-kernel",
@@ -3366,8 +3303,8 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         worktree_id: Option<&str>,
         worktree_path: Option<&str>,
-        context_run_id: Option<&str>,
-        context_role: Option<&str>,
+        _context_run_id: Option<&str>,
+        _context_role: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
@@ -3396,9 +3333,6 @@ impl CoordinationKernel {
         if let Some(value) = worktree_path {
             args.extend(["--worktree-path".to_string(), value.to_string()]);
         }
-        let (cloud_command, cloud_args) =
-            self.cloud_mcp_command_spec(None, None, Some(agent_id), Some(session_id));
-
         let generic_config = json!({
             "mcpServers": {
                 "coordination-kernel": {
@@ -3420,27 +3354,6 @@ impl CoordinationKernel {
                         "toggleable": false,
                         "authority": "local_coordination_kernel"
                     }
-                },
-                "cloud-diffforge": {
-                    "command": cloud_command.clone(),
-                    "args": cloud_args.clone(),
-                    "env": {
-                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
-                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
-                        "CLOUD_MCP_AGENT_ID": agent_id,
-                        "CLOUD_MCP_SESSION_ID": session_id,
-                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
-                    },
-                    "diffforge": {
-                        "scope": "agent",
-                        "slotKey": slot_key,
-                        "agentSlotId": agent_slot_id,
-                        "sessionId": session_id,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "authority": "cloud_context_pack"
-                    }
                 }
             }
         });
@@ -3461,10 +3374,7 @@ impl CoordinationKernel {
             .join("agents")
             .join(format!("{slot_key}.claude.json"));
         write_json_file_atomic(&generic_path, &generic_config)?;
-        write_text_file_atomic(
-            &codex_path,
-            &codex_config_toml(&command, &args, Some((&cloud_command, &cloud_args))),
-        )?;
+        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
         write_json_file_atomic(&claude_path, &claude_config)?;
         self.write_repo_root_dynamic_mcp_activation_files()?;
         if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
@@ -3478,8 +3388,6 @@ impl CoordinationKernel {
                 &generic_config,
                 &command,
                 &args,
-                &cloud_command,
-                &cloud_args,
             )?;
         }
         let config_bytes = serde_json::to_vec(&generic_config)
@@ -3566,62 +3474,12 @@ impl CoordinationKernel {
         (exe_name.to_string(), Vec::new())
     }
 
-    fn cloud_mcp_command_spec(
-        &self,
-        workspace_id: Option<&str>,
-        workspace_name: Option<&str>,
-        agent_id: Option<&str>,
-        session_id: Option<&str>,
-    ) -> (String, Vec<String>) {
-        let command = std::env::current_exe()
-            .ok()
-            .filter(|path| path.exists())
-            .map(|path| process_path_text(&path))
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "rust-diffforge.exe".to_string()
-                } else {
-                    "rust-diffforge".to_string()
-                }
-            });
-        let repo_path = process_path_text(&self.paths.repo_path);
-        let repo_id = cloud_mcp_repo_id_for_path(&self.paths.repo_path);
-        let mut args = vec![
-            "--cloud-mcp-proxy".to_string(),
-            "--base-url".to_string(),
-            cloud_mcp_base_url_for_config(),
-            "--repo-path".to_string(),
-            repo_path,
-            "--repo-id".to_string(),
-            repo_id,
-            "--db-path".to_string(),
-            process_path_text(&self.paths.db_path),
-            "--client-id".to_string(),
-            "rust-diffforge-agent".to_string(),
-        ];
-        if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
-            args.extend(["--workspace-id".to_string(), value.to_string()]);
-        }
-        if let Some(value) = workspace_name.filter(|value| !value.trim().is_empty()) {
-            args.extend(["--workspace-name".to_string(), value.to_string()]);
-        }
-        if let Some(value) = agent_id.filter(|value| !value.trim().is_empty()) {
-            args.extend(["--agent-id".to_string(), value.to_string()]);
-        }
-        if let Some(value) = session_id.filter(|value| !value.trim().is_empty()) {
-            args.extend(["--session-id".to_string(), value.to_string()]);
-        }
-        (command, args)
-    }
-
     fn write_worktree_mcp_activation_files(
         &self,
         worktree_path: &str,
         generic_config: &Value,
         command: &str,
         args: &[String],
-        cloud_command: &str,
-        cloud_args: &[String],
     ) -> Result<(), String> {
         let worktree = PathBuf::from(worktree_path);
         if !worktree.exists() {
@@ -3643,7 +3501,7 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         write_text_file_atomic(
             &codex_dir.join("config.toml"),
-            &codex_config_toml(command, args, Some((cloud_command, cloud_args))),
+            &codex_config_toml(command, args),
         )?;
         self.write_agent_contract_files(&worktree)?;
         Ok(())
@@ -3658,7 +3516,6 @@ impl CoordinationKernel {
             process_path_text(&self.paths.db_path),
         ]);
 
-        let (cloud_command, cloud_args) = self.cloud_mcp_command_spec(None, None, None, None);
         let generic_config = json!({
             "mcpServers": {
                 "coordination-kernel": {
@@ -3677,34 +3534,11 @@ impl CoordinationKernel {
                         "identitySource": "terminal_environment",
                         "authority": "local_coordination_kernel"
                     }
-                },
-                "cloud-diffforge": {
-                    "command": cloud_command.clone(),
-                    "args": cloud_args.clone(),
-                    "env": {
-                        "CLOUD_MCP_BASE_URL": cloud_mcp_base_url_for_config(),
-                        "CLOUD_MCP_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "CLOUD_MCP_REPO_ID": cloud_mcp_repo_id_for_path(&self.paths.repo_path),
-                        "CLOUD_MCP_CLIENT_ID": "rust-diffforge-agent"
-                    },
-                    "diffforge": {
-                        "scope": "repo-root-dynamic-agent",
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "identitySource": "terminal_environment",
-                        "authority": "cloud_context_pack"
-                    }
                 }
             }
         });
 
-        self.write_repo_root_mcp_activation_files(
-            &generic_config,
-            &command,
-            &args,
-            &cloud_command,
-            &cloud_args,
-        )
+        self.write_repo_root_mcp_activation_files(&generic_config, &command, &args)
     }
 
     fn write_repo_root_mcp_activation_files(
@@ -3712,8 +3546,6 @@ impl CoordinationKernel {
         generic_config: &Value,
         command: &str,
         args: &[String],
-        cloud_command: &str,
-        cloud_args: &[String],
     ) -> Result<(PathBuf, PathBuf), String> {
         self.ensure_repo_root_mcp_files_ignored()?;
 
@@ -3724,10 +3556,7 @@ impl CoordinationKernel {
         fs::create_dir_all(&codex_dir)
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         let codex_path = codex_dir.join("config.toml");
-        write_text_file_atomic(
-            &codex_path,
-            &codex_config_toml(command, args, Some((cloud_command, cloud_args))),
-        )?;
+        write_text_file_atomic(&codex_path, &codex_config_toml(command, args))?;
         self.write_agent_contract_files(&self.paths.repo_path)?;
 
         Ok((mcp_path, codex_path))
@@ -3752,10 +3581,13 @@ impl CoordinationKernel {
     }
 
     fn ensure_repo_root_mcp_files_ignored(&self) -> Result<(), String> {
-        let exclude_path_text = run_git(
+        let exclude_path_text = match run_git(
             &self.paths.repo_path,
             &["rev-parse", "--git-path", "info/exclude"],
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(_) => return Ok(()),
+        };
         let exclude_path = {
             let trimmed = exclude_path_text.trim();
             let path = PathBuf::from(trimmed);
@@ -9941,7 +9773,7 @@ impl CoordinationKernel {
         agent_id: Option<&str>,
         session_id: Option<&str>,
         task_id: Option<&str>,
-        context_run_id: Option<&str>,
+        _context_run_id: Option<&str>,
     ) -> Result<Value, String> {
         let session = if let Some(session_id) = session_id {
             self.query_json("SELECT * FROM agent_sessions WHERE id=?1", &[&session_id])?
@@ -9968,6 +9800,41 @@ impl CoordinationKernel {
             "recent_events": self.query_json("SELECT * FROM events ORDER BY seq DESC LIMIT 50", &[])?,
             "contract_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='contract' ORDER BY updated_at DESC LIMIT 20", &[])?,
             "handoff_memories": self.query_json("SELECT * FROM memories WHERE memory_kind='handoff' ORDER BY updated_at DESC LIMIT 20", &[])?,
+        })))
+    }
+
+    pub fn start_task(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        context_run_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let heartbeat = session_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|session_id| self.heartbeat_session(session_id).is_ok())
+            .unwrap_or(false);
+        let brief = self.get_brief(agent_id, session_id, task_id, context_run_id)?;
+        Ok(api_ok(json!({
+            "started": true,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "session_heartbeat_recorded": heartbeat,
+            "brief": brief["data"].clone(),
+            "workflow": {
+                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "submit_patch"],
+                "next": [
+                    "Acquire leases for the exact files/resources you will edit.",
+                    "Use normal shell and edit tools inside COORDINATION_AGENT_BRANCH_ROOT.",
+                    "Submit the patch when finished; submit_patch owns validation and safe integration."
+                ],
+                "cloud_mcp": {
+                    "mode": "automatic_rust_lifecycle",
+                    "agent_action_required": false,
+                    "note": "Diff Forge publishes context packs, task lifecycle, heartbeats, checkpoints, and lane state through the app/kernel cloud sync path."
+                }
+            }
         })))
     }
 
@@ -10407,15 +10274,8 @@ impl CoordinationKernel {
         let request_merge_listed = mcp_tools.contains(&"request_merge");
         let violation_resolver_listed = mcp_tools.contains(&"resolve_workspace_violation");
         let apply_merge_listed = mcp_tools.contains(&"apply_merge");
-        let dependency_graph_tools = [
-            "create_dependency",
-            "list_dependencies",
-            "explain_blockers",
-            "reevaluate_dependencies",
-            "cancel_dependency",
-            "list_ready_tasks",
-        ];
-        let missing_dependency_graph_tools = dependency_graph_tools
+        let minimal_agent_tools = ["start_task", "acquire_lease", "submit_patch"];
+        let missing_minimal_agent_tools = minimal_agent_tools
             .iter()
             .filter(|tool| !mcp_tools.contains(tool))
             .copied()
@@ -10473,7 +10333,12 @@ impl CoordinationKernel {
             &mut checks,
             context,
             "mcp.agent_tool_surface",
-            if !request_merge_listed && !violation_resolver_listed && !apply_merge_listed {
+            if !request_merge_listed
+                && !violation_resolver_listed
+                && !apply_merge_listed
+                && missing_minimal_agent_tools.is_empty()
+                && mcp_tools.len() == minimal_agent_tools.len()
+            {
                 "aligned"
             } else {
                 "violation"
@@ -10484,34 +10349,19 @@ impl CoordinationKernel {
                 "resolve_workspace_violation is exposed to agents; violation resolution must remain trusted UI/human-only."
             } else if apply_merge_listed {
                 "apply_merge is exposed to agents; merge application must remain trusted UI/human-only."
+            } else if !missing_minimal_agent_tools.is_empty()
+                || mcp_tools.len() != minimal_agent_tools.len()
+            {
+                "Agent MCP should expose only start_task, acquire_lease, and submit_patch."
             } else {
-                "Agent MCP exposes submit_patch only; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
+                "Agent MCP exposes only start_task, acquire_lease, and submit_patch; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
                 "resolve_workspace_violation_listed": violation_resolver_listed,
                 "apply_merge_listed": apply_merge_listed,
-                "tool_count": mcp_tools.len(),
-            }),
-        );
-        record_alignment_check(
-            &self.paths.repo_path,
-            &mut checks,
-            context,
-            "dependency_graph.mcp_surface",
-            if missing_dependency_graph_tools.is_empty() {
-                "aligned"
-            } else {
-                "violation"
-            },
-            if missing_dependency_graph_tools.is_empty() {
-                "Dependency graph tools are exposed through the local coordination MCP surface."
-            } else {
-                "One or more dependency graph MCP tools are missing from the agent-visible surface."
-            },
-            json!({
-                "expected_tools": dependency_graph_tools,
-                "missing_tools": missing_dependency_graph_tools,
+                "expected_tools": minimal_agent_tools,
+                "missing_tools": missing_minimal_agent_tools,
                 "tool_count": mcp_tools.len(),
             }),
         );
@@ -13746,7 +13596,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn codex_config_toml(command: &str, args: &[String], cloud: Option<(&str, &[String])>) -> String {
+fn codex_config_toml(command: &str, args: &[String]) -> String {
     let args = args
         .iter()
         .map(|arg| format!("\"{}\"", toml_escape(arg)))
@@ -13766,58 +13616,7 @@ fn codex_config_toml(command: &str, args: &[String], cloud: Option<(&str, &[Stri
         ));
     }
 
-    if let Some((cloud_command, cloud_args)) = cloud {
-        let cloud_args = cloud_args
-            .iter()
-            .map(|arg| format!("\"{}\"", toml_escape(arg)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        config.push_str(&format!(
-            "\n[mcp_servers.cloud-diffforge]\ncommand = \"{}\"\nargs = [{}]\ndefault_tools_approval_mode = \"prompt\"\n",
-            toml_escape(cloud_command),
-            cloud_args
-        ));
-        for tool in CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS {
-            config.push_str(&format!(
-                "\n[mcp_servers.cloud-diffforge.tools.{}]\napproval_mode = \"approve\"\n",
-                tool
-            ));
-        }
-    }
-
     config
-}
-
-const CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS: &[&str] = &[
-    "cloud_get_status",
-    "cloud_get_context_pack",
-    "cloud_get_merge_context_pack",
-    "cloud_get_workspace_snapshot",
-    "cloud_get_spec_graph",
-    "cloud_get_feature_matrix",
-    "cloud_get_spec_node",
-    "cloud_record_spec_activity",
-    "cloud_record_history_event",
-    "cloud_get_history_ledger",
-    "cloud_subtask_checkpoint",
-    "cloud_agent_heartbeat",
-    "cloud_claim_lane",
-    "cloud_release_lane",
-    "cloud_create_context_task",
-    "cloud_update_context_task",
-];
-
-fn cloud_mcp_base_url_for_config() -> String {
-    std::env::var("CLOUD_DIFFFORGE_BASE_URL")
-        .or_else(|_| std::env::var("CLOUD_MCP_BASE_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
-}
-
-fn cloud_mcp_repo_id_for_path(path: &Path) -> String {
-    let input = process_path_text(path);
-    let digest = Sha1::digest(input.as_bytes());
-    let hash = format!("{digest:x}").chars().take(12).collect::<String>();
-    format!("repo-{hash}")
 }
 
 const DIFFFORGE_AGENT_CONTRACT_BEGIN: &str = "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->";
@@ -13827,23 +13626,20 @@ fn diffforge_agent_contract_markdown() -> String {
     format!(
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge agent coordination contract\n\n\
-This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, but every app-launched coding agent must publish public coordination state through Cloud MCP so parallel agents can stay in their lanes.\n\n\
-## Required Cloud MCP flow for every user task\n\n\
-1. Call `coordination-kernel.get_brief` to read the current local task_id, branch root, and peer state. Rust creates and claims the local task when the prompt is submitted.\n\
-2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Spec Graph task. Do not copy the raw user prompt as the title.\n\
-3. Call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your concise `work_summary` or `task_title` describing what you are about to do.\n\
-4. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Report blocked/parked to Cloud MCP, then stop; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-5. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
-6. When Rust resumes a parked task, call `coordination-kernel.get_brief` again, inspect the refreshed target file/context first, then acquire the lease and continue.\n\
-7. Before installing, updating, or uninstalling repo dependencies, CLIs, tools, packages, runtimes, or generated lockfiles, publish a `cloud_agent_heartbeat` that names the package/tool and scope, acquire leases for package manifests/lockfiles or related config, then publish a `cloud_subtask_checkpoint` after the change with changed files and install/uninstall outcome. Never silently change dependency state.\n\
-8. When finished, call `coordination-kernel.submit_patch` first. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe. Only report `done` to Cloud MCP after submit_patch reports an applied auto_merge; otherwise report `review` or `blocked`.\n\
-9. Keep briefs public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
-## Local coordination remains authoritative\n\n\
-- Use the local coordination kernel for leases, memory, patch submission, and merge safety.\n\
+This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, and patch submission.\n\n\
+## Required flow for every user task\n\n\
+1. Call `coordination-kernel.start_task` once before editing, and again when a parked task resumes.\n\
+2. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
+3. Use normal shell and edit tools inside `COORDINATION_AGENT_BRANCH_ROOT`; never edit the shared project root or another agent slot's worktree.\n\
+4. When finished, call `coordination-kernel.submit_patch`. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\n\
+5. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+## Cloud MCP is automatic\n\n\
+- Do not call `cloud-diffforge` tools directly from the coding agent.\n\
+- Diff Forge's Rust app/kernel publishes context packs, visible task lifecycle, heartbeats, checkpoints, lane claims, and merge context through the Cloud MCP path.\n\
+- Use the local coordination kernel for leases, patch submission, and merge safety.\n\
 - Edit only inside the assigned agent worktree/branch root when one is provided.\n\
-- Autonomous intent-resolution tasks should fetch Cloud MCP merge context first, treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch.\n\
+- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch.\n\
 - Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
-- Cloud MCP and merge context packs are shared context and activity memory; it is not permission to bypass local file safety.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }
@@ -14667,8 +14463,13 @@ mod tests {
         ));
         assert!(worktree.join(".mcp.json").exists());
         assert!(worktree.join(".codex").join("config.toml").exists());
-        assert!(!repo.join(".mcp.json").exists());
-        assert!(!repo.join(".codex").join("config.toml").exists());
+        assert!(repo.join(".mcp.json").exists());
+        assert!(repo.join(".codex").join("config.toml").exists());
+        let repo_codex = fs::read_to_string(repo.join(".codex").join("config.toml")).unwrap();
+        let worktree_codex =
+            fs::read_to_string(worktree.join(".codex").join("config.toml")).unwrap();
+        assert!(!repo_codex.contains("[mcp_servers.cloud-diffforge]"));
+        assert!(!worktree_codex.contains("[mcp_servers.cloud-diffforge]"));
     }
 
     #[test]
@@ -14739,23 +14540,21 @@ mod tests {
         let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
 
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
-        for tool in [
+        for tool in ["start_task", "acquire_lease", "submit_patch"] {
+            assert!(config.contains(&format!(
+                "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
+            )));
+        }
+        assert!(!config.contains("[mcp_servers.cloud-diffforge]"));
+        for prompt_gated_tool in [
             "get_brief",
             "claim_task",
-            "acquire_lease",
             "validate_patch",
-            "submit_patch",
             "get_slot_status",
             "db_classify_sql",
             "db_request_approval",
             "request_approval",
             "watcher_scan",
-        ] {
-            assert!(config.contains(&format!(
-                "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
-            )));
-        }
-        for prompt_gated_tool in [
             "resolve_workspace_violation",
             "db_query_readonly",
             "db_propose_migration",
@@ -14774,6 +14573,7 @@ mod tests {
         let repo = temp_repo("mcp_surface");
         let _kernel = CoordinationKernel::init(&repo, None).unwrap();
         let tools = crate::coordination::mcp::TOOL_NAMES;
+        assert_eq!(tools, &["start_task", "acquire_lease", "submit_patch"]);
         assert!(!tools.contains(&"request_merge"));
         assert!(!tools.contains(&"resolve_workspace_violation"));
         assert!(!tools.contains(&"apply_merge"));
@@ -14803,7 +14603,7 @@ mod tests {
 
     #[test]
     fn agent_mcp_tool_call_records_client_mount_proof() {
-        let repo = temp_repo("mcp_client_mount");
+        let repo = init_git_repo("mcp_client_mount");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap().to_string();
@@ -14826,7 +14626,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 ..crate::coordination::mcp::McpContext::default()
             },
-            "get_brief",
+            "start_task",
             json!({}),
         );
         assert_eq!(response["ok"].as_bool(), Some(true));
@@ -14845,7 +14645,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0]["payload_json"]["details"]["tool"].as_str(),
-            Some("get_brief")
+            Some("start_task")
         );
     }
 
@@ -14932,15 +14732,16 @@ mod tests {
         assert_eq!(claimed["status"].as_str(), Some("claimed"));
         let events = kernel
             .query_json(
-                "SELECT * FROM events WHERE event_type IN ('task_dependency_created', 'task_blocked', 'task_dependency_satisfied', 'task_unblocked')",
+                "SELECT * FROM events WHERE event_type IN ('task_dependency_created', 'task_blocked', 'task_dependencies_satisfied', 'task_dependency_satisfied', 'task_dependency_refresh_completed')",
                 &[],
             )
             .unwrap();
         for event_type in [
             "task_dependency_created",
             "task_blocked",
+            "task_dependencies_satisfied",
             "task_dependency_satisfied",
-            "task_unblocked",
+            "task_dependency_refresh_completed",
         ] {
             assert!(events
                 .iter()
@@ -16476,7 +16277,7 @@ mod tests {
                 "missing task",
             )
             .unwrap();
-        assert_eq!(task["status"].as_str(), Some("patch_submitted"));
+        assert_eq!(task["status"].as_str(), Some("merged"));
 
         let patch_id = response["data"]["patch_id"].as_str().unwrap();
         kernel

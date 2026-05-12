@@ -5,11 +5,15 @@ const CLOUD_MCP_FILETREE_LIMIT: usize = 900;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_TODO_MAX_BYTES: usize = 128 * 1024;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
+const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
+const CLOUD_MCP_SPEC_GRAPH_SYNC_INTERVAL_MS: u64 = 1_500;
+const CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS: u64 = 4_000;
 
 #[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
     client: reqwest::Client,
+    spec_graph_syncs: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 struct CloudMcpRuntime {
@@ -130,6 +134,7 @@ impl CloudMcpState {
                 terminal_contexts: HashMap::new(),
             })),
             client,
+            spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -829,6 +834,7 @@ fn cloud_mcp_post_log_context(
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
         "/v1/spec/graph" => "cloud_get_spec_graph",
+        "/v1/spec/graph/delta" => "cloud_get_spec_graph_delta",
         "/v1/spec/feature-matrix" => "cloud_get_feature_matrix",
         "/v1/spec/nodes" => "cloud_get_spec_node",
         "/v1/context/subtasks/checkpoint" => "cloud_subtask_checkpoint",
@@ -3314,30 +3320,397 @@ async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
     }))
 }
 
-#[tauri::command]
-async fn cloud_mcp_get_spec_graph(
-    state: State<'_, CloudMcpState>,
+#[derive(Clone)]
+struct CloudMcpSpecGraphSyncRequest {
+    root: PathBuf,
+    root_display: String,
+    repo_id: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+}
+
+fn cloud_mcp_spec_graph_sync_request(
     repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
-) -> Result<Value, String> {
+) -> CloudMcpSpecGraphSyncRequest {
     let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
     let root_display = workspace_path_display(&root);
     let repo_id = cloud_mcp_repo_id_for_root(&root);
+    CloudMcpSpecGraphSyncRequest {
+        root,
+        root_display,
+        repo_id,
+        workspace_id,
+        workspace_name,
+    }
+}
 
-    cloud_mcp_connected_or_connect(state.inner(), "spec_graph_sync").await?;
+fn cloud_mcp_spec_graph_cache_dir(root: &Path) -> PathBuf {
+    root.join(".agents").join("spec-graph")
+}
 
-    let payload = json!({
-        "source": "rust-diffforge-spec-graph",
+fn cloud_mcp_spec_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
+    cloud_mcp_spec_graph_cache_dir(root).join(format!("{repo_id}.json"))
+}
+
+fn cloud_mcp_spec_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
+    json!({
+        "kind": "project_spec_graph",
+        "version": 3,
+        "repo_id": req.repo_id.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "nodes": [],
+        "edges": [],
+        "hidden_edges": [],
+        "agent_work": {},
+        "graph_stats": {},
+    })
+}
+
+fn cloud_mcp_spec_graph_snapshot_from_data(
+    req: &CloudMcpSpecGraphSyncRequest,
+    data: Value,
+    cache_path: &Path,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let nodes = data
+        .get("nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let edges = data
+        .get("edges")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let agent_work = data
+        .get("agent_work")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let graph_stats = data
+        .get("graph_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let cursor = data
+        .get("cursor")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let node_hashes = data
+        .get("node_hashes")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let edge_hashes = data
+        .get("edge_hashes")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let agent_work_hash = data
+        .get("agent_work_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let graph_stats_hash = data
+        .get("graph_stats_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    json!({
+        "ok": true,
+        "repoId": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "workspaceId": req.workspace_id.clone(),
+        "workspaceName": req.workspace_name.clone(),
+        "cachePath": workspace_path_display(cache_path),
+        "syncState": sync_state,
+        "syncError": sync_error,
+        "lastSyncedMs": cloud_mcp_now_ms(),
+        "cursor": cursor,
+        "nodeHashes": node_hashes,
+        "edgeHashes": edge_hashes,
+        "agentWorkHash": agent_work_hash,
+        "graphStatsHash": graph_stats_hash,
+        "specGraph": data.clone(),
+        "specNodes": nodes,
+        "specEdges": edges,
+        "agentWork": agent_work,
+        "graphStats": graph_stats,
+        "sourceOfTruth": {
+            "kind": "spec_graph",
+            "repo_id": req.repo_id.clone(),
+            "markdown_backed": true,
+            "cached_under_agents": true
+        },
+        "raw": data
+    })
+}
+
+fn cloud_mcp_stamp_spec_graph_snapshot(
+    mut snapshot: Value,
+    req: &CloudMcpSpecGraphSyncRequest,
+    cache_path: &Path,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    if !snapshot.is_object() {
+        snapshot = cloud_mcp_spec_graph_snapshot_from_data(
+            req,
+            cloud_mcp_spec_graph_empty_raw(req),
+            cache_path,
+            sync_state,
+            sync_error,
+        );
+    }
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("ok".to_string(), json!(true));
+        object.insert("repoId".to_string(), json!(req.repo_id.clone()));
+        object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+        object.insert("workspaceId".to_string(), json!(req.workspace_id.clone()));
+        object.insert("workspaceName".to_string(), json!(req.workspace_name.clone()));
+        object.insert("cachePath".to_string(), json!(workspace_path_display(cache_path)));
+        object.insert("syncState".to_string(), json!(sync_state));
+        object.insert("syncError".to_string(), json!(sync_error));
+        object.insert("sourceOfTruth".to_string(), json!({
+            "kind": "spec_graph",
+            "repo_id": req.repo_id.clone(),
+            "markdown_backed": true,
+            "cached_under_agents": true
+        }));
+    }
+    snapshot
+}
+
+fn cloud_mcp_read_spec_graph_cache(
+    req: &CloudMcpSpecGraphSyncRequest,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let snapshot = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| {
+            cloud_mcp_spec_graph_snapshot_from_data(
+                req,
+                cloud_mcp_spec_graph_empty_raw(req),
+                &cache_path,
+                "empty",
+                "",
+            )
+        });
+    cloud_mcp_stamp_spec_graph_snapshot(snapshot, req, &cache_path, sync_state, sync_error)
+}
+
+fn cloud_mcp_write_spec_graph_cache(
+    req: &CloudMcpSpecGraphSyncRequest,
+    snapshot: &Value,
+) -> Result<PathBuf, String> {
+    let cache_dir = cloud_mcp_spec_graph_cache_dir(&req.root);
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        format!(
+            "Unable to create Spec Graph cache directory {}: {error}",
+            workspace_path_display(&cache_dir)
+        )
+    })?;
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let body = serde_json::to_string_pretty(snapshot)
+        .map_err(|error| format!("Unable to encode Spec Graph cache: {error}"))?;
+    fs::write(&cache_path, body.as_bytes()).map_err(|error| {
+        format!(
+            "Unable to write Spec Graph cache {}: {error}",
+            workspace_path_display(&cache_path)
+        )
+    })?;
+    Ok(cache_path)
+}
+
+fn cloud_mcp_spec_graph_item_id(item: &Value) -> Option<String> {
+    ["id", "node_id", "nodeId", "edge_id", "edgeId"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn cloud_mcp_spec_graph_array(snapshot: &Value, camel_key: &str, raw_key: &str) -> Vec<Value> {
+    snapshot
+        .get(camel_key)
+        .and_then(Value::as_array)
+        .or_else(|| snapshot.get("raw").and_then(|raw| raw.get(raw_key)).and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_apply_spec_graph_items(
+    existing_items: Vec<Value>,
+    changed_items: Vec<Value>,
+    removed_ids: Vec<String>,
+) -> Vec<Value> {
+    let removed = removed_ids.into_iter().collect::<HashSet<_>>();
+    let mut changed_by_id = changed_items
+        .into_iter()
+        .filter_map(|item| cloud_mcp_spec_graph_item_id(&item).map(|id| (id, item)))
+        .collect::<HashMap<_, _>>();
+    let mut next_items = Vec::new();
+
+    for item in existing_items {
+        let Some(id) = cloud_mcp_spec_graph_item_id(&item) else {
+            next_items.push(item);
+            continue;
+        };
+        if removed.contains(&id) {
+            continue;
+        }
+        if let Some(changed) = changed_by_id.remove(&id) {
+            next_items.push(changed);
+        } else {
+            next_items.push(item);
+        }
+    }
+
+    let mut appended = changed_by_id.into_iter().collect::<Vec<_>>();
+    appended.sort_by(|left, right| left.0.cmp(&right.0));
+    next_items.extend(appended.into_iter().map(|(_, item)| item));
+    next_items
+}
+
+fn cloud_mcp_spec_graph_delta_array(delta: &Value, key: &str) -> Vec<Value> {
+    delta
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_spec_graph_delta_string_array(delta: &Value, key: &str) -> Vec<String> {
+    delta
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_apply_spec_graph_delta(
+    req: &CloudMcpSpecGraphSyncRequest,
+    cache: Value,
+    delta: Value,
+    cache_path: &Path,
+) -> Value {
+    let nodes = cloud_mcp_apply_spec_graph_items(
+        cloud_mcp_spec_graph_array(&cache, "specNodes", "nodes"),
+        cloud_mcp_spec_graph_delta_array(&delta, "changed_nodes"),
+        cloud_mcp_spec_graph_delta_string_array(&delta, "removed_node_ids"),
+    );
+    let edges = cloud_mcp_apply_spec_graph_items(
+        cloud_mcp_spec_graph_array(&cache, "specEdges", "edges"),
+        cloud_mcp_spec_graph_delta_array(&delta, "changed_edges"),
+        cloud_mcp_spec_graph_delta_string_array(&delta, "removed_edge_ids"),
+    );
+    let agent_work = if delta.get("agent_work").is_some_and(|value| !value.is_null()) {
+        delta["agent_work"].clone()
+    } else {
+        cache
+            .get("agentWork")
+            .cloned()
+            .or_else(|| cache.get("raw").and_then(|raw| raw.get("agent_work")).cloned())
+            .unwrap_or_else(|| json!({}))
+    };
+    let graph_stats = if delta.get("graph_stats").is_some_and(|value| !value.is_null()) {
+        delta["graph_stats"].clone()
+    } else {
+        cache
+            .get("graphStats")
+            .cloned()
+            .or_else(|| cache.get("raw").and_then(|raw| raw.get("graph_stats")).cloned())
+            .unwrap_or_else(|| json!({}))
+    };
+    let raw = json!({
+        "kind": "project_spec_graph",
+        "version": 3,
+        "repo_id": req.repo_id.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "nodes": nodes,
+        "edges": edges,
+        "hidden_edges": cache.get("raw").and_then(|raw| raw.get("hidden_edges")).cloned().unwrap_or_else(|| json!([])),
+        "agent_work": agent_work,
+        "graph_stats": graph_stats,
+    });
+    let mut snapshot = cloud_mcp_spec_graph_snapshot_from_data(req, raw, cache_path, "ready", "");
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert(
+            "cursor".to_string(),
+            delta.get("cursor").cloned().unwrap_or_else(|| json!("")),
+        );
+        object.insert(
+            "nodeHashes".to_string(),
+            delta.get("node_hashes").cloned().unwrap_or_else(|| json!({})),
+        );
+        object.insert(
+            "edgeHashes".to_string(),
+            delta.get("edge_hashes").cloned().unwrap_or_else(|| json!({})),
+        );
+        object.insert(
+            "agentWorkHash".to_string(),
+            delta.get("agent_work_hash").cloned().unwrap_or_else(|| json!("")),
+        );
+        object.insert(
+            "graphStatsHash".to_string(),
+            delta.get("graph_stats_hash").cloned().unwrap_or_else(|| json!("")),
+        );
+    }
+    snapshot
+}
+
+fn cloud_mcp_spec_graph_sync_payload(req: &CloudMcpSpecGraphSyncRequest, cache: &Value) -> Value {
+    json!({
+        "source": "rust-diffforge-spec-graph-cache",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": repo_id,
+        "repo_id": req.repo_id.clone(),
         "agent_id": "rust-diffforge",
         "self_agent_id": "rust-diffforge",
         "current_agent_id": "rust-diffforge",
-        "repo_path": root_display.clone(),
-        "workspace_root": root_display.clone(),
-        "workspace_id": workspace_id.clone(),
-        "workspace_name": workspace_name.clone(),
+        "repo_path": req.root_display.clone(),
+        "workspace_root": req.root_display.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "workspace_name": req.workspace_name.clone(),
+        "prompt": "",
+        "record_prompt": false,
+        "history_limit": 40,
+        "task_limit": 250,
+        "agent_limit": 100,
+        "cursor": cache.get("cursor").cloned().unwrap_or_else(|| json!("")),
+        "known_node_hashes": cache.get("nodeHashes").cloned().unwrap_or_else(|| json!({})),
+        "known_edge_hashes": cache.get("edgeHashes").cloned().unwrap_or_else(|| json!({})),
+        "agent_work_hash": cache.get("agentWorkHash").cloned().unwrap_or_else(|| json!("")),
+        "graph_stats_hash": cache.get("graphStatsHash").cloned().unwrap_or_else(|| json!("")),
+        "requested_sections": ["nodes", "edges", "agent_work", "graph_stats"],
+        "ts_ms": cloud_mcp_now_ms(),
+    })
+}
+
+async fn cloud_mcp_fetch_full_spec_graph_data(
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+) -> Result<Value, String> {
+    cloud_mcp_connected_or_connect(state, "spec_graph_sync").await?;
+    let payload = json!({
+        "source": "rust-diffforge-spec-graph",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id.clone(),
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "repo_path": req.root_display.clone(),
+        "workspace_root": req.root_display.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "workspace_name": req.workspace_name.clone(),
         "prompt": "",
         "record_prompt": false,
         "history_limit": 40,
@@ -3345,34 +3718,185 @@ async fn cloud_mcp_get_spec_graph(
         "agent_limit": 100,
         "ts_ms": cloud_mcp_now_ms(),
     });
-
-    let response = match cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/graph", &payload).await {
+    let response = match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph", &payload).await {
         Ok(response) => response,
         Err(error) if error.contains("HTTP 404") => {
-            cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/feature-matrix", &payload).await?
+            cloud_mcp_post_json_endpoint(state, "/v1/spec/feature-matrix", &payload).await?
         }
         Err(error) => return Err(error),
     };
-    let data = cloud_mcp_response_data(&response);
+    Ok(cloud_mcp_response_data(&response))
+}
 
+async fn cloud_mcp_sync_spec_graph_once(
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+) -> Result<(Value, bool), String> {
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let current_cache = cloud_mcp_read_spec_graph_cache(req, "syncing", "");
+    cloud_mcp_connected_or_connect(state, "spec_graph_background_sync").await?;
+    let payload = cloud_mcp_spec_graph_sync_payload(req, &current_cache);
+    let delta_response = match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph/delta", &payload).await {
+        Ok(response) => Some(response),
+        Err(error) if error.contains("HTTP 404") => None,
+        Err(error) => return Err(error),
+    };
+    let next_snapshot = if let Some(response) = delta_response {
+        let delta = cloud_mcp_response_data(&response);
+        if delta["requires_full_resync"].as_bool().unwrap_or(false) {
+            let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
+            cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
+        } else {
+            cloud_mcp_apply_spec_graph_delta(req, current_cache.clone(), delta, &cache_path)
+        }
+    } else {
+        let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
+        cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
+    };
+    let changed = current_cache
+        .get("cursor")
+        .and_then(Value::as_str)
+        != next_snapshot.get("cursor").and_then(Value::as_str)
+        || current_cache.get("syncState").and_then(Value::as_str) == Some("error");
+    if changed {
+        cloud_mcp_write_spec_graph_cache(req, &next_snapshot)?;
+    }
+    Ok((next_snapshot, changed))
+}
+
+fn cloud_mcp_emit_spec_graph_snapshot(app: &AppHandle, snapshot: Value) {
+    let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot);
+}
+
+async fn cloud_mcp_spec_graph_sync_loop(
+    app: AppHandle,
+    state: CloudMcpState,
+    req: CloudMcpSpecGraphSyncRequest,
+    generation: u64,
+) {
+    let mut first_sync = true;
+    loop {
+        let still_active = {
+            let syncs = state.spec_graph_syncs.lock().await;
+            syncs.get(&req.repo_id).copied() == Some(generation)
+        };
+        if !still_active {
+            break;
+        }
+
+        let delay_ms = match cloud_mcp_sync_spec_graph_once(&state, &req).await {
+            Ok((snapshot, changed)) => {
+                if first_sync || changed {
+                    cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                }
+                first_sync = false;
+                CLOUD_MCP_SPEC_GRAPH_SYNC_INTERVAL_MS
+            }
+            Err(error) => {
+                let snapshot = cloud_mcp_read_spec_graph_cache(
+                    &req,
+                    "error",
+                    &clean_terminal_telemetry_text(&error),
+                );
+                let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
+                cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                first_sync = false;
+                CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS
+            }
+        };
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_cached_spec_graph(
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    Ok(cloud_mcp_read_spec_graph_cache(&req, "cached", ""))
+}
+
+#[tauri::command]
+async fn cloud_mcp_start_spec_graph_sync(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let mut cached = cloud_mcp_read_spec_graph_cache(&req, "syncing", "");
+    let requested_generation = cloud_mcp_now_ms();
+    let mut active_generation = requested_generation;
+    let mut should_spawn = false;
+    {
+        let mut syncs = state.spec_graph_syncs.lock().await;
+        if let Some(existing_generation) = syncs.get(&req.repo_id).copied() {
+            active_generation = existing_generation;
+        } else {
+            syncs.insert(req.repo_id.clone(), requested_generation);
+            should_spawn = true;
+        }
+    }
+    if let Some(object) = cached.as_object_mut() {
+        object.insert("syncGeneration".to_string(), json!(active_generation));
+    }
+    if should_spawn {
+        let app_for_task = app.clone();
+        let state_for_task = state.inner().clone();
+        let req_for_task = req.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_spec_graph_sync_loop(
+                app_for_task,
+                state_for_task,
+                req_for_task,
+                requested_generation,
+            )
+            .await;
+        });
+    }
+    Ok(cached)
+}
+
+#[tauri::command]
+async fn cloud_mcp_stop_spec_graph_sync(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    sync_generation: Option<u64>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, None, None);
+    let mut syncs = state.spec_graph_syncs.lock().await;
+    let stopped = if sync_generation
+        .map(|generation| syncs.get(&req.repo_id).copied() == Some(generation))
+        .unwrap_or(true)
+    {
+        syncs.remove(&req.repo_id).is_some()
+    } else {
+        false
+    };
     Ok(json!({
         "ok": true,
-        "repoId": repo_id,
-        "repoPath": root_display,
-        "workspaceId": workspace_id,
-        "workspaceName": workspace_name,
-        "specGraph": data,
-        "specNodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
-        "specEdges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
-        "agentWork": data.get("agent_work").cloned().unwrap_or_else(|| json!({})),
-        "graphStats": data.get("graph_stats").cloned().unwrap_or_else(|| json!({})),
-        "sourceOfTruth": {
-            "kind": "spec_graph",
-            "repo_id": repo_id,
-            "markdown_backed": true
-        },
-        "raw": data
+        "repoId": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "stopped": stopped,
     }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_spec_graph(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let data = cloud_mcp_fetch_full_spec_graph_data(state.inner(), &req).await?;
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let snapshot = cloud_mcp_spec_graph_snapshot_from_data(&req, data, &cache_path, "ready", "");
+    let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
+    Ok(snapshot)
 }
 
 pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {

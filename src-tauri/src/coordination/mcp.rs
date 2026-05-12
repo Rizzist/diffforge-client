@@ -9,45 +9,9 @@ use serde_json::{json, Value};
 use super::{
     db::REPO_ID,
     kernel::{api_error, CoordinationKernel, EventRefs},
-    watcher,
 };
 
-pub const TOOL_NAMES: &[&str] = &[
-    "get_brief",
-    "claim_task",
-    "post_plan",
-    "acquire_lease",
-    "renew_lease",
-    "release_lease",
-    "create_dependency",
-    "list_dependencies",
-    "explain_blockers",
-    "reevaluate_dependencies",
-    "cancel_dependency",
-    "list_ready_tasks",
-    "list_resources",
-    "list_active_leases",
-    "list_task_dependencies",
-    "announce_change",
-    "validate_patch",
-    "submit_patch",
-    "list_workspace_violations",
-    "list_workspace_changes",
-    "file_watcher_status",
-    "watcher_scan",
-    "get_slot_status",
-    "search_memory",
-    "write_memory",
-    "db_get_mode",
-    "db_classify_sql",
-    "db_request_change",
-    "db_list_change_requests",
-    "db_get_change_request",
-    "db_attach_migration_proposal",
-    "db_propose_migration",
-    "db_request_approval",
-    "request_approval",
-];
+pub const TOOL_NAMES: &[&str] = &["start_task", "acquire_lease", "submit_patch"];
 
 #[derive(Debug, Clone, Default)]
 pub struct McpContext {
@@ -465,24 +429,13 @@ fn dispatch_tool_result(
     };
     apply_live_session_defaults(&kernel, &mut input);
     match tool {
-        "get_brief" => kernel.get_brief(
+        "start_task" => kernel.start_task(
             input["agent_id"].as_str(),
             input["session_id"].as_str(),
             input["task_id"].as_str(),
             None,
         ),
-        "claim_task" => kernel.claim_task(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-        ),
-        "post_plan" => kernel.post_plan(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            req(&input, "plan")?,
-        ),
-        "acquire_lease" | "db_acquire_lease" => kernel.acquire_lease(
+        "acquire_lease" => kernel.acquire_lease(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
             req(&input, "session_id")?,
@@ -491,145 +444,12 @@ fn dispatch_tool_result(
             input["ttl_seconds"].as_i64(),
             input["reason"].as_str(),
         ),
-        "renew_lease" => kernel.renew_lease(
-            req(&input, "lease_id")?,
-            input["fence_token"].as_i64().unwrap_or(0),
-            input["ttl_seconds"].as_i64(),
-        ),
-        "release_lease" => kernel.release_lease_lenient(
-            input["lease_id"].as_str(),
-            input["fence_token"].as_i64(),
-            input["task_id"].as_str(),
-            input["agent_id"].as_str(),
-            input["session_id"].as_str(),
-            input["resource_key"].as_str(),
-        ),
-        "create_dependency" => kernel.create_dependency(&input),
-        "list_dependencies" => kernel.list_dependencies(
-            input["task_id"].as_str(),
-            input["status"].as_str(),
-            input["include_satisfied"].as_bool().unwrap_or(true),
-        ),
-        "explain_blockers" => kernel.explain_blockers(req(&input, "task_id")?),
-        "reevaluate_dependencies" => kernel.reevaluate_dependencies(input["task_id"].as_str()),
-        "cancel_dependency" => kernel.cancel_dependency(
-            req(&input, "dependency_edge_id")?,
-            input["reason"].as_str(),
-            input["actor_type"].as_str(),
-            input["actor_id"]
-                .as_str()
-                .or_else(|| input["agent_id"].as_str()),
-        ),
-        "list_ready_tasks" => kernel.list_ready_tasks(input["limit"].as_i64()),
-        "list_resources" => kernel.list_resources(
-            input["resource_type"].as_str(),
-            input["min_risk_level"].as_i64(),
-        ),
-        "list_active_leases" => kernel.list_active_leases(
-            input["task_id"].as_str(),
-            input["agent_id"].as_str(),
-            input["resource_key"].as_str(),
-        ),
-        "list_task_dependencies" => kernel.list_task_dependencies(input["task_id"].as_str()),
-        "announce_change" => kernel.announce_change(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            input["paths"]
-                .as_array()
-                .map(|values| strings(values))
-                .unwrap_or_default(),
-            input["summary"].as_str(),
-        ),
-        "validate_patch" => kernel.validate_patch(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            input["worktree_id"].as_str(),
-            input["summary"].as_str(),
-        ),
         "submit_patch" => kernel.submit_patch(
             req(&input, "task_id")?,
             req(&input, "agent_id")?,
             req(&input, "session_id")?,
             input["worktree_id"].as_str(),
             input["summary"].as_str(),
-        ),
-        "list_workspace_violations" => kernel.list_workspace_violations(
-            input["task_id"].as_str(),
-            input["agent_id"].as_str(),
-            input["session_id"].as_str(),
-            input["worktree_id"].as_str(),
-            input["status"].as_str().or(Some("open")),
-        ),
-        "list_workspace_changes" => kernel.list_workspace_changes(
-            input["task_id"].as_str(),
-            input["agent_id"].as_str(),
-            input["session_id"].as_str(),
-            input["worktree_id"].as_str(),
-            input["resource_key"].as_str(),
-            input["limit"].as_i64(),
-        ),
-        "file_watcher_status" => watcher::file_watcher_status(&kernel),
-        "watcher_scan" => watcher::scan_known_violations(&kernel),
-        "get_slot_status" => {
-            kernel.get_slot_status(input["agent_slot_id"].as_str(), input["slot_key"].as_str())
-        }
-        "search_memory" => kernel.search_memory(
-            input["query"].as_str(),
-            input["memory_kind"].as_str(),
-            input["trust_level"].as_str(),
-        ),
-        "write_memory" => kernel.write_memory(
-            req(&input, "memory_kind")?,
-            req(&input, "title")?,
-            req(&input, "body")?,
-            input["trust_level"].as_str(),
-            input["task_id"].as_str(),
-            input["evidence_artifact_id"].as_str(),
-            input["context_run_id"].as_str(),
-            input["agent_id"].as_str(),
-            None,
-        ),
-        "write_contract_memory" => kernel.write_contract_memory(&input),
-        "write_handoff_memory" => kernel.write_handoff_memory(&input),
-        "db_get_mode" => kernel.db_get_mode(),
-        "db_classify_sql" => kernel.db_classify_sql(req(&input, "sql")?),
-        "db_request_change" => kernel.db_request_change(&input),
-        "db_list_change_requests" => {
-            kernel.db_list_change_requests(input["status"].as_str(), input["task_id"].as_str())
-        }
-        "db_get_change_request" => {
-            kernel.db_get_change_request(req(&input, "db_change_request_id")?)
-        }
-        "db_propose_migration" | "db_attach_migration_proposal" => kernel.db_propose_migration(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            req(&input, "migration_name")?,
-            input["engine"].as_str().unwrap_or("unknown"),
-            req(&input, "up_sql")?,
-            input["down_sql_or_rollforward_plan"]
-                .as_str()
-                .or_else(|| input["down_sql_or_rollback_plan"].as_str())
-                .unwrap_or("Roll forward manually after review."),
-            input["summary"].as_str(),
-        ),
-        "db_request_approval" if input["db_change_request_id"].as_str().is_some() => kernel
-            .db_request_approval(
-                req(&input, "db_change_request_id")?,
-                req(&input, "agent_id")?,
-                input["session_id"].as_str(),
-                input["reason"].as_str(),
-                input["risk_summary"].as_str(),
-            ),
-        "request_approval" | "db_request_approval" => kernel.request_approval(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            input["session_id"].as_str(),
-            req(&input, "approval_kind")?,
-            req(&input, "reason")?,
-            input["risk_summary"].as_str(),
         ),
         _ => Ok(api_error(
             "unknown_tool",
@@ -724,35 +544,20 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
 
 fn tool_description(name: &str) -> String {
     match name {
-        "get_brief" => "Read the current local coordination task/session/lease brief. Call this before local leases so you know the assigned task_id.".to_string(),
-        "claim_task" => "Claim an already-created local coordination task by task_id. This does not create tasks.".to_string(),
+        "start_task" => "Start the assigned coordination task and read the task/session/lease brief. Call this once before editing or after a parked task resumes.".to_string(),
         "acquire_lease" => "Acquire a lease for an already-created task. Use resource_key such as file:index.html, glob:src/**, route:GET /api/users, or db:table:users.".to_string(),
-        "release_lease" => "Release a lease. Prefer resource_key; the current task/session/agent defaults are filled automatically. lease_id and fence_token also work.".to_string(),
-        "create_dependency" => "Create an explicit predicate dependency edge for a task. Deterministic predicates only; no semantic inference.".to_string(),
-        "list_dependencies" => "List explicit predicate dependency edges and current blockers.".to_string(),
-        "explain_blockers" => "Explain why a task is blocked by predicate dependency edges.".to_string(),
-        "reevaluate_dependencies" => "Recompute deterministic predicate dependency edge statuses.".to_string(),
-        "cancel_dependency" => "Cancel a predicate dependency edge while preserving audit history.".to_string(),
-        "list_ready_tasks" => "List ready tasks with no blocking predicate dependencies.".to_string(),
+        "submit_patch" => "Submit the current task patch for validation and automatic safe integration when possible.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
     }
 }
 
 fn tool_input_schema(name: &str) -> Value {
     match name {
-        "get_brief" => json!({
+        "start_task" => json!({
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "Optional; defaults to the current session task when available."}
             },
-            "additionalProperties": true
-        }),
-        "claim_task" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "Existing local coordination task id from get_brief or COORDINATION_TASK_ID."}
-            },
-            "required": ["task_id"],
             "additionalProperties": true
         }),
         "acquire_lease" => json!({
@@ -767,65 +572,12 @@ fn tool_input_schema(name: &str) -> Value {
             "required": ["resource_key"],
             "additionalProperties": true
         }),
-        "release_lease" => json!({
+        "submit_patch" => json!({
             "type": "object",
             "properties": {
-                "resource_key": {"type": "string", "description": "Normalized resource key to release for the current task/session, for example file:index.html."},
-                "lease_id": {"type": "string", "description": "Optional explicit lease id."},
-                "fence_token": {"type": "integer", "description": "Optional fence token; resolved automatically when omitted for an active lease."}
-            },
-            "additionalProperties": true
-        }),
-        "create_dependency" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "Dependent task id."},
-                "prerequisite_kind": {"type": "string", "enum": ["task", "resource", "patch", "artifact", "contract", "approval"]},
-                "prerequisite_key": {"type": "string", "description": "Stable prerequisite key, for example task:<id>, file:index.html, patch:<id>, artifact:<id>."},
-                "predicate_kind": {"type": "string", "enum": ["task_status_is", "patch_status_is", "lease_released", "resource_available", "artifact_exists", "contract_certified", "approval_granted"]},
-                "predicate_json": {"type": "object"},
-                "required": {"type": "boolean", "default": true}
-            },
-            "required": ["task_id", "prerequisite_kind", "prerequisite_key", "predicate_kind"],
-            "additionalProperties": true
-        }),
-        "list_dependencies" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string"},
-                "status": {"type": "string"},
-                "include_satisfied": {"type": "boolean", "default": true}
-            },
-            "additionalProperties": true
-        }),
-        "explain_blockers" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string"}
-            },
-            "required": ["task_id"],
-            "additionalProperties": true
-        }),
-        "reevaluate_dependencies" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "Optional task id; omit to reevaluate all dependency edges."}
-            },
-            "additionalProperties": true
-        }),
-        "cancel_dependency" => json!({
-            "type": "object",
-            "properties": {
-                "dependency_edge_id": {"type": "string"},
-                "reason": {"type": "string"}
-            },
-            "required": ["dependency_edge_id"],
-            "additionalProperties": true
-        }),
-        "list_ready_tasks" => json!({
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 100}
+                "task_id": {"type": "string", "description": "Existing local task id; defaults to the current session task when available."},
+                "worktree_id": {"type": "string", "description": "Optional; defaults to the current session worktree when available."},
+                "summary": {"type": "string", "description": "Short public summary of the completed changes."}
             },
             "additionalProperties": true
         }),
@@ -838,11 +590,4 @@ fn req<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("{key} is required."))
-}
-
-fn strings(values: &[Value]) -> Vec<String> {
-    values
-        .iter()
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect()
 }

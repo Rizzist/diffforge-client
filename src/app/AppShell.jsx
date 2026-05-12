@@ -3994,6 +3994,55 @@ export default function App() {
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
+  const selectedWorkspaceIdForSpecSync = selectedWorkspace?.id || "";
+  const selectedWorkspaceNameForSpecSync = selectedWorkspace?.name || "";
+
+  useEffect(() => {
+    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
+    if (!repoPath || !selectedWorkspaceIdForSpecSync) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let syncGeneration = null;
+    const stopSync = () => {
+      if (!syncGeneration) return;
+      invoke("cloud_mcp_stop_spec_graph_sync", { repoPath, syncGeneration }).catch(() => {});
+    };
+
+    invoke("cloud_mcp_start_spec_graph_sync", {
+      repoPath,
+      workspaceId: selectedWorkspaceIdForSpecSync || null,
+      workspaceName: selectedWorkspaceNameForSpecSync || null,
+    })
+      .then((result) => {
+        syncGeneration = Number(result?.syncGeneration) || null;
+        if (cancelled) {
+          stopSync();
+        }
+      })
+      .catch((error) => {
+        writeTerminalTelemetry({
+          phase: "frontend.spec_graph.background_sync_start_error",
+          fields: {
+            error: getErrorMessage(error, "Unable to start Spec Graph background sync."),
+            repoPath,
+            workspaceId: selectedWorkspaceIdForSpecSync,
+          },
+        });
+      });
+
+    return () => {
+      cancelled = true;
+      stopSync();
+    };
+  }, [
+    activatedWorkspaceTerminalWorkingDirectory,
+    selectedWorkspaceFileRoot,
+    selectedWorkspaceIdForSpecSync,
+    selectedWorkspaceNameForSpecSync,
+  ]);
+
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
       ? crashRecoveryModal.interruptedTasks

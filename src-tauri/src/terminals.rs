@@ -3315,7 +3315,7 @@ Original task:\n{original_task}\n\n\
 Why you were parked:\n{parked_lines}\n\n\
 Dependency now resolved:\n{resolved_lines}{refresh_note}\n\n\
 Continue now:\n\
-1. Call coordination-kernel.get_brief to refresh coordination state.\n\
+1. Call coordination-kernel.start_task to refresh coordination state.\n\
 2. Inspect the current target file(s) before editing so you do not work from stale context.\n\
 3. Re-acquire the needed lease(s), continue the original task above, and submit the patch when finished."
     )
@@ -5652,7 +5652,7 @@ mod terminal_tests {
         assert!(args.iter().any(|arg| {
             arg.starts_with("mcp_servers.coordination-kernel.args=")
         }));
-        assert!(args.iter().any(|arg| {
+        assert!(!args.iter().any(|arg| {
             arg.starts_with("mcp_servers.cloud-diffforge.args=")
         }));
     }
