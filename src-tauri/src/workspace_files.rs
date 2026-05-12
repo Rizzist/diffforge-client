@@ -16,6 +16,8 @@ pub(crate) fn default_working_directory() -> Result<PathBuf, String> {
         current_dir
     };
 
+    let working_directory = visible_workspace_root_for_directory(&working_directory);
+
     if should_fallback_default_working_directory(&working_directory) {
         if let Some(fallback_directory) = default_working_directory_fallback() {
             return Ok(fallback_directory);
@@ -44,11 +46,38 @@ fn source_project_directory() -> Option<PathBuf> {
     project_root
         .canonicalize()
         .ok()
+        .map(|directory| visible_workspace_root_for_directory(&directory))
         .filter(|directory| directory.is_dir())
 }
 
 fn should_fallback_default_working_directory(directory: &Path) -> bool {
     is_filesystem_root_directory(directory) || is_windows_system_startup_directory(directory)
+}
+
+fn visible_workspace_root_for_directory(directory: &Path) -> PathBuf {
+    coordination_worktree_visible_root(directory).unwrap_or_else(|| directory.to_path_buf())
+}
+
+fn coordination_worktree_visible_root(directory: &Path) -> Option<PathBuf> {
+    let components = directory.components().collect::<Vec<_>>();
+
+    for index in 0..components.len().saturating_sub(1) {
+        if path_component_is_normal(components[index], ".agents")
+            && path_component_is_normal(components[index + 1], "worktrees")
+        {
+            let mut root = PathBuf::new();
+            for component in &components[..index] {
+                root.push(component.as_os_str());
+            }
+            return (!root.as_os_str().is_empty()).then_some(root);
+        }
+    }
+
+    None
+}
+
+fn path_component_is_normal(component: Component<'_>, expected: &str) -> bool {
+    matches!(component, Component::Normal(value) if value == expected)
 }
 
 pub(crate) fn is_filesystem_root_directory(directory: &Path) -> bool {
@@ -312,6 +341,14 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
     let canonical = directory
         .canonicalize()
         .map_err(|error| format!("Unable to read workspace root directory: {error}"))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("Unable to inspect workspace root directory: {error}"))?;
+
+    if !metadata.is_dir() {
+        return Err("Workspace root directory must be an existing directory.".to_string());
+    }
+
+    let canonical = visible_workspace_root_for_directory(&canonical);
     let metadata = fs::metadata(&canonical)
         .map_err(|error| format!("Unable to inspect workspace root directory: {error}"))?;
 
@@ -1001,6 +1038,27 @@ mod workspace_files_tests {
         assert!(matches!(update, WorkspaceAgentsGitignoreUpdate::Added));
         let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gitignore, ".agents/\n/logs/\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_root_directory_collapses_agent_worktree_to_project_root() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-visible-root-{suffix}"));
+        let worktree = root.join(".agents").join("worktrees").join("codex-01");
+        fs::create_dir_all(&worktree).unwrap();
+
+        assert_eq!(visible_workspace_root_for_directory(&worktree), root);
+
+        let resolved = resolve_workspace_root_directory(Some(worktree.to_str().unwrap())).unwrap();
+        assert_eq!(
+            normalized_path_key(&resolved),
+            normalized_path_key(&root.canonicalize().unwrap())
+        );
 
         let _ = fs::remove_dir_all(root);
     }

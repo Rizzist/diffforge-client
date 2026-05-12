@@ -9,6 +9,8 @@ pub const APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME: &str =
     "coordination_kernel_approval_sql_context_pack_alignment";
 pub const MIGRATION_VERSION: i64 = 5;
 pub const MIGRATION_NAME: &str = "coordination_kernel_ui_cleanup_alignment";
+pub const DEPENDENCY_GRAPH_MIGRATION_VERSION: i64 = 6;
+pub const DEPENDENCY_GRAPH_MIGRATION_NAME: &str = "coordination_kernel_dependency_graph_v2";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -126,6 +128,28 @@ CREATE TABLE IF NOT EXISTS task_slice_dependencies(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(task_id, resource_key, depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS dependency_edges(
+  id TEXT PRIMARY KEY,
+  dependent_task_id TEXT NOT NULL,
+  prerequisite_kind TEXT NOT NULL,
+  prerequisite_key TEXT NOT NULL,
+  predicate_kind TEXT NOT NULL,
+  predicate_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  required INTEGER NOT NULL DEFAULT 1,
+  composition TEXT NOT NULL DEFAULT 'all_of',
+  created_by_type TEXT NOT NULL,
+  created_by_id TEXT NOT NULL,
+  evidence_event_id TEXT,
+  satisfied_by_event_id TEXT,
+  satisfied_by_artifact_id TEXT,
+  invalidated_by_event_id TEXT,
+  cancel_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(dependent_task_id, prerequisite_kind, prerequisite_key, predicate_kind, predicate_json)
 );
 
 CREATE TABLE IF NOT EXISTS resources(
@@ -652,6 +676,9 @@ CREATE INDEX IF NOT EXISTS idx_task_resource_intents_task ON task_resource_inten
 CREATE INDEX IF NOT EXISTS idx_task_resource_intents_resource ON task_resource_intents(resource_key, status);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_task ON task_slice_dependencies(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_resource ON task_slice_dependencies(resource_key, status);
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_prerequisite ON dependency_edges(prerequisite_kind, prerequisite_key, status);
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_predicate ON dependency_edges(predicate_kind, status);
 CREATE INDEX IF NOT EXISTS idx_leases_resource_status ON leases(resource_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
@@ -680,6 +707,34 @@ CREATE INDEX IF NOT EXISTS idx_bloat_audits_created ON coordination_bloat_audits
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_slot ON worktrees(agent_slot_id) WHERE agent_slot_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_branch ON worktrees(branch_name);
+"#;
+
+pub const DEPENDENCY_GRAPH_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS dependency_edges(
+  id TEXT PRIMARY KEY,
+  dependent_task_id TEXT NOT NULL,
+  prerequisite_kind TEXT NOT NULL,
+  prerequisite_key TEXT NOT NULL,
+  predicate_kind TEXT NOT NULL,
+  predicate_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  required INTEGER NOT NULL DEFAULT 1,
+  composition TEXT NOT NULL DEFAULT 'all_of',
+  created_by_type TEXT NOT NULL,
+  created_by_id TEXT NOT NULL,
+  evidence_event_id TEXT,
+  satisfied_by_event_id TEXT,
+  satisfied_by_artifact_id TEXT,
+  invalidated_by_event_id TEXT,
+  cancel_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(dependent_task_id, prerequisite_kind, prerequisite_key, predicate_kind, predicate_json)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_prerequisite ON dependency_edges(prerequisite_kind, prerequisite_key, status);
+CREATE INDEX IF NOT EXISTS idx_dependency_edges_predicate ON dependency_edges(predicate_kind, status);
 "#;
 
 pub const SLOT_SCHEMA_SQL: &str = r#"

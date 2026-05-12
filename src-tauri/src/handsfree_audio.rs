@@ -657,8 +657,23 @@ fn audio_push_to_talk_uses_context_menu(app: &AppHandle) -> bool {
     audio_shortcut_is_bare_context_menu(&audio_push_to_talk_shortcut_for(app))
 }
 
+fn audio_shortcut_state_label(state: &ShortcutState) -> &'static str {
+    match state {
+        ShortcutState::Pressed => "pressed",
+        ShortcutState::Released => "released",
+    }
+}
+
 fn emit_audio_shortcuts_changed(app: &AppHandle) {
-    let _ = app.emit(AUDIO_SHORTCUTS_CHANGED_EVENT, audio_shortcuts_status_for(app));
+    match app.emit(AUDIO_SHORTCUTS_CHANGED_EVENT, audio_shortcuts_status_for(app)) {
+        Ok(()) => log_audio_diagnostic_event("audio.shortcuts.changed.emit_done", json!({})),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.shortcuts.changed.emit_error",
+            json!({
+                "error": clean_whisper_local_audio_log_text(&error.to_string()),
+            }),
+        ),
+    }
 }
 
 fn register_audio_shortcut_handler(
@@ -672,25 +687,77 @@ fn register_audio_shortcut_handler(
         AudioShortcutAction::PushToTalk => app
             .global_shortcut()
             .on_shortcut(shortcut, |app, shortcut, event| {
-                handle_audio_push_to_talk_state(
-                    app.clone(),
-                    event.state,
-                    shortcut.into_string(),
+                let shortcut = shortcut.into_string();
+                log_audio_diagnostic_event(
+                    "audio.ptt.shortcut.callback",
+                    json!({
+                        "shortcut": shortcut,
+                        "state": audio_shortcut_state_label(&event.state),
+                    }),
+                );
+                let handled =
+                    handle_audio_push_to_talk_state(app.clone(), event.state, shortcut.clone());
+                log_audio_diagnostic_event(
+                    "audio.ptt.shortcut.callback_done",
+                    json!({
+                        "shortcut": shortcut,
+                        "state": audio_shortcut_state_label(&event.state),
+                        "handled": handled,
+                    }),
                 );
             })
             .map_err(|error| format!("Unable to register hold-to-record shortcut: {error}")),
         AudioShortcutAction::Cancel => app
             .global_shortcut()
             .on_shortcut(shortcut, |app, shortcut, event| {
-                handle_audio_cancel_shortcut_state(app.clone(), event.state, shortcut.into_string());
+                let shortcut = shortcut.into_string();
+                log_audio_diagnostic_event(
+                    "audio.ptt.cancel_shortcut.callback",
+                    json!({
+                        "shortcut": shortcut,
+                        "state": audio_shortcut_state_label(&event.state),
+                    }),
+                );
+                handle_audio_cancel_shortcut_state(app.clone(), event.state, shortcut.clone());
+                log_audio_diagnostic_event(
+                    "audio.ptt.cancel_shortcut.callback_done",
+                    json!({
+                        "shortcut": shortcut,
+                        "state": audio_shortcut_state_label(&event.state),
+                    }),
+                );
             })
             .map_err(|error| format!("Unable to register cancel shortcut: {error}")),
     }
 }
 
 fn unregister_audio_shortcut(app: &AppHandle, shortcut_text: &str) {
-    if let Ok(shortcut) = parse_audio_shortcut(shortcut_text) {
-        let _ = app.global_shortcut().unregister(shortcut);
+    match parse_audio_shortcut(shortcut_text) {
+        Ok(shortcut) => {
+            let result = app.global_shortcut().unregister(shortcut);
+            match result {
+                Ok(()) => log_audio_diagnostic_event(
+                    "audio.shortcut.unregister_done",
+                    json!({
+                        "shortcut": shortcut_text,
+                    }),
+                ),
+                Err(error) => log_audio_diagnostic_event(
+                    "audio.shortcut.unregister_error",
+                    json!({
+                        "shortcut": shortcut_text,
+                        "error": clean_whisper_local_audio_log_text(&error.to_string()),
+                    }),
+                ),
+            }
+        }
+        Err(error) => log_audio_diagnostic_event(
+            "audio.shortcut.unregister_parse_error",
+            json!({
+                "shortcut": shortcut_text,
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        ),
     }
 }
 
@@ -699,7 +766,27 @@ fn register_deferred_audio_cancel_shortcut(app: &AppHandle) {
     let shortcut = manager.snapshot().cancel.shortcut;
 
     if audio_cancel_shortcut_defers_global_registration(&shortcut) {
-        let _ = register_audio_shortcut_handler(app, AudioShortcutAction::Cancel, &shortcut);
+        log_audio_diagnostic_event(
+            "audio.ptt.cancel_shortcut.defer_register_start",
+            json!({
+                "shortcut": shortcut,
+            }),
+        );
+        match register_audio_shortcut_handler(app, AudioShortcutAction::Cancel, &shortcut) {
+            Ok(()) => log_audio_diagnostic_event(
+                "audio.ptt.cancel_shortcut.defer_register_done",
+                json!({
+                    "shortcut": shortcut,
+                }),
+            ),
+            Err(error) => log_audio_diagnostic_event(
+                "audio.ptt.cancel_shortcut.defer_register_error",
+                json!({
+                    "shortcut": shortcut,
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            ),
+        }
     }
 }
 
@@ -708,6 +795,12 @@ fn unregister_deferred_audio_cancel_shortcut(app: &AppHandle) {
     let shortcut = manager.snapshot().cancel.shortcut;
 
     if audio_cancel_shortcut_defers_global_registration(&shortcut) {
+        log_audio_diagnostic_event(
+            "audio.ptt.cancel_shortcut.defer_unregister",
+            json!({
+                "shortcut": shortcut,
+            }),
+        );
         unregister_audio_shortcut(app, &shortcut);
     }
 }
@@ -717,43 +810,97 @@ fn register_audio_shortcut_registration(
     action: AudioShortcutAction,
     shortcut: String,
 ) -> AudioShortcutRegistration {
+    log_audio_diagnostic_event(
+        "audio.shortcut.register.start",
+        json!({
+            "action": action.label(),
+            "shortcut": shortcut,
+            "is_ptt_down": AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire),
+        }),
+    );
+
     if action == AudioShortcutAction::Cancel
         && audio_cancel_shortcut_defers_global_registration(&shortcut)
         && !AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire)
     {
+        log_audio_diagnostic_event(
+            "audio.shortcut.register.deferred_cancel",
+            json!({
+                "shortcut": shortcut,
+            }),
+        );
         return deferred_audio_cancel_registration(shortcut);
     }
 
     if audio_shortcut_uses_windows_context_menu_hook(action, &shortcut) {
         return match register_audio_context_menu_keyboard_hook(app) {
-            Ok(()) => AudioShortcutRegistration {
-                shortcut,
-                registered: true,
-                error: None,
-            },
-            Err(error) => AudioShortcutRegistration {
-                shortcut,
-                registered: false,
-                error: Some(error),
-            },
+            Ok(()) => {
+                log_audio_diagnostic_event(
+                    "audio.shortcut.register.context_menu_hook_done",
+                    json!({
+                        "action": action.label(),
+                        "shortcut": shortcut,
+                    }),
+                );
+                AudioShortcutRegistration {
+                    shortcut,
+                    registered: true,
+                    error: None,
+                }
+            }
+            Err(error) => {
+                log_audio_diagnostic_event(
+                    "audio.shortcut.register.context_menu_hook_error",
+                    json!({
+                        "action": action.label(),
+                        "shortcut": shortcut,
+                        "error": clean_whisper_local_audio_log_text(&error),
+                    }),
+                );
+                AudioShortcutRegistration {
+                    shortcut,
+                    registered: false,
+                    error: Some(error),
+                }
+            }
         };
     }
 
     match register_audio_shortcut_handler(app, action, &shortcut) {
-        Ok(()) => AudioShortcutRegistration {
-            shortcut,
-            registered: true,
-            error: None,
-        },
-        Err(error) => AudioShortcutRegistration {
-            shortcut,
-            registered: false,
-            error: Some(error),
-        },
+        Ok(()) => {
+            log_audio_diagnostic_event(
+                "audio.shortcut.register.done",
+                json!({
+                    "action": action.label(),
+                    "shortcut": shortcut,
+                }),
+            );
+            AudioShortcutRegistration {
+                shortcut,
+                registered: true,
+                error: None,
+            }
+        }
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.shortcut.register.error",
+                json!({
+                    "action": action.label(),
+                    "shortcut": shortcut,
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            AudioShortcutRegistration {
+                shortcut,
+                registered: false,
+                error: Some(error),
+            }
+        }
     }
 }
 
 fn register_audio_shortcuts(app: &AppHandle) {
+    log_audio_diagnostic_event("audio.shortcuts.startup_register.start", json!({}));
     let bindings = read_audio_shortcut_bindings(app);
     let mut state = AudioShortcutManagerState::from_bindings(&bindings);
 
@@ -766,8 +913,20 @@ fn register_audio_shortcuts(app: &AppHandle) {
         register_audio_shortcut_registration(app, AudioShortcutAction::Cancel, bindings.cancel);
 
     app.state::<AudioState>().shortcut_manager.replace(state);
-    let _ = register_audio_context_menu_keyboard_hook(app);
+    match register_audio_context_menu_keyboard_hook(app) {
+        Ok(()) => log_audio_diagnostic_event(
+            "audio.shortcuts.startup_context_menu_hook_done",
+            json!({}),
+        ),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.shortcuts.startup_context_menu_hook_error",
+            json!({
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        ),
+    }
     emit_audio_shortcuts_changed(app);
+    log_audio_diagnostic_event("audio.shortcuts.startup_register.done", json!({}));
 }
 
 fn set_audio_shortcut_for(
@@ -881,22 +1040,42 @@ unsafe extern "system" fn audio_context_menu_keyboard_hook(
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
+    log_audio_diagnostic_event(
+        "audio.ptt.context_menu_hook.event",
+        json!({
+            "code": code,
+            "vk_code": event.vkCode,
+            "wparam": wparam,
+            "lparam": lparam,
+        }),
+    );
+
     match wparam as u32 {
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            handle_audio_push_to_talk_state(
+            if handle_audio_push_to_talk_state(
                 app,
                 ShortcutState::Pressed,
                 "ContextMenu".to_string(),
-            );
-            1
+            ) {
+                log_audio_diagnostic_event("audio.ptt.context_menu_hook.handled_down", json!({}));
+                1
+            } else {
+                log_audio_diagnostic_event("audio.ptt.context_menu_hook.passed_down", json!({}));
+                CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+            }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            handle_audio_push_to_talk_state(
+            if handle_audio_push_to_talk_state(
                 app,
                 ShortcutState::Released,
                 "ContextMenu".to_string(),
-            );
-            1
+            ) {
+                log_audio_diagnostic_event("audio.ptt.context_menu_hook.handled_up", json!({}));
+                1
+            } else {
+                log_audio_diagnostic_event("audio.ptt.context_menu_hook.passed_up", json!({}));
+                CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+            }
         }
         _ => CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam),
     }
@@ -945,12 +1124,37 @@ fn emit_audio_push_to_talk_event(
     pressed: bool,
     shortcut: String,
 ) {
-    let _ = app.emit(AUDIO_PUSH_TO_TALK_EVENT, AudioPushToTalkEvent {
+    log_audio_diagnostic_event(
+        "audio.ptt.emit.start",
+        json!({
+            "phase": phase,
+            "pressed": pressed,
+            "shortcut": shortcut,
+        }),
+    );
+    let event = AudioPushToTalkEvent {
         phase,
         pressed,
         shortcut,
         created_at_ms: current_time_ms(),
-    });
+    };
+    match app.emit(AUDIO_PUSH_TO_TALK_EVENT, event) {
+        Ok(()) => log_audio_diagnostic_event(
+            "audio.ptt.emit.done",
+            json!({
+                "phase": phase,
+                "pressed": pressed,
+            }),
+        ),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.ptt.emit.error",
+            json!({
+                "phase": phase,
+                "pressed": pressed,
+                "error": clean_whisper_local_audio_log_text(&error.to_string()),
+            }),
+        ),
+    }
 }
 
 fn audio_push_to_talk_status_for(app: &AppHandle) -> AudioPushToTalkEvent {
@@ -965,7 +1169,13 @@ fn audio_push_to_talk_status_for(app: &AppHandle) -> AudioPushToTalkEvent {
 }
 
 fn emit_audio_cancel_event(app: &AppHandle, shortcut: String) {
-    let _ = app.emit(
+    log_audio_diagnostic_event(
+        "audio.ptt.cancel_emit.start",
+        json!({
+            "shortcut": shortcut,
+        }),
+    );
+    let result = app.emit(
         AUDIO_CANCEL_EVENT,
         AudioShortcutEvent {
             action: "cancel",
@@ -973,70 +1183,261 @@ fn emit_audio_cancel_event(app: &AppHandle, shortcut: String) {
             created_at_ms: current_time_ms(),
         },
     );
+    match result {
+        Ok(()) => log_audio_diagnostic_event("audio.ptt.cancel_emit.done", json!({})),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.ptt.cancel_emit.error",
+            json!({
+                "error": clean_whisper_local_audio_log_text(&error.to_string()),
+            }),
+        ),
+    }
 }
 
-fn show_audio_widget_for_handsfree(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
-    let status = whisper_model_status_for(app)?;
-    let window = ensure_audio_widget_window(app)?;
-    window
-        .show()
-        .map_err(|error| format!("Unable to show audio widget: {error}"))?;
+fn audio_widget_visibility_for_handsfree(
+    app: &AppHandle,
+) -> Result<Option<AudioWidgetVisibility>, String> {
+    log_audio_diagnostic_event("audio.ptt.widget_visibility.start", json!({}));
+    let visible = match audio_widget_visible_on_main_thread(app) {
+        Ok(visible) => visible,
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.ptt.widget_visibility.visible_error",
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+    };
 
+    if !visible {
+        log_audio_diagnostic_event("audio.ptt.widget_visibility.not_visible", json!({}));
+        return Ok(None);
+    }
+
+    let status = match whisper_model_status_for(app) {
+        Ok(status) => status,
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.ptt.widget_visibility.status_error",
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+    };
     let visibility = AudioWidgetVisibility {
         visible: true,
         installed: status.installed,
         shortcut: audio_push_to_talk_shortcut_for(app),
     };
     emit_audio_widget_visibility_changed(app, &visibility);
-    Ok(visibility)
+    log_audio_diagnostic_event(
+        "audio.ptt.widget_visibility.done",
+        json!({
+            "installed": visibility.installed,
+            "shortcut": visibility.shortcut,
+        }),
+    );
+    Ok(Some(visibility))
 }
 
-fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcut: String) {
+fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcut: String) -> bool {
+    let state_label = audio_shortcut_state_label(&state);
+    log_audio_diagnostic_event(
+        "audio.ptt.handle.start",
+        json!({
+            "state": state_label,
+            "shortcut": shortcut,
+            "is_down_before": AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire),
+        }),
+    );
+
     match state {
         ShortcutState::Pressed => {
-            if AUDIO_PUSH_TO_TALK_IS_DOWN.swap(true, Ordering::AcqRel) {
-                return;
+            let widget_visible = match audio_widget_visible_on_main_thread(&app) {
+                Ok(visible) => {
+                    log_audio_diagnostic_event(
+                        "audio.ptt.handle.initial_visibility",
+                        json!({
+                            "visible": visible,
+                        }),
+                    );
+                    visible
+                }
+                Err(error) => {
+                    log_audio_diagnostic_event(
+                        "audio.ptt.handle.initial_visibility_error",
+                        json!({
+                            "error": clean_whisper_local_audio_log_text(&error),
+                        }),
+                    );
+                    false
+                }
+            };
+
+            if !widget_visible {
+                if AUDIO_PUSH_TO_TALK_IS_DOWN.swap(false, Ordering::AcqRel) {
+                    log_audio_diagnostic_event(
+                        "audio.ptt.handle.not_visible_cancel_down",
+                        json!({}),
+                    );
+                    unregister_deferred_audio_cancel_shortcut(&app);
+                }
+                log_audio_diagnostic_event("audio.ptt.handle.ignored_not_visible", json!({}));
+                return false;
             }
 
+            if AUDIO_PUSH_TO_TALK_IS_DOWN.swap(true, Ordering::AcqRel) {
+                log_audio_diagnostic_event("audio.ptt.handle.duplicate_press", json!({}));
+                return true;
+            }
+
+            log_audio_diagnostic_event("audio.ptt.handle.register_cancel_shortcut", json!({}));
             register_deferred_audio_cancel_shortcut(&app);
 
+            log_audio_diagnostic_event("audio.ptt.handle.spawn_press_task", json!({}));
             tauri::async_runtime::spawn(async move {
+                log_audio_diagnostic_event("audio.ptt.press_task.start", json!({}));
+                let widget_visible = match audio_widget_visible_on_main_thread(&app) {
+                    Ok(visible) => {
+                        log_audio_diagnostic_event(
+                            "audio.ptt.press_task.visibility",
+                            json!({
+                                "visible": visible,
+                            }),
+                        );
+                        visible
+                    }
+                    Err(error) => {
+                        log_audio_diagnostic_event(
+                            "audio.ptt.press_task.visibility_error",
+                            json!({
+                                "error": clean_whisper_local_audio_log_text(&error),
+                            }),
+                        );
+                        false
+                    }
+                };
+
+                if !widget_visible {
+                    AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
+                    unregister_deferred_audio_cancel_shortcut(&app);
+                    log_audio_diagnostic_event(
+                        "audio.ptt.press_task.ignored_not_visible",
+                        json!({}),
+                    );
+                    return;
+                }
+
                 if !app_has_focused_audio_input_window(&app) {
+                    log_audio_diagnostic_event(
+                        "audio.ptt.press_task.clear_terminal_target_start",
+                        json!({}),
+                    );
                     let terminal_state = app.state::<TerminalState>();
                     let _ = clear_terminal_audio_input_target(&terminal_state);
+                    log_audio_diagnostic_event(
+                        "audio.ptt.press_task.clear_terminal_target_done",
+                        json!({}),
+                    );
                 }
 
                 if AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire) {
+                    log_audio_diagnostic_event("audio.ptt.press_task.emit_pressed", json!({}));
                     emit_audio_push_to_talk_event(&app, "pressed", true, shortcut);
                 }
 
-                if let Ok(visibility) = show_audio_widget_for_handsfree(&app) {
-                    if visibility.installed {
-                        let prepare_app = app.clone();
-                        let engine = app.state::<AudioState>().whisper_engine.clone();
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            let _ = prepare_whisper_model_for(&prepare_app, &engine);
-                        });
+                match audio_widget_visibility_for_handsfree(&app) {
+                    Ok(Some(visibility)) => {
+                        if visibility.installed {
+                            let prepare_app = app.clone();
+                            let engine = app.state::<AudioState>().whisper_engine.clone();
+                            log_audio_diagnostic_event(
+                                "audio.ptt.press_task.prepare_spawn",
+                                json!({}),
+                            );
+                            let _ = tauri::async_runtime::spawn_blocking(move || {
+                                match prepare_whisper_model_for(&prepare_app, &engine) {
+                                    Ok(status) => log_audio_diagnostic_event(
+                                        "audio.ptt.press_task.prepare_done",
+                                        json!({
+                                            "cached": status.cached,
+                                            "elapsed_ms": status.elapsed_ms,
+                                        }),
+                                    ),
+                                    Err(error) => log_audio_diagnostic_event(
+                                        "audio.ptt.press_task.prepare_error",
+                                        json!({
+                                            "error": clean_whisper_local_audio_log_text(&error),
+                                        }),
+                                    ),
+                                }
+                            });
+                        } else {
+                            log_audio_diagnostic_event(
+                                "audio.ptt.press_task.prepare_skipped_not_installed",
+                                json!({}),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        log_audio_diagnostic_event(
+                            "audio.ptt.press_task.visibility_none",
+                            json!({}),
+                        );
+                    }
+                    Err(error) => {
+                        log_audio_diagnostic_event(
+                            "audio.ptt.press_task.widget_visibility_error",
+                            json!({
+                                "error": clean_whisper_local_audio_log_text(&error),
+                            }),
+                        );
                     }
                 }
+                log_audio_diagnostic_event("audio.ptt.press_task.done", json!({}));
             });
+
+            log_audio_diagnostic_event("audio.ptt.handle.pressed_done", json!({}));
+            true
         }
         ShortcutState::Released => {
             if !AUDIO_PUSH_TO_TALK_IS_DOWN.swap(false, Ordering::AcqRel) {
-                return;
+                log_audio_diagnostic_event("audio.ptt.handle.release_ignored_not_down", json!({}));
+                return false;
             }
 
+            log_audio_diagnostic_event("audio.ptt.handle.unregister_cancel_shortcut", json!({}));
             unregister_deferred_audio_cancel_shortcut(&app);
 
+            log_audio_diagnostic_event("audio.ptt.handle.spawn_release_task", json!({}));
             tauri::async_runtime::spawn(async move {
+                log_audio_diagnostic_event("audio.ptt.release_task.emit_released", json!({}));
                 emit_audio_push_to_talk_event(&app, "released", false, shortcut);
+                log_audio_diagnostic_event("audio.ptt.release_task.done", json!({}));
             });
+
+            log_audio_diagnostic_event("audio.ptt.handle.released_done", json!({}));
+            true
         }
     }
 }
 
 fn handle_audio_cancel_shortcut_state(app: AppHandle, state: ShortcutState, shortcut: String) {
+    log_audio_diagnostic_event(
+        "audio.ptt.cancel_handle.start",
+        json!({
+            "state": audio_shortcut_state_label(&state),
+            "shortcut": shortcut,
+            "is_down_before": AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire),
+        }),
+    );
+
     if state != ShortcutState::Pressed {
+        log_audio_diagnostic_event("audio.ptt.cancel_handle.ignored_release", json!({}));
         return;
     }
 
@@ -1044,7 +1445,9 @@ fn handle_audio_cancel_shortcut_state(app: AppHandle, state: ShortcutState, shor
     unregister_deferred_audio_cancel_shortcut(&app);
 
     tauri::async_runtime::spawn(async move {
+        log_audio_diagnostic_event("audio.ptt.cancel_task.emit", json!({}));
         emit_audio_cancel_event(&app, shortcut);
+        log_audio_diagnostic_event("audio.ptt.cancel_task.done", json!({}));
     });
 }
 
@@ -1065,12 +1468,22 @@ fn insert_text_with_enigo(text: &str) -> Result<(), String> {
 
 #[tauri::command]
 async fn audio_shortcuts_status(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
+    log_audio_diagnostic_event("audio.shortcuts.status.command", json!({}));
     Ok(audio_shortcuts_status_for(&app))
 }
 
 #[tauri::command]
 async fn audio_push_to_talk_status(app: AppHandle) -> Result<AudioPushToTalkEvent, String> {
-    Ok(audio_push_to_talk_status_for(&app))
+    let status = audio_push_to_talk_status_for(&app);
+    log_audio_diagnostic_event(
+        "audio.ptt.status.command",
+        json!({
+            "phase": status.phase,
+            "pressed": status.pressed,
+            "shortcut": status.shortcut,
+        }),
+    );
+    Ok(status)
 }
 
 #[tauri::command]

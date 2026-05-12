@@ -1114,6 +1114,17 @@ function getAgentUpdateSummary(agents) {
   return updateLabels.join(" / ");
 }
 
+function collapseAgentWorktreeRootDirectory(value) {
+  const normalized = String(value || "").replace(/\\/g, "/");
+  const markerIndex = normalized.indexOf("/.agents/worktrees");
+
+  if (markerIndex <= 0) {
+    return value;
+  }
+
+  return value.slice(0, markerIndex).replace(/[\\/]+$/g, "");
+}
+
 function cleanWorkspaceRootDirectory(value) {
   if (typeof value !== "string") {
     return "";
@@ -1123,16 +1134,16 @@ function cleanWorkspaceRootDirectory(value) {
   const uncVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]UNC[\\/](.+)$/i);
 
   if (uncVerbatimMatch) {
-    return `\\\\${uncVerbatimMatch[1]}`.trim();
+    return collapseAgentWorktreeRootDirectory(`\\\\${uncVerbatimMatch[1]}`.trim());
   }
 
   const driveVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]([a-z]:[\\/].*)$/i);
 
   if (driveVerbatimMatch) {
-    return driveVerbatimMatch[1].trim();
+    return collapseAgentWorktreeRootDirectory(driveVerbatimMatch[1].trim());
   }
 
-  return cleaned;
+  return collapseAgentWorktreeRootDirectory(cleaned);
 }
 
 function isWindowsSystemRootDirectory(value) {
@@ -4536,7 +4547,7 @@ export default function App() {
                     type="button"
                   >
                     <ButtonForgeIcon aria-hidden="true" />
-                    <span>Kanban</span>
+                    <span>Feature Matrix</span>
                   </RailActionButton>
                   <RailActionButton
                     data-active={activeView === "vault"}
@@ -5014,7 +5025,7 @@ export default function App() {
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "kanban" ? (
-                <ForgeWorkspace aria-label="Workspace Kanban" data-motion={viewMotion}>
+                <ForgeWorkspace aria-label="Workspace Feature Matrix" data-motion={viewMotion}>
                   <KanbanWorkspaceView
                     defaultWorkingDirectory={defaultWorkingDirectory}
                     rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}

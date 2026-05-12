@@ -2,15 +2,35 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import styled from "styled-components";
 
-const KANBAN_COLUMNS = [
-  { id: "todo", label: "To do", tone: "#60a5fa" },
-  { id: "active", label: "In progress", tone: "#34d399" },
+const SPEC_COLUMNS = [
+  { id: "proposed", label: "Proposed", tone: "#38bdf8" },
+  { id: "active", label: "Active", tone: "#34d399" },
   { id: "blocked", label: "Blocked", tone: "#fb7185" },
   { id: "review", label: "Review", tone: "#fbbf24" },
-  { id: "done", label: "Done", tone: "#a78bfa" },
-  { id: "cancelled", label: "Cancelled", tone: "#94a3b8" },
-  { id: "interrupted", label: "Interrupted", tone: "#f97316" },
+  { id: "verified", label: "Verified", tone: "#a78bfa" },
+  { id: "stale", label: "Stale", tone: "#94a3b8" },
 ];
+
+const NODE_TYPE_TONES = {
+  feature: "#38bdf8",
+  flow: "#34d399",
+  behavior: "#fbbf24",
+  quirk: "#f97316",
+  platform: "#a78bfa",
+  guard: "#fb7185",
+  implementation_unit: "#94a3b8",
+};
+
+const GRAPH_NODE_SIZES = {
+  main: 154,
+  related: 108,
+  distant: 74,
+};
+const GRAPH_MIN_ZOOM = 0.48;
+const GRAPH_MAX_ZOOM = 1.8;
+const GRAPH_ZOOM_STEP = 0.16;
+const LIVE_AGENT_STATUSES = new Set(["", "active", "starting", "busy", "implementing", "working"]);
+const MAX_VISIBLE_AGENT_ORBITS = 6;
 
 function cleanText(value) {
   return String(value || "")
@@ -52,8 +72,19 @@ function jsonObject(value) {
   }
 }
 
-function metadata(task) {
-  return jsonObject(field(task, "metadata", "metadata_json", "metadataJson"));
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function metadata(item) {
+  return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
 }
 
 function shortId(value) {
@@ -68,7 +99,7 @@ function shortId(value) {
 
 function colorFor(value) {
   const palette = ["#38bdf8", "#34d399", "#fbbf24", "#fb7185", "#a78bfa", "#2dd4bf", "#f97316"];
-  const raw = String(value || "agent");
+  const raw = String(value || "feature");
   let hash = 0;
   for (let index = 0; index < raw.length; index += 1) {
     hash = (hash * 31 + raw.charCodeAt(index)) >>> 0;
@@ -76,78 +107,345 @@ function colorFor(value) {
   return palette[hash % palette.length];
 }
 
-function agentLabelFor(task, agentId) {
-  const meta = metadata(task);
-  const explicit = text(field(task, "agent_label", "agentLabel", "label") || meta.agent_label || meta.agentLabel);
-  if (explicit) return explicit.toUpperCase();
-
-  const slot = text(field(task, "slot_key", "slotKey") || meta.slot_key || meta.slotKey);
-  const match = slot.match(/^codex-(\d+)$/i);
-  if (match) {
-    const index = Number(match[1]);
-    if (Number.isFinite(index) && index > 0 && index <= 26) {
-      return `CX${String.fromCharCode(64 + index)}`;
-    }
+function freshnessTone(value) {
+  switch (value) {
+    case "in_sync":
+      return "#34d399";
+    case "spec_ahead":
+      return "#fbbf24";
+    case "code_ahead":
+      return "#f97316";
+    case "needs_review":
+      return "#fb7185";
+    default:
+      return "#94a3b8";
   }
-
-  return shortId(agentId);
 }
 
-function inferredStatus(task, fallback) {
-  const status = text(fallback, "todo").toLowerCase();
-  const meta = metadata(task);
-  const body = text(field(task, "body", "description"));
-  const title = text(field(task, "title", "summary"));
-  const requested = text(meta.requested_status || meta.requestedStatus).toLowerCase();
-  const combined = `${title} ${body} ${text(meta.block_reason || meta.blockReason)} ${text(meta.completion_gate || meta.completionGate)}`.toLowerCase();
+function agentLabelFor(agent) {
+  const explicit = text(field(agent, "agent_label", "agentLabel", "label"));
+  if (explicit) return explicit.toUpperCase();
+  return shortId(field(agent, "agent_id", "agentId", "id"));
+}
 
-  if (status === "interrupted" || requested === "interrupted" || combined.includes("interrupted")) {
-    return "interrupted";
-  }
-
-  if (status === "cancelled" || requested === "cancelled" || combined.includes("cancelled")) {
-    return "cancelled";
-  }
-
-  if (
-    status === "blocked" ||
-    meta.completion_blocked_until_submit_patch ||
-    meta.completionBlockedUntilSubmitPatch ||
-    combined.includes("blocked by") ||
-    combined.startsWith("blocked:") ||
-    combined.includes("unable to apply") ||
-    combined.includes("unable to complete") ||
-    combined.includes("owned by another active") ||
-    combined.includes("peer lease")
-  ) {
+function workStateFor(node) {
+  const activeAgents = jsonArray(field(node, "active_agents", "activeAgents"));
+  if (activeAgents.some((agent) => text(field(agent, "status")).toLowerCase() === "blocked")) {
     return "blocked";
   }
+  if (activeAgents.length) return "active";
 
-  if (status === "review" && requested === "done") return "review";
-  return KANBAN_COLUMNS.some((column) => column.id === status) ? status : "todo";
+  const freshness = text(field(node, "freshness_state", "freshnessState")).toLowerCase();
+  if (["code_ahead", "spec_ahead", "needs_review"].includes(freshness)) return "stale";
+
+  const status = text(field(node, "work_state", "workState", "status"), "proposed").toLowerCase();
+  if (status === "todo") return "proposed";
+  if (status === "done" || status === "completed" || status === "passed") return "verified";
+  if (SPEC_COLUMNS.some((column) => column.id === status)) return status;
+  return "proposed";
 }
 
-function normalizeBoard(response) {
-  const board = response?.taskBoard && typeof response.taskBoard === "object" ? response.taskBoard : {};
-  const tasks = Array.isArray(response?.tasks) ? response.tasks : [];
-  const byStatus = Object.fromEntries(KANBAN_COLUMNS.map((column) => [column.id, []]));
+function liveAgentCountFor(node) {
+  return liveAgentsFor(node).length;
+}
 
-  for (const column of KANBAN_COLUMNS) {
-    const items = Array.isArray(board[column.id]) ? board[column.id] : [];
-    for (const item of items) {
-      const status = inferredStatus(item, column.id);
-      byStatus[status].push(item);
+function liveAgentsFor(node) {
+  const cached = Number(field(node, "live_agent_count", "liveAgentCount"));
+  const agents = jsonArray(field(node, "active_agents", "activeAgents")).filter((agent) => {
+    const status = text(field(agent, "status")).toLowerCase();
+    return LIVE_AGENT_STATUSES.has(status);
+  });
+  if (agents.length || !Number.isFinite(cached) || cached <= 0) return agents;
+  return Array.from({ length: cached }, (_, index) => ({ id: `live-agent-${index}`, status: "active" }));
+}
+
+function normalizeNode(raw, index = 0) {
+  const meta = metadata(raw);
+  const id = text(field(raw, "id", "node_id", "nodeId", "task_id", "taskId"), `spec-${index}`);
+  const title = text(field(raw, "title", "summary"), "Untitled spec");
+  const nodeType = text(field(raw, "node_type", "nodeType", "type"), "feature").toLowerCase();
+  const area = text(field(raw, "feature_area", "featureArea", "lane", "resource_lane", "resourceLane"), "general");
+  const summary = text(field(raw, "summary", "current_summary", "body", "description"), "");
+  const purpose = text(field(raw, "purpose"), summary || "Intentional behavior captured from prompts, checkpoints, and patch history.");
+  const rawMarkdown = field(raw, "markdown");
+  const activeAgents = jsonArray(field(raw, "active_agents", "activeAgents"));
+  const events = jsonArray(field(raw, "recent_events", "recentEvents", "events"));
+  const linkedFiles = jsonArray(field(raw, "linked_files", "linkedFiles"));
+  const candidateFiles = jsonArray(field(raw, "candidate_files", "candidateFiles"));
+  const relatedSpecs = jsonArray(field(raw, "related_specs", "relatedSpecs"));
+  const liveAgentCount = activeAgents.filter((agent) => {
+    const status = text(field(agent, "status")).toLowerCase();
+    return LIVE_AGENT_STATUSES.has(status);
+  }).length;
+  return {
+    ...raw,
+    id,
+    title,
+    node_type: nodeType,
+    feature_area: area,
+    summary,
+    purpose,
+    work_state: workStateFor({ ...raw, active_agents: activeAgents }),
+    intent_state: text(field(raw, "intent_state", "intentState"), "inferred"),
+    implementation_state: text(field(raw, "implementation_state", "implementationState"), "none"),
+    freshness_state: text(field(raw, "freshness_state", "freshnessState"), "unknown"),
+    confidence: Number(field(raw, "confidence")) || 0.35,
+    risk_level: Number(field(raw, "risk_level", "riskLevel")) || 1,
+    verification_state: text(field(raw, "verification_state", "verificationState"), "needed"),
+    markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
+      ? rawMarkdown
+      : fallbackMarkdown({ title, node_type: nodeType, feature_area: area, summary, purpose, metadata: meta }),
+    markdown_path: text(field(raw, "markdown_path", "markdownPath")),
+    active_agents: activeAgents,
+    live_agent_count: liveAgentCount,
+    recent_events: events,
+    linked_files: linkedFiles,
+    candidate_files: candidateFiles,
+    related_specs: relatedSpecs,
+    metadata: meta,
+  };
+}
+
+function fallbackMarkdown(node) {
+  const guard = node.metadata?.regression_guard || "Do not regress accepted behavior without a superseding prompt or patch evidence.";
+  return [
+    `# ${node.title || "Spec Node"}`,
+    "",
+    "## Purpose",
+    node.purpose || "Track intentional project behavior.",
+    "",
+    "## Current Behavior",
+    node.summary || "No durable behavior has been promoted yet.",
+    "",
+    "## Implementation State",
+    `- Intent: ${node.intent_state || "inferred"}`,
+    `- Implementation: ${node.implementation_state || "none"}`,
+    `- Freshness: ${node.freshness_state || "unknown"}`,
+    "",
+    "## Regression Guards",
+    `- ${guard}`,
+    "",
+    "## Evidence",
+    "- Waiting for prompt, heartbeat, checkpoint, or patch evidence.",
+  ].join("\n");
+}
+
+function legacyTaskToNode(task, index) {
+  const meta = metadata(task);
+  return normalizeNode({
+    id: field(task, "id", "task_id", "taskId") || `legacy-${index}`,
+    title: field(task, "title", "summary"),
+    summary: field(task, "body", "description", "summary"),
+    node_type: "feature",
+    feature_area: field(task, "lane") || "context-task",
+    status: field(task, "status"),
+    active_agents: field(task, "agent_id", "agentId")
+      ? [{ agent_id: field(task, "agent_id", "agentId"), status: field(task, "status") || "active" }]
+      : [],
+    metadata: meta,
+  }, index);
+}
+
+function normalizeSnapshot(snapshot) {
+  const matrix = snapshot?.featureMatrix || snapshot?.raw || {};
+  const specNodes = Array.isArray(snapshot?.specNodes)
+    ? snapshot.specNodes
+    : Array.isArray(matrix?.nodes)
+      ? matrix.nodes
+      : [];
+  const fallbackTasks = Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
+  const nodes = (specNodes.length ? specNodes : fallbackTasks.map(legacyTaskToNode))
+    .map((node, index) => normalizeNode(node, index));
+
+  const edgeSource = Array.isArray(snapshot?.specEdges)
+    ? snapshot.specEdges
+    : Array.isArray(matrix?.edges)
+      ? matrix.edges
+      : [];
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  let edges = edgeSource
+    .map((edge, index) => ({
+      id: text(field(edge, "id"), `edge-${index}`),
+      from: text(field(edge, "from_node_id", "fromNodeId", "from", "source")),
+      to: text(field(edge, "to_node_id", "toNodeId", "to", "target")),
+      kind: text(field(edge, "edge_kind", "edgeKind", "kind"), "related"),
+    }))
+    .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+
+  if (!edges.length && nodes.length > 1) {
+    const hub = nodes.find((node) => node.id.includes("project")) || nodes[0];
+    edges = nodes
+      .filter((node) => node.id !== hub.id)
+      .slice(0, 32)
+      .map((node, index) => ({
+        id: `inferred-${index}`,
+        from: hub.id,
+        to: node.id,
+        kind: "inferred",
+      }));
+  }
+
+  return {
+    matrix,
+    nodes,
+    edges,
+    sessions: Array.isArray(snapshot?.specWorkSessions)
+      ? snapshot.specWorkSessions
+      : Array.isArray(matrix?.work_sessions)
+        ? matrix.work_sessions
+        : [],
+    events: Array.isArray(snapshot?.recentSpecEvents)
+      ? snapshot.recentSpecEvents
+      : Array.isArray(matrix?.recent_events)
+        ? matrix.recent_events
+        : [],
+    compiler: snapshot?.compiler || matrix?.compiler || {},
+    graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
+  };
+}
+
+function columnsFor(nodes) {
+  const columns = Object.fromEntries(SPEC_COLUMNS.map((column) => [column.id, []]));
+  for (const node of nodes) {
+    const target = columns[node.work_state] ? node.work_state : "proposed";
+    columns[target].push(node);
+  }
+  return columns;
+}
+
+function graphNodeSize(depth) {
+  if (depth === 0) return GRAPH_NODE_SIZES.main;
+  if (depth === 1) return GRAPH_NODE_SIZES.related;
+  return GRAPH_NODE_SIZES.distant;
+}
+
+function graphLayerConfig(depth) {
+  if (depth <= 0) return { radius: 0, maxPerRing: 1 };
+  if (depth === 1) return { radius: 172, maxPerRing: 10 };
+  return { radius: 288 + (depth - 2) * 108, maxPerRing: 18 };
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function graphRootNode(nodes, edges) {
+  if (!nodes.length) return null;
+  const degreeById = new Map(nodes.map((node) => [node.id, 0]));
+  for (const edge of edges) {
+    if (degreeById.has(edge.from)) degreeById.set(edge.from, degreeById.get(edge.from) + 1);
+    if (degreeById.has(edge.to)) degreeById.set(edge.to, degreeById.get(edge.to) + 1);
+  }
+  return [...nodes].sort((left, right) => {
+    const scoreFor = (node) => {
+      const title = `${node.id} ${node.title}`.toLowerCase();
+      const centralHint = title.includes("project") || title.includes("root") || title.includes("workspace") ? 140 : 0;
+      const activeHint = node.active_agents.length * 90;
+      const stateHint = node.work_state === "active"
+        ? 70
+        : node.work_state === "blocked"
+          ? 55
+          : node.work_state === "review"
+            ? 42
+            : 0;
+      const typeHint = node.node_type === "implementation_unit" ? -18 : 18;
+      const evidenceHint = (node.linked_files.length + node.candidate_files.length) * 7;
+      const freshnessHint = ["code_ahead", "spec_ahead", "needs_review"].includes(node.freshness_state) ? 18 : 0;
+      return centralHint
+        + activeHint
+        + stateHint
+        + typeHint
+        + evidenceHint
+        + freshnessHint
+        + (degreeById.get(node.id) || 0) * 20
+        + node.confidence * 10;
+    };
+    const delta = scoreFor(right) - scoreFor(left);
+    return delta || left.title.localeCompare(right.title);
+  })[0];
+}
+
+function graphLayout(nodes, edges) {
+  const root = graphRootNode(nodes, edges);
+  const byId = {};
+  if (!root) return { width: 760, height: 520, byId, rootId: "" };
+
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const adjacency = new Map(nodes.map((node) => [node.id, new Set()]));
+  for (const edge of edges) {
+    if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) continue;
+    adjacency.get(edge.from)?.add(edge.to);
+    adjacency.get(edge.to)?.add(edge.from);
+  }
+
+  const depthById = new Map([[root.id, 0]]);
+  const queue = [root.id];
+  for (let index = 0; index < queue.length; index += 1) {
+    const id = queue[index];
+    const depth = depthById.get(id) || 0;
+    for (const next of adjacency.get(id) || []) {
+      if (!depthById.has(next)) {
+        depthById.set(next, depth + 1);
+        queue.push(next);
+      }
     }
   }
 
-  if (!Object.values(byStatus).some((items) => items.length) && tasks.length) {
-    for (const task of tasks) {
-      const status = inferredStatus(task, field(task, "status"));
-      byStatus[status].push(task);
-    }
+  const layers = new Map();
+  for (const node of nodes) {
+    const depth = depthById.has(node.id) ? depthById.get(node.id) : 2;
+    if (!layers.has(depth)) layers.set(depth, []);
+    layers.get(depth).push(node);
+  }
+  for (const layer of layers.values()) {
+    layer.sort((left, right) => left.title.localeCompare(right.title));
   }
 
-  return byStatus;
+  let maxRadius = 0;
+  for (const [depth, layer] of layers) {
+    if (depth === 0) continue;
+    const config = graphLayerConfig(depth);
+    const overflowRings = Math.max(0, Math.ceil(layer.length / config.maxPerRing) - 1);
+    maxRadius = Math.max(maxRadius, config.radius + overflowRings * 92);
+  }
+
+  const canvasRadius = Math.max(310, maxRadius + GRAPH_NODE_SIZES.main);
+  const width = Math.max(760, canvasRadius * 2 + 80);
+  const height = Math.max(560, canvasRadius * 2 + 80);
+  const centerX = width / 2;
+  const centerY = height / 2;
+
+  for (const [depth, layer] of layers) {
+    const size = graphNodeSize(depth);
+    if (depth === 0) {
+      byId[root.id] = { x: centerX - size / 2, y: centerY - size / 2, size, depth: 0 };
+      continue;
+    }
+
+    const config = graphLayerConfig(depth);
+    layer.forEach((node, index) => {
+      const ringIndex = Math.floor(index / config.maxPerRing);
+      const ringOffset = ringIndex * config.maxPerRing;
+      const itemsInRing = Math.min(config.maxPerRing, layer.length - ringOffset);
+      const angleOffset = depth % 2 === 0 ? Math.PI / Math.max(itemsInRing, 1) : 0;
+      const angle = ((index - ringOffset) / Math.max(itemsInRing, 1)) * Math.PI * 2
+        - Math.PI / 2
+        + angleOffset;
+      const radius = config.radius + ringIndex * 92;
+      byId[node.id] = {
+        x: centerX + Math.cos(angle) * radius - size / 2,
+        y: centerY + Math.sin(angle) * radius - size / 2,
+        size,
+        depth,
+      };
+    });
+  }
+
+  return { width, height, byId, rootId: root.id };
+}
+
+function selectedFallback(nodes, selectedNodeId) {
+  return nodes.find((node) => node.id === selectedNodeId) || nodes[0] || null;
 }
 
 export default function KanbanWorkspaceView({
@@ -159,6 +457,7 @@ export default function KanbanWorkspaceView({
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [state, setState] = useState("idle");
+  const [selectedNodeId, setSelectedNodeId] = useState("");
   const refreshInFlightRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -184,84 +483,596 @@ export default function KanbanWorkspaceView({
 
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(refresh, 1000);
+    const timer = window.setInterval(refresh, 1500);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const board = useMemo(() => normalizeBoard(snapshot), [snapshot]);
+  const featureMatrix = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
+  const selectedNode = selectedFallback(featureMatrix.nodes, selectedNodeId);
+
+  useEffect(() => {
+    if (!selectedNodeId && featureMatrix.nodes.length) {
+      setSelectedNodeId(featureMatrix.nodes[0].id);
+    }
+  }, [featureMatrix.nodes, selectedNodeId]);
 
   return (
-    <KanbanSurface aria-label={`${workspace?.name || "Workspace"} Kanban`} data-state={state}>
-      {error && <KanbanError>{error}</KanbanError>}
-      <KanbanColumns>
-        {KANBAN_COLUMNS.map((column) => {
-          const items = board[column.id] || [];
-          return (
-            <KanbanColumn key={column.id} $tone={column.tone}>
-              <ColumnHeader $tone={column.tone}>
-                <span>{column.label}</span>
-                <strong>{items.length}</strong>
-              </ColumnHeader>
-              <TaskStack>
-                {items.length ? items.map((task) => {
-                  const taskId = text(field(task, "id", "task_id", "taskId"), "task");
-                  const agentId = text(field(task, "agent_id", "agentId", "owner_agent_id", "ownerAgentId"));
-                  const lane = text(field(task, "lane", "resource_lane", "resourceLane"));
-                  const priority = field(task, "priority");
-                  const title = text(field(task, "title", "summary"), "Untitled task");
-                  const body = text(field(task, "body", "description"));
-                  const agentLabel = agentLabelFor(task, agentId);
-                  return (
-                    <TaskCard key={taskId}>
-                      <TaskTitle>{title}</TaskTitle>
-                      {body && body !== title && (
-                        <TaskBody>{body}</TaskBody>
-                      )}
-                      <TaskMeta>
-                        {agentId && <TaskBadge $color={colorFor(agentLabel || agentId)}>{agentLabel}</TaskBadge>}
-                        {lane && <TaskBadge>{lane}</TaskBadge>}
-                        {priority !== "" && <TaskBadge>p{priority}</TaskBadge>}
-                      </TaskMeta>
-                    </TaskCard>
-                  );
-                }) : (
-                  <ColumnEmpty>Empty</ColumnEmpty>
-                )}
-              </TaskStack>
-            </KanbanColumn>
-          );
-        })}
-      </KanbanColumns>
-    </KanbanSurface>
+    <FeatureMatrixSurface aria-label={`${workspace?.name || "Workspace"} Feature Matrix`} data-state={state}>
+      {error && <MatrixError>{error}</MatrixError>}
+
+      <MatrixShell>
+        <MatrixMain>
+          <GraphView
+            nodes={featureMatrix.nodes}
+            edges={featureMatrix.edges}
+            selectedNodeId={selectedNode?.id}
+            onSelect={setSelectedNodeId}
+          />
+        </MatrixMain>
+
+        <SpecInspector node={selectedNode} />
+      </MatrixShell>
+    </FeatureMatrixSurface>
   );
 }
 
-const KanbanSurface = styled.section`
+function GraphView({ nodes, edges, selectedNodeId, onSelect }) {
+  const viewportRef = useRef(null);
+  const dragRef = useRef(null);
+  const centeredLayoutRef = useRef("");
+  const layout = useMemo(() => graphLayout(nodes, edges), [nodes, edges]);
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [isDragging, setIsDragging] = useState(false);
+
+  useEffect(() => {
+    const element = viewportRef.current;
+    if (!element) return undefined;
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      setViewportSize({ width: rect.width, height: rect.height });
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const centerGraph = useCallback((nextZoom = 1) => {
+    const root = layout.byId[layout.rootId];
+    if (!root || !viewportSize.width || !viewportSize.height) return;
+    setPan({
+      x: viewportSize.width / 2 - (root.x + root.size / 2) * nextZoom,
+      y: viewportSize.height / 2 - (root.y + root.size / 2) * nextZoom,
+    });
+  }, [layout, viewportSize.height, viewportSize.width]);
+
+  useEffect(() => {
+    const centerKey = `${layout.rootId}:${nodes.length}:${edges.length}:${Math.round(viewportSize.width)}x${Math.round(viewportSize.height)}`;
+    if (centeredLayoutRef.current === centerKey) return;
+    centeredLayoutRef.current = centerKey;
+    setZoom(1);
+    centerGraph(1);
+  }, [centerGraph, edges.length, layout.rootId, nodes.length, viewportSize.height, viewportSize.width]);
+
+  const zoomAt = useCallback((nextZoom, origin = null) => {
+    setZoom((currentZoom) => {
+      const clamped = clampNumber(nextZoom, GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM);
+      if (clamped === currentZoom) return currentZoom;
+      const rect = viewportRef.current?.getBoundingClientRect();
+      const center = origin && rect
+        ? { x: origin.x - rect.left, y: origin.y - rect.top }
+        : { x: viewportSize.width / 2, y: viewportSize.height / 2 };
+      setPan((currentPan) => ({
+        x: center.x - ((center.x - currentPan.x) / currentZoom) * clamped,
+        y: center.y - ((center.y - currentPan.y) / currentZoom) * clamped,
+      }));
+      return clamped;
+    });
+  }, [viewportSize.height, viewportSize.width]);
+
+  const handlePointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    if (event.target instanceof Element && event.target.closest("[data-graph-node]")) return;
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      pan,
+    };
+    setIsDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [pan]);
+
+  const handlePointerMove = useCallback((event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setPan({
+      x: drag.pan.x + event.clientX - drag.startX,
+      y: drag.pan.y + event.clientY - drag.startY,
+    });
+  }, []);
+
+  const finishDrag = useCallback((event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    setIsDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }, []);
+
+  const handleWheel = useCallback((event) => {
+    event.preventDefault();
+    const direction = event.deltaY > 0 ? -1 : 1;
+    zoomAt(zoom + direction * GRAPH_ZOOM_STEP, { x: event.clientX, y: event.clientY });
+  }, [zoom, zoomAt]);
+
+  if (!nodes.length) {
+    return <EmptyState>No spec graph nodes yet.</EmptyState>;
+  }
+
+  return (
+    <GraphScroller
+      ref={viewportRef}
+      $dragging={isDragging}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+      onWheel={handleWheel}
+    >
+      <GraphToolbar>
+        <GraphToolButton type="button" aria-label="Zoom out" title="Zoom out" onClick={() => zoomAt(zoom - GRAPH_ZOOM_STEP)}>
+          -
+        </GraphToolButton>
+        <GraphToolButton type="button" aria-label="Reset graph view" title="Reset graph view" onClick={() => {
+          setZoom(1);
+          centerGraph(1);
+        }}>
+          •
+        </GraphToolButton>
+        <GraphToolButton type="button" aria-label="Zoom in" title="Zoom in" onClick={() => zoomAt(zoom + GRAPH_ZOOM_STEP)}>
+          +
+        </GraphToolButton>
+      </GraphToolbar>
+      <GraphCanvas
+        style={{
+          width: layout.width,
+          height: layout.height,
+          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+        }}
+      >
+        <EdgeLayer width={layout.width} height={layout.height} aria-hidden="true">
+          {edges.map((edge) => {
+            const from = layout.byId[edge.from];
+            const to = layout.byId[edge.to];
+            if (!from || !to) return null;
+            return (
+              <g key={edge.id}>
+                <line
+                  x1={from.x + from.size / 2}
+                  y1={from.y + from.size / 2}
+                  x2={to.x + to.size / 2}
+                  y2={to.y + to.size / 2}
+                />
+              </g>
+            );
+          })}
+        </EdgeLayer>
+        {nodes.map((node) => {
+          const point = layout.byId[node.id] || { x: 20, y: 20, size: GRAPH_NODE_SIZES.distant, depth: 2 };
+          const tone = freshnessTone(node.freshness_state) || NODE_TYPE_TONES[node.node_type] || colorFor(node.node_type);
+          const liveAgents = liveAgentsFor(node);
+          const liveAgentCount = liveAgents.length;
+          return (
+            <GraphNodeButton
+              key={node.id}
+              type="button"
+              data-graph-node="true"
+              style={{
+                left: point.x,
+                top: point.y,
+                width: point.size,
+                height: point.size,
+              }}
+              $tone={tone}
+              $active={node.id === selectedNodeId}
+              $depth={point.depth}
+              $implementation={node.implementation_state}
+              $freshness={node.freshness_state}
+              $nodeType={node.node_type}
+              $live={liveAgentCount > 0}
+              onClick={() => onSelect(node.id)}
+            >
+              {liveAgents.slice(0, MAX_VISIBLE_AGENT_ORBITS).map((agent, index) => (
+                <ActiveAgentOrbit
+                  key={`${node.id}-orbit-${field(agent, "agent_id", "agentId", "id") || index}`}
+                  aria-hidden="true"
+                  $depth={point.depth}
+                  $tone={tone}
+                  $index={index}
+                  $total={liveAgentCount}
+                />
+              ))}
+              <NodeTitle $depth={point.depth}>{node.title}</NodeTitle>
+            </GraphNodeButton>
+          );
+        })}
+      </GraphCanvas>
+    </GraphScroller>
+  );
+}
+
+function MatrixTable({ nodes, selectedNodeId, onSelect }) {
+  if (!nodes.length) return <EmptyState>No spec matrix rows yet.</EmptyState>;
+  return (
+    <TableWrap>
+      <SpecTable>
+        <thead>
+          <tr>
+            <th>Spec</th>
+            <th>Type</th>
+            <th>Area</th>
+            <th>Impl</th>
+            <th>Fresh</th>
+            <th>Files</th>
+            <th>Agents</th>
+            <th>Guard</th>
+          </tr>
+        </thead>
+        <tbody>
+          {nodes.map((node) => {
+            const guard = text(node.metadata?.regression_guard, "guard needed");
+            return (
+              <tr key={node.id} data-active={node.id === selectedNodeId} onClick={() => onSelect(node.id)}>
+                <td>
+                  <strong>{node.title}</strong>
+                  <small>{node.summary || node.purpose}</small>
+                </td>
+                <td>{node.node_type}</td>
+                <td>{node.feature_area}</td>
+                <td>{node.implementation_state}</td>
+                <td>{node.freshness_state}</td>
+                <td>{node.linked_files.length || node.candidate_files.length || "none"}</td>
+                <td>{node.active_agents.length || "idle"}</td>
+                <td>{guard}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </SpecTable>
+    </TableWrap>
+  );
+}
+
+function BoardView({ columns, selectedNodeId, onSelect }) {
+  return (
+    <BoardColumns>
+      {SPEC_COLUMNS.map((column) => {
+        const items = columns[column.id] || [];
+        return (
+          <BoardColumn key={column.id} $tone={column.tone}>
+            <ColumnHeader $tone={column.tone}>
+              <span>{column.label}</span>
+              <strong>{items.length}</strong>
+            </ColumnHeader>
+            <TaskStack>
+              {items.length ? items.map((node) => (
+                <SpecCardButton
+                  key={node.id}
+                  type="button"
+                  $active={node.id === selectedNodeId}
+                  onClick={() => onSelect(node.id)}
+                >
+                  <TaskTitle>{node.title}</TaskTitle>
+                  <TaskBody>{node.summary || node.purpose}</TaskBody>
+                  <TaskMeta>
+                    <TaskBadge>{node.node_type}</TaskBadge>
+                    <TaskBadge>{node.feature_area}</TaskBadge>
+                    <TaskBadge $color={freshnessTone(node.freshness_state)}>{node.freshness_state}</TaskBadge>
+                    <TaskBadge>{node.implementation_state}</TaskBadge>
+                    {node.active_agents.slice(0, 3).map((agent) => (
+                      <TaskBadge key={`${node.id}-${field(agent, "agent_id", "agentId", "id")}`} $color={colorFor(agentLabelFor(agent))}>
+                        {agentLabelFor(agent)}
+                      </TaskBadge>
+                    ))}
+                  </TaskMeta>
+                </SpecCardButton>
+              )) : (
+                <ColumnEmpty>Empty</ColumnEmpty>
+              )}
+            </TaskStack>
+          </BoardColumn>
+        );
+      })}
+    </BoardColumns>
+  );
+}
+
+function SpecInspector({ node }) {
+  if (!node) {
+    return (
+      <Inspector>
+        <InspectorEmpty>Select a spec node.</InspectorEmpty>
+      </Inspector>
+    );
+  }
+
+  return (
+    <Inspector>
+      <InspectorHeader>
+        <h2>{node.title}</h2>
+      </InspectorHeader>
+      <MarkdownPane>
+        <pre>{node.markdown}</pre>
+      </MarkdownPane>
+    </Inspector>
+  );
+}
+
+const FeatureMatrixSurface = styled.section`
   width: 100%;
   height: 100%;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   padding: 10px;
   background:
-    linear-gradient(180deg, rgba(47, 128, 255, 0.035), rgba(255, 122, 24, 0.018)),
-    rgba(6, 9, 16, 0.94);
+    linear-gradient(180deg, rgba(17, 24, 39, 0.95), rgba(10, 11, 14, 0.96)),
+    #0a0b0e;
   color: var(--forge-text, #dbe7f7);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 `;
 
-const KanbanError = styled.div`
+const MatrixError = styled.div`
   border: 1px solid rgba(248, 113, 113, 0.3);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(127, 29, 29, 0.22);
   color: #fecaca;
-  margin-bottom: 10px;
   padding: 10px;
 `;
 
-const KanbanColumns = styled.div`
+const MatrixShell = styled.div`
+  align-items: stretch;
   display: grid;
-  grid-template-columns: repeat(6, minmax(172px, 1fr));
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 34%);
+  gap: 10px;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(360px, 1fr) minmax(260px, 40%);
+  }
+`;
+
+const MatrixMain = styled.main`
+  border: 1px solid rgba(230, 236, 245, 0.07);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.58);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const GraphScroller = styled.div`
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+  touch-action: none;
+  cursor: ${({ $dragging }) => ($dragging ? "grabbing" : "grab")};
+  user-select: none;
+`;
+
+const GraphCanvas = styled.div`
+  left: 0;
+  position: absolute;
+  top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+`;
+
+const GraphToolbar = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 5px;
+  left: 10px;
+  position: absolute;
+  top: 10px;
+  z-index: 4;
+`;
+
+const GraphToolButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 7px;
+  background: rgba(13, 17, 23, 0.82);
+  color: rgba(219, 231, 247, 0.8);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 15px;
+  font-weight: 850;
+  height: 30px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 30px;
+
+  &:hover {
+    border-color: rgba(56, 189, 248, 0.44);
+    color: #dff5ff;
+  }
+`;
+
+const EdgeLayer = styled.svg`
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+
+  line {
+    stroke: rgba(230, 236, 245, 0.18);
+    stroke-linecap: round;
+    stroke-width: 1.2;
+  }
+`;
+
+const GraphNodeButton = styled.button`
+  align-items: center;
+  border: 1px ${({ $implementation }) => ($implementation === "none" || $implementation === "candidate" ? "dashed" : "solid")} ${({ $active, $tone }) => ($active ? $tone : "rgba(230, 236, 245, 0.13)")};
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}24`}, rgba(13, 17, 23, 0.86) 58%),
+    rgba(13, 17, 23, 0.9);
+  box-shadow: ${({ $active, $live, $tone }) => {
+    if ($active) return `0 0 0 2px ${$tone}4d, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    if ($live) return `0 0 0 1px ${$tone}33, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    return "0 12px 30px rgba(0, 0, 0, 0.2)";
+  }};
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  justify-content: center;
+  padding: ${({ $depth }) => ($depth === 0 ? "18px" : $depth === 1 ? "13px" : "9px")};
+  position: absolute;
+  text-align: center;
+  opacity: ${({ $nodeType }) => ($nodeType === "implementation_unit" ? 0.88 : 1)};
+  overflow: visible;
+
+  &:hover {
+    border-color: ${({ $tone }) => $tone || "#38bdf8"};
+    transform: scale(1.025);
+  }
+`;
+
+const ActiveAgentOrbit = styled.span`
+  animation: spec-node-agent-orbit ${({ $depth, $index }) => {
+    const base = $depth === 0 ? 3.2 : $depth === 1 ? 2.75 : 2.35;
+    return `${base + (($index || 0) * 0.42)}s`;
+  }} linear infinite ${({ $index }) => ($index % 2 ? "reverse" : "normal")};
+  animation-delay: ${({ $index }) => `${-0.28 * ($index || 0)}s`};
+  border-radius: 999px;
+  inset: ${({ $depth, $index }) => {
+    const base = $depth === 0 ? 13 : $depth === 1 ? 10 : 8;
+    return `-${base + (($index || 0) * 5)}px`;
+  }};
+  pointer-events: none;
+  position: absolute;
+  z-index: 2;
+
+  &::before {
+    background: ${({ $tone }) => $tone || "#34d399"};
+    border: 2px solid rgba(7, 12, 19, 0.96);
+    border-radius: 999px;
+    box-shadow:
+      0 0 0 ${({ $total }) => ($total > 1 ? "3px" : "2px")} ${({ $tone }) => `${$tone || "#34d399"}33`},
+      0 0 18px ${({ $tone }) => `${$tone || "#34d399"}99`};
+    content: "";
+    height: ${({ $depth }) => ($depth === 0 ? "11px" : $depth === 1 ? "9px" : "7px")};
+    position: absolute;
+    right: 0;
+    top: ${({ $index, $total }) => {
+      if (($total || 0) < 2) return "50%";
+      const spread = (($index || 0) % 3) - 1;
+      return `${50 + spread * 9}%`;
+    }};
+    transform: translate(50%, -50%);
+    width: ${({ $depth }) => ($depth === 0 ? "11px" : $depth === 1 ? "9px" : "7px")};
+  }
+
+  @keyframes spec-node-agent-orbit {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+`;
+
+const NodeTitle = styled.div`
+  color: var(--forge-text-soft, #eef5ff);
+  display: -webkit-box;
+  font-size: ${({ $depth }) => ($depth === 0 ? "13px" : $depth === 1 ? "10.5px" : "9px")};
+  font-weight: ${({ $depth }) => ($depth === 0 ? 820 : 780)};
+  line-height: 1.18;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: ${({ $depth }) => ($depth === 0 ? 5 : $depth === 1 ? 4 : 3)};
+  word-break: break-word;
+`;
+
+const Inspector = styled.aside`
+  border: 1px solid rgba(230, 236, 245, 0.07);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.72);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const InspectorHeader = styled.header`
+  align-items: center;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.07);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+
+  h2 {
+    color: var(--forge-text-soft, #eef5ff);
+    font-size: 14px;
+    font-weight: 820;
+    line-height: 1.24;
+    margin: 0;
+    min-width: 0;
+  }
+`;
+
+const MarkdownPane = styled.div`
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+
+  pre {
+    color: rgba(229, 236, 246, 0.86);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 11px;
+    font-weight: 560;
+    line-height: 1.5;
+    margin: 0;
+    padding: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+`;
+
+const InspectorEmpty = styled.div`
+  color: rgba(219, 231, 247, 0.48);
+  font-size: 12px;
+  font-weight: 680;
+  padding: 14px;
+`;
+
+const BoardColumns = styled.div`
+  display: grid;
   gap: 6px;
-  min-height: 100%;
+  grid-template-columns: repeat(6, minmax(170px, 1fr));
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
 
   @media (max-width: 1500px) {
     grid-template-columns: repeat(3, minmax(190px, 1fr));
@@ -272,11 +1083,11 @@ const KanbanColumns = styled.div`
   }
 `;
 
-const KanbanColumn = styled.section`
+const BoardColumn = styled.section`
   border: 1px solid rgba(230, 236, 245, 0.06);
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.48);
-  min-height: 320px;
+  min-height: 280px;
   overflow: hidden;
 `;
 
@@ -289,30 +1100,28 @@ const ColumnHeader = styled.header`
 
   span {
     align-items: center;
-    color: var(--forge-text-disabled, rgba(219, 231, 247, 0.52));
+    color: rgba(219, 231, 247, 0.56);
     display: inline-flex;
     font-size: 10px;
-    font-weight: 760;
+    font-weight: 800;
     gap: 7px;
-    letter-spacing: 0.06em;
     text-transform: uppercase;
 
     &::before {
-      width: 3px;
-      height: 14px;
-      border-radius: 999px;
       background: ${({ $tone }) => $tone || "#60a5fa"};
-      box-shadow: 0 0 12px ${({ $tone }) => $tone || "#60a5fa"}33;
+      border-radius: 999px;
       content: "";
+      height: 14px;
+      width: 3px;
     }
   }
 
   strong {
     border: 1px solid rgba(230, 236, 245, 0.08);
     border-radius: 6px;
-    color: var(--forge-text-muted, rgba(219, 231, 247, 0.62));
+    color: rgba(219, 231, 247, 0.62);
     font-size: 10px;
-    font-weight: 760;
+    font-weight: 800;
     min-width: 20px;
     padding: 2px 6px;
     text-align: center;
@@ -326,38 +1135,29 @@ const TaskStack = styled.div`
   padding: 6px;
 `;
 
-const TaskCard = styled.article`
-  position: relative;
-  border: 1px solid rgba(230, 236, 245, 0.06);
+const SpecCardButton = styled.button`
+  border: 1px solid ${({ $active }) => ($active ? "rgba(56, 189, 248, 0.52)" : "rgba(230, 236, 245, 0.06)")};
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.56);
-  padding: 8px 8px 8px 15px;
-  overflow: hidden;
-
-  &::before {
-    position: absolute;
-    top: 10px;
-    bottom: 10px;
-    left: 7px;
-    width: 3px;
-    border-radius: 999px;
-    background: rgba(230, 236, 245, 0.16);
-    content: "";
-  }
+  background: ${({ $active }) => ($active ? "rgba(56, 189, 248, 0.11)" : "rgba(7, 9, 13, 0.56)")};
+  color: inherit;
+  cursor: pointer;
+  padding: 8px;
+  text-align: left;
+  width: 100%;
 `;
 
 const TaskTitle = styled.h2`
-  color: var(--forge-text-soft, #eef5ff);
+  color: #eef5ff;
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 760;
   line-height: 1.28;
   margin: 0;
 `;
 
 const TaskBody = styled.p`
-  color: var(--forge-text-muted, rgba(219, 231, 247, 0.56));
+  color: rgba(219, 231, 247, 0.56);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 620;
   line-height: 1.4;
   margin: 5px 0 0;
 `;
@@ -373,20 +1173,95 @@ const TaskBadge = styled.span`
   border: 1px solid ${({ $color }) => $color || "rgba(230, 236, 245, 0.08)"};
   border-radius: 6px;
   background: rgba(230, 236, 245, 0.035);
-  color: ${({ $color }) => $color || "var(--forge-text-muted, rgba(219, 231, 247, 0.68))"};
+  color: ${({ $color }) => $color || "rgba(219, 231, 247, 0.68)"};
   font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.06em;
+  font-weight: 800;
   line-height: 1;
-  padding: 3px 6px;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 4px 6px;
+  text-overflow: ellipsis;
   text-transform: uppercase;
+  white-space: nowrap;
 `;
 
 const ColumnEmpty = styled.div`
   border: 1px dashed rgba(230, 236, 245, 0.08);
   border-radius: 8px;
-  color: var(--forge-text-muted, rgba(219, 231, 247, 0.42));
+  color: rgba(219, 231, 247, 0.42);
   font-size: 11px;
   font-weight: 650;
   padding: 8px 9px;
+`;
+
+const TableWrap = styled.div`
+  height: 100%;
+  overflow: auto;
+`;
+
+const SpecTable = styled.table`
+  border-collapse: collapse;
+  min-width: 900px;
+  width: 100%;
+
+  th,
+  td {
+    border-bottom: 1px solid rgba(230, 236, 245, 0.06);
+    padding: 9px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    background: rgba(13, 17, 23, 0.92);
+    color: rgba(219, 231, 247, 0.5);
+    font-size: 10px;
+    font-weight: 850;
+    position: sticky;
+    text-transform: uppercase;
+    top: 0;
+    z-index: 1;
+  }
+
+  td {
+    color: rgba(219, 231, 247, 0.7);
+    font-size: 11px;
+    font-weight: 640;
+    line-height: 1.35;
+  }
+
+  tr {
+    cursor: pointer;
+  }
+
+  tr[data-active="true"] {
+    background: rgba(56, 189, 248, 0.09);
+  }
+
+  tr:hover {
+    background: rgba(230, 236, 245, 0.035);
+  }
+
+  strong {
+    color: #eef5ff;
+    display: block;
+    font-size: 12px;
+    font-weight: 760;
+  }
+
+  small {
+    color: rgba(219, 231, 247, 0.48);
+    display: block;
+    font-size: 10.5px;
+    font-weight: 620;
+    margin-top: 3px;
+    max-width: 420px;
+  }
+`;
+
+const EmptyState = styled.div`
+  color: rgba(219, 231, 247, 0.48);
+  font-size: 12px;
+  font-weight: 680;
+  padding: 14px;
 `;

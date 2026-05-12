@@ -673,6 +673,10 @@ fn terminal_args_with_codex_mcp_identity(
     let repo_id = env_value("CLOUD_MCP_REPO_ID").unwrap_or_else(|| {
         format!("repo-{}", cloud_mcp_short_hash(&coordination.repo_path))
     });
+    let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
+        .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
+
+    apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
 
     let mut coordination_args = vec![
         "--coordination-mcp".to_string(),
@@ -739,6 +743,33 @@ fn terminal_args_with_codex_mcp_identity(
     next.push("-c".to_string());
     next.push("shell_environment_policy.inherit=all".to_string());
     next
+}
+
+fn apply_codex_coordinated_auto_approval_args(args: &mut Vec<String>, write_root: Option<&str>) {
+    if !terminal_args_have_option(args, "--ask-for-approval", "-a") {
+        args.push("--ask-for-approval".to_string());
+        args.push("never".to_string());
+    }
+    if !terminal_args_have_option(args, "--sandbox", "-s")
+        && !terminal_args_have_option(args, "--dangerously-bypass-approvals-and-sandbox", "")
+    {
+        args.push("--sandbox".to_string());
+        args.push("workspace-write".to_string());
+    }
+    if let Some(write_root) = write_root.filter(|value| !value.trim().is_empty()) {
+        if !terminal_args_have_option(args, "--cd", "-C") {
+            args.push("--cd".to_string());
+            args.push(write_root.to_string());
+        }
+    }
+}
+
+fn terminal_args_have_option(args: &[String], long: &str, short: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == long
+            || (!short.is_empty() && arg == short)
+            || (!long.is_empty() && arg.starts_with(&format!("{long}=")))
+    })
 }
 
 fn terminal_toml_string_array(values: &[String]) -> String {

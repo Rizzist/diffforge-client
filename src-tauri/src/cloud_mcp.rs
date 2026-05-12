@@ -736,6 +736,8 @@ fn cloud_mcp_post_log_context(
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
+        "/v1/spec/feature-matrix" => "cloud_get_feature_matrix",
+        "/v1/spec/nodes" => "cloud_get_spec_node",
         "/v1/context/subtasks/checkpoint" => "cloud_subtask_checkpoint",
         "/v1/context/history/events" => "cloud_record_history_event",
         "/v1/context/agents/claim-lane" => "cloud_claim_lane",
@@ -2438,6 +2440,42 @@ async fn cloud_mcp_get_kanban(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
+    let feature_response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/spec/feature-matrix", &payload).await;
+    if let Ok(response) = feature_response {
+        let data = cloud_mcp_response_data(&response);
+        return Ok(json!({
+            "ok": true,
+            "repoId": repo_id,
+            "repoPath": root_display,
+            "workspaceId": workspace_id,
+            "workspaceName": workspace_name,
+            "featureMatrix": data,
+            "specGraph": {
+                "nodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
+                "edges": data.get("edges").cloned().unwrap_or_else(|| json!([]))
+            },
+            "specNodes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
+            "specEdges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
+            "specColumns": data.get("columns").cloned().unwrap_or_else(|| json!({})),
+            "specWorkSessions": data.get("work_sessions").cloned().unwrap_or_else(|| json!([])),
+            "recentSpecEvents": data.get("recent_events").cloned().unwrap_or_else(|| json!([])),
+            "compiler": data.get("compiler").cloned().unwrap_or_else(|| json!({})),
+            "taskBoard": data.get("columns").cloned().unwrap_or_else(|| json!({})),
+            "tasks": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
+            "activeAgents": data.get("work_sessions").cloned().unwrap_or_else(|| json!([])),
+            "laneClaims": json!([]),
+            "historyLedger": {
+                "events": data.get("recent_events").cloned().unwrap_or_else(|| json!([]))
+            },
+            "sourceOfTruth": {
+                "kind": "feature_matrix_spec_graph",
+                "repo_id": repo_id,
+                "markdown_backed": true
+            },
+            "raw": data
+        }));
+    }
+
     let response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/context/pack", &payload).await?;
     let data = cloud_mcp_response_data(&response);
     let snapshot = data.get("snapshot").cloned().unwrap_or_else(|| data.clone());
@@ -2455,6 +2493,7 @@ async fn cloud_mcp_get_kanban(
         "laneClaims": snapshot.get("lane_claims").cloned().unwrap_or_else(|| json!([])),
         "historyLedger": snapshot.get("history_ledger").cloned().unwrap_or_else(|| json!({})),
         "sourceOfTruth": snapshot.get("source_of_truth").cloned().unwrap_or_else(|| json!({})),
+        "featureMatrixError": "Feature Matrix endpoint unavailable; showing legacy context board.",
         "raw": data
     }))
 }

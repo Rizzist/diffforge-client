@@ -1334,7 +1334,7 @@ async fn terminal_open(
         Some(resolve_started_at.elapsed()),
         json!({ "working_directory": workspace_path_display(&working_directory) }),
     );
-    let mut process_working_directory = workspace_path_for_process(&working_directory);
+    let process_working_directory = workspace_path_for_process(&working_directory);
     let mut coordination_context = None;
 
     let command_started_at = Instant::now();
@@ -1393,9 +1393,6 @@ async fn terminal_open(
             }) {
             Ok(context) => {
                 let write_root = workspace_path_for_process(&PathBuf::from(&context.write_root));
-                if context.enforcement_mode == "worktree_required" {
-                    process_working_directory = write_root.clone();
-                }
                 log_terminal_event(
                     "terminal.open.coordination_ready",
                     Some(&pane_id),
@@ -1410,7 +1407,7 @@ async fn terminal_open(
                         "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
                         "write_root": workspace_path_display(&write_root),
                         "launch_cwd": workspace_path_display(&process_working_directory),
-                        "cwd_policy": "assigned_worktree_only",
+                        "cwd_policy": "project_root_visible_branch_root_editable",
                     }),
                 );
                 if context.enforcement_mode == "coordination_only"
@@ -1597,7 +1594,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "assigned_worktree_only"
+                "project_root_visible_branch_root_editable"
             } else {
                 "plain_project_root"
             },
@@ -1677,7 +1674,7 @@ async fn terminal_open(
                 .as_ref()
                 .map(|context| clean_terminal_telemetry_text(&context.write_root)),
             "cwd_policy": if coordination_context.is_some() {
-                "assigned_worktree_only"
+                "project_root_visible_branch_root_editable"
             } else {
                 "plain_project_root"
             },
@@ -1831,7 +1828,7 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
             "idle_sessions_interrupted": idle_sessions_interrupted,
             "finished_sessions_interrupted": finished_sessions_interrupted,
             "errors": errors.len(),
-            "modal_policy": "frontend_modal_only_for_interrupted_tasks_no_auto_input",
+            "modal_policy": "frontend_modal_only_for_interrupted_tasks_with_active_work_signals_no_auto_input",
         }),
     );
 
@@ -3129,76 +3126,89 @@ fn spawn_terminal_session_parking_monitor(
     ));
 }
 
-fn terminal_prompt_intent_resource_keys(prompt: &str) -> Vec<String> {
-    let lower = prompt.to_ascii_lowercase();
-    let mut resources = Vec::new();
-    for token in prompt.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}')) {
-        let cleaned = token
-            .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '<' | '>' | '.' | '!' | '?'))
-            .replace('\\', "/");
-        if cleaned.starts_with('/')
-            || cleaned.starts_with("http")
-            || cleaned.starts_with('@')
-            || cleaned.contains("..")
-        {
-            continue;
-        }
-        let lower_token = cleaned.to_ascii_lowercase();
-        let looks_like_path = cleaned.contains('/')
-            || lower_token.ends_with(".html")
-            || lower_token.ends_with(".css")
-            || lower_token.ends_with(".js")
-            || lower_token.ends_with(".jsx")
-            || lower_token.ends_with(".ts")
-            || lower_token.ends_with(".tsx")
-            || lower_token.ends_with(".json")
-            || lower_token.ends_with(".md")
-            || lower_token.ends_with(".rs")
-            || lower_token.ends_with(".py")
-            || lower_token.ends_with(".go")
-            || lower_token.ends_with(".toml")
-            || lower_token.ends_with(".lock");
-        if looks_like_path && !cleaned.is_empty() {
-            resources.push(format!("file:{cleaned}"));
-        }
+fn terminal_prompt_is_agent_command(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') || trimmed.starts_with("//") {
+        return false;
     }
-    for manifest in [
-        "package.json",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "bun.lockb",
-        "Cargo.toml",
-        "Cargo.lock",
-        "requirements.txt",
-        "pyproject.toml",
-    ] {
-        if prompt.contains(manifest) {
-            resources.push(format!("file:{manifest}"));
-        }
+    trimmed
+        .chars()
+        .nth(1)
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '?')
+}
+
+fn terminal_existing_session_task_with_active_leases(
+    kernel: &crate::coordination::CoordinationKernel,
+    coordination: &TerminalCoordinationSession,
+) -> Result<Option<(String, String, usize)>, String> {
+    let now = crate::coordination::kernel::now_rfc3339();
+    let rows = kernel.query_json(
+        "SELECT l.task_id,
+                t.title,
+                t.body,
+                t.status AS task_status,
+                COUNT(1) AS active_lease_count,
+                MAX(l.acquired_at) AS latest_lease_at,
+                CASE WHEN s.task_id=l.task_id THEN 0 ELSE 1 END AS session_task_rank
+         FROM leases l
+         LEFT JOIN tasks t ON t.id = l.task_id
+         LEFT JOIN agent_sessions s ON s.id = l.session_id
+         WHERE l.status='active'
+           AND l.expires_at >= ?1
+           AND l.agent_id=?2
+           AND l.session_id=?3
+           AND COALESCE(t.status, '') NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+         GROUP BY l.task_id
+         ORDER BY session_task_rank ASC, latest_lease_at DESC
+         LIMIT 1",
+        &[&now, &coordination.agent_id, &coordination.session_id],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let Some(task_id) = row["task_id"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let title = row["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Continue terminal task".to_string());
+    let active_lease_count = row["active_lease_count"].as_i64().unwrap_or(0).max(0) as usize;
+
+    Ok(Some((task_id, title, active_lease_count)))
+}
+
+fn terminal_attach_session_to_reused_task(
+    kernel: &crate::coordination::CoordinationKernel,
+    coordination: &TerminalCoordinationSession,
+    task_id: &str,
+) -> Result<(), String> {
+    let changed = kernel
+        .conn
+        .execute(
+            "UPDATE agent_sessions
+             SET task_id=?1, updated_at=?2
+             WHERE id=?3
+               AND agent_id=?4
+               AND status='active'",
+            rusqlite::params![
+                task_id,
+                crate::coordination::kernel::now_rfc3339(),
+                coordination.session_id.as_str(),
+                coordination.agent_id.as_str()
+            ],
+        )
+        .map_err(|error| format!("Unable to reattach terminal session to reused task: {error}"))?;
+    if changed == 0 {
+        return Err("Unable to reattach terminal session to reused task.".to_string());
     }
-    if lower.contains("index.html") {
-        resources.push("file:index.html".to_string());
-    }
-    if lower.contains("html")
-        || lower.contains("landing")
-        || lower.contains("splash")
-        || lower.contains("slash page")
-        || lower.contains("wishlist")
-        || lower.contains("wish list")
-        || lower.contains("waitlist")
-        || lower.contains("front end")
-        || lower.contains("frontend")
-        || lower.contains("single page")
-    {
-        resources.push("file:index.html".to_string());
-    }
-    if lower.contains("pricing") || (lower.contains("price") && lower.contains("page")) {
-        resources.push("file:pricing.html".to_string());
-    }
-    resources.sort();
-    resources.dedup();
-    resources
+    Ok(())
 }
 
 fn terminal_partial_parking_prompt(
@@ -3239,10 +3249,63 @@ fn terminal_prepare_coordination_task_for_prompt(
     pane_id: &str,
     instance_id: u64,
 ) -> Result<Option<TerminalPreparedCoordinationTask>, String> {
+    if terminal_prompt_is_agent_command(prompt) {
+        log_terminal_event(
+            "terminal.prompt.coordination_task_skipped",
+            Some(pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                "reason": "agent_slash_command",
+                "prompt": clean_terminal_telemetry_text(prompt),
+            }),
+        );
+        return Ok(None);
+    }
+
     let kernel = crate::coordination::CoordinationKernel::open(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
     )?;
+    if let Some((task_id, title, active_lease_count)) =
+        terminal_existing_session_task_with_active_leases(&kernel, coordination)?
+    {
+        terminal_attach_session_to_reused_task(&kernel, coordination, &task_id)?;
+        log_terminal_event(
+            "terminal.prompt.coordination_task_ready",
+            Some(pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                "task_id": clean_terminal_telemetry_text(&task_id),
+                "title": clean_terminal_telemetry_text(&title),
+                "intent_resources": [],
+                "parked": false,
+                "partial": false,
+                "runnable_resources": [],
+                "parked_resources": [],
+                "parking_details": [],
+                "reused_existing_session_task": true,
+                "reuse_reason": "same terminal session already owns active leases",
+                "active_lease_count": active_lease_count,
+            }),
+        );
+        return Ok(Some(TerminalPreparedCoordinationTask {
+            task_id,
+            title,
+            parked: false,
+            partial: false,
+            parking_details: Value::Array(Vec::new()),
+            intent_resources: Vec::new(),
+            runnable_resources: Vec::new(),
+            parked_resources: Vec::new(),
+        }));
+    }
+
     let title = terminal_prompt_task_title(prompt);
     let task = kernel.create_task(
         &title,
@@ -3258,54 +3321,7 @@ fn terminal_prepare_coordination_task_for_prompt(
         return Ok(None);
     };
     kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
-    let intent_resources = terminal_prompt_intent_resource_keys(prompt);
-    let mut parked = false;
-    let mut runnable_resources = Vec::new();
-    let mut parked_resources = Vec::new();
-    let mut parking_details = Vec::new();
-    for resource_key in &intent_resources {
-        match kernel.acquire_lease(
-            &task_id,
-            &coordination.agent_id,
-            &coordination.session_id,
-            resource_key,
-            "write",
-            Some(900),
-            Some("Prompt intent lease: park later agents behind this likely target file until the accepted patch lands."),
-        ) {
-            Ok(value) => {
-                if value["ok"].as_bool() == Some(false) {
-                    let code = value["error"]["code"].as_str().unwrap_or_default();
-                    if code.contains("queued") || code.contains("lease_conflict") || code.contains("cycle_prevented") {
-                        parked = true;
-                        parked_resources.push(resource_key.clone());
-                    }
-                    let mut value = value;
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("resource_key".to_string(), json!(resource_key));
-                    }
-                    parking_details.push(value);
-                } else {
-                    runnable_resources.push(resource_key.clone());
-                    parking_details.push(json!({
-                        "resource_key": resource_key,
-                        "status": "intent_lease_acquired",
-                        "lease": value,
-                    }));
-                }
-            }
-            Err(error) => {
-                parking_details.push(json!({
-                    "resource_key": resource_key,
-                    "status": "intent_lease_error",
-                    "error": clean_terminal_telemetry_text(&error),
-                }));
-            }
-        }
-    }
-    if !parked {
-        let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
-    }
+    let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
     log_terminal_event(
         "terminal.prompt.coordination_task_ready",
         Some(pane_id),
@@ -3316,23 +3332,25 @@ fn terminal_prepare_coordination_task_for_prompt(
             "session_id": clean_terminal_telemetry_text(&coordination.session_id),
             "task_id": clean_terminal_telemetry_text(&task_id),
             "title": clean_terminal_telemetry_text(&title),
-            "intent_resources": intent_resources.clone(),
-            "parked": parked,
-            "partial": parked && !runnable_resources.is_empty(),
-            "runnable_resources": runnable_resources.clone(),
-            "parked_resources": parked_resources.clone(),
-            "parking_details": parking_details.clone(),
+            "intent_resources": [],
+            "parked": false,
+            "partial": false,
+            "runnable_resources": [],
+            "parked_resources": [],
+            "parking_details": [],
+            "reused_existing_session_task": false,
+            "prompt_resource_parking": "disabled",
         }),
     );
     Ok(Some(TerminalPreparedCoordinationTask {
         task_id,
         title,
-        parked: parked && runnable_resources.is_empty(),
-        partial: parked && !runnable_resources.is_empty(),
-        parking_details: Value::Array(parking_details),
-        intent_resources,
-        runnable_resources,
-        parked_resources,
+        parked: false,
+        partial: false,
+        parking_details: Value::Array(Vec::new()),
+        intent_resources: Vec::new(),
+        runnable_resources: Vec::new(),
+        parked_resources: Vec::new(),
     }))
 }
 
@@ -5192,4 +5210,234 @@ async fn terminal_close_all(
     let closed = close_all_terminal_sessions(app, &state).await?;
 
     Ok(TerminalCloseAllResult { closed })
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn terminal_test_repo(name: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "diffforge_terminal_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        repo
+    }
+
+    fn terminal_test_coordination(name: &str) -> TerminalCoordinationSession {
+        let repo = terminal_test_repo(name);
+        let kernel = crate::coordination::CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(
+                &agent_id,
+                None,
+                Some("workspace-terminal-test-0-codex"),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let db_path = kernel.paths.db_path.display().to_string();
+        drop(kernel);
+
+        TerminalCoordinationSession {
+            repo_path: repo.display().to_string(),
+            db_path,
+            agent_id,
+            session_id,
+            env_vars: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn slash_command_does_not_create_coordination_task() {
+        assert!(terminal_prompt_is_agent_command("/model"));
+        assert!(terminal_prompt_is_agent_command(" /fast "));
+        assert!(!terminal_prompt_is_agent_command("make /api docs page"));
+    }
+
+    #[test]
+    fn coordinated_codex_launch_auto_approves_edits_in_worktree() {
+        let mut coordination = terminal_test_coordination("codex_auto_approval_args");
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            "/tmp/diffforge-agent-worktree".to_string(),
+        ));
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &["--model".to_string(), "gpt-5.2".to_string()],
+            Some(&coordination),
+            "pane-auto",
+            42,
+        );
+
+        assert!(args.windows(2).any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "workspace-write"]));
+        assert!(args.windows(2).any(|pair| pair == ["--cd", "/tmp/diffforge-agent-worktree"]));
+        assert!(args.iter().any(|arg| {
+            arg.starts_with("mcp_servers.coordination-kernel.args=")
+        }));
+        assert!(args.iter().any(|arg| {
+            arg.starts_with("mcp_servers.cloud-diffforge.args=")
+        }));
+    }
+
+    #[test]
+    fn coordinated_codex_launch_respects_explicit_approval_flags() {
+        let mut coordination = terminal_test_coordination("codex_existing_approval_args");
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            "/tmp/diffforge-agent-worktree".to_string(),
+        ));
+        let base = vec![
+            "--ask-for-approval".to_string(),
+            "on-request".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "--cd".to_string(),
+            "/tmp/custom-cwd".to_string(),
+        ];
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &base,
+            Some(&coordination),
+            "pane-auto",
+            42,
+        );
+
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--ask-for-approval").count(),
+            1
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--sandbox").count(),
+            1
+        );
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--ask-for-approval", "on-request"]));
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "read-only"]));
+        assert!(args.windows(2).any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
+    }
+
+    #[test]
+    fn prompt_preparation_does_not_create_prompt_intent_leases() {
+        let coordination = terminal_test_coordination("prompt_parking_disabled");
+
+        let first = terminal_prepare_coordination_task_for_prompt(
+            &coordination,
+            "make an index.html entry page for icecream wishlist",
+            "pane",
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!first.parked);
+        assert!(!first.partial);
+        assert!(first.intent_resources.is_empty());
+        assert!(first.runnable_resources.is_empty());
+        assert!(first.parked_resources.is_empty());
+
+        let inspect = crate::coordination::CoordinationKernel::open(
+            PathBuf::from(&coordination.repo_path),
+            Some(PathBuf::from(&coordination.db_path)),
+        )
+        .unwrap();
+        let active_leases = inspect
+            .query_json("SELECT id FROM leases WHERE status='active'", &[])
+            .unwrap();
+        assert!(active_leases.is_empty());
+        let intents = inspect
+            .query_json("SELECT id FROM task_resource_intents", &[])
+            .unwrap();
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn retry_prompt_reuses_same_session_active_lease_task() {
+        let coordination = terminal_test_coordination("retry_reuses_session_lease");
+
+        let first = terminal_prepare_coordination_task_for_prompt(
+            &coordination,
+            "make an index.html entry page for icecream wishlist",
+            "pane",
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!first.parked);
+
+        let lease_kernel = crate::coordination::CoordinationKernel::open(
+            PathBuf::from(&coordination.repo_path),
+            Some(PathBuf::from(&coordination.db_path)),
+        )
+        .unwrap();
+        lease_kernel
+            .acquire_lease(
+                &first.task_id,
+                &coordination.agent_id,
+                &coordination.session_id,
+                "file:index.html",
+                "write",
+                Some(900),
+                Some("test lease acquired by the agent after inspecting the repo"),
+            )
+            .unwrap();
+        drop(lease_kernel);
+
+        let retry = terminal_prepare_coordination_task_for_prompt(
+            &coordination,
+            "make the index.html for my icecream page",
+            "pane",
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retry.task_id, first.task_id);
+        assert!(!retry.parked);
+        assert!(retry.intent_resources.is_empty());
+        assert!(retry.runnable_resources.is_empty());
+
+        let inspect = crate::coordination::CoordinationKernel::open(
+            PathBuf::from(&coordination.repo_path),
+            Some(PathBuf::from(&coordination.db_path)),
+        )
+        .unwrap();
+        let retry_tasks = inspect
+            .query_json(
+                "SELECT id FROM tasks WHERE body='make the index.html for my icecream page'",
+                &[],
+            )
+            .unwrap();
+        assert!(retry_tasks.is_empty());
+        let session_rows = inspect
+            .query_json(
+                "SELECT task_id FROM agent_sessions WHERE id=?1",
+                &[&coordination.session_id],
+            )
+            .unwrap();
+        assert_eq!(session_rows[0]["task_id"].as_str(), Some(first.task_id.as_str()));
+        let active_index_leases = inspect
+            .query_json(
+                "SELECT l.id
+                 FROM leases l
+                 JOIN resources r ON r.id=l.resource_id
+                 WHERE l.status='active' AND r.resource_key='file:index.html'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(active_index_leases.len(), 1);
+    }
 }

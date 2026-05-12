@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -19,6 +19,7 @@ use super::{
         canonical_repo_path, open_connection, process_path_text, SchemaMigrationDiagnostics,
         StoragePaths, REPO_ID,
     },
+    dependency_graph::DependencyEdgeInput,
     events,
     models::{ApiEnvelope, ApiErrorEnvelope, PatchValidationResult, TerminalCoordinationContext},
     resources::{
@@ -48,6 +49,12 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "acquire_lease",
     "renew_lease",
     "release_lease",
+    "create_dependency",
+    "list_dependencies",
+    "explain_blockers",
+    "reevaluate_dependencies",
+    "cancel_dependency",
+    "list_ready_tasks",
     "list_resources",
     "list_active_leases",
     "list_task_dependencies",
@@ -213,14 +220,12 @@ impl CoordinationKernel {
     }
 
     fn reset_active_leases_once_per_process_start(&self) -> Result<Value, String> {
-        static RESET_DBS: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashSet<String>>,
-        > = std::sync::OnceLock::new();
+        static RESET_DBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
         let db_key = self.paths.db_path.display().to_string();
         let should_reset = {
-            let reset_dbs = RESET_DBS.get_or_init(|| {
-                std::sync::Mutex::new(std::collections::HashSet::new())
-            });
+            let reset_dbs =
+                RESET_DBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
             let mut guard = reset_dbs
                 .lock()
                 .map_err(|_| "Startup lease reset guard is poisoned.".to_string())?;
@@ -871,16 +876,18 @@ impl CoordinationKernel {
                     task_id
                 ],
             )
-            .map_err(|error| format!("Unable to sync local task with Cloud MCP context: {error}"))?;
+            .map_err(|error| {
+                format!("Unable to sync local task with Cloud MCP context: {error}")
+            })?;
         self.emit_event(
             "task_cloud_context_synced",
             "kernel",
             REPO_ID,
             EventRefs {
                 task_id: Some(task_id.to_string()),
-                context_run_id: clean_cloud_context_task_id.map(str::to_string).or_else(|| {
-                    task["context_run_id"].as_str().map(str::to_string)
-                }),
+                context_run_id: clean_cloud_context_task_id
+                    .map(str::to_string)
+                    .or_else(|| task["context_run_id"].as_str().map(str::to_string)),
                 ..EventRefs::default()
             },
             json!({
@@ -963,9 +970,23 @@ impl CoordinationKernel {
         } else {
             Vec::new()
         };
+        let predicate_edges =
+            if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+                self.list_dependencies(Some(task_id), None, true)?["data"]["dependencies"].clone()
+            } else {
+                self.list_dependencies(None, None, true)?["data"]["dependencies"].clone()
+            };
+        let predicate_blockers =
+            if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+                self.blocking_dependency_edges(task_id)?
+            } else {
+                Vec::new()
+            };
         Ok(api_ok(json!({
             "dependencies": dependencies,
             "blocking_dependencies": blockers,
+            "predicate_dependencies": predicate_edges,
+            "blocking_predicate_dependencies": predicate_blockers,
         })))
     }
 
@@ -980,7 +1001,11 @@ impl CoordinationKernel {
         let status = match normalized_status.as_str() {
             "cancelled" => "cancelled".to_string(),
             "interrupted" => "interrupted".to_string(),
-            _ => return Err("Stopped terminal task status must be cancelled or interrupted.".to_string()),
+            _ => {
+                return Err(
+                    "Stopped terminal task status must be cancelled or interrupted.".to_string(),
+                )
+            }
         };
         let task = self.query_one(
             "SELECT * FROM tasks WHERE id=?1",
@@ -1003,9 +1028,14 @@ impl CoordinationKernel {
                     params![&status, now, task_id, session_id],
                 )
                 .map_err(|error| format!("Unable to mark task {status}: {error}"))?;
-            let released_leases = self.release_active_leases_for_task(task_id, &format!("task_{status}"))?;
+            let released_leases =
+                self.release_active_leases_for_task(task_id, &format!("task_{status}"))?;
             self.emit_event(
-                if status == "cancelled" { "task_cancelled" } else { "task_interrupted" },
+                if status == "cancelled" {
+                    "task_cancelled"
+                } else {
+                    "task_interrupted"
+                },
                 "terminal",
                 session_id,
                 EventRefs {
@@ -1088,6 +1118,23 @@ impl CoordinationKernel {
                 "reused": reused,
             }),
         )?;
+        if !matches!(dependency_kind, "active_file_lease" | "unmerged_patch") {
+            let _ = self.create_dependency_edge(DependencyEdgeInput {
+                dependent_task_id: task_id.to_string(),
+                prerequisite_kind: "task".to_string(),
+                prerequisite_key: format!("task:{depends_on_task_id}"),
+                predicate_kind: "task_status_is".to_string(),
+                predicate_json: json!({
+                    "statuses": ["done", "completed", "merged", "cancelled", "skipped"],
+                    "dependency_kind": dependency_kind,
+                }),
+                required: true,
+                status: Some("pending".to_string()),
+                created_by_type: actor_type.to_string(),
+                created_by_id: actor_id.to_string(),
+                evidence_event_id: None,
+            });
+        }
         self.refresh_task_dependency_blocked_status(task_id, actor_type, actor_id)?;
         Ok(json!({
             "task_id": task_id,
@@ -1190,7 +1237,8 @@ impl CoordinationKernel {
                 "Task does not exist.",
             )?;
             let blockers = self.unsatisfied_dependency_details(task_id)?;
-            if !blockers.is_empty() {
+            let predicate_blockers = self.blocking_dependency_edges(task_id)?;
+            if !blockers.is_empty() || !predicate_blockers.is_empty() {
                 self.conn
                     .execute(
                         "UPDATE tasks
@@ -1214,13 +1262,17 @@ impl CoordinationKernel {
                     },
                     json!({
                         "blocking_dependencies": blockers.clone(),
+                        "blocking_predicate_dependencies": predicate_blockers.clone(),
                         "reason": "unsatisfied_dependencies",
                     }),
                 )?;
                 return Ok(api_error(
                     "task_blocked",
                     format!("Task {task_id} is blocked by unfinished dependencies."),
-                    json!({"blocking_dependencies": blockers}),
+                    json!({
+                        "blocking_dependencies": blockers,
+                        "blocking_predicate_dependencies": predicate_blockers,
+                    }),
                 ));
             }
 
@@ -1408,6 +1460,7 @@ impl CoordinationKernel {
             "Task does not exist.",
         )?;
         let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let predicate_blockers = self.blocking_dependency_edges(task_id)?;
         let blocked_slice_count: i64 = self
             .conn
             .query_row(
@@ -1423,7 +1476,7 @@ impl CoordinationKernel {
             )
             .map_err(|error| format!("Unable to inspect blocked task slices: {error}"))?;
         let now = now_rfc3339();
-        if blockers.is_empty() && blocked_slice_count == 0 {
+        if blockers.is_empty() && predicate_blockers.is_empty() && blocked_slice_count == 0 {
             let resume_ready_intent_count = self
                 .conn
                 .execute(
@@ -1433,7 +1486,9 @@ impl CoordinationKernel {
                        AND status IN ('parked', 'parked_cycle_prevented')",
                     params![now, task_id],
                 )
-                .map_err(|error| format!("Unable to mark resource intents resume-ready: {error}"))?;
+                .map_err(|error| {
+                    format!("Unable to mark resource intents resume-ready: {error}")
+                })?;
             let satisfied_slice_count = self
                 .conn
                 .execute(
@@ -1443,7 +1498,9 @@ impl CoordinationKernel {
                        AND status IN ('parked', 'parked_cycle_prevented', 'cycle_prevented')",
                     params![now, task_id],
                 )
-                .map_err(|error| format!("Unable to mark task slice dependencies satisfied: {error}"))?;
+                .map_err(|error| {
+                    format!("Unable to mark task slice dependencies satisfied: {error}")
+                })?;
             let changed = self
                 .conn
                 .execute(
@@ -1462,9 +1519,7 @@ impl CoordinationKernel {
                     actor_id,
                     EventRefs {
                         task_id: Some(task_id.to_string()),
-                        context_run_id: task["context_run_id"]
-                            .as_str()
-                            .map(str::to_string),
+                        context_run_id: task["context_run_id"].as_str().map(str::to_string),
                         ..EventRefs::default()
                     },
                     json!({
@@ -1534,14 +1589,13 @@ impl CoordinationKernel {
                     actor_id,
                     EventRefs {
                         task_id: Some(task_id.to_string()),
-                        context_run_id: task["context_run_id"]
-                            .as_str()
-                            .map(str::to_string),
+                        context_run_id: task["context_run_id"].as_str().map(str::to_string),
                         ..EventRefs::default()
                     },
                     json!({
                         "reason": "dependency_added",
                         "blocking_dependencies": blockers,
+                        "blocking_predicate_dependencies": predicate_blockers,
                         "blocked_slice_count": blocked_slice_count,
                     }),
                 )?;
@@ -1551,6 +1605,7 @@ impl CoordinationKernel {
     }
 
     fn refresh_dependent_tasks(&self, depends_on_task_id: &str) -> Result<(), String> {
+        let _ = self.reevaluate_dependency_edges_for_prerequisite_task(depends_on_task_id, None);
         let dependents = self.query_json(
             "SELECT task_id, dependency_kind
              FROM task_dependencies
@@ -1562,19 +1617,19 @@ impl CoordinationKernel {
             let Some(task_id) = dependent["task_id"].as_str() else {
                 continue;
             };
-                    self.emit_event(
-                        "task_dependency_satisfied",
-                        "kernel",
+            self.emit_event(
+                "task_dependency_satisfied",
+                "kernel",
                 REPO_ID,
                 EventRefs {
                     task_id: Some(task_id.to_string()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "depends_on_task_id": depends_on_task_id,
-                    "dependency_kind": dependent["dependency_kind"].clone(),
-                        }),
-                    )?;
+                "depends_on_task_id": depends_on_task_id,
+                "dependency_kind": dependent["dependency_kind"].clone(),
+                    }),
+            )?;
             self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
             let refreshed_task = self
                 .query_one(
@@ -1616,6 +1671,7 @@ impl CoordinationKernel {
             "Session does not exist.",
         )?;
         let blockers = self.unsatisfied_dependency_details(task_id)?;
+        let predicate_blockers = self.blocking_dependency_edges(task_id)?;
         let blocked_slices = self.query_json(
             "SELECT d.task_id,
                     d.resource_key,
@@ -1690,6 +1746,7 @@ impl CoordinationKernel {
         let has_parked_resource_intents = !parked_resource_intents.is_empty();
         let task_updated_at = task["updated_at"].as_str();
         let ready = blockers.is_empty()
+            && predicate_blockers.is_empty()
             && !has_cycle_prevented_slices
             && active_lease_count == 0
             && matches!(status, "ready" | "claimed")
@@ -1701,6 +1758,7 @@ impl CoordinationKernel {
         };
         if !ready
             && (!blockers.is_empty()
+                || !predicate_blockers.is_empty()
                 || has_cycle_prevented_slices
                 || has_parked_resource_intents
                 || active_lease_count > 0)
@@ -1720,6 +1778,7 @@ impl CoordinationKernel {
                     "status": status,
                     "session_status": session["status"].clone(),
                     "blocking_dependency_count": blockers.len(),
+                    "blocking_predicate_dependency_count": predicate_blockers.len(),
                     "blocked_slice_count": blocked_slices.len(),
                     "parked_resource_intent_count": parked_resource_intents.len(),
                     "active_lease_count": active_lease_count,
@@ -1782,6 +1841,7 @@ impl CoordinationKernel {
             "task": task,
             "session": session,
             "blocking_dependencies": blockers,
+            "blocking_predicate_dependencies": predicate_blockers,
             "blocked_slices": blocked_slices,
             "parked_resource_intents": parked_resource_intents,
             "active_lease_count": active_lease_count,
@@ -1816,9 +1876,7 @@ impl CoordinationKernel {
         }
 
         let current_task_id = session["task_id"].as_str().unwrap_or_default();
-        let current_task_status = session["current_task_status"]
-            .as_str()
-            .unwrap_or_default();
+        let current_task_status = session["current_task_status"].as_str().unwrap_or_default();
         let agent_id = session["agent_id"].as_str().unwrap_or_default();
         let agent_slot_id = session["agent_slot_id"].as_str().unwrap_or_default();
         let write_root = session["write_root"].as_str().unwrap_or_default();
@@ -2209,8 +2267,7 @@ impl CoordinationKernel {
                             task_id.or_else(|| existing["task_id"].as_str()),
                             existing["worktree_id"].as_str(),
                             worktree_path,
-                            context_run_id
-                                .or_else(|| existing["context_run_id"].as_str()),
+                            context_run_id.or_else(|| existing["context_run_id"].as_str()),
                             context_role.or_else(|| existing["context_role"].as_str()),
                         )?;
                         return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
@@ -2224,9 +2281,7 @@ impl CoordinationKernel {
                             agent_slot_id: Some(agent_slot_id.to_string()),
                             session_id: Some(active_session_id.to_string()),
                             task_id: existing["task_id"].as_str().map(str::to_string),
-                            context_run_id: existing["context_run_id"]
-                                .as_str()
-                                .map(str::to_string),
+                            context_run_id: existing["context_run_id"].as_str().map(str::to_string),
                             ..EventRefs::default()
                         },
                         json!({
@@ -2340,9 +2395,7 @@ impl CoordinationKernel {
                     agent_slot_id: Some(agent_slot_id.to_string()),
                     session_id: Some(existing_session_id.to_string()),
                     task_id: existing["task_id"].as_str().map(str::to_string),
-                    context_run_id: existing["context_run_id"]
-                        .as_str()
-                        .map(str::to_string),
+                    context_run_id: existing["context_run_id"].as_str().map(str::to_string),
                     ..EventRefs::default()
                 },
                 json!({
@@ -2644,7 +2697,8 @@ impl CoordinationKernel {
             )
             .map_err(|error| format!("Unable to release interrupted session slot: {error}"))?;
 
-        let close_discards_parked_task = matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
+        let close_discards_parked_task =
+            matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
         let mut discarded_parked_task = None;
         if close_discards_parked_task {
             if let Some(task_id) = session["task_id"]
@@ -2673,7 +2727,9 @@ impl CoordinationKernel {
                                AND status IN ('ready', 'blocked', 'claimed')",
                             params![now, task_id, session_id],
                         )
-                        .map_err(|error| format!("Unable to discard closed parked task: {error}"))?;
+                        .map_err(|error| {
+                            format!("Unable to discard closed parked task: {error}")
+                        })?;
                     if task_updated > 0 {
                         let intent_updated = self
                             .conn
@@ -2782,11 +2838,27 @@ impl CoordinationKernel {
                     t.title AS task_title,
                     t.body AS task_body,
                     t.status AS task_status,
-                    t.claimed_session_id
+                    t.claimed_session_id,
+                    COALESCE(active_leases.active_lease_count, 0) AS active_lease_count,
+                    COALESCE(startup_cleared_leases.startup_cleared_lease_count, 0) AS startup_cleared_lease_count
              FROM agent_sessions s
              LEFT JOIN agents a ON a.id=s.agent_id
              LEFT JOIN agent_slots slot ON slot.id=s.agent_slot_id
              LEFT JOIN tasks t ON t.id=s.task_id
+             LEFT JOIN (
+                SELECT session_id, task_id, COUNT(1) AS active_lease_count
+                FROM leases
+                WHERE status='active'
+                GROUP BY session_id, task_id
+             ) active_leases ON active_leases.session_id=s.id AND active_leases.task_id=s.task_id
+             LEFT JOIN (
+                SELECT session_id, task_id, COUNT(1) AS startup_cleared_lease_count
+                FROM events
+                WHERE event_type='startup_active_lease_cleared'
+                GROUP BY session_id, task_id
+             ) startup_cleared_leases
+               ON startup_cleared_leases.session_id=s.id
+              AND startup_cleared_leases.task_id=s.task_id
              WHERE s.status='active'
              ORDER BY s.updated_at DESC",
             &[],
@@ -2814,8 +2886,13 @@ impl CoordinationKernel {
                     task_status,
                     "done" | "completed" | "merged" | "cancelled" | "interrupted" | "skipped"
                 );
+            let active_lease_count = session["active_lease_count"].as_i64().unwrap_or(0);
+            let startup_cleared_lease_count =
+                session["startup_cleared_lease_count"].as_i64().unwrap_or(0);
+            let active_work_signal_count = active_lease_count + startup_cleared_lease_count;
+            let active_crashed_task = unfinished_task && active_work_signal_count > 0;
 
-            if let Some(task_id) = task_id.filter(|_| unfinished_task) {
+            if let Some(task_id) = task_id.filter(|_| active_crashed_task) {
                 let task_title = session["task_title"]
                     .as_str()
                     .filter(|value| !value.trim().is_empty())
@@ -2863,10 +2940,13 @@ impl CoordinationKernel {
                     },
                     json!({
                         "previous_task_status": task_status,
+                        "active_lease_count": active_lease_count,
+                        "startup_cleared_lease_count": startup_cleared_lease_count,
+                        "active_work_signal_count": active_work_signal_count,
                         "task_updated": task_updates > 0,
                         "updated_resource_intents": intent_updates,
                         "reason": "app_crash_recovery",
-                        "ui_policy": "show_manual_resume_modal_without_auto_input",
+                        "ui_policy": "show_manual_resume_modal_only_when_active_work_was_interrupted",
                     }),
                 )?;
 
@@ -2885,12 +2965,18 @@ impl CoordinationKernel {
                     "writeRoot": session["write_root"].as_str(),
                     "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
                     "sessionUpdatedAt": session["session_updated_at"].as_str(),
+                    "activeLeaseCount": active_lease_count,
+                    "startupClearedLeaseCount": startup_cleared_lease_count,
+                    "activeWorkSignalCount": active_work_signal_count,
                     "taskUpdated": task_updates > 0,
                     "updatedResourceIntents": intent_updates,
                     "interruptResult": interrupt_result,
                 }));
             } else {
-                let cleanup_reason = if task_id.is_some() {
+                let cleanup_reason = if unfinished_task {
+                    idle_sessions_interrupted += 1;
+                    "app_crash_idle_claimed_task_cleanup"
+                } else if task_id.is_some() {
                     finished_sessions_interrupted += 1;
                     "app_crash_finished_session_cleanup"
                 } else {
@@ -2912,7 +2998,7 @@ impl CoordinationKernel {
                     "interrupted_tasks": interrupted_tasks.len(),
                     "idle_sessions_interrupted": idle_sessions_interrupted,
                     "finished_sessions_interrupted": finished_sessions_interrupted,
-                    "modal_policy": "only_show_when_unfinished_task_sessions_exist",
+                    "modal_policy": "only_show_when_unfinished_task_sessions_have_active_work_signals",
                 }),
             )?;
         }
@@ -3610,7 +3696,10 @@ impl CoordinationKernel {
     }
 
     fn ensure_repo_root_mcp_files_ignored(&self) -> Result<(), String> {
-        let exclude_path_text = run_git(&self.paths.repo_path, &["rev-parse", "--git-path", "info/exclude"])?;
+        let exclude_path_text = run_git(
+            &self.paths.repo_path,
+            &["rev-parse", "--git-path", "info/exclude"],
+        )?;
         let exclude_path = {
             let trimmed = exclude_path_text.trim();
             let path = PathBuf::from(trimmed);
@@ -3622,7 +3711,10 @@ impl CoordinationKernel {
         };
         if let Some(parent) = exclude_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                format!("Unable to create git exclude directory {}: {error}", parent.display())
+                format!(
+                    "Unable to create git exclude directory {}: {error}",
+                    parent.display()
+                )
             })?;
         }
         let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
@@ -3630,7 +3722,10 @@ impl CoordinationKernel {
         if !existing.lines().any(|line| line.trim() == ".mcp.json") {
             additions.push(".mcp.json");
         }
-        if !existing.lines().any(|line| line.trim() == ".codex/config.toml") {
+        if !existing
+            .lines()
+            .any(|line| line.trim() == ".codex/config.toml")
+        {
             additions.push(".codex/config.toml");
         }
         if additions.is_empty() {
@@ -3642,7 +3737,8 @@ impl CoordinationKernel {
             .open(&exclude_path)
             .map_err(|error| format!("Unable to open {}: {error}", exclude_path.display()))?;
         if !existing.ends_with('\n') && !existing.is_empty() {
-            writeln!(file).map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+            writeln!(file)
+                .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
         }
         writeln!(file, "# Diff Forge local MCP activation files")
             .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
@@ -3904,6 +4000,24 @@ impl CoordinationKernel {
                                 "cycle_prevented",
                                 "cycle_prevented",
                             )?;
+                            self.create_dependency_edge(DependencyEdgeInput {
+                                dependent_task_id: task_id.to_string(),
+                                prerequisite_kind: "resource".to_string(),
+                                prerequisite_key: resource_key.clone(),
+                                predicate_kind: "lease_released".to_string(),
+                                predicate_json: json!({
+                                    "blocked_by_task_id": depends_on_task_id,
+                                    "blocked_by_lease_id": blocker["id"].as_str(),
+                                    "blocked_by_resource_key": blocking_resource_key,
+                                    "dependency_kind": "active_file_lease",
+                                    "mode": mode.clone(),
+                                }),
+                                required: true,
+                                status: Some("cycle_prevented".to_string()),
+                                created_by_type: "kernel".to_string(),
+                                created_by_id: REPO_ID.to_string(),
+                                evidence_event_id: None,
+                            })?;
                             self.emit_event(
                                 "task_dependency_cycle_prevented",
                                 "kernel",
@@ -3924,9 +4038,7 @@ impl CoordinationKernel {
                                 }),
                             )?;
                             self.refresh_task_dependency_blocked_status(
-                                task_id,
-                                "kernel",
-                                REPO_ID,
+                                task_id, "kernel", REPO_ID,
                             )?;
                             return Ok(api_error(
                                 "task_cycle_prevented",
@@ -3962,6 +4074,24 @@ impl CoordinationKernel {
                                     "active_file_lease",
                                     "parked",
                                 )?;
+                                self.create_dependency_edge(DependencyEdgeInput {
+                                    dependent_task_id: task_id.to_string(),
+                                    prerequisite_kind: "resource".to_string(),
+                                    prerequisite_key: resource_key.clone(),
+                                    predicate_kind: "lease_released".to_string(),
+                                    predicate_json: json!({
+                                        "blocked_by_task_id": depends_on_task_id,
+                                        "blocked_by_lease_id": blocker["id"].as_str(),
+                                        "blocked_by_resource_key": blocking_resource_key,
+                                        "dependency_kind": "active_file_lease",
+                                        "mode": mode.clone(),
+                                    }),
+                                    required: true,
+                                    status: Some("pending".to_string()),
+                                    created_by_type: "kernel".to_string(),
+                                    created_by_id: REPO_ID.to_string(),
+                                    evidence_event_id: None,
+                                })?;
                                 dependency_results.push(result)
                             }
                             Err(error) => dependency_results.push(json!({
@@ -4070,6 +4200,26 @@ impl CoordinationKernel {
                                     "unmerged_patch",
                                     "parked",
                                 )?;
+                                if let Some(patch_id) = blocker["patch_id"].as_str() {
+                                    self.create_dependency_edge(DependencyEdgeInput {
+                                        dependent_task_id: task_id.to_string(),
+                                        prerequisite_kind: "patch".to_string(),
+                                        prerequisite_key: format!("patch:{patch_id}"),
+                                        predicate_kind: "patch_status_is".to_string(),
+                                        predicate_json: json!({
+                                            "status": "merged",
+                                            "blocked_by_task_id": depends_on_task_id,
+                                            "blocked_by_resource_key": blocker["resource_key"].as_str(),
+                                            "requested_resource_key": resource_key.clone(),
+                                            "dependency_kind": "unmerged_patch",
+                                        }),
+                                        required: true,
+                                        status: Some("pending".to_string()),
+                                        created_by_type: "kernel".to_string(),
+                                        created_by_id: REPO_ID.to_string(),
+                                        evidence_event_id: None,
+                                    })?;
+                                }
                                 dependency_results.push(result)
                             }
                             Err(error) => dependency_results.push(json!({
@@ -4258,14 +4408,12 @@ impl CoordinationKernel {
         for mut row in rows {
             let path = row["path"].as_str().unwrap_or_default();
             let blocker_resource = path_to_file_resource(path);
-            let Some(conflict_reason) = resource_conflict_reason(&blocker_resource, resource_key) else {
+            let Some(conflict_reason) = resource_conflict_reason(&blocker_resource, resource_key)
+            else {
                 continue;
             };
             if let Some(object) = row.as_object_mut() {
-                object.insert(
-                    "resource_key".to_string(),
-                    Value::String(blocker_resource),
-                );
+                object.insert("resource_key".to_string(), Value::String(blocker_resource));
                 object.insert(
                     "requested_resource_key".to_string(),
                     Value::String(resource_key.to_string()),
@@ -4447,7 +4595,7 @@ impl CoordinationKernel {
                 params![now, lease_id],
             )
             .map_err(|error| format!("Unable to clear released lease intent: {error}"))?;
-        self.emit_event(
+        let release_event_id = self.emit_event(
             "lease_released",
             "agent",
             lease["agent_id"].as_str().unwrap_or_default(),
@@ -4466,6 +4614,15 @@ impl CoordinationKernel {
                 "intent_release_policy": "lease_granted_intents_return_to_planned",
             }),
         )?;
+        let predicate_dependency_refresh = self
+            .reevaluate_dependency_edges_for_lease(lease_id, Some(&release_event_id))
+            .unwrap_or_else(|error| {
+                api_error(
+                    "dependency_graph_refresh_failed",
+                    "Lease was released, but predicate dependency edges could not be refreshed.",
+                    json!({"lease_id": lease_id, "error": error}),
+                )
+            });
         let released_dependents = self
             .refresh_active_file_lease_dependents_after_release(&lease)
             .unwrap_or_else(|error| {
@@ -4481,6 +4638,7 @@ impl CoordinationKernel {
             "status": "released",
             "released_intent_count": released_intent_count,
             "released_dependents": released_dependents,
+            "predicate_dependency_refresh": predicate_dependency_refresh,
         })))
     }
 
@@ -4776,7 +4934,7 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to expire leases: {error}"))?;
 
         for (id, task_id, agent_id, agent_slot_id, session_id, resource_id) in expired {
-            self.emit_event(
+            let event_id = self.emit_event(
                 "lease_expired",
                 "kernel",
                 REPO_ID,
@@ -4790,6 +4948,7 @@ impl CoordinationKernel {
                 },
                 json!({"lease_id": id}),
             )?;
+            let _ = self.reevaluate_dependency_edges_for_lease(&id, Some(&event_id));
         }
 
         Ok(())
@@ -5478,11 +5637,13 @@ impl CoordinationKernel {
                         "merge": queued.clone(),
                     })),
                 )
-                .unwrap_or_else(|error| api_error(
-                    "smart_merge_resolution_failed",
-                    "Merge was blocked, and merge-resolution initialization failed.",
-                    json!({"patch_id": patch_id, "resolution_error": error}),
-                ));
+                .unwrap_or_else(|error| {
+                    api_error(
+                        "smart_merge_resolution_failed",
+                        "Merge was blocked, and merge-resolution initialization failed.",
+                        json!({"patch_id": patch_id, "resolution_error": error}),
+                    )
+                });
             return Ok(json!({
                 "status": "blocked",
                 "stage": "request_merge",
@@ -5518,11 +5679,13 @@ impl CoordinationKernel {
                     "apply": applied.clone(),
                 })),
             )
-                .unwrap_or_else(|error| api_error(
+            .unwrap_or_else(|error| {
+                api_error(
                     "smart_merge_resolution_failed",
                     "Merge apply failed, and merge-resolution initialization failed.",
                     json!({"patch_id": patch_id, "resolution_error": error}),
-                ))
+                )
+            })
         };
         Ok(json!({
             "status": status,
@@ -6192,11 +6355,11 @@ impl CoordinationKernel {
     ) -> Result<Vec<Value>, String> {
         Ok(self
             .query_json(
-            "SELECT * FROM workspace_violations
+                "SELECT * FROM workspace_violations
              WHERE status='open'
                AND (session_id = ?1 OR worktree_id = ?2)
                AND (severity IN ('error', 'critical') OR violation_kind='unleased_write')",
-            &[&session_id, &worktree_id],
+                &[&session_id, &worktree_id],
             )?
             .into_iter()
             .filter(|violation| !workspace_violation_is_ignored_system_noise(violation))
@@ -6244,10 +6407,12 @@ impl CoordinationKernel {
         let Some(violation_resource_key) = Self::workspace_violation_resource_key(violation) else {
             return false;
         };
-        lease_covered_resource_keys.iter().any(|covered_resource_key| {
-            resource_covers(covered_resource_key, &violation_resource_key)
-                || resource_covers(&violation_resource_key, covered_resource_key)
-        })
+        lease_covered_resource_keys
+            .iter()
+            .any(|covered_resource_key| {
+                resource_covers(covered_resource_key, &violation_resource_key)
+                    || resource_covers(&violation_resource_key, covered_resource_key)
+            })
     }
 
     fn changed_files(&self, worktree_path: &Path) -> Result<Vec<ChangedFile>, String> {
@@ -6491,8 +6656,7 @@ impl CoordinationKernel {
             .as_ref()
             .and_then(|risk| risk["reason"].as_str())
             .unwrap_or("patch_did_not_apply_cleanly");
-        let resolution_message =
-            format!("Autonomous resolver initialized: {resolution_reason}.");
+        let resolution_message = format!("Autonomous resolver initialized: {resolution_reason}.");
         let merge_job_id = self.create_merge_job(
             &patch,
             "resolution_initialized",
@@ -7003,7 +7167,11 @@ impl CoordinationKernel {
         if policy["merge_requires_clean_target"].as_i64().unwrap_or(1) == 1
             && !self.integration_worktree_is_clean()?
         {
-            self.update_merge_job(merge_job_id, "blocked", Some("Integration worktree is dirty."))?;
+            self.update_merge_job(
+                merge_job_id,
+                "blocked",
+                Some("Integration worktree is dirty."),
+            )?;
             return Ok(api_error(
                 "merge_blocked",
                 "Integration worktree is dirty.",
@@ -7029,7 +7197,8 @@ impl CoordinationKernel {
             Ok(_) => {
                 let changed_files = self.patch_file_paths(patch_id)?;
                 self.stage_patch_files(&integration.path, &changed_files)?;
-                let commit = self.commit_integration_patch(&integration.path, &patch, &changed_files)?;
+                let commit =
+                    self.commit_integration_patch(&integration.path, &patch, &changed_files)?;
                 let source_worktree_refresh =
                     self.reset_patch_source_worktree_to_integration(&patch).unwrap_or_else(|error| {
                         json!({
@@ -7054,7 +7223,9 @@ impl CoordinationKernel {
                             params![task_id],
                             |row| row.get(0),
                         )
-                        .map_err(|error| format!("Unable to inspect parked task slices: {error}"))?;
+                        .map_err(|error| {
+                            format!("Unable to inspect parked task slices: {error}")
+                        })?;
                     count > 0
                 } else {
                     false
@@ -7063,7 +7234,11 @@ impl CoordinationKernel {
                     .execute(
                         "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3",
                         params![
-                            if task_has_parked_slices { "blocked" } else { "merged" },
+                            if task_has_parked_slices {
+                                "blocked"
+                            } else {
+                                "merged"
+                            },
                             now_rfc3339(),
                             patch["task_id"].as_str()
                         ],
@@ -7077,12 +7252,15 @@ impl CoordinationKernel {
                              WHERE task_id=?2 AND status IN ('planned', 'lease_granted')",
                             params![now_rfc3339(), task_id],
                         )
-                        .map_err(|error| format!("Unable to mark task resource intents done: {error}"))?;
+                        .map_err(|error| {
+                            format!("Unable to mark task resource intents done: {error}")
+                        })?;
                     self.release_active_leases_for_task(task_id, "integration_merge_succeeded")?
                 } else {
                     json!({"released": []})
                 };
-                if let Some(task_id) = patch["task_id"].as_str().filter(|_| task_has_parked_slices) {
+                if let Some(task_id) = patch["task_id"].as_str().filter(|_| task_has_parked_slices)
+                {
                     let _ = self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID);
                 }
                 let root_fast_forward = self
@@ -7103,7 +7281,7 @@ impl CoordinationKernel {
                 } else {
                     json!({"status": "skipped", "reason": "patch_missing_task_id"})
                 };
-                self.emit_event(
+                let merge_event_id = self.emit_event(
                     "merge_succeeded",
                     "kernel",
                     REPO_ID,
@@ -7119,19 +7297,39 @@ impl CoordinationKernel {
                         "post_merge_schedule": post_merge_schedule.clone(),
                     }),
                 )?;
-                Ok(api_ok(
+                let predicate_dependency_refresh = if let Some(task_id) = patch["task_id"].as_str()
+                {
                     json!({
-                        "merge_job_id": merge_job_id,
-                        "status": "succeeded",
-                        "integration_branch": INTEGRATION_BRANCH,
-                        "integration_worktree": process_path_text(&integration.path),
-                        "commit": commit,
-                        "source_worktree_refresh": source_worktree_refresh,
-                        "released_leases": released_leases,
-                        "root_fast_forward": root_fast_forward,
-                        "post_merge_schedule": post_merge_schedule,
-                    }),
-                ))
+                        "task_edges": self
+                            .reevaluate_dependency_edges_for_prerequisite_task(task_id, Some(&merge_event_id))
+                            .unwrap_or_else(|error| api_error(
+                                "dependency_graph_task_refresh_failed",
+                                "Merge succeeded, but task predicate dependencies could not be refreshed.",
+                                json!({"task_id": task_id, "error": error}),
+                            )),
+                        "patch_edges": self
+                            .reevaluate_dependency_edges_for_patch(patch_id, Some(&merge_event_id))
+                            .unwrap_or_else(|error| api_error(
+                                "dependency_graph_patch_refresh_failed",
+                                "Merge succeeded, but patch predicate dependencies could not be refreshed.",
+                                json!({"patch_id": patch_id, "error": error}),
+                            )),
+                    })
+                } else {
+                    json!({"status": "skipped", "reason": "patch_missing_task_id"})
+                };
+                Ok(api_ok(json!({
+                    "merge_job_id": merge_job_id,
+                    "status": "succeeded",
+                    "integration_branch": INTEGRATION_BRANCH,
+                    "integration_worktree": process_path_text(&integration.path),
+                    "commit": commit,
+                    "source_worktree_refresh": source_worktree_refresh,
+                    "released_leases": released_leases,
+                    "root_fast_forward": root_fast_forward,
+                    "post_merge_schedule": post_merge_schedule,
+                    "predicate_dependency_refresh": predicate_dependency_refresh,
+                })))
             }
             Err(error) => {
                 self.update_merge_job(merge_job_id, "failed", Some(&error))?;
@@ -7247,7 +7445,10 @@ impl CoordinationKernel {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let output = run_git(&self.paths.repo_path, &["merge", "--ff-only", INTEGRATION_BRANCH])?;
+        let output = run_git(
+            &self.paths.repo_path,
+            &["merge", "--ff-only", INTEGRATION_BRANCH],
+        )?;
         let after = run_git(&self.paths.repo_path, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
@@ -7284,7 +7485,10 @@ impl CoordinationKernel {
         }
         run_git(&self.paths.repo_path, &["rev-parse", "--show-toplevel"])?;
         if !self.branch_exists(INTEGRATION_BRANCH)? {
-            run_git(&self.paths.repo_path, &["branch", INTEGRATION_BRANCH, "HEAD"])?;
+            run_git(
+                &self.paths.repo_path,
+                &["branch", INTEGRATION_BRANCH, "HEAD"],
+            )?;
             self.emit_event(
                 "integration_branch_created",
                 "kernel",
@@ -7311,7 +7515,9 @@ impl CoordinationKernel {
                     }),
                 )?;
                 run_git(&self.paths.repo_path, &["worktree", "prune"]).map_err(|prune_error| {
-                    format!("Unable to prune stale integration worktree registration: {prune_error}")
+                    format!(
+                        "Unable to prune stale integration worktree registration: {prune_error}"
+                    )
                 })?;
                 if path.exists() {
                     self.validate_git_worktree_path(&path, INTEGRATION_BRANCH)?;
@@ -7331,8 +7537,9 @@ impl CoordinationKernel {
             }
         } else {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Unable to create integration worktree root: {error}"))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!("Unable to create integration worktree root: {error}")
+                })?;
             }
             if let Err(error) = run_git(
                 &self.paths.repo_path,
@@ -7351,7 +7558,9 @@ impl CoordinationKernel {
                     }),
                 )?;
                 run_git(&self.paths.repo_path, &["worktree", "prune"]).map_err(|prune_error| {
-                    format!("Unable to prune stale integration worktree registration: {prune_error}")
+                    format!(
+                        "Unable to prune stale integration worktree registration: {prune_error}"
+                    )
                 })?;
                 if let Err(retry_error) = run_git(
                     &self.paths.repo_path,
@@ -7480,10 +7689,19 @@ impl CoordinationKernel {
         }
         let task_id = patch["task_id"].as_str().unwrap_or_default();
         let task_title = self
-            .query_one("SELECT title FROM tasks WHERE id=?1", &[&task_id], "Task does not exist.")
+            .query_one(
+                "SELECT title FROM tasks WHERE id=?1",
+                &[&task_id],
+                "Task does not exist.",
+            )
             .ok()
             .and_then(|task| task["title"].as_str().map(str::to_string))
-            .unwrap_or_else(|| format!("patch {}", short_id(patch["id"].as_str().unwrap_or_default())));
+            .unwrap_or_else(|| {
+                format!(
+                    "patch {}",
+                    short_id(patch["id"].as_str().unwrap_or_default())
+                )
+            });
         let file_summary = if changed_files.is_empty() {
             "no recorded files".to_string()
         } else {
@@ -7523,7 +7741,10 @@ impl CoordinationKernel {
     }
 
     fn reset_patch_source_worktree_to_integration(&self, patch: &Value) -> Result<Value, String> {
-        let Some(worktree_id) = patch["worktree_id"].as_str().filter(|value| !value.trim().is_empty()) else {
+        let Some(worktree_id) = patch["worktree_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        else {
             return Ok(json!({"status": "skipped", "reason": "patch_missing_worktree_id"}));
         };
         let worktree = self.get_worktree(worktree_id)?;
@@ -7535,7 +7756,10 @@ impl CoordinationKernel {
                 "worktree_id": worktree_id,
             }));
         }
-        self.validate_git_worktree_path(&path, worktree["branch_name"].as_str().unwrap_or_default())?;
+        self.validate_git_worktree_path(
+            &path,
+            worktree["branch_name"].as_str().unwrap_or_default(),
+        )?;
         run_git(&path, &["reset", "--hard", INTEGRATION_BRANCH])?;
         let current_sha = run_git(&path, &["rev-parse", "HEAD"])?.trim().to_string();
         self.conn
@@ -7543,8 +7767,13 @@ impl CoordinationKernel {
                 "UPDATE worktrees SET base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
                 params![current_sha.clone(), now_rfc3339(), worktree_id],
             )
-            .map_err(|error| format!("Unable to update source worktree after integration reset: {error}"))?;
-        if let Some(session_id) = patch["session_id"].as_str().filter(|value| !value.trim().is_empty()) {
+            .map_err(|error| {
+                format!("Unable to update source worktree after integration reset: {error}")
+            })?;
+        if let Some(session_id) = patch["session_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
             self.conn
                 .execute(
                     "UPDATE agent_sessions SET base_git_sha=?1, current_git_sha=?1, updated_at=?2 WHERE id=?3",
@@ -7592,11 +7821,13 @@ impl CoordinationKernel {
             };
             released.push(
                 self.release_lease(lease_id, fence_token)
-                    .unwrap_or_else(|error| api_error(
-                        "lease_release_failed",
-                        "Unable to release active task lease.",
-                        json!({"lease_id": lease_id, "error": error}),
-                    )),
+                    .unwrap_or_else(|error| {
+                        api_error(
+                            "lease_release_failed",
+                            "Unable to release active task lease.",
+                            json!({"lease_id": lease_id, "error": error}),
+                        )
+                    }),
             );
         }
         self.emit_event(
@@ -7688,8 +7919,7 @@ impl CoordinationKernel {
             let task_status = row["task_status"].as_str().unwrap_or_default();
             let refreshable_task_status = matches!(
                 task_status,
-                ""
-                    | "ready"
+                "" | "ready"
                     | "claimed"
                     | "blocked"
                     | "created"
@@ -7728,7 +7958,10 @@ impl CoordinationKernel {
                 results.push(result);
                 continue;
             }
-            let Some(path) = row["path"].as_str().filter(|value| !value.trim().is_empty()) else {
+            let Some(path) = row["path"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            else {
                 continue;
             };
             let worktree_path = PathBuf::from(path);
@@ -7957,7 +8190,9 @@ impl CoordinationKernel {
                      WHERE merge_job_id=?2 OR resolver_task_id=?3",
                     params![now, merge_job_id, task_id],
                 )
-                .map_err(|error| format!("Unable to update integration batch after resolution submit: {error}"))?;
+                .map_err(|error| {
+                    format!("Unable to update integration batch after resolution submit: {error}")
+                })?;
             self.conn
                 .execute(
                     "UPDATE integration_batch_items
@@ -9685,6 +9920,7 @@ impl CoordinationKernel {
             "db_change_requests": self.query_json("SELECT * FROM db_change_requests ORDER BY updated_at DESC LIMIT 200", &[])?,
             "db_change_request_resources": self.query_json("SELECT * FROM db_change_request_resources ORDER BY created_at DESC LIMIT 200", &[])?,
             "db_migrations": self.query_json("SELECT * FROM db_migrations ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "dependency_edges": self.query_json("SELECT * FROM dependency_edges ORDER BY updated_at DESC LIMIT 500", &[])?,
             "ui_surface_logs": self.query_json("SELECT * FROM coordination_ui_surface_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "bloat_audits": self.query_json("SELECT * FROM coordination_bloat_audits ORDER BY created_at DESC LIMIT 50", &[])?,
             "memories": self.query_json("SELECT id, memory_kind, trust_level, title, summary, task_id, context_run_id, created_at, updated_at FROM memories ORDER BY updated_at DESC LIMIT 200", &[])?,
@@ -9819,6 +10055,99 @@ impl CoordinationKernel {
             "SELECT * FROM events WHERE event_type IN ('db_change_requested', 'db_change_request_rejected', 'db_migration_proposed', 'db_change_approval_required') ORDER BY seq DESC LIMIT 500",
             &[],
         )?;
+        let dependency_edges = self.query_json(
+            "SELECT * FROM dependency_edges ORDER BY updated_at DESC LIMIT 1000",
+            &[],
+        )?;
+        let dependency_events = self.query_json(
+            "SELECT * FROM events
+             WHERE event_type IN (
+                'dependency_created',
+                'dependency_satisfied',
+                'dependency_invalidated',
+                'dependency_cancelled',
+                'dependency_expired',
+                'dependency_cycle_prevented',
+                'dependency_updated',
+                'task_blocked_by_dependencies',
+                'task_dependencies_satisfied'
+             )
+             ORDER BY seq DESC LIMIT 500",
+            &[],
+        )?;
+        let dependency_edges_missing_dependent = self.query_json(
+            "SELECT d.*
+             FROM dependency_edges d
+             LEFT JOIN tasks t ON t.id=d.dependent_task_id
+             WHERE t.id IS NULL
+             LIMIT 100",
+            &[],
+        )?;
+        let dependency_edges_missing_task_prerequisite = self.query_json(
+            "SELECT d.*
+             FROM dependency_edges d
+             LEFT JOIN tasks t
+               ON t.id=CASE
+                    WHEN d.prerequisite_key LIKE 'task:%' THEN substr(d.prerequisite_key, 6)
+                    ELSE d.prerequisite_key
+                  END
+             WHERE d.prerequisite_kind='task'
+               AND t.id IS NULL
+             LIMIT 100",
+            &[],
+        )?;
+        let dependency_edges_missing_patch_prerequisite = self.query_json(
+            "SELECT d.*
+             FROM dependency_edges d
+             LEFT JOIN patches p
+               ON p.id=CASE
+                    WHEN d.prerequisite_key LIKE 'patch:%' THEN substr(d.prerequisite_key, 7)
+                    ELSE d.prerequisite_key
+                  END
+             WHERE d.prerequisite_kind='patch'
+               AND p.id IS NULL
+             LIMIT 100",
+            &[],
+        )?;
+        let dependency_edges_missing_artifact_prerequisite = self.query_json(
+            "SELECT d.*
+             FROM dependency_edges d
+             LEFT JOIN artifacts a
+               ON a.id=CASE
+                    WHEN d.prerequisite_key LIKE 'artifact:%' THEN substr(d.prerequisite_key, 10)
+                    ELSE d.prerequisite_key
+                  END
+             WHERE d.prerequisite_kind='artifact'
+               AND d.prerequisite_key NOT IN ('artifact:*', '*')
+               AND a.id IS NULL
+             LIMIT 100",
+            &[],
+        )?;
+        let dependency_blocking_unblocked_tasks = self.query_json(
+            "SELECT d.*, t.status AS dependent_task_status
+             FROM dependency_edges d
+             LEFT JOIN tasks t ON t.id=d.dependent_task_id
+             WHERE d.required=1
+               AND d.status IN ('pending', 'invalidated', 'expired', 'cycle_prevented')
+               AND COALESCE(t.status, '') NOT IN ('blocked', 'done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+             LIMIT 100",
+            &[],
+        )?;
+        let dependency_legacy_rows_missing_edges = self.query_json(
+            "SELECT td.*
+             FROM task_dependencies td
+             LEFT JOIN dependency_edges d
+               ON d.dependent_task_id=td.task_id
+              AND (
+                   (td.dependency_kind NOT IN ('active_file_lease', 'unmerged_patch')
+                    AND d.prerequisite_kind='task'
+                    AND d.prerequisite_key=('task:' || td.depends_on_task_id))
+                   OR json_extract(d.predicate_json, '$.blocked_by_task_id')=td.depends_on_task_id
+              )
+             WHERE d.id IS NULL
+             LIMIT 100",
+            &[],
+        )?;
         let ui_surface_logs = self.query_json(
             "SELECT * FROM coordination_ui_surface_logs ORDER BY created_at DESC LIMIT 500",
             &[],
@@ -9840,12 +10169,6 @@ impl CoordinationKernel {
             &[],
         )?;
         let mcp_client_mounts = self.mcp_client_mount_summary()?;
-        let task_ids = self
-            .query_json("SELECT id FROM tasks", &[])?
-            .into_iter()
-            .filter_map(|task| task["id"].as_str().map(str::to_string))
-            .collect::<HashSet<_>>();
-
         record_alignment_check(
             &self.paths.repo_path,
             &mut checks,
@@ -9942,6 +10265,67 @@ impl CoordinationKernel {
         let request_merge_listed = mcp_tools.contains(&"request_merge");
         let violation_resolver_listed = mcp_tools.contains(&"resolve_workspace_violation");
         let apply_merge_listed = mcp_tools.contains(&"apply_merge");
+        let dependency_graph_tools = [
+            "create_dependency",
+            "list_dependencies",
+            "explain_blockers",
+            "reevaluate_dependencies",
+            "cancel_dependency",
+            "list_ready_tasks",
+        ];
+        let missing_dependency_graph_tools = dependency_graph_tools
+            .iter()
+            .filter(|tool| !mcp_tools.contains(tool))
+            .copied()
+            .collect::<Vec<_>>();
+        let known_dependency_statuses = HashSet::from([
+            "pending",
+            "satisfied",
+            "invalidated",
+            "cancelled",
+            "expired",
+            "cycle_prevented",
+        ]);
+        let known_dependency_predicates = HashSet::from([
+            "task_status_is",
+            "patch_status_is",
+            "lease_released",
+            "resource_available",
+            "artifact_exists",
+            "approval_granted",
+            "contract_certified",
+        ]);
+        let unknown_dependency_status_edges = dependency_edges
+            .iter()
+            .filter(|edge| {
+                edge["status"]
+                    .as_str()
+                    .is_some_and(|status| !known_dependency_statuses.contains(status))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let unknown_dependency_predicate_edges = dependency_edges
+            .iter()
+            .filter(|edge| {
+                edge["predicate_kind"]
+                    .as_str()
+                    .is_some_and(|predicate| !known_dependency_predicates.contains(predicate))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let blocking_dependency_edge_count = dependency_edges
+            .iter()
+            .filter(|edge| {
+                edge["required"].as_i64().unwrap_or(1) == 1
+                    && matches!(
+                        edge["status"].as_str(),
+                        Some("pending" | "invalidated" | "expired" | "cycle_prevented")
+                    )
+            })
+            .count();
+        let dependency_edge_status_counts = json_counts_by_field(&dependency_edges, "status");
+        let dependency_edge_predicate_counts =
+            json_counts_by_field(&dependency_edges, "predicate_kind");
         record_alignment_check(
             &self.paths.repo_path,
             &mut checks,
@@ -9966,6 +10350,181 @@ impl CoordinationKernel {
                 "resolve_workspace_violation_listed": violation_resolver_listed,
                 "apply_merge_listed": apply_merge_listed,
                 "tool_count": mcp_tools.len(),
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.mcp_surface",
+            if missing_dependency_graph_tools.is_empty() {
+                "aligned"
+            } else {
+                "violation"
+            },
+            if missing_dependency_graph_tools.is_empty() {
+                "Dependency graph tools are exposed through the local coordination MCP surface."
+            } else {
+                "One or more dependency graph MCP tools are missing from the agent-visible surface."
+            },
+            json!({
+                "expected_tools": dependency_graph_tools,
+                "missing_tools": missing_dependency_graph_tools,
+                "tool_count": mcp_tools.len(),
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.edge_schema",
+            if unknown_dependency_status_edges.is_empty()
+                && unknown_dependency_predicate_edges.is_empty()
+            {
+                "aligned"
+            } else {
+                "violation"
+            },
+            if unknown_dependency_status_edges.is_empty()
+                && unknown_dependency_predicate_edges.is_empty()
+            {
+                "Dependency graph edges use known statuses and deterministic predicate kinds."
+            } else {
+                "Dependency graph has edges with unknown status or predicate values."
+            },
+            json!({
+                "edge_count": dependency_edges.len(),
+                "status_counts": dependency_edge_status_counts,
+                "predicate_counts": dependency_edge_predicate_counts,
+                "unknown_status_edges": unknown_dependency_status_edges,
+                "unknown_predicate_edges": unknown_dependency_predicate_edges,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.referential_integrity",
+            if dependency_edges_missing_dependent.is_empty()
+                && dependency_edges_missing_task_prerequisite.is_empty()
+            {
+                "aligned"
+            } else {
+                "violation"
+            },
+            if dependency_edges_missing_dependent.is_empty()
+                && dependency_edges_missing_task_prerequisite.is_empty()
+            {
+                "Dependency graph edges point at existing dependent tasks and task prerequisites."
+            } else {
+                "At least one dependency edge points at a missing dependent task or task prerequisite."
+            },
+            json!({
+                "missing_dependent_edges": dependency_edges_missing_dependent,
+                "missing_task_prerequisite_edges": dependency_edges_missing_task_prerequisite,
+                "missing_patch_prerequisite_edges": dependency_edges_missing_patch_prerequisite,
+                "missing_artifact_prerequisite_edges": dependency_edges_missing_artifact_prerequisite,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.blocking_status_alignment",
+            if dependency_blocking_unblocked_tasks.is_empty() {
+                "aligned"
+            } else {
+                "violation"
+            },
+            if dependency_blocking_unblocked_tasks.is_empty() {
+                "Required blocking dependency edges align with blocked or terminal task states."
+            } else {
+                "Some tasks have required blocking dependency edges but are not marked blocked or terminal."
+            },
+            json!({
+                "blocking_edge_count": blocking_dependency_edge_count,
+                "blocking_unblocked_tasks": dependency_blocking_unblocked_tasks,
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.audit_events",
+            if dependency_edges.is_empty() || !dependency_events.is_empty() {
+                "aligned"
+            } else {
+                "warning"
+            },
+            if dependency_edges.is_empty() {
+                "No dependency graph edges have been recorded yet."
+            } else if !dependency_events.is_empty() {
+                "Dependency graph transitions are mirrored into append-only kernel events and JSONL alignment checks."
+            } else {
+                "Dependency graph edges exist, but no dependency graph transition events were found."
+            },
+            json!({
+                "edge_count": dependency_edges.len(),
+                "event_count": dependency_events.len(),
+                "recent_events": dependency_events.iter().take(20).cloned().collect::<Vec<_>>(),
+            }),
+        );
+        record_alignment_check(
+            &self.paths.repo_path,
+            &mut checks,
+            context,
+            "dependency_graph.legacy_projection",
+            if dependency_legacy_rows_missing_edges.is_empty() {
+                "aligned"
+            } else {
+                "warning"
+            },
+            if dependency_legacy_rows_missing_edges.is_empty() {
+                "Legacy task dependency rows have predicate-edge coverage or no legacy rows need mirroring."
+            } else {
+                "Some legacy task dependency rows do not yet have predicate-edge mirrors; run dependency reevaluation or recreate blockers through the graph path."
+            },
+            json!({
+                "legacy_dependency_count": task_dependencies.len(),
+                "legacy_rows_missing_predicate_edges": dependency_legacy_rows_missing_edges,
+            }),
+        );
+        let dependency_graph_warning_count = checks
+            .iter()
+            .filter(|check| {
+                check["check"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("dependency_graph."))
+                    && check["status"].as_str() == Some("warning")
+            })
+            .count();
+        let dependency_graph_violation_count = checks
+            .iter()
+            .filter(|check| {
+                check["check"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("dependency_graph."))
+                    && check["status"].as_str() == Some("violation")
+            })
+            .count();
+        let dependency_graph_alignment_status = if dependency_graph_violation_count > 0 {
+            "violation"
+        } else if dependency_graph_warning_count > 0 {
+            "warning"
+        } else {
+            "aligned"
+        };
+        self.write_alignment_lifecycle_log(
+            context,
+            "dependency_graph.alignment_checked",
+            dependency_graph_alignment_status,
+            "Dependency graph alignment checks completed for predicate edges, MCP tools, event logging, and task blocking state.",
+            json!({
+                "edge_count": dependency_edges.len(),
+                "blocking_edge_count": blocking_dependency_edge_count,
+                "dependency_event_count": dependency_events.len(),
+                "warning_count": dependency_graph_warning_count,
+                "violation_count": dependency_graph_violation_count,
             }),
         );
         let latest_mcp_health = mcp_health_events.first();
@@ -11015,6 +11574,10 @@ impl CoordinationKernel {
                 "workspace_change_count": workspace_changes.len(),
                 "open_workspace_violation_count": open_violations.len(),
                 "task_dependency_count": task_dependencies.len(),
+                "dependency_edge_count": dependency_edges.len(),
+                "blocking_dependency_edge_count": blocking_dependency_edge_count,
+                "dependency_event_count": dependency_events.len(),
+                "dependency_graph_alignment_status": dependency_graph_alignment_status,
                 "approval_count": approvals.len(),
                 "approval_gate_log_count": approval_gate_logs.len(),
                 "db_change_request_count": db_change_requests.len(),
@@ -11064,6 +11627,12 @@ impl CoordinationKernel {
                 "generated_at": now_rfc3339(),
                 "repo_path": process_path_text(&self.paths.repo_path),
                 "log": alignment::log_metadata(&self.paths.repo_path),
+                "dependency_graph": {
+                    "status": dependency_graph_alignment_status,
+                    "edge_count": dependency_edges.len(),
+                    "blocking_edge_count": blocking_dependency_edge_count,
+                    "event_count": dependency_events.len(),
+                },
             },
             "checks": checks,
             "policy": policy,
@@ -11079,6 +11648,8 @@ impl CoordinationKernel {
             "workspace_changes": workspace_changes,
             "open_workspace_violations": open_violations,
             "task_dependencies": task_dependencies,
+            "dependency_edges": dependency_edges,
+            "dependency_events": dependency_events,
             "approvals": approvals,
             "approval_gate_logs": approval_gate_logs,
             "db_change_requests": db_change_requests,
@@ -11661,7 +12232,8 @@ impl CoordinationKernel {
                             }),
                         )?;
                     } else {
-                        let refresh = self.refresh_agent_worktree_from_integration(&existing_path)?;
+                        let refresh =
+                            self.refresh_agent_worktree_from_integration(&existing_path)?;
                         self.conn
                             .execute(
                                 "UPDATE worktrees SET status='active', base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
@@ -11768,7 +12340,14 @@ impl CoordinationKernel {
             let args = if self.branch_exists(&branch)? {
                 vec!["worktree", "add", &path_string, &branch]
             } else {
-                vec!["worktree", "add", "-b", &branch, &path_string, INTEGRATION_BRANCH]
+                vec![
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    &path_string,
+                    INTEGRATION_BRANCH,
+                ]
             };
             if let Err(error) = run_git(&self.paths.repo_path, &args) {
                 self.emit_event(
@@ -11829,7 +12408,8 @@ impl CoordinationKernel {
             }
         }
         let canonical_worktree = path.canonicalize().unwrap_or(path);
-        let integration_refresh = self.refresh_agent_worktree_from_integration(&canonical_worktree)?;
+        let integration_refresh =
+            self.refresh_agent_worktree_from_integration(&canonical_worktree)?;
         let recorded_sha = integration_refresh["current_sha"]
             .as_str()
             .unwrap_or(base_sha.as_str())
@@ -12171,7 +12751,10 @@ impl CoordinationKernel {
         Ok(Value::Array(results))
     }
 
-    fn refresh_agent_worktree_from_integration(&self, worktree_path: &Path) -> Result<Value, String> {
+    fn refresh_agent_worktree_from_integration(
+        &self,
+        worktree_path: &Path,
+    ) -> Result<Value, String> {
         let dirty = self
             .changed_files(worktree_path)
             .map(|changes| {
@@ -12191,7 +12774,8 @@ impl CoordinationKernel {
         }
         match run_git(worktree_path, &["merge", "--ff-only", INTEGRATION_BRANCH]) {
             Ok(output) => {
-                let current_sha = run_git(worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
+                let current_sha =
+                    run_git(worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
                 Ok(json!({
                     "status": "refreshed",
                     "target_branch": INTEGRATION_BRANCH,
@@ -13017,11 +13601,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn codex_config_toml(
-    command: &str,
-    args: &[String],
-    cloud: Option<(&str, &[String])>,
-) -> String {
+fn codex_config_toml(command: &str, args: &[String], cloud: Option<(&str, &[String])>) -> String {
     let args = args
         .iter()
         .map(|arg| format!("\"{}\"", toml_escape(arg)))
@@ -13068,6 +13648,9 @@ const CODEX_AUTO_APPROVED_CLOUD_MCP_TOOLS: &[&str] = &[
     "cloud_get_context_pack",
     "cloud_get_merge_context_pack",
     "cloud_get_workspace_snapshot",
+    "cloud_get_feature_matrix",
+    "cloud_get_spec_node",
+    "cloud_record_spec_activity",
     "cloud_record_history_event",
     "cloud_get_history_ledger",
     "cloud_subtask_checkpoint",
@@ -13101,7 +13684,7 @@ fn diffforge_agent_contract_markdown() -> String {
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, but every app-launched coding agent must publish public coordination state through Cloud MCP so parallel agents can stay in their lanes.\n\n\
 ## Required Cloud MCP flow for every user task\n\n\
 1. Call `coordination-kernel.get_brief` to read the current local task_id, branch root, and peer state. Rust creates and claims the local task when the prompt is submitted.\n\
-2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Kanban task. Do not copy the raw user prompt as the title.\n\
+2. Call `cloud-diffforge.cloud_create_context_task` with an explicit agent-authored `title`, `body`, `status: \"active\"`, and lane for the visible Feature Matrix task. Do not copy the raw user prompt as the title.\n\
 3. Call `cloud-diffforge.cloud_get_context_pack` with the raw user prompt in `prompt` and your concise `work_summary` or `task_title` describing what you are about to do.\n\
 4. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Report blocked/parked to Cloud MCP, then stop; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 5. After each file-change subtask, call `cloud-diffforge.cloud_subtask_checkpoint` with a terse `subtask`, `brief`, and changed file paths. Do this before moving to the next subtask.\n\
@@ -13133,7 +13716,12 @@ fn write_or_update_generated_agent_contract(path: &Path, contract: &str) -> Resu
             return Ok(false);
         }
         let end_index = end + DIFFFORGE_AGENT_CONTRACT_END.len();
-        let next = format!("{}{}{}", &existing[..start], contract, &existing[end_index..]);
+        let next = format!(
+            "{}{}{}",
+            &existing[..start],
+            contract,
+            &existing[end_index..]
+        );
         if next == existing {
             return Ok(false);
         }
@@ -13160,8 +13748,12 @@ fn ensure_git_info_exclude_entries(root: &Path, additions: &[&str]) -> Result<()
         }
     };
     if let Some(parent) = exclude_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create git exclude directory {}: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create git exclude directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     let missing = additions
@@ -13178,7 +13770,8 @@ fn ensure_git_info_exclude_entries(root: &Path, additions: &[&str]) -> Result<()
         .open(&exclude_path)
         .map_err(|error| format!("Unable to open {}: {error}", exclude_path.display()))?;
     if !existing.ends_with('\n') && !existing.is_empty() {
-        writeln!(file).map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
+        writeln!(file)
+            .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
     }
     writeln!(file, "# Diff Forge generated agent instruction files")
         .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
@@ -13501,6 +14094,19 @@ fn require_workspace_objective_key(workspace_id: Option<&str>) -> Result<String,
 
 fn value_i64(value: &Value, key: &str) -> i64 {
     value[key].as_i64().unwrap_or(0)
+}
+
+fn json_counts_by_field(items: &[Value], field: &str) -> Value {
+    let mut counts = BTreeMap::<String, i64>::new();
+    for item in items {
+        let key = item[field]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("missing")
+            .to_string();
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    json!(counts)
 }
 
 fn same_path_text(left: &str, right: &str) -> bool {
@@ -13891,12 +14497,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|check| check["check"].as_str() == Some("policy.worktree_required")));
+        assert!(report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["check"].as_str() == Some("dependency_graph.edge_schema")));
+        assert_eq!(
+            report["data"]["summary"]["dependency_graph"]["status"].as_str(),
+            Some("aligned")
+        );
         if alignment::is_enabled() {
             let log_path =
                 PathBuf::from(report["data"]["summary"]["log"]["path"].as_str().unwrap());
             assert!(log_path.exists());
             let log = fs::read_to_string(log_path).unwrap();
             assert!(log.contains("\"event\":\"alignment.report_generated\""));
+            assert!(log.contains("\"event\":\"dependency_graph.alignment_checked\""));
         }
     }
 
@@ -14671,6 +15287,168 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session["status"].as_str(), Some("interrupted"));
+        assert_eq!(lease["status"].as_str(), Some("expired"));
+    }
+
+    #[test]
+    fn crash_recovery_suppresses_modal_for_idle_claimed_tasks_without_leases() {
+        let repo = init_git_repo("crash_recovery_idle_claimed_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Idle claimed task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        let report = kernel.recover_crashed_terminal_sessions().unwrap();
+
+        assert_eq!(report["interruptedTasks"].as_array().unwrap().len(), 0);
+        assert_eq!(report["idleSessionsInterrupted"].as_u64(), Some(1));
+        let session = kernel
+            .query_one(
+                "SELECT status FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&task_id],
+                "missing task",
+            )
+            .unwrap();
+        assert_eq!(session["status"].as_str(), Some("interrupted"));
+        assert_eq!(task["status"].as_str(), Some("claimed"));
+    }
+
+    #[test]
+    fn crash_recovery_reports_claimed_tasks_with_active_leases() {
+        let repo = init_git_repo("crash_recovery_active_lease_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Active lease task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        let lease = kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/a.js",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        let lease_id = lease["data"]["lease_id"].as_str().unwrap().to_string();
+
+        let report = kernel.recover_crashed_terminal_sessions().unwrap();
+
+        let interrupted_tasks = report["interruptedTasks"].as_array().unwrap();
+        assert_eq!(interrupted_tasks.len(), 1);
+        assert_eq!(interrupted_tasks[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(interrupted_tasks[0]["activeLeaseCount"].as_i64(), Some(1));
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&task_id],
+                "missing task",
+            )
+            .unwrap();
+        let lease = kernel
+            .query_one(
+                "SELECT status FROM leases WHERE id=?1",
+                &[&lease_id],
+                "missing lease",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("interrupted"));
+        assert_eq!(lease["status"].as_str(), Some("expired"));
+    }
+
+    #[test]
+    fn crash_recovery_reports_startup_cleared_leases_as_active_work() {
+        let repo = init_git_repo("crash_recovery_startup_cleared_lease_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task(
+                "Startup-cleared lease task",
+                None,
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        let lease = kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/startup.js",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        let lease_id = lease["data"]["lease_id"].as_str().unwrap().to_string();
+
+        kernel
+            .reset_active_leases_for_startup("kernel_process_start")
+            .unwrap();
+        let report = kernel.recover_crashed_terminal_sessions().unwrap();
+
+        let interrupted_tasks = report["interruptedTasks"].as_array().unwrap();
+        assert_eq!(interrupted_tasks.len(), 1);
+        assert_eq!(interrupted_tasks[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(interrupted_tasks[0]["activeLeaseCount"].as_i64(), Some(0));
+        assert_eq!(
+            interrupted_tasks[0]["startupClearedLeaseCount"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            interrupted_tasks[0]["activeWorkSignalCount"].as_i64(),
+            Some(1)
+        );
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&task_id],
+                "missing task",
+            )
+            .unwrap();
+        let lease = kernel
+            .query_one(
+                "SELECT status FROM leases WHERE id=?1",
+                &[&lease_id],
+                "missing lease",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("interrupted"));
         assert_eq!(lease["status"].as_str(), Some("expired"));
     }
 

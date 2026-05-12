@@ -3,6 +3,7 @@ pub mod cloud_context;
 pub mod cloud_mock;
 pub mod cloud_redaction;
 pub mod db;
+pub mod dependency_graph;
 pub mod events;
 pub mod kernel;
 pub mod mcp;

@@ -108,6 +108,7 @@ const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
 const WHISPER_MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
+static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
 const WHISPER_RUNTIME_PACKAGE_NAME: &str = "whisper.cpp v1.8.4 x64";
@@ -1052,6 +1053,48 @@ include!("api.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
 
+fn install_app_panic_log_hook() {
+    APP_PANIC_LOG_HOOK_INSTALLED.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let payload = panic_info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_string())
+                .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            let location = panic_info.location().map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            });
+            let thread = thread::current();
+            let thread_name = thread.name().unwrap_or("unnamed").to_string();
+            let thread_id = format!("{:?}", thread.id());
+            let fields = json!({
+                "app_pid": std::process::id(),
+                "location": location,
+                "payload": clean_terminal_telemetry_text(&payload),
+                "thread_id": thread_id,
+                "thread_name": clean_terminal_telemetry_text(&thread_name),
+            });
+
+            log_terminal_event(
+                "app.panic",
+                None,
+                None,
+                None,
+                fields.clone(),
+            );
+            log_audio_diagnostic_event("app.panic", fields);
+            previous_hook(panic_info);
+        }));
+    });
+}
+
 #[tauri::command]
 fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -1253,6 +1296,8 @@ fn restore_main_window_after_reopen(app: AppHandle, has_visible_windows: bool) {
 }
 
 pub fn run() {
+    install_app_panic_log_hook();
+
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
 
@@ -1262,6 +1307,13 @@ pub fn run() {
         None,
         None,
         json!({ "app_pid": std::process::id() }),
+    );
+    log_audio_diagnostic_event(
+        "audio.debug.process_start",
+        json!({
+            "app_pid": std::process::id(),
+            "log_file": whisper_local_audio_log_path().display().to_string(),
+        }),
     );
 
     #[cfg(desktop)]

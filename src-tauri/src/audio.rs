@@ -60,6 +60,25 @@ fn log_whisper_local_audio_event(phase: &str, elapsed: Option<Duration>, fields:
     }));
 }
 
+fn audio_debug_thread_label() -> String {
+    let current_thread = thread::current();
+    let name = current_thread.name().unwrap_or("unnamed");
+
+    format!("{:?}:{name}", current_thread.id())
+}
+
+fn log_audio_diagnostic_event(phase: &str, fields: Value) {
+    log_whisper_local_audio_event(
+        phase,
+        None,
+        json!({
+            "app_pid": std::process::id(),
+            "thread": audio_debug_thread_label(),
+            "fields": fields,
+        }),
+    );
+}
+
 struct WhisperCliWarmCacheState {
     model_bytes: u64,
     model_path: Option<PathBuf>,
@@ -2273,11 +2292,33 @@ fn transcribe_whisper_audio_for(
 }
 
 fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    log_audio_diagnostic_event(
+        "audio.widget.ensure.start",
+        json!({
+            "label": AUDIO_WIDGET_WINDOW_LABEL,
+        }),
+    );
+
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+        let visible = window.is_visible().ok();
+        log_audio_diagnostic_event(
+            "audio.widget.ensure.existing",
+            json!({
+                "label": AUDIO_WIDGET_WINDOW_LABEL,
+                "visible": visible,
+            }),
+        );
         return Ok(window);
     }
 
-    let window = WebviewWindowBuilder::new(
+    log_audio_diagnostic_event(
+        "audio.widget.ensure.create_start",
+        json!({
+            "label": AUDIO_WIDGET_WINDOW_LABEL,
+        }),
+    );
+
+    let window = match WebviewWindowBuilder::new(
         app,
         AUDIO_WIDGET_WINDOW_LABEL,
         WebviewUrl::App("index.html#/audio-widget".into()),
@@ -2295,12 +2336,54 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     .visible(false)
     .shadow(false)
     .build()
-    .map_err(|error| format!("Unable to create audio widget: {error}"))?;
-    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    {
+        Ok(window) => {
+            log_audio_diagnostic_event(
+                "audio.widget.ensure.create_done",
+                json!({
+                    "label": AUDIO_WIDGET_WINDOW_LABEL,
+                }),
+            );
+            window
+        }
+        Err(error) => {
+            let message = format!("Unable to create audio widget: {error}");
+            log_audio_diagnostic_event(
+                "audio.widget.ensure.create_error",
+                json!({
+                    "label": AUDIO_WIDGET_WINDOW_LABEL,
+                    "error": clean_whisper_local_audio_log_text(&message),
+                }),
+            );
+            return Err(message);
+        }
+    };
+
+    match window.set_background_color(Some(Color(0, 0, 0, 0))) {
+        Ok(()) => log_audio_diagnostic_event(
+            "audio.widget.ensure.background_done",
+            json!({
+                "label": AUDIO_WIDGET_WINDOW_LABEL,
+            }),
+        ),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.widget.ensure.background_error",
+            json!({
+                "label": AUDIO_WIDGET_WINDOW_LABEL,
+                "error": clean_whisper_local_audio_log_text(&error.to_string()),
+            }),
+        ),
+    }
 
     let app_handle = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
+            log_audio_diagnostic_event(
+                "audio.widget.window.destroyed",
+                json!({
+                    "label": AUDIO_WIDGET_WINDOW_LABEL,
+                }),
+            );
             emit_audio_widget_current_visibility(&app_handle, false);
         }
     });
@@ -2308,46 +2391,252 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     Ok(window)
 }
 
+fn run_audio_widget_action_on_main_thread<T, F>(
+    app: &AppHandle,
+    action_name: &'static str,
+    action: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
+{
+    let started_at = Instant::now();
+    let app_for_task = app.clone();
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+
+    log_audio_diagnostic_event(
+        "audio.widget.main_thread.schedule",
+        json!({
+            "action": action_name,
+        }),
+    );
+
+    app.run_on_main_thread(move || {
+        log_audio_diagnostic_event(
+            "audio.widget.main_thread.action_start",
+            json!({
+                "action": action_name,
+            }),
+        );
+        let result = action(&app_for_task);
+        match &result {
+            Ok(_) => log_audio_diagnostic_event(
+                "audio.widget.main_thread.action_done",
+                json!({
+                    "action": action_name,
+                }),
+            ),
+            Err(error) => log_audio_diagnostic_event(
+                "audio.widget.main_thread.action_error",
+                json!({
+                    "action": action_name,
+                    "error": clean_whisper_local_audio_log_text(error),
+                }),
+            ),
+        }
+        let _ = response_tx.send(result);
+    })
+    .map_err(|error| {
+        let message = format!("Unable to schedule audio widget action: {error}");
+        log_audio_diagnostic_event(
+            "audio.widget.main_thread.schedule_error",
+            json!({
+                "action": action_name,
+                "error": clean_whisper_local_audio_log_text(&message),
+            }),
+        );
+        message
+    })?;
+
+    log_audio_diagnostic_event(
+        "audio.widget.main_thread.wait_start",
+        json!({
+            "action": action_name,
+        }),
+    );
+
+    let result = response_rx.recv().map_err(|_| {
+        let message = "Audio widget action did not complete.".to_string();
+        log_audio_diagnostic_event(
+            "audio.widget.main_thread.wait_error",
+            json!({
+                "action": action_name,
+                "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
+                "error": clean_whisper_local_audio_log_text(&message),
+            }),
+        );
+        message
+    })?;
+
+    log_audio_diagnostic_event(
+        "audio.widget.main_thread.wait_done",
+        json!({
+            "action": action_name,
+            "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
+            "ok": result.is_ok(),
+        }),
+    );
+
+    result
+}
+
+fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Result<(), String> {
+    log_audio_diagnostic_event(
+        "audio.widget.show_window.request",
+        json!({
+            "focus": focus,
+        }),
+    );
+
+    run_audio_widget_action_on_main_thread(app, "show", move |app| {
+        let window = ensure_audio_widget_window(app)?;
+        window
+            .show()
+            .map_err(|error| format!("Unable to show audio widget: {error}"))?;
+
+        if focus {
+            let _ = window.set_focus();
+        }
+
+        Ok(())
+    })
+}
+
+fn hide_audio_widget_window_on_main_thread(app: &AppHandle) -> Result<(), String> {
+    log_audio_diagnostic_event("audio.widget.hide_window.request", json!({}));
+
+    run_audio_widget_action_on_main_thread(app, "hide", |app| {
+        if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+            window
+                .hide()
+                .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
+        }
+
+        Ok(())
+    })
+}
+
+fn audio_widget_visible_on_main_thread(app: &AppHandle) -> Result<bool, String> {
+    log_audio_diagnostic_event("audio.widget.visible.request", json!({}));
+
+    run_audio_widget_action_on_main_thread(app, "visible", |app| {
+        let visible = app
+            .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        log_audio_diagnostic_event(
+            "audio.widget.visible.result",
+            json!({
+                "visible": visible,
+            }),
+        );
+        Ok(visible)
+    })
+}
+
 fn audio_widget_visibility_for(
     app: &AppHandle,
     visible: bool,
 ) -> Result<AudioWidgetVisibility, String> {
+    log_audio_diagnostic_event(
+        "audio.widget.visibility.status_start",
+        json!({
+            "visible": visible,
+        }),
+    );
     let status = whisper_model_status_for(app)?;
 
-    Ok(AudioWidgetVisibility {
+    let visibility = AudioWidgetVisibility {
         visible,
         installed: status.installed,
         shortcut: status.shortcut,
-    })
+    };
+    log_audio_diagnostic_event(
+        "audio.widget.visibility.status_done",
+        json!({
+            "visible": visibility.visible,
+            "installed": visibility.installed,
+            "shortcut": visibility.shortcut,
+        }),
+    );
+    Ok(visibility)
 }
 
 fn audio_widget_status_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
-    let visible = app
-        .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false);
+    log_audio_diagnostic_event("audio.widget.status.start", json!({}));
+    let visible = audio_widget_visible_on_main_thread(app)?;
 
-    audio_widget_visibility_for(app, visible)
+    let visibility = audio_widget_visibility_for(app, visible)?;
+    log_audio_diagnostic_event(
+        "audio.widget.status.done",
+        json!({
+            "visible": visibility.visible,
+            "installed": visibility.installed,
+            "shortcut": visibility.shortcut,
+        }),
+    );
+    Ok(visibility)
 }
 
 fn emit_audio_widget_visibility_changed(app: &AppHandle, visibility: &AudioWidgetVisibility) {
-    let _ = app.emit(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, visibility.clone());
+    match app.emit(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, visibility.clone()) {
+        Ok(()) => log_audio_diagnostic_event(
+            "audio.widget.visibility.emit_done",
+            json!({
+                "visible": visibility.visible,
+                "installed": visibility.installed,
+                "shortcut": visibility.shortcut,
+            }),
+        ),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.widget.visibility.emit_error",
+            json!({
+                "visible": visibility.visible,
+                "installed": visibility.installed,
+                "shortcut": visibility.shortcut,
+                "error": clean_whisper_local_audio_log_text(&error.to_string()),
+            }),
+        ),
+    }
 }
 
 fn emit_audio_widget_current_visibility(app: &AppHandle, visible: bool) {
-    if let Ok(visibility) = audio_widget_visibility_for(app, visible) {
-        emit_audio_widget_visibility_changed(app, &visibility);
+    match audio_widget_visibility_for(app, visible) {
+        Ok(visibility) => emit_audio_widget_visibility_changed(app, &visibility),
+        Err(error) => log_audio_diagnostic_event(
+            "audio.widget.visibility.current_error",
+            json!({
+                "visible": visible,
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        ),
     }
 }
 
 fn show_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
-    let status = whisper_model_status_for(app)?;
+    log_audio_diagnostic_event("audio.widget.show.start", json!({}));
+    let status = match whisper_model_status_for(app) {
+        Ok(status) => status,
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.widget.show.status_error",
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+    };
 
-    let window = ensure_audio_widget_window(app)?;
-    window
-        .show()
-        .map_err(|error| format!("Unable to show audio widget: {error}"))?;
-    let _ = window.set_focus();
+    if let Err(error) = show_audio_widget_window_on_main_thread(app, true) {
+        log_audio_diagnostic_event(
+            "audio.widget.show.window_error",
+            json!({
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        );
+        return Err(error);
+    }
 
     let visibility = AudioWidgetVisibility {
         visible: true,
@@ -2355,26 +2644,53 @@ fn show_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Strin
         shortcut: audio_push_to_talk_shortcut_for(app),
     };
     emit_audio_widget_visibility_changed(app, &visibility);
+    log_audio_diagnostic_event(
+        "audio.widget.show.done",
+        json!({
+            "visible": visibility.visible,
+            "installed": visibility.installed,
+            "shortcut": visibility.shortcut,
+        }),
+    );
     Ok(visibility)
 }
 
 fn hide_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
-    if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
-        window
-            .hide()
-            .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
+    log_audio_diagnostic_event("audio.widget.hide.start", json!({}));
+    if let Err(error) = hide_audio_widget_window_on_main_thread(app) {
+        log_audio_diagnostic_event(
+            "audio.widget.hide.window_error",
+            json!({
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        );
+        return Err(error);
     }
 
     let visibility = audio_widget_visibility_for(app, false)?;
     emit_audio_widget_visibility_changed(app, &visibility);
+    log_audio_diagnostic_event(
+        "audio.widget.hide.done",
+        json!({
+            "visible": visibility.visible,
+            "installed": visibility.installed,
+            "shortcut": visibility.shortcut,
+        }),
+    );
     Ok(visibility)
 }
 
 fn toggle_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, String> {
-    if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
-        if window.is_visible().unwrap_or(false) {
-            return hide_audio_widget_for(app);
-        }
+    log_audio_diagnostic_event("audio.widget.toggle.start", json!({}));
+    let visible = audio_widget_visible_on_main_thread(app)?;
+    log_audio_diagnostic_event(
+        "audio.widget.toggle.visible",
+        json!({
+            "visible": visible,
+        }),
+    );
+    if visible {
+        return hide_audio_widget_for(app);
     }
 
     show_audio_widget_for(app)
@@ -2837,6 +3153,13 @@ async fn start_deepgram_realtime_transcription(
     audio_state: State<'_, AudioState>,
     request: DeepgramRealtimeStartRequest,
 ) -> Result<DeepgramRealtimeStartStatus, String> {
+    log_audio_diagnostic_event(
+        "audio.deepgram.start.command",
+        json!({
+            "language": request.language.clone(),
+            "has_api_key": !request.api_key.trim().is_empty(),
+        }),
+    );
     let api_key = clean_deepgram_api_key(&request.api_key)?;
     let language = clean_deepgram_language(request.language)?;
     let mut session_guard = audio_state.deepgram_stream.lock().await;
@@ -2878,6 +3201,14 @@ async fn start_deepgram_realtime_transcription(
 
     *session_guard = Some(DeepgramRealtimeSession { finished_rx });
 
+    log_audio_diagnostic_event(
+        "audio.deepgram.start.done",
+        json!({
+            "language": language,
+            "sample_rate": status.sample_rate,
+        }),
+    );
+
     Ok(DeepgramRealtimeStartStatus {
         active: true,
         language,
@@ -2890,11 +3221,13 @@ async fn start_deepgram_realtime_transcription(
 async fn stop_deepgram_realtime_transcription(
     audio_state: State<'_, AudioState>,
 ) -> Result<WhisperTranscriptionResult, String> {
+    log_audio_diagnostic_event("audio.deepgram.stop.command", json!({}));
     let session = {
         let mut session_guard = audio_state.deepgram_stream.lock().await;
         session_guard.take()
     };
     let Some(session) = session else {
+        log_audio_diagnostic_event("audio.deepgram.stop.inactive", json!({}));
         return Ok(WhisperTranscriptionResult {
             text: String::new(),
             segments: 0,
@@ -2904,17 +3237,27 @@ async fn stop_deepgram_realtime_transcription(
 
     audio_state.input_worker.detach_realtime_stream()?;
 
-    timeout(
+    let result = timeout(
         Duration::from_secs(DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS),
         session.finished_rx,
     )
     .await
     .map_err(|_| "Deepgram realtime transcription timed out.".to_string())?
-    .map_err(|_| "Deepgram realtime transcription stopped before a result was returned.".to_string())?
+    .map_err(|_| "Deepgram realtime transcription stopped before a result was returned.".to_string())?;
+    log_audio_diagnostic_event(
+        "audio.deepgram.stop.done",
+        json!({
+            "text_chars": result.text.chars().count(),
+            "segments": result.segments,
+            "duration_ms": result.duration_ms,
+        }),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
 async fn audio_widget_status(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
+    log_audio_diagnostic_event("audio.widget.status.command", json!({}));
     audio_widget_status_for(&app)
 }
 
@@ -2923,13 +3266,29 @@ async fn show_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
 ) -> Result<AudioWidgetVisibility, String> {
+    log_audio_diagnostic_event("audio.widget.show.command", json!({}));
     let visibility = show_audio_widget_for(&app)?;
     let prepare_app = app.clone();
     let engine = audio_state.whisper_engine.clone();
 
     if visibility.installed {
+        log_audio_diagnostic_event("audio.widget.show.prepare_spawn", json!({}));
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            let _ = prepare_whisper_model_for(&prepare_app, &engine);
+            match prepare_whisper_model_for(&prepare_app, &engine) {
+                Ok(status) => log_audio_diagnostic_event(
+                    "audio.widget.show.prepare_done",
+                    json!({
+                        "cached": status.cached,
+                        "elapsed_ms": status.elapsed_ms,
+                    }),
+                ),
+                Err(error) => log_audio_diagnostic_event(
+                    "audio.widget.show.prepare_error",
+                    json!({
+                        "error": clean_whisper_local_audio_log_text(&error),
+                    }),
+                ),
+            }
         });
     }
 
@@ -2938,6 +3297,7 @@ async fn show_audio_widget(
 
 #[tauri::command]
 async fn hide_audio_widget(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
+    log_audio_diagnostic_event("audio.widget.hide.command", json!({}));
     hide_audio_widget_for(&app)
 }
 
@@ -2946,13 +3306,29 @@ async fn toggle_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
 ) -> Result<AudioWidgetVisibility, String> {
+    log_audio_diagnostic_event("audio.widget.toggle.command", json!({}));
     let visibility = toggle_audio_widget_for(&app)?;
 
     if visibility.visible && visibility.installed {
         let prepare_app = app.clone();
         let engine = audio_state.whisper_engine.clone();
+        log_audio_diagnostic_event("audio.widget.toggle.prepare_spawn", json!({}));
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            let _ = prepare_whisper_model_for(&prepare_app, &engine);
+            match prepare_whisper_model_for(&prepare_app, &engine) {
+                Ok(status) => log_audio_diagnostic_event(
+                    "audio.widget.toggle.prepare_done",
+                    json!({
+                        "cached": status.cached,
+                        "elapsed_ms": status.elapsed_ms,
+                    }),
+                ),
+                Err(error) => log_audio_diagnostic_event(
+                    "audio.widget.toggle.prepare_error",
+                    json!({
+                        "error": clean_whisper_local_audio_log_text(&error),
+                    }),
+                ),
+            }
         });
     }
 

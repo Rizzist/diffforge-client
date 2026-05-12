@@ -628,7 +628,6 @@ pub fn coordination_resolve_approval(
     ))
 }
 
-
 #[tauri::command]
 pub fn coordination_scan_workspace_violations(
     repo_path: Option<String>,

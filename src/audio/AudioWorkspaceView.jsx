@@ -369,6 +369,18 @@ const AUDIO_MODIFIER_CODES = new Set([
   "ShiftLeft",
   "ShiftRight",
 ]);
+
+function writeAudioWidgetTelemetry(phase, fields = {}) {
+  writeTerminalTelemetry({
+    phase,
+    fields: {
+      route: typeof window !== "undefined" ? window.location.hash : "",
+      surface: "audio-widget",
+      ...fields,
+    },
+  });
+}
+
 function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
 }

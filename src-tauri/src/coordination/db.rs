@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use super::schema::{
     APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME, APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION,
-    CREATE_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION, MIGRATION_NAME,
+    CREATE_SCHEMA_SQL, DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
+    DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION, MIGRATION_NAME,
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
 };
@@ -296,6 +297,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
             MIGRATION_NAME,
         )?);
     }
+    diagnostics.push(apply_dependency_graph_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -413,6 +415,34 @@ fn interrupt_duplicate_active_sessions_for_guard_indexes(
             )
         })?;
     Ok((interrupted_slots, interrupted_ptys))
+}
+
+fn apply_dependency_graph_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, DEPENDENCY_GRAPH_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            DEPENDENCY_GRAPH_MIGRATION_VERSION,
+            DEPENDENCY_GRAPH_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry(
+        "Unable to initialize predicate dependency graph schema",
+        || connection.execute_batch(DEPENDENCY_GRAPH_SCHEMA_SQL),
+    )?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        DEPENDENCY_GRAPH_MIGRATION_VERSION,
+        DEPENDENCY_GRAPH_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        ["DEPENDENCY_GRAPH_SCHEMA_SQL executed idempotently".to_string()],
+    );
+    Ok(migration)
 }
 
 fn migration_applied(connection: &Connection, version: i64) -> Result<bool, String> {

@@ -19,6 +19,12 @@ pub const TOOL_NAMES: &[&str] = &[
     "acquire_lease",
     "renew_lease",
     "release_lease",
+    "create_dependency",
+    "list_dependencies",
+    "explain_blockers",
+    "reevaluate_dependencies",
+    "cancel_dependency",
+    "list_ready_tasks",
     "list_resources",
     "list_active_leases",
     "list_task_dependencies",
@@ -86,31 +92,51 @@ impl McpContext {
     }
 
     fn apply_env_defaults(&mut self) {
-        set_default_from_env(&mut self.repo_path, &["COORDINATION_REPO_PATH", "DIFFFORGE_REPO_PATH"]);
+        set_default_from_env(
+            &mut self.repo_path,
+            &["COORDINATION_REPO_PATH", "DIFFFORGE_REPO_PATH"],
+        );
         set_default_from_env(&mut self.db_path, &["COORDINATION_DB_PATH"]);
         set_default_from_env(
             &mut self.agent_id,
-            &["COORDINATION_AGENT_ID", "DIFFFORGE_AGENT_ID", "CLOUD_MCP_AGENT_ID"],
+            &[
+                "COORDINATION_AGENT_ID",
+                "DIFFFORGE_AGENT_ID",
+                "CLOUD_MCP_AGENT_ID",
+            ],
         );
         set_default_from_env(&mut self.agent_slot_id, &["COORDINATION_AGENT_SLOT_ID"]);
         set_default_from_env(&mut self.slot_key, &["COORDINATION_SLOT_KEY"]);
         set_default_from_env(
             &mut self.session_id,
-            &["COORDINATION_SESSION_ID", "DIFFFORGE_SESSION_ID", "CLOUD_MCP_SESSION_ID"],
+            &[
+                "COORDINATION_SESSION_ID",
+                "DIFFFORGE_SESSION_ID",
+                "CLOUD_MCP_SESSION_ID",
+            ],
         );
         set_default_from_env(&mut self.task_id, &["COORDINATION_TASK_ID"]);
         set_default_from_env(&mut self.worktree_id, &["COORDINATION_WORKTREE_ID"]);
         set_default_from_env(
             &mut self.worktree_path,
-            &["COORDINATION_WORKTREE_PATH", "COORDINATION_AGENT_BRANCH_ROOT"],
+            &[
+                "COORDINATION_WORKTREE_PATH",
+                "COORDINATION_AGENT_BRANCH_ROOT",
+            ],
         );
-        set_default_from_env(&mut self.workspace_id, &["COORDINATION_WORKSPACE_ID", "CLOUD_MCP_WORKSPACE_ID"]);
+        set_default_from_env(
+            &mut self.workspace_id,
+            &["COORDINATION_WORKSPACE_ID", "CLOUD_MCP_WORKSPACE_ID"],
+        );
         set_default_from_env(&mut self.objective_key, &["COORDINATION_OBJECTIVE_KEY"]);
     }
 }
 
 fn set_default_from_env(target: &mut Option<String>, keys: &[&str]) {
-    if target.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+    if target
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
         return;
     }
     for key in keys {
@@ -417,7 +443,11 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
     result
 }
 
-fn dispatch_tool_result(context: &McpContext, tool: &str, mut input: Value) -> Result<Value, String> {
+fn dispatch_tool_result(
+    context: &McpContext,
+    tool: &str,
+    mut input: Value,
+) -> Result<Value, String> {
     let Some(repo_path) = input["repo_path"].as_str().or(context.repo_path.as_deref()) else {
         return Ok(api_error(
             "missing_repo_path",
@@ -474,6 +504,23 @@ fn dispatch_tool_result(context: &McpContext, tool: &str, mut input: Value) -> R
             input["session_id"].as_str(),
             input["resource_key"].as_str(),
         ),
+        "create_dependency" => kernel.create_dependency(&input),
+        "list_dependencies" => kernel.list_dependencies(
+            input["task_id"].as_str(),
+            input["status"].as_str(),
+            input["include_satisfied"].as_bool().unwrap_or(true),
+        ),
+        "explain_blockers" => kernel.explain_blockers(req(&input, "task_id")?),
+        "reevaluate_dependencies" => kernel.reevaluate_dependencies(input["task_id"].as_str()),
+        "cancel_dependency" => kernel.cancel_dependency(
+            req(&input, "dependency_edge_id")?,
+            input["reason"].as_str(),
+            input["actor_type"].as_str(),
+            input["actor_id"]
+                .as_str()
+                .or_else(|| input["agent_id"].as_str()),
+        ),
+        "list_ready_tasks" => kernel.list_ready_tasks(input["limit"].as_i64()),
         "list_resources" => kernel.list_resources(
             input["resource_type"].as_str(),
             input["min_risk_level"].as_i64(),
@@ -665,7 +712,10 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
             .and_then(Value::as_str)
             .is_none_or(|value| value.trim().is_empty());
         if missing {
-            if let Some(value) = session[key].as_str().filter(|value| !value.trim().is_empty()) {
+            if let Some(value) = session[key]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
                 object.insert(key.to_string(), Value::String(value.to_string()));
             }
         }
@@ -678,6 +728,12 @@ fn tool_description(name: &str) -> String {
         "claim_task" => "Claim an already-created local coordination task by task_id. This does not create tasks.".to_string(),
         "acquire_lease" => "Acquire a lease for an already-created task. Use resource_key such as file:index.html, glob:src/**, route:GET /api/users, or db:table:users.".to_string(),
         "release_lease" => "Release a lease. Prefer resource_key; the current task/session/agent defaults are filled automatically. lease_id and fence_token also work.".to_string(),
+        "create_dependency" => "Create an explicit predicate dependency edge for a task. Deterministic predicates only; no semantic inference.".to_string(),
+        "list_dependencies" => "List explicit predicate dependency edges and current blockers.".to_string(),
+        "explain_blockers" => "Explain why a task is blocked by predicate dependency edges.".to_string(),
+        "reevaluate_dependencies" => "Recompute deterministic predicate dependency edge statuses.".to_string(),
+        "cancel_dependency" => "Cancel a predicate dependency edge while preserving audit history.".to_string(),
+        "list_ready_tasks" => "List ready tasks with no blocking predicate dependencies.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
     }
 }
@@ -717,6 +773,59 @@ fn tool_input_schema(name: &str) -> Value {
                 "resource_key": {"type": "string", "description": "Normalized resource key to release for the current task/session, for example file:index.html."},
                 "lease_id": {"type": "string", "description": "Optional explicit lease id."},
                 "fence_token": {"type": "integer", "description": "Optional fence token; resolved automatically when omitted for an active lease."}
+            },
+            "additionalProperties": true
+        }),
+        "create_dependency" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Dependent task id."},
+                "prerequisite_kind": {"type": "string", "enum": ["task", "resource", "patch", "artifact", "contract", "approval"]},
+                "prerequisite_key": {"type": "string", "description": "Stable prerequisite key, for example task:<id>, file:index.html, patch:<id>, artifact:<id>."},
+                "predicate_kind": {"type": "string", "enum": ["task_status_is", "patch_status_is", "lease_released", "resource_available", "artifact_exists", "contract_certified", "approval_granted"]},
+                "predicate_json": {"type": "object"},
+                "required": {"type": "boolean", "default": true}
+            },
+            "required": ["task_id", "prerequisite_kind", "prerequisite_key", "predicate_kind"],
+            "additionalProperties": true
+        }),
+        "list_dependencies" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "status": {"type": "string"},
+                "include_satisfied": {"type": "boolean", "default": true}
+            },
+            "additionalProperties": true
+        }),
+        "explain_blockers" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"}
+            },
+            "required": ["task_id"],
+            "additionalProperties": true
+        }),
+        "reevaluate_dependencies" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Optional task id; omit to reevaluate all dependency edges."}
+            },
+            "additionalProperties": true
+        }),
+        "cancel_dependency" => json!({
+            "type": "object",
+            "properties": {
+                "dependency_edge_id": {"type": "string"},
+                "reason": {"type": "string"}
+            },
+            "required": ["dependency_edge_id"],
+            "additionalProperties": true
+        }),
+        "list_ready_tasks" => json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 100}
             },
             "additionalProperties": true
         }),
