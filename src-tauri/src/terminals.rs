@@ -317,19 +317,6 @@ struct TerminalKillReport {
     child_kill_error: Option<String>,
 }
 
-impl TerminalKillReport {
-    fn to_json(&self) -> Value {
-        json!({
-            "pid": self.pid,
-            "taskkill_exit_code": self.taskkill_exit_code,
-            "taskkill_success": self.taskkill_success,
-            "taskkill_error": self.taskkill_error,
-            "child_kill_ok": self.child_kill_ok,
-            "child_kill_error": self.child_kill_error,
-        })
-    }
-}
-
 #[cfg(windows)]
 fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     let mut report = TerminalKillReport {
@@ -386,26 +373,16 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     report
 }
 
-fn interrupt_terminal_coordination_session(
-    coordination: &TerminalCoordinationSession,
-    pane_id: Option<&str>,
-    instance_id: Option<u64>,
-    reason: &str,
-) {
+fn interrupt_terminal_coordination_session(coordination: &TerminalCoordinationSession, reason: &str) {
     let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
     ) {
         Ok(kernel) => kernel,
-        Err(error) => {
-            return;
-        }
+        Err(_) => return,
     };
 
-    match kernel.interrupt_session(&coordination.session_id, reason) {
-        Ok(_) => {}
-        Err(error) => {}
-    }
+    let _ = kernel.interrupt_session(&coordination.session_id, reason);
 }
 
 fn terminal_coordination_session_from_context(
@@ -428,37 +405,20 @@ enum TerminalCoordinationCleanupMode {
     DeferToShutdownBatch,
 }
 
-impl TerminalCoordinationCleanupMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::InterruptAfterProcess => "interrupt_after_process",
-            Self::Preserve => "preserve",
-            Self::DeferToShutdownBatch => "defer_to_shutdown_batch",
-        }
-    }
-}
-
 #[derive(Clone)]
 struct TerminalShutdownCoordinationCleanup {
-    pane_id: String,
-    instance_id: u64,
     repo_path: String,
     db_path: String,
-    agent_id: String,
     session_id: String,
 }
 
 fn terminal_shutdown_coordination_cleanup_from_instance(
-    pane_id: &str,
     instance: &TerminalInstance,
 ) -> Option<TerminalShutdownCoordinationCleanup> {
     let coordination = instance.coordination.as_ref()?;
     Some(TerminalShutdownCoordinationCleanup {
-        pane_id: pane_id.to_string(),
-        instance_id: instance.id,
         repo_path: coordination.repo_path.clone(),
         db_path: coordination.db_path.clone(),
-        agent_id: coordination.agent_id.clone(),
         session_id: coordination.session_id.clone(),
     })
 }
@@ -467,54 +427,24 @@ fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
     cleanups: Vec<TerminalShutdownCoordinationCleanup>,
     reason: &'static str,
     timeout: Duration,
-) -> Value {
-    let total = cleanups.len();
-    if total == 0 {
-        return json!({
-            "completed": true,
-            "errors": 0,
-            "groups": 0,
-            "interrupted": 0,
-            "session_count": 0,
-            "timed_out": false,
-        });
+) {
+    if cleanups.is_empty() {
+        return;
     }
 
     let (summary_tx, summary_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        let summary = cleanup_terminal_shutdown_coordination_batch(cleanups, reason);
-        let _ = summary_tx.send(summary);
+        cleanup_terminal_shutdown_coordination_batch(cleanups, reason);
+        let _ = summary_tx.send(());
     });
 
-    match summary_rx.recv_timeout(timeout) {
-        Ok(summary) => summary,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            json!({
-                "completed": false,
-                "errors": 0,
-                "groups": null,
-                "interrupted": null,
-                "session_count": total,
-                "timed_out": true,
-            })
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            json!({
-                "completed": false,
-                "errors": total,
-                "groups": null,
-                "interrupted": 0,
-                "session_count": total,
-                "timed_out": false,
-            })
-        }
-    }
+    let _ = summary_rx.recv_timeout(timeout);
 }
 
 fn cleanup_terminal_shutdown_coordination_batch(
     cleanups: Vec<TerminalShutdownCoordinationCleanup>,
     reason: &'static str,
-) -> Value {
+) {
     let mut grouped: HashMap<(String, String), Vec<TerminalShutdownCoordinationCleanup>> =
         HashMap::new();
     for cleanup in cleanups {
@@ -523,12 +453,6 @@ fn cleanup_terminal_shutdown_coordination_batch(
             .or_default()
             .push(cleanup);
     }
-
-    let group_count = grouped.len();
-    let session_count = grouped.values().map(Vec::len).sum::<usize>();
-    let mut interrupted = 0usize;
-    let mut already_not_active = 0usize;
-    let mut errors = 0usize;
 
     for ((repo_path, db_path), group) in grouped {
         let session_ids = group
@@ -541,59 +465,15 @@ fn cleanup_terminal_shutdown_coordination_batch(
             Some(PathBuf::from(&db_path)),
         ) {
             Ok(kernel) => kernel,
-            Err(error) => {
-                errors += group.len();
-                for cleanup in group {}
-                continue;
-            }
+            Err(_) => continue,
         };
 
-        match kernel.interrupt_sessions_for_shutdown(&session_ids, reason) {
-            Ok(summary) => {
-                interrupted += summary["interrupted"].as_u64().unwrap_or(0) as usize;
-                already_not_active += summary["already_not_active"].as_u64().unwrap_or(0) as usize;
-                errors += summary["errors"].as_u64().unwrap_or(0) as usize;
-                let mut cleanups_by_session = group
-                    .into_iter()
-                    .map(|cleanup| (cleanup.session_id.clone(), cleanup))
-                    .collect::<HashMap<_, _>>();
-                if let Some(sessions) = summary["sessions"].as_array() {
-                    for session in sessions {
-                        let Some(session_id) = session["session_id"].as_str() else {
-                            continue;
-                        };
-                        let Some(cleanup) = cleanups_by_session.remove(session_id) else {
-                            continue;
-                        };
-                        if session["ok"].as_bool().unwrap_or(false) {
-                        } else {
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                errors += group.len();
-                for cleanup in group {}
-            }
-        }
+        let _ = kernel.interrupt_sessions_for_shutdown(&session_ids, reason);
     }
-
-    let summary = json!({
-        "already_not_active": already_not_active,
-        "completed": true,
-        "errors": errors,
-        "groups": group_count,
-        "interrupted": interrupted,
-        "session_count": session_count,
-        "timed_out": false,
-    });
-    summary
 }
 
 fn interrupt_terminal_coordination_after_process_cleanup(
     coordination: Option<&TerminalCoordinationSession>,
-    pane_id: Option<&str>,
-    instance_id: u64,
     reason: &'static str,
     coordination_cleanup_mode: TerminalCoordinationCleanupMode,
 ) {
@@ -608,7 +488,7 @@ fn interrupt_terminal_coordination_after_process_cleanup(
         return;
     };
 
-    interrupt_terminal_coordination_session(coordination, pane_id, Some(instance_id), reason);
+    interrupt_terminal_coordination_session(coordination, reason);
 }
 
 fn cleanup_terminal_instance_with_context(
@@ -653,35 +533,21 @@ fn cleanup_terminal_instance_with_context(
         drop(active_task);
         interrupt_terminal_coordination_after_process_cleanup(
             coordination.as_ref(),
-            pane_id.as_deref(),
-            instance_id,
             reason,
             coordination_cleanup_mode,
         );
         drop(coordination);
         return;
     };
-    let pid = child.process_id();
-    let mut initial_exit_observed = false;
-    let mut final_exit_observed;
-    let mut primary_kill = None;
-    let mut fallback_kill = None;
-
     if kill_first {
-        primary_kill = Some(kill_terminal_process_tree(child.as_mut()));
-    } else {
-        initial_exit_observed = poll_terminal_child_exit(child.as_mut());
-
-        if !initial_exit_observed {
-            primary_kill = Some(kill_terminal_process_tree(child.as_mut()));
-        }
+        kill_terminal_process_tree(child.as_mut());
+    } else if !poll_terminal_child_exit(child.as_mut()) {
+        kill_terminal_process_tree(child.as_mut());
     }
 
-    final_exit_observed = poll_terminal_child_exit(child.as_mut());
-
-    if !final_exit_observed {
-        fallback_kill = Some(kill_terminal_process_tree(child.as_mut()));
-        final_exit_observed = poll_terminal_child_exit(child.as_mut());
+    if !poll_terminal_child_exit(child.as_mut()) {
+        kill_terminal_process_tree(child.as_mut());
+        poll_terminal_child_exit(child.as_mut());
     }
 
     drop(child);
@@ -694,8 +560,6 @@ fn cleanup_terminal_instance_with_context(
     drop(active_task);
     interrupt_terminal_coordination_after_process_cleanup(
         coordination.as_ref(),
-        pane_id.as_deref(),
-        instance_id,
         reason,
         coordination_cleanup_mode,
     );
@@ -969,8 +833,6 @@ async fn prepare_terminal_coordination_launch(
                     let coordination = terminal_coordination_session_from_context(&context);
                     interrupt_terminal_coordination_session(
                         &coordination,
-                        Some(&log_pane_id),
-                        instance_id,
                         "coding_agent_requires_isolated_worktree",
                     );
                     let reason = if context.enforcement_mode == "coordination_only" {
@@ -1011,103 +873,6 @@ async fn prepare_terminal_coordination_launch(
     task_result
 }
 
-fn terminal_output_debug_fields(bytes: &[u8]) -> Value {
-    let text = String::from_utf8_lossy(bytes);
-    let display_text = terminal_output_display_text(&text);
-    let prefix_hex = bytes
-        .iter()
-        .take(24)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>();
-    let control_byte_hex = bytes
-        .iter()
-        .copied()
-        .filter(|byte| *byte < 32 || *byte == 127)
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>();
-    let printable_chars = display_text.chars().count();
-    let visible_chars = display_text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .count();
-    let safe_preview = display_text
-        .chars()
-        .take(120)
-        .collect::<String>()
-        .trim()
-        .to_string();
-
-    json!({
-        "bytes": bytes.len(),
-        "controlBytes": bytes.iter().filter(|byte| **byte < 32 || **byte == 127).count(),
-        "controlByteHex": control_byte_hex,
-        "escapeBytes": bytes.iter().filter(|byte| **byte == 0x1b).count(),
-        "hasEscape": bytes.iter().any(|byte| *byte == 0x1b),
-        "prefixHex": prefix_hex,
-        "printableChars": printable_chars,
-        "safePreview": clean_terminal_telemetry_text(&safe_preview),
-        "startsWithEscape": bytes.first().is_some_and(|byte| *byte == 0x1b),
-        "visibleChars": visible_chars,
-    })
-}
-
-fn terminal_output_display_text(text: &str) -> String {
-    let mut output = String::new();
-    let mut chars = text.chars().peekable();
-
-    while let Some(character) = chars.next() {
-        if character == '\u{1b}' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    while let Some(next) = chars.next() {
-                        let code = next as u32;
-                        if (0x40..=0x7e).contains(&code) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    let mut escape_pending = false;
-                    while let Some(next) = chars.next() {
-                        if escape_pending {
-                            if next == '\\' {
-                                break;
-                            }
-                            escape_pending = false;
-                        }
-                        if next == '\u{1b}' {
-                            escape_pending = true;
-                        } else if next == '\u{7}' {
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            }
-            continue;
-        }
-
-        if !character.is_control() {
-            output.push(character);
-        }
-    }
-
-    output
-}
-
-fn terminal_output_has_visible_text(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    terminal_output_display_text(&text)
-        .chars()
-        .any(|character| !character.is_whitespace())
-}
-
 fn spawn_terminal_reader(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -1123,17 +888,11 @@ fn spawn_terminal_reader(
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
         output_channel: &Channel<InvokeResponseBody>,
-        sent_frame_sequence: &mut usize,
-        flushed_chunks: &mut usize,
-        flushed_bytes: &mut usize,
-        frame_log_limit: usize,
-        reason: &str,
     ) -> bool {
         if chunk.is_empty() {
             return true;
         }
 
-        let bytes = chunk.len();
         let observer_state = cloud_mcp_state.clone();
         let observer_pane_id = pane_id.to_string();
         let observer_chunk = chunk.clone();
@@ -1147,49 +906,19 @@ fn spawn_terminal_reader(
             .await;
         });
 
-        *sent_frame_sequence += 1;
-        if *sent_frame_sequence <= frame_log_limit {}
-
-        if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
-            return false;
-        }
-
-        *flushed_chunks += 1;
-        *flushed_bytes += bytes;
-        true
+        output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
     }
 
     let reader_pane_id = pane_id.clone();
-    const FRAME_LOG_LIMIT: usize = 10;
 
     thread::spawn(move || {
         let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
-        let mut saw_first_output = false;
-        let mut saw_first_visible_output = false;
-        let mut read_frame_sequence = 0usize;
-        let mut sent_frame_sequence = 0usize;
-        let mut flushed_chunks = 0usize;
-        let mut flushed_bytes = 0usize;
-        let mut channel_failed = false;
 
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(bytes_read) => {
-                    read_frame_sequence += 1;
                     let chunk = &buffer[..bytes_read];
-                    let debug_fields = terminal_output_debug_fields(chunk);
-                    let has_visible_output = terminal_output_has_visible_text(chunk);
-
-                    if !saw_first_output {
-                        saw_first_output = true;
-                    }
-
-                    if has_visible_output && !saw_first_visible_output {
-                        saw_first_visible_output = true;
-                    }
-
-                    if read_frame_sequence <= FRAME_LOG_LIMIT {}
 
                     if !send_terminal_output_frame(
                         chunk.to_vec(),
@@ -1197,17 +926,11 @@ fn spawn_terminal_reader(
                         instance_id,
                         &cloud_mcp_state,
                         &output_channel,
-                        &mut sent_frame_sequence,
-                        &mut flushed_chunks,
-                        &mut flushed_bytes,
-                        FRAME_LOG_LIMIT,
-                        "reader_thread",
                     ) {
-                        channel_failed = true;
                         break;
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     break;
                 }
             }
@@ -1326,37 +1049,19 @@ async fn close_terminal_session(
         });
         if !wait_for_cleanup {
             tauri::async_runtime::spawn(async move {
-                let mut join_error = None;
-                let cleanup_finished = match tokio::time::timeout(
+                let _ = tokio::time::timeout(
                     Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS),
                     cleanup_task,
                 )
-                .await
-                {
-                    Ok(Ok(())) => true,
-                    Ok(Err(error)) => {
-                        join_error = Some(clean_terminal_telemetry_text(&error.to_string()));
-                        false
-                    }
-                    Err(_) => false,
-                };
+                .await;
             });
             return Ok(true);
         }
-        let mut join_error = None;
-        let cleanup_finished = match tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS),
             cleanup_task,
         )
-        .await
-        {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                join_error = Some(clean_terminal_telemetry_text(&error.to_string()));
-                false
-            }
-            Err(_) => false,
-        };
+        .await;
 
         return Ok(true);
     }
@@ -1382,9 +1087,7 @@ async fn close_all_terminal_sessions(
     let warm_total = warm_ptys.len();
     let coordination_cleanups = instances
         .iter()
-        .filter_map(|(pane_id, instance)| {
-            terminal_shutdown_coordination_cleanup_from_instance(pane_id, instance)
-        })
+        .filter_map(|(_, instance)| terminal_shutdown_coordination_cleanup_from_instance(instance))
         .collect::<Vec<_>>();
 
     let lifecycle_scheduled = instances

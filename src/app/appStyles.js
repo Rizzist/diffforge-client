@@ -2266,28 +2266,6 @@ export const XtermSurface = styled.div`
     height: 0 !important;
   }
 
-  &[data-scrollbar-platform="windows"] .xterm-viewport {
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-  }
-
-  &[data-scrollbar-platform="windows"] .xterm-viewport::-webkit-scrollbar {
-    display: none;
-    width: 0 !important;
-    height: 0 !important;
-  }
-
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar,
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-visible,
-  &[data-scrollbar-platform="windows"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-invisible {
-    display: none !important;
-    opacity: 0 !important;
-    pointer-events: none !important;
-  }
-
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
@@ -2324,40 +2302,6 @@ export const XtermSurface = styled.div`
     width: 3px !important;
     border-radius: 999px !important;
     background: rgba(172, 185, 207, 0.34) !important;
-  }
-`;
-
-export const TerminalScrollRail = styled.div`
-  position: absolute;
-  top: 48px;
-  right: 4px;
-  bottom: 8px;
-  z-index: 70;
-  width: 8px;
-  border-radius: 999px;
-  opacity: 1;
-  pointer-events: auto;
-  transition: opacity 150ms ease;
-`;
-
-export const TerminalScrollThumb = styled.div`
-  position: absolute;
-  top: 0;
-  right: 2px;
-  width: 4px;
-  min-height: 28px;
-  border-radius: 999px;
-  background: rgba(172, 185, 207, 0.62);
-  box-shadow: 0 0 12px rgba(172, 185, 207, 0.12);
-  transition:
-    background 150ms ease,
-    width 150ms ease,
-    right 150ms ease;
-
-  ${TerminalScrollRail}:hover & {
-    right: 1px;
-    width: 6px;
-    background: rgba(192, 204, 224, 0.72);
   }
 `;
 

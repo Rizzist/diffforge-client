@@ -108,8 +108,6 @@ import {
   ResizeHandle,
   TerminalFrame,
   XtermSurface,
-  TerminalScrollRail,
-  TerminalScrollThumb,
   TerminalClosedSurface,
   TerminalClosedLabel,
   TerminalClosingOverlay,
@@ -321,7 +319,6 @@ import {
 } from "../app/appStyles";
 import {
   createTerminalResizeController,
-  getTerminalActualCellSize,
   measureTerminalGrid,
 } from "./terminalResizeController";
 import {
@@ -426,40 +423,14 @@ function isWindowsTerminalHost() {
   return /windows|win32|win64|wince/i.test(`${platform} ${userAgent}`);
 }
 
-const TERMINAL_SCROLLBAR_PLATFORM = isWindowsTerminalHost() ? "windows" : "overlay";
+const TERMINAL_IS_WINDOWS_HOST = isWindowsTerminalHost();
+const TERMINAL_SCROLLBAR_PLATFORM = TERMINAL_IS_WINDOWS_HOST ? "native" : "overlay";
 const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "codex", label: "Codex", shortLabel: "CX" },
   { id: "claude", label: "Claude Code", shortLabel: "CL" },
   { id: "generic", label: "Terminal", shortLabel: "SH" },
   { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
-
-function getTerminalWheelScrollRows(event, terminal) {
-  const deltaY = Number(event?.deltaY || 0);
-
-  if (!Number.isFinite(deltaY) || deltaY === 0) {
-    return 0;
-  }
-
-  const direction = deltaY > 0 ? 1 : -1;
-
-  if (event.deltaMode === 1) {
-    return direction * Math.max(1, Math.ceil(Math.abs(deltaY)));
-  }
-
-  if (event.deltaMode === 2) {
-    const pageRows = Math.max(1, (Number(terminal?.rows) || TERMINAL_DEFAULT_ROWS) - 1);
-    return direction * Math.max(1, Math.ceil(Math.abs(deltaY) * pageRows));
-  }
-
-  const cellSize = getTerminalActualCellSize(terminal);
-  const cellHeight = Number(cellSize.actualCellHeight);
-  const normalizedCellHeight = cellSize.valid && Number.isFinite(cellHeight) && cellHeight > 0
-    ? cellHeight
-    : 16;
-
-  return direction * Math.max(1, Math.ceil(Math.abs(deltaY) / normalizedCellHeight));
-}
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -1233,8 +1204,6 @@ export default function WorkspaceTerminal({
   workspaceError,
 }) {
   const containerRef = useRef(null);
-  const scrollRailRef = useRef(null);
-  const scrollThumbRef = useRef(null);
   const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
@@ -1624,7 +1593,7 @@ export default function WorkspaceTerminal({
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
       reflowCursorLine: false,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
-      ...(TERMINAL_SCROLLBAR_PLATFORM === "windows" ? { windowsPty: { backend: "conpty" } } : {}),
+      ...(TERMINAL_IS_WINDOWS_HOST ? { windowsPty: { backend: "conpty" } } : {}),
       theme: {
         background: TERMINAL_THEME_BACKGROUND,
         foreground: "#e8eef8",
@@ -1656,7 +1625,6 @@ export default function WorkspaceTerminal({
 
     terminal.open(container);
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
-    const terminalViewportElement = container.querySelector(".xterm-viewport");
 
     let terminalFocusClearTimer = 0;
     const markTerminalAudioInputTarget = () => {
@@ -1725,297 +1693,109 @@ export default function WorkspaceTerminal({
       })
       .catch(() => {});
 
-    let terminalScrollbarHideTimer = 0;
-    const terminalScrollbarRefreshTimers = new Set();
-    let terminalScrollIntentUntil = 0;
-    const getTerminalMaxViewportY = (activeBuffer) => Math.max(
-      0,
-      Number(activeBuffer?.baseY || 0),
-      Number(activeBuffer?.length || 0) - Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS),
-    );
-    const updateWindowsTerminalScrollbarThumb = (activeBuffer, hasOverflow) => {
-      if (TERMINAL_SCROLLBAR_PLATFORM !== "windows" || !scrollThumbRef.current) {
-        return;
-      }
+    let updateTerminalScrollbarOverflow = () => false;
+    let scheduleTerminalScrollbarRefresh = () => {};
 
-      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
-      const viewportY = clampTerminalLine(activeBuffer?.viewportY || 0, 0, maxViewportY);
-      const viewportRows = Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS);
-      const totalRows = Math.max(viewportRows, maxViewportY + viewportRows);
-      const thumbHeightPercent = hasOverflow
-        ? Math.max(12, Math.min(100, (viewportRows / totalRows) * 100))
-        : 100;
-      const thumbTopPercent = hasOverflow && maxViewportY > 0
-        ? (viewportY / maxViewportY) * (100 - thumbHeightPercent)
-        : 0;
-
-      scrollThumbRef.current.style.height = `${thumbHeightPercent}%`;
-      scrollThumbRef.current.style.top = `${thumbTopPercent}%`;
-    };
-    const updateTerminalScrollbarOverflow = () => {
-      const activeBuffer = terminal.buffer?.active;
-      const hasOverflow = Boolean(
-        activeBuffer
-        && activeBuffer.type !== "alternate"
-        && (
-          Number(activeBuffer.baseY || 0) > 0
-          || getTerminalMaxViewportY(activeBuffer) > 0
-        ),
+    if (TERMINAL_SCROLLBAR_PLATFORM === "overlay" && terminalScrollableElement) {
+      let terminalScrollbarHideTimer = 0;
+      const terminalScrollbarRefreshTimers = new Set();
+      let terminalScrollIntentUntil = 0;
+      const getTerminalMaxViewportY = (activeBuffer) => Math.max(
+        0,
+        Number(activeBuffer?.baseY || 0),
+        Number(activeBuffer?.length || 0) - Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS),
       );
 
-      if (hasOverflow) {
-        container.dataset.scrollbarOverflow = "true";
-      } else {
-        delete container.dataset.scrollbarOverflow;
-      }
-
-      updateWindowsTerminalScrollbarThumb(activeBuffer, hasOverflow);
-
-      return hasOverflow;
-    };
-    const scheduleTerminalScrollbarRefresh = (delays = [0, 80, 240]) => {
-      delays.forEach((delayMs) => {
-        const refreshTimer = window.setTimeout(() => {
-          terminalScrollbarRefreshTimers.delete(refreshTimer);
-          if (!isDisposed) {
-            updateTerminalScrollbarOverflow();
-          }
-        }, Math.max(0, delayMs));
-
-        terminalScrollbarRefreshTimers.add(refreshTimer);
-      });
-    };
-    const hideTerminalScrollbar = () => {
-      terminalScrollbarHideTimer = 0;
-      if (!isDisposed) {
-        delete container.dataset.scrolling;
-      }
-    };
-    const scheduleHideTerminalScrollbar = () => {
-      if (terminalScrollbarHideTimer) {
-        window.clearTimeout(terminalScrollbarHideTimer);
-      }
-
-      terminalScrollbarHideTimer = window.setTimeout(
-        hideTerminalScrollbar,
-        TERMINAL_SCROLLBAR_HIDE_DELAY_MS,
-      );
-    };
-    const showTerminalScrollbar = () => {
-      if (isDisposed) {
-        return;
-      }
-
-      if (updateTerminalScrollbarOverflow()) {
-        container.dataset.scrolling = "true";
-        scheduleHideTerminalScrollbar();
-      }
-    };
-    const markTerminalScrollIntent = () => {
-      terminalScrollIntentUntil = performance.now() + TERMINAL_SCROLLBAR_INTENT_MS;
-    };
-    const handleTerminalScrollIntent = () => {
-      markTerminalScrollIntent();
-      showTerminalScrollbar();
-    };
-    const handleTerminalScrollbarRefreshIntent = () => {
-      markTerminalScrollIntent();
-      scheduleTerminalScrollbarRefresh([0, 80]);
-      showTerminalScrollbar();
-    };
-    const handleTerminalScrollKeyIntent = (event) => {
-      if (
-        event.key === "PageUp"
-        || event.key === "PageDown"
-        || event.key === "Home"
-        || event.key === "End"
-      ) {
-        handleTerminalScrollIntent();
-      }
-    };
-    const handleTerminalViewportScroll = () => {
-      updateTerminalScrollbarOverflow();
-      if (performance.now() <= terminalScrollIntentUntil) {
-        showTerminalScrollbar();
-      }
-    };
-    const finishHandledTerminalScroll = (event) => {
-      container.dataset.scrolling = "true";
-      scheduleHideTerminalScrollbar();
-
-      if (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        if (typeof event.stopImmediatePropagation === "function") {
-          event.stopImmediatePropagation();
-        }
-      }
-    };
-    const scrollWindowsTerminalToLine = (line, event) => {
-      const activeBuffer = terminal.buffer?.active;
-      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
-
-      if (!activeBuffer || activeBuffer.type === "alternate" || maxViewportY <= 0) {
-        updateTerminalScrollbarOverflow();
-        return false;
-      }
-
-      const currentViewportY = clampTerminalLine(activeBuffer.viewportY || 0, 0, maxViewportY);
-      const nextViewportY = clampTerminalLine(line, 0, maxViewportY);
-
-      if (nextViewportY === currentViewportY) {
-        updateTerminalScrollbarOverflow();
-        return false;
-      }
-
-      terminal.scrollToLine(nextViewportY);
-      updateTerminalScrollbarOverflow();
-      window.requestAnimationFrame(() => {
-        if (!isDisposed) {
-          updateTerminalScrollbarOverflow();
-        }
-      });
-      finishHandledTerminalScroll(event);
-      return true;
-    };
-    const scrollWindowsTerminalByLines = (lineDelta, event) => {
-      const activeBuffer = terminal.buffer?.active;
-      const normalizedLineDelta = Number.parseInt(lineDelta, 10) || 0;
-
-      if (!activeBuffer || activeBuffer.type === "alternate" || normalizedLineDelta === 0) {
-        updateTerminalScrollbarOverflow();
-        return false;
-      }
-
-      terminal.scrollLines(normalizedLineDelta);
-      updateTerminalScrollbarOverflow();
-      window.requestAnimationFrame(() => {
-        if (!isDisposed) {
-          updateTerminalScrollbarOverflow();
-        }
-      });
-      finishHandledTerminalScroll(event);
-      return true;
-    };
-    const handleWindowsTerminalWheel = (event) => {
-      const rows = getTerminalWheelScrollRows(event, terminal);
-
-      if (event.ctrlKey || rows === 0) {
-        return true;
-      }
-
-      markTerminalScrollIntent();
-      showTerminalScrollbar();
-
-      if (scrollWindowsTerminalByLines(rows, event)) {
-        return false;
-      }
-
-      return true;
-    };
-    const handleWindowsTerminalScrollKey = (event) => {
-      if (event.defaultPrevented) {
-        return;
-      }
-
-      if (event.shiftKey && event.key === "PageUp") {
-        terminal.scrollPages(-1);
-        finishHandledTerminalScroll(event);
-        return;
-      }
-
-      if (event.shiftKey && event.key === "PageDown") {
-        terminal.scrollPages(1);
-        finishHandledTerminalScroll(event);
-        return;
-      }
-
-      if (event.ctrlKey && event.key === "Home") {
-        scrollWindowsTerminalToLine(0, event);
-        return;
-      }
-
-      if (event.ctrlKey && event.key === "End") {
+      updateTerminalScrollbarOverflow = () => {
         const activeBuffer = terminal.buffer?.active;
-        scrollWindowsTerminalToLine(getTerminalMaxViewportY(activeBuffer), event);
-      }
-    };
-    const scrollWindowsTerminalFromScrollbarPointer = (event) => {
-      const railElement = scrollRailRef.current;
-      const activeBuffer = terminal.buffer?.active;
-      const maxViewportY = getTerminalMaxViewportY(activeBuffer);
+        const hasOverflow = Boolean(
+          activeBuffer
+          && activeBuffer.type !== "alternate"
+          && (
+            Number(activeBuffer.baseY || 0) > 0
+            || getTerminalMaxViewportY(activeBuffer) > 0
+          ),
+        );
 
-      if (
-        TERMINAL_SCROLLBAR_PLATFORM !== "windows"
-        || !railElement
-        || !activeBuffer
-        || activeBuffer.type === "alternate"
-        || maxViewportY <= 0
-      ) {
-        return;
-      }
+        if (hasOverflow) {
+          container.dataset.scrollbarOverflow = "true";
+        } else {
+          delete container.dataset.scrollbarOverflow;
+        }
 
-      const scrollToClientY = (clientY) => {
-        const rect = railElement.getBoundingClientRect();
-        const ratio = rect.height > 0
-          ? Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
-          : 0;
-        const targetLine = Math.round(ratio * maxViewportY);
+        return hasOverflow;
+      };
+      scheduleTerminalScrollbarRefresh = (delays = [0, 80, 240]) => {
+        delays.forEach((delayMs) => {
+          const refreshTimer = window.setTimeout(() => {
+            terminalScrollbarRefreshTimers.delete(refreshTimer);
+            if (!isDisposed) {
+              updateTerminalScrollbarOverflow();
+            }
+          }, Math.max(0, delayMs));
 
-        terminal.scrollToLine(targetLine);
+          terminalScrollbarRefreshTimers.add(refreshTimer);
+        });
+      };
+      const hideTerminalScrollbar = () => {
+        terminalScrollbarHideTimer = 0;
+        if (!isDisposed) {
+          delete container.dataset.scrolling;
+        }
+      };
+      const scheduleHideTerminalScrollbar = () => {
+        if (terminalScrollbarHideTimer) {
+          window.clearTimeout(terminalScrollbarHideTimer);
+        }
+
+        terminalScrollbarHideTimer = window.setTimeout(
+          hideTerminalScrollbar,
+          TERMINAL_SCROLLBAR_HIDE_DELAY_MS,
+        );
+      };
+      const showTerminalScrollbar = () => {
+        if (isDisposed) {
+          return;
+        }
+
+        if (updateTerminalScrollbarOverflow()) {
+          container.dataset.scrolling = "true";
+          scheduleHideTerminalScrollbar();
+        }
+      };
+      const markTerminalScrollIntent = () => {
+        terminalScrollIntentUntil = performance.now() + TERMINAL_SCROLLBAR_INTENT_MS;
+      };
+      const handleTerminalScrollIntent = () => {
+        markTerminalScrollIntent();
         showTerminalScrollbar();
+      };
+      const handleTerminalScrollKeyIntent = (event) => {
+        if (
+          event.key === "PageUp"
+          || event.key === "PageDown"
+          || event.key === "Home"
+          || event.key === "End"
+        ) {
+          handleTerminalScrollIntent();
+        }
+      };
+      const handleTerminalViewportScroll = () => {
         updateTerminalScrollbarOverflow();
+        if (performance.now() <= terminalScrollIntentUntil) {
+          showTerminalScrollbar();
+        }
       };
 
-      event.preventDefault();
-      event.stopPropagation();
-      markTerminalScrollIntent();
-      scrollToClientY(event.clientY);
-      railElement.setPointerCapture?.(event.pointerId);
-
-      const handlePointerMove = (moveEvent) => {
-        moveEvent.preventDefault();
-        scrollToClientY(moveEvent.clientY);
-      };
-      const stopPointerTracking = (upEvent) => {
-        railElement.releasePointerCapture?.(upEvent.pointerId);
-        railElement.removeEventListener("pointermove", handlePointerMove);
-        railElement.removeEventListener("pointerup", stopPointerTracking);
-        railElement.removeEventListener("pointercancel", stopPointerTracking);
-        scheduleHideTerminalScrollbar();
-      };
-
-      railElement.addEventListener("pointermove", handlePointerMove);
-      railElement.addEventListener("pointerup", stopPointerTracking);
-      railElement.addEventListener("pointercancel", stopPointerTracking);
-    };
-
-    if (terminalScrollableElement || terminalViewportElement || TERMINAL_SCROLLBAR_PLATFORM === "windows") {
       disposables.push(terminal.onWriteParsed(updateTerminalScrollbarOverflow));
       disposables.push(terminal.onResize(updateTerminalScrollbarOverflow));
-
-      if (TERMINAL_SCROLLBAR_PLATFORM === "windows") {
-        const windowsScrollIntentTarget = terminalViewportElement || terminalScrollableElement || container;
-
-        disposables.push(terminal.onScroll(handleTerminalViewportScroll));
-        terminal.attachCustomWheelEventHandler(handleWindowsTerminalWheel);
-        container.addEventListener("wheel", handleWindowsTerminalWheel, { capture: true, passive: false });
-        container.addEventListener("pointerenter", handleTerminalScrollbarRefreshIntent);
-        container.addEventListener("pointermove", updateTerminalScrollbarOverflow);
-        container.addEventListener("focusin", handleTerminalScrollbarRefreshIntent, true);
-        windowsScrollIntentTarget.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
-        windowsScrollIntentTarget.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
-        scrollRailRef.current?.addEventListener("pointerdown", scrollWindowsTerminalFromScrollbarPointer);
-        container.addEventListener("keydown", handleWindowsTerminalScrollKey, true);
-      } else {
-        terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
-        terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
-        container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
-        disposables.push(terminal.onScroll(handleTerminalViewportScroll));
-      }
-
+      terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
+      terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
+      container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
+      disposables.push(terminal.onScroll(handleTerminalViewportScroll));
       updateTerminalScrollbarOverflow();
       scheduleTerminalScrollbarRefresh([0, 80, 240, 800, 1600]);
+
       disposables.push(() => {
         if (terminalScrollbarHideTimer) {
           window.clearTimeout(terminalScrollbarHideTimer);
@@ -2028,23 +1808,9 @@ export default function WorkspaceTerminal({
         delete container.dataset.scrollbarOverflow;
         delete container.dataset.scrollbarPlatform;
 
-        if (TERMINAL_SCROLLBAR_PLATFORM === "windows") {
-          const windowsScrollIntentTarget = terminalViewportElement || terminalScrollableElement || container;
-
-          terminal.attachCustomWheelEventHandler(() => true);
-          container.removeEventListener("wheel", handleWindowsTerminalWheel, true);
-          container.removeEventListener("pointerenter", handleTerminalScrollbarRefreshIntent);
-          container.removeEventListener("pointermove", updateTerminalScrollbarOverflow);
-          container.removeEventListener("focusin", handleTerminalScrollbarRefreshIntent, true);
-          windowsScrollIntentTarget.removeEventListener("wheel", handleTerminalScrollIntent);
-          windowsScrollIntentTarget.removeEventListener("touchmove", handleTerminalScrollIntent);
-          scrollRailRef.current?.removeEventListener("pointerdown", scrollWindowsTerminalFromScrollbarPointer);
-          container.removeEventListener("keydown", handleWindowsTerminalScrollKey, true);
-        } else if (terminalScrollableElement) {
-          terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
-          terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
-          container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
-        }
+        terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
+        terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
+        container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
       });
     }
     listen(TERMINAL_AUDIO_INPUT_REFOCUS_EVENT, (event) => {
@@ -3500,11 +3266,6 @@ export default function WorkspaceTerminal({
               onDrop={isGenericTerminal ? undefined : handleTerminalTodoDrop}
               ref={containerRef}
             />
-            {TERMINAL_SCROLLBAR_PLATFORM === "windows" && (
-              <TerminalScrollRail aria-hidden="true" ref={scrollRailRef}>
-                <TerminalScrollThumb ref={scrollThumbRef} />
-              </TerminalScrollRail>
-            )}
             {showTerminalStatusOverlay && (
               <TerminalStatusOverlay
                 aria-live={terminalState === "error" ? "assertive" : "polite"}

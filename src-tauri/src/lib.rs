@@ -503,11 +503,11 @@ impl PtyPool {
                     }
 
                     if let Some(warm_pty) = should_cleanup {
-                        cleanup_warm_pty_with_context(warm_pty, "pool_refill_discard");
+                        cleanup_warm_pty_with_context(warm_pty);
                         break;
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     break;
                 }
             }
@@ -524,7 +524,7 @@ impl Drop for PtyPool {
             .unwrap_or_default();
 
         for warm_pty in warm_ptys {
-            cleanup_warm_pty_with_context(warm_pty, "pool_drop");
+            cleanup_warm_pty_with_context(warm_pty);
         }
     }
 }
