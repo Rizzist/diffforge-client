@@ -212,19 +212,13 @@ struct TerminalState {
 
 impl Drop for TerminalState {
     fn drop(&mut self) {
-        let mut terminal_lock_failed = false;
         let instances = match self.terminals.try_write() {
             Ok(mut terminals) => terminals
                 .drain()
                 .collect::<Vec<(String, TerminalInstance)>>(),
-            Err(_) => {
-                terminal_lock_failed = true;
-                Vec::new()
-            }
+            Err(_) => Vec::new(),
         };
-        let active_total = instances.len();
         let warm_ptys = self.pty_pool.drain_for_shutdown();
-        let warm_total = warm_ptys.len();
 
         for (pane_id, instance) in instances {
             cleanup_terminal_instance_with_context(
@@ -237,12 +231,12 @@ impl Drop for TerminalState {
         }
 
         for warm_pty in warm_ptys {
-            cleanup_warm_pty_with_context(warm_pty, "drop_fallback");
+            cleanup_warm_pty_with_context(warm_pty);
         }
 
-        let refill_idle = self.pty_pool.wait_for_refill_idle();
-        let login_closed = cleanup_login_terminal_children_with_context("drop_fallback");
-        let console_hosts_closed = cleanup_windows_headless_console_hosts("drop_fallback");
+        self.pty_pool.wait_for_refill_idle();
+        cleanup_login_terminal_children();
+        cleanup_windows_headless_console_hosts();
     }
 }
 
@@ -1062,7 +1056,6 @@ fn install_app_panic_log_hook() {
 
 fn schedule_app_exit_after_terminal_shutdown(
     app_for_exit: AppHandle,
-    app_pid: u32,
     window_label: String,
 ) -> Result<(), String> {
     thread::Builder::new()
@@ -1074,14 +1067,7 @@ fn schedule_app_exit_after_terminal_shutdown(
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
 
             if let Some(window) = app_for_exit.get_webview_window(&window_label) {
-                let destroy_result = window.destroy();
-                let (destroy_ok, destroy_error) = match destroy_result {
-                    Ok(()) => (true, None),
-                    Err(error) => (
-                        false,
-                        Some(clean_terminal_telemetry_text(&error.to_string())),
-                    ),
-                };
+                let _ = window.destroy();
             }
 
             thread::sleep(Duration::from_millis(
@@ -1098,7 +1084,6 @@ fn close_app_after_terminal_shutdown(
     app: AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    let app_pid = std::process::id();
     let window_label = window.label().to_string();
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -1107,7 +1092,7 @@ fn close_app_after_terminal_shutdown(
 
     let app_for_shutdown = app.clone();
     tauri::async_runtime::spawn(async move {
-        let closed = {
+        let _ = {
             let terminal_state = app_for_shutdown.state::<TerminalState>();
             let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
             let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
@@ -1121,21 +1106,11 @@ fn close_app_after_terminal_shutdown(
             close_all_result
         };
 
-        match closed {
-            Ok(closed) => (),
-            Err(error) => (),
-        }
+        let _ = coordination::mcp::stop_all_shared_daemons("app_close");
 
-        match coordination::mcp::stop_all_shared_daemons("app_close") {
-            Ok(summary) => (),
-            Err(error) => (),
-        }
-
-        if let Err(error) = schedule_app_exit_after_terminal_shutdown(
-            app_for_shutdown.clone(),
-            app_pid,
-            window_label.clone(),
-        ) {
+        if schedule_app_exit_after_terminal_shutdown(app_for_shutdown.clone(), window_label.clone())
+            .is_err()
+        {
             app_for_shutdown.exit(0);
         }
     });
@@ -1297,7 +1272,7 @@ pub fn run() {
             pty_pool.ensure_warm_async();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = cloud_mcp_connect_state(&cloud_mcp_state, "startup").await {}
+                let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
 
             register_audio_shortcuts(app.handle());
