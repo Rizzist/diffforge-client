@@ -8,7 +8,11 @@ const DEFAULT_MAX_ROWS = 160;
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 const DEFAULT_DEBOUNCE_MS = 16;
+const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 100;
 const MAX_INVALID_CELL_RETRIES = 30;
+
+const pendingFrameResizeControllers = new Set();
+let resizeFrameHandle = 0;
 
 function clampDimension(value, fallback, minimum, maximum) {
   const numericValue = Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -20,6 +24,36 @@ function nowMs() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
     : Date.now();
+}
+
+function requestResizeFrame() {
+  if (resizeFrameHandle) {
+    return;
+  }
+
+  resizeFrameHandle = window.requestAnimationFrame(() => {
+    resizeFrameHandle = 0;
+    const controllers = Array.from(pendingFrameResizeControllers);
+    pendingFrameResizeControllers.clear();
+    controllers.forEach((controller) => controller.flushScheduledResize());
+
+    if (pendingFrameResizeControllers.size) {
+      requestResizeFrame();
+    }
+  });
+}
+
+function enqueueResizeController(controller) {
+  if (!controller) {
+    return;
+  }
+
+  pendingFrameResizeControllers.add(controller);
+  requestResizeFrame();
+}
+
+function removeResizeController(controller) {
+  pendingFrameResizeControllers.delete(controller);
 }
 
 function callSafely(callback, payload) {
@@ -42,19 +76,6 @@ function getPositiveNumber(value) {
   const numericValue = Number(value);
 
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 0;
-}
-
-function getContainerResizeSnapshot(container) {
-  if (!container || typeof container.getBoundingClientRect !== "function") {
-    return {};
-  }
-
-  const bounds = container.getBoundingClientRect();
-
-  return {
-    containerHeight: Number(bounds.height),
-    containerWidth: Number(bounds.width),
-  };
 }
 
 export function getTerminalActualCellSize(term) {
@@ -189,6 +210,7 @@ export function createTerminalResizeController({
   maxRows = DEFAULT_MAX_ROWS,
   minCols = DEFAULT_MIN_COLS,
   minRows = DEFAULT_MIN_ROWS,
+  nativeResizeTrailingMs = DEFAULT_NATIVE_RESIZE_TRAILING_MS,
   onDone,
   onError,
   onSchedule,
@@ -201,25 +223,98 @@ export function createTerminalResizeController({
     return null;
   }
 
-  let debounceTimer = 0;
+  let controller = null;
   let disposed = false;
-  let inFlight = false;
   let invalidCellRetryCount = 0;
   let lastAppliedSize = null;
-  let pendingAfterFlight = false;
-  let pendingReason = "";
+  let lastNativeAppliedSize = null;
+  let nativeInFlight = false;
+  let nativePendingAfterFlight = false;
+  let nativeResizeTimer = 0;
+  let pendingNativeRequest = null;
+  let pendingNativeReason = "";
+  let queuedForResizeFrame = false;
+  let queuedResizeDeadlineMs = 0;
+  let queuedResizeReason = "";
 
   const getPaneId = () => getOptionValue(paneId, "");
   const getInstanceId = () => getOptionValue(instanceId, undefined);
   const getCanResize = () => (typeof canResize === "function" ? canResize() : canResize !== false);
 
-  const clearDebounce = () => {
-    if (!debounceTimer) {
+  const clearNativeResizeTimer = () => {
+    if (!nativeResizeTimer) {
       return;
     }
 
-    window.clearTimeout(debounceTimer);
-    debounceTimer = 0;
+    window.clearTimeout(nativeResizeTimer);
+    nativeResizeTimer = 0;
+  };
+
+  const flushNativeResize = async () => {
+    nativeResizeTimer = 0;
+
+    if (disposed || !pendingNativeRequest) {
+      return;
+    }
+
+    if (nativeInFlight) {
+      nativePendingAfterFlight = true;
+      return;
+    }
+
+    const request = pendingNativeRequest;
+    const reason = pendingNativeReason;
+    pendingNativeRequest = null;
+    pendingNativeReason = "";
+
+    if (
+      lastNativeAppliedSize?.cols === request.cols
+      && lastNativeAppliedSize?.rows === request.rows
+      && lastNativeAppliedSize?.paneId === request.paneId
+      && lastNativeAppliedSize?.instanceId === request.instanceId
+    ) {
+      return;
+    }
+
+    nativeInFlight = true;
+    try {
+      await invoke(command, request);
+      lastNativeAppliedSize = {
+        cols: request.cols,
+        instanceId: request.instanceId,
+        paneId: request.paneId,
+        rows: request.rows,
+      };
+    } catch (error) {
+      callSafely(onError, {
+        cols: request.cols,
+        error,
+        reason,
+        rows: request.rows,
+      });
+    } finally {
+      nativeInFlight = false;
+
+      if (!disposed && (nativePendingAfterFlight || pendingNativeRequest)) {
+        nativePendingAfterFlight = false;
+        clearNativeResizeTimer();
+        nativeResizeTimer = window.setTimeout(flushNativeResize, 0);
+      }
+    }
+  };
+
+  const scheduleNativeResize = (request, reason, delayMs) => {
+    if (disposed || !request?.cols || !request?.rows) {
+      return;
+    }
+
+    pendingNativeRequest = request;
+    pendingNativeReason = reason;
+    clearNativeResizeTimer();
+    nativeResizeTimer = window.setTimeout(
+      flushNativeResize,
+      Math.max(0, delayMs),
+    );
   };
 
   const schedule = (reason = "resize_observer", delayMs = debounceMs) => {
@@ -229,49 +324,57 @@ export function createTerminalResizeController({
 
     const normalizedDelayMs = Math.max(0, delayMs);
     callSafely(onSchedule, {
-      ...getContainerResizeSnapshot(container),
       canResize: getCanResize(),
       cols: term.cols,
       delayMs: normalizedDelayMs,
-      hasDebounceTimer: Boolean(debounceTimer),
-      inFlight,
+      hasDebounceTimer: queuedForResizeFrame,
+      inFlight: nativeInFlight,
       lastAppliedCols: lastAppliedSize?.cols ?? null,
       lastAppliedRows: lastAppliedSize?.rows ?? null,
-      pendingAfterFlight,
+      pendingAfterFlight: nativePendingAfterFlight || Boolean(pendingNativeRequest),
       reason,
       rows: term.rows,
     });
 
-    clearDebounce();
-    debounceTimer = window.setTimeout(() => {
-      debounceTimer = 0;
-      resizeNow(reason);
-    }, normalizedDelayMs);
+    queuedResizeReason = reason;
+
+    if (!queuedForResizeFrame) {
+      queuedForResizeFrame = true;
+      queuedResizeDeadlineMs = nowMs() + normalizedDelayMs;
+    } else {
+      queuedResizeDeadlineMs = Math.min(
+        queuedResizeDeadlineMs,
+        nowMs() + normalizedDelayMs,
+      );
+    }
+
+    enqueueResizeController(controller);
   };
 
   const observer = new ResizeObserver(() => {
     schedule("resize_observer", debounceMs);
   });
 
-  async function resizeNow(reason = "manual") {
-    if (disposed) {
-      return false;
+  function flushScheduledResize() {
+    if (disposed || !queuedForResizeFrame) {
+      queuedForResizeFrame = false;
+      return;
     }
 
-    if (inFlight) {
-      pendingAfterFlight = true;
-      pendingReason = reason;
-      callSafely(onSkip, {
-        ...getContainerResizeSnapshot(container),
-        cols: term.cols,
-        inFlight: true,
-        lastAppliedCols: lastAppliedSize?.cols ?? null,
-        lastAppliedRows: lastAppliedSize?.rows ?? null,
-        pendingAfterFlight,
-        reason,
-        rows: term.rows,
-        skipped: "in_flight",
-      });
+    if (nowMs() < queuedResizeDeadlineMs) {
+      enqueueResizeController(controller);
+      return;
+    }
+
+    const reason = queuedResizeReason || "resize_observer";
+    queuedForResizeFrame = false;
+    queuedResizeDeadlineMs = 0;
+    queuedResizeReason = "";
+    resizeNow(reason, { nativeDelayMs: nativeResizeTrailingMs });
+  }
+
+  async function resizeNow(reason = "manual", options = {}) {
+    if (disposed) {
       return false;
     }
 
@@ -317,6 +420,8 @@ export function createTerminalResizeController({
     if (lastAppliedSize?.cols === cols && lastAppliedSize?.rows === rows) {
       callSafely(onSkip, {
         ...measurement,
+        inFlight: nativeInFlight,
+        pendingAfterFlight: nativePendingAfterFlight || Boolean(pendingNativeRequest),
         reason,
         skipped: "duplicate_size",
       });
@@ -335,7 +440,6 @@ export function createTerminalResizeController({
       request.instanceId = resolvedInstanceId;
     }
 
-    inFlight = true;
     callSafely(onStart, {
       ...measurement,
       reason,
@@ -343,12 +447,6 @@ export function createTerminalResizeController({
     });
 
     try {
-      await invoke(command, request);
-
-      if (disposed) {
-        return false;
-      }
-
       term.resize(cols, rows);
 
       const webglAddon = typeof getWebglAddon === "function" ? getWebglAddon() : null;
@@ -370,6 +468,11 @@ export function createTerminalResizeController({
         elapsedMs: nowMs() - measuredAt,
         reason,
       });
+      scheduleNativeResize(
+        request,
+        reason,
+        options.nativeDelayMs ?? 0,
+      );
       return true;
     } catch (error) {
       callSafely(onError, {
@@ -379,29 +482,25 @@ export function createTerminalResizeController({
         reason,
       });
       return false;
-    } finally {
-      inFlight = false;
-
-      if (pendingAfterFlight && !disposed) {
-        const nextReason = pendingReason || "pending_resize";
-        pendingAfterFlight = false;
-        pendingReason = "";
-        schedule(nextReason, debounceMs);
-      }
     }
   }
 
-  observer.observe(container);
-
-  return {
+  controller = {
     dispose() {
       disposed = true;
-      clearDebounce();
+      queuedForResizeFrame = false;
+      removeResizeController(controller);
+      clearNativeResizeTimer();
       observer.disconnect();
     },
+    flushScheduledResize,
     resizeNow,
     schedule,
   };
+
+  observer.observe(container);
+
+  return controller;
 }
 
 export function useTerminalResizeController(options = {}) {

@@ -358,7 +358,9 @@ const TERMINAL_RENDER_PROBE_AFTER_WEBGL_MS = 140;
 const TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS = 80;
 const TERMINAL_RESIZE_DEBUG_IDLE_MS = 140;
 const TERMINAL_RESIZE_DEBUG_RECENT_MS = 1800;
+const TERMINAL_RESIZE_DEBUG_PROBES_ENABLED = false;
 const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
+const TERMINAL_RESIZE_WRITE_BARRIER_MAX_MS = 100;
 const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
@@ -1828,6 +1830,7 @@ export default function WorkspaceTerminal({
     let resizeWriteBarrierStartedAt = 0;
     let resizeWriteBarrierReason = "";
     let resizeWriteBarrierBytes = 0;
+    let resizeWriteBarrierTimer = 0;
     const resizeWriteBarrierQueue = [];
     const pendingOutputWrites = [];
     let pendingOutputBytes = 0;
@@ -2549,6 +2552,13 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      const isResizeProbe = `${reason || ""} ${extraFields.resizeReason || ""}`
+        .toLowerCase()
+        .includes("resize");
+      if (isResizeProbe && !TERMINAL_RESIZE_DEBUG_PROBES_ENABLED) {
+        return;
+      }
+
       const timer = window.setTimeout(() => {
         renderProbeTimers.delete(timer);
         logRenderProbe(reason, extraFields);
@@ -2558,7 +2568,7 @@ export default function WorkspaceTerminal({
     };
 
     const scheduleResizeDebugProbes = (reason, extraFields = {}) => {
-      if (isDisposed) {
+      if (isDisposed || !TERMINAL_RESIZE_DEBUG_PROBES_ENABLED) {
         return;
       }
 
@@ -2587,7 +2597,7 @@ export default function WorkspaceTerminal({
     };
 
     const scheduleResizeIdleDebugProbes = (extraFields = {}) => {
-      if (isDisposed) {
+      if (isDisposed || !TERMINAL_RESIZE_DEBUG_PROBES_ENABLED) {
         return;
       }
 
@@ -3197,6 +3207,12 @@ export default function WorkspaceTerminal({
       resizeWriteBarrierReason = event?.reason || "resize";
       resizeWriteBarrierBytes = 0;
       resizeWriteBarrierQueue.length = 0;
+      resizeWriteBarrierTimer = window.setTimeout(() => {
+        resizeWriteBarrierTimer = 0;
+        if (resizeWriteBarrierActive) {
+          closeResizeWriteBarrier("resize_barrier_max_ms");
+        }
+      }, TERMINAL_RESIZE_WRITE_BARRIER_MAX_MS);
       writeTerminalTelemetry({
         paneId,
         instanceId: terminalInstanceId,
@@ -3221,6 +3237,10 @@ export default function WorkspaceTerminal({
       resizeWriteBarrierStartedAt = 0;
       resizeWriteBarrierReason = "";
       resizeWriteBarrierBytes = 0;
+      if (resizeWriteBarrierTimer) {
+        window.clearTimeout(resizeWriteBarrierTimer);
+        resizeWriteBarrierTimer = 0;
+      }
 
       if (queuedWrites.length) {
         writeTerminalTelemetry({
@@ -4325,6 +4345,10 @@ export default function WorkspaceTerminal({
       pendingOutputBytes = 0;
       outputBatchQueuedAt = 0;
       resizeWriteBarrierActive = false;
+      if (resizeWriteBarrierTimer) {
+        window.clearTimeout(resizeWriteBarrierTimer);
+        resizeWriteBarrierTimer = 0;
+      }
       resizeWriteBarrierQueue.length = 0;
       resizeWriteBarrierBytes = 0;
       pendingResizeScrollAnchor = null;
