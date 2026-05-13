@@ -913,17 +913,16 @@ fn create_agent_terminal_pty(
     spawn_terminal_pty(size, command, "agent terminal")
 }
 
-fn cleanup_warm_pty_with_context(warm_pty: WarmPty, reason: &'static str) {
+fn cleanup_warm_pty_with_context(warm_pty: WarmPty) {
     let WarmPty {
         mut child,
         master,
         writer,
         reader,
-        size,
+        size: _,
     } = warm_pty;
-    let pid = child.process_id();
-    let kill_report = kill_terminal_process_tree(child.as_mut());
-    let final_exit_observed = poll_terminal_child_exit(child.as_mut());
+    kill_terminal_process_tree(child.as_mut());
+    poll_terminal_child_exit(child.as_mut());
     thread::spawn(move || {
         drop(child);
         drop(reader);
@@ -1039,26 +1038,22 @@ fn terminate_windows_process(process_id: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn cleanup_windows_headless_console_hosts(reason: &'static str) -> usize {
+fn cleanup_windows_headless_console_hosts() -> usize {
     let app_pid = std::process::id();
     let process_ids = app_child_process_ids_by_name(app_pid, "conhost.exe");
     let mut closed_process_ids = Vec::new();
-    let mut failed_process_ids = Vec::new();
 
     for process_id in process_ids {
         if terminate_windows_process(process_id) {
             closed_process_ids.push(process_id);
-        } else {
-            failed_process_ids.push(process_id);
         }
     }
 
-    let closed_count = closed_process_ids.len();
-    closed_count
+    closed_process_ids.len()
 }
 
 #[cfg(not(windows))]
-fn cleanup_windows_headless_console_hosts(_reason: &'static str) -> usize {
+fn cleanup_windows_headless_console_hosts() -> usize {
     0
 }
 
@@ -1370,23 +1365,20 @@ fn kill_login_terminal_child(child: &mut std::process::Child) -> TerminalKillRep
 }
 
 fn track_login_terminal_child(mut child: std::process::Child) {
-    let pid = child.id();
     let children = LOGIN_TERMINAL_CHILDREN.get_or_init(|| StdMutex::new(Vec::new()));
 
     let Ok(mut children) = children.lock() else {
-        let kill_report = kill_login_terminal_child(&mut child);
-        let final_exit_observed = poll_login_terminal_child_exit(&mut child);
+        kill_login_terminal_child(&mut child);
+        poll_login_terminal_child_exit(&mut child);
         return;
     };
 
-    let before_retain = children.len();
     children.retain_mut(|existing_child| {
         existing_child
             .try_wait()
             .map(|status| status.is_none())
             .unwrap_or(false)
     });
-    let removed_exited = before_retain.saturating_sub(children.len());
 
     if child
         .try_wait()
@@ -1394,52 +1386,34 @@ fn track_login_terminal_child(mut child: std::process::Child) {
         .unwrap_or(false)
     {
         children.push(child);
-    } else {
     }
 }
 
-fn cleanup_login_terminal_children_with_context(reason: &'static str) -> usize {
+fn cleanup_login_terminal_children() -> usize {
     let children = LOGIN_TERMINAL_CHILDREN.get_or_init(|| StdMutex::new(Vec::new()));
-    let mut lock_failed = false;
     let tracked_children = match children.lock() {
         Ok(mut children) => children.drain(..).collect::<Vec<_>>(),
-        Err(_) => {
-            lock_failed = true;
-            Vec::new()
-        }
+        Err(_) => Vec::new(),
     };
     let tracked_count = tracked_children.len();
-    let mut already_exited_count = 0usize;
-    let mut killed_count = 0usize;
-    let mut exit_observed_count = 0usize;
 
     for mut child in tracked_children {
-        let pid = child.id();
         let mut already_exited = false;
-        let mut exit_code = None;
-        let mut try_wait_error = None;
-        let mut kill_report = None;
 
         match child.try_wait() {
-            Ok(Some(status)) => {
+            Ok(Some(_)) => {
                 already_exited = true;
-                exit_code = status.code();
-                already_exited_count += 1;
             }
             Ok(None) => {
-                killed_count += 1;
-                kill_report = Some(kill_login_terminal_child(&mut child));
+                kill_login_terminal_child(&mut child);
             }
-            Err(error) => {
-                try_wait_error = Some(clean_terminal_telemetry_text(&error.to_string()));
-                killed_count += 1;
-                kill_report = Some(kill_login_terminal_child(&mut child));
+            Err(_) => {
+                kill_login_terminal_child(&mut child);
             }
         }
 
-        let final_exit_observed = already_exited || poll_login_terminal_child_exit(&mut child);
-        if final_exit_observed {
-            exit_observed_count += 1;
+        if !already_exited {
+            poll_login_terminal_child_exit(&mut child);
         }
     }
     tracked_count
