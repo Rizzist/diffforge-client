@@ -1473,6 +1473,129 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
 }
 
 #[tauri::command]
+async fn deactivate_workspace_runtime(
+    app: AppHandle,
+    repo_path: Option<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let started_at = Instant::now();
+    let reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workspace_deactivate")
+        .to_string();
+    let repo_path = repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    log_terminal_diagnostic_event(
+        &app,
+        "workspace_deactivate_runtime.start",
+        json!({
+            "reason": reason,
+            "repo_path": repo_path.as_deref().unwrap_or(""),
+        }),
+    );
+
+    let watcher_started_at = Instant::now();
+    let watchers = coordination::watcher::stop_all_file_watchers(&reason);
+    log_terminal_diagnostic_event(
+        &app,
+        "workspace_deactivate_runtime.watchers_stopped",
+        json!({
+            "reason": reason,
+            "duration_ms": terminal_diagnostic_elapsed_ms(watcher_started_at),
+        }),
+    );
+
+    let terminal_started_at = Instant::now();
+    let terminal_result = {
+        let terminal_state = app.state::<TerminalState>();
+        let cloud_mcp_state = app.state::<CloudMcpState>();
+        let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        close_all_terminal_sessions(app.clone(), &terminal_state, cloud_mcp_state.inner()).await
+    };
+    let (closed_terminals, terminal_error) = match terminal_result {
+        Ok(closed) => (closed, None),
+        Err(error) => (0, Some(error)),
+    };
+    log_terminal_diagnostic_event(
+        &app,
+        "workspace_deactivate_runtime.terminals_closed",
+        json!({
+            "reason": reason,
+            "closed": closed_terminals,
+            "error": terminal_error.as_deref().unwrap_or(""),
+            "duration_ms": terminal_diagnostic_elapsed_ms(terminal_started_at),
+        }),
+    );
+
+    let mcp_started_at = Instant::now();
+    let (mcp, mcp_error) = if let Some(repo_path) = repo_path.as_deref() {
+        match coordination::mcp::stop_shared_daemon_for_repo(PathBuf::from(repo_path), &reason) {
+            Ok(value) => (value, None),
+            Err(error) => (
+                json!({
+                    "active": false,
+                    "repo_path": repo_path,
+                }),
+                Some(error),
+            ),
+        }
+    } else {
+        (
+            json!({
+                "active": false,
+                "skipped": true,
+            }),
+            None,
+        )
+    };
+    log_terminal_diagnostic_event(
+        &app,
+        "workspace_deactivate_runtime.daemons_stopped",
+        json!({
+            "reason": reason,
+            "error": mcp_error.as_deref().unwrap_or(""),
+            "duration_ms": terminal_diagnostic_elapsed_ms(mcp_started_at),
+        }),
+    );
+
+    let errors = [terminal_error, mcp_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let result = json!({
+        "ok": errors.is_empty(),
+        "reason": reason,
+        "repoPath": repo_path.as_deref().unwrap_or(""),
+        "watchers": watchers,
+        "terminals": {
+            "closed": closed_terminals,
+        },
+        "mcp": mcp,
+        "errors": errors,
+        "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+    });
+
+    log_terminal_diagnostic_event(
+        &app,
+        "workspace_deactivate_runtime.complete",
+        json!({
+            "reason": reason,
+            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
+        }),
+    );
+
+    Ok(result)
+}
+
+#[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -1785,6 +1908,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_request_approval,
             coordination::tauri_commands::coordination_resolve_approval,
             coordination::tauri_commands::coordination_scan_workspace_violations,
+            deactivate_workspace_runtime,
             close_app_after_terminal_shutdown
         ])
         .build(tauri::generate_context!())

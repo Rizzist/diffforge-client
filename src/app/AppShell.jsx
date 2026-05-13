@@ -236,6 +236,8 @@ import {
   BlankStatusStack,
   WorkspaceSettingsOverlay,
   WorkspaceSettingsDialog,
+  WorkspaceSettingsBusyOverlay,
+  WorkspaceSettingsBusyPanel,
   WorkspaceSettingsDialogHeader,
   WorkspaceSettingsHeaderMain,
   WorkspaceSettingsHeaderMeta,
@@ -424,10 +426,18 @@ const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 18000;
+const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS = 1200;
 const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
+const WORKSPACE_DEACTIVATION_INITIAL_STATE = {
+  isActive: false,
+  workspaceId: "",
+  source: "",
+  closed: 0,
+  total: 0,
+};
 const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
 const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
@@ -1292,7 +1302,7 @@ function TerminalLayoutMiniature({ count, roleOptions, roles = [] }) {
   );
 }
 
-function WorkspaceTerminalCountPicker({ onChange, roleOptions, roles, value }) {
+function WorkspaceTerminalCountPicker({ disabled = false, onChange, roleOptions, roles, value }) {
   const selectedCount = normalizeWorkspaceTerminalCount(value);
 
   return (
@@ -1301,6 +1311,7 @@ function WorkspaceTerminalCountPicker({ onChange, roleOptions, roles, value }) {
         <TerminalCountButton
           aria-pressed={count === selectedCount}
           data-selected={count === selectedCount}
+          disabled={disabled}
           key={count}
           onClick={() => onChange(String(count))}
           title={`${count} ${count === 1 ? "terminal" : "terminals"}`}
@@ -1319,6 +1330,7 @@ function WorkspaceTerminalCountPicker({ onChange, roleOptions, roles, value }) {
 
 function WorkspaceTerminalRolePicker({
   count,
+  disabled = false,
   onChange,
   roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
   value,
@@ -1348,6 +1360,7 @@ function WorkspaceTerminalRolePicker({
             <TerminalRoleRange
               aria-label={`${role.label} terminal count`}
               data-role={role.id}
+              disabled={disabled}
               max={terminalCount}
               min="0"
               onChange={(event) => {
@@ -1507,15 +1520,15 @@ function normalizeWorkspaceTerminalSlotIndexes(indexes) {
   }, []);
 }
 
-function getWorkspaceVisibleTerminalIndexes(workspaceTerminalSlots, workspaceId, terminalCount) {
-  if (Object.prototype.hasOwnProperty.call(workspaceTerminalSlots || {}, workspaceId)) {
-    return normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalSlots[workspaceId]);
+function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
+  if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
+    return normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId]);
   }
 
   return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
 }
 
-function flattenTerminalPanelRows(rows) {
+function flattenWorkspaceDisplayRows(rows) {
   return Array.isArray(rows)
     ? rows.flatMap((row) => (
       Array.isArray(row?.terminalIndexes)
@@ -1527,9 +1540,9 @@ function flattenTerminalPanelRows(rows) {
     : [];
 }
 
-function normalizeWorkspaceTerminalLayoutRows(layoutRows, terminalIndexes) {
-  const visibleIndexes = normalizeWorkspaceTerminalSlotIndexes(terminalIndexes);
-  const visibleSet = new Set(visibleIndexes);
+function normalizeWorkspaceDisplayTerminalRows(layoutRows, terminalIndexes) {
+  const logicalIndexes = normalizeWorkspaceTerminalSlotIndexes(terminalIndexes);
+  const logicalIndexSet = new Set(logicalIndexes);
   const usedIndexes = new Set();
   const rows = [];
 
@@ -1546,7 +1559,7 @@ function normalizeWorkspaceTerminalLayoutRows(layoutRows, terminalIndexes) {
         const terminalIndex = Number.parseInt(index, 10);
         if (
           Number.isInteger(terminalIndex)
-          && visibleSet.has(terminalIndex)
+          && logicalIndexSet.has(terminalIndex)
           && !usedIndexes.has(terminalIndex)
         ) {
           usedIndexes.add(terminalIndex);
@@ -1560,7 +1573,7 @@ function normalizeWorkspaceTerminalLayoutRows(layoutRows, terminalIndexes) {
     });
   }
 
-  const missingIndexes = visibleIndexes.filter((terminalIndex) => !usedIndexes.has(terminalIndex));
+  const missingIndexes = logicalIndexes.filter((terminalIndex) => !usedIndexes.has(terminalIndex));
   if (missingIndexes.length) {
     getTerminalPanelRows(missingIndexes).forEach((row) => {
       if (row.terminalIndexes.length) {
@@ -1571,7 +1584,7 @@ function normalizeWorkspaceTerminalLayoutRows(layoutRows, terminalIndexes) {
 
   const normalizedRows = rows.length
     ? rows
-    : getTerminalPanelRows(visibleIndexes).map((row) => row.terminalIndexes);
+    : getTerminalPanelRows(logicalIndexes).map((row) => row.terminalIndexes);
 
   return normalizedRows.map((terminalIndexes, rowIndex) => ({
     rowIndex,
@@ -1579,19 +1592,19 @@ function normalizeWorkspaceTerminalLayoutRows(layoutRows, terminalIndexes) {
   }));
 }
 
-function getWorkspaceTerminalLayoutRows(workspaceTerminalLayouts, workspaceId, terminalIndexes) {
-  return normalizeWorkspaceTerminalLayoutRows(
-    workspaceId ? workspaceTerminalLayouts?.[workspaceId] : null,
-    terminalIndexes,
+function getWorkspaceDisplayTerminalRows(workspaceTerminalDisplayLayouts, workspaceId, logicalTerminalIndexes) {
+  return normalizeWorkspaceDisplayTerminalRows(
+    workspaceId ? workspaceTerminalDisplayLayouts?.[workspaceId] : null,
+    logicalTerminalIndexes,
   );
 }
 
-function getDefaultWorkspaceTerminalLayoutRows(terminalIndexes) {
-  return getTerminalPanelRows(terminalIndexes).map((row) => row.terminalIndexes);
+function getDefaultWorkspaceDisplayTerminalRows(logicalTerminalIndexes) {
+  return getTerminalPanelRows(logicalTerminalIndexes).map((row) => row.terminalIndexes);
 }
 
-function insertWorkspaceTerminalInLayoutRows(rows, sourceTerminalIndex, newTerminalIndex, direction) {
-  const nextRows = normalizeWorkspaceTerminalLayoutRows(rows, flattenTerminalPanelRows(rows))
+function insertLogicalTerminalInDisplayRows(rows, sourceTerminalIndex, newTerminalIndex, direction) {
+  const nextRows = normalizeWorkspaceDisplayTerminalRows(rows, flattenWorkspaceDisplayRows(rows))
     .map((row) => row.terminalIndexes.slice());
   const rowIndex = nextRows.findIndex((row) => row.includes(sourceTerminalIndex));
 
@@ -1610,20 +1623,10 @@ function insertWorkspaceTerminalInLayoutRows(rows, sourceTerminalIndex, newTermi
   return nextRows;
 }
 
-function removeWorkspaceTerminalFromLayoutRows(rows, terminalIndex) {
-  return normalizeWorkspaceTerminalLayoutRows(rows, flattenTerminalPanelRows(rows))
+function removeLogicalTerminalFromDisplayRows(rows, terminalIndex) {
+  return normalizeWorkspaceDisplayTerminalRows(rows, flattenWorkspaceDisplayRows(rows))
     .map((row) => row.terminalIndexes.filter((index) => index !== terminalIndex))
     .filter((row) => row.length);
-}
-
-function getWorkspaceVisibleTerminalCount(workspaceSettings, workspaceTerminalSlots, workspaceId) {
-  const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
-
-  if (Object.prototype.hasOwnProperty.call(workspaceTerminalSlots || {}, workspaceId)) {
-    return getWorkspaceVisibleTerminalIndexes(workspaceTerminalSlots, workspaceId, terminalCount).length;
-  }
-
-  return terminalCount;
 }
 
 function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
@@ -1710,8 +1713,8 @@ export default function App() {
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
-  const [workspaceTerminalSlots, setWorkspaceTerminalSlots] = useState({});
-  const [workspaceTerminalLayouts, setWorkspaceTerminalLayouts] = useState({});
+  const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState({});
+  const [workspaceTerminalDisplayLayouts, setWorkspaceTerminalDisplayLayouts] = useState({});
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState("");
   const [workspaceSettingsState, setWorkspaceSettingsState] = useState("idle");
   const [workspaceSettingsError, setWorkspaceSettingsError] = useState("");
@@ -1728,6 +1731,7 @@ export default function App() {
   const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
+  const [workspaceDeactivationState, setWorkspaceDeactivationState] = useState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
   const launchStartedAtRef = useRef(Date.now());
@@ -1740,8 +1744,8 @@ export default function App() {
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
   const workspaceSettingsRef = useRef(workspaceSettings);
-  const workspaceTerminalSlotsRef = useRef(workspaceTerminalSlots);
-  const workspaceTerminalLayoutsRef = useRef(workspaceTerminalLayouts);
+  const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
+  const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
   const preparedTerminalsRef = useRef(new Map());
@@ -1750,6 +1754,8 @@ export default function App() {
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const sharedMcpActiveRepoRef = useRef("");
+  const workspaceDeactivationInFlightRef = useRef("");
+  const workspaceRuntimeDeactivatedRepoRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -1773,12 +1779,12 @@ export default function App() {
   }, [workspaceSettings]);
 
   useEffect(() => {
-    workspaceTerminalSlotsRef.current = workspaceTerminalSlots;
-  }, [workspaceTerminalSlots]);
+    workspaceTerminalLogicalIndexesRef.current = workspaceTerminalLogicalIndexes;
+  }, [workspaceTerminalLogicalIndexes]);
 
   useEffect(() => {
-    workspaceTerminalLayoutsRef.current = workspaceTerminalLayouts;
-  }, [workspaceTerminalLayouts]);
+    workspaceTerminalDisplayLayoutsRef.current = workspaceTerminalDisplayLayouts;
+  }, [workspaceTerminalDisplayLayouts]);
 
   useEffect(() => {
     workspaceLifecycleSettingsRef.current = workspaceLifecycleSettings;
@@ -1909,8 +1915,8 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    setWorkspaceTerminalSlots({});
-    setWorkspaceTerminalLayouts({});
+    setWorkspaceTerminalLogicalIndexes({});
+    setWorkspaceTerminalDisplayLayouts({});
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -1940,8 +1946,8 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    setWorkspaceTerminalSlots({});
-    setWorkspaceTerminalLayouts({});
+    setWorkspaceTerminalLogicalIndexes({});
+    setWorkspaceTerminalDisplayLayouts({});
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -2021,6 +2027,10 @@ export default function App() {
   const activateWorkspace = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
 
+    if (workspaceDeactivationInFlightRef.current) {
+      return;
+    }
+
     if (!workspace) {
       return;
     }
@@ -2050,20 +2060,94 @@ export default function App() {
     });
   }, [activateWorkspace, showView]);
 
-  const deactivateWorkspace = useCallback((workspaceId, source = "manual") => {
+  const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
 
     if (!targetWorkspaceId || activatedWorkspaceIdRef.current !== targetWorkspaceId) {
       return;
     }
 
-    const clearedPreparedCount = clearPreparedWorkspaceTerminals(targetWorkspaceId);
+    if (workspaceDeactivationInFlightRef.current) {
+      return;
+    }
+
+    const runtimeRepoPath = getWorkspaceRootDirectory(workspaceSettingsRef.current, targetWorkspaceId)
+      || defaultWorkingDirectory;
+    const expectedTerminalTotal = normalizeCloseCount(workspaceCloseExpectedTotalRef.current);
+    let unlistenCloseProgress = null;
+    let runtimeCleanupCompleted = false;
+
+    workspaceDeactivationInFlightRef.current = targetWorkspaceId;
+    setWorkspaceDeactivationState({
+      isActive: true,
+      workspaceId: targetWorkspaceId,
+      source,
+      closed: 0,
+      total: expectedTerminalTotal,
+    });
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+
+    clearPreparedWorkspaceTerminals(targetWorkspaceId);
 
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
     setWorkspaceAgentBatchSentKey("");
-    setActivatedWorkspaceId("");
-  }, [activeView, clearPreparedWorkspaceTerminals, visibleView]);
+
+    try {
+      unlistenCloseProgress = await listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
+        const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
+
+        setWorkspaceDeactivationState((currentState) => {
+          if (!currentState.isActive || currentState.workspaceId !== targetWorkspaceId) {
+            return currentState;
+          }
+
+          const currentProgress = normalizeTerminalCloseProgress(currentState);
+
+          return {
+            ...currentState,
+            closed: Math.max(currentProgress.closed, nextProgress.closed),
+            total: Math.max(currentProgress.total, nextProgress.total),
+          };
+        });
+      });
+    } catch {
+      // Progress events are a UI nicety; cleanup still belongs to the backend command.
+    }
+
+    try {
+      await withTimeout(
+        invoke("deactivate_workspace_runtime", {
+          repoPath: runtimeRepoPath || null,
+          reason: "workspace_deactivate",
+        }),
+        WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
+        "Workspace deactivation timed out.",
+      );
+      runtimeCleanupCompleted = true;
+    } catch (error) {
+      setWorkspaceSettingsError(getErrorMessage(error, "Unable to deactivate workspace cleanly."));
+    } finally {
+      if (typeof unlistenCloseProgress === "function") {
+        unlistenCloseProgress();
+      }
+
+      if (runtimeCleanupCompleted && runtimeRepoPath) {
+        workspaceRuntimeDeactivatedRepoRef.current = runtimeRepoPath;
+        if (sharedMcpActiveRepoRef.current === runtimeRepoPath) {
+          sharedMcpActiveRepoRef.current = "";
+        }
+      }
+
+      if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
+        setActivatedWorkspaceId("");
+      }
+
+      workspaceDeactivationInFlightRef.current = "";
+      setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
+    }
+  }, [clearPreparedWorkspaceTerminals, defaultWorkingDirectory]);
 
   const completeAuthStartup = useCallback(() => {
     if (authStartupFinishedRef.current) {
@@ -2740,6 +2824,10 @@ export default function App() {
   }, []);
 
   const closeWorkspaceSettings = useCallback(() => {
+    if (workspaceDeactivationInFlightRef.current) {
+      return;
+    }
+
     setWorkspaceSettingsModalId("");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -2747,6 +2835,10 @@ export default function App() {
 
   const saveWorkspaceSettings = useCallback(async (event) => {
     event.preventDefault();
+
+    if (workspaceDeactivationInFlightRef.current) {
+      return;
+    }
 
     if (!selectedWorkspace) {
       setWorkspaceSettingsError("Select a workspace before changing settings.");
@@ -2812,8 +2904,9 @@ export default function App() {
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, terminalRoles[index]]
       )));
-      const currentTerminalIndexes = normalizeWorkspaceTerminalIndexes(
-        workspaceTerminalSlots[selectedWorkspace.id],
+      const currentTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
+        workspaceTerminalLogicalIndexes,
+        selectedWorkspace.id,
         currentTerminalCount,
       );
       const rootChanged = rootDirectory !== currentRootDirectory;
@@ -2924,18 +3017,18 @@ export default function App() {
       });
 
       if (rootChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
-        const nextSlots = {
-          ...workspaceTerminalSlots,
+        const nextLogicalIndexesByWorkspace = {
+          ...workspaceTerminalLogicalIndexes,
           [selectedWorkspace.id]: nextTerminalIndexes,
         };
-        const nextLayouts = {
-          ...workspaceTerminalLayoutsRef.current,
-          [selectedWorkspace.id]: getDefaultWorkspaceTerminalLayoutRows(nextTerminalIndexes),
+        const nextDisplayLayouts = {
+          ...workspaceTerminalDisplayLayoutsRef.current,
+          [selectedWorkspace.id]: getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes),
         };
-        workspaceTerminalSlotsRef.current = nextSlots;
-        workspaceTerminalLayoutsRef.current = nextLayouts;
-        setWorkspaceTerminalSlots(nextSlots);
-        setWorkspaceTerminalLayouts(nextLayouts);
+        workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+        workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+        setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+        setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
       }
 
       if (rootChanged && selectedWorkspace.id === activatedWorkspaceIdRef.current && nextMcpRepoPath) {
@@ -2979,7 +3072,7 @@ export default function App() {
     workspaceTerminalCountDraft,
     workspaceTerminalRolesDraft,
     workspaceSettings,
-    workspaceTerminalSlots,
+    workspaceTerminalLogicalIndexes,
     activeAgent,
     defaultWorkingDirectory,
     workspaceTerminalFallbackRole,
@@ -2994,8 +3087,8 @@ export default function App() {
     }
 
     const currentSettings = workspaceSettingsRef.current;
-    const currentSlots = workspaceTerminalSlotsRef.current;
-    const currentLayouts = workspaceTerminalLayoutsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
     const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
       currentSettings,
@@ -3004,15 +3097,21 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const currentIndexes = getWorkspaceVisibleTerminalIndexes(currentSlots, workspaceId, terminalCount);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
 
     if (currentIndexes.length === 0) {
       return;
     }
 
+    let removedTerminalIndex = terminalIndex;
     let nextIndexes = currentIndexes.filter((index) => index !== terminalIndex);
 
     if (nextIndexes.length === currentIndexes.length) {
+      removedTerminalIndex = currentIndexes[currentIndexes.length - 1];
       nextIndexes = currentIndexes.slice(0, -1);
     }
 
@@ -3021,15 +3120,15 @@ export default function App() {
       const roleIndex = currentIndexes.indexOf(index);
       return currentTerminalRoles[roleIndex] || workspaceTerminalFallbackRole;
     });
-    const nextSlots = {
-      ...currentSlots,
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
     };
-    const nextLayouts = {
-      ...currentLayouts,
-      [workspaceId]: removeWorkspaceTerminalFromLayoutRows(
-        getWorkspaceTerminalLayoutRows(currentLayouts, workspaceId, currentIndexes),
-        terminalIndex,
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: removeLogicalTerminalFromDisplayRows(
+        getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes),
+        removedTerminalIndex,
       ),
     };
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
@@ -3039,17 +3138,17 @@ export default function App() {
     let clearedPreparedTerminal = false;
 
     preparedTerminalsRef.current.forEach((session, key) => {
-      if (session.workspaceId === workspaceId && session.terminalIndex === terminalIndex) {
+      if (session.workspaceId === workspaceId && session.terminalIndex === removedTerminalIndex) {
         preparedTerminalsRef.current.delete(key);
         clearedPreparedTerminal = true;
       }
     });
 
-    workspaceTerminalSlotsRef.current = nextSlots;
-    workspaceTerminalLayoutsRef.current = nextLayouts;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
     workspaceSettingsRef.current = nextSettings;
-    setWorkspaceTerminalSlots(nextSlots);
-    setWorkspaceTerminalLayouts(nextLayouts);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
     setWorkspaceSettings(nextSettings);
     persistWorkspaceSettings(nextSettings);
 
@@ -3073,10 +3172,14 @@ export default function App() {
     }
 
     const currentSettings = workspaceSettingsRef.current;
-    const currentSlots = workspaceTerminalSlotsRef.current;
-    const currentLayouts = workspaceTerminalLayoutsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
     const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
-    const currentIndexes = getWorkspaceVisibleTerminalIndexes(currentSlots, workspaceId, terminalCount);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
 
     if (currentIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
       return;
@@ -3111,14 +3214,14 @@ export default function App() {
       currentRoles[orderIndex] || workspaceTerminalFallbackRole,
     ]));
     const sourceRole = roleByIndex[terminalIndex] || workspaceTerminalFallbackRole;
-    const currentRows = getWorkspaceTerminalLayoutRows(currentLayouts, workspaceId, currentIndexes);
-    const nextLayoutRows = insertWorkspaceTerminalInLayoutRows(
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = insertLogicalTerminalInDisplayRows(
       currentRows,
       terminalIndex,
       nextTerminalIndex,
       direction,
     );
-    const nextIndexes = normalizeWorkspaceTerminalSlotIndexes(flattenTerminalPanelRows(nextLayoutRows));
+    const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
     const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => (
       index === nextTerminalIndex ? sourceRole : roleByIndex[index] || workspaceTerminalFallbackRole
@@ -3127,21 +3230,21 @@ export default function App() {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
     });
-    const nextSlots = {
-      ...currentSlots,
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
     };
-    const nextLayouts = {
-      ...currentLayouts,
-      [workspaceId]: nextLayoutRows,
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
     };
 
     workspaceSettingsRef.current = nextSettings;
-    workspaceTerminalSlotsRef.current = nextSlots;
-    workspaceTerminalLayoutsRef.current = nextLayouts;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
     setWorkspaceSettings(nextSettings);
-    setWorkspaceTerminalSlots(nextSlots);
-    setWorkspaceTerminalLayouts(nextLayouts);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
@@ -3165,8 +3268,9 @@ export default function App() {
       workspaceTerminalRoleOptions,
     );
     const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
-    const currentIndexes = normalizeWorkspaceTerminalIndexes(
-      workspaceTerminalSlots[workspaceId],
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      workspaceTerminalLogicalIndexes,
+      workspaceId,
       terminalCount,
     );
     const roleIndex = currentIndexes.indexOf(terminalIndex);
@@ -3217,7 +3321,7 @@ export default function App() {
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
-    workspaceTerminalSlots,
+    workspaceTerminalLogicalIndexes,
   ]);
 
   const useDefaultWorkspaceRoot = useCallback(() => {
@@ -3909,11 +4013,11 @@ export default function App() {
       workspaceSettings,
     ],
   );
-  const activatedWorkspaceTerminalIndexes = useMemo(
+  const activatedWorkspaceLogicalTerminalIndexes = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
-        ? getWorkspaceVisibleTerminalIndexes(
-          workspaceTerminalSlots,
+        ? getWorkspaceLogicalTerminalIndexes(
+          workspaceTerminalLogicalIndexes,
           activatedWorkspace.id,
           activatedWorkspaceTerminalCount,
         )
@@ -3923,13 +4027,13 @@ export default function App() {
       activatedWorkspace?.id,
       activatedWorkspaceTerminalCount,
       shouldShowWorkspaceSetup,
-      workspaceTerminalSlots,
+      workspaceTerminalLogicalIndexes,
     ],
   );
-  const activatedWorkspaceVisibleTerminalCount = activatedWorkspaceTerminalIndexes.length;
-  workspaceCloseExpectedTotalRef.current = activatedWorkspaceVisibleTerminalCount;
+  const activatedWorkspaceLogicalTerminalCount = activatedWorkspaceLogicalTerminalIndexes.length;
+  workspaceCloseExpectedTotalRef.current = activatedWorkspaceLogicalTerminalCount;
   const activatedWorkspaceTerminalRoleEntries = useMemo(
-    () => activatedWorkspaceTerminalIndexes.map((terminalIndex, index) => ({
+    () => activatedWorkspaceLogicalTerminalIndexes.map((terminalIndex, index) => ({
       role: normalizeWorkspaceTerminalRole(
         activatedWorkspaceTerminalRoles[index] || activatedWorkspaceTerminalRoles[terminalIndex],
         workspaceTerminalFallbackRole,
@@ -3938,7 +4042,7 @@ export default function App() {
       terminalIndex,
     })),
     [
-      activatedWorkspaceTerminalIndexes,
+      activatedWorkspaceLogicalTerminalIndexes,
       activatedWorkspaceTerminalRoles,
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
@@ -4030,6 +4134,11 @@ export default function App() {
     return () => {
       disposed = true;
 
+      if (workspaceRuntimeDeactivatedRepoRef.current === repoPath) {
+        workspaceRuntimeDeactivatedRepoRef.current = "";
+        return;
+      }
+
       if (sharedMcpActiveRepoRef.current === repoPath) {
         sharedMcpActiveRepoRef.current = "";
       }
@@ -4051,8 +4160,14 @@ export default function App() {
         });
     };
   }, [activatedWorkspace?.id, activatedWorkspace?.name, activatedWorkspaceTerminalWorkingDirectory]);
+  const isActivatedWorkspaceDeactivating = Boolean(
+    workspaceDeactivationState.isActive
+      && activatedWorkspace
+      && workspaceDeactivationState.workspaceId === activatedWorkspace.id,
+  );
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && Boolean(activatedWorkspace)
+    && !isActivatedWorkspaceDeactivating
     && activatedWorkspaceAgentTerminalEntries.length > 0;
   const workspaceAgentLaunchKey = workspaceTerminalAgentLaunchReady && activatedWorkspace
     ? [
@@ -4061,17 +4176,17 @@ export default function App() {
       activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => `${terminalIndex}:${role}`).join(","),
     ].join(":")
     : "";
-  const terminalPanelRows = useMemo(
+  const activatedWorkspaceDisplayTerminalRows = useMemo(
     () => (
-      activatedWorkspaceTerminalIndexes.length
-        ? getWorkspaceTerminalLayoutRows(
-          workspaceTerminalLayouts,
+      activatedWorkspaceLogicalTerminalIndexes.length
+        ? getWorkspaceDisplayTerminalRows(
+          workspaceTerminalDisplayLayouts,
           activatedWorkspace?.id,
-          activatedWorkspaceTerminalIndexes,
+          activatedWorkspaceLogicalTerminalIndexes,
         )
         : []
     ),
-    [activatedWorkspace?.id, activatedWorkspaceTerminalIndexes, workspaceTerminalLayouts],
+    [activatedWorkspace?.id, activatedWorkspaceLogicalTerminalIndexes, workspaceTerminalDisplayLayouts],
   );
   const selectedWorkspaceFileRoot = selectedWorkspaceRootDirectory || defaultWorkingDirectory;
   const isSelectedWorkspaceActivated = Boolean(selectedWorkspace && activatedWorkspace?.id === selectedWorkspace.id);
@@ -4080,6 +4195,12 @@ export default function App() {
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
+  const isWorkspaceSettingsDeactivating = Boolean(
+    workspaceDeactivationState.isActive
+      && selectedWorkspace
+      && workspaceDeactivationState.workspaceId === selectedWorkspace.id,
+  );
+  const isWorkspaceSettingsBusy = workspaceSettingsState === "saving" || isWorkspaceSettingsDeactivating;
   const selectedWorkspaceIdForSpecSync = selectedWorkspace?.id || "";
   const selectedWorkspaceNameForSpecSync = selectedWorkspace?.name || "";
 
@@ -4202,6 +4323,10 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (workspaceDeactivationInFlightRef.current) {
+      return;
+    }
+
     if (!workspaceAgentLaunchKey) {
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
@@ -4252,8 +4377,8 @@ export default function App() {
   }, [
     activatedWorkspace?.id,
     activatedWorkspaceAgentTerminalEntries.length,
-    activatedWorkspaceTerminalIndexes,
-    activatedWorkspaceVisibleTerminalCount,
+    activatedWorkspaceLogicalTerminalIndexes,
+    activatedWorkspaceLogicalTerminalCount,
     preparedWorkspaceTerminalCount,
     preparedWorkspaceTerminalRequests,
     workspaceAgentBatchSentKey,
@@ -4300,11 +4425,11 @@ export default function App() {
     activatedWorkspace,
     activatedWorkspaceAgentTerminalEntries,
     activatedWorkspaceRootDirectory,
-    activatedWorkspaceTerminalIndexes,
+    activatedWorkspaceLogicalTerminalIndexes,
     activatedWorkspaceTerminalRoleEntries,
-    activatedWorkspaceVisibleTerminalCount,
+    activatedWorkspaceLogicalTerminalCount,
     shouldShowWorkspaceSetup,
-    terminalPanelRows.length,
+    activatedWorkspaceDisplayTerminalRows.length,
     viewMotion,
     visibleView,
     workspaceState,
@@ -4343,6 +4468,16 @@ export default function App() {
     ? Math.min(100, Math.round((workspaceCloseClosed / workspaceCloseTotal) * 100))
     : 0;
   const workspaceCloseTerminalLabel = workspaceCloseTotal === 1 ? "terminal" : "terminals";
+  const workspaceDeactivateReportedClosed = normalizeCloseCount(workspaceDeactivationState.closed);
+  const workspaceDeactivateTotal = Math.max(
+    normalizeCloseCount(workspaceDeactivationState.total),
+    workspaceDeactivateReportedClosed,
+  );
+  const workspaceDeactivateClosed = Math.min(workspaceDeactivateReportedClosed, workspaceDeactivateTotal);
+  const workspaceDeactivateProgress = workspaceDeactivateTotal > 0
+    ? Math.min(100, Math.round((workspaceDeactivateClosed / workspaceDeactivateTotal) * 100))
+    : 0;
+  const workspaceDeactivateTerminalLabel = workspaceDeactivateTotal === 1 ? "terminal" : "terminals";
   const isWorkspaceStartupOverlayVisible = workspaceState !== "ready"
     || shouldHoldWorkspaceRevealForTerminalBatch;
 
@@ -4633,8 +4768,8 @@ export default function App() {
                       terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
                       terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
                       terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
-                      terminalWorkspaceTerminalIndexes={activatedWorkspaceTerminalIndexes}
-                      terminalWorkspaceVisibleTerminalCount={activatedWorkspaceVisibleTerminalCount}
+                      terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
+                      terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
                       agentStatusError={agentStatusError}
                       agentStatuses={agentStatuses}
                       agentStatusState={agentStatusState}
@@ -4648,7 +4783,7 @@ export default function App() {
                       shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
                       showSettingsView={showSettingsView}
                       splitWorkspaceTerminal={splitWorkspaceTerminal}
-                      terminalPanelRows={terminalPanelRows}
+                      terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
                       viewMotion={viewMotion}
                       workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
                       workspaceError={workspaceError}
@@ -4948,13 +5083,17 @@ export default function App() {
                             : "No terminal runtime is currently active."}
                         </SettingsHint>
                         {activatedWorkspace ? (
-                          <PrimaryDangerButton onClick={() => deactivateWorkspace(activatedWorkspace.id, "settings_page")} type="button">
+                          <PrimaryDangerButton
+                            disabled={workspaceDeactivationState.isActive}
+                            onClick={() => deactivateWorkspace(activatedWorkspace.id, "settings_page")}
+                            type="button"
+                          >
                             <ButtonCloseIcon aria-hidden="true" />
-                            <span>Deactivate workspace</span>
+                            <span>{isActivatedWorkspaceDeactivating ? "Deactivating..." : "Deactivate workspace"}</span>
                           </PrimaryDangerButton>
                         ) : (
                           <PrimaryButton
-                            disabled={!selectedWorkspace}
+                            disabled={!selectedWorkspace || workspaceDeactivationState.isActive}
                             onClick={() => selectedWorkspace && activateWorkspace(selectedWorkspace.id, "settings_page")}
                             type="button"
                           >
@@ -5088,12 +5227,17 @@ export default function App() {
                 <WorkspaceSettingsOverlay
                   aria-label="Workspace settings modal"
                   onMouseDown={(event) => {
+                    if (isWorkspaceSettingsDeactivating) {
+                      return;
+                    }
+
                     if (event.target === event.currentTarget) {
                       closeWorkspaceSettings();
                     }
                   }}
                 >
                   <WorkspaceSettingsDialog
+                    aria-busy={isWorkspaceSettingsBusy}
                     aria-labelledby="workspace-settings-title"
                     aria-modal="true"
                     role="dialog"
@@ -5134,14 +5278,16 @@ export default function App() {
                         <WorkspaceSettingsHeaderActions>
                           {isSelectedWorkspaceActivated ? (
                             <PrimaryDangerButton
+                              disabled={isWorkspaceSettingsBusy}
                               onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings")}
                               type="button"
                             >
                               <ButtonCloseIcon aria-hidden="true" />
-                              <span>Deactivate</span>
+                              <span>{isWorkspaceSettingsDeactivating ? "Deactivating..." : "Deactivate"}</span>
                             </PrimaryDangerButton>
                           ) : (
                             <SecondaryButton
+                              disabled={isWorkspaceSettingsBusy}
                               onClick={() => activateWorkspace(selectedWorkspace.id, "workspace_settings")}
                               type="button"
                             >
@@ -5151,6 +5297,7 @@ export default function App() {
                           )}
                           {isSelectedWorkspaceDefault ? (
                             <SecondaryButton
+                              disabled={isWorkspaceSettingsBusy}
                               onClick={() => setDefaultWorkspace("", "workspace_settings")}
                               type="button"
                             >
@@ -5159,6 +5306,7 @@ export default function App() {
                             </SecondaryButton>
                           ) : (
                             <SecondaryButton
+                              disabled={isWorkspaceSettingsBusy}
                               onClick={() => setDefaultWorkspace(selectedWorkspace.id, "workspace_settings")}
                               type="button"
                             >
@@ -5168,6 +5316,7 @@ export default function App() {
                           )}
                           <WorkspaceModalCloseButton
                             aria-label="Close workspace settings"
+                            disabled={isWorkspaceSettingsBusy}
                             onClick={closeWorkspaceSettings}
                             title="Close"
                             type="button"
@@ -5187,6 +5336,7 @@ export default function App() {
                           <SetupField>
                             <SettingsLabel>Name</SettingsLabel>
                             <WorkspaceSettingsInput
+                              disabled={isWorkspaceSettingsBusy}
                               maxLength={80}
                               onChange={(event) => {
                                 setWorkspaceNameDraft(event.target.value);
@@ -5199,6 +5349,7 @@ export default function App() {
                           <WorkspaceRootChooser>
                             <SettingsLabel>Root directory</SettingsLabel>
                             <RootDirectoryInput
+                              disabled={isWorkspaceSettingsBusy}
                               maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
                               placeholder={defaultWorkingDirectory || "Choose project root"}
                               readOnly
@@ -5207,7 +5358,7 @@ export default function App() {
                             />
                             <WorkspaceRootActions>
                               <SecondaryButton
-                                disabled={workspaceSettingsState === "saving"}
+                                disabled={isWorkspaceSettingsBusy}
                                 onClick={chooseWorkspaceRootDirectory}
                                 type="button"
                               >
@@ -5215,7 +5366,7 @@ export default function App() {
                                 <span>Choose directory</span>
                               </SecondaryButton>
                               <SecondaryButton
-                                disabled={!defaultWorkingDirectory || workspaceSettingsState === "saving"}
+                                disabled={!defaultWorkingDirectory || isWorkspaceSettingsBusy}
                                 onClick={useDefaultWorkspaceRoot}
                                 type="button"
                               >
@@ -5233,6 +5384,7 @@ export default function App() {
                           <SettingsHint>Choose the total, then distribute panes across installed agent CLIs and plain terminals.</SettingsHint>
                         </div>
                         <WorkspaceTerminalCountPicker
+                          disabled={isWorkspaceSettingsBusy}
                           onChange={(count) => {
                             const nextCount = normalizeWorkspaceTerminalCount(count);
                             setWorkspaceTerminalCountDraft(count);
@@ -5253,6 +5405,7 @@ export default function App() {
                         />
                         <WorkspaceTerminalRolePicker
                           count={workspaceTerminalCountDraft}
+                          disabled={isWorkspaceSettingsBusy}
                           onChange={(roles) => {
                             setWorkspaceTerminalRolesDraft(roles);
                             setWorkspaceSettingsError("");
@@ -5264,7 +5417,7 @@ export default function App() {
                       </WorkspaceSettingsSection>
 
                       <WorkspaceSettingsActions>
-                        <PrimaryButton disabled={workspaceSettingsState === "saving"} type="submit">
+                        <PrimaryButton disabled={isWorkspaceSettingsBusy} type="submit">
                           <ButtonCheckIcon aria-hidden="true" />
                           <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>
                         </PrimaryButton>
@@ -5274,6 +5427,25 @@ export default function App() {
                     {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
                     {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
                   </WorkspaceSettingsDialog>
+                  {isWorkspaceSettingsDeactivating && (
+                    <WorkspaceSettingsBusyOverlay aria-live="polite" role="status">
+                      <WorkspaceSettingsBusyPanel aria-label="Deactivating workspace">
+                        <WorkspaceCloseSpinner aria-hidden="true" />
+                        <WorkspaceCloseTitle>Deactivating workspace</WorkspaceCloseTitle>
+                        <WorkspaceCloseDetail>
+                          Stopping file watchers, terminals, and workspace services before the runtime is released.
+                        </WorkspaceCloseDetail>
+                        <WorkspaceCloseCounter>
+                          {workspaceDeactivateTotal > 0
+                            ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
+                            : "Stopping workspace runtime"}
+                        </WorkspaceCloseCounter>
+                        <WorkspaceCloseProgressTrack aria-hidden="true">
+                          <WorkspaceCloseProgressBar $progress={workspaceDeactivateProgress} />
+                        </WorkspaceCloseProgressTrack>
+                      </WorkspaceSettingsBusyPanel>
+                    </WorkspaceSettingsBusyOverlay>
+                  )}
                 </WorkspaceSettingsOverlay>
               )}
               {crashRecoveryModal?.interruptedTasks?.length > 0 && (

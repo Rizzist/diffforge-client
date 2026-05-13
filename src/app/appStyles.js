@@ -6260,6 +6260,36 @@ export const WorkspaceSettingsDialog = styled.aside`
   }
 `;
 
+export const WorkspaceSettingsBusyOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  background:
+    linear-gradient(180deg, rgba(3, 5, 8, 0.18), rgba(3, 5, 8, 0.38)),
+    rgba(3, 5, 8, 0.44);
+  backdrop-filter: blur(7px);
+`;
+
+export const WorkspaceSettingsBusyPanel = styled.section`
+  display: grid;
+  width: min(390px, 100%);
+  min-width: 0;
+  justify-items: center;
+  gap: 11px;
+  padding: 22px;
+  border: 1px solid rgba(230, 236, 245, 0.13);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(98, 160, 255, 0.08), rgba(255, 122, 24, 0.035)),
+    rgba(8, 13, 20, 0.96);
+  box-shadow: 0 26px 82px rgba(0, 0, 0, 0.55);
+`;
+
 export const WorkspaceSettingsDialogHeader = styled.header`
   display: flex;
   min-width: 0;
@@ -6424,6 +6454,11 @@ export const WorkspaceModalCloseButton = styled.button`
     border-color: rgba(239, 107, 107, 0.38);
     color: #ffc8c8;
     background: rgba(239, 107, 107, 0.1);
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.62;
   }
 
   svg {
@@ -6625,6 +6660,12 @@ export const TerminalCountButton = styled.button`
       linear-gradient(180deg, rgba(47, 128, 255, 0.18), rgba(255, 122, 24, 0.055)),
       rgba(13, 17, 23, 0.92);
     box-shadow: inset 0 0 0 1px rgba(98, 160, 255, 0.12);
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.58;
+    transform: none;
   }
 `;
 

@@ -1396,6 +1396,17 @@ function getTerminalWheelEventDiagnostics(event) {
   };
 }
 
+function getCsiParamValue(value) {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  const numberValue = Number(candidate);
+
+  return Number.isFinite(numberValue) ? numberValue : 0;
+}
+
+function isEraseSavedLinesCsiParams(params) {
+  return getCsiParamValue(Array.isArray(params) ? params[0] : undefined) === 3;
+}
+
 function clampTerminalLine(value, minimum, maximum) {
   const numericValue = Number(value);
 
@@ -2306,6 +2317,40 @@ function WorkspaceTerminal({
         },
       );
     };
+
+    if (TERMINAL_IS_WINDOWS_HOST && terminal.parser?.registerCsiHandler) {
+      try {
+        const eraseSavedLinesHandler = terminal.parser.registerCsiHandler({ final: "J" }, (params) => {
+          if (!isEraseSavedLinesCsiParams(params)) {
+            return false;
+          }
+
+          logTerminalScrollDiagnostic(
+            "frontend.scrollback_purge_blocked",
+            {
+              csiFinal: "J",
+              csiParams: Array.isArray(params) ? params : [],
+            },
+            {
+              force: true,
+              throttleMs: 0,
+            },
+          );
+
+          return true;
+        });
+        disposables.push(eraseSavedLinesHandler);
+      } catch (error) {
+        logTerminalScrollDiagnostic(
+          "frontend.scrollback_purge_shield_error",
+          { message: getErrorMessage(error, "Unable to register scrollback purge shield.") },
+          {
+            force: true,
+            throttleMs: 0,
+          },
+        );
+      }
+    }
 
     if (windowsTerminalDiagnosticsEnabled) {
       const handleTerminalWheelCapture = (event) => {

@@ -47,8 +47,8 @@ function TerminalView({
   terminalAgentsByIndex = {},
   terminalRolesByIndex = {},
   terminalWorkspaceWorkingDirectory,
-  terminalWorkspaceTerminalIndexes,
-  terminalWorkspaceVisibleTerminalCount,
+  terminalWorkspaceLogicalIndexes,
+  terminalWorkspaceLogicalTerminalCount,
   agentStatusError,
   agentStatuses,
   agentStatusState,
@@ -62,7 +62,7 @@ function TerminalView({
   shouldShowWorkspaceSetup,
   showSettingsView,
   splitWorkspaceTerminal,
-  terminalPanelRows,
+  terminalDisplayRows,
   viewMotion,
   workspaceAgentLaunchEpoch,
   workspaceError,
@@ -72,7 +72,13 @@ function TerminalView({
   workspaceTerminalRenderAgent,
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
-  const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && terminalPanelRows.length > 0;
+  const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
+    ? terminalWorkspaceLogicalIndexes
+    : [];
+  const displayTerminalRows = Array.isArray(terminalDisplayRows)
+    ? terminalDisplayRows
+    : [];
+  const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && displayTerminalRows.length > 0;
   const [activeTerminalPaneId, setActiveTerminalPaneId] = useState("");
   const [fullscreenTerminalIndex, setFullscreenTerminalIndex] = useState(null);
   const [fullscreenMotion, setFullscreenMotion] = useState(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
@@ -97,13 +103,13 @@ function TerminalView({
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
   const visibleTerminalPaneIds = useMemo(() => (
     terminalWorkspace
-      ? terminalWorkspaceTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
+      ? logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
       : []
-  ), [getTerminalPaneId, terminalWorkspace, terminalWorkspaceTerminalIndexes]);
+  ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
-    && terminalWorkspaceTerminalIndexes.includes(fullscreenTerminalIndex);
+    && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
   const fullscreenState = fullscreenActive
     ? fullscreenMotion.phase === "opening" || fullscreenMotion.phase === "closing"
       ? fullscreenMotion.phase
@@ -158,21 +164,21 @@ function TerminalView({
 
   useEffect(() => {
     setFullscreenTerminalIndex((currentIndex) => (
-      Number.isInteger(currentIndex) && terminalWorkspaceTerminalIndexes.includes(currentIndex)
+      Number.isInteger(currentIndex) && logicalTerminalIndexes.includes(currentIndex)
         ? currentIndex
         : null
     ));
-  }, [terminalWorkspaceTerminalIndexes]);
+  }, [logicalTerminalIndexes]);
 
   useEffect(() => {
     if (
       Number.isInteger(fullscreenTerminalIndex)
-      && !terminalWorkspaceTerminalIndexes.includes(fullscreenTerminalIndex)
+      && !logicalTerminalIndexes.includes(fullscreenTerminalIndex)
     ) {
       clearFullscreenTransitionTimer();
       setFullscreenMotion(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
     }
-  }, [clearFullscreenTransitionTimer, fullscreenTerminalIndex, terminalWorkspaceTerminalIndexes]);
+  }, [clearFullscreenTransitionTimer, fullscreenTerminalIndex, logicalTerminalIndexes]);
 
   const handleActivateTerminalPane = useCallback(({ paneId }) => {
     if (paneId) {
@@ -268,7 +274,7 @@ function TerminalView({
                   id={`workspace-terminal-rows-${terminalWorkspace.id}`}
                   orientation="vertical"
                 >
-                  {terminalPanelRows.map((row, rowOrderIndex) => (
+                  {displayTerminalRows.map((row, rowOrderIndex) => (
                     <Fragment key={`row-${row.rowIndex}`}>
                       {rowOrderIndex > 0 && (
                         <ResizeHandle
@@ -277,9 +283,9 @@ function TerminalView({
                       )}
                       <ResizePanel
                         data-terminal-row="true"
-                        defaultSize={`${100 / terminalPanelRows.length}%`}
+                        defaultSize={`${100 / displayTerminalRows.length}%`}
                         id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
-                        minSize={getTerminalPaneMinSizePercent(terminalPanelRows.length)}
+                        minSize={getTerminalPaneMinSizePercent(displayTerminalRows.length)}
                       >
                         <ResizePanelGroup
                           id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
@@ -319,7 +325,7 @@ function TerminalView({
                                   onSplitTerminal={handleSplitTerminal}
                                   onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                                   prewarmShell={shouldPrewarmWorkspaceTerminals}
-                                  terminalCount={terminalWorkspaceVisibleTerminalCount}
+                                  terminalCount={terminalWorkspaceLogicalTerminalCount}
                                   terminalIndex={terminalIndex}
                                   terminalRole={getTerminalRole(terminalIndex)}
                                   workingDirectory={terminalWorkspaceWorkingDirectory}
@@ -337,7 +343,7 @@ function TerminalView({
               </WorkspaceTerminalPanels>
             ) : !hasWorkspaceTerminals ? (
               <WorkspaceTerminal
-                key={`${terminalWorkspace?.id || "empty"}-${terminalWorkspaceTerminalIndexes[0] || 0}-${getTerminalRole(terminalWorkspaceTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
+                key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}-${getTerminalRole(logicalTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
                 agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
@@ -345,7 +351,7 @@ function TerminalView({
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
                 fullscreenState="idle"
-                isActive={activePaneId === getTerminalPaneId(terminalWorkspaceTerminalIndexes[0] || 0)}
+                isActive={activePaneId === getTerminalPaneId(logicalTerminalIndexes[0] || 0)}
                 isFullscreen={false}
                 onActivateTerminal={handleActivateTerminalPane}
                 onChangeTerminalRole={changeWorkspaceTerminalRole}
@@ -356,9 +362,9 @@ function TerminalView({
                 onSplitTerminal={handleSplitTerminal}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-                terminalCount={terminalWorkspaceVisibleTerminalCount}
-                terminalIndex={terminalWorkspaceTerminalIndexes[0] || 0}
-                terminalRole={getTerminalRole(terminalWorkspaceTerminalIndexes[0] || 0)}
+                terminalCount={terminalWorkspaceLogicalTerminalCount}
+                terminalIndex={logicalTerminalIndexes[0] || 0}
+                terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
                 workingDirectory={terminalWorkspaceWorkingDirectory}
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
