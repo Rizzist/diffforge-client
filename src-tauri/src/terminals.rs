@@ -774,16 +774,13 @@ async fn prepare_terminal_coordination_launch(
                 }
             };
 
-        match crate::coordination::mcp::ensure_shared_daemon_for_paths(
+        if let Err(error) = crate::coordination::mcp::ensure_shared_daemon_for_paths(
             &coordination_kernel.paths.repo_path,
             &coordination_kernel.paths.db_path,
         ) {
-            Ok(status) => {}
-            Err(error) => {
-                return Err(format!(
-                    "Unable to start shared coordination MCP daemon: {error}"
-                ));
-            }
+            return Err(format!(
+                "Unable to start shared coordination MCP daemon: {error}"
+            ));
         }
 
         let launch_provider_id = provider_for_coordination
@@ -1090,34 +1087,30 @@ async fn close_all_terminal_sessions(
         .filter_map(|(_, instance)| terminal_shutdown_coordination_cleanup_from_instance(instance))
         .collect::<Vec<_>>();
 
-    let lifecycle_scheduled = instances
-        .iter()
-        .map(|(pane_id, instance)| {
-            let notify_state = cloud_mcp_state.clone();
-            let notify_pane_id = pane_id.clone();
-            let notify_instance_id = instance.id;
-            let has_coordination = instance.coordination.is_some();
-            let notify_context = TerminalCloudMcpCloseContext::from_instance(instance);
-            tauri::async_runtime::spawn(async move {
-                cloud_mcp_mark_terminal_closed(
-                    &notify_state,
-                    &notify_pane_id,
-                    notify_instance_id,
-                    &notify_context,
-                    "close_all",
-                )
-                .await;
-            })
-        })
-        .count();
+    for (pane_id, instance) in &instances {
+        let notify_state = cloud_mcp_state.clone();
+        let notify_pane_id = pane_id.clone();
+        let notify_instance_id = instance.id;
+        let notify_context = TerminalCloudMcpCloseContext::from_instance(instance);
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_mark_terminal_closed(
+                &notify_state,
+                &notify_pane_id,
+                notify_instance_id,
+                &notify_context,
+                "close_all",
+            )
+            .await;
+        });
+    }
 
     emit_terminal_close_all_progress(&app, 0, total, None, None);
 
-    let cleanup_summary = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         enum CleanupSignal {
             Active,
             Warm,
-            Login(usize),
+            Login,
         }
 
         let closed_count = Arc::new(AtomicUsize::new(0));
@@ -1154,7 +1147,7 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
-                cleanup_warm_pty_with_context(warm_pty, "close_all");
+                cleanup_warm_pty_with_context(warm_pty);
                 let _ = cleanup_tx.send(CleanupSignal::Warm);
             });
         }
@@ -1163,8 +1156,8 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
-                let login_closed = cleanup_login_terminal_children_with_context("close_all");
-                let _ = cleanup_tx.send(CleanupSignal::Login(login_closed));
+                cleanup_login_terminal_children();
+                let _ = cleanup_tx.send(CleanupSignal::Login);
             });
         }
 
@@ -1192,8 +1185,8 @@ async fn close_all_terminal_sessions(
                 Ok(CleanupSignal::Warm) => {
                     warm_done += 1;
                 }
-                Ok(CleanupSignal::Login(closed)) => {
-                    login_closed = Some(closed);
+                Ok(CleanupSignal::Login) => {
+                    login_closed = Some(());
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     timed_out = true;
@@ -1205,53 +1198,18 @@ async fn close_all_terminal_sessions(
             }
         }
 
-        let coordination_summary = if timed_out {
-            json!({
-                "completed": false,
-                "errors": 0,
-                "groups": null,
-                "interrupted": null,
-                "session_count": coordination_cleanups.len(),
-                "skipped_reason": "cleanup_wait_timed_out",
-                "timed_out": false,
-            })
-        } else {
+        if !timed_out {
             cleanup_terminal_shutdown_coordination_batch_with_timeout(
                 coordination_cleanups,
                 "close_all",
                 Duration::from_millis(TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS),
-            )
-        };
-
-        let refill_idle = if timed_out {
-            false
-        } else {
-            let refill_idle = pty_pool.wait_for_refill_idle();
-            refill_idle
-        };
-        let login_closed = login_closed.unwrap_or(0);
-        let console_hosts_closed = cleanup_windows_headless_console_hosts("close_all");
-        (
-            active_done,
-            warm_done,
-            login_closed,
-            console_hosts_closed,
-            refill_idle,
-            timed_out,
-            coordination_summary,
-        )
+            );
+            pty_pool.wait_for_refill_idle();
+        }
+        cleanup_windows_headless_console_hosts();
     })
     .await
     .map_err(|error| format!("Unable to join terminal shutdown cleanup: {error}"))?;
-    let (
-        active_done,
-        warm_done,
-        login_closed,
-        console_hosts_closed,
-        refill_idle,
-        timed_out,
-        coordination_summary,
-    ) = cleanup_summary;
 
     Ok(closed)
 }
@@ -1354,7 +1312,7 @@ async fn terminal_open(
 
     let preserve_coordination_session =
         request.preserve_coordination_session.unwrap_or(false) && !plain_shell;
-    let closed_existing = close_terminal_session(
+    let _ = close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
@@ -1418,7 +1376,6 @@ async fn terminal_open(
 
     let mut command = "prepared-shell".to_string();
     let mut agent_started = false;
-    let mut launch_arg_count = args.len();
     let terminal_coordination = coordination_context
         .as_ref()
         .map(terminal_coordination_session_from_context);
@@ -1453,7 +1410,6 @@ async fn terminal_open(
             &pane_id,
             instance_id,
         );
-        launch_arg_count = launch_args.len();
         let coordination_env_vars = terminal_coordination
             .as_ref()
             .map(|coordination| coordination.env_vars.as_slice())
@@ -1491,7 +1447,6 @@ async fn terminal_open(
         .write()
         .await
         .insert(pane_id.clone(), instance);
-    let displaced_existing = displaced_instance.is_some();
     if let Some(displaced_instance) = displaced_instance {
         cleanup_terminal_instance_async(
             displaced_instance,
@@ -1708,19 +1663,13 @@ async fn terminal_start_agent(
                 .to_string(),
         );
     }
-    match require_cloud_mcp_terminal_gate_for_path(
+    require_cloud_mcp_terminal_gate_for_path(
         cloud_mcp_state.inner(),
         instance.working_directory.as_ref(),
         None,
         None,
     )
-    .await
-    {
-        Ok(status) => (),
-        Err(error) => {
-            return Err(error);
-        }
-    }
+    .await?;
     let launch_args = terminal_args_with_codex_mcp_identity(
         definition.id,
         &args,
@@ -1973,12 +1922,7 @@ async fn terminal_start_agent_many(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
         ));
     }
-    match require_cloud_mcp_connected_state(cloud_mcp_state.inner()).await {
-        Ok(status) => (),
-        Err(error) => {
-            return Err(error);
-        }
-    }
+    require_cloud_mcp_connected_state(cloud_mcp_state.inner()).await?;
 
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -2041,9 +1985,9 @@ async fn terminal_write_to_audio_input_target(
     state: State<'_, TerminalState>,
     data: String,
 ) -> Result<bool, String> {
-    let Some(target) = active_terminal_audio_input_target(&state)? else {
+    if active_terminal_audio_input_target(&state)?.is_none() {
         return Ok(false);
-    };
+    }
 
     let wrote = write_to_active_terminal_audio_input_target(&app, &state, &data).await?;
 
@@ -2422,34 +2366,11 @@ fn terminal_parked_waiting_on_from_blocking_dependencies(
     waiting_on
 }
 
-fn terminal_parked_waiting_on_from_resume_state(state: &Value) -> Vec<TerminalParkedWaitingOn> {
-    let mut waiting_on = terminal_parked_waiting_on_from_blocking_dependencies(
-        &state["data"]["blocking_dependencies"],
-    );
-    for blocker in
-        terminal_parked_waiting_on_from_blocking_dependencies(&state["data"]["blocked_slices"])
-    {
-        terminal_push_unique_waiting_on(&mut waiting_on, blocker);
-    }
-    for blocker in terminal_parked_waiting_on_from_blocking_dependencies(
-        &state["data"]["parked_resource_intents"],
-    ) {
-        terminal_push_unique_waiting_on(&mut waiting_on, blocker);
-    }
-    waiting_on
-}
-
 fn terminal_task_status_is_terminal(status: &str) -> bool {
     matches!(
         status,
         "merged" | "done" | "completed" | "cancelled" | "interrupted" | "skipped"
     )
-}
-
-fn terminal_resume_state_has_parked_intents(state: &Value) -> bool {
-    state["data"]["parked_resource_intents"]
-        .as_array()
-        .is_some_and(|items| !items.is_empty())
 }
 
 fn terminal_parking_snapshot_from_kernel(
@@ -4135,32 +4056,11 @@ async fn terminal_interrupt_agent(
     Ok(())
 }
 
-struct TerminalResizeApplyResult {
-    applied: bool,
-    previous_cols: u16,
-    previous_rows: u16,
-    next_cols: u16,
-    next_rows: u16,
-}
-
-async fn resize_terminal_instance(
-    instance: &TerminalInstance,
-    size: PtySize,
-) -> Result<TerminalResizeApplyResult, String> {
+async fn resize_terminal_instance(instance: &TerminalInstance, size: PtySize) -> Result<(), String> {
     let mut current_size = instance.size.lock().await;
-    let previous_cols = current_size.cols;
-    let previous_rows = current_size.rows;
-    let next_cols = size.cols;
-    let next_rows = size.rows;
 
     if *current_size == size {
-        return Ok(TerminalResizeApplyResult {
-            applied: false,
-            previous_cols,
-            previous_rows,
-            next_cols,
-            next_rows,
-        });
+        return Ok(());
     }
 
     let master = instance.master.lock().await;
@@ -4170,13 +4070,7 @@ async fn resize_terminal_instance(
         .map_err(|error| format!("Unable to resize terminal: {error}"))?;
     *current_size = size;
 
-    Ok(TerminalResizeApplyResult {
-        applied: true,
-        previous_cols,
-        previous_rows,
-        next_cols,
-        next_rows,
-    })
+    Ok(())
 }
 
 async fn resolve_terminal_for_resize(
@@ -4238,16 +4132,11 @@ async fn resize_terminal(
             return Err(error);
         }
     };
-    let Some((resolved_pane_id, instance)) = resolved else {
+    let Some((_, instance)) = resolved else {
         return Ok(());
     };
 
-    let resize_result = match resize_terminal_instance(&instance, size).await {
-        Ok(result) => result,
-        Err(error) => {
-            return Err(error);
-        }
-    };
+    resize_terminal_instance(&instance, size).await?;
 
     Ok(())
 }
@@ -4275,12 +4164,7 @@ async fn terminal_resize(
             return Err(error);
         }
     };
-    let resize_result = match resize_terminal_instance(&instance, size).await {
-        Ok(result) => result,
-        Err(error) => {
-            return Err(error);
-        }
-    };
+    resize_terminal_instance(&instance, size).await?;
 
     Ok(())
 }
@@ -4300,7 +4184,7 @@ async fn terminal_close(
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
 
-    match close_terminal_session(
+    close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
@@ -4308,13 +4192,7 @@ async fn terminal_close(
         preserve_coordination_session,
         wait_for_cleanup,
     )
-    .await
-    {
-        Ok(closed) => {}
-        Err(error) => {
-            return Err(error);
-        }
-    }
+    .await?;
 
     Ok(())
 }

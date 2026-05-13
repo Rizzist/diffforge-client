@@ -2313,7 +2313,6 @@ impl CoordinationKernel {
         context_role: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
-        let agent_slot_id_for_log = slot["id"].as_str().unwrap_or_default().to_string();
         let session = self.create_session_for_slot_with_options(
             &slot,
             task_id,
@@ -2475,7 +2474,6 @@ impl CoordinationKernel {
              ORDER BY updated_at DESC, created_at DESC",
             &[&agent_slot_id],
         )?;
-        let active_session_count = active_sessions.len();
         for existing in active_sessions {
             let Some(existing_session_id) = existing["id"].as_str() else {
                 continue;
@@ -3201,9 +3199,8 @@ impl CoordinationKernel {
         match self.conn.execute(
                 "UPDATE agent_sessions SET status='interrupted', updated_at=?1 WHERE id=?2 AND status='active'",
                 params![now, session_id],
-            ) {
-            Ok(updated) => {
-            }
+        ) {
+            Ok(_) => {}
             Err(error) => {
                 let error = format!("Unable to interrupt session: {error}");
                 return Err(error);
@@ -3215,7 +3212,7 @@ impl CoordinationKernel {
                  WHERE session_id=?2 AND status='active'",
             params![now, session_id],
         ) {
-            Ok(updated) => {}
+            Ok(_) => {}
             Err(error) => {
                 let error = format!("Unable to expire interrupted session leases: {error}");
                 return Err(error);
@@ -3227,7 +3224,7 @@ impl CoordinationKernel {
                  WHERE session_id=?2 AND status='active'",
             params![now, session_id],
         ) {
-            Ok(updated) => {}
+            Ok(_) => {}
             Err(error) => {
                 let error = format!("Unable to mark interrupted session worktrees: {error}");
                 return Err(error);
@@ -3239,7 +3236,7 @@ impl CoordinationKernel {
                  WHERE active_session_id=?2",
             params![now, session_id],
         ) {
-            Ok(updated) => {}
+            Ok(_) => {}
             Err(error) => {
                 let error = format!("Unable to release interrupted session slot: {error}");
                 return Err(error);
@@ -3673,8 +3670,6 @@ impl CoordinationKernel {
         if telemetry_pane_id.is_some() {
             if let Some(cached) = cached_workspace_mcp_activation(&cache_key) {
                 let cached_response = cached.response;
-                let cached_hash = cached.config_hash;
-                let cache_age_ms = cached.cached_at.elapsed().as_secs_f64() * 1000.0;
                 return Ok(cached_response);
             }
         }
@@ -3907,7 +3902,7 @@ impl CoordinationKernel {
         &self,
         agent_slot_id: &str,
         session_id: &str,
-        pty_id: Option<&str>,
+        _pty_id: Option<&str>,
         _task_id: Option<&str>,
         worktree_id: Option<&str>,
         worktree_path: Option<&str>,
@@ -8155,7 +8150,6 @@ impl CoordinationKernel {
     fn try_cached_integration_worktree(
         &self,
         telemetry_pane_id: Option<&str>,
-        total_started_at: Instant,
     ) -> Result<Option<IntegrationWorktree>, String> {
         if telemetry_pane_id.is_none() {
             return Ok(None);
@@ -8200,7 +8194,7 @@ impl CoordinationKernel {
                 };
                 Ok(Some(integration))
             }
-            Err(error) => {
+            Err(_) => {
                 if let Ok(mut guard) = integration_worktree_cache().lock() {
                     guard.remove(&cache_key);
                 }
@@ -8231,10 +8225,7 @@ impl CoordinationKernel {
         &self,
         telemetry_pane_id: Option<&str>,
     ) -> Result<IntegrationWorktree, String> {
-        let total_started_at = Instant::now();
-        if let Some(integration) =
-            self.try_cached_integration_worktree(telemetry_pane_id, total_started_at)?
-        {
+        if let Some(integration) = self.try_cached_integration_worktree(telemetry_pane_id)? {
             return Ok(integration);
         }
         if !repo_has_git(&self.paths.repo_path) {
@@ -12994,7 +12985,7 @@ impl CoordinationKernel {
     fn prepared_worktree_for_slot_with_telemetry(
         &self,
         agent_slot_id: &str,
-        telemetry_pane_id: Option<&str>,
+        _telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
@@ -13659,7 +13650,7 @@ impl CoordinationKernel {
     fn refresh_agent_worktree_from_integration_with_telemetry(
         &self,
         worktree_path: &Path,
-        telemetry_pane_id: Option<&str>,
+        _telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
         let dirty = self
             .changed_files(worktree_path)

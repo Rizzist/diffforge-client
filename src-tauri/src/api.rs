@@ -365,12 +365,12 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 return Err(error);
             }
         };
-        let agents_gitignore_update = match ensure_workspace_agents_gitignore(&working_directory) {
-            Ok(update) => update,
+        match ensure_workspace_agents_gitignore(&working_directory) {
+            Ok(_) => {}
             Err(error) => {
                 return Err(error);
             }
-        };
+        }
         let resolved_directory = workspace_path_display(&working_directory);
         Ok(ForgeWorkingDirectory {
             working_directory: resolved_directory,

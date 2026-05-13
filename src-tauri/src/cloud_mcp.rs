@@ -196,10 +196,7 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
     cloud_mcp_snapshot(&runtime)
 }
 
-async fn cloud_mcp_connect_state(
-    state: &CloudMcpState,
-    reason: &str,
-) -> Result<CloudMcpStatus, String> {
+async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
     let base_url = {
         let runtime = state.inner.lock().await;
         runtime.base_url.clone()
@@ -216,7 +213,6 @@ async fn cloud_mcp_connect_state(
 
         match response {
             Ok(response) if response.status().is_success() => {
-                let server_response = response.json::<Value>().await.unwrap_or(Value::Null);
                 let mut runtime = state.inner.lock().await;
                 runtime.connected = true;
                 runtime.status = "connected".to_string();
@@ -249,14 +245,13 @@ async fn cloud_mcp_connect_state(
 
 async fn cloud_mcp_connected_or_connect(
     state: &CloudMcpState,
-    reason: &str,
 ) -> Result<CloudMcpStatus, String> {
     let current = cloud_mcp_status_snapshot(state).await;
     if current.connected {
         return Ok(current);
     }
 
-    cloud_mcp_connect_state(state, reason).await
+    cloud_mcp_connect_state(state).await
 }
 
 async fn require_cloud_mcp_connected_state(
@@ -1529,7 +1524,7 @@ async fn cloud_mcp_claim_terminal_lane(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_claimed", &payload).await {}
+    let _ = cloud_mcp_post_event_endpoint(state, "lane_claimed", &payload).await;
 }
 
 async fn cloud_mcp_release_terminal_lane(
@@ -1564,7 +1559,7 @@ async fn cloud_mcp_release_terminal_lane(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_released", &payload).await {}
+    let _ = cloud_mcp_post_event_endpoint(state, "lane_released", &payload).await;
 }
 
 async fn cloud_mcp_sync_terminal_agent_status(
@@ -1619,10 +1614,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    match cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await {
-        Ok(_) => {}
-        Err(error) => {}
-    }
+    let _ = cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await;
 }
 
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
@@ -1660,10 +1652,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     lane: &str,
     brief: &str,
 ) -> Option<String> {
-    if cloud_mcp_connected_or_connect(state, "terminal_task_lifecycle")
-        .await
-        .is_err()
-    {
+    if cloud_mcp_connected_or_connect(state).await.is_err() {
         return None;
     }
 
@@ -1750,10 +1739,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     close_context: &TerminalCloudMcpCloseContext,
     reason: &str,
 ) {
-    if cloud_mcp_connected_or_connect(state, "terminal_closed")
-        .await
-        .is_err()
-    {
+    if cloud_mcp_connected_or_connect(state).await.is_err() {
         let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.remove(&terminal_key);
@@ -2068,7 +2054,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         );
     }
 
-    if let Err(error) = cloud_mcp_connected_or_connect(&state, "terminal_context_pack").await {
+    if let Err(error) = cloud_mcp_connected_or_connect(&state).await {
         let _ = cloud_mcp_workspace_log(
             &working_directory,
             "cloud_mcp.context_pack.error",
@@ -2382,10 +2368,7 @@ async fn cloud_mcp_track_terminal_file_changes(
         if !should_report {
             continue;
         }
-        if cloud_mcp_connected_or_connect(&state, "terminal_subtask_checkpoint")
-            .await
-            .is_err()
-        {
+        if cloud_mcp_connected_or_connect(&state).await.is_err() {
             continue;
         }
         let brief = format!(
@@ -2485,7 +2468,7 @@ async fn require_cloud_mcp_terminal_gate_for_path(
 
 #[tauri::command]
 async fn cloud_mcp_connect(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
-    cloud_mcp_connect_state(state.inner(), "manual").await
+    cloud_mcp_connect_state(state.inner()).await
 }
 
 #[tauri::command]
@@ -2970,7 +2953,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
     state: &CloudMcpState,
     req: &CloudMcpSpecGraphSyncRequest,
 ) -> Result<Value, String> {
-    cloud_mcp_connected_or_connect(state, "spec_graph_sync").await?;
+    cloud_mcp_connected_or_connect(state).await?;
     let payload = json!({
         "source": "rust-diffforge-spec-graph",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
@@ -2996,7 +2979,7 @@ async fn cloud_mcp_sync_spec_graph_once(
 ) -> Result<(Value, bool), String> {
     let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
     let current_cache = cloud_mcp_read_spec_graph_cache(req, "syncing", "");
-    cloud_mcp_connected_or_connect(state, "spec_graph_background_sync").await?;
+    cloud_mcp_connected_or_connect(state).await?;
     let payload = cloud_mcp_spec_graph_sync_payload(req, &current_cache);
     let delta_response =
         match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph/delta", &payload).await {
