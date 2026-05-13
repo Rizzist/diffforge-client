@@ -683,6 +683,8 @@ fn forget_workspace_git_bootstrap_flight(key: &str, id: u64) {
 async fn ensure_workspace_git_bootstrap_for_terminal(
     root: &Path,
 ) -> Result<WorkspaceGitBootstrap, String> {
+    ensure_app_not_shutting_down("workspace Git bootstrap")?;
+
     if let Some(bootstrap) = cached_workspace_git_bootstrap(root) {
         return Ok(bootstrap);
     }
@@ -1365,6 +1367,7 @@ async fn terminal_open(
 ) -> Result<TerminalOpenResult, String> {
     let open_started_at = Instant::now();
     validate_terminal_pane_id(&request.pane_id)?;
+    ensure_app_not_shutting_down("terminal open")?;
     let pane_id = request.pane_id;
     let requested_cols = request.cols;
     let requested_rows = request.rows;
@@ -1547,6 +1550,26 @@ async fn terminal_open(
             "shell_pty": shell_pty,
         }),
     );
+    log_windows_terminal_diagnostic_event(
+        &app,
+        "backend.windows_terminal_open.done",
+        json!({
+            "agent_started": agent_started,
+            "colorterm": TERMINAL_EMULATION_COLORTERM,
+            "cols": size.cols,
+            "conpty_passthrough_requested": cfg!(windows),
+            "force_color": TERMINAL_EMULATION_FORCE_COLOR,
+            "instance_id": instance_id,
+            "kind": clean_terminal_diagnostic_log_text(&kind),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "plain_shell": plain_shell,
+            "pty_backend": if cfg!(windows) { "conpty" } else { "native" },
+            "rows": size.rows,
+            "shell_pty": shell_pty,
+            "term": TERMINAL_EMULATION_TERM,
+            "term_program": TERMINAL_EMULATION_PROGRAM,
+        }),
+    );
 
     Ok(TerminalOpenResult {
         pane_id,
@@ -1691,6 +1714,7 @@ async fn terminal_start_agent(
     model: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
+    ensure_app_not_shutting_down("terminal agent start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
     let provider = parse_agent_provider(&provider)?;
@@ -1782,6 +1806,16 @@ async fn start_terminal_agent_in_prepared_pty(
 ) -> TerminalStartAgentPaneResult {
     let pane_id = request.pane_id;
     let instance_id = request.instance_id;
+
+    if app_shutdown_requested() {
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id,
+            started: false,
+            skipped: true,
+            message: app_shutdown_blocked_message("terminal agent batch start"),
+        };
+    }
 
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
         return TerminalStartAgentPaneResult {
@@ -1957,6 +1991,7 @@ async fn terminal_start_agent_many(
     cloud_mcp_state: State<'_, CloudMcpState>,
     requests: Vec<TerminalStartAgentRequest>,
 ) -> Result<TerminalStartAgentManyResult, String> {
+    ensure_app_not_shutting_down("terminal agent batch start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
     if requests.len() > MAX_TERMINAL_START_AGENT_BATCH {

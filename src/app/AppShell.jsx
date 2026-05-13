@@ -423,7 +423,6 @@ const TERMINAL_WEBGL_STAGGER_MS = 90;
 const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
-const WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS = 18000;
 const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
@@ -777,18 +776,7 @@ function normalizeTerminalCloseProgress(payload) {
   };
 }
 
-function closeErrorMessage(error) {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return typeof error === "string" ? error : "Unknown close error.";
-}
-
 async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
-  const nativeExitStartedAt = performance.now();
-
-
   try {
     await withTimeout(
       invoke("close_app_after_terminal_shutdown"),
@@ -796,12 +784,10 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
       "Native app exit timed out.",
     );
     return;
-  } catch (nativeExitError) {
+  } catch {
   }
 
-  const closeStartedAt = performance.now();
   let closeSucceeded = false;
-
 
   try {
     await withTimeout(
@@ -824,8 +810,6 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
 
     throw new Error("Window destroy is unavailable.");
   }
-
-  const destroyStartedAt = performance.now();
 
   try {
     await withTimeout(
@@ -3402,38 +3386,16 @@ export default function App() {
       }
 
       try {
-        const result = await withTimeout(
-          invoke("terminal_close_all"),
-          WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS,
-          "Terminal shutdown timed out.",
-        );
-        const closed = normalizeCloseCount(result?.closed);
-
-        setWorkspaceCloseState((currentCloseState) => {
-          const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
-          const total = Math.max(currentProgress.total, closed, expectedTerminalTotal);
-
-          return {
-            isActive: true,
-            closed: total,
-            total,
-          };
-        });
-      } catch {
-        // App close should still complete if terminal cleanup cannot report status.
-      } finally {
-        if (typeof unlistenCloseProgress === "function") {
-          unlistenCloseProgress();
-        }
-      }
-
-      try {
         workspaceCloseAllowNativeRef.current = true;
         await closeWorkspaceWindowAfterTerminalShutdown(appWindow);
       } catch (closeError) {
         workspaceCloseAllowNativeRef.current = false;
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
+      } finally {
+        if (typeof unlistenCloseProgress === "function") {
+          unlistenCloseProgress();
+        }
       }
     });
   }, []);

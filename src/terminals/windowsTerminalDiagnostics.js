@@ -1,8 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
+export const windowsterminaldiagnostics = true;
 
-const WINDOWS_TERMINAL_DIAGNOSTIC_STORAGE_KEY = "windowsterminaldiagnostics";
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT = 512;
 
 let backendLoggingSynced = null;
@@ -15,18 +14,8 @@ function cleanDiagnosticText(value) {
     .slice(0, WINDOWS_TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT);
 }
 
-function readStorageEnabled() {
-  try {
-    const value = window.localStorage?.getItem(WINDOWS_TERMINAL_DIAGNOSTIC_STORAGE_KEY);
-
-    return value === "1" || value === "true" || value === "yes";
-  } catch {
-    return false;
-  }
-}
-
 export function isWindowsTerminalDiagnosticLoggingEnabled() {
-  return WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || readStorageEnabled();
+  return windowsterminaldiagnostics;
 }
 
 export function syncWindowsTerminalDiagnosticLogging() {

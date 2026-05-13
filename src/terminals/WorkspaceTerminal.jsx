@@ -120,7 +120,7 @@ import {
   TerminalParkedAgentBadge,
   TerminalParkedCancelButton,
   TerminalRestartPill,
-  TerminalAgentIdBadge,
+  TerminalAgentDot,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -709,6 +709,7 @@ const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
 const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
+const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 80, 190, 280];
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -1075,22 +1076,6 @@ function getAgentStatusSummary(agentStatuses) {
   return [codex, claude, opencode].filter(Boolean);
 }
 
-function getShortRealAgentId(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  return text.replace(/[^a-z0-9]/gi, "").slice(0, 3);
-}
-
-function getTerminalAgentId(agentId, realAgentId) {
-  const realId = getShortRealAgentId(realAgentId);
-  if (realId) return realId;
-
-  const kind = getTerminalAgentKind(agentId);
-  if (kind === "generic") return "sh";
-
-  return "...";
-}
-
 function getTerminalRoleSwitchOptions(agentStatuses) {
   const installedAgentIds = new Set(
     (Array.isArray(agentStatuses) ? agentStatuses : [])
@@ -1123,6 +1108,19 @@ function getEventTargetElement(target) {
 
 function isTerminalControlEventTarget(target) {
   return Boolean(getEventTargetElement(target)?.closest?.(TERMINAL_CONTROL_SELECTOR));
+}
+
+function getPlainDomRect(rect) {
+  if (!rect) {
+    return null;
+  }
+
+  return {
+    height: Number(rect.height) || 0,
+    left: Number(rect.left) || 0,
+    top: Number(rect.top) || 0,
+    width: Number(rect.width) || 0,
+  };
 }
 
 export function getDefaultTerminalIndexes(count) {
@@ -1717,6 +1715,7 @@ function WorkspaceTerminal({
   agentStatuses,
   agentStatusError,
   agentStatusState,
+  fullscreenState = "idle",
   isActive = false,
   isFullscreen = false,
   onActivateTerminal,
@@ -1738,6 +1737,8 @@ function WorkspaceTerminal({
 }) {
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
+  const resizeControllerRef = useRef(null);
+  const surfaceRef = useRef(null);
   const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
@@ -1770,8 +1771,9 @@ function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
-  const terminalAgentId = getTerminalAgentId(paneAgentId, terminalLaunchInfo?.agentId);
-  const terminalAgentTitle = `${isGenericTerminal ? "Generic shell" : agent?.label || "Agent"} terminal ${terminalAgentId}`;
+  const terminalAgentTitle = isGenericTerminal
+    ? "Generic shell terminal"
+    : `${agent?.label || "Agent"} terminal`;
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
     const terminal = xtermRef.current;
     if (!terminal) {
@@ -1900,6 +1902,33 @@ function WorkspaceTerminal({
     requestTerminalAudioInputTarget(false);
     return undefined;
   }, [isActive, paneId, requestTerminalAudioInputTarget, updateTerminalInteractiveState]);
+
+  useEffect(() => {
+    const controller = resizeControllerRef.current;
+    if (!controller) {
+      return undefined;
+    }
+
+    const reason = isFullscreen
+      ? `terminal_fullscreen_${fullscreenState || "open"}`
+      : "terminal_fullscreen_grid";
+    const timers = [];
+
+    TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS.forEach((delayMs) => {
+      if (delayMs <= 0) {
+        controller.schedule(reason, 0);
+        return;
+      }
+
+      timers.push(window.setTimeout(() => {
+        controller.schedule(reason, 0);
+      }, delayMs));
+    });
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [fullscreenState, isFullscreen]);
 
   useEffect(() => {
     if (!restartRoleMenuOpen) {
@@ -2163,6 +2192,7 @@ function WorkspaceTerminal({
       macOptionIsMeta: true,
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
       reflowCursorLine: false,
+      scrollOnEraseInDisplay: TERMINAL_IS_WINDOWS_HOST,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       ...(TERMINAL_IS_WINDOWS_HOST ? { windowsPty: { backend: "conpty" } } : {}),
       theme: {
@@ -2208,6 +2238,7 @@ function WorkspaceTerminal({
       paneId,
       rendererMode,
       scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
+      scrollOnEraseInDisplay: TERMINAL_IS_WINDOWS_HOST,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       terminalIndex,
       useWebglRenderer,
@@ -3229,6 +3260,7 @@ function WorkspaceTerminal({
       paneId: () => paneId,
       term: terminal,
     });
+    resizeControllerRef.current = resizeController;
     resizeController?.schedule("mount");
 
     async function startTerminal() {
@@ -3861,6 +3893,9 @@ function WorkspaceTerminal({
 
     return () => {
       isDisposed = true;
+      if (resizeControllerRef.current === resizeController) {
+        resizeControllerRef.current = null;
+      }
       resizeController?.dispose();
       activeWebglAddon = null;
       if (webglAttachTimer) {
@@ -4128,8 +4163,13 @@ function WorkspaceTerminal({
       return;
     }
 
+    const surfaceElement = surfaceRef.current;
+    const panelElement = surfaceElement?.parentElement || null;
+
     onToggleFullscreenTerminal?.({
+      panelRect: getPlainDomRect(panelElement?.getBoundingClientRect?.()),
       paneId,
+      surfaceRect: getPlainDomRect(surfaceElement?.getBoundingClientRect?.()),
       terminalIndex,
       workspaceId: workspace?.id || "",
     });
@@ -4218,13 +4258,16 @@ function WorkspaceTerminal({
     <TerminalWorkspaceSurface
       data-focused={terminalFocused ? "true" : "false"}
       data-pane-id={paneId}
+      data-terminal-fullscreen={isFullscreen ? "true" : undefined}
+      data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
       data-terminal-index={terminalIndex}
       onFocusCapture={handleTerminalSurfaceFocusCapture}
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
+      ref={surfaceRef}
     >
       <TerminalRestartPill data-terminal-control="true">
-        <TerminalAgentIdBadge
-          aria-label={terminalAgentTitle}
+        <TerminalAgentDot
+          aria-hidden="true"
           data-agent={terminalAgentKind}
           data-slot={getTerminalAgentColorSlot(terminalIndex)}
           title={terminalAgentTitle}
@@ -4370,7 +4413,7 @@ function WorkspaceTerminal({
                       {(parkedPrompt.waitingOn || []).length
                         ? parkedPrompt.waitingOn.map((agent, index) => (
                           <TerminalParkedAgentBadge key={`${agent.agentId || agent.agentLabel || "agent"}-${index}`}>
-                            {agent.agentLabel || getShortRealAgentId(agent.agentId) || "agent"}
+                            {agent.agentLabel || "agent"}
                           </TerminalParkedAgentBadge>
                         ))
                         : <TerminalParkedAgentBadge>peer</TerminalParkedAgentBadge>}

@@ -819,6 +819,20 @@ fn default_terminal_working_directory() -> PathBuf {
         })
 }
 
+const TERMINAL_EMULATION_TERM: &str = "xterm-256color";
+const TERMINAL_EMULATION_COLORTERM: &str = "truecolor";
+const TERMINAL_EMULATION_FORCE_COLOR: &str = "1";
+const TERMINAL_EMULATION_PROGRAM: &str = "DiffForge";
+
+fn apply_terminal_emulation_env(command: &mut CommandBuilder) {
+    command.env("TERM", TERMINAL_EMULATION_TERM);
+    command.env("COLORTERM", TERMINAL_EMULATION_COLORTERM);
+    command.env("FORCE_COLOR", TERMINAL_EMULATION_FORCE_COLOR);
+    command.env("CLICOLOR", TERMINAL_EMULATION_FORCE_COLOR);
+    command.env("TERM_PROGRAM", TERMINAL_EMULATION_PROGRAM);
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+}
+
 fn spawn_terminal_pty(
     size: PtySize,
     mut command: CommandBuilder,
@@ -828,8 +842,7 @@ fn spawn_terminal_pty(
     let pair = pty_system
         .openpty(size)
         .map_err(|error| format!("Unable to open {context} PTY: {error}"))?;
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
+    apply_terminal_emulation_env(&mut command);
 
     let child = pair
         .slave
@@ -1214,6 +1227,8 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
 }
 
 fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
+    ensure_app_not_shutting_down("agent login terminal")?;
+
     let definition = agent_definition(provider);
     let binary = npm_global_executable_path(definition)
         .map(|path| path.to_string_lossy().to_string())

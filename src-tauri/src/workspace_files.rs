@@ -397,6 +397,8 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
 }
 
 fn ensure_workspace_git_ready_for_coordination(root: &Path) -> Result<WorkspaceGitBootstrap, String> {
+    ensure_app_not_shutting_down("workspace Git setup")?;
+
     let repo_key = root
         .canonicalize()
         .map(|path| normalized_path_key(&path))
@@ -754,6 +756,10 @@ fn parse_git_status_output(output: &str) -> HashMap<String, String> {
 }
 
 fn workspace_git_statuses(root: &Path) -> HashMap<String, String> {
+    if app_shutdown_requested() {
+        return HashMap::new();
+    }
+
     let capture = match run_command_capture(
         "git",
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -962,6 +968,10 @@ fn truncate_workspace_diff(diff: String) -> (String, bool) {
 }
 
 fn workspace_file_git_diff(root: &Path, relative_path: &str, cached: bool) -> String {
+    if app_shutdown_requested() {
+        return String::new();
+    }
+
     let mut args = vec![
         "-c",
         "core.quotepath=false",

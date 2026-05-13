@@ -32,7 +32,7 @@ import {
   PageSubline,
   PanelKicker,
   PanelHeading,
-  TerminalAgentIdBadge,
+  TerminalAgentDot,
   VaultPlaceholderIcon,
 } from "../app/appStyles";
 
@@ -305,7 +305,7 @@ export default function McpsWorkspaceView({
                   const slotKey = mount.slot_key || "";
                   return (
                     <McpMountRow key={mount.session_id || slotKey}>
-                      <TerminalAgentIdBadge
+                      <TerminalAgentDot
                         aria-hidden="true"
                         data-agent={normalizedAgentKind}
                         data-slot={slotColorSlot(slotKey)}

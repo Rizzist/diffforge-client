@@ -751,19 +751,57 @@ fn cloud_mcp_gitignore_glob_matches(pattern: &str, value: &str) -> bool {
     matches_from(&pattern, &value, &mut memo, 0, 0)
 }
 
-fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn cloud_mcp_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    if app_shutdown_requested() {
         return None;
     }
 
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn().ok()?;
+    loop {
+        if app_shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+
+    let output = child.wait_with_output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
+    let output = cloud_mcp_git_output(
+        root,
+        &["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    )?;
+
     let mut file_paths = output
-        .stdout
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
         .filter_map(cloud_mcp_normalized_git_path)
@@ -1821,21 +1859,14 @@ fn cloud_mcp_title_from_changed_files(changed_files: &[Value]) -> Option<String>
 }
 
 fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
-    let Ok(output) = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
-        .output()
+    let Some(output) =
+        cloud_mcp_git_output(root, &["status", "--porcelain", "-z", "--untracked-files=all"])
     else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
 
     let mut files = Vec::new();
     let mut parts = output
-        .stdout
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty());
     while let Some(entry) = parts.next() {

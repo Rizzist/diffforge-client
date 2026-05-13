@@ -56,6 +56,10 @@ fn run_command_capture_with_cancel<F>(
 where
     F: FnMut() -> bool,
 {
+    if app_shutdown_requested() {
+        return Err(app_shutdown_blocked_message(binary));
+    }
+
     if should_cancel() {
         return Err(canceled_message.to_string());
     }
@@ -71,6 +75,18 @@ where
         command.stdin(Stdio::piped());
     } else {
         command.stdin(Stdio::null());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    if app_shutdown_requested() {
+        return Err(app_shutdown_blocked_message(binary));
     }
 
     let mut child = command
@@ -96,10 +112,14 @@ where
     let started_at = Instant::now();
 
     loop {
-        if should_cancel() {
+        if should_cancel() || app_shutdown_requested() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(canceled_message.to_string());
+            return if app_shutdown_requested() {
+                Err(app_shutdown_blocked_message(binary))
+            } else {
+                Err(canceled_message.to_string())
+            };
         }
 
         match child.try_wait() {

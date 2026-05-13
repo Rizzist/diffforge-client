@@ -1,15 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 fn whisper_local_audio_log_path() -> PathBuf {
-    let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = tauri_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(tauri_root);
-
-    project_root
-        .join(DIAGNOSTIC_LOG_DIR)
-        .join(WHISPER_LOCAL_AUDIO_LOG_FILE)
+    diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
 }
 
 fn clean_whisper_local_audio_log_text(value: &str) -> String {

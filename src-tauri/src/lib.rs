@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     thread,
@@ -86,6 +86,12 @@ const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
+const APP_SHUTDOWN_PHASE_RUNNING: u8 = 0;
+const APP_SHUTDOWN_PHASE_QUIESCING: u8 = 1;
+const APP_SHUTDOWN_PHASE_STOPPING_WATCHERS: u8 = 2;
+const APP_SHUTDOWN_PHASE_CLOSING_TERMINALS: u8 = 3;
+const APP_SHUTDOWN_PHASE_STOPPING_DAEMONS: u8 = 4;
+const APP_SHUTDOWN_PHASE_EXITING: u8 = 5;
 const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
@@ -120,6 +126,7 @@ const WHISPER_MODEL_URL: &str =
 const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
@@ -210,6 +217,84 @@ const SM_CYSMICON: i32 = 50;
 #[cfg(windows)]
 const WM_SETICON: u32 = 0x0080;
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetErrorMode(u_mode: u32) -> u32;
+}
+
+pub(crate) fn app_shutdown_requested() -> bool {
+    APP_SHUTDOWN_PHASE.load(Ordering::Acquire) >= APP_SHUTDOWN_PHASE_QUIESCING
+}
+
+pub(crate) fn app_shutdown_phase_label() -> &'static str {
+    match APP_SHUTDOWN_PHASE.load(Ordering::Acquire) {
+        APP_SHUTDOWN_PHASE_RUNNING => "running",
+        APP_SHUTDOWN_PHASE_QUIESCING => "quiescing",
+        APP_SHUTDOWN_PHASE_STOPPING_WATCHERS => "stopping_watchers",
+        APP_SHUTDOWN_PHASE_CLOSING_TERMINALS => "closing_terminals",
+        APP_SHUTDOWN_PHASE_STOPPING_DAEMONS => "stopping_daemons",
+        APP_SHUTDOWN_PHASE_EXITING => "exiting",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn app_shutdown_blocked_message(operation: &str) -> String {
+    format!(
+        "{operation} skipped because Diff Forge is shutting down ({})",
+        app_shutdown_phase_label()
+    )
+}
+
+pub(crate) fn ensure_app_not_shutting_down(operation: &str) -> Result<(), String> {
+    if app_shutdown_requested() {
+        Err(app_shutdown_blocked_message(operation))
+    } else {
+        Ok(())
+    }
+}
+
+fn begin_app_shutdown() -> bool {
+    APP_SHUTDOWN_PHASE
+        .compare_exchange(
+            APP_SHUTDOWN_PHASE_RUNNING,
+            APP_SHUTDOWN_PHASE_QUIESCING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn advance_app_shutdown_phase(phase: u8) {
+    loop {
+        let current = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
+        if current >= phase {
+            return;
+        }
+
+        if APP_SHUTDOWN_PHASE
+            .compare_exchange(current, phase, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn configure_windows_process_error_mode() {
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_windows_process_error_mode() {}
+
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
@@ -253,6 +338,11 @@ impl WindowsTerminalDiagnosticState {
 
 impl Drop for TerminalState {
     fn drop(&mut self) {
+        let _ = begin_app_shutdown();
+        advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
+        let _ = coordination::watcher::stop_all_file_watchers("terminal_state_drop");
+        advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_CLOSING_TERMINALS);
+
         let instances = match self.terminals.try_write() {
             Ok(mut terminals) => terminals
                 .drain()
@@ -484,7 +574,7 @@ impl PtyPool {
     }
 
     fn ensure_warm_async(self: &Arc<Self>) {
-        if self.shutting_down.load(Ordering::Acquire) {
+        if self.shutting_down.load(Ordering::Acquire) || app_shutdown_requested() {
             return;
         }
 
@@ -510,7 +600,7 @@ impl PtyPool {
 
     fn refill_blocking(&self) {
         loop {
-            if self.shutting_down.load(Ordering::Acquire) {
+            if self.shutting_down.load(Ordering::Acquire) || app_shutdown_requested() {
                 break;
             }
 
@@ -1074,88 +1164,22 @@ include!("api.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
 
-fn terminal_diagnostic_log_path() -> PathBuf {
-    if let Ok(path) = env::var("DIFFFORGE_TERMINAL_DIAGNOSTIC_LOG") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        if current_dir.join("package.json").is_file()
-            || current_dir.join("src-tauri").is_dir()
-            || current_dir.join(".git").is_dir()
-        {
-            return current_dir
-                .join(DIAGNOSTIC_LOG_DIR)
-                .join(TERMINAL_DIAGNOSTIC_LOG_FILE);
-        }
-    }
-
+fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = tauri_root
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or(tauri_root);
 
-    if project_root.exists() {
-        return project_root
-            .join(DIAGNOSTIC_LOG_DIR)
-            .join(TERMINAL_DIAGNOSTIC_LOG_FILE);
-    }
+    project_root.join(DIAGNOSTIC_LOG_DIR).join(file_name)
+}
 
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir
-                .join(DIAGNOSTIC_LOG_DIR)
-                .join(TERMINAL_DIAGNOSTIC_LOG_FILE);
-        }
-    }
-
-    PathBuf::from(DIAGNOSTIC_LOG_DIR).join(TERMINAL_DIAGNOSTIC_LOG_FILE)
+fn terminal_diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path(TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
 
 fn windows_terminal_diagnostic_log_path() -> PathBuf {
-    if let Ok(path) = env::var("DIFFFORGE_WINDOWS_TERMINAL_DIAGNOSTIC_LOG") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        if current_dir.join("package.json").is_file()
-            || current_dir.join("src-tauri").is_dir()
-            || current_dir.join(".git").is_dir()
-        {
-            return current_dir
-                .join(DIAGNOSTIC_LOG_DIR)
-                .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
-        }
-    }
-
-    let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = tauri_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(tauri_root);
-
-    if project_root.exists() {
-        return project_root
-            .join(DIAGNOSTIC_LOG_DIR)
-            .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
-    }
-
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir
-                .join(DIAGNOSTIC_LOG_DIR)
-                .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
-        }
-    }
-
-    PathBuf::from(DIAGNOSTIC_LOG_DIR).join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
+    diagnostic_log_path(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
 
 fn clean_terminal_diagnostic_log_text(value: &str) -> String {
@@ -1240,6 +1264,25 @@ fn log_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
     }
 
     write_terminal_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+}
+
+fn windows_terminal_diagnostics_enabled_for_app(app: &AppHandle) -> bool {
+    app.state::<WindowsTerminalDiagnosticState>().is_enabled()
+}
+
+fn log_windows_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
+    if !windows_terminal_diagnostics_enabled_for_app(app) {
+        return;
+    }
+
+    write_windows_terminal_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(phase),
         "source": "backend",
@@ -1400,41 +1443,48 @@ fn schedule_app_exit_after_terminal_shutdown(
         .map_err(|error| format!("Failed to schedule app close: {error}"))
 }
 
+async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
+    advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
+    let _ = coordination::watcher::stop_all_file_watchers("app_close");
+
+    advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_CLOSING_TERMINALS);
+    let _ = {
+        let terminal_state = app_for_shutdown.state::<TerminalState>();
+        let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
+        let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        close_all_terminal_sessions(
+            app_for_shutdown.clone(),
+            &terminal_state,
+            cloud_mcp_state.inner(),
+        )
+        .await
+    };
+
+    advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_DAEMONS);
+    let _ = coordination::mcp::stop_all_shared_daemons("app_close");
+
+    advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
+    if schedule_app_exit_after_terminal_shutdown(app_for_shutdown.clone(), window_label.clone())
+        .is_err()
+    {
+        app_for_shutdown.exit(0);
+    }
+}
+
 #[tauri::command]
-fn close_app_after_terminal_shutdown(
+async fn close_app_after_terminal_shutdown(
     app: AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     let window_label = window.label().to_string();
+    let _ = begin_app_shutdown();
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
 
-    let app_for_shutdown = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = {
-            let terminal_state = app_for_shutdown.state::<TerminalState>();
-            let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
-            let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
-            let _lifecycle_guard = lifecycle_lock.lock().await;
-            let close_all_result = close_all_terminal_sessions(
-                app_for_shutdown.clone(),
-                &terminal_state,
-                cloud_mcp_state.inner(),
-            )
-            .await;
-            close_all_result
-        };
-
-        let _ = coordination::mcp::stop_all_shared_daemons("app_close");
-
-        if schedule_app_exit_after_terminal_shutdown(app_for_shutdown.clone(), window_label.clone())
-            .is_err()
-        {
-            app_for_shutdown.exit(0);
-        }
-    });
+    run_backend_app_shutdown(app, window_label).await;
 
     Ok(())
 }
@@ -1545,6 +1595,7 @@ fn restore_main_window_after_reopen(app: AppHandle, has_visible_windows: bool) {
 }
 
 pub fn run() {
+    configure_windows_process_error_mode();
     install_app_panic_log_hook();
 
     let mut builder = tauri::Builder::default();
@@ -1740,7 +1791,12 @@ pub fn run() {
         .expect("error while building Diff Forge AI desktop")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                let _ = begin_app_shutdown();
+                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
+                let _ = coordination::watcher::stop_all_file_watchers("run_exit_requested");
+                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_DAEMONS);
                 let _ = coordination::mcp::stop_all_shared_daemons("run_exit_requested");
+                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
             }
 
             #[cfg(not(target_os = "macos"))]

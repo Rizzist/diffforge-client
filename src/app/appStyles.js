@@ -27,8 +27,8 @@ import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
-import { HorizontalSplit } from "@styled-icons/material-rounded/HorizontalSplit";
-import { VerticalSplit } from "@styled-icons/material-rounded/VerticalSplit";
+import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
+import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
 
 export const TITLE_BAR_HEIGHT = "34px";
 export const VIEW_TRANSITION_MS = 170;
@@ -522,6 +522,48 @@ export const panelExit = keyframes`
   to {
     opacity: 0;
     transform: translateY(5px);
+  }
+`;
+
+export const terminalFullscreenEnter = keyframes`
+  from {
+    opacity: 0.96;
+    transform:
+      translate3d(
+        var(--terminal-fullscreen-origin-x, 0px),
+        var(--terminal-fullscreen-origin-y, 0px),
+        0
+      )
+      scale(
+        var(--terminal-fullscreen-origin-scale-x, 1),
+        var(--terminal-fullscreen-origin-scale-y, 1)
+      );
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1, 1);
+  }
+`;
+
+export const terminalFullscreenExit = keyframes`
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1, 1);
+  }
+
+  to {
+    opacity: 0.96;
+    transform:
+      translate3d(
+        var(--terminal-fullscreen-origin-x, 0px),
+        var(--terminal-fullscreen-origin-y, 0px),
+        0
+      )
+      scale(
+        var(--terminal-fullscreen-origin-scale-x, 1),
+        var(--terminal-fullscreen-origin-scale-y, 1)
+      );
   }
 `;
 
@@ -1464,11 +1506,11 @@ export const WorkspaceButton = styled.button`
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 54px;
+  min-height: 42px;
   grid-template-columns: 4px minmax(0, 1fr);
   align-items: stretch;
-  gap: 9px;
-  padding: 8px 40px 8px 9px;
+  gap: 8px;
+  padding: 5px 36px 5px 8px;
   border: 1px solid rgba(230, 236, 245, 0.06);
   border-radius: 8px;
   box-sizing: border-box;
@@ -1487,6 +1529,7 @@ export const WorkspaceButton = styled.button`
     overflow: hidden;
     font-size: 12px;
     font-weight: 720;
+    line-height: 1.1;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1513,7 +1556,7 @@ export const WorkspaceLabel = styled.div`
   max-width: 100%;
   overflow: hidden;
   align-content: center;
-  gap: 4px;
+  gap: 2px;
 
   > span {
     display: block;
@@ -1522,6 +1565,7 @@ export const WorkspaceLabel = styled.div`
     color: var(--forge-text-muted);
     font-size: 10px;
     font-weight: 650;
+    line-height: 1.15;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1532,8 +1576,8 @@ export const WorkspaceSettingsButton = styled.button`
   top: 50%;
   right: 4px;
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   place-items: center;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
@@ -1895,6 +1939,41 @@ export const TerminalWorkspaceSurface = styled.section`
     linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     rgba(3, 5, 8, 0.14);
   background-size: 68px 68px, 68px 68px, auto;
+  transition:
+    filter 180ms ease,
+    opacity 180ms ease,
+    box-shadow 180ms ease;
+
+  &[data-terminal-fullscreen="true"] {
+    position: absolute;
+    inset: 0;
+    z-index: 220;
+    width: auto;
+    height: auto;
+    min-width: 0;
+    min-height: 0;
+    background:
+      linear-gradient(90deg, rgba(255, 255, 255, 0.024) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+      ${TERMINAL_THEME_BACKGROUND};
+    background-size: 68px 68px, 68px 68px, auto;
+    box-shadow:
+      0 34px 90px rgba(0, 0, 0, 0.52),
+      0 0 0 1px rgba(226, 232, 240, 0.08);
+    pointer-events: auto;
+    transform: translate3d(0, 0, 0) scale(1, 1);
+    transform-origin: top left;
+    will-change: transform, opacity;
+  }
+
+  &[data-terminal-fullscreen-state="opening"] {
+    animation: ${terminalFullscreenEnter} var(--terminal-fullscreen-duration, 190ms) cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  &[data-terminal-fullscreen-state="closing"] {
+    animation: ${terminalFullscreenExit} var(--terminal-fullscreen-duration, 190ms) cubic-bezier(0.7, 0, 0.84, 0) both;
+    pointer-events: none;
+  }
 
   &::after {
     position: absolute;
@@ -1920,6 +1999,8 @@ export const TerminalWorkspaceSurface = styled.section`
 `;
 
 export const WorkspaceTerminalPanels = styled.div`
+  position: relative;
+  isolation: isolate;
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -1933,6 +2014,16 @@ export const WorkspaceTerminalPanels = styled.div`
 
   &[data-terminal-fullscreen="true"] {
     background: ${TERMINAL_THEME_BACKGROUND};
+  }
+
+  &[data-terminal-fullscreen="true"] [data-panel] {
+    overflow: visible !important;
+  }
+
+  &[data-terminal-fullscreen="true"] ${TerminalWorkspaceSurface}:not([data-terminal-fullscreen="true"]) {
+    opacity: 0.42;
+    filter: brightness(0.58) saturate(0.75);
+    pointer-events: none;
   }
 `;
 
@@ -1958,18 +2049,8 @@ export const ResizePanel = styled(Panel)`
     min-width: ${TERMINAL_PANE_MIN_WIDTH_PX}px;
   }
 
-  &[data-terminal-fullscreen-hidden="true"] {
-    display: none !important;
-    flex: 0 0 0 !important;
-    min-width: 0 !important;
-    min-height: 0 !important;
-    overflow: hidden;
-  }
-
-  &[data-terminal-fullscreen-active="true"] {
-    flex: 1 1 100% !important;
-    min-width: 0 !important;
-    min-height: 0 !important;
+  ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
+    overflow: visible;
   }
 `;
 
@@ -1992,10 +2073,6 @@ export const ResizeHandle = styled(Separator)`
     height: 5px;
     margin: -2px 0;
     cursor: row-resize;
-  }
-
-  ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
-    display: none !important;
   }
 
   &::after {
@@ -2520,7 +2597,7 @@ export const TerminalRestartPill = styled.div`
   backdrop-filter: blur(10px);
 `;
 
-export const TerminalAgentIdBadge = styled.span`
+export const TerminalAgentDot = styled.span`
   --terminal-slot-accent: #62a0ff;
 
   display: inline-flex;
@@ -2667,8 +2744,8 @@ export const TerminalRestartButton = styled.button`
     transform 160ms ease;
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 14px;
+    height: 14px;
   }
 
   &:hover:not(:disabled) {
@@ -6027,7 +6104,7 @@ export const McpMountRow = styled.div`
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.36);
 
-  ${TerminalAgentIdBadge} {
+  ${TerminalAgentDot} {
     justify-self: center;
   }
 `;
@@ -7824,11 +7901,11 @@ export const ButtonRefreshIcon = styled(Refresh)`
   ${buttonIconSize}
 `;
 
-export const ButtonSplitHorizontalIcon = styled(HorizontalSplit)`
+export const ButtonSplitHorizontalIcon = styled(LayoutSplit)`
   ${buttonIconSize}
 `;
 
-export const ButtonSplitVerticalIcon = styled(VerticalSplit)`
+export const ButtonSplitVerticalIcon = styled(LayoutRow)`
   ${buttonIconSize}
 `;
 
@@ -7906,7 +7983,7 @@ export const ButtonCheckIcon = styled(CheckCircle)`
 
 export const FileChevronIcon = styled(ChevronRight)`
   width: 16px;
-  height: 16px;
+  height: 14px;
 `;
 
 export const FileExpandIcon = styled(ExpandMore)`

@@ -13983,6 +13983,10 @@ impl CoordinationKernel {
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, String> {
+        if crate::app_shutdown_requested() {
+            return Err(crate::app_shutdown_blocked_message("git branch inspection"));
+        }
+
         let safe_directory = format!(
             "safe.directory={}",
             git_safe_directory_value(&self.paths.repo_path)
@@ -14782,6 +14786,14 @@ fn probe_mcp_stdio(command: &str, args: &[String]) -> Value {
             "tool_count": 0,
         });
     }
+    if crate::app_shutdown_requested() {
+        return json!({
+            "responded": false,
+            "status": "app_shutdown",
+            "error": crate::app_shutdown_blocked_message("MCP stdio probe"),
+            "tool_count": 0,
+        });
+    }
 
     let mut child = match Command::new(command)
         .args(args)
@@ -14822,6 +14834,16 @@ fn probe_mcp_stdio(command: &str, args: &[String]) -> Value {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
+            Ok(None) if crate::app_shutdown_requested() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return json!({
+                    "responded": false,
+                    "status": "app_shutdown",
+                    "error": crate::app_shutdown_blocked_message("MCP stdio probe"),
+                    "tool_count": 0,
+                });
+            }
             Ok(None) if started_at.elapsed() < Duration::from_secs(3) => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -14911,16 +14933,58 @@ fn repo_has_git(repo_path: &Path) -> bool {
 }
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    if crate::app_shutdown_requested() {
+        return Err(crate::app_shutdown_blocked_message("git"));
+    }
+
     let safe_directory = format!("safe.directory={}", git_safe_directory_value(cwd));
     let mut git_args = Vec::with_capacity(args.len() + 2);
     git_args.push("-c".to_string());
     git_args.push(safe_directory);
     git_args.extend(args.iter().map(|arg| (*arg).to_string()));
-    let output = Command::new("git")
+
+    let mut command = Command::new("git");
+    command
         .current_dir(PathBuf::from(process_path_text(cwd)))
         .args(&git_args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("Unable to run git {}: {error}", args.join(" ")))?;
+    loop {
+        if crate::app_shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(crate::app_shutdown_blocked_message("git"));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Unable to wait for git {}: {error}",
+                    args.join(" ")
+                ));
+            }
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Unable to read git {} output: {error}", args.join(" ")))?;
 
     if output.status.success() {
         return Ok(output.stdout);

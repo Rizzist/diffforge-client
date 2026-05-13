@@ -3,10 +3,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ use super::{
 
 const DEFAULT_DEBOUNCE_MS: u64 = 750;
 const DEFAULT_REFRESH_MS: u64 = 5_000;
+const STOP_ALL_JOIN_TIMEOUT_MS: u64 = 2_500;
 
 struct WatcherRuntime {
     watcher_id: String,
@@ -175,6 +176,65 @@ pub fn stop_file_watcher(kernel: &CoordinationKernel) -> Result<Value, String> {
     })))
 }
 
+pub fn stop_all_file_watchers(reason: &str) -> Value {
+    let runtimes = match watcher_runtimes().lock() {
+        Ok(mut runtimes) => runtimes
+            .drain()
+            .map(|(_, runtime)| runtime)
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    let total = runtimes.len();
+
+    if total == 0 {
+        return api_ok(json!({
+            "status": "stopped",
+            "reason": reason,
+            "stopped": 0,
+            "total": 0,
+            "timed_out": false,
+        }));
+    }
+
+    let (joined_tx, joined_rx) = mpsc::channel();
+    for mut runtime in runtimes {
+        runtime.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = runtime.join.take() {
+            let joined_tx = joined_tx.clone();
+            thread::spawn(move || {
+                let _ = join.join();
+                let _ = joined_tx.send(());
+            });
+        } else {
+            let _ = joined_tx.send(());
+        }
+    }
+    drop(joined_tx);
+
+    let deadline = Instant::now() + Duration::from_millis(STOP_ALL_JOIN_TIMEOUT_MS);
+    let mut stopped = 0usize;
+    while stopped < total {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        match joined_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(()) => stopped += 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    api_ok(json!({
+        "status": "stopped",
+        "reason": reason,
+        "stopped": stopped,
+        "total": total,
+        "timed_out": stopped < total,
+    }))
+}
+
 pub fn file_watcher_status(kernel: &CoordinationKernel) -> Result<Value, String> {
     let key = watcher_key(kernel);
     let runtime = watcher_runtimes()
@@ -210,7 +270,7 @@ fn spawn_watcher_worker(
     thread::spawn(move || {
         let mut watched_paths = Vec::new();
         loop {
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || crate::app_shutdown_requested() {
                 break;
             }
 
@@ -231,7 +291,7 @@ fn spawn_watcher_worker(
                 );
             }
 
-            if !watched_paths.is_empty() {
+            if !watched_paths.is_empty() && !crate::app_shutdown_requested() {
                 run_poll_scan(
                     &repo_path,
                     db_path.as_ref(),
@@ -266,6 +326,10 @@ fn run_poll_scan(
     debounce_ms: u64,
     watched_paths: &[String],
 ) {
+    if crate::app_shutdown_requested() {
+        return;
+    }
+
     log_watcher_event(
         repo_path,
         db_path,
