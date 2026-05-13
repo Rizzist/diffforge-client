@@ -84,6 +84,7 @@ const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
 const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = true;
+const TERMINAL_PARKED_LOGGING_ENABLED: bool = false;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
@@ -110,6 +111,7 @@ const WHISPER_MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
 const WHISPER_RUNTIME_PACKAGE_NAME: &str = "whisper.cpp v1.8.4 x64";
@@ -204,6 +206,7 @@ struct TerminalState {
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
+    workspace_bootstrap_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     pty_pool: Arc<PtyPool>,
     next_terminal_instance_id: AtomicU64,
 }
@@ -239,7 +242,13 @@ impl Drop for TerminalState {
         );
 
         for (pane_id, instance) in instances {
-            cleanup_terminal_instance_with_context(instance, true, Some(pane_id), "drop_fallback");
+            cleanup_terminal_instance_with_context(
+                instance,
+                true,
+                Some(pane_id),
+                "drop_fallback",
+                false,
+            );
         }
 
         for warm_pty in warm_ptys {
@@ -313,6 +322,7 @@ struct TerminalInstance {
 struct TerminalCoordinationSession {
     repo_path: String,
     db_path: String,
+    mcp_command: String,
     agent_id: String,
     session_id: String,
     env_vars: Vec<(String, String)>,
@@ -753,6 +763,9 @@ struct TerminalOpenRequest {
     provider: Option<String>,
     model: Option<String>,
     plain_shell: Option<bool>,
+    preserve_coordination_session: Option<bool>,
+    slot_key: Option<String>,
+    terminal_index: Option<u16>,
     working_directory: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
@@ -1092,14 +1105,11 @@ fn install_app_panic_log_hook() {
     });
 }
 
-#[tauri::command]
-fn close_app_after_terminal_shutdown(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
+fn schedule_app_exit_after_terminal_shutdown(
+    app_for_exit: AppHandle,
+    app_pid: u32,
+    window_label: String,
 ) -> Result<(), String> {
-    let app_pid = std::process::id();
-    let window_label = window.label().to_string();
-
     log_terminal_event(
         "terminal.app_close.exit_schedule",
         None,
@@ -1111,7 +1121,6 @@ fn close_app_after_terminal_shutdown(
         }),
     );
 
-    let app_for_exit = app.clone();
     thread::Builder::new()
         .name("diffforge-app-close".to_string())
         .spawn(move || {
@@ -1185,6 +1194,129 @@ fn close_app_after_terminal_shutdown(
         })
         .map(|_| ())
         .map_err(|error| format!("Failed to schedule app close: {error}"))
+}
+
+#[tauri::command]
+fn close_app_after_terminal_shutdown(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let app_pid = std::process::id();
+    let window_label = window.label().to_string();
+
+    if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        log_terminal_event(
+            "terminal.app_close.already_in_flight",
+            None,
+            None,
+            None,
+            json!({
+                "app_pid": app_pid,
+                "window_label": clean_terminal_telemetry_text(&window_label),
+            }),
+        );
+        return Ok(());
+    }
+
+    let app_for_shutdown = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let cleanup_started_at = Instant::now();
+        log_terminal_event(
+            "terminal.app_close.cleanup_start",
+            None,
+            None,
+            None,
+            json!({
+                "app_pid": app_pid,
+                "window_label": clean_terminal_telemetry_text(&window_label),
+            }),
+        );
+
+        let closed = {
+            let terminal_state = app_for_shutdown.state::<TerminalState>();
+            let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
+            let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            close_all_terminal_sessions(
+                app_for_shutdown.clone(),
+                &terminal_state,
+                cloud_mcp_state.inner(),
+            )
+            .await
+        };
+
+        match closed {
+            Ok(closed) => log_terminal_event(
+                "terminal.app_close.cleanup_done",
+                None,
+                None,
+                Some(cleanup_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "closed": closed,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            ),
+            Err(error) => log_terminal_event(
+                "terminal.app_close.cleanup_error",
+                None,
+                None,
+                Some(cleanup_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            ),
+        }
+
+        let mcp_cleanup_started_at = Instant::now();
+        match coordination::mcp::stop_all_shared_daemons("app_close") {
+            Ok(summary) => log_terminal_event(
+                "terminal.app_close.shared_mcp_cleanup_done",
+                None,
+                None,
+                Some(mcp_cleanup_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "summary": summary,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            ),
+            Err(error) => log_terminal_event(
+                "terminal.app_close.shared_mcp_cleanup_error",
+                None,
+                None,
+                Some(mcp_cleanup_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            ),
+        }
+
+        if let Err(error) = schedule_app_exit_after_terminal_shutdown(
+            app_for_shutdown.clone(),
+            app_pid,
+            window_label.clone(),
+        ) {
+            log_terminal_event(
+                "terminal.app_close.exit_schedule_error",
+                None,
+                None,
+                Some(cleanup_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+            app_for_shutdown.exit(0);
+        }
+    });
+
+    Ok(())
 }
 
 fn restore_main_window(app: &AppHandle) -> bool {
@@ -1329,6 +1461,7 @@ pub fn run() {
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
+            workspace_bootstrap_locks: Arc::new(StdMutex::new(HashMap::new())),
             pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
         })
@@ -1429,8 +1562,6 @@ pub fn run() {
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
-            cloud_mcp_get_todo,
-            cloud_mcp_save_todo,
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,
             cloud_mcp_start_spec_graph_sync,
@@ -1459,10 +1590,9 @@ pub fn run() {
             coordination::tauri_commands::coordination_get_file_watcher_status,
             coordination::tauri_commands::coordination_get_alignment_report,
             coordination::tauri_commands::coordination_get_workspace_mcp_status,
-            coordination::tauri_commands::coordination_create_task,
-            coordination::tauri_commands::coordination_add_task_dependency,
-            coordination::tauri_commands::coordination_list_task_dependencies,
-            coordination::tauri_commands::coordination_claim_task,
+            coordination::tauri_commands::coordination_activate_shared_mcp_daemon,
+            coordination::tauri_commands::coordination_deactivate_shared_mcp_daemon,
+            coordination::tauri_commands::coordination_stop_all_shared_mcp_daemons,
             coordination::tauri_commands::coordination_create_session,
             coordination::tauri_commands::coordination_heartbeat_session,
             coordination::tauri_commands::coordination_acquire_lease,
@@ -1500,6 +1630,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Diff Forge AI desktop")
         .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let _ = coordination::mcp::stop_all_shared_daemons("run_exit_requested");
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
+
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
                 has_visible_windows,

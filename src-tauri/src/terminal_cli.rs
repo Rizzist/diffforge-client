@@ -671,8 +671,15 @@ fn terminal_args_with_codex_mcp_identity(
 
     apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
 
-    let mut coordination_args = vec![
-        "--coordination-mcp".to_string(),
+    next.push("-c".to_string());
+    next.push(format!(
+        "mcp_servers.coordination-kernel.command={}",
+        terminal_toml_string(&coordination.mcp_command)
+    ));
+
+    let mut coordination_args =
+        crate::coordination::mcp::proxy_args_for_repo(&coordination.repo_path);
+    coordination_args.extend([
         "--repo-path".to_string(),
         coordination.repo_path.clone(),
         "--db-path".to_string(),
@@ -681,7 +688,7 @@ fn terminal_args_with_codex_mcp_identity(
         coordination.agent_id.clone(),
         "--session-id".to_string(),
         coordination.session_id.clone(),
-    ];
+    ]);
     for (env_key, arg_key) in [
         ("COORDINATION_AGENT_SLOT_ID", "--agent-slot-id"),
         ("COORDINATION_SLOT_KEY", "--slot-key"),
@@ -702,6 +709,18 @@ fn terminal_args_with_codex_mcp_identity(
         "mcp_servers.coordination-kernel.args={}",
         terminal_toml_string_array(&coordination_args)
     ));
+    next.push("-c".to_string());
+    next.push(format!(
+        "mcp_servers.coordination-kernel.default_tools_approval_mode={}",
+        terminal_toml_string("prompt")
+    ));
+    for tool in crate::coordination::mcp::TOOL_NAMES {
+        next.push("-c".to_string());
+        next.push(format!(
+            "mcp_servers.coordination-kernel.tools.{tool}.approval_mode={}",
+            terminal_toml_string("approve")
+        ));
+    }
     next.push("-c".to_string());
     next.push("shell_environment_policy.inherit=all".to_string());
     next
@@ -737,10 +756,25 @@ fn terminal_args_have_option(args: &[String], long: &str, short: &str) -> bool {
 fn terminal_toml_string_array(values: &[String]) -> String {
     let items = values
         .iter()
-        .map(|value| format!("\"{}\"", terminal_toml_escape(value)))
+        .map(|value| terminal_toml_string(value))
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{items}]")
+}
+
+#[cfg(windows)]
+fn terminal_toml_string(value: &str) -> String {
+    // The Windows PowerShell/npm launch path strips embedded double quotes from Codex -c values.
+    if value.contains("'''") {
+        format!("\"{}\"", terminal_toml_escape(value))
+    } else {
+        format!("'''{}'''", value)
+    }
+}
+
+#[cfg(not(windows))]
+fn terminal_toml_string(value: &str) -> String {
+    format!("\"{}\"", terminal_toml_escape(value))
 }
 
 fn terminal_toml_escape(value: &str) -> String {

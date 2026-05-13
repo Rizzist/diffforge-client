@@ -83,8 +83,6 @@ export default function CoordinationWorkspaceView({
   const [snapshot, setSnapshot] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
-  const [taskTitle, setTaskTitle] = useState("");
-  const [taskBody, setTaskBody] = useState("");
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryResults, setMemoryResults] = useState([]);
   const [sqlText, setSqlText] = useState("SELECT * FROM users LIMIT 5;");
@@ -135,7 +133,6 @@ export default function CoordinationWorkspaceView({
         "refresh",
         "succeeded",
         {
-          taskCount: unwrapData(response)?.tasks?.length || 0,
           bloatStatus: auditData?.status || "not_run",
         },
         "coordination_get_snapshot",
@@ -150,32 +147,6 @@ export default function CoordinationWorkspaceView({
   useEffect(() => {
     refresh();
   }, [refresh]);
-
-  const createTask = async (event) => {
-    event.preventDefault();
-    if (!taskTitle.trim()) {
-      return;
-    }
-    setMessage("");
-    setError("");
-    try {
-      await invoke("coordination_create_task", {
-        ...commandBase,
-        input: {
-          title: taskTitle.trim(),
-          body: taskBody.trim(),
-          priority: 0,
-          risk_level: 1,
-        },
-      });
-      setTaskTitle("");
-      setTaskBody("");
-      setMessage("Task created.");
-      refresh();
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  };
 
   const classifySql = async () => {
     setError("");
@@ -348,36 +319,6 @@ export default function CoordinationWorkspaceView({
       <Grid>
         <Panel>
           <PanelTopline>
-            <span>Tasks</span>
-            <strong>{snapshot?.tasks?.length || 0}</strong>
-          </PanelTopline>
-          <TaskForm onSubmit={createTask}>
-            <Field>
-              <SettingsLabel>Title</SettingsLabel>
-              <Input value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} placeholder="Implementation slice" />
-            </Field>
-            <Field>
-              <SettingsLabel>Body</SettingsLabel>
-              <Textarea value={taskBody} onChange={(event) => setTaskBody(event.target.value)} placeholder="Scope, risks, expected output" rows={3} />
-            </Field>
-            <PrimaryButton disabled={!taskTitle.trim()} type="submit">
-              <ButtonCheckIcon aria-hidden="true" />
-              <span>Create</span>
-            </PrimaryButton>
-          </TaskForm>
-          <CompactTable
-            columns={[
-              { key: "title", label: "Task" },
-              { key: "status", label: "Status" },
-              { key: "claimed_session_id", label: "Session", render: (row) => row.claimed_session_id || "none" },
-            ]}
-            empty="No tasks yet."
-            rows={snapshot?.tasks || []}
-          />
-        </Panel>
-
-        <Panel>
-          <PanelTopline>
             <span>Sessions</span>
             <strong>{snapshot?.sessions?.length || 0}</strong>
           </PanelTopline>
@@ -467,23 +408,6 @@ export default function CoordinationWorkspaceView({
             ]}
             empty="No resource queues."
             rows={snapshot?.resource_queues || []}
-          />
-        </Panel>
-
-        <Panel>
-          <PanelTopline>
-            <span>Task slices</span>
-            <strong>{snapshot?.task_resource_intents?.length || 0}</strong>
-          </PanelTopline>
-          <CompactTable
-            columns={[
-              { key: "resource_key", label: "Resource" },
-              { key: "status", label: "Status" },
-              { key: "task_id", label: "Task" },
-              { key: "depends_on_task_id", label: "Depends on", render: (row) => row.depends_on_task_id || "none" },
-            ]}
-            empty="No task resource slices."
-            rows={snapshot?.task_resource_intents || []}
           />
         </Panel>
 

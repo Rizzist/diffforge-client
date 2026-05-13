@@ -113,6 +113,9 @@ import {
   TerminalClosedSurface,
   TerminalClosedLabel,
   TerminalClosingOverlay,
+  TerminalStatusOverlay,
+  TerminalStatusSpinner,
+  TerminalStatusCopy,
   TerminalParkedBar,
   TerminalParkedSpinner,
   TerminalParkedCopy,
@@ -353,8 +356,6 @@ const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
 const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
-const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
-const TERMINAL_BLANK_STARTUP_RESTART_LIMIT = 3;
 const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
 const TERMINAL_SCROLLBAR_INTENT_MS = 900;
 const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
@@ -533,6 +534,93 @@ function getTerminalInputDebugFields(data) {
   };
 }
 
+function stripTerminalControlSequences(text) {
+  const value = String(text || "");
+  let output = "";
+  let index = 0;
+
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+
+    if (code === 0x1b) {
+      const next = value[index + 1] || "";
+
+      if (next === "[") {
+        index += 2;
+        while (index < value.length) {
+          const finalCode = value.charCodeAt(index);
+          index += 1;
+          if (finalCode >= 0x40 && finalCode <= 0x7e) {
+            break;
+          }
+        }
+        continue;
+      }
+
+      if (next === "]") {
+        index += 2;
+        while (index < value.length) {
+          const currentCode = value.charCodeAt(index);
+          if (currentCode === 0x07) {
+            index += 1;
+            break;
+          }
+          if (currentCode === 0x1b && value[index + 1] === "\\") {
+            index += 2;
+            break;
+          }
+          index += 1;
+        }
+        continue;
+      }
+
+      index += next ? 2 : 1;
+      continue;
+    }
+
+    if (code >= 0x20 && code !== 0x7f) {
+      output += value[index];
+    }
+    index += 1;
+  }
+
+  return output;
+}
+
+function isTerminalGeneratedReplyInput(data) {
+  const text = String(data || "");
+
+  return /^\x1b\[\d+;\d+R$/.test(text)
+    || /^\x1b\[\??[0-9;]*c$/.test(text);
+}
+
+function getTerminalOutputDebugFields(data) {
+  const bytes = Array.from(data || []);
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(data || new Uint8Array());
+  const displayText = stripTerminalControlSequences(text);
+  const displayChars = Array.from(displayText);
+
+  return {
+    bytes: bytes.length,
+    chars: displayChars.length,
+    controlByteHex: bytes
+      .filter((byte) => byte < 32 || byte === 127)
+      .slice(0, 16)
+      .map((byte) => byte.toString(16).padStart(2, "0")),
+    controlBytes: bytes.filter((byte) => byte < 32 || byte === 127).length,
+    escapeBytes: bytes.filter((byte) => byte === 0x1b).length,
+    hasEscape: bytes.includes(0x1b),
+    prefixHex: bytes.slice(0, 24).map((byte) => byte.toString(16).padStart(2, "0")),
+    printableChars: displayChars.length,
+    safePreview: displayChars
+      .slice(0, 120)
+      .join("")
+      .trim(),
+    startsWithEscape: bytes[0] === 0x1b,
+    visibleChars: displayChars.filter((character) => !/\s/.test(character)).length,
+  };
+}
+
 function getTerminalKeyDebugFields(event, extraFields = {}) {
   return {
     altKey: Boolean(event.altKey),
@@ -559,6 +647,21 @@ function isPlainShiftEnterEvent(event) {
 }
 
 let nextWorkspaceTerminalInstanceId = 1;
+const workspaceTerminalOpenQueues = new Map();
+
+function enqueueWorkspaceTerminalOpen(workspaceKey, task) {
+  const key = String(workspaceKey || "default");
+  const previous = workspaceTerminalOpenQueues.get(key) || Promise.resolve();
+  const run = previous.catch(() => {}).then(task);
+  const cleanup = run.finally(() => {
+    if (workspaceTerminalOpenQueues.get(key) === cleanup) {
+      workspaceTerminalOpenQueues.delete(key);
+    }
+  });
+
+  workspaceTerminalOpenQueues.set(key, cleanup);
+  return run;
+}
 
 function getSafePaneToken(value) {
   const token = String(value || "workspace")
@@ -695,6 +798,7 @@ export function closeWorkspaceTerminalPane({
   previousTerminalCount,
   reason,
   terminalIndex,
+  waitForCleanup = false,
   workspaceId,
 }) {
   const paneId = getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId);
@@ -709,10 +813,14 @@ export function closeWorkspaceTerminalPane({
       reason,
       terminalIndex,
       workspaceId,
+      waitForCleanup,
     },
   });
 
-  invoke("terminal_close", { paneId })
+  return invoke("terminal_close", {
+    paneId,
+    waitForCleanup: waitForCleanup || undefined,
+  })
     .then(() => {
       writeTerminalTelemetry({
         paneId,
@@ -724,23 +832,28 @@ export function closeWorkspaceTerminalPane({
           reason,
           terminalIndex,
           workspaceId,
+          waitForCleanup,
         },
       });
+      return { closed: true, paneId };
     })
     .catch((error) => {
+      const message = getErrorMessage(error, "Unable to close removed terminal.");
       writeTerminalTelemetry({
         paneId,
         phase: "frontend.workspace.terminal.close_removed_error",
         fields: {
           agentId,
-          error: getErrorMessage(error, "Unable to close removed terminal."),
+          error: message,
           nextTerminalCount,
           previousTerminalCount,
           reason,
           terminalIndex,
           workspaceId,
+          waitForCleanup,
         },
       });
+      return { closed: false, error: message, paneId };
     });
 }
 
@@ -1384,11 +1497,18 @@ export default function WorkspaceTerminal({
   const agentLaunchReadyRef = useRef(agentLaunchReady);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
-  const blankStartupRestartCountRef = useRef(0);
+  const blankStartupProbeCountRef = useRef(0);
   const terminalClosingRef = useRef(false);
+  const preserveCoordinationOnNextCleanupRef = useRef(false);
+  const preserveCoordinationOnNextOpenRef = useRef(false);
   const parkedPromptRef = useRef(null);
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
   const [terminalError, setTerminalError] = useState("");
+  const [terminalStatus, setTerminalStatus] = useState(() => ({
+    detail: agent ? "Preparing pane." : "No terminal agent is configured.",
+    title: agent ? "Starting Terminal" : "Terminal Blocked",
+    visible: Boolean(agent),
+  }));
   const [restartKey, setRestartKey] = useState(0);
   const [terminalClosed, setTerminalClosed] = useState(false);
   const [terminalClosing, setTerminalClosing] = useState(false);
@@ -1407,9 +1527,14 @@ export default function WorkspaceTerminal({
     terminalLaunchInfo?.projectRoot || terminalLaunchInfo?.workingDirectory || workingDirectory || "",
   );
   const projectLabel = getCoreRepoDisplayLabel(projectRoot, workspace?.name || "Project");
+  const coordinationMode = terminalLaunchInfo?.coordinationMode || "";
+  const hasIsolatedWorktree = !isGenericTerminal && Boolean(
+    coordinationMode === "worktree_required"
+    || (terminalLaunchInfo?.agentBranchRoot && coordinationMode !== "coordination_only"),
+  );
   const isolationLabel = isGenericTerminal
     ? "plain shell"
-    : terminalLaunchInfo?.coordinationMode === "worktree_required"
+    : hasIsolatedWorktree
       ? "isolated edits"
       : "preparing isolation";
   const projectBadgeLabel = isGenericTerminal
@@ -1506,7 +1631,7 @@ export default function WorkspaceTerminal({
     setTerminalLaunchInfo(null);
     setParkedPrompt(null);
     lastAgentLaunchEpochRef.current = 0;
-    blankStartupRestartCountRef.current = 0;
+    blankStartupProbeCountRef.current = 0;
   }, [agent?.id, terminalIndex, terminalRoleId, workspace?.id]);
 
   useEffect(() => {
@@ -1615,8 +1740,15 @@ export default function WorkspaceTerminal({
   useEffect(() => {
     if (!agent) {
       startAgentInPrewarmedTerminalRef.current = null;
+      preserveCoordinationOnNextCleanupRef.current = false;
+      preserveCoordinationOnNextOpenRef.current = false;
       setTerminalState("blocked");
       setTerminalError("");
+      setTerminalStatus({
+        detail: "No terminal agent is configured.",
+        title: "Terminal Blocked",
+        visible: true,
+      });
       setTerminalLaunchInfo(null);
       setParkedPrompt(null);
       terminalClosingRef.current = false;
@@ -1625,8 +1757,15 @@ export default function WorkspaceTerminal({
     }
 
     if (terminalClosed) {
+      preserveCoordinationOnNextCleanupRef.current = false;
+      preserveCoordinationOnNextOpenRef.current = false;
       setTerminalState("closed");
       setTerminalError("");
+      setTerminalStatus({
+        detail: "This pane is closed.",
+        title: "Terminal Closed",
+        visible: false,
+      });
       setTerminalLaunchInfo(null);
       setParkedPrompt(null);
       terminalClosingRef.current = false;
@@ -1650,9 +1789,14 @@ export default function WorkspaceTerminal({
     // Tauri's WebView can corrupt xterm's WebGL glyph atlas during rapid multi-pane resize.
     let rendererMode = useWebglRenderer ? "webgl_pending" : "canvas";
     let runtimeTerminalState = "starting";
-    setTerminalLaunchInfo(null);
+    const preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
+    preserveCoordinationOnNextOpenRef.current = false;
+    if (!preserveCoordinationForThisStart) {
+      setTerminalLaunchInfo(null);
+    }
     let startAgentInCurrentPty = null;
     let hasOpenPty = false;
+    let startupControlReplyBridgeOpen = false;
     let activeWebglAddon = null;
     let resizeController = null;
     let lastResizeMeasureAt = 0;
@@ -1666,13 +1810,42 @@ export default function WorkspaceTerminal({
     let resizeWriteBarrierBytes = 0;
     const resizeWriteBarrierQueue = [];
     let sawFirstOutput = false;
+    let sawFirstVisibleOutput = false;
     let outputBytes = 0;
     let outputChunks = 0;
+    let visibleOutputBytes = 0;
+    let visibleOutputChunks = 0;
     const disposables = [];
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     terminalInstanceIdRef.current = terminalInstanceId;
     const lifecycleStartedAt = performance.now();
+    const setPaneStage = (state, title, detail = "", fields = {}) => {
+      if (isDisposed) {
+        return;
+      }
+
+      runtimeTerminalState = state;
+      setTerminalState(state);
+      setTerminalStatus({
+        detail,
+        title,
+        visible: state !== "running" && state !== "prewarmed" && state !== "closed" && !terminalClosed,
+      });
+      writeTerminalTelemetry({
+        paneId,
+        instanceId: terminalInstanceId,
+        phase: "frontend.state.stage",
+        elapsedMs: performance.now() - lifecycleStartedAt,
+        fields: {
+          detail,
+          state,
+          terminalIndex,
+          title,
+          ...fields,
+        },
+      });
+    };
 
     writeTerminalTelemetry({
       paneId,
@@ -1684,6 +1857,7 @@ export default function WorkspaceTerminal({
         ...getWorkspaceOpenTelemetryFields(workspace?.id),
       },
     });
+    setPaneStage("starting", "Preparing Terminal", "Creating terminal renderer.");
 
     const waitForStartupMetricPoll = (delayMs) => new Promise((resolve) => {
       if (isDisposed) {
@@ -2458,7 +2632,11 @@ export default function WorkspaceTerminal({
         const hasVisibleRows = (bufferDiagnostics?.nonEmptyViewportRows || 0) > 0;
         const cursorMoved = (bufferDiagnostics?.cursorX || 0) > 0 || (bufferDiagnostics?.cursorY || 0) > 0;
 
-        if (hasVisibleRows || cursorMoved || outputBytes > 8) {
+        if (hasVisibleRows || visibleOutputChunks > 0) {
+          setTerminalStatus((current) => ({
+            ...current,
+            visible: false,
+          }));
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -2471,28 +2649,40 @@ export default function WorkspaceTerminal({
               terminalIndex,
               outputBytes,
               outputChunks,
+              cursorMoved,
               retryConfirmMs: TERMINAL_BLANK_STARTUP_CONFIRM_MS,
               retryProbeMs: TERMINAL_BLANK_STARTUP_PROBE_MS,
+              visibleOutputBytes,
+              visibleOutputChunks,
               buffer: bufferDiagnostics,
             },
           });
           return;
         }
 
-        const restartAttempt = blankStartupRestartCountRef.current + 1;
+        blankStartupProbeCountRef.current += 1;
+        const blankProbeAttempt = blankStartupProbeCountRef.current;
         const probeFields = {
           reason,
           rendererMode,
           terminalIndex,
           outputBytes,
           outputChunks,
-          restartAttempt,
+          blankProbeAttempt,
+          cursorMoved,
           retryConfirmMs: TERMINAL_BLANK_STARTUP_CONFIRM_MS,
           retryProbeMs: TERMINAL_BLANK_STARTUP_PROBE_MS,
+          visibleOutputBytes,
+          visibleOutputChunks,
           buffer: bufferDiagnostics,
         };
 
         if (!previousProbe) {
+          setTerminalStatus({
+            detail: "PTY is connected; waiting for printable terminal output.",
+            title: "Waiting For Visible Output",
+            visible: true,
+          });
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -2512,12 +2702,16 @@ export default function WorkspaceTerminal({
           scheduleBlankStartupWatch("blank_startup_confirm", TERMINAL_BLANK_STARTUP_CONFIRM_MS, {
             outputBytes,
             outputChunks,
+            visibleOutputBytes,
+            visibleOutputChunks,
           });
           return;
         }
 
         const outputChanged = outputBytes !== previousProbe.outputBytes
-          || outputChunks !== previousProbe.outputChunks;
+          || outputChunks !== previousProbe.outputChunks
+          || visibleOutputBytes !== previousProbe.visibleOutputBytes
+          || visibleOutputChunks !== previousProbe.visibleOutputChunks;
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
@@ -2528,6 +2722,8 @@ export default function WorkspaceTerminal({
             ...probeFields,
             previousOutputBytes: previousProbe.outputBytes,
             previousOutputChunks: previousProbe.outputChunks,
+            previousVisibleOutputBytes: previousProbe.visibleOutputBytes,
+            previousVisibleOutputChunks: previousProbe.visibleOutputChunks,
             outputChanged,
           },
         });
@@ -2541,51 +2737,21 @@ export default function WorkspaceTerminal({
           outputChunks,
         });
 
-        if (blankStartupRestartCountRef.current >= TERMINAL_BLANK_STARTUP_RESTART_LIMIT) {
-          writeTerminalTelemetry({
-            paneId,
-            instanceId: terminalInstanceId,
-            phase: "frontend.start.blank_restart_limit",
-            fields: {
-              outputBytes,
-              outputChunks,
-              restartLimit: TERMINAL_BLANK_STARTUP_RESTART_LIMIT,
-              retryConfirmMs: TERMINAL_BLANK_STARTUP_CONFIRM_MS,
-              retryProbeMs: TERMINAL_BLANK_STARTUP_PROBE_MS,
-            },
-          });
-          hasOpenPty = false;
-          runtimeTerminalState = "error";
-          setTerminalState("error");
-          setTerminalError(`${agent.label} started but did not produce visible terminal output.`);
-          invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
-          return;
-        }
-
-        blankStartupRestartCountRef.current += 1;
-        const restartDelayMs = TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS;
-        hasOpenPty = false;
-        runtimeTerminalState = "restarting";
-        setTerminalState("starting");
-        invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          phase: "frontend.start.blank_restart_scheduled",
+          phase: "frontend.start.blank_restart_disabled",
+          cols: terminal.cols,
+          rows: terminal.rows,
           fields: {
-            outputBytes,
-            outputChunks,
-            restartAttempt,
-            restartDelayMs,
-            retryConfirmMs: TERMINAL_BLANK_STARTUP_CONFIRM_MS,
-            retryProbeMs: TERMINAL_BLANK_STARTUP_PROBE_MS,
+            ...probeFields,
+            previousOutputBytes: previousProbe.outputBytes,
+            previousOutputChunks: previousProbe.outputChunks,
+            previousVisibleOutputBytes: previousProbe.visibleOutputBytes,
+            previousVisibleOutputChunks: previousProbe.visibleOutputChunks,
+            outputChanged,
           },
         });
-        window.setTimeout(() => {
-          if (!isDisposed) {
-            setRestartKey((key) => key + 1);
-          }
-        }, restartDelayMs);
       }, delayMs);
 
       startupWatchTimers.add(timer);
@@ -2776,6 +2942,8 @@ export default function WorkspaceTerminal({
       }
 
       const isFirstOutputChunk = options.isFirstOutputChunk === true;
+      const isFirstVisibleOutputChunk = options.isFirstVisibleOutputChunk === true;
+      const outputDebug = options.outputDebug || getTerminalOutputDebugFields(data);
 
       if (resizeWriteBarrierActive && !options.fromResizeBarrier) {
         const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
@@ -2784,6 +2952,8 @@ export default function WorkspaceTerminal({
         resizeWriteBarrierQueue.push({
           data: queuedData,
           isFirstOutputChunk,
+          isFirstVisibleOutputChunk,
+          outputDebug,
         });
         resizeWriteBarrierBytes += queuedData.byteLength;
 
@@ -2803,6 +2973,23 @@ export default function WorkspaceTerminal({
         }
 
         return;
+      }
+
+      if (outputChunks <= 10 || isFirstOutputChunk || isFirstVisibleOutputChunk) {
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.xterm.write_start",
+          cols: terminal.cols,
+          rows: terminal.rows,
+          fields: {
+            frame: outputDebug,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            outputChunks,
+            terminalIndex,
+          },
+        });
       }
 
       terminal.write(data, () => {
@@ -2826,6 +3013,35 @@ export default function WorkspaceTerminal({
               transport: "binary_channel",
             },
           );
+        }
+
+        if (isFirstVisibleOutputChunk) {
+          refreshTerminalRenderer("first_visible_output_written", {
+            bytes: data.byteLength,
+            transport: "binary_channel",
+          });
+          setTerminalStatus((current) => ({
+            ...current,
+            visible: false,
+          }));
+        }
+
+        if (outputChunks <= 10 || isFirstOutputChunk || isFirstVisibleOutputChunk) {
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.xterm.write_done",
+            cols: terminal.cols,
+            rows: terminal.rows,
+            fields: {
+              buffer: getTerminalBufferDiagnostics(terminal),
+              frame: outputDebug,
+              isFirstOutputChunk,
+              isFirstVisibleOutputChunk,
+              outputChunks,
+              terminalIndex,
+            },
+          });
         }
       });
     };
@@ -2886,6 +3102,8 @@ export default function WorkspaceTerminal({
         writeTerminalOutput(queuedWrite.data, {
           fromResizeBarrier: true,
           isFirstOutputChunk: queuedWrite.isFirstOutputChunk,
+          isFirstVisibleOutputChunk: queuedWrite.isFirstVisibleOutputChunk,
+          outputDebug: queuedWrite.outputDebug,
         });
       });
 
@@ -3051,6 +3269,7 @@ export default function WorkspaceTerminal({
 
     async function startTerminal() {
       try {
+        setPaneStage("starting", "Preparing Terminal", "Creating terminal session.");
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
@@ -3090,6 +3309,14 @@ export default function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
           outputBytes += displayData.byteLength;
+          const outputDebug = getTerminalOutputDebugFields(displayData);
+          const hasVisibleOutput = outputDebug.visibleChars > 0;
+          const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
+
+          if (hasVisibleOutput) {
+            visibleOutputBytes += displayData.byteLength;
+            visibleOutputChunks += 1;
+          }
 
           if (isFirstOutputChunk) {
             sawFirstOutput = true;
@@ -3100,14 +3327,50 @@ export default function WorkspaceTerminal({
               elapsedMs: performance.now() - lifecycleStartedAt,
               fields: {
                 bytes: displayData.byteLength,
+                frame: outputDebug,
                 transport: "binary_channel",
               },
             });
             scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
           }
 
+          if (outputChunks <= 10) {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.output.frame_received",
+              elapsedMs: performance.now() - lifecycleStartedAt,
+              fields: {
+                frame: outputDebug,
+                outputChunks,
+                terminalIndex,
+                transport: "binary_channel",
+              },
+            });
+          }
+
+          if (isFirstVisibleOutputChunk) {
+            sawFirstVisibleOutput = true;
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.output.first_visible_chunk",
+              elapsedMs: performance.now() - lifecycleStartedAt,
+              fields: {
+                frame: outputDebug,
+                outputBytes,
+                outputChunks,
+                terminalIndex,
+                visibleOutputBytes,
+                visibleOutputChunks,
+              },
+            });
+          }
+
           writeTerminalOutput(displayData, {
             isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            outputDebug,
           });
         });
         disposables.push(await listen("forge-terminal-exit", (event) => {
@@ -3124,8 +3387,13 @@ export default function WorkspaceTerminal({
               fields: { exitCode: event.payload.exitCode ?? null },
             });
             hasOpenPty = false;
-            runtimeTerminalState = "exited";
-            setTerminalState("exited");
+            setPaneStage(
+              "exited",
+              "Terminal Exited",
+              event.payload.exitCode == null
+                ? "Process ended."
+                : `Process exited with code ${event.payload.exitCode}.`,
+            );
           }
         }));
         let terminalInputBuffer = "";
@@ -3268,7 +3536,7 @@ export default function WorkspaceTerminal({
           return true;
         };
         disposables.push(terminal.onData((data) => {
-          if (!hasOpenPty || isDisposed || parkedPromptRef.current) {
+          if (isDisposed || parkedPromptRef.current) {
             return;
           }
 
@@ -3278,18 +3546,34 @@ export default function WorkspaceTerminal({
             return;
           }
 
+          const startupControlReply = !hasOpenPty
+            && startupControlReplyBridgeOpen
+            && isTerminalGeneratedReplyInput(safeData);
+
+          if (!hasOpenPty && !startupControlReply) {
+            return;
+          }
+
           if (safeData.startsWith("\x1b")) {
             writeTerminalTelemetry({
               paneId,
               instanceId: terminalInstanceId,
               phase: "frontend.xterm.on_data.escape",
               fields: {
+                startupControlReply,
                 terminalIndex,
                 ...getTerminalInputDebugFields(safeData),
               },
             });
             flushTerminalInput("escape_sequence_flush_before");
-            writeTerminalInputChunk(safeData, safeData === "\x1b" ? "escape" : "escape_sequence");
+            writeTerminalInputChunk(
+              safeData,
+              startupControlReply
+                ? "startup_terminal_control_reply"
+                : safeData === "\x1b"
+                  ? "escape"
+                  : "escape_sequence",
+            );
             return;
           }
 
@@ -3502,6 +3786,7 @@ export default function WorkspaceTerminal({
           });
         }
 
+        setPaneStage("starting", "Measuring Terminal", "Waiting for renderer dimensions.");
         const initialSize = await waitForTerminalSizeForOpen("terminal_open");
 
         if (isDisposed || !initialSize) {
@@ -3537,8 +3822,7 @@ export default function WorkspaceTerminal({
           agentStartedInCurrentPty = true;
           startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
           startupWatchTimers.clear();
-          runtimeTerminalState = "starting";
-          setTerminalState("starting");
+          setPaneStage("starting", "Starting Agent", "Attaching the prepared terminal.");
           setTerminalError("");
 
           const agentLaunchStartedAt = performance.now();
@@ -3557,8 +3841,7 @@ export default function WorkspaceTerminal({
             },
           });
 
-          runtimeTerminalState = "running";
-          setTerminalState("running");
+          setPaneStage("running", "Agent Running", "Terminal is connected.");
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -3601,6 +3884,27 @@ export default function WorkspaceTerminal({
         });
 
         const openStartedAt = performance.now();
+        if (isGenericTerminal) {
+          setPaneStage(
+            "starting",
+            "Preparing Shell",
+            "Opening terminal.",
+            {
+              kind: openKind,
+              prewarmShell: shouldPrewarmShell,
+            },
+          );
+        } else {
+          setPaneStage(
+            "starting",
+            "Queued Terminal Launch",
+            "Waiting for this workspace's terminal launch turn.",
+            {
+              kind: openKind,
+              prewarmShell: shouldPrewarmShell,
+            },
+          );
+        }
         if (isDisposed) {
           writeTerminalTelemetry({
             paneId,
@@ -3628,24 +3932,64 @@ export default function WorkspaceTerminal({
             ...getWorkspaceOpenTelemetryFields(workspace?.id),
           },
         });
-        const openResult = await invoke("terminal_open", {
-          request: {
-            paneId,
-            instanceId: terminalInstanceId,
-            kind: openKind,
-            provider: openProvider,
-            model: "",
-            plainShell: isGenericTerminal,
-            workingDirectory: workingDirectory || "",
-            workspaceId: workspace?.id || "",
-            workspaceName: workspace?.name || "",
-            cols: initialSize.cols,
-            rows: initialSize.rows,
-          },
-          outputChannel,
-        });
+        const invokeTerminalOpen = async (queued = false) => {
+          if (isDisposed) {
+            throw new Error("Terminal launch was cancelled.");
+          }
+
+          setPaneStage(
+            "starting",
+            isGenericTerminal ? "Preparing Shell" : "Preparing Agent",
+            isGenericTerminal
+              ? "Opening terminal."
+              : "Creating the terminal worktree and MCP config.",
+            {
+              kind: openKind,
+              prewarmShell: shouldPrewarmShell,
+            },
+          );
+          if (queued) {
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.open.queue_acquired",
+              elapsedMs: performance.now() - openStartedAt,
+              fields: {
+                terminalIndex,
+                workspaceOpenQueueKey,
+                ...getWorkspaceOpenTelemetryFields(workspace?.id),
+              },
+            });
+          }
+
+          startupControlReplyBridgeOpen = true;
+          return invoke("terminal_open", {
+            request: {
+              paneId,
+              instanceId: terminalInstanceId,
+              kind: openKind,
+              provider: openProvider,
+              model: "",
+              plainShell: isGenericTerminal,
+              preserveCoordinationSession: preserveCoordinationForThisStart,
+              slotKey: String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1),
+              terminalIndex,
+              workingDirectory: workingDirectory || "",
+              workspaceId: workspace?.id || "",
+              workspaceName: workspace?.name || "",
+              cols: initialSize.cols,
+              rows: initialSize.rows,
+            },
+            outputChannel,
+          });
+        };
+        const workspaceOpenQueueKey = workspace?.id || workingDirectory || "default";
+        const openResult = isGenericTerminal
+          ? await invokeTerminalOpen(false)
+          : await enqueueWorkspaceTerminalOpen(workspaceOpenQueueKey, () => invokeTerminalOpen(true));
 
         if (isDisposed) {
+          startupControlReplyBridgeOpen = false;
           invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
           return;
         }
@@ -3654,12 +3998,27 @@ export default function WorkspaceTerminal({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(
             openResult?.projectRoot || openResult?.workingDirectory || workingDirectory || "",
           ),
-          functionalRepoPath: openResult?.workingDirectory || openResult?.agentBranchRoot || "",
+          functionalRepoPath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
         });
         hasOpenPty = true;
+        startupControlReplyBridgeOpen = false;
         setTerminalLaunchInfo(openResult || null);
-        runtimeTerminalState = shouldPrewarmShell ? "prewarmed" : "running";
-        setTerminalState(shouldPrewarmShell ? "starting" : "running");
+        if (shouldPrewarmShell) {
+          runtimeTerminalState = "prewarmed";
+          setTerminalState("starting");
+          setTerminalStatus({
+            detail: "Waiting for the agent launch gate.",
+            title: "Terminal Prepared",
+            visible: true,
+          });
+        } else {
+          setPaneStage("running", "Terminal Running", "Waiting for visible terminal output.");
+          setTerminalStatus({
+            detail: "Waiting for printable terminal output.",
+            title: "Waiting For Visible Output",
+            visible: true,
+          });
+        }
         patchTerminalMetrics({ startupMs: performance.now() - openStartedAt });
         writeTerminalTelemetry({
           paneId,
@@ -3674,6 +4033,7 @@ export default function WorkspaceTerminal({
             projectRoot: openResult?.projectRoot || "",
             agentBranch: openResult?.agentBranch || "",
             agentBranchRoot: openResult?.agentBranchRoot || "",
+            coordinationMode: openResult?.coordinationMode || "",
           },
         });
         resizeController?.resizeNow("terminal_open_done");
@@ -3720,10 +4080,11 @@ export default function WorkspaceTerminal({
 
         scheduleBlankStartupWatch("terminal_open_done");
       } catch (error) {
+        startupControlReplyBridgeOpen = false;
         if (!isDisposed) {
-          runtimeTerminalState = "error";
-          setTerminalState("error");
-          setTerminalError(getErrorMessage(error, `Unable to launch ${agent.label}.`));
+          const errorMessage = getErrorMessage(error, `Unable to launch ${agent.label}.`);
+          setPaneStage("error", "Terminal Launch Failed", errorMessage);
+          setTerminalError(errorMessage);
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -3789,7 +4150,13 @@ export default function WorkspaceTerminal({
         elapsedMs: performance.now() - lifecycleStartedAt,
         fields: getWorkspaceOpenTelemetryFields(workspace?.id),
       });
-      invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
+      const preserveCoordinationSession = preserveCoordinationOnNextCleanupRef.current && !isGenericTerminal;
+      preserveCoordinationOnNextCleanupRef.current = false;
+      invoke("terminal_close", {
+        paneId,
+        instanceId: terminalInstanceId,
+        preserveCoordinationSession,
+      }).catch(() => {});
       terminal.dispose();
     };
   }, [agent?.id, agent?.label, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
@@ -3872,6 +4239,11 @@ export default function WorkspaceTerminal({
     terminalClosingRef.current = true;
     setTerminalClosing(true);
     setTerminalState("closing");
+    setTerminalStatus({
+      detail: "Shutting down the PTY.",
+      title: "Closing Terminal",
+      visible: false,
+    });
 
     try {
       await invoke("terminal_close", {
@@ -3881,7 +4253,14 @@ export default function WorkspaceTerminal({
     } catch (error) {
       terminalClosingRef.current = false;
       setTerminalClosing(false);
-      setTerminalError(getErrorMessage(error, "Unable to close terminal."));
+      const errorMessage = getErrorMessage(error, "Unable to close terminal.");
+      setTerminalState("error");
+      setTerminalStatus({
+        detail: errorMessage,
+        title: "Terminal Close Failed",
+        visible: true,
+      });
+      setTerminalError(errorMessage);
       return;
     }
 
@@ -3889,6 +4268,11 @@ export default function WorkspaceTerminal({
     setTerminalClosing(false);
     setTerminalClosed(true);
     setTerminalState("closed");
+    setTerminalStatus({
+      detail: "This pane is closed.",
+      title: "Terminal Closed",
+      visible: false,
+    });
     onCloseTerminal?.({
       paneId,
       terminalIndex,
@@ -3933,12 +4317,31 @@ export default function WorkspaceTerminal({
 
     setTerminalClosed(false);
     terminalClosingRef.current = false;
+    preserveCoordinationOnNextCleanupRef.current = !isGenericTerminal;
+    preserveCoordinationOnNextOpenRef.current = !isGenericTerminal;
     setTerminalClosing(false);
     setTerminalState("starting");
     setTerminalError("");
-    setTerminalLaunchInfo(null);
+    setTerminalStatus({
+      detail: "Restarting terminal session.",
+      title: "Preparing Terminal",
+      visible: true,
+    });
     setRestartKey((key) => key + 1);
-  }, [onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
+  }, [isGenericTerminal, onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
+
+  const showTerminalStatusOverlay = Boolean(
+    terminalStatus?.visible
+    && !terminalClosed
+    && !terminalClosing
+    && !parkedPrompt,
+  );
+  const terminalStatusTitle = terminalState === "error" && terminalError
+    ? "Terminal Launch Failed"
+    : terminalStatus?.title || "Preparing Terminal";
+  const terminalStatusDetail = terminalState === "error" && terminalError
+    ? terminalError
+    : terminalStatus?.detail || "";
 
   if (!agent) {
     return (
@@ -4091,6 +4494,21 @@ export default function WorkspaceTerminal({
               <TerminalScrollRail aria-hidden="true" ref={scrollRailRef}>
                 <TerminalScrollThumb ref={scrollThumbRef} />
               </TerminalScrollRail>
+            )}
+            {showTerminalStatusOverlay && (
+              <TerminalStatusOverlay
+                aria-live={terminalState === "error" ? "assertive" : "polite"}
+                data-tone={terminalState === "error" ? "error" : "neutral"}
+                role="status"
+              >
+                <div>
+                  {terminalState !== "error" && <TerminalStatusSpinner aria-hidden="true" />}
+                  <TerminalStatusCopy>
+                    <strong>{terminalStatusTitle}</strong>
+                    {terminalStatusDetail && <span>{terminalStatusDetail}</span>}
+                  </TerminalStatusCopy>
+                </div>
+              </TerminalStatusOverlay>
             )}
             {terminalClosing && (
               <TerminalClosingOverlay aria-live="polite" role="status">

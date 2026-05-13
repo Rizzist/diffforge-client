@@ -2393,6 +2393,76 @@ export const TerminalClosedLabel = styled.span`
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
 `;
 
+export const TerminalStatusOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px;
+  background: rgba(2, 3, 4, 0.5);
+  pointer-events: none;
+
+  > div {
+    display: grid;
+    max-width: min(300px, 100%);
+    min-width: 0;
+    justify-items: center;
+    gap: 8px;
+    border: 1px solid rgba(143, 157, 183, 0.22);
+    border-radius: 8px;
+    padding: 14px 16px;
+    background: rgba(8, 12, 20, 0.86);
+    color: rgba(232, 238, 248, 0.92);
+    text-align: center;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  }
+
+  &[data-tone="error"] {
+    background: rgba(18, 5, 8, 0.58);
+
+    > div {
+      border-color: rgba(248, 113, 113, 0.34);
+      background: rgba(24, 10, 14, 0.88);
+    }
+  }
+`;
+
+export const TerminalStatusSpinner = styled.span`
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(143, 157, 183, 0.24);
+  border-top-color: #4fd1c5;
+  border-radius: 999px;
+  animation: ${workspaceCloseSpin} 760ms linear infinite;
+`;
+
+export const TerminalStatusCopy = styled.div`
+  display: grid;
+  max-width: 100%;
+  min-width: 0;
+  gap: 4px;
+
+  strong {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    font-weight: 900;
+    line-height: 1.1;
+  }
+
+  span {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: rgba(154, 165, 181, 0.9);
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1.25;
+  }
+`;
+
 export const TerminalClosingOverlay = styled.div`
   position: absolute;
   inset: 0;

@@ -361,7 +361,7 @@ import {
 import VaultWorkspaceView from "../vault/VaultWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import SpecGraphWorkspaceView from "../kanban/KanbanWorkspaceView.jsx";
+import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import CoordinationWorkspaceView from "../coordination/CoordinationWorkspaceView.jsx";
 
@@ -440,9 +440,10 @@ const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
 const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
-const TERMINAL_BLANK_STARTUP_RESTART_DELAY_MS = 800;
-const TERMINAL_BLANK_STARTUP_RESTART_LIMIT = 3;
-const WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS = 4500;
+const WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS = 18000;
+const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 18000;
+const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
+const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS = 1200;
 const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
 const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
@@ -812,7 +813,7 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
   try {
     await withTimeout(
       invoke("close_app_after_terminal_shutdown"),
-      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
+      WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
       "Native app exit timed out.",
     );
     writeTerminalTelemetry({
@@ -1685,6 +1686,8 @@ export default function App() {
   const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
+  const workspaceCloseExpectedTotalRef = useRef(0);
+  const sharedMcpActiveRepoRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -2917,6 +2920,9 @@ export default function App() {
         workspaceTerminalSlots[selectedWorkspace.id],
         currentTerminalCount,
       );
+      const rootChanged = rootDirectory !== currentRootDirectory;
+      const previousMcpRepoPath = currentRootDirectory || defaultWorkingDirectory;
+      const nextMcpRepoPath = rootDirectory || defaultWorkingDirectory;
       const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
         !nextTerminalIndexSet.has(terminalIndex)
       ));
@@ -2924,10 +2930,12 @@ export default function App() {
         nextTerminalIndexSet.has(terminalIndex)
         && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
-      const terminalIndexesToClose = Array.from(new Set([
-        ...removedTerminalIndexes,
-        ...roleChangedTerminalIndexes,
-      ]));
+      const terminalIndexesToClose = rootChanged
+        ? currentTerminalIndexes
+        : Array.from(new Set([
+          ...removedTerminalIndexes,
+          ...roleChangedTerminalIndexes,
+        ]));
       let nextWorkspace = selectedWorkspace;
 
       writeTerminalTelemetry({
@@ -2939,10 +2947,134 @@ export default function App() {
           currentRootDirectory,
           requestedRootDirectory: cleanedRoot,
           resolvedRootDirectory: rootDirectory,
-          rootChanged: rootDirectory !== currentRootDirectory,
+          rootChanged,
           workspaceId: selectedWorkspace.id,
         },
       });
+
+      if (rootChanged) {
+        const cleanupStartedAt = performance.now();
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: "frontend.workspace_settings.terminal_cleanup_start",
+          fields: {
+            mode: "close_all_for_root_change",
+            requestedRootDirectory: cleanedRoot,
+            resolvedRootDirectory: rootDirectory,
+            terminalIndexes: terminalIndexesToClose,
+            workspaceId: selectedWorkspace.id,
+          },
+        });
+
+        const cleanupResult = await withTimeout(
+          invoke("terminal_close_all"),
+          WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
+          "Terminal cleanup timed out.",
+        );
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: "frontend.workspace_settings.terminal_cleanup_done",
+          elapsedMs: performance.now() - cleanupStartedAt,
+          fields: {
+            closed: normalizeCloseCount(cleanupResult?.closed),
+            mode: "close_all_for_root_change",
+            terminalIndexes: terminalIndexesToClose,
+            workspaceId: selectedWorkspace.id,
+          },
+        });
+
+        if (previousMcpRepoPath && previousMcpRepoPath !== nextMcpRepoPath) {
+          const mcpCleanupStartedAt = performance.now();
+
+          writeTerminalTelemetry({
+            paneId: selectedWorkspace.id,
+            phase: "frontend.workspace_settings.shared_mcp_cleanup_start",
+            fields: {
+              previousRepoPath: previousMcpRepoPath,
+              reason: "workspace_root_change",
+              resolvedRootDirectory: rootDirectory,
+              workspaceId: selectedWorkspace.id,
+            },
+          });
+
+          const mcpCleanupResult = await withTimeout(
+            invoke("coordination_deactivate_shared_mcp_daemon", {
+              repoPath: previousMcpRepoPath,
+              reason: "workspace_root_change",
+            }),
+            WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+            "Shared MCP cleanup timed out.",
+          );
+          const mcpCleanupData = mcpCleanupResult?.data || mcpCleanupResult || {};
+
+          writeTerminalTelemetry({
+            paneId: selectedWorkspace.id,
+            phase: "frontend.workspace_settings.shared_mcp_cleanup_done",
+            elapsedMs: performance.now() - mcpCleanupStartedAt,
+            fields: {
+              previousRepoPath: previousMcpRepoPath,
+              reason: "workspace_root_change",
+              stopped: Boolean(mcpCleanupData?.stopped),
+              workspaceId: selectedWorkspace.id,
+            },
+          });
+        }
+      } else if (terminalIndexesToClose.length) {
+        const cleanupStartedAt = performance.now();
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: "frontend.workspace_settings.terminal_cleanup_start",
+          fields: {
+            mode: "close_selected_for_count_or_role_change",
+            removedTerminalIndexes,
+            roleChangedTerminalIndexes,
+            terminalIndexes: terminalIndexesToClose,
+            workspaceId: selectedWorkspace.id,
+          },
+        });
+
+        const cleanupResults = await withTimeout(
+          Promise.all(terminalIndexesToClose.map((terminalIndex) => {
+            const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
+
+            return closeWorkspaceTerminalPane({
+              agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
+              nextTerminalCount: terminalCount,
+              previousTerminalCount: currentTerminalCount,
+              reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
+              terminalIndex,
+              waitForCleanup: true,
+              workspaceId: selectedWorkspace.id,
+            });
+          })),
+          WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
+          "Terminal cleanup timed out.",
+        );
+        const failedCleanup = cleanupResults.filter((result) => !result?.closed);
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: failedCleanup.length
+            ? "frontend.workspace_settings.terminal_cleanup_error"
+            : "frontend.workspace_settings.terminal_cleanup_done",
+          elapsedMs: performance.now() - cleanupStartedAt,
+          fields: {
+            failedCount: failedCleanup.length,
+            mode: "close_selected_for_count_or_role_change",
+            removedTerminalIndexes,
+            roleChangedTerminalIndexes,
+            terminalIndexes: terminalIndexesToClose,
+            workspaceId: selectedWorkspace.id,
+          },
+        });
+
+        if (failedCleanup.length) {
+          throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
+        }
+      }
 
       if (workspaceNameValue !== selectedWorkspace.name) {
         const result = await invoke("update_workspace", {
@@ -2971,24 +3103,49 @@ export default function App() {
         return nextSettings;
       });
 
-      if (rootDirectory !== currentRootDirectory || terminalCount !== currentTerminalCount || terminalRolesChanged) {
+      if (rootChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
         setWorkspaceTerminalSlots((slots) => ({
           ...slots,
           [selectedWorkspace.id]: nextTerminalIndexes,
         }));
       }
 
-      terminalIndexesToClose.forEach((terminalIndex) => {
-        const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
-        closeWorkspaceTerminalPane({
-          agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
-          nextTerminalCount: terminalCount,
-          previousTerminalCount: currentTerminalCount,
-          reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
-          terminalIndex,
-          workspaceId: selectedWorkspace.id,
+      if (rootChanged && selectedWorkspace.id === activatedWorkspaceIdRef.current && nextMcpRepoPath) {
+        const mcpActivateStartedAt = performance.now();
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: "frontend.workspace_settings.shared_mcp_restart_start",
+          fields: {
+            repoPath: nextMcpRepoPath,
+            reason: "workspace_root_change",
+            workspaceId: selectedWorkspace.id,
+          },
         });
-      });
+
+        const mcpActivateResult = await withTimeout(
+          invoke("coordination_activate_shared_mcp_daemon", {
+            repoPath: nextMcpRepoPath,
+            workspaceId: selectedWorkspace.id,
+            workspaceName: nextWorkspace.name,
+          }),
+          WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+          "Shared MCP restart timed out.",
+        );
+        const mcpActivateData = mcpActivateResult?.data || mcpActivateResult || {};
+
+        writeTerminalTelemetry({
+          paneId: selectedWorkspace.id,
+          phase: "frontend.workspace_settings.shared_mcp_restart_done",
+          elapsedMs: performance.now() - mcpActivateStartedAt,
+          fields: {
+            daemonStarted: Boolean(mcpActivateData?.daemon?.started ?? mcpActivateData?.started),
+            repoPath: nextMcpRepoPath,
+            reason: "workspace_root_change",
+            workspaceId: selectedWorkspace.id,
+          },
+        });
+      }
 
       setWorkspaceNameDraft(nextWorkspace.name);
       setWorkspaceRootDraft(rootDirectory);
@@ -3003,7 +3160,7 @@ export default function App() {
           removedTerminalIndexes,
           roleChangedTerminalIndexes,
           resolvedRootDirectory: rootDirectory,
-          rootChanged: rootDirectory !== currentRootDirectory,
+          rootChanged,
           terminalCount,
           terminalCountChanged: terminalCount !== currentTerminalCount,
           terminalRoles,
@@ -3011,6 +3168,7 @@ export default function App() {
           workspaceId: selectedWorkspace.id,
         },
       });
+      closeWorkspaceSettings();
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -3041,8 +3199,10 @@ export default function App() {
     workspaceSettings,
     workspaceTerminalSlots,
     activeAgent,
+    defaultWorkingDirectory,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
+    closeWorkspaceSettings,
   ]);
 
   const closeWorkspaceTerminal = useCallback(({ workspaceId, terminalIndex }) => {
@@ -3312,7 +3472,8 @@ export default function App() {
 
     workspaceCloseInFlightRef.current = true;
     workspaceCloseAllowNativeRef.current = false;
-    setWorkspaceCloseState({ isActive: true, closed: 0, total: 0 });
+    const expectedTerminalTotal = normalizeCloseCount(workspaceCloseExpectedTotalRef.current);
+    setWorkspaceCloseState({ isActive: true, closed: 0, total: expectedTerminalTotal });
 
     runWindowAction(async () => {
       let unlistenCloseProgress = null;
@@ -3345,7 +3506,7 @@ export default function App() {
 
         setWorkspaceCloseState((currentCloseState) => {
           const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
-          const total = Math.max(currentProgress.total, closed);
+          const total = Math.max(currentProgress.total, closed, expectedTerminalTotal);
 
           return {
             isActive: true,
@@ -3810,6 +3971,7 @@ export default function App() {
   const userIsPaid = isPaidUser(user);
   const planLabel = userIsPaid ? "Pro" : "Free";
   const connectedAgentCount = agentStatuses.filter((agent) => agent.installed && agent.authenticated).length;
+  const optionalAgentCount = Math.max(0, AGENT_PROVIDERS.length - connectedAgentCount);
   const startupAgentUpdates = getAgentUpdatesAvailable(agentStatuses);
   const startupAgentStatusTitle = startupAgentGateState === "choice"
     ? "Terminal CLI updates available"
@@ -3825,7 +3987,7 @@ export default function App() {
       : startupAgentGateState === "checking"
         ? "Terminal CLI readiness is being checked while the workspace loads."
         : connectedAgentCount > 0
-          ? `${connectedAgentCount}/${AGENT_PROVIDERS.length} terminal CLIs ready.`
+          ? `${connectedAgentCount} terminal CLI${connectedAgentCount === 1 ? "" : "s"} ready. ${optionalAgentCount} optional provider${optionalAgentCount === 1 ? "" : "s"} unavailable.`
           : "No ready terminal CLIs found. Settings will open so you can install or connect one.";
   const startupAgentStatusState = startupAgentGateState === "choice"
     ? "update"
@@ -3917,6 +4079,7 @@ export default function App() {
     ],
   );
   const activatedWorkspaceVisibleTerminalCount = activatedWorkspaceTerminalIndexes.length;
+  workspaceCloseExpectedTotalRef.current = activatedWorkspaceVisibleTerminalCount;
   const activatedWorkspaceTerminalRoleEntries = useMemo(
     () => activatedWorkspaceTerminalIndexes.map((terminalIndex, index) => ({
       role: normalizeWorkspaceTerminalRole(
@@ -3972,6 +4135,132 @@ export default function App() {
       activatedWorkspaceTerminalRoles[0] || workspaceTerminalFallbackRole,
     )
     : null;
+  const selectedWorkspaceRootDisplay = selectedWorkspaceRootDirectory || defaultWorkingDirectory || "App directory";
+  const activatedWorkspaceTerminalWorkingDirectory = activatedWorkspaceRootDirectory || defaultWorkingDirectory;
+  useEffect(() => {
+    if (!activatedWorkspace || !activatedWorkspaceTerminalWorkingDirectory) {
+      return undefined;
+    }
+
+    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = activatedWorkspace.id;
+    const workspaceName = activatedWorkspace.name || "";
+    let disposed = false;
+    const activateStartedAt = performance.now();
+
+    sharedMcpActiveRepoRef.current = repoPath;
+    writeTerminalTelemetry({
+      paneId: workspaceId,
+      phase: "frontend.workspace.shared_mcp.activate_start",
+      fields: {
+        repoPath,
+        workspaceId,
+        workspaceName,
+      },
+    });
+
+    withTimeout(
+      invoke("coordination_activate_shared_mcp_daemon", {
+        repoPath,
+        workspaceId,
+        workspaceName,
+      }),
+      WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+      "Shared MCP activation timed out.",
+    )
+      .then((response) => {
+        if (disposed) {
+          if (sharedMcpActiveRepoRef.current !== repoPath) {
+            invoke("coordination_deactivate_shared_mcp_daemon", {
+              repoPath,
+              reason: "workspace_activation_disposed",
+            }).catch(() => {});
+          }
+          return;
+        }
+
+        const data = response?.data || response || {};
+        writeTerminalTelemetry({
+          paneId: workspaceId,
+          phase: "frontend.workspace.shared_mcp.activate_done",
+          elapsedMs: performance.now() - activateStartedAt,
+          fields: {
+            daemonStarted: Boolean(data?.daemon?.started ?? data?.started),
+            repoPath,
+            workspaceId,
+          },
+        });
+      })
+      .catch((error) => {
+        if (disposed) {
+          return;
+        }
+
+        writeTerminalTelemetry({
+          paneId: workspaceId,
+          phase: "frontend.workspace.shared_mcp.activate_error",
+          elapsedMs: performance.now() - activateStartedAt,
+          fields: {
+            error: getErrorMessage(error, "Unable to activate shared MCP daemon."),
+            repoPath,
+            workspaceId,
+          },
+        });
+      });
+
+    return () => {
+      disposed = true;
+
+      if (sharedMcpActiveRepoRef.current === repoPath) {
+        sharedMcpActiveRepoRef.current = "";
+      }
+
+      const deactivateStartedAt = performance.now();
+      writeTerminalTelemetry({
+        paneId: workspaceId,
+        phase: "frontend.workspace.shared_mcp.deactivate_start",
+        fields: {
+          repoPath,
+          workspaceId,
+          workspaceName,
+        },
+      });
+
+      withTimeout(
+        invoke("coordination_deactivate_shared_mcp_daemon", {
+          repoPath,
+          reason: "workspace_deactivate",
+        }),
+        WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+        "Shared MCP deactivation timed out.",
+      )
+        .then((response) => {
+          const data = response?.data || response || {};
+          writeTerminalTelemetry({
+            paneId: workspaceId,
+            phase: "frontend.workspace.shared_mcp.deactivate_done",
+            elapsedMs: performance.now() - deactivateStartedAt,
+            fields: {
+              repoPath,
+              stopped: Boolean(data?.stopped),
+              workspaceId,
+            },
+          });
+        })
+        .catch((error) => {
+          writeTerminalTelemetry({
+            paneId: workspaceId,
+            phase: "frontend.workspace.shared_mcp.deactivate_error",
+            elapsedMs: performance.now() - deactivateStartedAt,
+            fields: {
+              error: getErrorMessage(error, "Unable to deactivate shared MCP daemon."),
+              repoPath,
+              workspaceId,
+            },
+          });
+        });
+    };
+  }, [activatedWorkspace?.id, activatedWorkspace?.name, activatedWorkspaceTerminalWorkingDirectory]);
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && Boolean(activatedWorkspace)
     && activatedWorkspaceAgentTerminalEntries.length > 0;
@@ -3985,8 +4274,6 @@ export default function App() {
     () => getTerminalPanelRows(activatedWorkspaceTerminalIndexes),
     [activatedWorkspaceTerminalIndexes],
   );
-  const selectedWorkspaceRootDisplay = selectedWorkspaceRootDirectory || defaultWorkingDirectory || "App directory";
-  const activatedWorkspaceTerminalWorkingDirectory = activatedWorkspaceRootDirectory || defaultWorkingDirectory;
   const selectedWorkspaceFileRoot = selectedWorkspaceRootDirectory || defaultWorkingDirectory;
   const isSelectedWorkspaceActivated = Boolean(selectedWorkspace && activatedWorkspace?.id === selectedWorkspace.id);
   const isSelectedWorkspaceDefault = Boolean(
@@ -4581,8 +4868,8 @@ export default function App() {
                     <span>Files</span>
                   </RailActionButton>
                   <RailActionButton
-                    data-active={activeView === "kanban"}
-                    onClick={() => showView("kanban")}
+                    data-active={activeView === "specGraph"}
+                    onClick={() => showView("specGraph")}
                     type="button"
                   >
                     <ButtonForgeIcon aria-hidden="true" />
@@ -5063,7 +5350,7 @@ export default function App() {
                     />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "kanban" ? (
+              ) : visibleView === "specGraph" ? (
                 <ForgeWorkspace aria-label="Workspace Spec Graph" data-motion={viewMotion}>
                   <SpecGraphWorkspaceView
                     defaultWorkingDirectory={defaultWorkingDirectory}

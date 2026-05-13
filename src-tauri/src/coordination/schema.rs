@@ -391,7 +391,6 @@ CREATE TABLE IF NOT EXISTS integration_batch_items(
   base_sha TEXT,
   changed_files_json TEXT NOT NULL,
   intent_summary TEXT,
-  cloud_context_task_id TEXT,
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

@@ -33,34 +33,10 @@ import {
 } from "../app/appStyles";
 
 const COORDINATION_TOOLS = [
-  "get_brief",
-  "claim_task",
-  "post_plan",
+  "start_task",
   "acquire_lease",
-  "renew_lease",
-  "release_lease",
-  "list_resources",
-  "list_active_leases",
-  "list_task_dependencies",
-  "announce_change",
-  "validate_patch",
+  "checkpoint",
   "submit_patch",
-  "list_workspace_violations",
-  "list_workspace_changes",
-  "file_watcher_status",
-  "watcher_scan",
-  "get_slot_status",
-  "search_memory",
-  "write_memory",
-  "db_get_mode",
-  "db_classify_sql",
-  "db_request_change",
-  "db_list_change_requests",
-  "db_get_change_request",
-  "db_attach_migration_proposal",
-  "db_propose_migration",
-  "db_request_approval",
-  "request_approval",
 ];
 
 function unwrapData(response, fallback = {}) {

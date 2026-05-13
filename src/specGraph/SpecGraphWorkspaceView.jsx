@@ -86,6 +86,11 @@ function normalizeFreshnessState(value) {
     case "review":
     case "stale":
       return "behind_code";
+    case "out_of_spec":
+    case "incomplete":
+    case "cancelled":
+    case "interrupted":
+      return "out_of_spec";
     case "ahead_of_code":
     case "spec_ahead":
     case "candidate":
@@ -102,6 +107,8 @@ function freshnessLabel(value) {
       return "updated";
     case "behind_code":
       return "behind code";
+    case "out_of_spec":
+      return "out of spec";
     case "ahead_of_code":
     default:
       return "ahead of code";
@@ -114,6 +121,8 @@ function freshnessTone(value) {
       return "#34d399";
     case "behind_code":
       return "#fb7185";
+    case "out_of_spec":
+      return "#fb923c";
     case "ahead_of_code":
     default:
       return "#fbbf24";
@@ -142,6 +151,15 @@ function normalizeNode(raw, index = 0) {
   const activeSpecs = jsonArray(field(raw, "active_specs", "activeSpecs"));
   const supersededSpecs = jsonArray(field(raw, "superseded_specs", "supersededSpecs"));
   const agentRationale = jsonArray(field(raw, "agent_rationale", "agentRationale"));
+  const notifications = jsonArray(field(raw, "notifications"));
+  const notificationCount = Math.max(
+    0,
+    Number(field(raw, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
+  );
+  const outOfSpecCount = Math.max(
+    notificationCount,
+    Number(field(raw, "out_of_spec_count", "outOfSpecCount")) || 0,
+  );
   return {
     ...raw,
     id,
@@ -157,6 +175,9 @@ function normalizeNode(raw, index = 0) {
     active_specs: activeSpecs,
     superseded_specs: supersededSpecs,
     agent_rationale: agentRationale,
+    notifications,
+    notification_count: notificationCount,
+    out_of_spec_count: outOfSpecCount,
     markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
       ? rawMarkdown
       : fallbackMarkdown({ title, summary, purpose, freshness_state: freshnessState, metadata: meta }),
@@ -175,19 +196,6 @@ function fallbackMarkdown(node) {
   ].join("\n");
 }
 
-function legacyTaskToNode(task, index) {
-  const meta = metadata(task);
-  return normalizeNode({
-    id: field(task, "id", "task_id", "taskId") || `legacy-${index}`,
-    title: field(task, "title", "summary"),
-    summary: field(task, "body", "description", "summary"),
-    node_type: "feature",
-    status: field(task, "status"),
-    active_agent_count: field(task, "agent_id", "agentId") ? 1 : 0,
-    metadata: meta,
-  }, index);
-}
-
 function normalizeSnapshot(snapshot) {
   const matrix = snapshot?.specGraph || snapshot?.raw || {};
   const specNodes = Array.isArray(snapshot?.specNodes)
@@ -195,9 +203,7 @@ function normalizeSnapshot(snapshot) {
     : Array.isArray(matrix?.nodes)
       ? matrix.nodes
       : [];
-  const fallbackTasks = Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
-  const nodes = (specNodes.length ? specNodes : fallbackTasks.map(legacyTaskToNode))
-    .map((node, index) => normalizeNode(node, index));
+  const nodes = specNodes.map((node, index) => normalizeNode(node, index));
 
   const edgeSource = Array.isArray(snapshot?.specEdges)
     ? snapshot.specEdges
@@ -622,6 +628,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
           const tone = freshnessTone(node.freshness_state);
           const liveAgents = liveAgentsFor(node);
           const liveAgentCount = liveAgents.length;
+          const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
           return (
             <GraphNodeButton
               key={node.id}
@@ -651,6 +658,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
                 />
               ))}
               {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
+              {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
               <NodeTitle $depth={point.depth}>{node.title}</NodeTitle>
             </GraphNodeButton>
           );
@@ -676,6 +684,9 @@ function SpecInspector({ node }) {
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
           <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
+          {(Number(node.out_of_spec_count || node.notification_count) || 0) > 0 && (
+            <span data-state="out_of_spec">out of spec: {Number(node.out_of_spec_count || node.notification_count) || 0}</span>
+          )}
         </InspectorFacts>
       </InspectorHeader>
       <MarkdownPane>
@@ -870,6 +881,25 @@ const AgentCountBadge = styled.span`
   z-index: 3;
 `;
 
+const OutOfSpecBadge = styled.span`
+  align-items: center;
+  background: rgba(124, 45, 18, 0.94);
+  border: 1px solid rgba(251, 146, 60, 0.58);
+  border-radius: 999px;
+  color: #ffedd5;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 920;
+  height: 22px;
+  justify-content: center;
+  min-width: 22px;
+  padding: 0 6px;
+  position: absolute;
+  left: -7px;
+  top: -7px;
+  z-index: 3;
+`;
+
 const ActiveAgentOrbit = styled.span`
   animation: spec-node-agent-orbit ${({ $depth, $index }) => {
     const base = $depth === 0 ? 3.2 : $depth === 1 ? 2.75 : 2.35;
@@ -989,6 +1019,11 @@ const InspectorFacts = styled.div`
   span[data-state="ahead_of_code"] {
     border-color: rgba(251, 191, 36, 0.3);
     color: #fde68a;
+  }
+
+  span[data-state="out_of_spec"] {
+    border-color: rgba(251, 146, 60, 0.38);
+    color: #fed7aa;
   }
 `;
 

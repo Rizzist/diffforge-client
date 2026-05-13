@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use super::{
     kernel::{api_error, api_ok, CoordinationKernel},
-    watcher,
+    mcp, watcher,
 };
 
 fn kernel(
@@ -118,68 +118,53 @@ pub fn coordination_get_workspace_mcp_status(
 }
 
 #[tauri::command]
-pub fn coordination_create_task(
+pub fn coordination_activate_shared_mcp_daemon(
     repo_path: Option<String>,
     db_path: Option<String>,
-    input: Value,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
 ) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?
-            .create_task(
-                input["title"].as_str().unwrap_or("Untitled task"),
-                input["body"].as_str(),
-                input["priority"].as_i64().unwrap_or(0),
-                input["risk_level"].as_i64().unwrap_or(1),
-                input["context_run_id"].as_str(),
-                input["source_plan_item_id"].as_str(),
-                input["assigned_role"].as_str(),
-                input["expected_output"].as_str(),
-            )
-            .map(api_ok_from_data),
-    )
+    let kernel = kernel(repo_path, db_path)?;
+    let workspace_id = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let data = if let Some(workspace_id) = workspace_id {
+        kernel.get_workspace_mcp_status(Some(workspace_id), workspace_name.as_deref())?
+    } else {
+        mcp::ensure_shared_daemon_for_paths(&kernel.paths.repo_path, &kernel.paths.db_path)?
+    };
+
+    Ok(api_ok_from_data(data))
 }
 
 #[tauri::command]
-pub fn coordination_add_task_dependency(
+pub fn coordination_deactivate_shared_mcp_daemon(
     repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
+    reason: Option<String>,
 ) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?
-            .add_task_dependency(
-                req(&input, "task_id")?,
-                req(&input, "depends_on_task_id")?,
-                input["dependency_kind"].as_str(),
-            )
-            .map(api_ok_from_data),
-    )
+    let repo_path = repo_path
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_repo_path);
+    let reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workspace_deactivate");
+
+    mcp::stop_shared_daemon_for_repo(repo_path, reason).map(api_ok_from_data)
 }
 
 #[tauri::command]
-pub fn coordination_list_task_dependencies(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.list_task_dependencies(input["task_id"].as_str()))
-}
+pub fn coordination_stop_all_shared_mcp_daemons(reason: Option<String>) -> Result<Value, String> {
+    let reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("app_shutdown");
 
-#[tauri::command]
-pub fn coordination_claim_task(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-    input: Value,
-) -> Result<Value, String> {
-    result(
-        kernel(repo_path, db_path)?
-            .claim_task(
-                req(&input, "task_id")?,
-                req(&input, "agent_id")?,
-                req(&input, "session_id")?,
-            )
-            .map(api_ok_from_data),
-    )
+    mcp::stop_all_shared_daemons(reason).map(api_ok_from_data)
 }
 
 #[tauri::command]
