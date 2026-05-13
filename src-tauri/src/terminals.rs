@@ -787,6 +787,47 @@ fn workspace_bootstrap_lock_for_path(state: &TerminalState, root: &Path) -> Arc<
     }
 }
 
+fn workspace_git_bootstrap_cache() -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrap>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrap>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn workspace_git_bootstrap_cache_key(root: &Path) -> String {
+    root.canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(root))
+}
+
+fn cached_workspace_git_bootstrap(root: &Path) -> Option<WorkspaceGitBootstrap> {
+    let key = workspace_git_bootstrap_cache_key(root);
+    workspace_git_bootstrap_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+}
+
+fn remember_workspace_git_bootstrap(root: &Path, bootstrap: &WorkspaceGitBootstrap) {
+    let key = workspace_git_bootstrap_cache_key(root);
+    if let Ok(mut cache) = workspace_git_bootstrap_cache().lock() {
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(key, bootstrap.clone());
+    }
+}
+
+fn workspace_git_bootstrap_fields(bootstrap: &WorkspaceGitBootstrap, cached: bool) -> Value {
+    json!({
+        "repoPath": bootstrap.repo_path,
+        "branch": bootstrap.branch,
+        "headSha": bootstrap.head_sha,
+        "initializedRepo": bootstrap.initialized_repo,
+        "createdInitialCommit": bootstrap.created_initial_commit,
+        "gitignoreUpdate": bootstrap.gitignore_update,
+        "cached": cached,
+    })
+}
+
 fn terminal_output_debug_fields(bytes: &[u8]) -> Value {
     let text = String::from_utf8_lossy(bytes);
     let display_text = terminal_output_display_text(&text);
@@ -893,8 +934,8 @@ fn spawn_terminal_reader(
     output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
 ) {
-    fn flush_terminal_output_frame(
-        pending: &mut Vec<u8>,
+    fn send_terminal_output_frame(
+        chunk: Vec<u8>,
         pane_id: &str,
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
@@ -905,12 +946,11 @@ fn spawn_terminal_reader(
         frame_log_limit: usize,
         reason: &str,
     ) -> bool {
-        if pending.is_empty() {
+        if chunk.is_empty() {
             return true;
         }
 
-        let bytes = pending.len();
-        let chunk = std::mem::take(pending);
+        let bytes = chunk.len();
         let observer_state = cloud_mcp_state.clone();
         let observer_pane_id = pane_id.to_string();
         let observer_chunk = chunk.clone();
@@ -948,7 +988,6 @@ fn spawn_terminal_reader(
         true
     }
 
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let reader_pane_id = pane_id.clone();
     const FRAME_LOG_LIMIT: usize = 10;
 
@@ -965,6 +1004,10 @@ fn spawn_terminal_reader(
         let mut saw_first_output = false;
         let mut saw_first_visible_output = false;
         let mut read_frame_sequence = 0usize;
+        let mut sent_frame_sequence = 0usize;
+        let mut flushed_chunks = 0usize;
+        let mut flushed_bytes = 0usize;
+        let mut channel_failed = false;
 
         loop {
             match reader.read(&mut buffer) {
@@ -1021,7 +1064,19 @@ fn spawn_terminal_reader(
                         );
                     }
 
-                    if output_tx.send(chunk.to_vec()).is_err() {
+                    if !send_terminal_output_frame(
+                        chunk.to_vec(),
+                        &reader_pane_id,
+                        instance_id,
+                        &cloud_mcp_state,
+                        &output_channel,
+                        &mut sent_frame_sequence,
+                        &mut flushed_chunks,
+                        &mut flushed_bytes,
+                        FRAME_LOG_LIMIT,
+                        "reader_thread",
+                    ) {
+                        channel_failed = true;
                         break;
                     }
                 }
@@ -1049,122 +1104,15 @@ fn spawn_terminal_reader(
                 "saw_first_visible_output": saw_first_visible_output,
             }),
         );
-    });
-
-    tauri::async_runtime::spawn(async move {
-        let mut ticker = interval(Duration::from_micros(TERMINAL_OUTPUT_FRAME_MICROS));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_READ_BUFFER_BYTES * 2);
-        let mut pending_since: Option<Instant> = None;
-        let mut reader_closed = false;
-        let mut flushed_chunks = 0usize;
-        let mut flushed_bytes = 0usize;
-        let mut channel_failed = false;
-        let mut sent_frame_sequence = 0usize;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = ticker.tick() => {
-                    while let Ok(chunk) = output_rx.try_recv() {
-                        pending.extend_from_slice(&chunk);
-                    }
-
-                    if !pending.is_empty()
-                        && !flush_terminal_output_frame(
-                            &mut pending,
-                            &pane_id,
-                            instance_id,
-                            &cloud_mcp_state,
-                            &output_channel,
-                            &mut sent_frame_sequence,
-                            &mut flushed_chunks,
-                            &mut flushed_bytes,
-                            FRAME_LOG_LIMIT,
-                            "frame_tick",
-                        )
-                    {
-                            channel_failed = true;
-                            break;
-                    }
-                    pending_since = None;
-
-                    if reader_closed {
-                        break;
-                    }
-                }
-                maybe_chunk = output_rx.recv(), if !reader_closed => {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            if pending.is_empty() {
-                                pending_since = Some(Instant::now());
-                            }
-                            pending.extend_from_slice(&chunk);
-                            while let Ok(chunk) = output_rx.try_recv() {
-                                pending.extend_from_slice(&chunk);
-                            }
-
-                            let pending_is_over_frame_budget = pending_since
-                                .map(|started| {
-                                    started.elapsed()
-                                        >= Duration::from_micros(TERMINAL_OUTPUT_FRAME_MICROS)
-                                })
-                                .unwrap_or(false);
-                            let pending_is_large = pending.len() >= TERMINAL_OUTPUT_READ_BUFFER_BYTES;
-                            if pending_is_over_frame_budget || pending_is_large {
-                                let reason = if pending_is_large {
-                                    "max_frame_bytes"
-                                } else {
-                                    "max_frame_latency"
-                                };
-                                if !flush_terminal_output_frame(
-                                    &mut pending,
-                                    &pane_id,
-                                    instance_id,
-                                    &cloud_mcp_state,
-                                    &output_channel,
-                                    &mut sent_frame_sequence,
-                                    &mut flushed_chunks,
-                                    &mut flushed_bytes,
-                                    FRAME_LOG_LIMIT,
-                                    reason,
-                                ) {
-                                    channel_failed = true;
-                                    break;
-                                }
-                                pending_since = None;
-                            }
-                        }
-                        None => reader_closed = true,
-                    }
-                }
-            }
-        }
-
-        if !channel_failed && !pending.is_empty() {
-            if !flush_terminal_output_frame(
-                &mut pending,
-                &pane_id,
-                instance_id,
-                &cloud_mcp_state,
-                &output_channel,
-                &mut sent_frame_sequence,
-                &mut flushed_chunks,
-                &mut flushed_bytes,
-                FRAME_LOG_LIMIT,
-                "reader_closed",
-            ) {
-                channel_failed = true;
-            }
-        }
 
         log_terminal_event(
             "terminal.reader.frame_flush_closed",
-            Some(&pane_id),
+            Some(&reader_pane_id),
             Some(instance_id),
             None,
             json!({
                 "channel_failed": channel_failed,
+                "direct_send": true,
                 "flushed_bytes": flushed_bytes,
                 "flushed_chunks": flushed_chunks,
                 "frame_micros": TERMINAL_OUTPUT_FRAME_MICROS,
@@ -1172,41 +1120,48 @@ fn spawn_terminal_reader(
             }),
         );
 
-        if let Some(instance) =
-            remove_terminal_instance_if_current(&terminals, &pane_id, instance_id).await
-        {
-            let notify_state = cloud_mcp_state.clone();
-            let notify_pane_id = pane_id.clone();
-            let notify_instance = instance.clone();
-            let notify_task = tauri::async_runtime::spawn(async move {
-                cloud_mcp_mark_terminal_closed(
-                    &notify_state,
-                    &notify_pane_id,
-                    instance_id,
-                    &notify_instance,
+        let cleanup_app = app.clone();
+        let cleanup_terminals = Arc::clone(&terminals);
+        let cleanup_state = cloud_mcp_state.clone();
+        let cleanup_pane_id = reader_pane_id.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(instance) =
+                remove_terminal_instance_if_current(&cleanup_terminals, &cleanup_pane_id, instance_id)
+                    .await
+            {
+                let notify_state = cleanup_state.clone();
+                let notify_pane_id = cleanup_pane_id.clone();
+                let notify_instance = instance.clone();
+                let notify_task = tauri::async_runtime::spawn(async move {
+                    cloud_mcp_mark_terminal_closed(
+                        &notify_state,
+                        &notify_pane_id,
+                        instance_id,
+                        &notify_instance,
+                        "reader_exit",
+                    )
+                    .await;
+                });
+                let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
+                cleanup_terminal_instance_async(
+                    instance,
+                    false,
+                    Some(cleanup_pane_id.clone()),
                     "reader_exit",
-                )
-                .await;
-            });
-            let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
-            cleanup_terminal_instance_async(
-                instance,
-                false,
-                Some(pane_id.clone()),
-                "reader_exit",
-                false,
-            );
-        }
+                    false,
+                );
+            }
 
-        let _ = app.emit(
-            "forge-terminal-exit",
-            TerminalExitPayload {
-                pane_id,
-                instance_id,
-                exit_code: None,
-                exited_at_ms: terminal_now_ms(),
-            },
-        );
+            let _ = cleanup_app.emit(
+                "forge-terminal-exit",
+                TerminalExitPayload {
+                    pane_id: cleanup_pane_id,
+                    instance_id,
+                    exit_code: None,
+                    exited_at_ms: terminal_now_ms(),
+                },
+            );
+        });
     });
 }
 
@@ -1770,7 +1725,25 @@ async fn terminal_open(
             }),
         );
     } else if !is_prewarm_pty {
-        {
+        if let Some(bootstrap) = cached_workspace_git_bootstrap(&working_directory) {
+            log_terminal_event(
+                "terminal.open.git_bootstrap_cache_hit",
+                Some(&pane_id),
+                request.instance_id,
+                Some(command_started_at.elapsed()),
+                json!({
+                    "cache_scope": "process",
+                    "working_directory": workspace_path_display(&working_directory),
+                }),
+            );
+            log_terminal_event(
+                "terminal.open.git_bootstrap_ready",
+                Some(&pane_id),
+                request.instance_id,
+                Some(command_started_at.elapsed()),
+                workspace_git_bootstrap_fields(&bootstrap, true),
+            );
+        } else {
             let bootstrap_lock = workspace_bootstrap_lock_for_path(state.inner(), &working_directory);
             let bootstrap_wait_started_at = Instant::now();
             log_terminal_event(
@@ -1794,14 +1767,35 @@ async fn terminal_open(
             );
 
             let git_started_at = Instant::now();
-            match ensure_workspace_git_ready_for_coordination(&working_directory) {
-                Ok(bootstrap) => {
+            let bootstrap_result =
+                if let Some(bootstrap) = cached_workspace_git_bootstrap(&working_directory) {
+                    log_terminal_event(
+                        "terminal.open.git_bootstrap_cache_hit",
+                        Some(&pane_id),
+                        request.instance_id,
+                        Some(git_started_at.elapsed()),
+                        json!({
+                            "after_lock_wait": true,
+                            "cache_scope": "process",
+                            "working_directory": workspace_path_display(&working_directory),
+                        }),
+                    );
+                    Ok((bootstrap, true))
+                } else {
+                    ensure_workspace_git_ready_for_coordination(&working_directory)
+                        .map(|bootstrap| (bootstrap, false))
+                };
+            match bootstrap_result {
+                Ok((bootstrap, cached)) => {
+                    if !cached {
+                        remember_workspace_git_bootstrap(&working_directory, &bootstrap);
+                    }
                     log_terminal_event(
                         "terminal.open.git_bootstrap_ready",
                         Some(&pane_id),
                         request.instance_id,
                         Some(git_started_at.elapsed()),
-                        serde_json::to_value(&bootstrap).unwrap_or_else(|_| json!({})),
+                        workspace_git_bootstrap_fields(&bootstrap, cached),
                     );
                 }
                 Err(error) => {

@@ -4,7 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -159,6 +159,7 @@ struct CachedWorkspaceMcpActivation {
 }
 
 type WorkspaceMcpActivationCache = HashMap<String, CachedWorkspaceMcpActivation>;
+type WorktreeMutationLocks = HashMap<String, Arc<Mutex<()>>>;
 
 fn integration_worktree_cache() -> &'static Mutex<HashMap<String, CachedIntegrationWorktree>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedIntegrationWorktree>>> = OnceLock::new();
@@ -168,6 +169,11 @@ fn integration_worktree_cache() -> &'static Mutex<HashMap<String, CachedIntegrat
 fn workspace_mcp_activation_cache() -> &'static Mutex<WorkspaceMcpActivationCache> {
     static CACHE: OnceLock<Mutex<WorkspaceMcpActivationCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn worktree_mutation_locks() -> &'static Mutex<WorktreeMutationLocks> {
+    static LOCKS: OnceLock<Mutex<WorktreeMutationLocks>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn initialized_kernel_dbs() -> &'static Mutex<HashSet<String>> {
@@ -236,6 +242,19 @@ fn remember_workspace_mcp_activation(key: String, config_hash: String, response:
                 cached_at: Instant::now(),
             },
         );
+    }
+}
+
+fn worktree_mutation_lock_for_repo(repo_path: &Path) -> Arc<Mutex<()>> {
+    let mut key = process_path_text(repo_path);
+    #[cfg(windows)]
+    {
+        key = key.to_ascii_lowercase();
+    }
+
+    match worktree_mutation_locks().lock() {
+        Ok(mut locks) => Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(())))),
+        Err(_) => Arc::new(Mutex::new(())),
     }
 }
 
@@ -2727,11 +2746,53 @@ impl CoordinationKernel {
                                 "slot_key": slot_key,
                             }),
                         );
-                        self.create_or_reuse_worktree_for_slot_with_refresh(
-                            agent_slot_id,
-                            options.refresh_worktree,
+                        let mutation_lock = worktree_mutation_lock_for_repo(&self.paths.repo_path);
+                        let lock_wait_started_at = Instant::now();
+                        terminal_coordination_log(
+                            "terminal.coordination.worktree.creation_lock_wait_start",
                             pty_id,
-                        )
+                            None,
+                            json!({
+                                "agent_slot_id": agent_slot_id,
+                                "repo_path": process_path_text(&self.paths.repo_path),
+                                "slot_key": slot_key,
+                            }),
+                        );
+                        let _mutation_guard = mutation_lock
+                            .lock()
+                            .map_err(|_| "Unable to lock worktree creation gate.".to_string())?;
+                        terminal_coordination_log(
+                            "terminal.coordination.worktree.creation_lock_acquired",
+                            pty_id,
+                            Some(lock_wait_started_at.elapsed()),
+                            json!({
+                                "agent_slot_id": agent_slot_id,
+                                "repo_path": process_path_text(&self.paths.repo_path),
+                                "slot_key": slot_key,
+                            }),
+                        );
+                        match self.prepared_worktree_for_slot_with_telemetry(agent_slot_id, pty_id)
+                        {
+                            Ok(worktree) => {
+                                terminal_coordination_log(
+                                    "terminal.coordination.worktree.prepared_hit_after_creation_wait",
+                                    pty_id,
+                                    Some(lock_wait_started_at.elapsed()),
+                                    json!({
+                                        "agent_slot_id": agent_slot_id,
+                                        "path": worktree["path"].as_str(),
+                                        "slot_key": slot_key,
+                                        "worktree_id": worktree["id"].as_str(),
+                                    }),
+                                );
+                                Ok(worktree)
+                            }
+                            Err(_) => self.create_or_reuse_worktree_for_slot_with_refresh(
+                                agent_slot_id,
+                                options.refresh_worktree,
+                                pty_id,
+                            ),
+                        }
                     }
                 }
             } else {

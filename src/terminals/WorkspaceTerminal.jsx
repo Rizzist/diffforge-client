@@ -366,6 +366,8 @@ const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_ACTIVE_PANE_EVENT = "forge-terminal-active-pane-change";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
+const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
+const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
 const TERMINAL_INPUT_BATCH_MS = 8;
 const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
@@ -647,21 +649,6 @@ function isPlainShiftEnterEvent(event) {
 }
 
 let nextWorkspaceTerminalInstanceId = 1;
-const workspaceTerminalOpenQueues = new Map();
-
-function enqueueWorkspaceTerminalOpen(workspaceKey, task) {
-  const key = String(workspaceKey || "default");
-  const previous = workspaceTerminalOpenQueues.get(key) || Promise.resolve();
-  const run = previous.catch(() => {}).then(task);
-  const cleanup = run.finally(() => {
-    if (workspaceTerminalOpenQueues.get(key) === cleanup) {
-      workspaceTerminalOpenQueues.delete(key);
-    }
-  });
-
-  workspaceTerminalOpenQueues.set(key, cleanup);
-  return run;
-}
 
 function getSafePaneToken(value) {
   const token = String(value || "workspace")
@@ -1809,6 +1796,11 @@ export default function WorkspaceTerminal({
     let resizeWriteBarrierReason = "";
     let resizeWriteBarrierBytes = 0;
     const resizeWriteBarrierQueue = [];
+    const pendingOutputWrites = [];
+    let pendingOutputBytes = 0;
+    let outputBatchRafId = 0;
+    let outputBatchTimeoutId = 0;
+    let outputBatchQueuedAt = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
     let outputBytes = 0;
@@ -2936,6 +2928,153 @@ export default function WorkspaceTerminal({
       throw new Error("Terminal render metrics were not ready before PTY startup.");
     };
 
+    const cancelTerminalOutputBatchTimers = () => {
+      if (outputBatchRafId) {
+        window.cancelAnimationFrame(outputBatchRafId);
+        outputBatchRafId = 0;
+      }
+      if (outputBatchTimeoutId) {
+        window.clearTimeout(outputBatchTimeoutId);
+        outputBatchTimeoutId = 0;
+      }
+    };
+
+    const combineTerminalOutputWrites = (writes) => {
+      if (writes.length === 1) {
+        return writes[0].data;
+      }
+
+      const combined = new Uint8Array(writes.reduce((total, write) => total + write.data.byteLength, 0));
+      let offset = 0;
+      writes.forEach((write) => {
+        combined.set(write.data, offset);
+        offset += write.data.byteLength;
+      });
+      return combined;
+    };
+
+    const flushTerminalOutputBatch = (reason) => {
+      if (isDisposed || !pendingOutputWrites.length) {
+        cancelTerminalOutputBatchTimers();
+        pendingOutputWrites.length = 0;
+        pendingOutputBytes = 0;
+        outputBatchQueuedAt = 0;
+        return;
+      }
+
+      const writes = pendingOutputWrites.splice(0);
+      const batchBytes = pendingOutputBytes;
+      const queuedMs = outputBatchQueuedAt ? performance.now() - outputBatchQueuedAt : 0;
+      pendingOutputBytes = 0;
+      outputBatchQueuedAt = 0;
+      cancelTerminalOutputBatchTimers();
+
+      const batchData = combineTerminalOutputWrites(writes);
+      const isFirstOutputChunk = writes.some((write) => write.isFirstOutputChunk);
+      const isFirstVisibleOutputChunk = writes.some((write) => write.isFirstVisibleOutputChunk);
+      const outputDebug = getTerminalOutputDebugFields(batchData);
+      const shouldLogWrite = outputChunks <= 10
+        || isFirstOutputChunk
+        || isFirstVisibleOutputChunk
+        || writes.length > 1;
+
+      if (shouldLogWrite) {
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.xterm.write_start",
+          cols: terminal.cols,
+          rows: terminal.rows,
+          fields: {
+            batchBytes,
+            batchChunks: writes.length,
+            frame: outputDebug,
+            flushReason: reason,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            maxBatchMs: TERMINAL_OUTPUT_BATCH_MAX_MS,
+            outputChunks,
+            queuedMs,
+            terminalIndex,
+          },
+        });
+      }
+
+      terminal.write(batchData, () => {
+        if (isDisposed) {
+          return;
+        }
+
+        updateTerminalScrollbarOverflow();
+        scheduleTerminalScrollbarRefresh([40, 160]);
+
+        if (isFirstOutputChunk) {
+          refreshTerminalRenderer("first_output_written", {
+            bytes: batchData.byteLength,
+            transport: "binary_channel",
+          });
+          scheduleRenderProbe(
+            "first_output_written",
+            TERMINAL_RENDER_PROBE_AFTER_WRITE_MS,
+            {
+              bytes: batchData.byteLength,
+              transport: "binary_channel",
+            },
+          );
+        }
+
+        if (isFirstVisibleOutputChunk) {
+          refreshTerminalRenderer("first_visible_output_written", {
+            bytes: batchData.byteLength,
+            transport: "binary_channel",
+          });
+          setTerminalStatus((current) => ({
+            ...current,
+            visible: false,
+          }));
+        }
+
+        if (shouldLogWrite) {
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.xterm.write_done",
+            cols: terminal.cols,
+            rows: terminal.rows,
+            fields: {
+              batchBytes,
+              batchChunks: writes.length,
+              buffer: getTerminalBufferDiagnostics(terminal),
+              frame: outputDebug,
+              flushReason: reason,
+              isFirstOutputChunk,
+              isFirstVisibleOutputChunk,
+              maxBatchMs: TERMINAL_OUTPUT_BATCH_MAX_MS,
+              outputChunks,
+              queuedMs,
+              terminalIndex,
+            },
+          });
+        }
+      });
+    };
+
+    const scheduleTerminalOutputBatchFlush = () => {
+      if (!outputBatchRafId) {
+        outputBatchRafId = window.requestAnimationFrame(() => {
+          outputBatchRafId = 0;
+          flushTerminalOutputBatch("animation_frame");
+        });
+      }
+
+      if (!outputBatchTimeoutId) {
+        outputBatchTimeoutId = window.setTimeout(() => {
+          outputBatchTimeoutId = 0;
+          flushTerminalOutputBatch("max_latency");
+        }, TERMINAL_OUTPUT_BATCH_MAX_MS);
+      }
+    };
+
     const writeTerminalOutput = (data, options = {}) => {
       if (isDisposed || !data?.byteLength) {
         return;
@@ -2975,75 +3114,24 @@ export default function WorkspaceTerminal({
         return;
       }
 
-      if (outputChunks <= 10 || isFirstOutputChunk || isFirstVisibleOutputChunk) {
-        writeTerminalTelemetry({
-          paneId,
-          instanceId: terminalInstanceId,
-          phase: "frontend.xterm.write_start",
-          cols: terminal.cols,
-          rows: terminal.rows,
-          fields: {
-            frame: outputDebug,
-            isFirstOutputChunk,
-            isFirstVisibleOutputChunk,
-            outputChunks,
-            terminalIndex,
-          },
-        });
+      const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
+      if (!pendingOutputWrites.length) {
+        outputBatchQueuedAt = performance.now();
+      }
+      pendingOutputWrites.push({
+        data: queuedData,
+        isFirstOutputChunk,
+        isFirstVisibleOutputChunk,
+        outputDebug,
+      });
+      pendingOutputBytes += queuedData.byteLength;
+
+      if (pendingOutputBytes >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+        flushTerminalOutputBatch("max_bytes");
+        return;
       }
 
-      terminal.write(data, () => {
-        if (isDisposed) {
-          return;
-        }
-
-        updateTerminalScrollbarOverflow();
-        scheduleTerminalScrollbarRefresh([40, 160]);
-
-        if (isFirstOutputChunk) {
-          refreshTerminalRenderer("first_output_written", {
-            bytes: data.byteLength,
-            transport: "binary_channel",
-          });
-          scheduleRenderProbe(
-            "first_output_written",
-            TERMINAL_RENDER_PROBE_AFTER_WRITE_MS,
-            {
-              bytes: data.byteLength,
-              transport: "binary_channel",
-            },
-          );
-        }
-
-        if (isFirstVisibleOutputChunk) {
-          refreshTerminalRenderer("first_visible_output_written", {
-            bytes: data.byteLength,
-            transport: "binary_channel",
-          });
-          setTerminalStatus((current) => ({
-            ...current,
-            visible: false,
-          }));
-        }
-
-        if (outputChunks <= 10 || isFirstOutputChunk || isFirstVisibleOutputChunk) {
-          writeTerminalTelemetry({
-            paneId,
-            instanceId: terminalInstanceId,
-            phase: "frontend.xterm.write_done",
-            cols: terminal.cols,
-            rows: terminal.rows,
-            fields: {
-              buffer: getTerminalBufferDiagnostics(terminal),
-              frame: outputDebug,
-              isFirstOutputChunk,
-              isFirstVisibleOutputChunk,
-              outputChunks,
-              terminalIndex,
-            },
-          });
-        }
-      });
+      scheduleTerminalOutputBatchFlush();
     };
 
     const openResizeWriteBarrier = (event) => {
@@ -3051,6 +3139,7 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      flushTerminalOutputBatch("resize_barrier_start");
       resizeWriteBarrierActive = true;
       resizeWriteBarrierStartedAt = performance.now();
       resizeWriteBarrierReason = event?.reason || "resize";
@@ -3897,8 +3986,8 @@ export default function WorkspaceTerminal({
         } else {
           setPaneStage(
             "starting",
-            "Queued Terminal Launch",
-            "Waiting for this workspace's terminal launch turn.",
+            "Opening Agent Terminal",
+            "Opening terminal backend.",
             {
               kind: openKind,
               prewarmShell: shouldPrewarmShell,
@@ -3932,7 +4021,7 @@ export default function WorkspaceTerminal({
             ...getWorkspaceOpenTelemetryFields(workspace?.id),
           },
         });
-        const invokeTerminalOpen = async (queued = false) => {
+        const invokeTerminalOpen = async () => {
           if (isDisposed) {
             throw new Error("Terminal launch was cancelled.");
           }
@@ -3942,25 +4031,25 @@ export default function WorkspaceTerminal({
             isGenericTerminal ? "Preparing Shell" : "Preparing Agent",
             isGenericTerminal
               ? "Opening terminal."
-              : "Creating the terminal worktree and MCP config.",
+              : "Opening terminal backend.",
             {
               kind: openKind,
               prewarmShell: shouldPrewarmShell,
             },
           );
-          if (queued) {
-            writeTerminalTelemetry({
-              paneId,
-              instanceId: terminalInstanceId,
-              phase: "frontend.open.queue_acquired",
-              elapsedMs: performance.now() - openStartedAt,
-              fields: {
-                terminalIndex,
-                workspaceOpenQueueKey,
-                ...getWorkspaceOpenTelemetryFields(workspace?.id),
-              },
-            });
-          }
+          writeTerminalTelemetry({
+            paneId,
+            instanceId: terminalInstanceId,
+            phase: "frontend.open.invoke_immediate",
+            elapsedMs: performance.now() - openStartedAt,
+            fields: {
+              kind: openKind,
+              plainShell: isGenericTerminal,
+              prewarmShell: shouldPrewarmShell,
+              terminalIndex,
+              ...getWorkspaceOpenTelemetryFields(workspace?.id),
+            },
+          });
 
           startupControlReplyBridgeOpen = true;
           return invoke("terminal_open", {
@@ -3983,10 +4072,7 @@ export default function WorkspaceTerminal({
             outputChannel,
           });
         };
-        const workspaceOpenQueueKey = workspace?.id || workingDirectory || "default";
-        const openResult = isGenericTerminal
-          ? await invokeTerminalOpen(false)
-          : await enqueueWorkspaceTerminalOpen(workspaceOpenQueueKey, () => invokeTerminalOpen(true));
+        const openResult = await invokeTerminalOpen();
 
         if (isDisposed) {
           startupControlReplyBridgeOpen = false;
@@ -4116,6 +4202,10 @@ export default function WorkspaceTerminal({
       resizeDebugProbeTimers.clear();
       startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
       startupWatchTimers.clear();
+      cancelTerminalOutputBatchTimers();
+      pendingOutputWrites.length = 0;
+      pendingOutputBytes = 0;
+      outputBatchQueuedAt = 0;
       resizeWriteBarrierActive = false;
       resizeWriteBarrierQueue.length = 0;
       resizeWriteBarrierBytes = 0;

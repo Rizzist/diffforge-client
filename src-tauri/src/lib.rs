@@ -28,7 +28,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
     sync::{mpsc, oneshot, Mutex, RwLock},
-    time::{interval, sleep, timeout, MissedTickBehavior},
+    time::{sleep, timeout},
 };
 use tokio_tungstenite::{
     connect_async,
