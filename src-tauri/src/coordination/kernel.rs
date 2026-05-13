@@ -84,6 +84,14 @@ fn bool_i64(value: bool) -> i64 {
     }
 }
 
+fn resource_keys_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty()
+        && !right.is_empty()
+        && (resource_covers(left, right) || resource_covers(right, left))
+}
+
 pub fn api_ok(data: Value) -> Value {
     serde_json::to_value(ApiEnvelope {
         ok: true,
@@ -507,7 +515,7 @@ impl CoordinationKernel {
         let mut dependent_refreshes = Vec::new();
         for lease in &leases {
             dependent_refreshes.push(
-                self.refresh_active_file_lease_dependents_after_release(lease)
+                self.refresh_active_file_lease_dependents_after_release(lease, None)
                     .unwrap_or_else(|error| {
                         api_error(
                             "startup_lease_dependent_refresh_failed",
@@ -970,8 +978,37 @@ impl CoordinationKernel {
         assigned_role: Option<&str>,
         expected_output: Option<&str>,
     ) -> Result<Value, String> {
+        self.create_task_with_id(
+            None,
+            title,
+            body,
+            priority,
+            risk_level,
+            context_run_id,
+            source_plan_item_id,
+            assigned_role,
+            expected_output,
+        )
+    }
+
+    fn create_task_with_id(
+        &self,
+        requested_id: Option<&str>,
+        title: &str,
+        body: Option<&str>,
+        priority: i64,
+        risk_level: i64,
+        context_run_id: Option<&str>,
+        source_plan_item_id: Option<&str>,
+        assigned_role: Option<&str>,
+        expected_output: Option<&str>,
+    ) -> Result<Value, String> {
         let title = non_empty(title, "Task title")?;
-        let id = uuid();
+        let id = requested_id
+            .map(|value| non_empty(value, "Task id"))
+            .transpose()?
+            .map(str::to_string)
+            .unwrap_or_else(uuid);
         let now = now_rfc3339();
         self.conn
             .execute(
@@ -1093,6 +1130,72 @@ impl CoordinationKernel {
         })))
     }
 
+    fn mark_task_resource_intents_stopped(
+        &self,
+        task_id: &str,
+        status: &str,
+        now: &str,
+    ) -> Result<usize, String> {
+        let normalized_status = status.trim().to_ascii_lowercase();
+        let status = match normalized_status.as_str() {
+            "cancelled" => "cancelled",
+            "interrupted" => "interrupted",
+            _ => {
+                return Err(
+                    "Stopped task resource intent status must be cancelled or interrupted."
+                        .to_string(),
+                )
+            }
+        };
+        self.conn
+            .execute(
+                "UPDATE task_resource_intents
+                 SET status=?1,
+                     lease_id=NULL,
+                     updated_at=?2
+                 WHERE task_id=?3
+                   AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                params![status, now, task_id],
+            )
+            .map_err(|error| format!("Unable to mark task resource intents {status}: {error}"))
+    }
+
+    fn refresh_task_stopped_file_lease_queue(
+        &self,
+        task_id: &str,
+        event_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let resource_rows = self.query_json(
+            "SELECT DISTINCT resource_key
+             FROM task_resource_intents
+             WHERE task_id=?1
+               AND COALESCE(resource_key, '') != ''
+             ORDER BY resource_key ASC",
+            &[&task_id],
+        )?;
+        let mut refreshed = Vec::new();
+        for row in resource_rows {
+            let resource_key =
+                normalize_resource_key(row["resource_key"].as_str().unwrap_or_default());
+            if resource_key.is_empty() {
+                continue;
+            }
+            if let Some(waiter) = self.next_active_file_lease_queue_waiter(&resource_key)? {
+                refreshed.push(self.release_active_file_lease_queue_waiter(
+                    &waiter,
+                    &resource_key,
+                    task_id,
+                    event_id,
+                )?);
+            }
+        }
+        Ok(json!({
+            "status": "completed",
+            "task_id": task_id,
+            "released_dependents": refreshed,
+        }))
+    }
+
     pub fn mark_terminal_task_stopped(
         &self,
         task_id: &str,
@@ -1131,8 +1234,15 @@ impl CoordinationKernel {
                     params![&status, now, task_id, session_id],
                 )
                 .map_err(|error| format!("Unable to mark task {status}: {error}"))?;
-            let released_leases =
-                self.release_active_leases_for_task(task_id, &format!("task_{status}"))?;
+            let released_leases = self.release_active_leases_for_task_with_event(
+                task_id,
+                &format!("task_{status}"),
+                "task_leases_released_after_stop",
+            )?;
+            let updated_resource_intents =
+                self.mark_task_resource_intents_stopped(task_id, &status, &now)?;
+            let stopped_queue_refresh =
+                self.refresh_task_stopped_file_lease_queue(task_id, None)?;
             self.emit_event(
                 if status == "cancelled" {
                     "task_cancelled"
@@ -1150,6 +1260,8 @@ impl CoordinationKernel {
                     "reason": reason,
                     "released_leases": released_leases,
                     "status": status.clone(),
+                    "updated_resource_intents": updated_resource_intents,
+                    "stopped_queue_refresh": stopped_queue_refresh,
                 }),
             )?;
             Ok(json!({
@@ -1157,6 +1269,8 @@ impl CoordinationKernel {
                 "session_id": session_id,
                 "status": status,
                 "released_leases": released_leases,
+                "updated_resource_intents": updated_resource_intents,
+                "stopped_queue_refresh": stopped_queue_refresh,
             }))
         })();
 
@@ -3314,8 +3428,47 @@ impl CoordinationKernel {
             }
         }
 
+        let (updated_resource_intents, updated_task_status, stopped_queue_refresh) = if let Some(
+            task_id,
+        ) = session
+            ["task_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let updated_resource_intents =
+                self.mark_task_resource_intents_stopped(task_id, "interrupted", &now)?;
+            let updated_task_status = if updated_resource_intents > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE tasks
+                         SET status='interrupted', updated_at=?1
+                         WHERE id=?2
+                           AND claimed_session_id=?3
+                           AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
+                        params![now, task_id, session_id],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to mark interrupted session task interrupted: {error}")
+                    })?
+            } else {
+                0
+            };
+            (
+                updated_resource_intents,
+                updated_task_status,
+                self.refresh_task_stopped_file_lease_queue(task_id, None)?,
+            )
+        } else {
+            (
+                0,
+                0,
+                json!({"status": "skipped", "reason": "session_missing_task"}),
+            )
+        };
+
+        let mut expired_dependents = Vec::new();
         for lease in &active_leases {
-            self.emit_event(
+            let lease_event_id = self.emit_event(
                 "lease_expired",
                 "kernel",
                 REPO_ID,
@@ -3333,6 +3486,19 @@ impl CoordinationKernel {
                     "interrupt_reason": reason,
                 }),
             )?;
+            let released_dependents = self
+                .refresh_active_file_lease_dependents_after_release(lease, Some(&lease_event_id))
+                .unwrap_or_else(|error| {
+                    api_error(
+                        "lease_dependent_refresh_failed",
+                        "Lease was expired, but dependent parked tasks could not be refreshed.",
+                        json!({"lease_id": lease["id"], "error": error}),
+                    )
+                });
+            expired_dependents.push(json!({
+                "lease_id": lease["id"],
+                "released_dependents": released_dependents,
+            }));
         }
 
         self.emit_event(
@@ -3352,6 +3518,10 @@ impl CoordinationKernel {
                 "expired_leases": active_leases.len(),
                 "interrupted_worktrees": active_worktrees.len(),
                 "discarded_parked_task": discarded_parked_task,
+                "updated_resource_intents": updated_resource_intents,
+                "updated_task_status": updated_task_status,
+                "stopped_queue_refresh": stopped_queue_refresh,
+                "expired_dependents": expired_dependents,
             }),
         )?;
         Ok(json!({
@@ -3360,6 +3530,10 @@ impl CoordinationKernel {
             "interrupted": true,
             "expired_leases": active_leases.len(),
             "interrupted_worktrees": active_worktrees.len(),
+            "updated_resource_intents": updated_resource_intents,
+            "updated_task_status": updated_task_status,
+            "stopped_queue_refresh": stopped_queue_refresh,
+            "expired_dependents": expired_dependents,
         }))
     }
 
@@ -5189,7 +5363,7 @@ impl CoordinationKernel {
                 )
             });
         let released_dependents = self
-            .refresh_active_file_lease_dependents_after_release(&lease)
+            .refresh_active_file_lease_dependents_after_release(&lease, Some(&release_event_id))
             .unwrap_or_else(|error| {
                 api_error(
                     "lease_dependent_refresh_failed",
@@ -5235,6 +5409,7 @@ impl CoordinationKernel {
     fn refresh_active_file_lease_dependents_after_release(
         &self,
         lease: &Value,
+        release_event_id: Option<&str>,
     ) -> Result<Value, String> {
         let Some(blocking_task_id) = lease["task_id"]
             .as_str()
@@ -5246,8 +5421,115 @@ impl CoordinationKernel {
         let Some(released_resource_key) = self.lease_resource_key_from_row(lease)? else {
             return Ok(json!({"status": "skipped", "reason": "lease_missing_resource"}));
         };
-        let dependents = self.query_json(
-            "SELECT DISTINCT d.task_id,
+        let refreshed = if let Some(waiter) =
+            self.next_active_file_lease_queue_waiter(&released_resource_key)?
+        {
+            vec![self.release_active_file_lease_queue_waiter(
+                &waiter,
+                &released_resource_key,
+                blocking_task_id,
+                release_event_id,
+            )?]
+        } else {
+            Vec::new()
+        };
+        Ok(json!({
+            "status": "completed",
+            "released_resource_key": released_resource_key.clone(),
+            "queue_policy": "fifo_single_waiter_per_resource",
+            "dependents": refreshed,
+        }))
+    }
+
+    fn next_active_file_lease_queue_waiter(
+        &self,
+        released_resource_key: &str,
+    ) -> Result<Option<Value>, String> {
+        let released_resource_key = normalize_resource_key(released_resource_key);
+        let resume_ready_waiters = self.query_json(
+            "SELECT i.task_id, i.resource_key
+             FROM task_resource_intents i
+             JOIN tasks t ON t.id=i.task_id
+             WHERE i.status='resume_ready'
+               AND t.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+             ORDER BY i.created_at ASC, i.updated_at ASC, i.task_id ASC",
+            &[],
+        )?;
+        if resume_ready_waiters.iter().any(|waiter| {
+            resource_keys_overlap(
+                &released_resource_key,
+                waiter["resource_key"].as_str().unwrap_or_default(),
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let waiters = self.query_json(
+            "SELECT i.id,
+                    i.task_id,
+                    i.resource_key,
+                    i.depends_on_task_id,
+                    i.status,
+                    i.created_at,
+                    i.updated_at,
+                    t.status AS task_status,
+                    t.claimed_session_id,
+                    t.context_run_id,
+                    (
+                        SELECT json_extract(e.predicate_json, '$.mode')
+                        FROM dependency_edges e
+                        WHERE e.dependent_task_id=i.task_id
+                          AND e.required=1
+                          AND e.predicate_kind='lease_released'
+                          AND json_extract(e.predicate_json, '$.dependency_kind')='active_file_lease'
+                          AND e.status IN ('pending', 'cycle_prevented')
+                        ORDER BY e.created_at ASC
+                        LIMIT 1
+                    ) AS requested_mode
+             FROM task_resource_intents i
+             JOIN tasks t ON t.id=i.task_id
+             WHERE i.status IN ('parked', 'parked_cycle_prevented')
+               AND t.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+             ORDER BY i.created_at ASC, i.updated_at ASC, i.task_id ASC",
+            &[],
+        )?;
+        for waiter in waiters {
+            let waiter_resource_key = waiter["resource_key"].as_str().unwrap_or_default();
+            if !resource_keys_overlap(&released_resource_key, waiter_resource_key) {
+                continue;
+            }
+            let requested_mode = waiter["requested_mode"].as_str().unwrap_or("write");
+            if self
+                .active_conflicting_leases(waiter_resource_key, requested_mode)?
+                .is_empty()
+            {
+                return Ok(Some(waiter));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn release_active_file_lease_queue_waiter(
+        &self,
+        waiter: &Value,
+        released_resource_key: &str,
+        releasing_task_id: &str,
+        release_event_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let task_id = waiter["task_id"].as_str().unwrap_or_default();
+        let intent_id = waiter["id"].as_str().unwrap_or_default();
+        let waiter_resource_key = waiter["resource_key"].as_str().unwrap_or_default();
+        if task_id.is_empty() || intent_id.is_empty() || waiter_resource_key.is_empty() {
+            return Err(
+                "Queued active-file lease waiter is missing required identity.".to_string(),
+            );
+        }
+
+        let now = now_rfc3339();
+        let mut dependency_task_ids = HashSet::new();
+        let dependency_rows = self.query_json(
+            "SELECT d.depends_on_task_id,
                     intent.resource_key AS intent_resource_key,
                     slice.resource_key AS slice_resource_key,
                     slice.depends_on_resource_key AS depends_on_resource_key
@@ -5258,143 +5540,199 @@ impl CoordinationKernel {
              LEFT JOIN task_slice_dependencies slice
                ON slice.task_id=d.task_id
               AND slice.depends_on_task_id=d.depends_on_task_id
-             WHERE d.depends_on_task_id=?1
+             WHERE d.task_id=?1
                AND d.dependency_kind='active_file_lease'
-             ORDER BY d.task_id ASC",
-            &[&blocking_task_id],
+             ORDER BY d.created_at ASC",
+            &[&task_id],
         )?;
-        let mut refreshed = Vec::new();
-        let mut seen_tasks = Vec::new();
-        for dependent in dependents {
-            let Some(dependent_task_id) = dependent["task_id"]
+        for dependency in dependency_rows {
+            let depends_on_task_id = dependency["depends_on_task_id"]
                 .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            if seen_tasks.iter().any(|task| task == dependent_task_id) {
+                .unwrap_or_default()
+                .trim();
+            if depends_on_task_id.is_empty() {
                 continue;
             }
-            let dependency_resource = dependent["intent_resource_key"]
-                .as_str()
-                .or_else(|| dependent["slice_resource_key"].as_str())
-                .or_else(|| dependent["depends_on_resource_key"].as_str())
-                .unwrap_or_default();
-            if !dependency_resource.is_empty()
-                && !resource_covers(&released_resource_key, dependency_resource)
-                && !resource_covers(dependency_resource, &released_resource_key)
-            {
-                continue;
-            }
-            let dependent_resources = self.query_json(
-                "SELECT resource_key
-                 FROM task_resource_intents
-                 WHERE task_id=?1
-                   AND depends_on_task_id=?2
-                 UNION
-                 SELECT resource_key
-                 FROM task_slice_dependencies
-                 WHERE task_id=?1
-                   AND depends_on_task_id=?2
-                 UNION
-                 SELECT depends_on_resource_key AS resource_key
-                 FROM task_slice_dependencies
-                 WHERE task_id=?1
-                   AND depends_on_task_id=?2
-                   AND depends_on_resource_key IS NOT NULL",
-                &[&dependent_task_id, &blocking_task_id],
-            )?;
-            let active_blocking_leases = self.query_json(
-                "SELECT l.id, r.resource_key
-                 FROM leases l
-                 JOIN resources r ON r.id=l.resource_id
-                 WHERE l.task_id=?1
-                   AND l.status='active'",
-                &[&blocking_task_id],
-            )?;
-            let still_blocked = dependent_resources.iter().any(|resource| {
-                let resource_key = resource["resource_key"].as_str().unwrap_or_default();
-                !resource_key.is_empty()
-                    && active_blocking_leases.iter().any(|active| {
-                        let active_resource = active["resource_key"].as_str().unwrap_or_default();
-                        resource_covers(active_resource, resource_key)
-                            || resource_covers(resource_key, active_resource)
-                    })
+            let overlaps_released_resource = [
+                dependency["intent_resource_key"]
+                    .as_str()
+                    .unwrap_or_default(),
+                dependency["slice_resource_key"]
+                    .as_str()
+                    .unwrap_or_default(),
+                dependency["depends_on_resource_key"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ]
+            .into_iter()
+            .filter(|resource_key| !resource_key.trim().is_empty())
+            .any(|resource_key| {
+                resource_keys_overlap(waiter_resource_key, resource_key)
+                    || resource_keys_overlap(released_resource_key, resource_key)
             });
-            if still_blocked {
-                continue;
+            if overlaps_released_resource {
+                dependency_task_ids.insert(depends_on_task_id.to_string());
             }
-            let now = now_rfc3339();
-            let dependency_rows = self
+        }
+
+        let mut dependency_rows_removed = 0;
+        for depends_on_task_id in &dependency_task_ids {
+            dependency_rows_removed += self
                 .conn
                 .execute(
                     "DELETE FROM task_dependencies
                      WHERE task_id=?1
                        AND depends_on_task_id=?2
                        AND dependency_kind='active_file_lease'",
-                    params![dependent_task_id, blocking_task_id],
+                    params![task_id, depends_on_task_id],
                 )
                 .map_err(|error| {
                     format!("Unable to clear released active-file lease dependency: {error}")
                 })?;
-            let intent_rows = self
-                .conn
-                .execute(
-                    "UPDATE task_resource_intents
-                     SET status='resume_ready', updated_at=?1
-                     WHERE task_id=?2
-                       AND depends_on_task_id=?3
-                       AND status IN ('parked', 'parked_cycle_prevented')",
-                    params![now, dependent_task_id, blocking_task_id],
-                )
-                .map_err(|error| {
-                    format!("Unable to mark released active-file lease intents ready: {error}")
-                })?;
-            let slice_rows = self
+        }
+
+        let intent_rows_resume_ready = self
+            .conn
+            .execute(
+                "UPDATE task_resource_intents
+                 SET status='resume_ready', updated_at=?1
+                 WHERE id=?2
+                   AND status IN ('parked', 'parked_cycle_prevented')",
+                params![now, intent_id],
+            )
+            .map_err(|error| {
+                format!("Unable to mark released active-file lease intent ready: {error}")
+            })?;
+
+        let mut slice_rows_satisfied = 0;
+        let slice_rows = self.query_json(
+            "SELECT id, resource_key, depends_on_resource_key
+             FROM task_slice_dependencies
+             WHERE task_id=?1
+               AND dependency_kind='active_file_lease'
+               AND status IN ('parked', 'parked_cycle_prevented', 'cycle_prevented')
+             ORDER BY created_at ASC",
+            &[&task_id],
+        )?;
+        for slice in slice_rows {
+            let slice_id = slice["id"].as_str().unwrap_or_default();
+            let slice_resource_key = slice["resource_key"].as_str().unwrap_or_default();
+            let depends_on_resource_key = slice["depends_on_resource_key"]
+                .as_str()
+                .unwrap_or_default();
+            if slice_id.is_empty()
+                || (!resource_keys_overlap(waiter_resource_key, slice_resource_key)
+                    && !resource_keys_overlap(released_resource_key, slice_resource_key)
+                    && !resource_keys_overlap(waiter_resource_key, depends_on_resource_key)
+                    && !resource_keys_overlap(released_resource_key, depends_on_resource_key))
+            {
+                continue;
+            }
+            slice_rows_satisfied += self
                 .conn
                 .execute(
                     "UPDATE task_slice_dependencies
                      SET status='satisfied', updated_at=?1
-                     WHERE task_id=?2
-                       AND depends_on_task_id=?3
-                       AND dependency_kind='active_file_lease'
-                       AND status IN ('parked', 'parked_cycle_prevented', 'cycle_prevented')",
-                    params![now, dependent_task_id, blocking_task_id],
+                     WHERE id=?2",
+                    params![now, slice_id],
                 )
                 .map_err(|error| {
-                    format!("Unable to mark released active-file lease slices satisfied: {error}")
+                    format!("Unable to mark released active-file lease slice satisfied: {error}")
                 })?;
-            self.refresh_task_dependency_blocked_status(dependent_task_id, "kernel", REPO_ID)?;
+        }
+
+        let mut dependency_edges_satisfied = 0;
+        let edges = self.query_json(
+            "SELECT id, prerequisite_key, predicate_json, status
+             FROM dependency_edges
+             WHERE dependent_task_id=?1
+               AND required=1
+               AND predicate_kind='lease_released'
+               AND json_extract(predicate_json, '$.dependency_kind')='active_file_lease'
+               AND status IN ('pending', 'cycle_prevented')
+             ORDER BY created_at ASC",
+            &[&task_id],
+        )?;
+        for edge in edges {
+            let edge_id = edge["id"].as_str().unwrap_or_default();
+            let edge_resource_key = edge["prerequisite_key"]
+                .as_str()
+                .unwrap_or_default()
+                .strip_prefix("resource:")
+                .unwrap_or_else(|| edge["prerequisite_key"].as_str().unwrap_or_default());
+            let blocked_by_resource_key = edge["predicate_json"]["blocked_by_resource_key"]
+                .as_str()
+                .unwrap_or_default();
+            if edge_id.is_empty()
+                || (!resource_keys_overlap(waiter_resource_key, edge_resource_key)
+                    && !resource_keys_overlap(released_resource_key, edge_resource_key)
+                    && !resource_keys_overlap(waiter_resource_key, blocked_by_resource_key)
+                    && !resource_keys_overlap(released_resource_key, blocked_by_resource_key))
+            {
+                continue;
+            }
+            dependency_edges_satisfied += self
+                .conn
+                .execute(
+                    "UPDATE dependency_edges
+                     SET status='satisfied',
+                         satisfied_by_event_id=COALESCE(?1, satisfied_by_event_id),
+                         updated_at=?2
+                     WHERE id=?3
+                       AND status IN ('pending', 'cycle_prevented')",
+                    params![release_event_id, now, edge_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to satisfy released active-file lease dependency edge: {error}")
+                })?;
             self.emit_event(
-                "active_file_lease_dependency_released",
+                "dependency_satisfied",
                 "kernel",
                 REPO_ID,
                 EventRefs {
-                    task_id: Some(dependent_task_id.to_string()),
+                    task_id: Some(task_id.to_string()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "blocking_task_id": blocking_task_id,
-                    "released_resource_key": released_resource_key.clone(),
-                    "dependency_rows_removed": dependency_rows,
-                    "intent_rows_resume_ready": intent_rows,
-                    "slice_rows_satisfied": slice_rows,
-                    "resume_policy": "lease_release_unblocks_parked_active_file_waiters",
+                    "dependency_edge_id": edge_id,
+                    "dependent_task_id": task_id,
+                    "predicate_kind": "lease_released",
+                    "proof_event_id": release_event_id,
+                    "reason": "Resource queue waiter reached the FIFO head for a released active-file lease.",
+                    "resume_policy": "fifo_single_waiter_per_resource",
                 }),
             )?;
-            refreshed.push(json!({
-                "task_id": dependent_task_id,
-                "dependency_rows_removed": dependency_rows,
-                "intent_rows_resume_ready": intent_rows,
-                "slice_rows_satisfied": slice_rows,
-            }));
-            seen_tasks.push(dependent_task_id.to_string());
         }
+
+        self.refresh_dependency_graph_blocked_status(task_id, "kernel", REPO_ID)?;
+        self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID)?;
+        self.emit_event(
+            "active_file_lease_queue_waiter_released",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "releasing_task_id": releasing_task_id,
+                "released_resource_key": released_resource_key,
+                "waiter_resource_key": waiter_resource_key,
+                "dependency_rows_removed": dependency_rows_removed,
+                "intent_rows_resume_ready": intent_rows_resume_ready,
+                "slice_rows_satisfied": slice_rows_satisfied,
+                "dependency_edges_satisfied": dependency_edges_satisfied,
+                "resume_policy": "fifo_single_waiter_per_resource",
+            }),
+        )?;
+
         Ok(json!({
-            "status": "completed",
-            "released_resource_key": released_resource_key.clone(),
-            "dependents": refreshed,
+            "task_id": task_id,
+            "resource_key": waiter_resource_key,
+            "dependency_rows_removed": dependency_rows_removed,
+            "intent_rows_resume_ready": intent_rows_resume_ready,
+            "slice_rows_satisfied": slice_rows_satisfied,
+            "dependency_edges_satisfied": dependency_edges_satisfied,
         }))
     }
 
@@ -10620,15 +10958,149 @@ impl CoordinationKernel {
         session_id: Option<&str>,
         task_id: Option<&str>,
         context_run_id: Option<&str>,
+        start_plan: Option<&str>,
+        task_title: Option<&str>,
+        assigned_role: Option<&str>,
     ) -> Result<Value, String> {
         let heartbeat = session_id
             .filter(|value| !value.trim().is_empty())
             .map(|session_id| self.heartbeat_session(session_id).is_ok())
             .unwrap_or(false);
-        let brief = self.get_brief(agent_id, session_id, task_id, context_run_id)?;
+        let raw_task_id = task_id.map(str::trim).filter(|value| !value.is_empty());
+        let task_id_is_session_id = raw_task_id.is_some_and(|value| session_id == Some(value));
+        let requested_task_id = raw_task_id.filter(|value| session_id != Some(*value));
+        let session_task_id = session_id.and_then(|session_id| {
+            self.query_json(
+                "SELECT task_id FROM agent_sessions WHERE id=?1 LIMIT 1",
+                &[&session_id],
+            )
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|session| {
+                session["task_id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        });
+        let mut created_task = false;
+        let mut reused_task = false;
+        let ignored_session_id_task_id = task_id_is_session_id;
+        let mut create_with_task_id = None::<String>;
+        let effective_task_id = if let Some(task_id) = requested_task_id {
+            if self
+                .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+                .is_empty()
+            {
+                create_with_task_id = Some(task_id.to_string());
+                None
+            } else {
+                reused_task = true;
+                Some(task_id.to_string())
+            }
+        } else if let Some(task_id) = session_task_id {
+            if self
+                .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+                .is_empty()
+            {
+                None
+            } else {
+                reused_task = true;
+                Some(task_id)
+            }
+        } else {
+            None
+        };
+
+        let effective_task_id = if let Some(task_id) = effective_task_id {
+            task_id
+        } else if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
+            let title = task_title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| start_task_title_from_plan(start_plan));
+            let task = self.create_task_with_id(
+                create_with_task_id.as_deref(),
+                &title,
+                start_plan,
+                0,
+                1,
+                context_run_id,
+                None,
+                assigned_role,
+                Some("Complete the direct agent task in the assigned worktree."),
+            )?;
+            let Some(task_id) = task["id"].as_str().map(str::to_string) else {
+                return Err("Created task did not return an id.".to_string());
+            };
+            let claimed = self.claim_task(&task_id, agent_id, session_id)?;
+            if claimed["ok"].as_bool() == Some(false) {
+                return Ok(claimed);
+            }
+            let _ = self.task_resume_state(&task_id, session_id);
+            created_task = true;
+            task_id
+        } else {
+            String::new()
+        };
+
+        if !effective_task_id.is_empty() {
+            if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
+                let task = self.query_one(
+                    "SELECT * FROM tasks WHERE id=?1",
+                    &[&effective_task_id],
+                    "Task does not exist.",
+                )?;
+                let claimed_session_id = task["claimed_session_id"].as_str().unwrap_or_default();
+                if claimed_session_id.is_empty() {
+                    let claimed = self.claim_task(&effective_task_id, agent_id, session_id)?;
+                    if claimed["ok"].as_bool() == Some(false) {
+                        return Ok(claimed);
+                    }
+                } else if claimed_session_id == session_id {
+                    let now = now_rfc3339();
+                    self.conn
+                        .execute(
+                            "UPDATE agent_sessions SET task_id=?1, updated_at=?2 WHERE id=?3",
+                            params![&effective_task_id, now, session_id],
+                        )
+                        .map_err(|error| {
+                            format!("Unable to attach session to started task: {error}")
+                        })?;
+                } else {
+                    return Ok(api_error(
+                        "task_claimed_by_another_session",
+                        "Task is claimed by another session.",
+                        json!({
+                            "task_id": effective_task_id,
+                            "claimed_session_id": claimed_session_id,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        let task_id_for_brief =
+            (!effective_task_id.is_empty()).then_some(effective_task_id.as_str());
+        let task = if effective_task_id.is_empty() {
+            Value::Null
+        } else {
+            self.query_one(
+                "SELECT * FROM tasks WHERE id=?1",
+                &[&effective_task_id],
+                "Task does not exist.",
+            )?
+        };
+        let brief = self.get_brief(agent_id, session_id, task_id_for_brief, context_run_id)?;
         Ok(api_ok(json!({
             "started": true,
-            "task_id": task_id,
+            "task_id": task_id_for_brief,
+            "task": task,
+            "created_task": created_task,
+            "reused_task": reused_task,
+            "ignored_session_id_task_id": ignored_session_id_task_id,
             "agent_id": agent_id,
             "session_id": session_id,
             "session_heartbeat_recorded": heartbeat,
@@ -14216,6 +14688,29 @@ fn non_empty<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
     Ok(trimmed)
 }
 
+fn start_task_title_from_plan(plan: Option<&str>) -> String {
+    let cleaned = plan
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Agent task")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut title = cleaned.chars().take(80).collect::<String>();
+    if cleaned.chars().count() > 80 {
+        title = title
+            .trim_end_matches(|character: char| {
+                character.is_ascii_punctuation() || character.is_whitespace()
+            })
+            .to_string();
+    }
+    if title.trim().is_empty() {
+        "Agent task".to_string()
+    } else {
+        title
+    }
+}
+
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
         .as_str()
@@ -15642,6 +16137,9 @@ mod tests {
             json!({"plan": "Verify the coordination MCP mount proof path."}),
         );
         assert_eq!(response["ok"].as_bool(), Some(true));
+        let task_id = response["data"]["task_id"].as_str().unwrap();
+        assert!(!task_id.is_empty());
+        assert_eq!(response["data"]["created_task"].as_bool(), Some(true));
 
         let summary = kernel.mcp_client_mount_summary().unwrap();
         assert_eq!(summary["status"].as_str(), Some("confirmed"));
@@ -15659,6 +16157,148 @@ mod tests {
             events[0]["payload_json"]["details"]["tool"].as_str(),
             Some("start_task")
         );
+        let session = kernel
+            .query_one(
+                "SELECT task_id FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(session["task_id"].as_str(), Some(task_id));
+    }
+
+    #[test]
+    fn agent_mcp_start_task_bootstraps_task_for_lease_defaults() {
+        let repo = init_git_repo("mcp_start_task_bootstrap");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let context = crate::coordination::mcp::McpContext {
+            repo_path: Some(process_path_text(&repo)),
+            agent_id: Some(agent_id.clone()),
+            session_id: Some(session_id.clone()),
+            ..crate::coordination::mcp::McpContext::default()
+        };
+
+        let started = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({"plan": "Create a simple ice cream wish list page."}),
+        );
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        let task_id = started["data"]["task_id"].as_str().unwrap();
+        assert!(!task_id.is_empty());
+        assert_eq!(started["data"]["created_task"].as_bool(), Some(true));
+
+        let repeated = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({"plan": "Continue the simple ice cream wish list page."}),
+        );
+        assert_eq!(repeated["ok"].as_bool(), Some(true));
+        assert_eq!(repeated["data"]["task_id"].as_str(), Some(task_id));
+        assert_eq!(repeated["data"]["created_task"].as_bool(), Some(false));
+        assert_eq!(repeated["data"]["reused_task"].as_bool(), Some(true));
+
+        let lease = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "acquire_lease",
+            json!({"resource_key": "file:index.html", "reason": "Create the wishlist page"}),
+        );
+        assert_eq!(lease["ok"].as_bool(), Some(true));
+        assert_eq!(
+            lease["data"]["resource_key"].as_str(),
+            Some("file:index.html")
+        );
+        let rows = kernel
+            .query_json("SELECT * FROM leases WHERE task_id=?1", &[&task_id])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn agent_mcp_start_task_treats_session_id_task_id_as_omitted() {
+        let repo = init_git_repo("mcp_start_task_session_id");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+
+        let started = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id.clone()),
+                session_id: Some(session_id.clone()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "start_task",
+            json!({
+                "task_id": session_id,
+                "plan": "Create a simple ice cream wish list page."
+            }),
+        );
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        let task_id = started["data"]["task_id"].as_str().unwrap();
+        assert!(!task_id.is_empty());
+        assert_ne!(task_id, session_id);
+        assert_eq!(
+            started["data"]["ignored_session_id_task_id"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_mcp_start_task_creates_unknown_explicit_task_id() {
+        let repo = init_git_repo("mcp_start_task_explicit_id");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+
+        let started = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id.clone()),
+                session_id: Some(session_id.clone()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "start_task",
+            json!({
+                "task_id": "ice-cream-wishlist-index",
+                "plan": "Create a simple ice cream wish list page."
+            }),
+        );
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        let task_id = started["data"]["task_id"].as_str().unwrap().to_string();
+        assert!(!task_id.is_empty());
+        assert_eq!(started["data"]["created_task"].as_bool(), Some(true));
+
+        let lease = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id),
+                session_id: Some(session_id),
+                task_id: Some(task_id.clone()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "acquire_lease",
+            json!({"resource_key": "file:index.html", "reason": "Create the wishlist page"}),
+        );
+        assert_eq!(lease["ok"].as_bool(), Some(true));
+        let rows = kernel
+            .query_json("SELECT * FROM leases WHERE task_id=?1", &[&task_id])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -16289,8 +16929,507 @@ mod tests {
                 "missing lease",
             )
             .unwrap();
+        let intent = kernel
+            .query_one(
+                "SELECT status, lease_id FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&task_id],
+                "missing interrupted intent",
+            )
+            .unwrap();
         assert_eq!(session["status"].as_str(), Some("interrupted"));
         assert_eq!(lease["status"].as_str(), Some("expired"));
+        assert_eq!(intent["status"].as_str(), Some("interrupted"));
+        assert!(intent["lease_id"].is_null());
+    }
+
+    #[test]
+    fn interrupt_session_wakes_parked_lease_waiter() {
+        let repo = temp_repo("interrupt_session_wakes_waiter");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let owner_agent = kernel.create_or_get_agent("Owner", "codex", None).unwrap();
+        let owner_agent_id = owner_agent["id"].as_str().unwrap();
+        let owner_session = kernel
+            .create_session_for_slot_key(
+                "interrupt-waiter-owner",
+                "Owner",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_session_id = owner_session["id"].as_str().unwrap();
+        let owner_task = kernel
+            .create_task("Owner", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let owner_task_id = owner_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(owner_task_id, owner_agent_id, owner_session_id)
+            .unwrap();
+        kernel
+            .acquire_lease(
+                owner_task_id,
+                owner_agent_id,
+                owner_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+
+        let waiter_agent = kernel.create_or_get_agent("Waiter", "codex", None).unwrap();
+        let waiter_agent_id = waiter_agent["id"].as_str().unwrap();
+        let waiter_session = kernel
+            .create_session_for_slot_key(
+                "interrupt-waiter-waiter",
+                "Waiter",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let waiter_session_id = waiter_session["id"].as_str().unwrap();
+        let waiter_task = kernel
+            .create_task("Waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let waiter_task_id = waiter_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(waiter_task_id, waiter_agent_id, waiter_session_id)
+            .unwrap();
+        let parked = kernel
+            .acquire_lease(
+                waiter_task_id,
+                waiter_agent_id,
+                waiter_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(parked["ok"].as_bool(), Some(false));
+
+        kernel
+            .interrupt_session(owner_session_id, "terminal_close")
+            .unwrap();
+
+        let owner_intent = kernel
+            .query_one(
+                "SELECT status, lease_id FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&owner_task_id],
+                "missing owner intent",
+            )
+            .unwrap();
+        let waiter_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&waiter_task_id],
+                "missing waiter intent",
+            )
+            .unwrap();
+        assert_eq!(owner_intent["status"].as_str(), Some("interrupted"));
+        assert!(owner_intent["lease_id"].is_null());
+        assert_eq!(waiter_intent["status"].as_str(), Some("resume_ready"));
+    }
+
+    #[test]
+    fn terminal_task_interruption_clears_intents_and_wakes_lease_waiter() {
+        let repo = temp_repo("terminal_interrupt_wakes_waiter");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let owner_agent = kernel.create_or_get_agent("Owner", "codex", None).unwrap();
+        let owner_agent_id = owner_agent["id"].as_str().unwrap();
+        let owner_session = kernel
+            .create_session_for_slot_key(
+                "terminal-interrupt-owner",
+                "Owner",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_session_id = owner_session["id"].as_str().unwrap();
+        let owner_task = kernel
+            .create_task("Owner", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let owner_task_id = owner_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(owner_task_id, owner_agent_id, owner_session_id)
+            .unwrap();
+        let owner_lease = kernel
+            .acquire_lease(
+                owner_task_id,
+                owner_agent_id,
+                owner_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        let owner_lease_id = owner_lease["data"]["lease_id"].as_str().unwrap();
+
+        let waiter_agent = kernel.create_or_get_agent("Waiter", "codex", None).unwrap();
+        let waiter_agent_id = waiter_agent["id"].as_str().unwrap();
+        let waiter_session = kernel
+            .create_session_for_slot_key(
+                "terminal-interrupt-waiter",
+                "Waiter",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let waiter_session_id = waiter_session["id"].as_str().unwrap();
+        let waiter_task = kernel
+            .create_task("Waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let waiter_task_id = waiter_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(waiter_task_id, waiter_agent_id, waiter_session_id)
+            .unwrap();
+        let parked = kernel
+            .acquire_lease(
+                waiter_task_id,
+                waiter_agent_id,
+                waiter_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(parked["ok"].as_bool(), Some(false));
+
+        kernel
+            .mark_terminal_task_stopped(
+                owner_task_id,
+                owner_session_id,
+                "interrupted",
+                "escape_key",
+            )
+            .unwrap();
+
+        let owner_task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&owner_task_id],
+                "missing owner task",
+            )
+            .unwrap();
+        let owner_lease = kernel
+            .query_one(
+                "SELECT status FROM leases WHERE id=?1",
+                &[&owner_lease_id],
+                "missing owner lease",
+            )
+            .unwrap();
+        let owner_intent = kernel
+            .query_one(
+                "SELECT status, lease_id FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&owner_task_id],
+                "missing owner intent",
+            )
+            .unwrap();
+        let waiter_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&waiter_task_id],
+                "missing waiter intent",
+            )
+            .unwrap();
+        assert_eq!(owner_task["status"].as_str(), Some("interrupted"));
+        assert_eq!(owner_lease["status"].as_str(), Some("released"));
+        assert_eq!(owner_intent["status"].as_str(), Some("interrupted"));
+        assert!(owner_intent["lease_id"].is_null());
+        assert_eq!(waiter_intent["status"].as_str(), Some("resume_ready"));
+    }
+
+    #[test]
+    fn cancelling_resume_ready_parked_task_wakes_next_waiter() {
+        let repo = temp_repo("cancel_resume_ready_wakes_next");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let owner_agent = kernel.create_or_get_agent("Owner", "codex", None).unwrap();
+        let owner_agent_id = owner_agent["id"].as_str().unwrap();
+        let owner_session = kernel
+            .create_session_for_slot_key(
+                "cancel-head-owner",
+                "Owner",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_session_id = owner_session["id"].as_str().unwrap();
+        let owner_task = kernel
+            .create_task("Owner", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let owner_task_id = owner_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(owner_task_id, owner_agent_id, owner_session_id)
+            .unwrap();
+        let owner_lease = kernel
+            .acquire_lease(
+                owner_task_id,
+                owner_agent_id,
+                owner_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+
+        let first_agent = kernel.create_or_get_agent("First", "codex", None).unwrap();
+        let first_agent_id = first_agent["id"].as_str().unwrap();
+        let first_session = kernel
+            .create_session_for_slot_key(
+                "cancel-head-first",
+                "First",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_session_id = first_session["id"].as_str().unwrap();
+        let first_task = kernel
+            .create_task("First waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let first_task_id = first_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(first_task_id, first_agent_id, first_session_id)
+            .unwrap();
+        let first_queue = kernel
+            .acquire_lease(
+                first_task_id,
+                first_agent_id,
+                first_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first_queue["ok"].as_bool(), Some(false));
+
+        let second_agent = kernel.create_or_get_agent("Second", "codex", None).unwrap();
+        let second_agent_id = second_agent["id"].as_str().unwrap();
+        let second_session = kernel
+            .create_session_for_slot_key(
+                "cancel-head-second",
+                "Second",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let second_session_id = second_session["id"].as_str().unwrap();
+        let second_task = kernel
+            .create_task("Second waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let second_task_id = second_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(second_task_id, second_agent_id, second_session_id)
+            .unwrap();
+        let second_queue = kernel
+            .acquire_lease(
+                second_task_id,
+                second_agent_id,
+                second_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second_queue["ok"].as_bool(), Some(false));
+
+        kernel
+            .release_lease(
+                owner_lease["data"]["lease_id"].as_str().unwrap(),
+                owner_lease["data"]["fence_token"].as_i64().unwrap(),
+            )
+            .unwrap();
+        let first_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&first_task_id],
+                "missing first intent before cancel",
+            )
+            .unwrap();
+        assert_eq!(first_intent["status"].as_str(), Some("resume_ready"));
+
+        kernel
+            .mark_terminal_task_stopped(
+                first_task_id,
+                first_session_id,
+                "cancelled",
+                "parked_task_cancel_button",
+            )
+            .unwrap();
+
+        let first_intent = kernel
+            .query_one(
+                "SELECT status, lease_id FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&first_task_id],
+                "missing first intent after cancel",
+            )
+            .unwrap();
+        let second_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&second_task_id],
+                "missing second intent after first cancel",
+            )
+            .unwrap();
+        assert_eq!(first_intent["status"].as_str(), Some("cancelled"));
+        assert!(first_intent["lease_id"].is_null());
+        assert_eq!(second_intent["status"].as_str(), Some("resume_ready"));
+    }
+
+    #[test]
+    fn interrupting_resume_ready_parked_session_marks_task_interrupted() {
+        let repo = temp_repo("interrupt_resume_ready_marks_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let owner_agent = kernel.create_or_get_agent("Owner", "codex", None).unwrap();
+        let owner_agent_id = owner_agent["id"].as_str().unwrap();
+        let owner_session = kernel
+            .create_session_for_slot_key(
+                "interrupt-ready-owner",
+                "Owner",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_session_id = owner_session["id"].as_str().unwrap();
+        let owner_task = kernel
+            .create_task("Owner", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let owner_task_id = owner_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(owner_task_id, owner_agent_id, owner_session_id)
+            .unwrap();
+        let owner_lease = kernel
+            .acquire_lease(
+                owner_task_id,
+                owner_agent_id,
+                owner_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+
+        let waiter_agent = kernel.create_or_get_agent("Waiter", "codex", None).unwrap();
+        let waiter_agent_id = waiter_agent["id"].as_str().unwrap();
+        let waiter_session = kernel
+            .create_session_for_slot_key(
+                "interrupt-ready-waiter",
+                "Waiter",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let waiter_session_id = waiter_session["id"].as_str().unwrap();
+        let waiter_task = kernel
+            .create_task("Waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let waiter_task_id = waiter_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(waiter_task_id, waiter_agent_id, waiter_session_id)
+            .unwrap();
+        let parked = kernel
+            .acquire_lease(
+                waiter_task_id,
+                waiter_agent_id,
+                waiter_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(parked["ok"].as_bool(), Some(false));
+
+        kernel
+            .release_lease(
+                owner_lease["data"]["lease_id"].as_str().unwrap(),
+                owner_lease["data"]["fence_token"].as_i64().unwrap(),
+            )
+            .unwrap();
+
+        let waiter_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&waiter_task_id],
+                "missing waiter intent before interrupt",
+            )
+            .unwrap();
+        assert_eq!(waiter_intent["status"].as_str(), Some("resume_ready"));
+
+        kernel
+            .interrupt_session(waiter_session_id, "app_crash_idle_claimed_task_cleanup")
+            .unwrap();
+
+        let waiter_task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&waiter_task_id],
+                "missing waiter task after interrupt",
+            )
+            .unwrap();
+        let waiter_intent = kernel
+            .query_one(
+                "SELECT status, lease_id FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&waiter_task_id],
+                "missing waiter intent after interrupt",
+            )
+            .unwrap();
+        assert_eq!(waiter_task["status"].as_str(), Some("interrupted"));
+        assert_eq!(waiter_intent["status"].as_str(), Some("interrupted"));
+        assert!(waiter_intent["lease_id"].is_null());
     }
 
     #[test]
@@ -16587,6 +17726,171 @@ mod tests {
             .unwrap()
             .iter()
             .any(|resource| resource["resource_key"].as_str() == Some("file:src/a.js")));
+    }
+
+    #[test]
+    fn lease_release_resumes_only_first_parked_waiter_for_resource_queue() {
+        let repo = temp_repo("lease_fifo_queue");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let owner_agent = kernel.create_or_get_agent("Owner", "codex", None).unwrap();
+        let owner_agent_id = owner_agent["id"].as_str().unwrap();
+        let owner_session = kernel
+            .create_session_for_slot_key(
+                "lease-fifo-owner",
+                "Owner",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_session_id = owner_session["id"].as_str().unwrap();
+        let owner_task = kernel
+            .create_task("Owner", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let owner_task_id = owner_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(owner_task_id, owner_agent_id, owner_session_id)
+            .unwrap();
+        let owner_lease = kernel
+            .acquire_lease(
+                owner_task_id,
+                owner_agent_id,
+                owner_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+
+        let first_agent = kernel.create_or_get_agent("First", "codex", None).unwrap();
+        let first_agent_id = first_agent["id"].as_str().unwrap();
+        let first_session = kernel
+            .create_session_for_slot_key(
+                "lease-fifo-first",
+                "First",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_session_id = first_session["id"].as_str().unwrap();
+        let first_task = kernel
+            .create_task("First waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let first_task_id = first_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(first_task_id, first_agent_id, first_session_id)
+            .unwrap();
+        let first_queue = kernel
+            .acquire_lease(
+                first_task_id,
+                first_agent_id,
+                first_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first_queue["ok"].as_bool(), Some(false));
+
+        let second_agent = kernel.create_or_get_agent("Second", "codex", None).unwrap();
+        let second_agent_id = second_agent["id"].as_str().unwrap();
+        let second_session = kernel
+            .create_session_for_slot_key(
+                "lease-fifo-second",
+                "Second",
+                "codex",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let second_session_id = second_session["id"].as_str().unwrap();
+        let second_task = kernel
+            .create_task("Second waiter", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let second_task_id = second_task["id"].as_str().unwrap();
+        kernel
+            .claim_task(second_task_id, second_agent_id, second_session_id)
+            .unwrap();
+        let second_queue = kernel
+            .acquire_lease(
+                second_task_id,
+                second_agent_id,
+                second_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second_queue["ok"].as_bool(), Some(false));
+
+        kernel
+            .release_lease(
+                owner_lease["data"]["lease_id"].as_str().unwrap(),
+                owner_lease["data"]["fence_token"].as_i64().unwrap(),
+            )
+            .unwrap();
+
+        let first_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&first_task_id],
+                "missing first intent",
+            )
+            .unwrap();
+        let second_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&second_task_id],
+                "missing second intent",
+            )
+            .unwrap();
+        assert_eq!(first_intent["status"].as_str(), Some("resume_ready"));
+        assert_eq!(second_intent["status"].as_str(), Some("parked"));
+
+        let first_lease = kernel
+            .acquire_lease(
+                first_task_id,
+                first_agent_id,
+                first_session_id,
+                "file:src/a.js",
+                "write",
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first_lease["ok"].as_bool(), Some(true));
+        kernel
+            .release_lease(
+                first_lease["data"]["lease_id"].as_str().unwrap(),
+                first_lease["data"]["fence_token"].as_i64().unwrap(),
+            )
+            .unwrap();
+
+        let second_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 AND resource_key='file:src/a.js'",
+                &[&second_task_id],
+                "missing second intent after first release",
+            )
+            .unwrap();
+        assert_eq!(second_intent["status"].as_str(), Some("resume_ready"));
     }
 
     #[test]

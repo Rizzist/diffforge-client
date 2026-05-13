@@ -1,18 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  Background,
+  Controls,
+  Handle,
+  MarkerType,
+  Position,
+  ReactFlow,
+  useEdgesState,
+  useNodesState,
+} from "@xyflow/react";
+import ELK from "elkjs/lib/elk.bundled.js";
+import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
 import styled from "styled-components";
+import "@xyflow/react/dist/style.css";
 
-const GRAPH_NODE_SIZES = {
-  main: 154,
-  related: 108,
-  distant: 74,
-};
-const GRAPH_MIN_ZOOM = 0.48;
-const GRAPH_MAX_ZOOM = 1.8;
-const GRAPH_ZOOM_STEP = 0.16;
-const MAX_VISIBLE_AGENT_ORBITS = 6;
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
+const MAX_VISIBLE_AGENT_ORBITS = 6;
+const elk = new ELK();
+
+const NODE_DIMENSIONS = {
+  workspace: { width: 172, height: 172 },
+  folder: { width: 150, height: 92 },
+  file: { width: 136, height: 78 },
+  abstract: { width: 166, height: 104 },
+};
 
 function cleanText(value) {
   return String(value || "")
@@ -42,6 +55,20 @@ function field(item, ...keys) {
   return "";
 }
 
+function booleanField(item, ...keys) {
+  for (const key of keys) {
+    const value = item?.[key];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["true", "1", "yes"].includes(normalized)) return true;
+      if (["false", "0", "no"].includes(normalized)) return false;
+    }
+  }
+  return false;
+}
+
 function jsonObject(value) {
   if (!value) return {};
   if (typeof value === "object" && !Array.isArray(value)) return value;
@@ -52,10 +79,6 @@ function jsonObject(value) {
   } catch {
     return {};
   }
-}
-
-function metadata(item) {
-  return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
 }
 
 function jsonArray(value) {
@@ -69,8 +92,27 @@ function jsonArray(value) {
   }
 }
 
+function metadata(item) {
+  return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
+}
+
 function isFileNodeType(nodeType) {
   return nodeType === "file" || nodeType === "implementation_unit";
+}
+
+function isFolderNodeType(nodeType) {
+  return nodeType === "folder";
+}
+
+function isWorkspaceNodeType(nodeType) {
+  return ["workspace", "repository", "repo_root", "root"].includes(nodeType);
+}
+
+function nodeKind(node) {
+  if (isWorkspaceNodeType(node?.node_type)) return "workspace";
+  if (isFolderNodeType(node?.node_type)) return "folder";
+  if (isFileNodeType(node?.node_type)) return "file";
+  return "abstract";
 }
 
 function normalizeFreshnessState(value) {
@@ -80,6 +122,10 @@ function normalizeFreshnessState(value) {
     case "verified":
     case "linked":
       return "updated";
+    case "no_spec":
+    case "uncovered":
+    case "not_specified":
+      return "no_spec";
     case "behind_code":
     case "code_ahead":
     case "needs_review":
@@ -105,6 +151,8 @@ function freshnessLabel(value) {
   switch (normalizeFreshnessState(value)) {
     case "updated":
       return "updated";
+    case "no_spec":
+      return "no spec";
     case "behind_code":
       return "behind code";
     case "out_of_spec":
@@ -119,6 +167,8 @@ function freshnessTone(value) {
   switch (normalizeFreshnessState(value)) {
     case "updated":
       return "#34d399";
+    case "no_spec":
+      return "#64748b";
     case "behind_code":
       return "#fb7185";
     case "out_of_spec":
@@ -129,9 +179,32 @@ function freshnessTone(value) {
   }
 }
 
+function isWorktreeFileNode(node) {
+  if (!isFileNodeType(node?.node_type)) return false;
+  return node.file_source === "worktree" || node.provisional || node.pending_main_sync;
+}
+
+function hasActiveSpecs(node) {
+  return Array.isArray(node?.active_specs) && node.active_specs.length > 0;
+}
+
+function isUnspecifiedStructuralNode(node) {
+  return ["workspace", "folder", "file"].includes(nodeKind(node)) && !hasActiveSpecs(node);
+}
+
+function nodeTone(node) {
+  if (isUnspecifiedStructuralNode(node)) return "#64748b";
+  if (isWorktreeFileNode(node)) return "#38bdf8";
+  if (isWorkspaceNodeType(node?.node_type)) return "#2dd4bf";
+  if (isFolderNodeType(node?.node_type)) return "#a78bfa";
+  return freshnessTone(node?.freshness_state);
+}
+
 function liveAgentsFor(node) {
+  const activeAgents = jsonArray(field(node, "active_agents", "activeAgents", "live_agents", "liveAgents"));
+  if (activeAgents.length) return activeAgents;
   const count = Number(field(node, "active_agent_count", "activeAgentCount", "live_agent_count", "liveAgentCount")) || 0;
-  return Array.from({ length: Math.max(0, count) }, (_, index) => ({ id: `live-agent-${index}`, status: "active" }));
+  return Array.from({ length: Math.max(0, count) }, (_, index) => ({ id: `live-agent-${index}` }));
 }
 
 function normalizeNode(raw, index = 0) {
@@ -143,15 +216,21 @@ function normalizeNode(raw, index = 0) {
   const purpose = text(field(raw, "purpose"), summary || "Intentional behavior captured from prompts, checkpoints, and patch history.");
   const rawMarkdown = field(raw, "markdown");
   const freshnessState = normalizeFreshnessState(field(raw, "freshness_state", "freshnessState", "spec_state", "specState"));
+  const activeAgents = jsonArray(field(raw, "active_agents", "activeAgents", "live_agents", "liveAgents"));
   const activeAgentCount = Math.max(
-    0,
+    activeAgents.length,
     Number(field(raw, "active_agent_count", "activeAgentCount", "live_agent_count", "liveAgentCount")) || 0,
   );
-  const specs = jsonArray(field(raw, "specs"));
-  const activeSpecs = jsonArray(field(raw, "active_specs", "activeSpecs"));
-  const supersededSpecs = jsonArray(field(raw, "superseded_specs", "supersededSpecs"));
-  const agentRationale = jsonArray(field(raw, "agent_rationale", "agentRationale"));
-  const notifications = jsonArray(field(raw, "notifications"));
+  const fileSource = text(
+    field(raw, "file_source", "fileSource") || field(meta, "source", "file_source", "fileSource"),
+  ).toLowerCase();
+  const fileOrigin = text(
+    field(raw, "file_origin", "fileOrigin") || field(meta, "origin", "file_origin", "fileOrigin"),
+    fileSource,
+  ).toLowerCase();
+  const provisional = booleanField(raw, "provisional", "isProvisional") || booleanField(meta, "provisional", "isProvisional");
+  const pendingMainSync = booleanField(raw, "pending_main_sync", "pendingMainSync")
+    || booleanField(meta, "pending_main_sync", "pendingMainSync");
   const notificationCount = Math.max(
     0,
     Number(field(raw, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
@@ -165,22 +244,28 @@ function normalizeNode(raw, index = 0) {
     id,
     title,
     node_type: nodeType,
+    path: text(field(raw, "path") || field(meta, "path")),
     summary,
     purpose,
     freshness_state: freshnessState,
     spec_state: freshnessState,
     spec_state_label: freshnessLabel(freshnessState),
     active_agent_count: activeAgentCount,
-    specs,
-    active_specs: activeSpecs,
-    superseded_specs: supersededSpecs,
-    agent_rationale: agentRationale,
-    notifications,
+    active_agents: activeAgents,
+    specs: jsonArray(field(raw, "specs")),
+    active_specs: jsonArray(field(raw, "active_specs", "activeSpecs")),
+    superseded_specs: jsonArray(field(raw, "superseded_specs", "supersededSpecs")),
+    agent_rationale: jsonArray(field(raw, "agent_rationale", "agentRationale")),
+    notifications: jsonArray(field(raw, "notifications")),
     notification_count: notificationCount,
     out_of_spec_count: outOfSpecCount,
+    file_source: fileSource,
+    file_origin: fileOrigin,
+    provisional,
+    pending_main_sync: pendingMainSync,
     markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
       ? rawMarkdown
-      : fallbackMarkdown({ title, summary, purpose, freshness_state: freshnessState, metadata: meta }),
+      : fallbackMarkdown({ title, summary, purpose, freshness_state: freshnessState }),
     markdown_path: text(field(raw, "markdown_path", "markdownPath")),
     metadata: meta,
   };
@@ -196,6 +281,44 @@ function fallbackMarkdown(node) {
   ].join("\n");
 }
 
+function isConsolidationSpec(spec) {
+  const reason = text(field(spec, "supersession_reason", "supersessionReason")).toLowerCase();
+  return ["consolidat", "merg", "incorporat", "absorb", "combin", "roll into", "rolled into"]
+    .some((marker) => reason.includes(marker));
+}
+
+function splitSpecHistory(activeSpecs, supersededSpecs) {
+  const active = Array.isArray(activeSpecs) ? activeSpecs : [];
+  const superseded = Array.isArray(supersededSpecs) ? supersededSpecs : [];
+  const activeIds = new Set(active.map((spec) => text(field(spec, "id"))).filter(Boolean));
+  const consolidatedByActiveId = new Map(active.map((spec) => [text(field(spec, "id")), []]));
+  const historical = [];
+
+  superseded.forEach((spec) => {
+    if (!isConsolidationSpec(spec)) {
+      historical.push(spec);
+      return;
+    }
+    const targetId = text(field(spec, "superseded_by_id", "supersededById"));
+    if (targetId && activeIds.has(targetId)) {
+      consolidatedByActiveId.get(targetId).push(spec);
+      return;
+    }
+    if (active.length === 1) {
+      const onlyActiveId = text(field(active[0], "id"));
+      consolidatedByActiveId.get(onlyActiveId)?.push(spec);
+    }
+  });
+
+  return {
+    active: active.map((spec) => ({
+      ...spec,
+      consolidated_specs: consolidatedByActiveId.get(text(field(spec, "id"))) || [],
+    })),
+    historical,
+  };
+}
+
 function normalizeSnapshot(snapshot) {
   const matrix = snapshot?.specGraph || snapshot?.raw || {};
   const specNodes = Array.isArray(snapshot?.specNodes)
@@ -204,14 +327,13 @@ function normalizeSnapshot(snapshot) {
       ? matrix.nodes
       : [];
   const nodes = specNodes.map((node, index) => normalizeNode(node, index));
-
   const edgeSource = Array.isArray(snapshot?.specEdges)
     ? snapshot.specEdges
     : Array.isArray(matrix?.edges)
       ? matrix.edges
       : [];
   const nodeIds = new Set(nodes.map((node) => node.id));
-  let edges = edgeSource
+  const edges = edgeSource
     .map((edge, index) => {
       const meta = metadata(edge);
       if (meta.hidden || field(edge, "hidden") === true) return null;
@@ -220,23 +342,11 @@ function normalizeSnapshot(snapshot) {
         from: text(field(edge, "from_node_id", "fromNodeId", "from", "source")),
         to: text(field(edge, "to_node_id", "toNodeId", "to", "target")),
         kind: text(field(edge, "edge_kind", "edgeKind", "kind"), "related"),
+        metadata: meta,
       };
     })
     .filter(Boolean)
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
-
-  if (!edges.length && nodes.length > 1) {
-    const hub = nodes.find((node) => node.id.includes("project")) || nodes[0];
-    edges = nodes
-      .filter((node) => node.id !== hub.id)
-      .slice(0, 32)
-      .map((node, index) => ({
-        id: `inferred-${index}`,
-        from: hub.id,
-        to: node.id,
-        kind: "inferred",
-      }));
-  }
 
   return {
     matrix,
@@ -247,23 +357,21 @@ function normalizeSnapshot(snapshot) {
   };
 }
 
-function graphNodeSize(depth) {
-  if (depth === 0) return GRAPH_NODE_SIZES.main;
-  if (depth === 1) return GRAPH_NODE_SIZES.related;
-  return GRAPH_NODE_SIZES.distant;
+function selectedFallback(nodes, selectedNodeId) {
+  return nodes.find((node) => node.id === selectedNodeId) || nodes[0] || null;
 }
 
-function graphLayerConfig(depth) {
-  if (depth <= 0) return { radius: 0, maxPerRing: 1 };
-  if (depth === 1) return { radius: 172, maxPerRing: 10 };
-  return { radius: 288 + (depth - 2) * 108, maxPerRing: 18 };
+function isContainmentEdge(edge) {
+  return edge.kind === "contains" || edge.metadata?.containment === true;
 }
 
-function clampNumber(value, min, max) {
-  return Math.min(max, Math.max(min, value));
+function dimensionsForNode(node) {
+  return NODE_DIMENSIONS[nodeKind(node)] || NODE_DIMENSIONS.abstract;
 }
 
 function graphRootNode(nodes, edges) {
+  const workspaceNode = nodes.find((node) => isWorkspaceNodeType(node.node_type));
+  if (workspaceNode) return workspaceNode;
   if (!nodes.length) return null;
   const degreeById = new Map(nodes.map((node) => [node.id, 0]));
   for (const edge of edges) {
@@ -273,103 +381,230 @@ function graphRootNode(nodes, edges) {
   return [...nodes].sort((left, right) => {
     const scoreFor = (node) => {
       const title = `${node.id} ${node.title}`.toLowerCase();
-      const centralHint = title.includes("project") || title.includes("root") || title.includes("workspace") ? 140 : 0;
-      const activeHint = node.active_agent_count * 90;
-      const typeHint = isFileNodeType(node.node_type) ? -18 : 18;
-      const freshnessHint = node.freshness_state === "updated" ? 0 : 18;
-      return centralHint
-        + activeHint
-        + typeHint
-        + freshnessHint
-        + (degreeById.get(node.id) || 0) * 20;
+      const centralHint = title.includes("project") || title.includes("root") || title.includes("workspace") ? 160 : 0;
+      const typeHint = isFileNodeType(node.node_type) ? -20 : 20;
+      return centralHint + typeHint + (degreeById.get(node.id) || 0) * 20;
     };
-    const delta = scoreFor(right) - scoreFor(left);
-    return delta || left.title.localeCompare(right.title);
+    return scoreFor(right) - scoreFor(left) || left.title.localeCompare(right.title);
   })[0];
 }
 
-function graphLayout(nodes, edges) {
+function setNodeCenter(layout, node, center) {
+  const dimensions = dimensionsForNode(node);
+  layout.set(node.id, {
+    x: center.x - dimensions.width / 2,
+    y: center.y - dimensions.height / 2,
+  });
+}
+
+function centerFor(layout, node) {
+  const dimensions = dimensionsForNode(node);
+  const position = layout.get(node.id) || { x: 0, y: 0 };
+  return {
+    x: position.x + dimensions.width / 2,
+    y: position.y + dimensions.height / 2,
+  };
+}
+
+function sortedChildren(children, nodeById) {
+  return [...children].sort((leftId, rightId) => {
+    const left = nodeById.get(leftId);
+    const right = nodeById.get(rightId);
+    const leftKind = nodeKind(left);
+    const rightKind = nodeKind(right);
+    const kindRank = { folder: 0, file: 1, workspace: 2, abstract: 3 };
+    return (kindRank[leftKind] ?? 4) - (kindRank[rightKind] ?? 4)
+      || (left?.title || "").localeCompare(right?.title || "");
+  });
+}
+
+function radialHierarchyLayout(nodes, edges) {
   const root = graphRootNode(nodes, edges);
-  const byId = {};
-  if (!root) return { width: 760, height: 520, byId, rootId: "" };
+  if (!root) return new Map();
 
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const adjacency = new Map(nodes.map((node) => [node.id, new Set()]));
-  for (const edge of edges) {
-    if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) continue;
-    adjacency.get(edge.from)?.add(edge.to);
-    adjacency.get(edge.to)?.add(edge.from);
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const layout = new Map();
+  const placed = new Set();
+  const containmentEdges = edges.filter(isContainmentEdge);
+  const childrenByParent = new Map();
+  const structuralChildIds = new Set();
+  for (const edge of containmentEdges) {
+    if (!childrenByParent.has(edge.from)) childrenByParent.set(edge.from, []);
+    childrenByParent.get(edge.from).push(edge.to);
+    structuralChildIds.add(edge.to);
   }
 
-  const depthById = new Map([[root.id, 0]]);
-  const queue = [root.id];
-  for (let index = 0; index < queue.length; index += 1) {
-    const id = queue[index];
-    const depth = depthById.get(id) || 0;
-    for (const next of adjacency.get(id) || []) {
-      if (!depthById.has(next)) {
-        depthById.set(next, depth + 1);
-        queue.push(next);
-      }
-    }
-  }
+  setNodeCenter(layout, root, { x: 0, y: 0 });
+  placed.add(root.id);
 
-  const layers = new Map();
-  for (const node of nodes) {
-    const depth = depthById.has(node.id) ? depthById.get(node.id) : 2;
-    if (!layers.has(depth)) layers.set(depth, []);
-    layers.get(depth).push(node);
-  }
-  for (const layer of layers.values()) {
-    layer.sort((left, right) => left.title.localeCompare(right.title));
-  }
+  const placeChildren = (parentId, parentAngle, depth) => {
+    const parent = nodeById.get(parentId);
+    const children = sortedChildren(childrenByParent.get(parentId) || [], nodeById)
+      .filter((id) => nodeById.has(id) && !placed.has(id));
+    if (!parent || !children.length) return;
 
-  let maxRadius = 0;
-  for (const [depth, layer] of layers) {
-    if (depth === 0) continue;
-    const config = graphLayerConfig(depth);
-    const overflowRings = Math.max(0, Math.ceil(layer.length / config.maxPerRing) - 1);
-    maxRadius = Math.max(maxRadius, config.radius + overflowRings * 92);
-  }
-
-  const canvasRadius = Math.max(310, maxRadius + GRAPH_NODE_SIZES.main);
-  const width = Math.max(760, canvasRadius * 2 + 80);
-  const height = Math.max(560, canvasRadius * 2 + 80);
-  const centerX = width / 2;
-  const centerY = height / 2;
-
-  for (const [depth, layer] of layers) {
-    const size = graphNodeSize(depth);
-    if (depth === 0) {
-      byId[root.id] = { x: centerX - size / 2, y: centerY - size / 2, size, depth: 0 };
-      continue;
-    }
-
-    const config = graphLayerConfig(depth);
-    layer.forEach((node, index) => {
-      const ringIndex = Math.floor(index / config.maxPerRing);
-      const ringOffset = ringIndex * config.maxPerRing;
-      const itemsInRing = Math.min(config.maxPerRing, layer.length - ringOffset);
-      const angleOffset = depth % 2 === 0 ? Math.PI / Math.max(itemsInRing, 1) : 0;
-      const angle = ((index - ringOffset) / Math.max(itemsInRing, 1)) * Math.PI * 2
-        - Math.PI / 2
-        + angleOffset;
-      const radius = config.radius + ringIndex * 92;
-      byId[node.id] = {
-        x: centerX + Math.cos(angle) * radius - size / 2,
-        y: centerY + Math.sin(angle) * radius - size / 2,
-        size,
-        depth,
+    const parentCenter = centerFor(layout, parent);
+    const rootChild = parentId === root.id;
+    const spread = rootChild ? Math.PI * 2 : Math.min(Math.PI * 1.25, 0.7 + children.length * 0.28);
+    const start = rootChild ? -Math.PI / 2 : parentAngle - spread / 2;
+    const radius = (rootChild ? 282 : 178) + Math.min(120, Math.max(0, children.length - 3) * 10) + depth * 38;
+    children.forEach((childId, index) => {
+      const child = nodeById.get(childId);
+      const angle = rootChild
+        ? start + (index / Math.max(children.length, 1)) * Math.PI * 2
+        : start + ((index + 0.5) / Math.max(children.length, 1)) * spread;
+      const center = {
+        x: parentCenter.x + Math.cos(angle) * radius,
+        y: parentCenter.y + Math.sin(angle) * radius,
       };
+      setNodeCenter(layout, child, center);
+      placed.add(childId);
+      placeChildren(childId, angle, depth + 1);
     });
+  };
+
+  placeChildren(root.id, -Math.PI / 2, 0);
+
+  const orphanStructural = nodes
+    .filter((node) => node.id !== root.id)
+    .filter((node) => ["folder", "file"].includes(nodeKind(node)))
+    .filter((node) => !structuralChildIds.has(node.id) && !placed.has(node.id));
+  orphanStructural.forEach((node, index) => {
+    const angle = -Math.PI / 2 + (index / Math.max(orphanStructural.length, 1)) * Math.PI * 2;
+    setNodeCenter(layout, node, {
+      x: Math.cos(angle) * 360,
+      y: Math.sin(angle) * 360,
+    });
+    placed.add(node.id);
+  });
+
+  const structuralKinds = new Set(["workspace", "folder", "file"]);
+  const abstractNodes = nodes.filter((node) => !structuralKinds.has(nodeKind(node)));
+  const rootCenter = centerFor(layout, root);
+  abstractNodes.forEach((node, index) => {
+    const linkedStructural = edges
+      .filter((edge) => !isContainmentEdge(edge) && (edge.from === node.id || edge.to === node.id))
+      .map((edge) => (edge.from === node.id ? edge.to : edge.from))
+      .map((id) => nodeById.get(id))
+      .filter((target) => target && ["workspace", "folder", "file"].includes(nodeKind(target)) && layout.has(target.id));
+
+    if (linkedStructural.length) {
+      const direction = linkedStructural.reduce(
+        (acc, target) => {
+          const center = centerFor(layout, target);
+          const dx = center.x - rootCenter.x;
+          const dy = center.y - rootCenter.y;
+          const length = Math.hypot(dx, dy);
+          if (length < 1) return acc;
+          return { x: acc.x + dx / length, y: acc.y + dy / length };
+        },
+        { x: 0, y: 0 },
+      );
+      const directionLength = Math.hypot(direction.x, direction.y);
+      const angle = directionLength > 0.25
+        ? Math.atan2(direction.y, direction.x)
+        : -Math.PI / 2 + ((index + 0.5) / Math.max(abstractNodes.length, 1)) * Math.PI * 2;
+      const radius = 214 + Math.min(96, Math.max(0, linkedStructural.length - 1) * 18);
+      const offset = ((index % 3) - 1) * 52;
+      setNodeCenter(layout, node, {
+        x: rootCenter.x + Math.cos(angle) * radius + Math.cos(angle + Math.PI / 2) * offset,
+        y: rootCenter.y + Math.sin(angle) * radius + Math.sin(angle + Math.PI / 2) * offset,
+      });
+    } else {
+      const angle = Math.PI / 5 + (index / Math.max(abstractNodes.length, 1)) * Math.PI * 2;
+      setNodeCenter(layout, node, {
+        x: Math.cos(angle) * 238,
+        y: Math.sin(angle) * 238,
+      });
+    }
+    placed.add(node.id);
+  });
+
+  const unplaced = nodes.filter((node) => !placed.has(node.id));
+  unplaced.forEach((node, index) => {
+    const angle = -Math.PI / 2 + (index / Math.max(unplaced.length, 1)) * Math.PI * 2;
+    setNodeCenter(layout, node, {
+      x: Math.cos(angle) * 460,
+      y: Math.sin(angle) * 460,
+    });
+  });
+
+  return layout;
+}
+
+async function elkFallbackLayout(nodes, edges) {
+  const graph = {
+    id: "spec-graph",
+    layoutOptions: {
+      "elk.algorithm": "layered",
+      "elk.direction": "RIGHT",
+      "elk.spacing.nodeNode": "56",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "120",
+      "elk.edgeRouting": "SPLINES",
+    },
+    children: nodes.map((node) => {
+      const dimensions = dimensionsForNode(node);
+      return { id: node.id, width: dimensions.width, height: dimensions.height };
+    }),
+    edges: edges.map((edge) => ({
+      id: edge.id,
+      sources: [edge.from],
+      targets: [edge.to],
+    })),
+  };
+  const result = await elk.layout(graph);
+  return new Map((result.children || []).map((child) => [child.id, { x: child.x || 0, y: child.y || 0 }]));
+}
+
+async function layoutSpecGraph(nodes, edges) {
+  if (!nodes.length) return new Map();
+  if (edges.some(isContainmentEdge) || nodes.some((node) => isWorkspaceNodeType(node.node_type))) {
+    return radialHierarchyLayout(nodes, edges);
   }
-
-  return { width, height, byId, rootId: root.id };
+  try {
+    return await elkFallbackLayout(nodes, edges);
+  } catch {
+    return radialHierarchyLayout(nodes, edges);
+  }
 }
 
-function selectedFallback(nodes, selectedNodeId) {
-  return nodes.find((node) => node.id === selectedNodeId) || nodes[0] || null;
+function flowEdgeStyle(edge) {
+  if (isContainmentEdge(edge)) {
+    return {
+      stroke: "rgba(148, 163, 184, 0.72)",
+      strokeWidth: 3,
+    };
+  }
+  return {
+    stroke: "rgba(56, 189, 248, 0.82)",
+    strokeWidth: 3.2,
+  };
 }
+
+function toFlowEdges(edges) {
+  return edges.map((edge) => ({
+    id: edge.id,
+    source: edge.from,
+    target: edge.to,
+    type: isContainmentEdge(edge) ? "straight" : "bezier",
+    animated: !isContainmentEdge(edge),
+    zIndex: isContainmentEdge(edge) ? 1 : 2,
+    interactionWidth: 18,
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color: isContainmentEdge(edge) ? "rgba(148, 163, 184, 0.92)" : "rgba(56, 189, 248, 0.9)",
+      width: 16,
+      height: 16,
+    },
+    style: flowEdgeStyle(edge),
+    data: edge,
+  }));
+}
+
+const INVISIBLE_HANDLE_STYLE = {
+  opacity: 0,
+  pointerEvents: "none",
+};
 
 export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
@@ -440,9 +675,7 @@ export default function SpecGraphWorkspaceView({
 
     return () => {
       cancelled = true;
-      if (typeof unlistenCache === "function") {
-        unlistenCache();
-      }
+      if (typeof unlistenCache === "function") unlistenCache();
     };
   }, [applySnapshot, repoPath, workspace?.id, workspace?.name]);
 
@@ -451,9 +684,10 @@ export default function SpecGraphWorkspaceView({
 
   useEffect(() => {
     if (specGraph.nodes.length && !specGraph.nodes.some((node) => node.id === selectedNodeId)) {
-      setSelectedNodeId(specGraph.nodes[0].id);
+      const root = graphRootNode(specGraph.nodes, specGraph.edges);
+      setSelectedNodeId(root?.id || specGraph.nodes[0].id);
     }
-  }, [specGraph.nodes, selectedNodeId]);
+  }, [specGraph.edges, specGraph.nodes, selectedNodeId]);
 
   return (
     <SpecGraphSurface aria-label={`${workspace?.name || "Workspace"} Spec Graph`} data-state={state}>
@@ -477,194 +711,145 @@ export default function SpecGraphWorkspaceView({
 }
 
 function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
-  const viewportRef = useRef(null);
-  const dragRef = useRef(null);
-  const centeredLayoutRef = useRef("");
-  const layout = useMemo(() => graphLayout(nodes, edges), [nodes, edges]);
-  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [zoom, setZoom] = useState(1);
-  const [isDragging, setIsDragging] = useState(false);
+  const [flowNodes, setFlowNodes, onNodesChange] = useNodesState([]);
+  const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState([]);
+  const flowInstanceRef = useRef(null);
+  const lastFitTopologyRef = useRef("");
+  const nodeTypes = useMemo(() => ({ specGraphNode: SpecGraphNode }), []);
 
   useEffect(() => {
-    const element = viewportRef.current;
-    if (!element) return undefined;
-    const updateSize = () => {
-      const rect = element.getBoundingClientRect();
-      setViewportSize({ width: rect.width, height: rect.height });
-    };
-    updateSize();
-    const observer = new ResizeObserver(updateSize);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  const centerGraph = useCallback((nextZoom = 1) => {
-    const root = layout.byId[layout.rootId];
-    if (!root || !viewportSize.width || !viewportSize.height) return;
-    setPan({
-      x: viewportSize.width / 2 - (root.x + root.size / 2) * nextZoom,
-      y: viewportSize.height / 2 - (root.y + root.size / 2) * nextZoom,
-    });
-  }, [layout, viewportSize.height, viewportSize.width]);
-
-  useEffect(() => {
-    const centerKey = `${layout.rootId}:${nodes.length}:${edges.length}:${Math.round(viewportSize.width)}x${Math.round(viewportSize.height)}`;
-    if (centeredLayoutRef.current === centerKey) return;
-    centeredLayoutRef.current = centerKey;
-    setZoom(1);
-    centerGraph(1);
-  }, [centerGraph, edges.length, layout.rootId, nodes.length, viewportSize.height, viewportSize.width]);
-
-  const zoomAt = useCallback((nextZoom, origin = null) => {
-    setZoom((currentZoom) => {
-      const clamped = clampNumber(nextZoom, GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM);
-      if (clamped === currentZoom) return currentZoom;
-      const rect = viewportRef.current?.getBoundingClientRect();
-      const center = origin && rect
-        ? { x: origin.x - rect.left, y: origin.y - rect.top }
-        : { x: viewportSize.width / 2, y: viewportSize.height / 2 };
-      setPan((currentPan) => ({
-        x: center.x - ((center.x - currentPan.x) / currentZoom) * clamped,
-        y: center.y - ((center.y - currentPan.y) / currentZoom) * clamped,
-      }));
-      return clamped;
-    });
-  }, [viewportSize.height, viewportSize.width]);
-
-  const handlePointerDown = useCallback((event) => {
-    if (event.button !== 0) return;
-    if (event.target instanceof Element && event.target.closest("[data-graph-node]")) return;
-    dragRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      pan,
-    };
-    setIsDragging(true);
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }, [pan]);
-
-  const handlePointerMove = useCallback((event) => {
-    const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    setPan({
-      x: drag.pan.x + event.clientX - drag.startX,
-      y: drag.pan.y + event.clientY - drag.startY,
-    });
-  }, []);
-
-  const finishDrag = useCallback((event) => {
-    const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    dragRef.current = null;
-    setIsDragging(false);
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
+    let cancelled = false;
+    if (!nodes.length) {
+      setFlowNodes([]);
+      setFlowEdges([]);
+      lastFitTopologyRef.current = "";
+      return () => {
+        cancelled = true;
+      };
     }
-  }, []);
 
-  const handleWheel = useCallback((event) => {
-    event.preventDefault();
-    const direction = event.deltaY > 0 ? -1 : 1;
-    zoomAt(zoom + direction * GRAPH_ZOOM_STEP, { x: event.clientX, y: event.clientY });
-  }, [zoom, zoomAt]);
+    const topologyKey = `${nodes.map((node) => node.id).join("|")}:${edges.map((edge) => edge.id).join("|")}`;
+    layoutSpecGraph(nodes, edges).then((layout) => {
+      if (cancelled) return;
+      const nextNodes = nodes.map((node) => {
+        const dimensions = dimensionsForNode(node);
+        return {
+          id: node.id,
+          type: "specGraphNode",
+          position: layout.get(node.id) || { x: 0, y: 0 },
+          data: {
+            node,
+            onSelect,
+            selected: false,
+          },
+          draggable: false,
+          selectable: true,
+          style: {
+            width: dimensions.width,
+            height: dimensions.height,
+          },
+        };
+      });
+      setFlowNodes(nextNodes);
+      setFlowEdges(toFlowEdges(edges));
+      if (topologyKey !== lastFitTopologyRef.current) {
+        lastFitTopologyRef.current = topologyKey;
+        window.requestAnimationFrame(() => {
+          flowInstanceRef.current?.fitView({ padding: 0.18, duration: 360 });
+        });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [edges, nodes, onSelect, setFlowEdges, setFlowNodes]);
+
+  useEffect(() => {
+    setFlowNodes((current) => current.map((node) => ({
+      ...node,
+      data: {
+        ...node.data,
+        selected: node.id === selectedNodeId,
+      },
+    })));
+  }, [selectedNodeId, setFlowNodes]);
 
   if (!nodes.length) {
-    const isSyncing = ["loading", "syncing", "cached"].includes(state);
+    const isSyncing = ["loading", "syncing"].includes(state);
     return <EmptyState>{isSyncing ? "Syncing spec graph..." : "No spec graph nodes yet."}</EmptyState>;
   }
 
   return (
-    <GraphScroller
-      ref={viewportRef}
-      $dragging={isDragging}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={finishDrag}
-      onPointerCancel={finishDrag}
-      onWheel={handleWheel}
-    >
-      <GraphToolbar>
-        <GraphToolButton type="button" aria-label="Zoom out" title="Zoom out" onClick={() => zoomAt(zoom - GRAPH_ZOOM_STEP)}>
-          -
-        </GraphToolButton>
-        <GraphToolButton type="button" aria-label="Reset graph view" title="Reset graph view" onClick={() => {
-          setZoom(1);
-          centerGraph(1);
-        }}>
-          •
-        </GraphToolButton>
-        <GraphToolButton type="button" aria-label="Zoom in" title="Zoom in" onClick={() => zoomAt(zoom + GRAPH_ZOOM_STEP)}>
-          +
-        </GraphToolButton>
-      </GraphToolbar>
-      <GraphCanvas
-        style={{
-          width: layout.width,
-          height: layout.height,
-          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+    <FlowFrame>
+      <ReactFlow
+        nodes={flowNodes}
+        edges={flowEdges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onInit={(instance) => {
+          flowInstanceRef.current = instance;
         }}
+        onNodeClick={(_, node) => onSelect(node.id)}
+        fitView
+        fitViewOptions={{ padding: 0.18, duration: 360 }}
+        minZoom={0.18}
+        maxZoom={1.8}
+        nodesConnectable={false}
+        nodesDraggable={false}
+        panOnScroll
+        proOptions={{ hideAttribution: true }}
       >
-        <EdgeLayer width={layout.width} height={layout.height} aria-hidden="true">
-          {edges.map((edge) => {
-            const from = layout.byId[edge.from];
-            const to = layout.byId[edge.to];
-            if (!from || !to) return null;
-            return (
-              <g key={edge.id}>
-                <line
-                  x1={from.x + from.size / 2}
-                  y1={from.y + from.size / 2}
-                  x2={to.x + to.size / 2}
-                  y2={to.y + to.size / 2}
-                />
-              </g>
-            );
-          })}
-        </EdgeLayer>
-        {nodes.map((node) => {
-          const point = layout.byId[node.id] || { x: 20, y: 20, size: GRAPH_NODE_SIZES.distant, depth: 2 };
-          const tone = freshnessTone(node.freshness_state);
-          const liveAgents = liveAgentsFor(node);
-          const liveAgentCount = liveAgents.length;
-          const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
-          return (
-            <GraphNodeButton
-              key={node.id}
-              type="button"
-              data-graph-node="true"
-              style={{
-                left: point.x,
-                top: point.y,
-                width: point.size,
-                height: point.size,
-              }}
-              $tone={tone}
-              $active={node.id === selectedNodeId}
-              $depth={point.depth}
-              $freshness={node.freshness_state}
-              $live={liveAgentCount > 0}
-              onClick={() => onSelect(node.id)}
-            >
-              {liveAgents.slice(0, MAX_VISIBLE_AGENT_ORBITS).map((agent, index) => (
-                <ActiveAgentOrbit
-                  key={`${node.id}-orbit-${field(agent, "agent_id", "agentId", "id") || index}`}
-                  aria-hidden="true"
-                  $depth={point.depth}
-                  $tone={tone}
-                  $index={index}
-                  $total={liveAgentCount}
-                />
-              ))}
-              {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
-              {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
-              <NodeTitle $depth={point.depth}>{node.title}</NodeTitle>
-            </GraphNodeButton>
-          );
-        })}
-      </GraphCanvas>
-    </GraphScroller>
+        <Background color="rgba(148, 163, 184, 0.08)" gap={28} size={1} />
+        <Controls showInteractive={false} />
+      </ReactFlow>
+    </FlowFrame>
+  );
+}
+
+function SpecGraphNode({ data, selected }) {
+  const node = data.node;
+  const kind = nodeKind(node);
+  const tone = nodeTone(node);
+  const liveAgents = liveAgentsFor(node);
+  const liveAgentCount = liveAgents.length;
+  const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
+  const active = Boolean(selected || data.selected);
+  const path = text(node.path);
+
+  return (
+    <FlowNodeCard
+      className="nodrag"
+      type="button"
+      $active={active}
+      $kind={kind}
+      $tone={tone}
+      $live={liveAgentCount > 0}
+      $provisional={isWorktreeFileNode(node)}
+      $unspecified={isUnspecifiedStructuralNode(node)}
+      onClick={(event) => {
+        event.stopPropagation();
+        data.onSelect(node.id);
+      }}
+    >
+      <Handle type="target" position={Position.Top} isConnectable={false} style={INVISIBLE_HANDLE_STYLE} />
+      <Handle type="source" position={Position.Bottom} isConnectable={false} style={INVISIBLE_HANDLE_STYLE} />
+      {liveAgents.slice(0, MAX_VISIBLE_AGENT_ORBITS).map((agent, index) => (
+        <ActiveAgentOrbit
+          key={`${node.id}-orbit-${field(agent, "agent_id", "agentId", "id") || index}`}
+          aria-hidden="true"
+          $tone={tone}
+          $index={index}
+          $total={liveAgentCount}
+        />
+      ))}
+      {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
+      {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
+      <NodeKindLabel $kind={kind}>{isUnspecifiedStructuralNode(node) ? "no spec" : kind}</NodeKindLabel>
+      <NodeTitle $kind={kind}>{node.title}</NodeTitle>
+      {path && kind !== "workspace" && <NodePath>{path}</NodePath>}
+    </FlowNodeCard>
   );
 }
 
@@ -677,12 +862,16 @@ function SpecInspector({ node }) {
     );
   }
 
+  const specHistory = splitSpecHistory(node.active_specs, node.superseded_specs);
+
   return (
     <Inspector>
       <InspectorHeader>
         <h2>{node.title}</h2>
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
+          {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}
+          {isWorktreeFileNode(node) && <span data-state="worktree">worktree</span>}
           <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
           {(Number(node.out_of_spec_count || node.notification_count) || 0) > 0 && (
             <span data-state="out_of_spec">out of spec: {Number(node.out_of_spec_count || node.notification_count) || 0}</span>
@@ -690,11 +879,10 @@ function SpecInspector({ node }) {
         </InspectorFacts>
       </InspectorHeader>
       <MarkdownPane>
-        <pre>{node.markdown}</pre>
-        <SpecObjectList title="Active Specs" specs={node.active_specs} empty="No active specs recorded yet." />
+        <SpecObjectList title="Active Specs" specs={specHistory.active} empty="No active specs recorded yet." />
         <SpecObjectList
           title="Superseded History"
-          specs={node.superseded_specs}
+          specs={specHistory.historical}
           empty="No superseded specs yet."
           historical
         />
@@ -705,18 +893,57 @@ function SpecInspector({ node }) {
 
 function SpecObjectList({ title, specs, empty, historical = false }) {
   const visibleSpecs = Array.isArray(specs) ? specs : [];
+  const [expandedPriorSpecs, setExpandedPriorSpecs] = useState({});
+  const togglePriorSpecs = useCallback((specKey) => {
+    setExpandedPriorSpecs((current) => ({
+      ...current,
+      [specKey]: !current[specKey],
+    }));
+  }, []);
+
   return (
     <SpecObjectsSection>
       <h3>{title}</h3>
       {visibleSpecs.length ? (
-        visibleSpecs.map((spec, index) => (
-          <SpecObjectCard key={field(spec, "id") || `${title}-${index}`} $historical={historical}>
-            <p>{text(field(spec, "statement"), "Unnamed spec")}</p>
-            {historical && text(field(spec, "supersession_reason")) && (
-              <small>Reason: {text(field(spec, "supersession_reason"))}</small>
-            )}
-          </SpecObjectCard>
-        ))
+        visibleSpecs.map((spec, index) => {
+          const specKey = field(spec, "id") || `${title}-${index}`;
+          const priorSpecs = Array.isArray(spec.consolidated_specs) ? spec.consolidated_specs : [];
+          const priorSpecsExpanded = Boolean(expandedPriorSpecs[specKey]);
+          return (
+            <SpecObjectCard key={specKey} $historical={historical}>
+              <p>{text(field(spec, "statement"), "Unnamed spec")}</p>
+              {priorSpecs.length > 0 && (
+                <>
+                  <PriorSpecsButton
+                    type="button"
+                    aria-expanded={priorSpecsExpanded ? "true" : "false"}
+                    $expanded={priorSpecsExpanded}
+                    onClick={() => togglePriorSpecs(specKey)}
+                  >
+                    <PriorSpecsIcon aria-hidden="true" />
+                    {priorSpecs.length} prior {priorSpecs.length === 1 ? "version" : "versions"}
+                  </PriorSpecsButton>
+                  {priorSpecsExpanded && (
+                    <PriorSpecsList>
+                      {priorSpecs.map((priorSpec, priorIndex) => (
+                        <PriorSpecItem key={field(priorSpec, "id") || `${specKey}-prior-${priorIndex}`}>
+                          <span>Previously</span>
+                          <p>{text(field(priorSpec, "statement"), "Unnamed spec")}</p>
+                          {text(field(priorSpec, "supersession_reason")) && (
+                            <small>{text(field(priorSpec, "supersession_reason"))}</small>
+                          )}
+                        </PriorSpecItem>
+                      ))}
+                    </PriorSpecsList>
+                  )}
+                </>
+              )}
+              {historical && text(field(spec, "supersession_reason")) && (
+                <small>Reason: {text(field(spec, "supersession_reason"))}</small>
+              )}
+            </SpecObjectCard>
+          );
+        })
       ) : (
         <SpecObjectsEmpty>{empty}</SpecObjectsEmpty>
       )}
@@ -774,92 +1001,129 @@ const SpecGraphMain = styled.main`
   overflow: hidden;
 `;
 
-const GraphScroller = styled.div`
+const FlowFrame = styled.div`
   height: 100%;
-  overflow: hidden;
+  min-height: 0;
   position: relative;
-  touch-action: none;
-  cursor: ${({ $dragging }) => ($dragging ? "grabbing" : "grab")};
-  user-select: none;
-`;
 
-const GraphCanvas = styled.div`
-  left: 0;
-  position: absolute;
-  top: 0;
-  transform-origin: 0 0;
-  will-change: transform;
-`;
-
-const GraphToolbar = styled.div`
-  align-items: center;
-  display: flex;
-  gap: 5px;
-  left: 10px;
-  position: absolute;
-  top: 10px;
-  z-index: 4;
-`;
-
-const GraphToolButton = styled.button`
-  align-items: center;
-  border: 1px solid rgba(230, 236, 245, 0.1);
-  border-radius: 7px;
-  background: rgba(13, 17, 23, 0.82);
-  color: rgba(219, 231, 247, 0.8);
-  cursor: pointer;
-  display: inline-flex;
-  font-size: 15px;
-  font-weight: 850;
-  height: 30px;
-  justify-content: center;
-  line-height: 1;
-  padding: 0;
-  width: 30px;
-
-  &:hover {
-    border-color: rgba(56, 189, 248, 0.44);
-    color: #dff5ff;
+  .react-flow {
+    background: rgba(3, 6, 11, 0.62);
   }
-`;
 
-const EdgeLayer = styled.svg`
-  inset: 0;
-  pointer-events: none;
-  position: absolute;
+  .react-flow__node {
+    transition: transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
 
-  line {
-    stroke: rgba(230, 236, 245, 0.18);
+  .react-flow__edges {
+    z-index: 3;
+  }
+
+  .react-flow__edge {
+    z-index: 3 !important;
+  }
+
+  .react-flow__edge-path {
+    transition: stroke 180ms ease, stroke-width 180ms ease;
+    filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.45));
     stroke-linecap: round;
-    stroke-width: 1.2;
+  }
+
+  .react-flow__controls {
+    border: 1px solid rgba(230, 236, 245, 0.1);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: none;
+  }
+
+  .react-flow__controls-button {
+    background: rgba(13, 17, 23, 0.92);
+    border-bottom-color: rgba(230, 236, 245, 0.08);
+    color: rgba(219, 231, 247, 0.82);
   }
 `;
 
-const GraphNodeButton = styled.button`
+const FlowNodeCard = styled.button`
   align-items: center;
-  border: 1px solid ${({ $active, $tone }) => ($active ? $tone : "rgba(230, 236, 245, 0.13)")};
-  border-radius: 999px;
+  border: 1px solid ${({ $active, $provisional, $tone }) => ($active || $provisional ? $tone : "rgba(230, 236, 245, 0.14)")};
+  border-radius: ${({ $kind }) => {
+    if ($kind === "folder") return "12px";
+    if ($kind === "file") return "9px";
+    return "999px";
+  }};
   background:
-    radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}24`}, rgba(13, 17, 23, 0.86) 58%),
-    rgba(13, 17, 23, 0.9);
-  box-shadow: ${({ $active, $live, $tone }) => {
-    if ($active) return `0 0 0 2px ${$tone}4d, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}26`}, rgba(13, 17, 23, 0.88) 62%),
+    rgba(13, 17, 23, 0.94);
+  box-shadow: ${({ $active, $live, $provisional, $tone }) => {
+    if ($active) return `0 0 0 2px ${$tone}55, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    if ($provisional) return `0 0 0 1px ${$tone}44, 0 0 24px ${$tone}22, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     if ($live) return `0 0 0 1px ${$tone}33, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     return "0 12px 30px rgba(0, 0, 0, 0.2)";
   }};
   color: inherit;
   cursor: pointer;
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  height: 100%;
   justify-content: center;
-  padding: ${({ $depth }) => ($depth === 0 ? "18px" : $depth === 1 ? "13px" : "9px")};
-  position: absolute;
-  text-align: center;
+  opacity: ${({ $unspecified }) => ($unspecified ? 0.68 : 1)};
+  outline: ${({ $provisional, $tone }) => ($provisional ? `1px dashed ${$tone}66` : "none")};
+  outline-offset: 4px;
   overflow: visible;
+  padding: ${({ $kind }) => ($kind === "workspace" ? "20px" : "10px 12px")};
+  position: relative;
+  text-align: center;
+  width: 100%;
+
+  &::before {
+    background: ${({ $kind, $tone }) => ($kind === "folder" ? `${$tone || "#a78bfa"}66` : "transparent")};
+    border-radius: 8px 8px 3px 3px;
+    content: "";
+    display: ${({ $kind }) => ($kind === "folder" ? "block" : "none")};
+    height: 9px;
+    left: 14px;
+    position: absolute;
+    top: -7px;
+    width: 38px;
+  }
 
   &:hover {
     border-color: ${({ $tone }) => $tone || "#38bdf8"};
     transform: scale(1.025);
   }
+`;
+
+const NodeKindLabel = styled.span`
+  color: ${({ $kind }) => ($kind === "workspace" ? "rgba(167, 243, 208, 0.84)" : "rgba(219, 231, 247, 0.45)")};
+  font-size: ${({ $kind }) => ($kind === "workspace" ? "10px" : "8.5px")};
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-transform: uppercase;
+`;
+
+const NodeTitle = styled.div`
+  color: var(--forge-text-soft, #eef5ff);
+  display: -webkit-box;
+  font-size: ${({ $kind }) => ($kind === "workspace" ? "14px" : $kind === "abstract" ? "12px" : "11px")};
+  font-weight: 840;
+  line-height: 1.18;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: ${({ $kind }) => ($kind === "workspace" ? 5 : 3)};
+  word-break: break-word;
+`;
+
+const NodePath = styled.div`
+  color: rgba(219, 231, 247, 0.45);
+  font-size: 8.5px;
+  font-weight: 680;
+  line-height: 1.15;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const AgentCountBadge = styled.span`
@@ -892,25 +1156,19 @@ const OutOfSpecBadge = styled.span`
   font-weight: 920;
   height: 22px;
   justify-content: center;
+  left: -7px;
   min-width: 22px;
   padding: 0 6px;
   position: absolute;
-  left: -7px;
   top: -7px;
   z-index: 3;
 `;
 
 const ActiveAgentOrbit = styled.span`
-  animation: spec-node-agent-orbit ${({ $depth, $index }) => {
-    const base = $depth === 0 ? 3.2 : $depth === 1 ? 2.75 : 2.35;
-    return `${base + (($index || 0) * 0.42)}s`;
-  }} linear infinite ${({ $index }) => ($index % 2 ? "reverse" : "normal")};
+  animation: spec-node-agent-orbit ${({ $index }) => `${2.7 + (($index || 0) * 0.42)}s`} linear infinite ${({ $index }) => ($index % 2 ? "reverse" : "normal")};
   animation-delay: ${({ $index }) => `${-0.28 * ($index || 0)}s`};
   border-radius: 999px;
-  inset: ${({ $depth, $index }) => {
-    const base = $depth === 0 ? 13 : $depth === 1 ? 10 : 8;
-    return `-${base + (($index || 0) * 5)}px`;
-  }};
+  inset: ${({ $index }) => `-${10 + (($index || 0) * 5)}px`};
   pointer-events: none;
   position: absolute;
   z-index: 2;
@@ -923,7 +1181,7 @@ const ActiveAgentOrbit = styled.span`
       0 0 0 ${({ $total }) => ($total > 1 ? "3px" : "2px")} ${({ $tone }) => `${$tone || "#34d399"}33`},
       0 0 18px ${({ $tone }) => `${$tone || "#34d399"}99`};
     content: "";
-    height: ${({ $depth }) => ($depth === 0 ? "11px" : $depth === 1 ? "9px" : "7px")};
+    height: 9px;
     position: absolute;
     right: 0;
     top: ${({ $index, $total }) => {
@@ -932,7 +1190,7 @@ const ActiveAgentOrbit = styled.span`
       return `${50 + spread * 9}%`;
     }};
     transform: translate(50%, -50%);
-    width: ${({ $depth }) => ($depth === 0 ? "11px" : $depth === 1 ? "9px" : "7px")};
+    width: 9px;
   }
 
   @keyframes spec-node-agent-orbit {
@@ -943,19 +1201,6 @@ const ActiveAgentOrbit = styled.span`
       transform: rotate(360deg);
     }
   }
-`;
-
-const NodeTitle = styled.div`
-  color: var(--forge-text-soft, #eef5ff);
-  display: -webkit-box;
-  font-size: ${({ $depth }) => ($depth === 0 ? "13px" : $depth === 1 ? "10.5px" : "9px")};
-  font-weight: ${({ $depth }) => ($depth === 0 ? 820 : 780)};
-  line-height: 1.18;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: ${({ $depth }) => ($depth === 0 ? 5 : $depth === 1 ? 4 : 3)};
-  word-break: break-word;
 `;
 
 const Inspector = styled.aside`
@@ -1021,9 +1266,19 @@ const InspectorFacts = styled.div`
     color: #fde68a;
   }
 
+  span[data-state="no_spec"] {
+    border-color: rgba(100, 116, 139, 0.38);
+    color: #cbd5e1;
+  }
+
   span[data-state="out_of_spec"] {
     border-color: rgba(251, 146, 60, 0.38);
     color: #fed7aa;
+  }
+
+  span[data-state="worktree"] {
+    border-color: rgba(56, 189, 248, 0.42);
+    color: #bae6fd;
   }
 `;
 
@@ -1031,18 +1286,6 @@ const MarkdownPane = styled.div`
   flex: 1;
   min-height: 0;
   overflow: auto;
-
-  pre {
-    color: rgba(229, 236, 246, 0.86);
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-    font-size: 11px;
-    font-weight: 560;
-    line-height: 1.5;
-    margin: 0;
-    padding: 12px;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
 `;
 
 const SpecObjectsSection = styled.section`
@@ -1084,6 +1327,75 @@ const SpecObjectCard = styled.article`
     font-weight: 650;
     line-height: 1.4;
     margin-top: 7px;
+  }
+`;
+
+const PriorSpecsButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  background: rgba(7, 12, 19, 0.38);
+  color: rgba(219, 231, 247, 0.66);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 780;
+  gap: 3px;
+  line-height: 1;
+  margin-top: 8px;
+  padding: 5px 8px 5px 6px;
+
+  &:hover {
+    border-color: rgba(52, 211, 153, 0.24);
+    color: rgba(238, 245, 255, 0.9);
+  }
+
+  svg {
+    transform: ${({ $expanded }) => ($expanded ? "rotate(-90deg)" : "rotate(0deg)")};
+  }
+`;
+
+const PriorSpecsIcon = styled(KeyboardArrowLeft)`
+  height: 14px;
+  transition: transform 140ms ease;
+  width: 14px;
+`;
+
+const PriorSpecsList = styled.div`
+  border-left: 1px solid rgba(52, 211, 153, 0.18);
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+  padding-left: 9px;
+`;
+
+const PriorSpecItem = styled.div`
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.36);
+  padding: 8px 9px;
+
+  span {
+    color: rgba(219, 231, 247, 0.42);
+    display: block;
+    font-size: 9px;
+    font-weight: 850;
+    letter-spacing: 0.06em;
+    line-height: 1;
+    margin-bottom: 5px;
+    text-transform: uppercase;
+  }
+
+  p {
+    color: rgba(229, 236, 246, 0.68);
+    font-size: 10.5px;
+    font-weight: 640;
+    line-height: 1.42;
+    margin: 0;
+  }
+
+  small {
+    color: rgba(251, 191, 36, 0.74);
   }
 `;
 

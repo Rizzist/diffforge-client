@@ -322,6 +322,13 @@ import {
   measureTerminalGrid,
 } from "./terminalResizeController";
 import {
+  getTerminalDiagnosticEnvironment,
+  logTerminalDiagnosticDuration,
+  logTerminalDiagnosticEvent,
+  startTerminalDiagnosticHeartbeat,
+  syncTerminalDiagnosticLogging,
+} from "./terminalDiagnostics";
+import {
   addTerminalMetrics,
   patchTerminalMetrics,
 } from "./terminalTelemetry.jsx";
@@ -364,6 +371,9 @@ const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
+const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
+const TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS = 16;
+const TERMINAL_SCROLL_ANCHOR_DIAGNOSTIC_SLOW_MS = 8;
 const TERMINAL_INPUT_BATCH_MS = 8;
 const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
@@ -1237,6 +1247,7 @@ export default function WorkspaceTerminal({
   const preserveCoordinationOnNextCleanupRef = useRef(false);
   const preserveCoordinationOnNextOpenRef = useRef(false);
   const parkedPromptRef = useRef(null);
+  const cancellingParkedPromptKeysRef = useRef(new Set());
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
   const [terminalError, setTerminalError] = useState("");
   const [terminalStatus, setTerminalStatus] = useState(() => ({
@@ -1294,6 +1305,10 @@ export default function WorkspaceTerminal({
   }, []);
   const focusTerminalKeyboardInput = useCallback((force = false) => {
     if (!force && !terminalActiveRef.current) {
+      return;
+    }
+
+    if (parkedPromptRef.current) {
       return;
     }
 
@@ -1485,9 +1500,14 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      const promptKey = `${Number(payload.instanceId || 0)}:${payload.taskId || ""}`;
       if (payload.status === "parked") {
+        if (cancellingParkedPromptKeysRef.current.has(promptKey)) {
+          return;
+        }
         setParkedPrompt(payload);
       } else {
+        cancellingParkedPromptKeysRef.current.delete(promptKey);
         setParkedPrompt(null);
       }
     })
@@ -1527,7 +1547,11 @@ export default function WorkspaceTerminal({
         if (disposed) {
           return;
         }
-        if (payload?.status === "parked") {
+        const promptKey = `${Number(payload?.instanceId || 0)}:${payload?.taskId || ""}`;
+        if (
+          payload?.status === "parked"
+          && !cancellingParkedPromptKeysRef.current.has(promptKey)
+        ) {
           setParkedPrompt(payload);
         } else {
           setParkedPrompt(null);
@@ -1708,6 +1732,19 @@ export default function WorkspaceTerminal({
     xtermRef.current = terminal;
 
     terminal.open(container);
+    syncTerminalDiagnosticLogging();
+    startTerminalDiagnosticHeartbeat();
+    logTerminalDiagnosticEvent("frontend.terminal_mount", {
+      ...getTerminalDiagnosticEnvironment(),
+      fontSize: 12,
+      lineHeight: 1.22,
+      paneId,
+      rendererMode,
+      scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
+      terminalIndex,
+      useWebglRenderer,
+      windowsPty: TERMINAL_IS_WINDOWS_HOST ? "conpty" : "",
+    });
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
 
     let terminalFocusClearTimer = 0;
@@ -1952,15 +1989,30 @@ export default function WorkspaceTerminal({
           if (activeWebglAddon === webglAddon) {
             activeWebglAddon = null;
           }
+          logTerminalDiagnosticEvent("frontend.webgl.context_loss", {
+            paneId,
+            reason,
+            terminalIndex,
+          });
           webglAddon.dispose();
         }));
         patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
+        logTerminalDiagnosticDuration("frontend.webgl.attach_done", webglStartedAt, {
+          paneId,
+          reason,
+          terminalIndex,
+        });
         refreshTerminalRenderer("webgl_attach_done", { reason });
       } catch {
         // WebGL is best-effort; xterm keeps its canvas renderer when WebGL2 is unavailable.
         rendererMode = "canvas";
         webglAddon.dispose();
         patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
+        logTerminalDiagnosticDuration("frontend.webgl.attach_failed", webglStartedAt, {
+          paneId,
+          reason,
+          terminalIndex,
+        });
       }
     };
 
@@ -2174,6 +2226,7 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      const flushStartedAt = performance.now();
       const writes = pendingOutputWrites.splice(0);
       const batchBytes = pendingOutputBytes;
       const queuedMs = outputBatchQueuedAt ? performance.now() - outputBatchQueuedAt : 0;
@@ -2181,10 +2234,14 @@ export default function WorkspaceTerminal({
       outputBatchQueuedAt = 0;
       cancelTerminalOutputBatchTimers();
 
+      const combineStartedAt = performance.now();
       const batchData = combineTerminalOutputWrites(writes);
+      const combineMs = performance.now() - combineStartedAt;
       const isFirstOutputChunk = writes.some((write) => write.isFirstOutputChunk);
       const isFirstVisibleOutputChunk = writes.some((write) => write.isFirstVisibleOutputChunk);
+      const debugStartedAt = performance.now();
       const outputDebug = getTerminalOutputDebugFields(batchData);
+      const debugMs = performance.now() - debugStartedAt;
       const shouldLogWrite = outputChunks <= 10
         || isFirstOutputChunk
         || isFirstVisibleOutputChunk
@@ -2193,7 +2250,30 @@ export default function WorkspaceTerminal({
       if (shouldLogWrite) {
       }
 
+      const writeStartedAt = performance.now();
       terminal.write(batchData, () => {
+        const writeCallbackMs = performance.now() - writeStartedAt;
+        const elapsedMs = performance.now() - flushStartedAt;
+        logTerminalDiagnosticEvent(
+          "frontend.output_write.slow",
+          {
+            batchBytes,
+            combineMs,
+            debugMs,
+            elapsedMs,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            paneId,
+            queuedMs,
+            reason,
+            rendererMode,
+            terminalIndex,
+            visibleChars: outputDebug.visibleChars,
+            writeCallbackMs,
+            writes: writes.length,
+          },
+          { minElapsedMs: TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS },
+        );
         if (isDisposed) {
           return;
         }
@@ -2359,7 +2439,19 @@ export default function WorkspaceTerminal({
 
         const scrollAnchor = pendingResizeScrollAnchor;
         pendingResizeScrollAnchor = null;
+        const restoreStartedAt = performance.now();
         const scrollAnchorRestore = restoreTerminalScrollAnchor(terminal, scrollAnchor);
+        logTerminalDiagnosticDuration(
+          "frontend.resize_scroll_anchor_restore.slow",
+          restoreStartedAt,
+          {
+            mode: scrollAnchorRestore?.mode || "",
+            paneId,
+            reason: event.reason || "resize_applied",
+            terminalIndex,
+          },
+          { minElapsedMs: TERMINAL_SCROLL_ANCHOR_DIAGNOSTIC_SLOW_MS },
+        );
         const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_applied");
         patchTerminalMetrics({
           gridMs: event.elapsedMs,
@@ -2373,6 +2465,19 @@ export default function WorkspaceTerminal({
       onError: (event) => {
         const scrollAnchor = pendingResizeScrollAnchor;
         pendingResizeScrollAnchor = null;
+        const restoreStartedAt = performance.now();
+        const scrollAnchorRestore = restoreTerminalScrollAnchor(terminal, scrollAnchor);
+        logTerminalDiagnosticDuration(
+          "frontend.resize_scroll_anchor_restore_error.slow",
+          restoreStartedAt,
+          {
+            mode: scrollAnchorRestore?.mode || "",
+            paneId,
+            reason: event.reason || "resize_error",
+            terminalIndex,
+          },
+          { minElapsedMs: TERMINAL_SCROLL_ANCHOR_DIAGNOSTIC_SLOW_MS },
+        );
         const resizeBarrier = closeResizeWriteBarrier(event.reason || "resize_error");
 
       },
@@ -2381,7 +2486,19 @@ export default function WorkspaceTerminal({
       onSkip: (event) => {
       },
       onStart: (event) => {
+        const captureStartedAt = performance.now();
         pendingResizeScrollAnchor = captureTerminalScrollAnchor(terminal);
+        logTerminalDiagnosticDuration(
+          "frontend.resize_scroll_anchor_capture.slow",
+          captureStartedAt,
+          {
+            mode: pendingResizeScrollAnchor?.mode || "",
+            paneId,
+            reason: event.reason || "resize",
+            terminalIndex,
+          },
+          { minElapsedMs: TERMINAL_SCROLL_ANCHOR_DIAGNOSTIC_SLOW_MS },
+        );
         openResizeWriteBarrier(event);
       },
       paneId: () => paneId,
@@ -2400,6 +2517,7 @@ export default function WorkspaceTerminal({
             return;
           }
 
+          const chunkStartedAt = performance.now();
           const data = message instanceof ArrayBuffer
             ? new Uint8Array(message)
             : ArrayBuffer.isView(message)
@@ -2416,7 +2534,9 @@ export default function WorkspaceTerminal({
           });
           patchTerminalMetrics({ outputLagMs: 0 });
 
+          const maskStartedAt = performance.now();
           const displayData = outputDisplayMasker.maskBytes(data);
+          const maskMs = performance.now() - maskStartedAt;
           if (!displayData.byteLength) {
             return;
           }
@@ -2424,7 +2544,9 @@ export default function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
           outputBytes += displayData.byteLength;
+          const debugStartedAt = performance.now();
           const outputDebug = getTerminalOutputDebugFields(displayData);
+          const debugMs = performance.now() - debugStartedAt;
           const hasVisibleOutput = outputDebug.visibleChars > 0;
           const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
 
@@ -2444,6 +2566,25 @@ export default function WorkspaceTerminal({
           if (isFirstVisibleOutputChunk) {
             sawFirstVisibleOutput = true;
           }
+
+          logTerminalDiagnosticEvent(
+            "frontend.output_chunk.slow",
+            {
+              debugMs,
+              displayBytes: displayData.byteLength,
+              elapsedMs: performance.now() - chunkStartedAt,
+              inputBytes: data.byteLength,
+              isFirstOutputChunk,
+              isFirstVisibleOutputChunk,
+              maskMs,
+              outputChunks,
+              paneId,
+              rendererMode,
+              terminalIndex,
+              visibleChars: outputDebug.visibleChars,
+            },
+            { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
+          );
 
           writeTerminalOutput(displayData, {
             isFirstOutputChunk,
@@ -2673,9 +2814,6 @@ export default function WorkspaceTerminal({
             && !event.ctrlKey
             && !event.altKey
             && !event.shiftKey;
-          if (event.key === "Escape") {
-          }
-
           if (
             !isPlainEscape
             || isDisposed
@@ -2688,7 +2826,7 @@ export default function WorkspaceTerminal({
           event.stopPropagation?.();
           event.stopImmediatePropagation?.();
 
-          if (parkedPromptRef.current && !isGenericTerminal) {
+          if (!isGenericTerminal) {
             invoke("terminal_interrupt_agent", {
               paneId,
               instanceId: terminalInstanceId,
@@ -2918,7 +3056,15 @@ export default function WorkspaceTerminal({
             visible: false,
           });
         }
-        patchTerminalMetrics({ startupMs: performance.now() - openStartedAt });
+        const startupMs = performance.now() - openStartedAt;
+        patchTerminalMetrics({ startupMs });
+        logTerminalDiagnosticEvent("frontend.terminal_open.done", {
+          agentStarted: !shouldPrewarmShell,
+          paneId,
+          rendererMode,
+          startupMs,
+          terminalIndex,
+        });
         resizeController?.resizeNow("terminal_open_done");
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);
@@ -3144,18 +3290,26 @@ export default function WorkspaceTerminal({
       return;
     }
 
+    const cancelledPrompt = parkedPrompt;
+    const promptKey = `${Number(cancelledPrompt.instanceId || 0)}:${cancelledPrompt.taskId}`;
+    cancellingParkedPromptKeysRef.current.add(promptKey);
     setTerminalError("");
+    setParkedPrompt(null);
+    parkedPromptRef.current = null;
+    updateTerminalInteractiveState(terminalActiveRef.current, false);
+    focusTerminalKeyboardInput(true);
     try {
       await invoke("terminal_cancel_parked_task", {
         paneId,
-        instanceId: parkedPrompt.instanceId,
-        taskId: parkedPrompt.taskId,
+        instanceId: cancelledPrompt.instanceId,
+        taskId: cancelledPrompt.taskId,
       });
-      setParkedPrompt(null);
     } catch (error) {
+      cancellingParkedPromptKeysRef.current.delete(promptKey);
+      setParkedPrompt(cancelledPrompt);
       setTerminalError(getErrorMessage(error, "Unable to cancel parked task."));
     }
-  }, [paneId, parkedPrompt]);
+  }, [focusTerminalKeyboardInput, paneId, parkedPrompt, updateTerminalInteractiveState]);
 
   const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
     if (terminalClosing) {
@@ -3378,7 +3532,7 @@ export default function WorkspaceTerminal({
               </TerminalClosingOverlay>
             )}
             {parkedPrompt && (
-              <TerminalParkedBar aria-live="polite" role="status">
+              <TerminalParkedBar aria-live="polite" data-terminal-control="true" role="status">
                 <TerminalParkedSpinner aria-hidden="true" />
                 <TerminalParkedCopy>
                   <strong>Parked: {parkedPrompt.title || "Waiting for dependency"}</strong>
@@ -3395,7 +3549,7 @@ export default function WorkspaceTerminal({
                     </TerminalParkedAgents>
                   </span>
                 </TerminalParkedCopy>
-                <TerminalParkedCancelButton onClick={cancelParkedPrompt} type="button">
+                <TerminalParkedCancelButton data-terminal-control="true" onClick={cancelParkedPrompt} type="button">
                   Cancel task
                 </TerminalParkedCancelButton>
               </TerminalParkedBar>

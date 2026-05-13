@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect } from "react";
 
+import { logTerminalDiagnosticDuration, logTerminalDiagnosticEvent } from "./terminalDiagnostics";
+
 const DEFAULT_MIN_COLS = 20;
 const DEFAULT_MIN_ROWS = 6;
 const DEFAULT_MAX_COLS = 400;
@@ -10,6 +12,7 @@ const DEFAULT_ROWS = 24;
 const DEFAULT_DEBOUNCE_MS = 16;
 const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 100;
 const MAX_INVALID_CELL_RETRIES = 30;
+const RESIZE_DIAGNOSTIC_SLOW_MS = 16;
 
 const pendingFrameResizeControllers = new Set();
 let resizeFrameHandle = 0;
@@ -32,10 +35,17 @@ function requestResizeFrame() {
   }
 
   resizeFrameHandle = window.requestAnimationFrame(() => {
+    const frameStartedAt = nowMs();
     resizeFrameHandle = 0;
     const controllers = Array.from(pendingFrameResizeControllers);
     pendingFrameResizeControllers.clear();
     controllers.forEach((controller) => controller.flushScheduledResize());
+    logTerminalDiagnosticDuration(
+      "frontend.resize_frame.slow",
+      frameStartedAt,
+      { controllers: controllers.length },
+      { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
+    );
 
     if (pendingFrameResizeControllers.size) {
       requestResizeFrame();
@@ -277,8 +287,20 @@ export function createTerminalResizeController({
     }
 
     nativeInFlight = true;
+    const invokeStartedAt = nowMs();
     try {
       await invoke(command, request);
+      logTerminalDiagnosticDuration(
+        "frontend.resize_native_invoke.slow",
+        invokeStartedAt,
+        {
+          cols: request.cols,
+          paneId: request.paneId || "",
+          reason,
+          rows: request.rows,
+        },
+        { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
+      );
       lastNativeAppliedSize = {
         cols: request.cols,
         instanceId: request.instanceId,
@@ -383,6 +405,7 @@ export function createTerminalResizeController({
       return false;
     }
 
+    const resizeStartedAt = nowMs();
     const measuredAt = nowMs();
     const measurement = measureTerminalGrid({
       container,
@@ -394,6 +417,7 @@ export function createTerminalResizeController({
       maxCols,
       maxRows,
     });
+    const measureMs = nowMs() - measuredAt;
 
     if (!measurement.ok) {
       callSafely(onSkip, {
@@ -447,19 +471,49 @@ export function createTerminalResizeController({
     });
 
     try {
+      const termResizeStartedAt = nowMs();
       term.resize(cols, rows);
+      const termResizeMs = nowMs() - termResizeStartedAt;
 
       const webglAddon = typeof getWebglAddon === "function" ? getWebglAddon() : null;
       const clearTextureAtlas = webglAddon?.clearTextureAtlas;
       const clearedTextureAtlas = typeof clearTextureAtlas === "function";
 
       if (clearedTextureAtlas) {
+        const atlasStartedAt = nowMs();
         try {
           clearTextureAtlas.call(webglAddon);
         } catch {
           // WebGL atlas clearing is best-effort; xterm has already accepted the grid.
         }
+        logTerminalDiagnosticDuration(
+          "frontend.resize_webgl_atlas_clear.slow",
+          atlasStartedAt,
+          {
+            cols,
+            paneId: request.paneId || "",
+            reason,
+            rows,
+          },
+          { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
+        );
       }
+
+      const elapsedMs = nowMs() - resizeStartedAt;
+      logTerminalDiagnosticEvent(
+        "frontend.resize.slow",
+        {
+          clearedTextureAtlas,
+          cols,
+          elapsedMs,
+          measureMs,
+          paneId: request.paneId || "",
+          reason,
+          rows,
+          termResizeMs,
+        },
+        { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
+      );
 
       lastAppliedSize = { cols, rows };
       callSafely(onDone, {

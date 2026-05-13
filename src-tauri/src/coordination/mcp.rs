@@ -1038,13 +1038,7 @@ fn dispatch_tool_result(
             input["reason"].as_str(),
         ),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
-        "submit_patch" => kernel.submit_patch(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            input["worktree_id"].as_str(),
-            input["summary"].as_str(),
-        ),
+        "submit_patch" => kernel_submit_patch(&kernel, &input),
         _ => Ok(api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),
@@ -1066,26 +1060,28 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let task_id = input["task_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
-    let task = task_id
-        .and_then(|task_id| {
+    let input_task_id_is_session_id =
+        task_id.is_some_and(|task_id| session_id == Some(task_id.trim()));
+    let requested_lane = input["lane"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
+    let requested_title = input["title"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
+    let local_task_hint = existing_local_task_id_for_start(kernel, task_id, session_id)?;
+    let lane = requested_lane.map(str::to_string).or_else(|| {
+        local_task_hint.as_deref().and_then(|task_id| {
             kernel
                 .query_json(
-                    "SELECT id, title, body, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
+                    "SELECT assigned_role FROM tasks WHERE id=?1 LIMIT 1",
                     &[&task_id],
                 )
                 .ok()
                 .and_then(|rows| rows.into_iter().next())
+                .and_then(|task| task["assigned_role"].as_str().map(str::to_string))
         })
-        .unwrap_or_else(|| json!({}));
-    let lane = input["lane"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| task["assigned_role"].as_str());
-    let task_title = input["title"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| task["title"].as_str());
-    let task_body = task["body"].as_str();
+    });
+    let task_title = requested_title.map(str::to_string);
 
     let cloud = match crate::cloud_mcp_forward_agent_start_task(
         input["repo_path"].as_str(),
@@ -1093,25 +1089,115 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         input["workspace_id"].as_str(),
         agent_id,
         session_id,
-        task_id,
+        local_task_hint.as_deref(),
         input["worktree_id"].as_str(),
         input["worktree_path"].as_str(),
-        lane,
-        task_title,
-        task_body,
+        lane.as_deref(),
+        task_title.as_deref(),
+        None,
         &start_plan,
     ) {
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
+    let cloud_task_id = cloud["response"]
+        .as_object()
+        .and_then(|_| cloud_start_task_id(&cloud["response"]));
+    let local_start_task_id = cloud_task_id
+        .as_deref()
+        .or(local_task_hint.as_deref())
+        .or(task_id);
 
-    let started = kernel.start_task(agent_id, session_id, task_id, None)?;
+    let started = kernel.start_task(
+        agent_id,
+        session_id,
+        local_start_task_id,
+        None,
+        Some(&start_plan),
+        requested_title,
+        requested_lane,
+    )?;
+    if started["ok"].as_bool() == Some(false) {
+        return Ok(started);
+    }
+
     let mut data = started["data"].clone();
+
     if let Some(object) = data.as_object_mut() {
         object.insert("start_plan".to_string(), json!(start_plan));
         object.insert("cloud".to_string(), cloud);
+        object.insert(
+            "task_id_source".to_string(),
+            json!(if cloud_task_id.is_some() {
+                "cloud"
+            } else if local_task_hint.is_some() {
+                "local_existing"
+            } else {
+                "local_fallback"
+            }),
+        );
+        if input_task_id_is_session_id {
+            object.insert("ignored_session_id_task_id".to_string(), json!(true));
+        }
     }
     Ok(api_ok(data))
+}
+
+fn existing_local_task_id_for_start(
+    kernel: &CoordinationKernel,
+    requested_task_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(task_id) = requested_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !kernel
+            .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+            .is_empty()
+        {
+            return Ok(Some(task_id.to_string()));
+        }
+    }
+
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let session = kernel.query_json(
+        "SELECT task_id FROM agent_sessions WHERE id=?1 LIMIT 1",
+        &[&session_id],
+    )?;
+    let task_id = session
+        .into_iter()
+        .next()
+        .and_then(|row| row["task_id"].as_str().map(str::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+    if kernel
+        .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(task_id))
+}
+
+fn cloud_start_task_id(response: &Value) -> Option<String> {
+    response["task_id"]
+        .as_str()
+        .or_else(|| response["data"]["task_id"].as_str())
+        .or_else(|| response["data"]["task"]["id"].as_str())
+        .or_else(|| response["task"]["id"].as_str())
+        .or_else(|| response["event"]["task_id"].as_str())
+        .or_else(|| response["event"]["task"]["id"].as_str())
+        .or_else(|| response["data"]["event"]["task_id"].as_str())
+        .or_else(|| response["data"]["event"]["task"]["id"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn optional_start_task_text(input: &Value) -> Option<String> {
@@ -1196,6 +1282,61 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         "summary": summary,
         "cloud": cloud,
     })))
+}
+
+fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let task_id = req(input, "task_id")?;
+    let agent_id = req(input, "agent_id")?;
+    let session_id = req(input, "session_id")?;
+    let task = kernel
+        .query_json(
+            "SELECT id, status, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
+            &[&task_id],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({}));
+    let lane = input["lane"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| task["assigned_role"].as_str());
+    let submitted = kernel.submit_patch(
+        task_id,
+        agent_id,
+        session_id,
+        input["worktree_id"].as_str(),
+        input["summary"].as_str(),
+    )?;
+    let task_after = kernel
+        .query_json(
+            "SELECT id, status, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
+            &[&task_id],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .unwrap_or_else(|| task.clone());
+    let cloud = match crate::cloud_mcp_forward_agent_submit_patch(
+        input["repo_path"].as_str(),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        Some(agent_id),
+        Some(session_id),
+        Some(task_id),
+        input["worktree_id"].as_str(),
+        input["worktree_path"].as_str(),
+        lane,
+        input["summary"].as_str(),
+        task_after["status"].as_str(),
+        &submitted,
+    ) {
+        Ok(response) => json!({"ok": true, "response": response}),
+        Err(error) => json!({"ok": false, "error": error}),
+    };
+    let mut response = submitted;
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
 }
 
 fn apply_context_defaults(context: &McpContext, input: &mut Value) {
@@ -1362,7 +1503,7 @@ fn clean_identity(value: Option<&str>) -> Option<String> {
 
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the assigned coordination task. Include a short plan explaining what you are about to do; Rust sends that plan to Cloud MCP for spec classification before work starts.".to_string(),
+        "start_task" => "Start the Cloud-created coordination task for this session. Omit task_id on the first call; Rust mirrors the returned server task_id locally for leases, checkpoints, and patches.".to_string(),
         "acquire_lease" => "Acquire a lease for an already-created task. Use resource_key such as file:index.html, glob:src/**, route:GET /api/users, or db:table:users.".to_string(),
         "checkpoint" => "Send one short summary of what has been done so far. Rust attaches task/session/file context and forwards it to Cloud MCP.".to_string(),
         "submit_patch" => "Submit the current task patch for validation and automatic safe integration when possible.".to_string(),
@@ -1375,7 +1516,7 @@ fn tool_input_schema(name: &str) -> Value {
         "start_task" => json!({
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "Optional; defaults to the current session task when available."},
+                "task_id": {"type": "string", "description": "Optional existing server task_id returned by start_task. Omit this on the first call."},
                 "plan": {"type": "string", "description": "Required short explanation of what you are about to do before editing."}
             },
             "required": ["plan"],
@@ -1417,6 +1558,21 @@ fn tool_input_schema(name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_start_task_id_accepts_event_response_data_shape() {
+        let response = json!({
+            "ok": true,
+            "data": {
+                "task_id": "server-task-123",
+                "task": {"id": "server-task-123"}
+            }
+        });
+        assert_eq!(
+            cloud_start_task_id(&response).as_deref(),
+            Some("server-task-123")
+        );
+    }
 
     #[test]
     fn shared_daemon_handles_initialize_for_bound_context() {

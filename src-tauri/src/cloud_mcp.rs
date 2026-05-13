@@ -1,18 +1,20 @@
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 3;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
-const CLOUD_MCP_FILETREE_LIMIT: usize = 900;
+const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_SPEC_GRAPH_SYNC_INTERVAL_MS: u64 = 1_500;
 const CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS: u64 = 4_000;
+const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 
 #[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
     client: reqwest::Client,
     spec_graph_syncs: Arc<Mutex<HashMap<String, u64>>>,
+    spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 struct CloudMcpRuntime {
@@ -122,6 +124,7 @@ impl CloudMcpState {
             })),
             client,
             spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
+            spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -421,7 +424,187 @@ fn cloud_mcp_file_references(path: &Path, size: Option<u64>) -> Vec<String> {
     references
 }
 
+fn cloud_mcp_normalized_git_path(value: &[u8]) -> Option<String> {
+    let path = String::from_utf8_lossy(value)
+        .replace('\\', "/")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    if path.is_empty()
+        || path == ".git"
+        || path == ".agents"
+        || matches!(path.as_str(), ".gitignore" | ".gitattributes" | ".gitmodules")
+        || path.starts_with(".git/")
+        || path.starts_with(".agents/")
+        || path.ends_with("/.gitignore")
+        || path.ends_with("/.gitattributes")
+        || path.ends_with("/.gitmodules")
+        || path.starts_with("../")
+        || path.contains("/../")
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn cloud_mcp_collect_gitignore_signatures(root: &Path) -> Vec<String> {
+    let mut signatures = Vec::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0usize));
+    while let Some((directory, depth)) = queue.pop_front() {
+        if depth > CLOUD_MCP_FILETREE_MAX_DEPTH {
+            continue;
+        }
+        let Ok(read_dir) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" || name == ".agents" {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                queue.push_back((path, depth + 1));
+                continue;
+            }
+            if name != ".gitignore" {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .map(workspace_path_display)
+                .unwrap_or_else(|| workspace_path_display(&path));
+            signatures.push(format!(
+                "{}:{}:{}",
+                relative.replace('\\', "/"),
+                metadata.len(),
+                cloud_mcp_modified_ms(&metadata).unwrap_or(0)
+            ));
+        }
+    }
+    if let Ok(metadata) = fs::metadata(root.join(".git").join("info").join("exclude")) {
+        signatures.push(format!(
+            ".git/info/exclude:{}:{}",
+            metadata.len(),
+            cloud_mcp_modified_ms(&metadata).unwrap_or(0)
+        ));
+    }
+    signatures.sort();
+    signatures
+}
+
+fn cloud_mcp_gitignore_signature(root: &Path) -> String {
+    cloud_mcp_collect_gitignore_signatures(root).join("|")
+}
+
+async fn cloud_mcp_wait_for_initial_gitignore(root: &Path) {
+    if !root.join(".git").exists() || root.join(".gitignore").exists() {
+        return;
+    }
+    let started = cloud_mcp_now_ms();
+    while cloud_mcp_now_ms().saturating_sub(started) < CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS {
+        sleep(Duration::from_millis(150)).await;
+        if root.join(".gitignore").exists() {
+            break;
+        }
+    }
+}
+
+fn cloud_mcp_parent_folders_for_relative_path(path: &str) -> Vec<String> {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+    (1..parts.len()).map(|end| parts[..end].join("/")).collect()
+}
+
+fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut file_paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .filter_map(cloud_mcp_normalized_git_path)
+        .collect::<Vec<_>>();
+    file_paths.sort();
+    file_paths.dedup();
+
+    let mut folder_paths = HashSet::new();
+    for file_path in &file_paths {
+        for folder_path in cloud_mcp_parent_folders_for_relative_path(file_path) {
+            folder_paths.insert(folder_path);
+        }
+    }
+    let mut folder_paths = folder_paths.into_iter().collect::<Vec<_>>();
+    folder_paths.sort();
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for folder_path in folder_paths {
+        if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
+            truncated = true;
+            break;
+        }
+        let path = root.join(&folder_path);
+        let metadata = fs::metadata(&path).ok();
+        entries.push(CloudMcpFileEntry {
+            relative_path: folder_path,
+            kind: "directory".to_string(),
+            size: None,
+            modified_ms: metadata
+                .as_ref()
+                .and_then(|metadata| cloud_mcp_modified_ms(metadata)),
+            references: Vec::new(),
+        });
+    }
+
+    for file_path in file_paths {
+        if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
+            truncated = true;
+            break;
+        }
+        let path = root.join(&file_path);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let size = Some(metadata.len());
+        entries.push(CloudMcpFileEntry {
+            relative_path: file_path,
+            kind: "file".to_string(),
+            size,
+            modified_ms: cloud_mcp_modified_ms(&metadata),
+            references: cloud_mcp_file_references(&path, size),
+        });
+    }
+
+    Some((entries, truncated))
+}
+
 fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
+    if let Some(filetree) = cloud_mcp_collect_git_visible_filetree(root) {
+        return filetree;
+    }
+
     let mut entries = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back((root.to_path_buf(), 0usize));
@@ -927,6 +1110,8 @@ async fn cloud_mcp_push_current_filetree_snapshot(
     state: &CloudMcpState,
     repo_id: &str,
     workspace_root: &Path,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
     reason: &str,
 ) -> Result<Value, String> {
     let root = workspace_root.to_path_buf();
@@ -938,8 +1123,8 @@ async fn cloud_mcp_push_current_filetree_snapshot(
         state,
         repo_id,
         workspace_root,
-        None,
-        None,
+        workspace_id,
+        workspace_name,
         filetree,
         filetree_truncated,
         reason,
@@ -1166,6 +1351,17 @@ fn cloud_mcp_terminal_repo_id(
                 cloud_mcp_short_hash(&workspace_path_display(working_directory))
             )
         })
+}
+
+fn cloud_mcp_terminal_repo_root_path(
+    working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
+) -> PathBuf {
+    coordination
+        .map(|coordination| coordination.repo_path.trim())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| working_directory.to_path_buf())
 }
 
 fn cloud_mcp_strip_terminal_sequences(value: &str) -> String {
@@ -1656,25 +1852,28 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
 
     let agent_id = cloud_mcp_terminal_agent_id(pane_id, instance_id, coordination);
     let repo_id = cloud_mcp_terminal_repo_id(working_directory, coordination);
+    let repo_root = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
     let lifecycle_changed_files = if matches!(status, "done" | "review" | "merged" | "completed") {
         cloud_mcp_terminal_changed_files_for_status(coordination, local_task_id, working_directory)
     } else {
         Vec::new()
     };
-    if matches!(status, "done" | "review" | "merged" | "completed")
-        && !lifecycle_changed_files.is_empty()
-    {
+    let should_sync_filetree = matches!(status, "done" | "merged" | "completed")
+        || (status == "review" && !lifecycle_changed_files.is_empty());
+    if should_sync_filetree {
         if let Err(error) = cloud_mcp_push_current_filetree_snapshot(
             state,
             &repo_id,
-            working_directory,
+            &repo_root,
+            None,
+            None,
             "terminal_work_filetree_update",
         )
         .await
         {
             let _ = cloud_mcp_workspace_log(
-                working_directory,
+                &repo_root,
                 "cloud_mcp.filetree.sync_error",
                 "",
                 "",
@@ -2723,6 +2922,39 @@ fn cloud_mcp_read_spec_graph_cache(
     cloud_mcp_stamp_spec_graph_snapshot(snapshot, req, &cache_path, sync_state, sync_error)
 }
 
+fn cloud_mcp_read_spec_graph_cache_preserving_state(
+    req: &CloudMcpSpecGraphSyncRequest,
+    fallback_sync_state: &str,
+    fallback_sync_error: &str,
+) -> Value {
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let Some(snapshot) = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return cloud_mcp_read_spec_graph_cache(req, fallback_sync_state, fallback_sync_error);
+    };
+
+    let sync_state = snapshot
+        .get("syncState")
+        .or_else(|| snapshot.get("sync_state"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_sync_state)
+        .to_string();
+    let sync_error = snapshot
+        .get("syncError")
+        .or_else(|| snapshot.get("sync_error"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_sync_error)
+        .to_string();
+
+    cloud_mcp_stamp_spec_graph_snapshot(snapshot, req, &cache_path, &sync_state, &sync_error)
+}
+
 fn cloud_mcp_write_spec_graph_cache(
     req: &CloudMcpSpecGraphSyncRequest,
     snapshot: &Value,
@@ -3017,6 +3249,9 @@ async fn cloud_mcp_spec_graph_sync_loop(
     generation: u64,
 ) {
     let mut first_sync = true;
+    let mut needs_filetree_sync = true;
+    let mut handled_filetree_request = 0u64;
+    let mut last_gitignore_signature = String::new();
     loop {
         let still_active = {
             let syncs = state.spec_graph_syncs.lock().await;
@@ -3026,9 +3261,46 @@ async fn cloud_mcp_spec_graph_sync_loop(
             break;
         }
 
-        let delay_ms = match cloud_mcp_sync_spec_graph_once(&state, &req).await {
+        let requested_filetree_sync = {
+            let requests = state.spec_graph_filetree_sync_requests.lock().await;
+            requests.get(&req.repo_id).copied().unwrap_or(0)
+        };
+        if requested_filetree_sync > handled_filetree_request {
+            handled_filetree_request = requested_filetree_sync;
+            needs_filetree_sync = true;
+        }
+        let gitignore_signature = cloud_mcp_gitignore_signature(&req.root);
+        if !last_gitignore_signature.is_empty() && gitignore_signature != last_gitignore_signature {
+            needs_filetree_sync = true;
+        }
+
+        let mut filetree_synced = false;
+        let sync_result = async {
+            if needs_filetree_sync {
+                if first_sync {
+                    cloud_mcp_wait_for_initial_gitignore(&req.root).await;
+                }
+                let current_signature = cloud_mcp_gitignore_signature(&req.root);
+                cloud_mcp_push_current_filetree_snapshot(
+                    &state,
+                    &req.repo_id,
+                    &req.root,
+                    req.workspace_id.as_deref(),
+                    req.workspace_name.as_deref(),
+                    "spec_graph_first_sync",
+                )
+                .await?;
+                last_gitignore_signature = current_signature;
+                needs_filetree_sync = false;
+                filetree_synced = true;
+            }
+            cloud_mcp_sync_spec_graph_once(&state, &req).await
+        }
+        .await;
+
+        let delay_ms = match sync_result {
             Ok((snapshot, changed)) => {
-                if first_sync || changed {
+                if first_sync || changed || filetree_synced {
                     cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
                 }
                 first_sync = false;
@@ -3042,7 +3314,6 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 );
                 let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
                 cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
-                first_sync = false;
                 CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS
             }
         };
@@ -3057,7 +3328,9 @@ async fn cloud_mcp_get_cached_spec_graph(
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
-    Ok(cloud_mcp_read_spec_graph_cache(&req, "cached", ""))
+    Ok(cloud_mcp_read_spec_graph_cache_preserving_state(
+        &req, "empty", "",
+    ))
 }
 
 #[tauri::command]
@@ -3069,7 +3342,6 @@ async fn cloud_mcp_start_spec_graph_sync(
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
-    let mut cached = cloud_mcp_read_spec_graph_cache(&req, "syncing", "");
     let requested_generation = cloud_mcp_now_ms();
     let mut active_generation = requested_generation;
     let mut should_spawn = false;
@@ -3082,6 +3354,15 @@ async fn cloud_mcp_start_spec_graph_sync(
             should_spawn = true;
         }
     }
+    {
+        let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
+        requests.insert(req.repo_id.clone(), requested_generation);
+    }
+    let mut cached = if should_spawn {
+        cloud_mcp_read_spec_graph_cache(&req, "syncing", "")
+    } else {
+        cloud_mcp_read_spec_graph_cache_preserving_state(&req, "syncing", "")
+    };
     if let Some(object) = cached.as_object_mut() {
         object.insert("syncGeneration".to_string(), json!(active_generation));
     }
@@ -3248,6 +3529,63 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cloud_mcp_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_mcp_filetree_uses_git_visible_paths() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-{suffix}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::create_dir_all(root.join("ignored_dir")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored.log\nignored_dir/\n").unwrap();
+        fs::write(root.join("src").join("app.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        fs::write(root.join("assets").join("logo.png"), b"png").unwrap();
+        fs::write(root.join("ignored.log"), "ignored\n").unwrap();
+        fs::write(root.join("ignored_dir").join("hidden.rs"), "ignored\n").unwrap();
+
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("init")
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
+        let paths = entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(!truncated);
+        assert!(paths.contains("src"));
+        assert!(paths.contains("src/app.rs"));
+        assert!(paths.contains("assets"));
+        assert!(paths.contains("assets/logo.png"));
+        assert!(paths.contains("package-lock.json"));
+        assert!(!paths.contains(".gitignore"));
+        assert!(!paths.contains("ignored.log"));
+        assert!(!paths.contains("ignored_dir"));
+        assert!(!paths.contains("ignored_dir/hidden.rs"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3450,17 +3788,25 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     summary: &str,
 ) -> Result<Value, String> {
     let repo_path_text = repo_path
-        .or(worktree_path)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let worktree_path_text = worktree_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let scan_path_text = worktree_path_text
+        .as_ref()
+        .or(repo_path_text.as_ref())
+        .cloned();
     let repo_id = repo_path_text
         .as_deref()
+        .or(scan_path_text.as_deref())
         .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
     let base_url = cloud_mcp_base_url();
     let identity = CloudMcpProxyIdentity {
         base_url: Some(base_url.clone()),
-        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_path: scan_path_text.as_ref().map(PathBuf::from),
         repo_id,
         workspace_id: workspace_id
             .map(str::trim)
@@ -3480,7 +3826,7 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
         terminal_instance_id: None,
         slot_key: None,
         agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
-        client_id: "rust-diffforge-agent-checkpoint".to_string(),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
     };
     let event_kind = "checkpoint_recorded";
     let mut metadata = serde_json::Map::new();
@@ -3526,9 +3872,8 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     if let Some(repo_id) = identity.repo_id.as_deref() {
         arguments.insert("repo_id".to_string(), json!(repo_id));
     }
-    if let Some(repo_path) = identity.repo_path.as_ref() {
-        let repo_path = repo_path.to_string_lossy().to_string();
-        arguments.insert("repo_path".to_string(), json!(repo_path.clone()));
+    if let Some(repo_path) = repo_path_text.as_deref().or(scan_path_text.as_deref()) {
+        arguments.insert("repo_path".to_string(), json!(repo_path));
         arguments.insert("workspace_root".to_string(), json!(repo_path));
     }
     if let Some(workspace_id) = identity.workspace_id.as_deref() {
@@ -3542,6 +3887,7 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     if let Some(session_id) = identity.session_id.as_deref() {
         arguments.insert("session_id".to_string(), json!(session_id));
     }
+    cloud_mcp_proxy_insert_local_file_scope(&mut arguments, &identity, event_kind);
 
     let request = json!({
         "event_kind": event_kind,
@@ -3577,6 +3923,186 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
                 event_kind,
                 json!({
                     "activity": "agent checkpoint sync failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn cloud_mcp_forward_agent_submit_patch(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    worktree_id: Option<&str>,
+    worktree_path: Option<&str>,
+    lane: Option<&str>,
+    summary: Option<&str>,
+    local_task_status: Option<&str>,
+    submit_result: &Value,
+) -> Result<Value, String> {
+    let repo_path_text = repo_path
+        .or(worktree_path)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = cloud_mcp_base_url();
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let data = submit_result.get("data").unwrap_or(&Value::Null);
+    let ok = submit_result["ok"].as_bool() == Some(true);
+    let validation_status = data["validation_status"].as_str().unwrap_or_default();
+    let auto_merge_status = data["auto_merge"]["status"].as_str().unwrap_or_default();
+    let task_status = local_task_status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if data["noop"].as_bool() == Some(true) {
+                "skipped".to_string()
+            } else if ok && auto_merge_status == "applied" {
+                "merged".to_string()
+            } else if ok && validation_status == "passed" {
+                "review".to_string()
+            } else {
+                "review".to_string()
+            }
+        });
+    let changed_files = data
+        .get("changed_files")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.submit_patch"),
+    );
+    metadata.insert("submit_result".to_string(), submit_result.clone());
+    metadata.insert("validation_status".to_string(), json!(validation_status));
+    metadata.insert("auto_merge_status".to_string(), json!(auto_merge_status));
+    if let Some(task_id) = task_id {
+        metadata.insert("cloud_task_id".to_string(), json!(task_id));
+        metadata.insert("coordination_task_id".to_string(), json!(task_id));
+        metadata.insert("local_coordination_task_id".to_string(), json!(task_id));
+    }
+    if let Some(patch_id) = data["patch_id"].as_str() {
+        metadata.insert("local_patch_id".to_string(), json!(patch_id));
+    }
+    if let Some(diff_artifact_id) = data["diff_artifact_id"].as_str() {
+        metadata.insert("local_diff_artifact_id".to_string(), json!(diff_artifact_id));
+    }
+    if let Some(worktree_id) = worktree_id {
+        metadata.insert("worktree_id".to_string(), json!(worktree_id));
+    }
+    if let Some(worktree_path) = worktree_path {
+        metadata.insert("worktree_path".to_string(), json!(worktree_path));
+    }
+
+    let mut arguments = serde_json::Map::new();
+    let summary_text = summary.unwrap_or("Patch submitted through the local coordination kernel.");
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-agent-submit-patch"),
+    );
+    arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
+    arguments.insert("status".to_string(), json!(task_status.clone()));
+    arguments.insert("task_status".to_string(), json!(task_status.clone()));
+    arguments.insert("summary".to_string(), json!(summary_text));
+    arguments.insert("brief".to_string(), json!(summary_text));
+    arguments.insert("changed_files".to_string(), changed_files);
+    arguments.insert("metadata".to_string(), Value::Object(metadata));
+    if let Some(task_id) = task_id.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("task_id".to_string(), json!(task_id));
+        arguments.insert("run_id".to_string(), json!(task_id));
+    }
+    if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("lane".to_string(), json!(lane));
+    }
+    if let Some(repo_id) = identity.repo_id.as_deref() {
+        arguments.insert("repo_id".to_string(), json!(repo_id));
+    }
+    if let Some(repo_path) = identity.repo_path.as_ref() {
+        let repo_path = repo_path.to_string_lossy().to_string();
+        arguments.insert("repo_path".to_string(), json!(repo_path.clone()));
+        arguments.insert("workspace_root".to_string(), json!(repo_path));
+    }
+    if let Some(workspace_id) = identity.workspace_id.as_deref() {
+        arguments.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    if let Some(agent_id) = identity.cloud_agent_id() {
+        arguments.insert("agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("self_agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("current_agent_id".to_string(), json!(agent_id));
+    }
+    if let Some(session_id) = identity.session_id.as_deref() {
+        arguments.insert("session_id".to_string(), json!(session_id));
+    }
+
+    let request = json!({
+        "event_kind": "submit_patch",
+        "payload": Value::Object(arguments),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    identity.log(
+        "cloud_mcp.agent_submit_patch.start",
+        "submit_patch",
+        json!({
+            "activity": "agent submit_patch",
+            "baseUrl": base_url,
+            "taskStatus": task_status,
+            "taskId": task_id,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
+        Ok(response) => {
+            identity.log(
+                "cloud_mcp.agent_submit_patch.done",
+                "submit_patch",
+                json!({
+                    "activity": "agent submit_patch synced",
+                    "baseUrl": base_url,
+                }),
+            );
+            let parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            Ok(parsed)
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.agent_submit_patch.error",
+                "submit_patch",
+                json!({
+                    "activity": "agent submit_patch sync failed",
                     "baseUrl": base_url,
                     "error": clean_terminal_telemetry_text(&error),
                 }),
@@ -3635,7 +4161,7 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         terminal_instance_id: None,
         slot_key: None,
         agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
-        client_id: "rust-diffforge-agent-start-task".to_string(),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
     };
     let title = task_title
         .map(str::trim)
@@ -3732,8 +4258,24 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         .get("data")
         .cloned()
         .unwrap_or_else(|| event_parsed.clone());
+    let server_task_id = event_data["task_id"]
+        .as_str()
+        .or_else(|| event_data["task"]["id"].as_str())
+        .map(str::to_string);
 
     let mut context_payload = arguments;
+    if let Some(task_id) = server_task_id.as_deref() {
+        context_payload.insert("task_id".to_string(), json!(task_id));
+        context_payload.insert("run_id".to_string(), json!(task_id));
+        if let Some(metadata) = context_payload
+            .entry("metadata".to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            metadata.insert("cloud_task_id".to_string(), json!(task_id));
+            metadata.insert("coordination_task_id".to_string(), json!(task_id));
+        }
+    }
     context_payload.insert("history_limit".to_string(), json!(30));
     context_payload.insert("agent_limit".to_string(), json!(50));
     let context_request = Value::Object(context_payload.clone());
@@ -3768,6 +4310,8 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     );
 
     Ok(json!({
+        "task_id": server_task_id,
+        "task": event_data["task"].clone(),
         "event": event_data,
         "spec_activity": event_data["spec_activity"].clone(),
         "context_pack": context_pack,
@@ -4433,14 +4977,15 @@ fn cloud_mcp_proxy_post_json_endpoint(
     endpoint_path: &str,
     body: &str,
 ) -> Result<String, String> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     let endpoint = cloud_mcp_proxy_parse_http_url(base_url, endpoint_path)?;
     let mut stream = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .map_err(|error| format!("connect failed: {error}"))?;
-    let timeout = std::time::Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS as u64);
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    let read_poll_timeout = Duration::from_secs(1);
+    let write_timeout = Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
+    let _ = stream.set_read_timeout(Some(read_poll_timeout));
+    let _ = stream.set_write_timeout(Some(write_timeout));
 
     let mut headers = String::new();
     let body_value = serde_json::from_str::<Value>(body).ok();
@@ -4488,10 +5033,7 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .write_all(request.as_bytes())
         .map_err(|error| format!("write failed: {error}"))?;
 
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("read failed: {error}"))?;
+    let response = cloud_mcp_proxy_read_http_response(&mut stream)?;
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -4512,6 +5054,65 @@ fn cloud_mcp_proxy_post_json_endpoint(
     String::from_utf8(body).map_err(|error| format!("Cloud MCP returned invalid UTF-8: {error}"))
 }
 
+fn cloud_mcp_proxy_read_http_response(stream: &mut std::net::TcpStream) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(response),
+            Ok(bytes_read) => {
+                response.extend_from_slice(&buffer[..bytes_read]);
+                if cloud_mcp_proxy_http_response_complete(&response) {
+                    return Ok(response);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "read timed out after {CLOUD_MCP_SYNC_TIMEOUT_SECS}s waiting for Cloud MCP response"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("read failed: {error}")),
+        }
+    }
+}
+
+fn cloud_mcp_proxy_http_response_complete(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end + 4..];
+    if let Some(content_length) = cloud_mcp_proxy_content_length(&head) {
+        return body.len() >= content_length;
+    }
+    if cloud_mcp_proxy_header_contains(&head, "transfer-encoding", "chunked") {
+        return cloud_mcp_proxy_chunked_body_complete(body);
+    }
+    false
+}
+
+fn cloud_mcp_proxy_content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
 fn cloud_mcp_proxy_header_contains(head: &str, header_name: &str, expected_value: &str) -> bool {
     let header_name = header_name.to_ascii_lowercase();
     let expected_value = expected_value.to_ascii_lowercase();
@@ -4522,6 +5123,41 @@ fn cloud_mcp_proxy_header_contains(head: &str, header_name: &str, expected_value
         name.trim().eq_ignore_ascii_case(&header_name)
             && value.to_ascii_lowercase().contains(&expected_value)
     })
+}
+
+fn cloud_mcp_proxy_chunked_body_complete(body: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    loop {
+        let Some(line_end) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| cursor + offset)
+        else {
+            return false;
+        };
+        let Ok(size_line) = std::str::from_utf8(&body[cursor..line_end]) else {
+            return false;
+        };
+        let size_text = size_line
+            .split_once(';')
+            .map(|(size, _)| size)
+            .unwrap_or(size_line)
+            .trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            return false;
+        };
+        cursor = line_end + 2;
+        if size == 0 {
+            return body[cursor..].windows(2).any(|window| window == b"\r\n");
+        }
+        let Some(chunk_end) = cursor.checked_add(size) else {
+            return false;
+        };
+        if chunk_end + 2 > body.len() || &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return false;
+        }
+        cursor = chunk_end + 2;
+    }
 }
 
 fn cloud_mcp_proxy_decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {

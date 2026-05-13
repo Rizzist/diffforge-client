@@ -7,7 +7,10 @@ use uuid::Uuid;
 use super::{
     db::REPO_ID,
     kernel::{api_ok, now_rfc3339, CoordinationKernel, EventRefs},
-    resources::{lease_mode_conflict_reason, normalize_resource_key, resource_conflict_reason},
+    resources::{
+        lease_mode_conflict_reason, normalize_resource_key, resource_conflict_reason,
+        resource_covers,
+    },
 };
 
 const TERMINAL_TASK_STATUSES: &[&str] = &["done", "completed", "merged", "cancelled", "skipped"];
@@ -697,6 +700,9 @@ impl CoordinationKernel {
         }
         let rows = self.query_json("SELECT status FROM leases WHERE id=?1", &[&lease_id])?;
         let Some(lease) = rows.first() else {
+            if let Some(reason) = self.active_file_lease_queue_pending_reason(edge)? {
+                return Ok(pending(&reason));
+            }
             return Ok(EdgeEvaluation {
                 status: "satisfied".to_string(),
                 reason: "Blocking lease no longer exists.".to_string(),
@@ -711,12 +717,89 @@ impl CoordinationKernel {
                 proof_artifact_id: None,
             })
         } else {
+            if let Some(reason) = self.active_file_lease_queue_pending_reason(edge)? {
+                return Ok(pending(&reason));
+            }
             Ok(EdgeEvaluation {
                 status: "satisfied".to_string(),
                 reason: format!("Blocking lease is {status}."),
                 proof_artifact_id: None,
             })
         }
+    }
+
+    fn active_file_lease_queue_pending_reason(
+        &self,
+        edge: &Value,
+    ) -> Result<Option<String>, String> {
+        if edge["predicate_json"]["dependency_kind"].as_str() != Some("active_file_lease") {
+            return Ok(None);
+        }
+        let dependent_task_id = edge["dependent_task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .trim();
+        if dependent_task_id.is_empty() {
+            return Ok(None);
+        }
+        let queue_resource_key = active_file_lease_edge_resource_key(edge);
+        if queue_resource_key.is_empty() {
+            return Ok(None);
+        }
+
+        let waiters = self.query_json(
+            "SELECT i.task_id, i.resource_key, i.status, i.created_at, i.updated_at
+             FROM task_resource_intents i
+             JOIN tasks t ON t.id=i.task_id
+             WHERE i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+               AND t.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+             ORDER BY i.created_at ASC, i.updated_at ASC, i.task_id ASC",
+            &[],
+        )?;
+        for waiter in waiters {
+            let waiter_resource_key = waiter["resource_key"].as_str().unwrap_or_default();
+            if waiter_resource_key.is_empty()
+                || (!resource_covers(&queue_resource_key, waiter_resource_key)
+                    && !resource_covers(waiter_resource_key, &queue_resource_key))
+            {
+                continue;
+            }
+            let waiter_task_id = waiter["task_id"].as_str().unwrap_or_default();
+            if waiter_task_id != dependent_task_id {
+                return Ok(Some(format!(
+                    "{queue_resource_key} is waiting for an older parked resource-queue task."
+                )));
+            }
+            break;
+        }
+
+        let mode = edge["predicate_json"]["mode"].as_str().unwrap_or("write");
+        let now = now_rfc3339();
+        let active = self.query_json(
+            "SELECT l.id, l.task_id, l.mode, r.resource_key
+             FROM leases l
+             JOIN resources r ON r.id=l.resource_id
+             WHERE l.status='active' AND l.expires_at >= ?1
+             ORDER BY l.acquired_at ASC",
+            &[&now],
+        )?;
+        let blocked_by_active_lease = active.into_iter().any(|lease| {
+            let active_task_id = lease["task_id"].as_str().unwrap_or_default();
+            if active_task_id == dependent_task_id {
+                return false;
+            }
+            let active_key = lease["resource_key"].as_str().unwrap_or_default();
+            let active_mode = lease["mode"].as_str().unwrap_or_default();
+            resource_conflict_reason(active_key, &queue_resource_key).is_some()
+                && lease_mode_conflict_reason(active_mode, mode).is_some()
+        });
+        if blocked_by_active_lease {
+            return Ok(Some(format!(
+                "{queue_resource_key} is still blocked by an active conflicting lease."
+            )));
+        }
+
+        Ok(None)
     }
 
     fn evaluate_resource_available_edge(&self, edge: &Value) -> Result<EdgeEvaluation, String> {
@@ -1028,6 +1111,29 @@ fn dependency_prerequisite_task_id(
     predicate_json["blocked_by_task_id"]
         .as_str()
         .map(str::to_string)
+}
+
+fn active_file_lease_edge_resource_key(edge: &Value) -> String {
+    let prerequisite_key = edge["prerequisite_key"]
+        .as_str()
+        .unwrap_or_default()
+        .strip_prefix("resource:")
+        .unwrap_or_else(|| edge["prerequisite_key"].as_str().unwrap_or_default())
+        .trim();
+    let predicate_resource_key = edge["predicate_json"]["blocked_by_resource_key"]
+        .as_str()
+        .unwrap_or_default()
+        .trim();
+    let resource_key = if prerequisite_key.is_empty() {
+        predicate_resource_key
+    } else {
+        prerequisite_key
+    };
+    if resource_key.is_empty() {
+        String::new()
+    } else {
+        normalize_resource_key(resource_key)
+    }
 }
 
 fn wanted_statuses(predicate_json: &Value, default: &[&str]) -> Vec<String> {

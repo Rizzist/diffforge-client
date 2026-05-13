@@ -231,6 +231,7 @@ fn app_has_focused_audio_input_window(app: &AppHandle) -> bool {
 }
 
 async fn write_terminal_input(
+    app: Option<&AppHandle>,
     state: &TerminalState,
     pane_id: &str,
     instance_id: Option<u64>,
@@ -251,7 +252,10 @@ async fn write_terminal_input(
     else {
         return Ok(false);
     };
+    let lock_started_at = Instant::now();
     let mut writer = instance.writer.lock().await;
+    let lock_wait_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
+    let write_started_at = Instant::now();
 
     writer
         .write_all(data.as_bytes())
@@ -259,6 +263,25 @@ async fn write_terminal_input(
     writer
         .flush()
         .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
+    let write_ms = terminal_diagnostic_elapsed_ms(write_started_at);
+    let elapsed_ms = lock_wait_ms + write_ms;
+
+    if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+        if let Some(app) = app {
+            log_terminal_diagnostic_event(
+                app,
+                "backend.input_write.slow",
+                json!({
+                    "bytes": data.len(),
+                    "elapsed_ms": elapsed_ms,
+                    "instance_id": instance.id,
+                    "lock_wait_ms": lock_wait_ms,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "write_ms": write_ms,
+                }),
+            );
+        }
+    }
 
     Ok(true)
 }
@@ -278,6 +301,7 @@ async fn write_to_active_terminal_audio_input_target(
     }
 
     let wrote = write_terminal_input(
+        Some(app),
         state,
         &target.pane_id,
         target.instance_id,
@@ -855,9 +879,9 @@ fn spawn_terminal_reader(
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
         output_channel: &Channel<InvokeResponseBody>,
-    ) -> bool {
+    ) -> (bool, f64) {
         if chunk.is_empty() {
-            return true;
+            return (true, 0.0);
         }
 
         let observer_state = cloud_mcp_state.clone();
@@ -873,13 +897,21 @@ fn spawn_terminal_reader(
             .await;
         });
 
-        output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
+        let send_started_at = Instant::now();
+        let sent = output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok();
+        (sent, terminal_diagnostic_elapsed_ms(send_started_at))
     }
 
     let reader_pane_id = pane_id.clone();
 
     thread::spawn(move || {
         let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
+        let mut stats_started_at = Instant::now();
+        let mut stats_chunks: u64 = 0;
+        let mut stats_bytes: u64 = 0;
+        let mut stats_slow_sends: u64 = 0;
+        let mut stats_total_send_ms = 0.0f64;
+        let mut stats_max_send_ms = 0.0f64;
 
         loop {
             match reader.read(&mut buffer) {
@@ -887,13 +919,57 @@ fn spawn_terminal_reader(
                 Ok(bytes_read) => {
                     let chunk = &buffer[..bytes_read];
 
-                    if !send_terminal_output_frame(
+                    let (sent, send_ms) = send_terminal_output_frame(
                         chunk.to_vec(),
                         &reader_pane_id,
                         instance_id,
                         &cloud_mcp_state,
                         &output_channel,
-                    ) {
+                    );
+                    if terminal_diagnostics_enabled_for_app(&app) {
+                        stats_chunks += 1;
+                        stats_bytes += bytes_read as u64;
+                        stats_total_send_ms += send_ms;
+                        stats_max_send_ms = stats_max_send_ms.max(send_ms);
+                        if send_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+                            stats_slow_sends += 1;
+                            log_terminal_diagnostic_event(
+                                &app,
+                                "backend.output_channel_send.slow",
+                                json!({
+                                    "bytes": bytes_read,
+                                    "elapsed_ms": send_ms,
+                                    "instance_id": instance_id,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                }),
+                            );
+                        }
+
+                        if stats_started_at.elapsed() >= Duration::from_secs(1) {
+                            log_terminal_diagnostic_event(
+                                &app,
+                                "backend.output_window",
+                                json!({
+                                    "bytes": stats_bytes,
+                                    "chunks": stats_chunks,
+                                    "elapsed_ms": terminal_diagnostic_elapsed_ms(stats_started_at),
+                                    "instance_id": instance_id,
+                                    "max_send_ms": stats_max_send_ms,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                    "slow_sends": stats_slow_sends,
+                                    "total_send_ms": stats_total_send_ms,
+                                }),
+                            );
+                            stats_started_at = Instant::now();
+                            stats_chunks = 0;
+                            stats_bytes = 0;
+                            stats_slow_sends = 0;
+                            stats_total_send_ms = 0.0;
+                            stats_max_send_ms = 0.0;
+                        }
+                    }
+
+                    if !sent {
                         break;
                     }
                 }
@@ -1252,6 +1328,7 @@ async fn terminal_open(
     request: TerminalOpenRequest,
     output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
+    let open_started_at = Instant::now();
     validate_terminal_pane_id(&request.pane_id)?;
     let pane_id = request.pane_id;
     let requested_cols = request.cols;
@@ -1432,6 +1509,22 @@ async fn terminal_open(
             );
         }
     }
+
+    log_terminal_diagnostic_event(
+        &app,
+        "backend.terminal_open.done",
+        json!({
+            "agent_started": agent_started,
+            "cols": size.cols,
+            "elapsed_ms": terminal_diagnostic_elapsed_ms(open_started_at),
+            "instance_id": instance_id,
+            "kind": clean_terminal_diagnostic_log_text(&kind),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "plain_shell": plain_shell,
+            "rows": size.rows,
+            "shell_pty": shell_pty,
+        }),
+    );
 
     Ok(TerminalOpenResult {
         pane_id,
@@ -3571,6 +3664,39 @@ async fn terminal_write_inner(
     let _input_guard = instance.input_queue.lock().await;
     let mut data_to_write = data.clone();
 
+    let escape_interrupt_task_id = if data == "\x1b" && instance.coordination.is_some() {
+        instance
+            .active_task
+            .lock()
+            .await
+            .as_ref()
+            .map(|task| task.task_id.clone())
+    } else {
+        None
+    };
+    if let Some(active_task_id) = escape_interrupt_task_id.as_deref() {
+        write_terminal_interrupt_escape(&instance).await?;
+        mark_terminal_active_task_interrupted(
+            cloud_mcp_state,
+            &pane_id,
+            &instance,
+            "escape_key",
+            "Interrupted by Escape; the terminal remains open for follow-up instructions.",
+        )
+        .await?;
+        interrupt_terminal_parked_prompts(
+            &app,
+            state,
+            cloud_mcp_state,
+            &pane_id,
+            &instance,
+            "escape_key",
+            Some(active_task_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
         if *instance.agent_started.lock().await {
             let prepared_coordination_task =
@@ -3716,6 +3842,7 @@ async fn terminal_write_inner(
     }
 
     write_terminal_input(
+        Some(&app),
         state,
         &pane_id,
         instance_id,
@@ -3851,20 +3978,24 @@ async fn terminal_cancel_parked_task(
         }
     }
 
-    cloud_mcp_mark_terminal_task_lifecycle(
-        cloud_mcp_state.inner(),
-        &parked.pane_id,
-        parked.instance_id,
-        &parked.working_directory,
-        Some(&parked.coordination),
-        Some(&parked.task_id),
-        Some(&parked.title),
-        "cancelled",
-        "terminal-agent",
-        "Cancelled before resuming: the parked task was cancelled from the terminal bar.",
-    )
-    .await;
     emit_terminal_parked_prompt_event(&app, &parked, "cancelled", Some("cancel_button"));
+
+    let cloud_state = cloud_mcp_state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_mark_terminal_task_lifecycle(
+            &cloud_state,
+            &parked.pane_id,
+            parked.instance_id,
+            &parked.working_directory,
+            Some(&parked.coordination),
+            Some(&parked.task_id),
+            Some(&parked.title),
+            "cancelled",
+            "terminal-agent",
+            "Cancelled before resuming: the parked task was cancelled from the terminal bar.",
+        )
+        .await;
+    });
 
     Ok(())
 }
@@ -3975,6 +4106,126 @@ async fn terminal_get_parked_prompt(
     }))
 }
 
+async fn write_terminal_interrupt_escape(instance: &TerminalInstance) -> Result<(), String> {
+    let mut writer = instance.writer.lock().await;
+    writer
+        .write_all(b"\x1b")
+        .map_err(|error| format!("Unable to send terminal interrupt: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Unable to flush terminal interrupt: {error}"))
+}
+
+async fn mark_terminal_active_task_interrupted(
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance: &TerminalInstance,
+    reason: &str,
+    lifecycle_message: &str,
+) -> Result<bool, String> {
+    let active_task = instance.active_task.lock().await.clone();
+    let (Some(coordination), Some(active_task)) =
+        (instance.coordination.as_ref(), active_task.as_ref())
+    else {
+        return Ok(false);
+    };
+
+    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    ) {
+        let _ = kernel.mark_terminal_task_stopped(
+            &active_task.task_id,
+            &coordination.session_id,
+            "interrupted",
+            reason,
+        );
+    }
+    cloud_mcp_mark_terminal_task_lifecycle(
+        cloud_mcp_state,
+        pane_id,
+        instance.id,
+        instance.working_directory.as_ref(),
+        Some(coordination),
+        Some(&active_task.task_id),
+        Some(&active_task.title),
+        "interrupted",
+        "terminal-agent",
+        lifecycle_message,
+    )
+    .await;
+    let mut stored_active_task = instance.active_task.lock().await;
+    if stored_active_task
+        .as_ref()
+        .is_some_and(|task| task.task_id == active_task.task_id)
+    {
+        *stored_active_task = None;
+    }
+    Ok(true)
+}
+
+fn mark_terminal_parked_prompt_stopped(
+    parked: &TerminalParkedPrompt,
+    status: &str,
+    reason: &str,
+) {
+    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &parked.coordination.repo_path,
+        Some(PathBuf::from(&parked.coordination.db_path)),
+    ) {
+        let _ = kernel.mark_terminal_task_stopped(
+            &parked.task_id,
+            &parked.coordination.session_id,
+            status,
+            reason,
+        );
+    }
+}
+
+async fn interrupt_terminal_parked_prompts(
+    app: &AppHandle,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance: &TerminalInstance,
+    reason: &str,
+    skip_kernel_task_id: Option<&str>,
+) -> Result<(), String> {
+    let parked_to_interrupt = {
+        let mut parked = state.parked_prompts.write().await;
+        let matching_keys = parked
+            .iter()
+            .filter_map(|(key, value)| {
+                (value.pane_id == pane_id && value.instance_id == instance.id).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        matching_keys
+            .into_iter()
+            .filter_map(|key| parked.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    for parked in parked_to_interrupt {
+        if skip_kernel_task_id != Some(parked.task_id.as_str()) {
+            mark_terminal_parked_prompt_stopped(&parked, "interrupted", reason);
+        }
+        cloud_mcp_mark_terminal_task_lifecycle(
+            cloud_mcp_state,
+            &parked.pane_id,
+            parked.instance_id,
+            &parked.working_directory,
+            Some(&parked.coordination),
+            Some(&parked.task_id),
+            Some(&parked.title),
+            "interrupted",
+            "terminal-agent",
+            "Interrupted by Escape while parked; the task was not marked cancelled.",
+        )
+        .await;
+        emit_terminal_parked_prompt_event(app, &parked, "interrupted", Some("escape_key"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn terminal_interrupt_agent(
     app: AppHandle,
@@ -3991,90 +4242,41 @@ async fn terminal_interrupt_agent(
     };
     let reason = reason.unwrap_or_else(|| "escape_key".to_string());
 
-    {
-        let mut writer = instance.writer.lock().await;
-        writer
-            .write_all(b"\x1b")
-            .map_err(|error| format!("Unable to send terminal interrupt: {error}"))?;
-        writer
-            .flush()
-            .map_err(|error| format!("Unable to flush terminal interrupt: {error}"))?;
-    }
-
-    let active_task = instance.active_task.lock().await.clone();
-    if let (Some(coordination), Some(active_task)) =
-        (instance.coordination.as_ref(), active_task.as_ref())
-    {
-        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
-            &coordination.repo_path,
-            Some(PathBuf::from(&coordination.db_path)),
-        ) {
-            let _ = kernel.mark_terminal_task_stopped(
-                &active_task.task_id,
-                &coordination.session_id,
-                "interrupted",
-                &reason,
-            );
-        }
-        cloud_mcp_mark_terminal_task_lifecycle(
-            cloud_mcp_state.inner(),
-            &pane_id,
-            instance.id,
-            instance.working_directory.as_ref(),
-            Some(coordination),
-            Some(&active_task.task_id),
-            Some(&active_task.title),
-            "interrupted",
-            "terminal-agent",
-            "Interrupted by Escape; the terminal remains open for follow-up instructions.",
-        )
-        .await;
-        let mut stored_active_task = instance.active_task.lock().await;
-        if stored_active_task
-            .as_ref()
-            .is_some_and(|task| task.task_id == active_task.task_id)
-        {
-            *stored_active_task = None;
-        }
-    }
-
-    let parked_to_interrupt = {
-        let mut parked = state.parked_prompts.write().await;
-        let matching_keys = parked
-            .iter()
-            .filter_map(|(key, value)| {
-                (value.pane_id == pane_id && value.instance_id == instance.id).then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
-        matching_keys
-            .into_iter()
-            .filter_map(|key| parked.remove(&key))
-            .collect::<Vec<_>>()
-    };
-    for parked in parked_to_interrupt {
-        cloud_mcp_mark_terminal_task_lifecycle(
-            cloud_mcp_state.inner(),
-            &parked.pane_id,
-            parked.instance_id,
-            &parked.working_directory,
-            Some(&parked.coordination),
-            Some(&parked.task_id),
-            Some(&parked.title),
-            "interrupted",
-            "terminal-agent",
-            "Interrupted by Escape while parked; the task was not marked cancelled.",
-        )
-        .await;
-        emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("escape_key"));
-    }
+    let active_task_id = instance
+        .active_task
+        .lock()
+        .await
+        .as_ref()
+        .map(|task| task.task_id.clone());
+    write_terminal_interrupt_escape(&instance).await?;
+    mark_terminal_active_task_interrupted(
+        cloud_mcp_state.inner(),
+        &pane_id,
+        &instance,
+        &reason,
+        "Interrupted by Escape; the terminal remains open for follow-up instructions.",
+    )
+    .await?;
+    interrupt_terminal_parked_prompts(
+        &app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        &pane_id,
+        &instance,
+        &reason,
+        active_task_id.as_deref(),
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn resize_terminal_instance(
+    app: Option<&AppHandle>,
     instance: &TerminalInstance,
     size: PtySize,
 ) -> Result<(), String> {
+    let resize_started_at = Instant::now();
     let mut current_size = instance.size.lock().await;
 
     if *current_size == size {
@@ -4087,6 +4289,21 @@ async fn resize_terminal_instance(
         .resize(size)
         .map_err(|error| format!("Unable to resize terminal: {error}"))?;
     *current_size = size;
+    let elapsed_ms = terminal_diagnostic_elapsed_ms(resize_started_at);
+    if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+        if let Some(app) = app {
+            log_terminal_diagnostic_event(
+                app,
+                "backend.resize_pty.slow",
+                json!({
+                    "cols": size.cols,
+                    "elapsed_ms": elapsed_ms,
+                    "instance_id": instance.id,
+                    "rows": size.rows,
+                }),
+            );
+        }
+    }
 
     Ok(())
 }
@@ -4132,6 +4349,7 @@ async fn resolve_terminal_for_resize(
 
 #[tauri::command]
 async fn resize_terminal(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     pane_id: Option<String>,
     instance_id: Option<u64>,
@@ -4154,13 +4372,14 @@ async fn resize_terminal(
         return Ok(());
     };
 
-    resize_terminal_instance(&instance, size).await?;
+    resize_terminal_instance(Some(&app), &instance, size).await?;
 
     Ok(())
 }
 
 #[tauri::command]
 async fn terminal_resize(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     pane_id: String,
     cols: u16,
@@ -4182,7 +4401,7 @@ async fn terminal_resize(
             return Err(error);
         }
     };
-    resize_terminal_instance(&instance, size).await?;
+    resize_terminal_instance(Some(&app), &instance, size).await?;
 
     Ok(())
 }
