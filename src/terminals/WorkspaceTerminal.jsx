@@ -372,6 +372,11 @@ const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
 const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
+const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_OUTPUT_BATCH_MAX_MS;
+const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 75;
+const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 2;
+const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = 1;
+const TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS = 8;
 const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
 const TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS = 16;
 const TERMINAL_SCROLL_ANCHOR_DIAGNOSTIC_SLOW_MS = 8;
@@ -399,6 +404,258 @@ const clearActiveTerminalKeyboardTargetIfCurrent = (paneId, instanceId) => {
     activeTerminalKeyboardTarget = null;
   }
 };
+
+const terminalRenderNow = () => (
+  typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now()
+);
+
+const terminalGlobalRenderScheduler = (() => {
+  const entries = new Map();
+  let rafId = 0;
+  let timerId = 0;
+  let frameId = 0;
+
+  const hasWindow = () => typeof window !== "undefined";
+
+  const clearTimer = () => {
+    if (timerId && hasWindow()) {
+      window.clearTimeout(timerId);
+    }
+    timerId = 0;
+  };
+
+  const entryAge = (entry, now = terminalRenderNow()) => {
+    const queuedAt = Number(entry.getQueuedAt?.() || 0);
+    return queuedAt > 0 ? Math.max(0, now - queuedAt) : 0;
+  };
+
+  const entryBytes = (entry) => Math.max(0, Number(entry.getPendingBytes?.() || 0));
+
+  const isEntryActive = (entry) => Boolean(entry.isActive?.());
+
+  const isEntryDue = (entry, now = terminalRenderNow()) => {
+    if (!entry.hasPending?.()) {
+      return false;
+    }
+
+    const age = entryAge(entry, now);
+    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      return true;
+    }
+
+    if (isEntryActive(entry)) {
+      return age >= 0;
+    }
+
+    return age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+  };
+
+  const nextDelayMs = (now = terminalRenderNow()) => {
+    let delay = null;
+
+    entries.forEach((entry) => {
+      if (!entry.hasPending?.()) {
+        return;
+      }
+
+      if (isEntryActive(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+        delay = 0;
+        return;
+      }
+
+      const age = entryAge(entry, now);
+      const remaining = Math.max(0, TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS - age);
+      delay = delay == null ? remaining : Math.min(delay, remaining);
+    });
+
+    return delay;
+  };
+
+  const scheduleFrame = () => {
+    if (!hasWindow() || rafId) {
+      return;
+    }
+
+    rafId = window.requestAnimationFrame(() => {
+      rafId = 0;
+      flushFrame();
+    });
+  };
+
+  const scheduleTimer = () => {
+    if (!hasWindow() || rafId) {
+      return;
+    }
+
+    const delay = nextDelayMs();
+    if (delay == null) {
+      clearTimer();
+      return;
+    }
+
+    if (delay <= 0) {
+      clearTimer();
+      scheduleFrame();
+      return;
+    }
+
+    clearTimer();
+    timerId = window.setTimeout(() => {
+      timerId = 0;
+      scheduleFrame();
+    }, Math.min(delay, TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS));
+  };
+
+  const scheduleNext = () => {
+    const delay = nextDelayMs();
+    if (delay == null) {
+      clearTimer();
+      return;
+    }
+
+    if (delay <= 0) {
+      clearTimer();
+      scheduleFrame();
+      return;
+    }
+
+    scheduleTimer();
+  };
+
+  const compareEntries = (now) => (left, right) => {
+    const leftActive = isEntryActive(left);
+    const rightActive = isEntryActive(right);
+    if (leftActive !== rightActive) {
+      return leftActive ? -1 : 1;
+    }
+
+    const leftAge = entryAge(left, now);
+    const rightAge = entryAge(right, now);
+    const leftOverdue = leftAge >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+    const rightOverdue = rightAge >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+    if (leftOverdue !== rightOverdue) {
+      return leftOverdue ? -1 : 1;
+    }
+
+    const leftBytes = entryBytes(left);
+    const rightBytes = entryBytes(right);
+    if (leftBytes !== rightBytes) {
+      return rightBytes - leftBytes;
+    }
+
+    return rightAge - leftAge;
+  };
+
+  const flushReasonForEntry = (entry, now) => {
+    const age = entryAge(entry, now);
+    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      return "global_max_bytes_frame";
+    }
+    if (isEntryActive(entry)) {
+      return "global_active_frame";
+    }
+    if (age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS) {
+      return "global_background_max_latency_frame";
+    }
+    return "global_background_frame";
+  };
+
+  const flushFrame = () => {
+    const frameStartedAt = terminalRenderNow();
+    const candidates = Array.from(entries.values())
+      .filter((entry) => isEntryDue(entry, frameStartedAt))
+      .sort(compareEntries(frameStartedAt));
+
+    let flushed = 0;
+    let activeFlushed = 0;
+    let backgroundFlushed = 0;
+    let deferred = 0;
+    let bytes = 0;
+
+    frameId += 1;
+
+    for (const entry of candidates) {
+      const active = isEntryActive(entry);
+      const age = entryAge(entry, frameStartedAt);
+      const starved = age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+      const elapsedMs = terminalRenderNow() - frameStartedAt;
+      const reachedPaneBudget = flushed >= TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME;
+      const reachedBackgroundBudget = !active
+        && backgroundFlushed >= TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME
+        && !starved;
+      const reachedTimeBudget = !active
+        && flushed > 0
+        && elapsedMs >= TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS
+        && !starved;
+
+      if (reachedPaneBudget || reachedBackgroundBudget || reachedTimeBudget) {
+        deferred += 1;
+        continue;
+      }
+
+      const entryPendingBytes = entryBytes(entry);
+      bytes += entryPendingBytes;
+      entry.flush(flushReasonForEntry(entry, frameStartedAt));
+      flushed += 1;
+      if (active) {
+        activeFlushed += 1;
+      } else {
+        backgroundFlushed += 1;
+      }
+    }
+
+    const elapsedMs = terminalRenderNow() - frameStartedAt;
+    logTerminalDiagnosticEvent(
+      "frontend.global_render_frame",
+      {
+        activeFlushed,
+        backgroundFlushed,
+        bytes,
+        candidates: candidates.length,
+        deferred,
+        elapsedMs,
+        frameId,
+        flushed,
+        registered: entries.size,
+      },
+      { minElapsedMs: TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS },
+    );
+
+    scheduleNext();
+  };
+
+  return {
+    cancel() {
+      scheduleNext();
+    },
+    register(entry) {
+      if (!entry?.id) {
+        return;
+      }
+      entries.set(entry.id, entry);
+      scheduleNext();
+    },
+    request(id) {
+      const entry = entries.get(id);
+      if (!entry?.hasPending?.()) {
+        scheduleNext();
+        return;
+      }
+      if (isEntryActive(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+        clearTimer();
+        scheduleFrame();
+      } else {
+        scheduleTimer();
+      }
+    },
+    unregister(id) {
+      entries.delete(id);
+      scheduleNext();
+    },
+  };
+})();
 
 const TODO_DROP_OVERLAY_STYLE = {
   position: "absolute",
@@ -1723,9 +1980,8 @@ function WorkspaceTerminal({
     const resizeWriteBarrierQueue = [];
     const pendingOutputWrites = [];
     let pendingOutputBytes = 0;
-    let outputBatchRafId = 0;
-    let outputBatchTimeoutId = 0;
     let outputBatchQueuedAt = 0;
+    let outputWriteInFlight = false;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
     let outputBytes = 0;
@@ -1756,6 +2012,7 @@ function WorkspaceTerminal({
     const disposables = [];
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
+    const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
     terminalInstanceIdRef.current = terminalInstanceId;
     if (terminalActiveRef.current) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceId);
@@ -2368,14 +2625,7 @@ function WorkspaceTerminal({
     };
 
     const cancelTerminalOutputBatchTimers = () => {
-      if (outputBatchRafId) {
-        window.cancelAnimationFrame(outputBatchRafId);
-        outputBatchRafId = 0;
-      }
-      if (outputBatchTimeoutId) {
-        window.clearTimeout(outputBatchTimeoutId);
-        outputBatchTimeoutId = 0;
-      }
+      terminalGlobalRenderScheduler.cancel(renderSchedulerId);
     };
 
     const combineTerminalOutputWrites = (writes) => {
@@ -2398,6 +2648,11 @@ function WorkspaceTerminal({
         pendingOutputWrites.length = 0;
         pendingOutputBytes = 0;
         outputBatchQueuedAt = 0;
+        return;
+      }
+
+      if (outputWriteInFlight) {
+        scheduleTerminalOutputBatchFlush();
         return;
       }
 
@@ -2445,7 +2700,9 @@ function WorkspaceTerminal({
       }
 
       const writeStartedAt = performance.now();
-      terminal.write(batchData, () => {
+      outputWriteInFlight = true;
+      const handleTerminalWriteComplete = () => {
+        outputWriteInFlight = false;
         const writeCallbackMs = performance.now() - writeStartedAt;
         const elapsedMs = performance.now() - flushStartedAt;
         if (terminalDiagnosticsEnabled) {
@@ -2482,6 +2739,10 @@ function WorkspaceTerminal({
           return;
         }
 
+        if (pendingOutputWrites.length) {
+          scheduleTerminalOutputBatchFlush();
+        }
+
         updateTerminalScrollbarOverflow();
         scheduleTerminalScrollbarRefresh([40, 160]);
 
@@ -2505,24 +2766,40 @@ function WorkspaceTerminal({
 
         if (shouldLogWrite) {
         }
-      });
+      };
+
+      try {
+        terminal.write(batchData, handleTerminalWriteComplete);
+      } catch (error) {
+        outputWriteInFlight = false;
+        logTerminalDiagnosticEvent("frontend.output_write.error", {
+          batchBytes,
+          message: error?.message || String(error || "terminal write failed"),
+          paneId,
+          reason,
+          rendererMode,
+          terminalIndex,
+          writes: writes.length,
+        });
+        if (pendingOutputWrites.length) {
+          scheduleTerminalOutputBatchFlush();
+        }
+      }
     };
 
     const scheduleTerminalOutputBatchFlush = () => {
-      if (!outputBatchRafId) {
-        outputBatchRafId = window.requestAnimationFrame(() => {
-          outputBatchRafId = 0;
-          flushTerminalOutputBatch("animation_frame");
-        });
-      }
-
-      if (!outputBatchTimeoutId) {
-        outputBatchTimeoutId = window.setTimeout(() => {
-          outputBatchTimeoutId = 0;
-          flushTerminalOutputBatch("max_latency");
-        }, TERMINAL_OUTPUT_BATCH_MAX_MS);
-      }
+      terminalGlobalRenderScheduler.request(renderSchedulerId);
     };
+
+    terminalGlobalRenderScheduler.register({
+      flush: (reason) => flushTerminalOutputBatch(reason),
+      getPendingBytes: () => pendingOutputBytes,
+      getQueuedAt: () => outputBatchQueuedAt,
+      hasPending: () => !isDisposed && !outputWriteInFlight && pendingOutputWrites.length > 0,
+      id: renderSchedulerId,
+      isActive: () => terminalActiveRef.current,
+    });
+    disposables.push(() => terminalGlobalRenderScheduler.unregister(renderSchedulerId));
 
     const writeTerminalOutput = (data, options = {}) => {
       if (isDisposed || !data?.byteLength) {
@@ -2566,7 +2843,7 @@ function WorkspaceTerminal({
       pendingOutputBytes += queuedData.byteLength;
 
       if (pendingOutputBytes >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
-        flushTerminalOutputBatch("max_bytes");
+        scheduleTerminalOutputBatchFlush();
         return;
       }
 
@@ -2578,7 +2855,7 @@ function WorkspaceTerminal({
         return;
       }
 
-      flushTerminalOutputBatch("resize_barrier_start");
+      scheduleTerminalOutputBatchFlush();
       resizeWriteBarrierActive = true;
       resizeWriteBarrierStartedAt = performance.now();
       resizeWriteBarrierReason = event?.reason || "resize";

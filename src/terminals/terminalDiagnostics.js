@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = true;
+export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
 
 const TERMINAL_DIAGNOSTIC_STORAGE_KEY = "diffforge.terminalDiagnostics";
 const TERMINAL_DIAGNOSTIC_HEARTBEAT_MS = 100;
