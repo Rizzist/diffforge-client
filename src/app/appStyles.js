@@ -2066,7 +2066,7 @@ export const ResizePanel = styled(Panel)`
 
 export const ResizeHandle = styled(Separator)`
   position: relative;
-  z-index: 5;
+  z-index: 48;
   flex: 0 0 auto;
   background: rgba(255, 255, 255, 0.08);
   transition:
@@ -2074,15 +2074,21 @@ export const ResizeHandle = styled(Separator)`
     box-shadow 140ms ease;
 
   &[data-direction="horizontal"] {
-    width: 5px;
-    margin: 0 -2px;
+    width: 9px;
+    margin: 0 -4px;
     cursor: col-resize;
   }
 
   &[data-direction="vertical"] {
-    height: 5px;
-    margin: -2px 0;
+    height: 9px;
+    margin: -4px 0;
     cursor: row-resize;
+  }
+
+  ${WorkspaceTerminalPanels}[data-terminal-dragging="true"] &,
+  ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
+    opacity: 0;
+    pointer-events: none;
   }
 
   &::after {
@@ -2093,14 +2099,14 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-direction="horizontal"]::after {
-    left: 2px;
-    right: 2px;
+    left: 4px;
+    right: 4px;
     background: rgba(255, 255, 255, 0.1);
   }
 
   &[data-direction="vertical"]::after {
-    top: 2px;
-    bottom: 2px;
+    top: 4px;
+    bottom: 4px;
     background: rgba(255, 255, 255, 0.1);
   }
 
@@ -6841,19 +6847,21 @@ export const TerminalRestartMenu = styled.div`
 
 export const TerminalRestartDropdown = styled.div`
   position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  top: calc(100% + 5px);
+  left: 50%;
   z-index: 60;
-  display: grid;
-  min-width: 168px;
-  gap: 3px;
-  padding: 5px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
-    rgba(7, 9, 13, 0.98);
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42);
+  display: inline-flex;
+  width: max-content;
+  max-width: min(220px, calc(100vw - 24px));
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(65, 71, 82, 0.72);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+  transform: translateX(-50%);
+  backdrop-filter: blur(10px);
 
   &[data-open="false"] {
     display: none;
@@ -6861,67 +6869,87 @@ export const TerminalRestartDropdown = styled.div`
 `;
 
 export const TerminalRestartOption = styled.button`
-  display: flex;
-  min-width: 0;
+  --terminal-option-accent: rgba(255, 255, 255, 0.72);
+
+  position: relative;
+  display: inline-flex;
+  width: 28px;
+  height: 22px;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 7px 8px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--forge-text-soft);
+  justify-content: center;
+  flex: 0 0 auto;
+  gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.82);
   background: transparent;
-  text-align: left;
+  cursor: pointer;
   transition:
-    background 150ms ease,
-    border-color 150ms ease,
-    color 150ms ease;
+    color 150ms ease,
+    opacity 150ms ease,
+    transform 150ms ease;
 
   strong {
-    min-width: 0;
+    position: absolute;
+    width: 1px;
+    height: 1px;
     overflow: hidden;
-    font-size: 11px;
-    font-weight: 820;
-    text-overflow: ellipsis;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
     white-space: nowrap;
   }
 
   span {
-    flex: 0 0 auto;
-    color: var(--forge-text-muted);
-    font-size: 10px;
+    color: currentColor;
+    font-size: 9px;
     font-weight: 900;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
+    line-height: 1;
   }
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(98, 160, 255, 0.22);
     color: #fff;
-    background: rgba(98, 160, 255, 0.1);
+    transform: translateY(-1px);
     outline: none;
   }
 
-  &[data-role="claude"]:hover,
-  &[data-role="claude"]:focus-visible {
-    border-color: rgba(255, 154, 61, 0.26);
-    background: rgba(255, 122, 24, 0.11);
+  &::after {
+    position: absolute;
+    right: 5px;
+    bottom: 3px;
+    left: 5px;
+    height: 1px;
+    border-radius: 999px;
+    background: var(--terminal-option-accent);
+    opacity: 0;
+    content: "";
+    transition: opacity 150ms ease;
   }
 
-  &[data-role="generic"]:hover,
-  &[data-role="generic"]:focus-visible {
-    border-color: rgba(143, 157, 183, 0.24);
-    background: rgba(143, 157, 183, 0.1);
+  &[data-role="codex"] {
+    --terminal-option-accent: #62a0ff;
   }
 
-  &[data-role="opencode"]:hover,
-  &[data-role="opencode"]:focus-visible {
-    border-color: rgba(67, 229, 176, 0.26);
-    background: rgba(37, 211, 154, 0.1);
+  &[data-role="claude"] {
+    --terminal-option-accent: #ff9d48;
   }
 
-  &[data-selected="true"] span {
-    color: var(--forge-blue-soft);
+  &[data-role="opencode"] {
+    --terminal-option-accent: #3ccb7f;
+  }
+
+  &[data-role="generic"] {
+    --terminal-option-accent: #d0d7e6;
+  }
+
+  &[data-selected="true"] {
+    color: #fff;
+  }
+
+  &[data-selected="true"]::after {
+    opacity: 0.95;
   }
 `;
 

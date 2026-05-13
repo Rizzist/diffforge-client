@@ -110,6 +110,235 @@ const TerminalSurfaceSlot = styled.div`
   }
 `;
 
+const TODO_QUEUE_DRAG_MIME = "application/x-diffforge-todo";
+const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
+const TODO_QUEUE_VISIBLE_MIN_WIDTH = 1120;
+const TODO_QUEUE_MAX_ITEMS = 120;
+const TODO_QUEUE_MAX_TEXT_LENGTH = 4000;
+
+const TodoQueueSurface = styled.aside`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  color: #e8eef8;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
+    rgba(5, 8, 13, 0.96);
+  overflow: hidden;
+`;
+
+const TodoQueueComposer = styled.form`
+  display: grid;
+  gap: 8px;
+`;
+
+const TodoQueueHeader = styled.div`
+  display: grid;
+  gap: 3px;
+
+  strong {
+    color: #f7fafc;
+    font-size: 13px;
+    font-weight: 850;
+    letter-spacing: 0.01em;
+  }
+
+  span {
+    color: #8996a8;
+    font-size: 11px;
+    font-weight: 680;
+    line-height: 1.4;
+  }
+`;
+
+const TodoQueueTextArea = styled.textarea`
+  width: 100%;
+  min-height: 118px;
+  max-height: 220px;
+  resize: vertical;
+  padding: 11px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 8px;
+  color: #f7fafc;
+  background: rgba(2, 4, 8, 0.76);
+  font: 12px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  outline: none;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    background 150ms ease;
+
+  &::placeholder {
+    color: rgba(166, 178, 194, 0.58);
+  }
+
+  &:focus {
+    border-color: rgba(98, 160, 255, 0.46);
+    background: rgba(2, 5, 10, 0.94);
+    box-shadow:
+      0 0 0 1px rgba(98, 160, 255, 0.12),
+      0 0 22px rgba(47, 128, 255, 0.08);
+  }
+`;
+
+const TodoQueueSubmitRow = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+`;
+
+const TodoQueueHint = styled.span`
+  min-width: 0;
+  color: #778397;
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.35;
+`;
+
+const TodoQueueSubmitButton = styled.button`
+  display: inline-flex;
+  min-height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0 11px;
+  border: 1px solid rgba(98, 160, 255, 0.28);
+  border-radius: 7px;
+  color: #f7fafc;
+  background: rgba(47, 128, 255, 0.14);
+  font-size: 11px;
+  font-weight: 820;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    opacity 150ms ease;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(98, 160, 255, 0.5);
+    background: rgba(47, 128, 255, 0.22);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.48;
+  }
+`;
+
+const TodoQueueListWrap = styled.div`
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(230, 236, 245, 0.08);
+`;
+
+const TodoQueueListTopline = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #8996a8;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+`;
+
+const TodoQueueList = styled.div`
+  display: grid;
+  min-height: 0;
+  align-content: start;
+  gap: 7px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
+`;
+
+const TodoQueueItemCard = styled.article`
+  position: relative;
+  display: grid;
+  gap: 8px;
+  padding: 10px 34px 10px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 8px;
+  color: #eef4fb;
+  background: rgba(13, 17, 23, 0.72);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  cursor: grab;
+
+  &:hover {
+    border-color: rgba(98, 160, 255, 0.26);
+    background:
+      linear-gradient(90deg, rgba(47, 128, 255, 0.09), rgba(255, 122, 24, 0.035)),
+      rgba(13, 17, 23, 0.86);
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+`;
+
+const TodoQueueItemText = styled.p`
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #edf5ff;
+  font-size: 12px;
+  font-weight: 690;
+  line-height: 1.45;
+`;
+
+const TodoQueueItemMeta = styled.span`
+  color: #748198;
+  font-size: 10px;
+  font-weight: 760;
+`;
+
+const TodoQueueRemoveButton = styled.button`
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #8996a8;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 900;
+
+  &:hover {
+    border-color: rgba(239, 107, 107, 0.24);
+    color: #ffd0d0;
+    background: rgba(239, 107, 107, 0.08);
+  }
+`;
+
+const TodoQueueEmpty = styled.div`
+  display: grid;
+  min-height: 120px;
+  place-items: center;
+  padding: 18px;
+  border: 1px dashed rgba(230, 236, 245, 0.12);
+  border-radius: 8px;
+  color: #778397;
+  background: rgba(2, 4, 8, 0.3);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.45;
+  text-align: center;
+`;
+
 const TERMINAL_PANEL_ANCHOR_SELECTOR = "[data-terminal-panel-anchor='true']";
 
 function normalizeViewTerminalRows(rows) {
@@ -386,6 +615,204 @@ function areRectsEqual(leftRect, rightRect) {
     && Math.abs(leftRect.height - rightRect.height) < 0.5;
 }
 
+function canUseTodoQueueStorage() {
+  try {
+    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+  } catch {
+    return false;
+  }
+}
+
+function getTodoQueueStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+
+  return `${TODO_QUEUE_STORAGE_PREFIX}.${safeWorkspaceId}`;
+}
+
+function normalizeTodoQueueText(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim()
+    .slice(0, TODO_QUEUE_MAX_TEXT_LENGTH);
+}
+
+function createTodoQueueItem(text) {
+  const createdAt = new Date().toISOString();
+  const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  return {
+    createdAt,
+    id,
+    text,
+  };
+}
+
+function normalizeTodoQueueItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const text = normalizeTodoQueueText(item.text);
+  if (!text) {
+    return null;
+  }
+
+  return {
+    createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+    id: typeof item.id === "string" && item.id.trim()
+      ? item.id
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    text,
+  };
+}
+
+function normalizeTodoQueueItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .map(normalizeTodoQueueItem)
+    .filter(Boolean)
+    .slice(0, TODO_QUEUE_MAX_ITEMS);
+}
+
+function readTodoQueueItems(storageKey) {
+  if (!canUseTodoQueueStorage()) {
+    return [];
+  }
+
+  try {
+    return normalizeTodoQueueItems(JSON.parse(window.localStorage.getItem(storageKey) || "[]"));
+  } catch {
+    return [];
+  }
+}
+
+function writeTodoQueueItems(storageKey, items) {
+  if (!canUseTodoQueueStorage()) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(normalizeTodoQueueItems(items)));
+  } catch {
+    // The queue is a convenience layer; storage failures should not interrupt terminal work.
+  }
+}
+
+function formatTodoQueueCreatedAt(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "queued";
+  }
+
+  return date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+const TodoQueuePanel = memo(function TodoQueuePanel({
+  draft,
+  items,
+  onDraftChange,
+  onRemoveItem,
+  onSubmitDraft,
+  workspaceId,
+}) {
+  const handleDraftKeyDown = useCallback((event) => {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+
+    event.preventDefault();
+    onSubmitDraft();
+  }, [onSubmitDraft]);
+
+  const handleSubmit = useCallback((event) => {
+    event.preventDefault();
+    onSubmitDraft();
+  }, [onSubmitDraft]);
+
+  const handleDragStart = useCallback((event, item) => {
+    const text = normalizeTodoQueueText(item?.text);
+    if (!text) {
+      event.preventDefault();
+      return;
+    }
+
+    event.dataTransfer.effectAllowed = "copy";
+    event.dataTransfer.setData("text/plain", text);
+    event.dataTransfer.setData(TODO_QUEUE_DRAG_MIME, JSON.stringify({
+      id: item.id,
+      source: "todo-queue",
+      text,
+      workspaceId,
+    }));
+  }, [workspaceId]);
+
+  return (
+    <TodoQueueSurface aria-label="To Do Queue">
+      <TodoQueueComposer onSubmit={handleSubmit}>
+        <TodoQueueHeader>
+          <strong>To Do Queue</strong>
+          <span>Type like a note. Enter queues it. Shift+Enter adds a line.</span>
+        </TodoQueueHeader>
+        <TodoQueueTextArea
+          aria-label="New todo"
+          maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+          onChange={(event) => onDraftChange(event.target.value)}
+          onKeyDown={handleDraftKeyDown}
+          placeholder="Ask an agent to do something..."
+          spellCheck="true"
+          value={draft}
+        />
+        <TodoQueueSubmitRow>
+          <TodoQueueHint>Click here first, then use your audio widget if you want dictation.</TodoQueueHint>
+          <TodoQueueSubmitButton disabled={!normalizeTodoQueueText(draft)} type="submit">
+            Add
+          </TodoQueueSubmitButton>
+        </TodoQueueSubmitRow>
+      </TodoQueueComposer>
+
+      <TodoQueueListWrap>
+        <TodoQueueListTopline>
+          <span>Queue</span>
+          <span>{items.length}</span>
+        </TodoQueueListTopline>
+        <TodoQueueList role="list">
+          {items.length ? items.map((item) => (
+            <TodoQueueItemCard
+              draggable
+              key={item.id}
+              onDragStart={(event) => handleDragStart(event, item)}
+              role="listitem"
+              title="Drag into an agent terminal"
+            >
+              <TodoQueueItemText>{item.text}</TodoQueueItemText>
+              <TodoQueueItemMeta>{formatTodoQueueCreatedAt(item.createdAt)}</TodoQueueItemMeta>
+              <TodoQueueRemoveButton
+                aria-label="Remove todo"
+                onClick={() => onRemoveItem(item.id)}
+                title="Remove"
+                type="button"
+              >
+                x
+              </TodoQueueRemoveButton>
+            </TodoQueueItemCard>
+          )) : (
+            <TodoQueueEmpty>
+              Queued todos will live here. Drag one into an agent terminal when you are ready.
+            </TodoQueueEmpty>
+          )}
+        </TodoQueueList>
+      </TodoQueueListWrap>
+    </TodoQueueSurface>
+  );
+});
+
 function TerminalView({
   terminalWorkspace,
   terminalAgentsByIndex = {},
@@ -423,9 +850,6 @@ function TerminalView({
   const displayTerminalRows = Array.isArray(terminalDisplayRows)
     ? terminalDisplayRows
     : [];
-  const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
-  const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
-  const terminalDragActive = Boolean(terminalDragState);
   const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && displayTerminalRows.length > 0;
   const [activeTerminalPaneId, setActiveTerminalPaneId] = useState("");
   const [fullscreenTerminalIndex, setFullscreenTerminalIndex] = useState(null);
@@ -433,12 +857,25 @@ function TerminalView({
   const [terminalLayoutRects, setTerminalLayoutRects] = useState({});
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
   const [terminalDragState, setTerminalDragState] = useState(null);
+  const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
+  const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
+  const terminalDragActive = Boolean(terminalDragState);
+  const [todoQueueDraft, setTodoQueueDraft] = useState("");
+  const [todoQueueItems, setTodoQueueItems] = useState([]);
+  const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const fullscreenTransitionTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
   const terminalDragStateRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
   const terminalPanelRectRef = useRef(null);
+  const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
+  const todoQueueStorageKeyRef = useRef("");
+  const todoQueueStorageKey = useMemo(
+    () => getTodoQueueStorageKey(terminalWorkspace?.id),
+    [terminalWorkspace?.id],
+  );
+  todoQueueStorageKeyRef.current = todoQueueStorageKey;
   const getTerminalAgent = useCallback((terminalIndex) => (
     Object.prototype.hasOwnProperty.call(terminalAgentsByIndex, terminalIndex)
       ? terminalAgentsByIndex[terminalIndex]
@@ -564,6 +1001,37 @@ function TerminalView({
     }
   }, [clearFullscreenTransitionTimer]);
 
+  useEffect(() => {
+    setTodoQueueItems(readTodoQueueItems(todoQueueStorageKey));
+    setTodoQueueDraft("");
+  }, [todoQueueStorageKey]);
+
+  useEffect(() => {
+    const element = terminalWorkspaceMainRef.current;
+    if (!element) {
+      return undefined;
+    }
+
+    const updateWidth = () => {
+      const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
+      setTerminalWorkspaceMainWidth((currentWidth) => (
+        currentWidth === nextWidth ? currentWidth : nextWidth
+      ));
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateWidth);
+      return () => window.removeEventListener("resize", updateWidth);
+    }
+
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, [shouldShowWorkspaceSetup]);
+
   useLayoutEffect(() => {
     measureTerminalLayout();
   }, [activeDisplayRowsSignature, fullscreenActive, measureTerminalLayout]);
@@ -627,6 +1095,35 @@ function TerminalView({
       workspaceId: terminalWorkspace?.id || "",
     });
   }, [splitWorkspaceTerminal, terminalWorkspace?.id]);
+
+  const updateTodoQueueItems = useCallback((updater) => {
+    setTodoQueueItems((currentItems) => {
+      const nextItems = normalizeTodoQueueItems(
+        typeof updater === "function" ? updater(currentItems) : updater,
+      );
+      writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
+      return nextItems;
+    });
+  }, []);
+
+  const submitTodoQueueDraft = useCallback(() => {
+    const text = normalizeTodoQueueText(todoQueueDraft);
+    if (!text) {
+      return;
+    }
+
+    updateTodoQueueItems((currentItems) => [
+      createTodoQueueItem(text),
+      ...currentItems,
+    ]);
+    setTodoQueueDraft("");
+  }, [todoQueueDraft, updateTodoQueueItems]);
+
+  const removeTodoQueueItem = useCallback((itemId) => {
+    updateTodoQueueItems((currentItems) => (
+      currentItems.filter((item) => item.id !== itemId)
+    ));
+  }, [updateTodoQueueItems]);
 
   const updateTerminalDragState = useCallback((updater) => {
     setTerminalDragState((currentState) => {
@@ -877,6 +1374,147 @@ function TerminalView({
     terminalPanelRect,
   ]);
 
+  const todoQueueVisible = Boolean(
+    hasVisibleWorkspaceTerminalPanes
+    && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
+  );
+  const terminalWorkspaceContent = hasVisibleWorkspaceTerminalPanes ? (
+    <WorkspaceTerminalPanels
+      data-terminal-dragging={terminalDragActive ? "true" : "false"}
+      data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
+      data-terminal-fullscreen-state={fullscreenState}
+      ref={terminalPanelsRef}
+      style={fullscreenMotionStyle}
+    >
+      <ResizePanelGroup
+        id={`workspace-terminal-rows-${terminalWorkspace.id}`}
+        orientation="vertical"
+      >
+        {activeDisplayRows.map((row, rowOrderIndex) => (
+          <Fragment key={`row-${row.rowIndex}`}>
+            {rowOrderIndex > 0 && (
+              <ResizeHandle
+                data-direction="vertical"
+              />
+            )}
+            <ResizePanel
+              data-terminal-row="true"
+              defaultSize={`${100 / activeDisplayRows.length}%`}
+              id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
+              minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
+            >
+              <ResizePanelGroup
+                id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
+                orientation="horizontal"
+              >
+                {row.terminalIndexes.map((terminalIndex, columnIndex) => (
+                  <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
+                    {columnIndex > 0 && (
+                      <ResizeHandle
+                        data-direction="horizontal"
+                      />
+                    )}
+                    <ResizePanel
+                      data-terminal-column="true"
+                      data-terminal-leaf="true"
+                      defaultSize={`${100 / row.terminalIndexes.length}%`}
+                      id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
+                      minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                    >
+                      <TerminalPanelAnchor
+                        data-terminal-drag-placeholder={
+                          terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
+                        }
+                        data-terminal-index={terminalIndex}
+                        data-terminal-panel-anchor="true"
+                      />
+                    </ResizePanel>
+                  </Fragment>
+                ))}
+              </ResizePanelGroup>
+            </ResizePanel>
+          </Fragment>
+        ))}
+      </ResizePanelGroup>
+      <TerminalSurfaceLayer aria-hidden={false}>
+        {logicalTerminalIndexes.map((terminalIndex) => {
+          const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
+          const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
+          const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
+            || draggingThisTerminal
+            || fullscreenThisTerminal;
+
+          return (
+            <TerminalSurfaceSlot
+              data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
+              data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
+              data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
+              key={`${terminalWorkspace.id}-${terminalIndex}`}
+              style={getTerminalSlotStyle(terminalIndex)}
+            >
+              <WorkspaceTerminal
+                key={`${terminalWorkspace.id}-${terminalIndex}-${getTerminalRole(terminalIndex)}-${terminalWorkspaceWorkingDirectory || ""}`}
+                agent={getTerminalAgent(terminalIndex)}
+                agentLaunchEpoch={workspaceAgentLaunchEpoch}
+                agentLaunchReady={workspaceTerminalAgentLaunchReady}
+                agentStatuses={agentStatuses}
+                agentStatusError={agentStatusError}
+                agentStatusState={agentStatusState}
+                fullscreenState={fullscreenState}
+                isActive={activePaneId === getTerminalPaneId(terminalIndex)}
+                isFullscreen={fullscreenThisTerminal}
+                onActivateTerminal={handleActivateTerminalPane}
+                onBeginTerminalDrag={handleBeginTerminalDrag}
+                onChangeTerminalRole={changeWorkspaceTerminalRole}
+                onCloseTerminal={closeWorkspaceTerminal}
+                onOpenSettings={showSettingsView}
+                onPreparedTerminalChange={handlePreparedTerminalChange}
+                onRecheckAgents={refreshAgentStatuses}
+                onSplitTerminal={handleSplitTerminal}
+                onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
+                prewarmShell={shouldPrewarmWorkspaceTerminals}
+                terminalCount={terminalWorkspaceLogicalTerminalCount}
+                terminalIndex={terminalIndex}
+                terminalRole={getTerminalRole(terminalIndex)}
+                workingDirectory={terminalWorkspaceWorkingDirectory}
+                workspace={terminalWorkspace}
+                workspaceError={workspaceError}
+              />
+            </TerminalSurfaceSlot>
+          );
+        })}
+      </TerminalSurfaceLayer>
+    </WorkspaceTerminalPanels>
+  ) : !hasWorkspaceTerminals ? (
+    <WorkspaceTerminal
+      key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}-${getTerminalRole(logicalTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
+      agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
+      agentLaunchEpoch={workspaceAgentLaunchEpoch}
+      agentLaunchReady={workspaceTerminalAgentLaunchReady}
+      agentStatuses={agentStatuses}
+      agentStatusError={agentStatusError}
+      agentStatusState={agentStatusState}
+      fullscreenState="idle"
+      isActive={activePaneId === getTerminalPaneId(logicalTerminalIndexes[0] || 0)}
+      isFullscreen={false}
+      onActivateTerminal={handleActivateTerminalPane}
+      onChangeTerminalRole={changeWorkspaceTerminalRole}
+      onCloseTerminal={closeWorkspaceTerminal}
+      onOpenSettings={showSettingsView}
+      onPreparedTerminalChange={handlePreparedTerminalChange}
+      onRecheckAgents={refreshAgentStatuses}
+      onSplitTerminal={handleSplitTerminal}
+      onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
+      prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
+      terminalCount={terminalWorkspaceLogicalTerminalCount}
+      terminalIndex={logicalTerminalIndexes[0] || 0}
+      terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
+      workingDirectory={terminalWorkspaceWorkingDirectory}
+      workspace={terminalWorkspace}
+      workspaceError={workspaceError}
+    />
+  ) : null;
+
   return (
     <ForgeWorkspace aria-label="Forge workspace" data-motion={viewMotion}>
       {shouldShowWorkspaceSetup ? (
@@ -902,143 +1540,41 @@ function TerminalView({
           </PrimaryButton>
         </WorkspaceSetupPanel>
       ) : (
-          <TerminalWorkspaceMain>
+          <TerminalWorkspaceMain ref={terminalWorkspaceMainRef}>
             {hasVisibleWorkspaceTerminalPanes ? (
-              <WorkspaceTerminalPanels
-                data-terminal-dragging={terminalDragActive ? "true" : "false"}
-                data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
-                data-terminal-fullscreen-state={fullscreenState}
-                ref={terminalPanelsRef}
-                style={fullscreenMotionStyle}
+              <ResizePanelGroup
+                id={`workspace-terminal-main-${terminalWorkspace.id}`}
+                orientation="horizontal"
               >
-                <ResizePanelGroup
-                  id={`workspace-terminal-rows-${terminalWorkspace.id}`}
-                  orientation="vertical"
+                <ResizePanel
+                  defaultSize={todoQueueVisible ? "76%" : "100%"}
+                  id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
+                  minSize={todoQueueVisible ? "54%" : "100%"}
                 >
-                  {activeDisplayRows.map((row, rowOrderIndex) => (
-                    <Fragment key={`row-${row.rowIndex}`}>
-                      {rowOrderIndex > 0 && (
-                        <ResizeHandle
-                          data-direction="vertical"
-                        />
-                      )}
-                      <ResizePanel
-                        data-terminal-row="true"
-                        defaultSize={`${100 / activeDisplayRows.length}%`}
-                        id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
-                        minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
-                      >
-                        <ResizePanelGroup
-                          id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
-                          orientation="horizontal"
-                        >
-                          {row.terminalIndexes.map((terminalIndex, columnIndex) => (
-                            <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
-                              {columnIndex > 0 && (
-                                <ResizeHandle
-                                  data-direction="horizontal"
-                                />
-                              )}
-                              <ResizePanel
-                                data-terminal-column="true"
-                                data-terminal-leaf="true"
-                                defaultSize={`${100 / row.terminalIndexes.length}%`}
-                                id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
-                                minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                              >
-                                <TerminalPanelAnchor
-                                  data-terminal-drag-placeholder={
-                                    terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
-                                  }
-                                  data-terminal-index={terminalIndex}
-                                  data-terminal-panel-anchor="true"
-                                />
-                              </ResizePanel>
-                            </Fragment>
-                          ))}
-                        </ResizePanelGroup>
-                      </ResizePanel>
-                    </Fragment>
-                  ))}
-                </ResizePanelGroup>
-                <TerminalSurfaceLayer aria-hidden={false}>
-                  {logicalTerminalIndexes.map((terminalIndex) => {
-                    const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
-                    const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
-                    const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
-                      || draggingThisTerminal
-                      || fullscreenThisTerminal;
-
-                    return (
-                      <TerminalSurfaceSlot
-                        data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
-                        data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                        data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
-                        key={`${terminalWorkspace.id}-${terminalIndex}`}
-                        style={getTerminalSlotStyle(terminalIndex)}
-                      >
-                        <WorkspaceTerminal
-                          key={`${terminalWorkspace.id}-${terminalIndex}-${getTerminalRole(terminalIndex)}-${terminalWorkspaceWorkingDirectory || ""}`}
-                          agent={getTerminalAgent(terminalIndex)}
-                          agentLaunchEpoch={workspaceAgentLaunchEpoch}
-                          agentLaunchReady={workspaceTerminalAgentLaunchReady}
-                          agentStatuses={agentStatuses}
-                          agentStatusError={agentStatusError}
-                          agentStatusState={agentStatusState}
-                          fullscreenState={fullscreenState}
-                          isActive={activePaneId === getTerminalPaneId(terminalIndex)}
-                          isFullscreen={fullscreenThisTerminal}
-                          onActivateTerminal={handleActivateTerminalPane}
-                          onBeginTerminalDrag={handleBeginTerminalDrag}
-                          onChangeTerminalRole={changeWorkspaceTerminalRole}
-                          onCloseTerminal={closeWorkspaceTerminal}
-                          onOpenSettings={showSettingsView}
-                          onPreparedTerminalChange={handlePreparedTerminalChange}
-                          onRecheckAgents={refreshAgentStatuses}
-                          onSplitTerminal={handleSplitTerminal}
-                          onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
-                          prewarmShell={shouldPrewarmWorkspaceTerminals}
-                          terminalCount={terminalWorkspaceLogicalTerminalCount}
-                          terminalIndex={terminalIndex}
-                          terminalRole={getTerminalRole(terminalIndex)}
-                          workingDirectory={terminalWorkspaceWorkingDirectory}
-                          workspace={terminalWorkspace}
-                          workspaceError={workspaceError}
-                        />
-                      </TerminalSurfaceSlot>
-                    );
-                  })}
-                </TerminalSurfaceLayer>
-              </WorkspaceTerminalPanels>
-            ) : !hasWorkspaceTerminals ? (
-              <WorkspaceTerminal
-                key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}-${getTerminalRole(logicalTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
-                agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
-                agentLaunchEpoch={workspaceAgentLaunchEpoch}
-                agentLaunchReady={workspaceTerminalAgentLaunchReady}
-                agentStatuses={agentStatuses}
-                agentStatusError={agentStatusError}
-                agentStatusState={agentStatusState}
-                fullscreenState="idle"
-                isActive={activePaneId === getTerminalPaneId(logicalTerminalIndexes[0] || 0)}
-                isFullscreen={false}
-                onActivateTerminal={handleActivateTerminalPane}
-                onChangeTerminalRole={changeWorkspaceTerminalRole}
-                onCloseTerminal={closeWorkspaceTerminal}
-                onOpenSettings={showSettingsView}
-                onPreparedTerminalChange={handlePreparedTerminalChange}
-                onRecheckAgents={refreshAgentStatuses}
-                onSplitTerminal={handleSplitTerminal}
-                onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
-                prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-                terminalCount={terminalWorkspaceLogicalTerminalCount}
-                terminalIndex={logicalTerminalIndexes[0] || 0}
-                terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
-                workingDirectory={terminalWorkspaceWorkingDirectory}
-                workspace={terminalWorkspace}
-                workspaceError={workspaceError}
-              />
-            ) : null}
+                  {terminalWorkspaceContent}
+                </ResizePanel>
+                {todoQueueVisible && (
+                  <>
+                    <ResizeHandle data-direction="horizontal" />
+                    <ResizePanel
+                      defaultSize="24%"
+                      id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
+                      maxSize="36%"
+                      minSize="18%"
+                    >
+                      <TodoQueuePanel
+                        draft={todoQueueDraft}
+                        items={todoQueueItems}
+                        onDraftChange={setTodoQueueDraft}
+                        onRemoveItem={removeTodoQueueItem}
+                        onSubmitDraft={submitTodoQueueDraft}
+                        workspaceId={terminalWorkspace.id}
+                      />
+                    </ResizePanel>
+                  </>
+                )}
+              </ResizePanelGroup>
+            ) : terminalWorkspaceContent}
           </TerminalWorkspaceMain>
       )}
     </ForgeWorkspace>

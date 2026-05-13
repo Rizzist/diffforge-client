@@ -355,6 +355,7 @@ const TERMINAL_MIN_ROWS = 6;
 const TERMINAL_MAX_COLS = 400;
 const TERMINAL_MAX_ROWS = 160;
 const TERMINAL_ENABLE_WEBGL_RENDERER = false;
+const TERMINAL_START_LAYOUT_WAIT_MS = 4000;
 const TERMINAL_START_METRIC_WAIT_MS = 900;
 const TERMINAL_START_METRIC_POLL_MS = 16;
 const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
@@ -373,6 +374,10 @@ const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
 const TERMINAL_SCROLL_ANCHOR_SEARCH_RADIUS_ROWS = 180;
 const TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS = 360;
 const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
+const WINDOWS_TERMINAL_PURGE_STARTUP_GRACE_MS = 4500;
+const WINDOWS_TERMINAL_PURGE_RESIZE_GRACE_MS = 1600;
+const WINDOWS_TERMINAL_PURGE_CLEAR_GRACE_MS = 900;
+const WINDOWS_TERMINAL_PURGE_USER_SCROLL_PROTECT_MS = 6000;
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT = "forge-terminal-input";
@@ -702,7 +707,7 @@ function isWindowsTerminalHost() {
 }
 
 const TERMINAL_IS_WINDOWS_HOST = isWindowsTerminalHost();
-const TERMINAL_SCROLLBAR_PLATFORM = TERMINAL_IS_WINDOWS_HOST ? "native" : "overlay";
+const TERMINAL_SCROLLBAR_PLATFORM = "overlay";
 const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "codex", label: "Codex", shortLabel: "CX" },
   { id: "claude", label: "Claude Code", shortLabel: "CL" },
@@ -1406,6 +1411,10 @@ function getCsiParamValue(value) {
 
 function isEraseSavedLinesCsiParams(params) {
   return getCsiParamValue(Array.isArray(params) ? params[0] : undefined) === 3;
+}
+
+function isEraseAllDisplayCsiParams(params) {
+  return getCsiParamValue(Array.isArray(params) ? params[0] : undefined) === 2;
 }
 
 function clampTerminalLine(value, minimum, maximum) {
@@ -2237,30 +2246,120 @@ function WorkspaceTerminal({
     });
     xtermRef.current = terminal;
 
-    terminal.open(container);
     const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
     const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
     syncTerminalDiagnosticLogging();
     syncWindowsTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
-    logTerminalDiagnosticEvent("frontend.terminal_mount", {
-      ...getTerminalDiagnosticEnvironment(),
-      fontSize: 12,
-      isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
-      lineHeight: 1.22,
-      paneId,
-      rendererMode,
-      scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
-      scrollOnEraseInDisplay: TERMINAL_IS_WINDOWS_HOST,
-      scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
-      terminalIndex,
-      useWebglRenderer,
-      windowsPty: TERMINAL_IS_WINDOWS_HOST ? "conpty" : "",
-    });
-    const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+    let terminalScrollableElement = null;
+    let terminalRendererOpened = false;
+    const getTerminalOpenContainerMeasurement = () => {
+      const bounds = typeof container.getBoundingClientRect === "function"
+        ? container.getBoundingClientRect()
+        : null;
+      const containerHeight = Number(bounds?.height ?? container.clientHeight ?? 0);
+      const containerWidth = Number(bounds?.width ?? container.clientWidth ?? 0);
+
+      return {
+        clientHeight: Math.round(Number(container.clientHeight || 0)),
+        clientWidth: Math.round(Number(container.clientWidth || 0)),
+        containerHeight,
+        containerWidth,
+        ok: Number.isFinite(containerHeight)
+          && Number.isFinite(containerWidth)
+          && containerHeight >= 1
+          && containerWidth >= 1,
+      };
+    };
+    const openTerminalRenderer = (reason, fields = {}) => {
+      if (terminalRendererOpened) {
+        return true;
+      }
+
+      if (isDisposed) {
+        return false;
+      }
+
+      const measurement = getTerminalOpenContainerMeasurement();
+      if (!measurement.ok) {
+        return false;
+      }
+
+      terminal.open(container);
+      terminalRendererOpened = true;
+      terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+      logTerminalDiagnosticEvent("frontend.terminal_mount", {
+        ...getTerminalDiagnosticEnvironment(),
+        containerClientHeight: measurement.clientHeight,
+        containerClientWidth: measurement.clientWidth,
+        containerHeight: measurement.containerHeight,
+        containerWidth: measurement.containerWidth,
+        fontSize: 12,
+        isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
+        lineHeight: 1.22,
+        openAttempts: fields.attempts ?? null,
+        openReason: reason,
+        openWaitMs: fields.waitMs ?? null,
+        paneId,
+        rendererMode,
+        scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
+        scrollOnEraseInDisplay: TERMINAL_IS_WINDOWS_HOST,
+        scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
+        terminalIndex,
+        useWebglRenderer,
+        windowsPty: TERMINAL_IS_WINDOWS_HOST ? "conpty" : "",
+      });
+
+      return true;
+    };
+    const waitForTerminalRendererOpen = async (reason) => {
+      if (openTerminalRenderer(reason, { attempts: 1, waitMs: 0 })) {
+        return true;
+      }
+
+      const waitStartedAt = performance.now();
+      let attempts = 1;
+      const firstMeasurement = getTerminalOpenContainerMeasurement();
+      logTerminalDiagnosticEvent("frontend.terminal_mount_deferred", {
+        ...firstMeasurement,
+        paneId,
+        reason,
+        terminalIndex,
+      });
+      setPaneStage("starting", "Preparing Terminal", "Waiting for terminal layout.");
+
+      while (
+        !isDisposed
+        && performance.now() - waitStartedAt < TERMINAL_START_LAYOUT_WAIT_MS
+      ) {
+        await waitForStartupMetricPoll(TERMINAL_START_METRIC_POLL_MS);
+
+        if (isDisposed) {
+          return false;
+        }
+
+        attempts += 1;
+        if (
+          openTerminalRenderer(reason, {
+            attempts,
+            waitMs: performance.now() - waitStartedAt,
+          })
+        ) {
+          return true;
+        }
+      }
+
+      throw new Error("Terminal container was not visible before renderer startup.");
+    };
+    openTerminalRenderer("mount", { attempts: 1, waitMs: 0 });
     let terminalScrollDiagnosticLastAt = 0;
     let terminalScrollModeSignature = "";
     let terminalWheelDiagnosticCount = 0;
+    let windowsTerminalLastEraseAllAt = 0;
+    let windowsTerminalLastEraseAllSnapshot = null;
+    let windowsTerminalLastResizeAt = 0;
+    let windowsTerminalLastUserScrollAt = 0;
+    let windowsTerminalScrollOnEraseRestoreQueued = false;
     const logTerminalScrollDiagnostic = (phase, fields = {}, options = {}) => {
       if (!windowsTerminalDiagnosticsEnabled) {
         return;
@@ -2320,18 +2419,182 @@ function WorkspaceTerminal({
       );
     };
 
+    const getWindowsTerminalPurgeBufferSnapshot = () => {
+      const activeBuffer = terminal.buffer?.active;
+      const bufferType = activeBuffer?.type || "";
+      const baseY = Number(activeBuffer?.baseY || 0);
+      const viewportY = Number(activeBuffer?.viewportY || 0);
+      const bufferLength = Number(activeBuffer?.length || 0);
+      const rows = Math.max(1, Number(terminal.rows || 0));
+      const hasScrollback = bufferType !== "alternate" && (baseY > 0 || bufferLength > rows);
+
+      return {
+        baseY,
+        bufferLength,
+        bufferType,
+        hasScrollback,
+        rows,
+        viewportY,
+      };
+    };
+
+    const temporarilyDisableWindowsScrollOnEraseInDisplay = () => {
+      if (!TERMINAL_IS_WINDOWS_HOST || terminal.options?.scrollOnEraseInDisplay !== true) {
+        return false;
+      }
+
+      terminal.options.scrollOnEraseInDisplay = false;
+
+      if (!windowsTerminalScrollOnEraseRestoreQueued) {
+        windowsTerminalScrollOnEraseRestoreQueued = true;
+        const restoreScrollOnErase = () => {
+          windowsTerminalScrollOnEraseRestoreQueued = false;
+          if (!isDisposed) {
+            terminal.options.scrollOnEraseInDisplay = true;
+          }
+        };
+
+        if (typeof queueMicrotask === "function") {
+          queueMicrotask(restoreScrollOnErase);
+        } else {
+          Promise.resolve().then(restoreScrollOnErase);
+        }
+      }
+
+      return true;
+    };
+
+    const getWindowsTerminalPurgeDecision = (now) => {
+      const {
+        baseY,
+        bufferType,
+        hasScrollback,
+        viewportY,
+      } = getWindowsTerminalPurgeBufferSnapshot();
+      const userScrolledBack = hasScrollback && viewportY < baseY;
+      const startupMs = now - lifecycleStartedAt;
+      const resizeMs = windowsTerminalLastResizeAt ? now - windowsTerminalLastResizeAt : Number.POSITIVE_INFINITY;
+      const eraseAllMs = windowsTerminalLastEraseAllAt ? now - windowsTerminalLastEraseAllAt : Number.POSITIVE_INFINITY;
+      const recentEraseAll = Boolean(windowsTerminalLastEraseAllSnapshot)
+        && eraseAllMs <= WINDOWS_TERMINAL_PURGE_CLEAR_GRACE_MS;
+      const userScrollMs = windowsTerminalLastUserScrollAt ? now - windowsTerminalLastUserScrollAt : Number.POSITIVE_INFINITY;
+
+      if (bufferType === "alternate") {
+        return { action: "allow", reason: "alternate_buffer" };
+      }
+
+      if (!hasScrollback) {
+        return { action: "allow", reason: "no_scrollback" };
+      }
+
+      if (userScrollMs <= WINDOWS_TERMINAL_PURGE_USER_SCROLL_PROTECT_MS && userScrolledBack) {
+        return { action: "block", reason: "user_scrolled_back" };
+      }
+
+      if (userScrollMs <= WINDOWS_TERMINAL_PURGE_USER_SCROLL_PROTECT_MS) {
+        return { action: "block", reason: "recent_user_scroll" };
+      }
+
+      if (recentEraseAll) {
+        if (windowsTerminalLastEraseAllSnapshot.hasScrollback) {
+          return { action: "block", reason: "clear_preserve_existing_scrollback" };
+        }
+
+        if (windowsTerminalLastEraseAllSnapshot.suppressedScrollOnErase) {
+          return { action: "allow", reason: "clear_repaint_empty_history" };
+        }
+
+        return { action: "block", reason: "clear_preserve_screen_snapshot" };
+      }
+
+      if (resizeWriteBarrierActive || resizeMs <= WINDOWS_TERMINAL_PURGE_RESIZE_GRACE_MS) {
+        return { action: "block", reason: "resize_preserve_scrollback" };
+      }
+
+      if (startupMs <= WINDOWS_TERMINAL_PURGE_STARTUP_GRACE_MS) {
+        return { action: "block", reason: "startup_preserve_scrollback" };
+      }
+
+      if (userScrolledBack) {
+        return { action: "block", reason: "scrolled_back_without_recent_input" };
+      }
+
+      return { action: "block", reason: "unclassified_history" };
+    };
+
     if (TERMINAL_IS_WINDOWS_HOST && terminal.parser?.registerCsiHandler) {
       try {
         const eraseSavedLinesHandler = terminal.parser.registerCsiHandler({ final: "J" }, (params) => {
+          const now = performance.now();
+
+          if (isEraseAllDisplayCsiParams(params)) {
+            const resizeMs = windowsTerminalLastResizeAt
+              ? now - windowsTerminalLastResizeAt
+              : Number.POSITIVE_INFINITY;
+            const startupMs = now - lifecycleStartedAt;
+            const snapshot = getWindowsTerminalPurgeBufferSnapshot();
+            const shouldSuppressScrollback = snapshot.hasScrollback
+              || resizeWriteBarrierActive
+              || resizeMs <= WINDOWS_TERMINAL_PURGE_RESIZE_GRACE_MS
+              || startupMs <= WINDOWS_TERMINAL_PURGE_STARTUP_GRACE_MS;
+            const suppressedScrollOnErase = shouldSuppressScrollback
+              ? temporarilyDisableWindowsScrollOnEraseInDisplay()
+              : false;
+
+            windowsTerminalLastEraseAllAt = now;
+            windowsTerminalLastEraseAllSnapshot = {
+              ...snapshot,
+              resizeMs,
+              startupMs,
+              suppressedScrollOnErase: shouldSuppressScrollback,
+              suppressApplied: suppressedScrollOnErase,
+              suppressReason: shouldSuppressScrollback
+                ? snapshot.hasScrollback
+                  ? "preserve_existing_scrollback"
+                  : resizeWriteBarrierActive || resizeMs <= WINDOWS_TERMINAL_PURGE_RESIZE_GRACE_MS
+                    ? "resize_repaint"
+                    : "startup_repaint"
+                : "",
+            };
+
+            return false;
+          }
+
           if (!isEraseSavedLinesCsiParams(params)) {
             return false;
           }
 
+          const purgeDecision = getWindowsTerminalPurgeDecision(now);
+          const phase = purgeDecision.action === "block"
+            ? "frontend.scrollback_purge_blocked"
+            : "frontend.scrollback_purge_allowed";
+
           logTerminalScrollDiagnostic(
-            "frontend.scrollback_purge_blocked",
+            phase,
             {
               csiFinal: "J",
               csiParams: Array.isArray(params) ? params : [],
+              eraseAllBaseY: windowsTerminalLastEraseAllSnapshot?.baseY ?? null,
+              eraseAllBufferLength: windowsTerminalLastEraseAllSnapshot?.bufferLength ?? null,
+              eraseAllHadScrollback: windowsTerminalLastEraseAllSnapshot?.hasScrollback ?? null,
+              eraseAllMs: windowsTerminalLastEraseAllAt
+                ? Math.round(now - windowsTerminalLastEraseAllAt)
+                : null,
+              eraseAllRows: windowsTerminalLastEraseAllSnapshot?.rows ?? null,
+              eraseAllScrollOnEraseSuppressed:
+                windowsTerminalLastEraseAllSnapshot?.suppressedScrollOnErase ?? null,
+              eraseAllScrollOnEraseSuppressApplied:
+                windowsTerminalLastEraseAllSnapshot?.suppressApplied ?? null,
+              eraseAllSuppressReason: windowsTerminalLastEraseAllSnapshot?.suppressReason || "",
+              purgeAction: purgeDecision.action,
+              purgeReason: purgeDecision.reason,
+              resizeMs: windowsTerminalLastResizeAt
+                ? Math.round(now - windowsTerminalLastResizeAt)
+                : null,
+              startupMs: Math.round(now - lifecycleStartedAt),
+              userScrollMs: windowsTerminalLastUserScrollAt
+                ? Math.round(now - windowsTerminalLastUserScrollAt)
+                : null,
             },
             {
               force: true,
@@ -2339,7 +2602,7 @@ function WorkspaceTerminal({
             },
           );
 
-          return true;
+          return purgeDecision.action === "block";
         });
         disposables.push(eraseSavedLinesHandler);
       } catch (error) {
@@ -2354,49 +2617,68 @@ function WorkspaceTerminal({
       }
     }
 
-    if (windowsTerminalDiagnosticsEnabled) {
-      const handleTerminalWheelCapture = (event) => {
-        terminalWheelDiagnosticCount += 1;
-        const beforeViewportY = Number(terminal.buffer?.active?.viewportY || 0);
-        const beforeBufferType = terminal.buffer?.active?.type || "";
-        const wheelCount = terminalWheelDiagnosticCount;
+    disposables.push(terminal.onScroll((viewportY) => {
+      logTerminalScrollDiagnostic(
+        "frontend.scroll_viewport",
+        { viewportY: Number(viewportY || 0) },
+        { throttleMs: 80 },
+      );
+    }));
+    disposables.push(terminal.onWriteParsed(() => logTerminalScrollModeIfChanged("write_parsed")));
+    disposables.push(terminal.onResize(() => {
+      windowsTerminalLastResizeAt = performance.now();
+      logTerminalScrollModeIfChanged("resize");
+    }));
+    if (terminalRendererOpened) {
+      logTerminalScrollModeIfChanged("mount", { force: true });
+    }
 
+    const handleTerminalWheelCapture = (event) => {
+      terminalWheelDiagnosticCount += 1;
+      if (getTerminalBufferDiagnostics(terminal)?.hasScrollback) {
+        windowsTerminalLastUserScrollAt = performance.now();
+      }
+      const beforeViewportY = Number(terminal.buffer?.active?.viewportY || 0);
+      const beforeBufferType = terminal.buffer?.active?.type || "";
+      const wheelCount = terminalWheelDiagnosticCount;
+
+      logTerminalScrollDiagnostic(
+        "frontend.scroll_wheel_capture",
+        {
+          beforeBufferType,
+          beforeViewportY,
+          wheel: getTerminalWheelEventDiagnostics(event),
+          wheelCount,
+        },
+        { force: wheelCount <= 3 },
+      );
+
+      window.setTimeout(() => {
+        if (isDisposed) {
+          return;
+        }
+
+        const afterViewportY = Number(terminal.buffer?.active?.viewportY || 0);
         logTerminalScrollDiagnostic(
-          "frontend.scroll_wheel_capture",
+          "frontend.scroll_wheel_result",
           {
+            afterViewportY,
             beforeBufferType,
             beforeViewportY,
-            wheel: getTerminalWheelEventDiagnostics(event),
+            defaultPreventedAfterDispatch: Boolean(event.defaultPrevented),
+            viewportChanged: afterViewportY !== beforeViewportY,
             wheelCount,
           },
           { force: wheelCount <= 3 },
         );
+      }, 0);
+    };
+    container.addEventListener("wheel", handleTerminalWheelCapture, { capture: true, passive: true });
+    disposables.push(() => {
+      container.removeEventListener("wheel", handleTerminalWheelCapture, true);
+    });
 
-        window.setTimeout(() => {
-          if (isDisposed) {
-            return;
-          }
-
-          const afterViewportY = Number(terminal.buffer?.active?.viewportY || 0);
-          logTerminalScrollDiagnostic(
-            "frontend.scroll_wheel_result",
-            {
-              afterViewportY,
-              beforeBufferType,
-              beforeViewportY,
-              defaultPreventedAfterDispatch: Boolean(event.defaultPrevented),
-              viewportChanged: afterViewportY !== beforeViewportY,
-              wheelCount,
-            },
-            { force: wheelCount <= 3 },
-          );
-        }, 0);
-      };
-      container.addEventListener("wheel", handleTerminalWheelCapture, { capture: true, passive: true });
-      disposables.push(() => {
-        container.removeEventListener("wheel", handleTerminalWheelCapture, true);
-      });
-
+    if (windowsTerminalDiagnosticsEnabled) {
       if (typeof terminal.attachCustomWheelEventHandler === "function") {
         terminal.attachCustomWheelEventHandler((event) => {
           logTerminalScrollDiagnostic(
@@ -2417,17 +2699,6 @@ function WorkspaceTerminal({
           }
         });
       }
-
-      disposables.push(terminal.onScroll((viewportY) => {
-        logTerminalScrollDiagnostic(
-          "frontend.scroll_viewport",
-          { viewportY: Number(viewportY || 0) },
-          { throttleMs: 80 },
-        );
-      }));
-      disposables.push(terminal.onWriteParsed(() => logTerminalScrollModeIfChanged("write_parsed")));
-      disposables.push(terminal.onResize(() => logTerminalScrollModeIfChanged("resize")));
-      logTerminalScrollModeIfChanged("mount", { force: true });
     }
 
     const flushOutputDiagnosticWindow = (reason = "window") => {
@@ -2723,7 +2994,7 @@ function WorkspaceTerminal({
     });
 
     const attachWebglRenderer = (reason = "scheduled") => {
-      if (!useWebglRenderer || isDisposed || webglAttachAttempted) {
+      if (!useWebglRenderer || isDisposed || webglAttachAttempted || !terminalRendererOpened) {
         return;
       }
 
@@ -3735,6 +4006,14 @@ function WorkspaceTerminal({
         }
 
         setPaneStage("starting", "Measuring Terminal", "Waiting for renderer dimensions.");
+        const rendererOpened = await waitForTerminalRendererOpen("terminal_open");
+
+        if (isDisposed || !rendererOpened) {
+          return;
+        }
+
+        logTerminalScrollModeIfChanged("renderer_open", { force: true });
+
         const initialSize = await waitForTerminalSizeForOpen("terminal_open");
 
         if (isDisposed || !initialSize) {
