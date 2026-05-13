@@ -9,6 +9,16 @@
 // Keep this file as the single frontend place that decides how functional repo
 // paths are collapsed for terminal chrome and raw PTY/Codex output.
 
+import {
+  collapseFunctionalRepoPathToCoreRepoPath as collapseWorkspaceFunctionalRepoPathToCoreRepoPath,
+  createWorkspacePathAliases,
+  getWorkspaceDisplayRootLabel,
+  normalizeWorkspacePathSeparators,
+  workspacePathLeaf,
+  workspacePathLooksCaseInsensitive,
+  workspacePathRegExpSource,
+} from "../workspace/workspaceDisplayIdentity.js";
+
 const FUNCTIONAL_REPO_WORKTREE_MARKER = "/.agents/worktrees";
 const FUNCTIONAL_REPO_AGENTS_MARKER = "/.agents";
 const ANSI_CSI_PATTERN = String.raw`\u001b\[[0-?]*[ -/]*[@-~]`;
@@ -35,62 +45,65 @@ const FUNCTIONAL_REPO_PATH_TERMINATORS = new Set([
   "\u001b",
 ]);
 
-function normalizePathSeparators(value) {
-  return String(value || "").replace(/\\/g, "/");
-}
-
-function pathLeaf(value) {
-  const text = normalizePathSeparators(value).replace(/\/+$/g, "");
-  const parts = text.split("/").filter(Boolean);
-  return parts[parts.length - 1] || "";
-}
-
-function escapeRegExp(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function homePathVariant(value) {
-  const text = normalizePathSeparators(value);
-  const match = text.match(/^\/Users\/[^/]+\/(.+)$/);
-  return match ? `~/${match[1]}` : "";
-}
-
 function replacementForCoreRepo(coreRepoPath, childPath = "") {
-  const repoName = pathLeaf(coreRepoPath);
+  const repoName = workspacePathLeaf(coreRepoPath);
   if (!repoName) return childPath || "";
-  const normalizedChild = normalizePathSeparators(childPath).replace(/^\/+/, "");
+  const normalizedChild = normalizeWorkspacePathSeparators(childPath).replace(/^\/+/, "");
   return normalizedChild ? `/${repoName}/${normalizedChild}` : `/${repoName}`;
 }
 
 export function collapseFunctionalRepoPathToCoreRepoPath(value) {
-  const text = String(value || "");
-  const normalized = normalizePathSeparators(text);
-  const markerIndex = normalized.indexOf(FUNCTIONAL_REPO_WORKTREE_MARKER);
-
-  if (markerIndex <= 0) {
-    return text;
-  }
-
-  return text.slice(0, markerIndex).replace(/[\\/]+$/g, "");
+  return collapseWorkspaceFunctionalRepoPathToCoreRepoPath(value);
 }
 
 export function getCoreRepoDisplayLabel(value, fallback = "Project") {
-  const repoName = pathLeaf(collapseFunctionalRepoPathToCoreRepoPath(value));
-  return repoName ? `/${repoName}` : fallback;
+  return getWorkspaceDisplayRootLabel(collapseFunctionalRepoPathToCoreRepoPath(value), fallback);
+}
+
+function regexFlagsForPath(value) {
+  return workspacePathLooksCaseInsensitive(value) ? "gi" : "g";
 }
 
 function maskKnownFunctionalPath(text, functionalRepoPath, coreRepoPath) {
-  const functionalPath = normalizePathSeparators(functionalRepoPath).replace(/\/+$/g, "");
-  const corePath = normalizePathSeparators(coreRepoPath).replace(/\/+$/g, "");
+  const functionalPath = normalizeWorkspacePathSeparators(functionalRepoPath).replace(/\/+$/g, "");
+  const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
 
   if (!functionalPath || !corePath || functionalPath === corePath) {
     return text;
   }
 
   let next = text;
-  const variants = [functionalPath, homePathVariant(functionalPath)].filter(Boolean);
+  const variants = createWorkspacePathAliases(functionalPath);
   for (const variant of variants) {
-    const pattern = new RegExp(`${escapeRegExp(variant)}((?:[/\\\\][^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]+)*)`, "g");
+    const pathSource = workspacePathRegExpSource(variant);
+    if (!pathSource) continue;
+    const pattern = new RegExp(
+      `${pathSource}((?:[/\\\\][^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]+)*)(?=$|[\\s"'\\\`<>()\\[\\]{}|;,\\u001b])`,
+      regexFlagsForPath(variant),
+    );
+    next = next.replace(pattern, (_match, childPath = "") => (
+      replacementForCoreRepo(corePath, childPath)
+    ));
+  }
+  return next;
+}
+
+function maskKnownCorePath(text, coreRepoPath) {
+  const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
+
+  if (!corePath) {
+    return text;
+  }
+
+  let next = text;
+  const variants = createWorkspacePathAliases(corePath);
+  for (const variant of variants) {
+    const pathSource = workspacePathRegExpSource(variant);
+    if (!pathSource) continue;
+    const pattern = new RegExp(
+      `${pathSource}((?:[/\\\\][^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]+)*)(?=$|[\\s"'\\\`<>()\\[\\]{}|;,\\u001b])`,
+      regexFlagsForPath(variant),
+    );
     next = next.replace(pattern, (_match, childPath = "") => (
       replacementForCoreRepo(corePath, childPath)
     ));
@@ -100,7 +113,7 @@ function maskKnownFunctionalPath(text, functionalRepoPath, coreRepoPath) {
 
 function maskEllipsizedFunctionalPath(text, coreRepoPath) {
   return String(text || "").replace(
-    /((?:~|\/|[A-Za-z]:\/)[^\s"'`<>()\[\]{}|;,\u001b]*?(?:…|\.\.\.)[\/\\]worktrees[\/\\][^\/\\\s"'`<>()\[\]{}|;,\u001b]+)((?:[\/\\][^\s"'`<>()\[\]{}|;,\u001b]+)*)/g,
+    /((?:~|[\/\\]|[A-Za-z]:[\/\\]|\\\\)[^\s"'`<>()\[\]{}|;,\u001b]*?(?:…|\.\.\.)[\/\\]worktrees[\/\\][^\/\\\s"'`<>()\[\]{}|;,\u001b]+)((?:[\/\\][^\s"'`<>()\[\]{}|;,\u001b]+)*)/g,
     (_match, _functionalPath, childPath = "") => (
       replacementForCoreRepo(coreRepoPath, childPath)
     ),
@@ -109,7 +122,7 @@ function maskEllipsizedFunctionalPath(text, coreRepoPath) {
 
 function maskCodexShortenedFunctionalPath(text, coreRepoPath) {
   return String(text || "").replace(
-    /((?:~|\/|[A-Za-z]:\/)[^\s"'`<>()\[\]{}|;,\u001b]*\/([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.agents[\/\\]work(?:…|\.\.\.))(?=$|[\s"'`<>()\[\]{}|;,\u001b])/g,
+    /((?:~|[\/\\]|[A-Za-z]:[\/\\]|\\\\)[^\s"'`<>()\[\]{}|;,\u001b]*[\/\\]([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.agents[\/\\]work(?:…|\.\.\.))(?=$|[\s"'`<>()\[\]{}|;,\u001b])/g,
     (_match, _functionalPath, repoName) => (
       replacementForCoreRepo(coreRepoPath || repoName)
     ),
@@ -117,17 +130,19 @@ function maskCodexShortenedFunctionalPath(text, coreRepoPath) {
 }
 
 function maskAnsiDecoratedCoreAgentsPath(text, coreRepoPath) {
-  const corePath = normalizePathSeparators(coreRepoPath).replace(/\/+$/g, "");
+  const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
   if (!corePath) {
     return text;
   }
 
   let next = String(text || "");
-  const variants = [corePath, homePathVariant(corePath)].filter(Boolean);
+  const variants = createWorkspacePathAliases(corePath);
   for (const variant of variants) {
+    const pathSource = workspacePathRegExpSource(variant);
+    if (!pathSource) continue;
     const pattern = new RegExp(
-      `${escapeRegExp(variant)}(?:${ANSI_CSI_PATTERN})+[\\\\/]\\.(?:a|ag|age|agen|agent|agents[^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]*)(?:…|\\.\\.\\.)?(?=$|[\\s"'\\\`<>()\\[\\]{}|;,\\u001b])`,
-      "g",
+      `${pathSource}(?:${ANSI_CSI_PATTERN})+[\\\\/]\\.(?:a|ag|age|agen|agent|agents[^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]*)(?:…|\\.\\.\\.)?(?=$|[\\s"'\\\`<>()\\[\\]{}|;,\\u001b])`,
+      regexFlagsForPath(variant),
     );
     next = next.replace(pattern, () => replacementForCoreRepo(corePath));
   }
@@ -136,7 +151,7 @@ function maskAnsiDecoratedCoreAgentsPath(text, coreRepoPath) {
 
 function maskPartialAgentsMarkerPath(text, coreRepoPath) {
   return String(text || "").replace(
-    /((?:~|\/|[A-Za-z]:\/)[^\s"'`<>()\[\]{}|;,\u001b]*\/([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.(?:a|ag|age|agen|agent|agents)(?:…|\.\.\.)?)(?=$|[\s"'`<>()\[\]{}|;,\u001b])/g,
+    /((?:~|[\/\\]|[A-Za-z]:[\/\\]|\\\\)[^\s"'`<>()\[\]{}|;,\u001b]*[\/\\]([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.(?:a|ag|age|agen|agent|agents)(?:…|\.\.\.)?)(?=$|[\s"'`<>()\[\]{}|;,\u001b])/g,
     (_match, _functionalPath, repoName) => (
       replacementForCoreRepo(coreRepoPath || repoName)
     ),
@@ -145,7 +160,7 @@ function maskPartialAgentsMarkerPath(text, coreRepoPath) {
 
 function maskFullWorktreePath(text) {
   return String(text || "").replace(
-    /((?:~|\/|[A-Za-z]:\/)[^\s"'`<>()\[\]{}|;,\u001b]*\/([^\/\s"'`<>()\[\]{}|;,\u001b]+)\/\.agents\/worktrees\/[^\/\\\s"'`<>()\[\]{}|;,\u001b]+)((?:[\/\\][^\s"'`<>()\[\]{}|;,\u001b]+)*)/g,
+    /((?:~|[\/\\]|[A-Za-z]:[\/\\]|\\\\)[^\s"'`<>()\[\]{}|;,\u001b]*[\/\\]([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.agents[\/\\]worktrees[\/\\][^\/\\\s"'`<>()\[\]{}|;,\u001b]+)((?:[\/\\][^\s"'`<>()\[\]{}|;,\u001b]+)*)/g,
     (_match, _functionalPath, repoName, childPath = "") => (
       replacementForCoreRepo(repoName, childPath)
     ),
@@ -154,7 +169,7 @@ function maskFullWorktreePath(text) {
 
 function maskAnyAgentsInternalPath(text, coreRepoPath) {
   return String(text || "").replace(
-    /((?:~|\/|[A-Za-z]:\/)[^\s"'`<>()\[\]{}|;,\u001b]*\/([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.agents[^\s"'`<>()\[\]{}|;,\u001b]*)/g,
+    /((?:~|[\/\\]|[A-Za-z]:[\/\\]|\\\\)[^\s"'`<>()\[\]{}|;,\u001b]*[\/\\]([^\/\\\s"'`<>()\[\]{}|;,\u001b]+)[\/\\]\.agents[^\s"'`<>()\[\]{}|;,\u001b]*)/g,
     (_match, _functionalPath, repoName) => (
       replacementForCoreRepo(coreRepoPath || repoName)
     ),
@@ -162,22 +177,27 @@ function maskAnyAgentsInternalPath(text, coreRepoPath) {
 }
 
 function maskTrailingKnownCoreRepoPath(text, coreRepoPath) {
-  const corePath = normalizePathSeparators(coreRepoPath).replace(/\/+$/g, "");
+  const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
   if (!corePath) {
     return { masked: false, text };
   }
 
-  const variants = [corePath, homePathVariant(corePath)]
-    .filter(Boolean)
-    .map((variant) => normalizePathSeparators(variant).replace(/\/+$/g, ""))
+  const variants = createWorkspacePathAliases(corePath)
+    .map((variant) => normalizeWorkspacePathSeparators(variant).replace(/\/+$/g, ""))
     .sort((left, right) => right.length - left.length);
 
   for (const variant of variants) {
-    if (!variant || !String(text || "").endsWith(variant)) {
+    const pathSource = workspacePathRegExpSource(variant);
+    if (!pathSource) {
       continue;
     }
 
-    const start = text.length - variant.length;
+    const match = String(text || "").match(new RegExp(`${pathSource}$`, regexFlagsForPath(variant).replace("g", "")));
+    if (!match) {
+      continue;
+    }
+
+    const start = match.index ?? (text.length - match[0].length);
     const boundaryStart = rewindAnsiSequencesBeforeIndex(text, start);
     const before = text.slice(0, boundaryStart);
     const previous = before[before.length - 1] || "";
@@ -201,7 +221,7 @@ function hasFunctionalRepoPathTerminator(text) {
 }
 
 function shouldCarryLeadingAgentsContinuation(rest) {
-  const normalized = normalizePathSeparators(rest);
+  const normalized = normalizeWorkspacePathSeparators(rest);
   if (!normalized) {
     return false;
   }
@@ -236,7 +256,7 @@ function stripLeadingAgentsContinuationAfterCoreRepo(text) {
       return { consumed: true, carry: source, text: "" };
     }
 
-    const childPath = normalizePathSeparators(worktreeMatch[1] || "");
+    const childPath = normalizeWorkspacePathSeparators(worktreeMatch[1] || "");
     return {
       consumed: true,
       text: `${ansiPrefix}${childPath}${worktreeMatch[2] || ""}`,
@@ -276,8 +296,12 @@ export function maskFunctionalRepoPathsForDisplayText(value, options = {}) {
     options.functionalRepoPath,
     options.coreRepoPath,
   );
-  const codexShortenedMasked = maskCodexShortenedFunctionalPath(
+  const coreMasked = maskKnownCorePath(
     knownMasked,
+    options.coreRepoPath,
+  );
+  const codexShortenedMasked = maskCodexShortenedFunctionalPath(
+    coreMasked,
     options.coreRepoPath,
   );
   const ansiDecoratedMasked = maskAnsiDecoratedCoreAgentsPath(
@@ -311,19 +335,20 @@ function rewindAnsiSequencesBeforeIndex(text, index) {
 }
 
 function findFunctionalPathCarryStart(text) {
-  let markerIndex = text.lastIndexOf(FUNCTIONAL_REPO_WORKTREE_MARKER);
+  const normalized = normalizeWorkspacePathSeparators(text);
+  let markerIndex = normalized.lastIndexOf(FUNCTIONAL_REPO_WORKTREE_MARKER);
   if (markerIndex < 0) {
-    markerIndex = text.lastIndexOf(FUNCTIONAL_REPO_AGENTS_MARKER);
+    markerIndex = normalized.lastIndexOf(FUNCTIONAL_REPO_AGENTS_MARKER);
   }
   if (markerIndex < 0) {
-    const matches = [...text.matchAll(/(?:…|\.\.\.)[\/\\]worktrees/g)];
+    const matches = [...normalized.matchAll(/(?:…|\.\.\.)[\/\\]worktrees/g)];
     markerIndex = matches.length ? matches[matches.length - 1].index : -1;
   }
   if (markerIndex < 0) {
     for (let length = FUNCTIONAL_REPO_AGENTS_MARKER.length - 1; length >= 2; length -= 1) {
       const prefix = FUNCTIONAL_REPO_AGENTS_MARKER.slice(0, length);
-      if (text.endsWith(prefix)) {
-        markerIndex = text.length - prefix.length;
+      if (normalized.endsWith(prefix)) {
+        markerIndex = normalized.length - prefix.length;
         break;
       }
     }
@@ -341,20 +366,19 @@ function findFunctionalPathCarryStart(text) {
 
 function shouldCarryFunctionalPathTail(text) {
   if (!text) return false;
-  const markerIndex = text.lastIndexOf(FUNCTIONAL_REPO_WORKTREE_MARKER);
+  const normalized = normalizeWorkspacePathSeparators(text);
+  const markerIndex = normalized.lastIndexOf(FUNCTIONAL_REPO_WORKTREE_MARKER);
   if (markerIndex >= 0) {
-    const afterMarker = text.slice(markerIndex + FUNCTIONAL_REPO_WORKTREE_MARKER.length);
+    const afterMarker = normalized.slice(markerIndex + FUNCTIONAL_REPO_WORKTREE_MARKER.length);
     if (/^\/[^\s"'`<>()\[\]{}|;,\u001b]+/.test(afterMarker)) {
       return false;
     }
     return !/[ \t\r\n"'`<>()\[\]{}|;,\u001b]/.test(afterMarker);
   }
 
-  const agentsMarkerIndex = text.lastIndexOf(FUNCTIONAL_REPO_AGENTS_MARKER);
+  const agentsMarkerIndex = normalized.lastIndexOf(FUNCTIONAL_REPO_AGENTS_MARKER);
   if (agentsMarkerIndex >= 0) {
-    const afterMarker = normalizePathSeparators(
-      text.slice(agentsMarkerIndex + FUNCTIONAL_REPO_AGENTS_MARKER.length),
-    );
+    const afterMarker = normalized.slice(agentsMarkerIndex + FUNCTIONAL_REPO_AGENTS_MARKER.length);
     if (afterMarker.includes("…") || afterMarker.includes("...")) {
       return false;
     }
@@ -365,16 +389,16 @@ function shouldCarryFunctionalPathTail(text) {
   }
 
   for (let length = FUNCTIONAL_REPO_AGENTS_MARKER.length - 1; length >= 2; length -= 1) {
-    if (text.endsWith(FUNCTIONAL_REPO_AGENTS_MARKER.slice(0, length))) {
+    if (normalized.endsWith(FUNCTIONAL_REPO_AGENTS_MARKER.slice(0, length))) {
       return true;
     }
   }
 
-  const matches = [...text.matchAll(/(?:…|\.\.\.)[\/\\]worktrees/g)];
+  const matches = [...normalized.matchAll(/(?:…|\.\.\.)[\/\\]worktrees/g)];
   const lastMatch = matches[matches.length - 1];
   if (!lastMatch) return false;
 
-  const afterMarker = text.slice(lastMatch.index + lastMatch[0].length);
+  const afterMarker = normalized.slice(lastMatch.index + lastMatch[0].length);
   if (/^[\/\\][^\s"'`<>()\[\]{}|;,\u001b]+/.test(afterMarker)) {
     return false;
   }

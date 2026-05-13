@@ -8,7 +8,6 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
-  getCoreRepoDisplayLabel,
 } from "./coreRepoNameDisplay";
 import {
   GlobalStyle,
@@ -122,7 +121,6 @@ import {
   TerminalParkedCancelButton,
   TerminalRestartPill,
   TerminalAgentIdBadge,
-  TerminalProjectBadge,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -296,6 +294,10 @@ import {
   TitleRestoreIcon,
   TitleCloseIcon,
   ButtonRefreshIcon,
+  ButtonSplitHorizontalIcon,
+  ButtonSplitVerticalIcon,
+  ButtonFullscreenIcon,
+  ButtonFullscreenExitIcon,
   ButtonAddIcon,
   ButtonLoginIcon,
   ButtonBrowserIcon,
@@ -329,6 +331,11 @@ import {
   syncTerminalDiagnosticLogging,
 } from "./terminalDiagnostics";
 import {
+  isWindowsTerminalDiagnosticLoggingEnabled,
+  logWindowsTerminalDiagnosticEvent,
+  syncWindowsTerminalDiagnosticLogging,
+} from "./windowsTerminalDiagnostics";
+import {
   addTerminalMetrics,
   patchTerminalMetrics,
 } from "./terminalTelemetry.jsx";
@@ -360,6 +367,7 @@ const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
 const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
 const TERMINAL_SCROLLBAR_INTENT_MS = 900;
+const TERMINAL_SCROLL_DIAGNOSTIC_THROTTLE_MS = 180;
 const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
 const TERMINAL_SCROLL_ANCHOR_SEARCH_RADIUS_ROWS = 180;
 const TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS = 360;
@@ -1273,10 +1281,120 @@ function getTerminalBufferDiagnostics(terminal) {
     baseY: buffer.baseY,
     cursorX: buffer.cursorX,
     cursorY: buffer.cursorY,
+    hasScrollback: Boolean(
+      buffer.type !== "alternate"
+      && (
+        Number(buffer.baseY || 0) > 0
+        || Number(buffer.length || 0) > Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS)
+      ),
+    ),
     length: buffer.length,
-    viewportY: buffer.viewportY,
     nonEmptyViewportRows,
+    type: buffer.type || "",
+    viewportY: buffer.viewportY,
     wrappedViewportRows,
+  };
+}
+
+function getTerminalElementDiagnostics(element) {
+  if (!element) {
+    return null;
+  }
+
+  const bounds = typeof element.getBoundingClientRect === "function"
+    ? element.getBoundingClientRect()
+    : null;
+  const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
+    ? window.getComputedStyle(element)
+    : null;
+
+  return {
+    clientHeight: Math.round(Number(element.clientHeight || 0)),
+    clientWidth: Math.round(Number(element.clientWidth || 0)),
+    display: style?.display || "",
+    offsetHeight: Math.round(Number(element.offsetHeight || 0)),
+    offsetWidth: Math.round(Number(element.offsetWidth || 0)),
+    overflowY: style?.overflowY || "",
+    pointerEvents: style?.pointerEvents || "",
+    rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
+    rectWidth: bounds ? Math.round(Number(bounds.width || 0)) : 0,
+    scrollHeight: Math.round(Number(element.scrollHeight || 0)),
+    scrollTop: Math.round(Number(element.scrollTop || 0)),
+    visibility: style?.visibility || "",
+  };
+}
+
+function getTerminalModesDiagnostics(terminal) {
+  try {
+    const modes = terminal?.modes;
+
+    return {
+      applicationCursorKeysMode: Boolean(modes?.applicationCursorKeysMode),
+      mouseTrackingMode: modes?.mouseTrackingMode || "unavailable",
+      originMode: Boolean(modes?.originMode),
+      sendFocusMode: Boolean(modes?.sendFocusMode),
+      wraparoundMode: Boolean(modes?.wraparoundMode),
+    };
+  } catch (_) {
+    return {
+      applicationCursorKeysMode: false,
+      mouseTrackingMode: "unavailable",
+      originMode: false,
+      sendFocusMode: false,
+      wraparoundMode: false,
+    };
+  }
+}
+
+function getTerminalScrollDiagnostics(terminal, container, scrollableElement) {
+  const buffer = getTerminalBufferDiagnostics(terminal) || {};
+  const viewportElement = container?.querySelector?.(".xterm-viewport") || null;
+  const screenElement = container?.querySelector?.(".xterm-screen") || null;
+  const options = terminal?.options || {};
+
+  return {
+    bufferBaseY: Number(buffer.baseY || 0),
+    bufferCursorX: Number(buffer.cursorX || 0),
+    bufferCursorY: Number(buffer.cursorY || 0),
+    bufferHasScrollback: Boolean(buffer.hasScrollback),
+    bufferLength: Number(buffer.length || 0),
+    bufferType: buffer.type || "",
+    bufferViewportY: Number(buffer.viewportY || 0),
+    cols: Number(terminal?.cols || 0),
+    container: getTerminalElementDiagnostics(container),
+    fastScrollSensitivity: Number(options.fastScrollSensitivity || 0),
+    mouse: getTerminalModesDiagnostics(terminal),
+    nativeViewport: getTerminalElementDiagnostics(viewportElement),
+    rows: Number(terminal?.rows || 0),
+    screen: getTerminalElementDiagnostics(screenElement),
+    scrollSensitivity: Number(options.scrollSensitivity || 0),
+    scrollback: Number(options.scrollback || 0),
+    scrollable: getTerminalElementDiagnostics(scrollableElement),
+    scrollOnUserInput: options.scrollOnUserInput !== false,
+    windowsPtyBackend: options.windowsPty?.backend || "",
+  };
+}
+
+function getTerminalWheelEventDiagnostics(event) {
+  const target = event?.target;
+  const currentTarget = event?.currentTarget;
+
+  return {
+    altKey: Boolean(event?.altKey),
+    cancelable: Boolean(event?.cancelable),
+    ctrlKey: Boolean(event?.ctrlKey),
+    currentTargetClass: currentTarget?.className || "",
+    currentTargetTag: currentTarget?.tagName || "",
+    defaultPrevented: Boolean(event?.defaultPrevented),
+    deltaMode: Number(event?.deltaMode ?? -1),
+    deltaX: Number(event?.deltaX || 0),
+    deltaY: Number(event?.deltaY || 0),
+    deltaZ: Number(event?.deltaZ || 0),
+    eventPhase: Number(event?.eventPhase || 0),
+    metaKey: Boolean(event?.metaKey),
+    shiftKey: Boolean(event?.shiftKey),
+    targetClass: target?.className || "",
+    targetTag: target?.tagName || "",
   };
 }
 
@@ -1600,12 +1718,15 @@ function WorkspaceTerminal({
   agentStatusError,
   agentStatusState,
   isActive = false,
+  isFullscreen = false,
   onActivateTerminal,
   onChangeTerminalRole,
   onCloseTerminal,
   onOpenSettings,
   onPreparedTerminalChange,
   onRecheckAgents,
+  onSplitTerminal,
+  onToggleFullscreenTerminal,
   prewarmShell = false,
   terminalIndex = 0,
   terminalCount = 1,
@@ -1651,26 +1772,6 @@ function WorkspaceTerminal({
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const terminalAgentId = getTerminalAgentId(paneAgentId, terminalLaunchInfo?.agentId);
   const terminalAgentTitle = `${isGenericTerminal ? "Generic shell" : agent?.label || "Agent"} terminal ${terminalAgentId}`;
-  const projectRoot = collapseFunctionalRepoPathToCoreRepoPath(
-    terminalLaunchInfo?.projectRoot || terminalLaunchInfo?.workingDirectory || workingDirectory || "",
-  );
-  const projectLabel = getCoreRepoDisplayLabel(projectRoot, workspace?.name || "Project");
-  const coordinationMode = terminalLaunchInfo?.coordinationMode || "";
-  const hasIsolatedWorktree = !isGenericTerminal && Boolean(
-    coordinationMode === "worktree_required"
-    || (terminalLaunchInfo?.agentBranchRoot && coordinationMode !== "coordination_only"),
-  );
-  const isolationLabel = isGenericTerminal
-    ? "plain shell"
-    : hasIsolatedWorktree
-      ? "isolated edits"
-      : "preparing isolation";
-  const projectBadgeLabel = isGenericTerminal
-    ? `${projectLabel} plain shell terminal`
-    : `${projectLabel} editing with isolated branch protection`;
-  const projectBadgeTitle = isGenericTerminal
-    ? `${projectLabel} - generic shell with normal terminal controls`
-    : `${projectLabel} - edits are isolated in the agent worktree until merge`;
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
     const terminal = xtermRef.current;
     if (!terminal) {
@@ -2095,20 +2196,161 @@ function WorkspaceTerminal({
 
     terminal.open(container);
     const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
+    const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
     syncTerminalDiagnosticLogging();
+    syncWindowsTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
     logTerminalDiagnosticEvent("frontend.terminal_mount", {
       ...getTerminalDiagnosticEnvironment(),
       fontSize: 12,
+      isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
       lineHeight: 1.22,
       paneId,
       rendererMode,
+      scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       terminalIndex,
       useWebglRenderer,
       windowsPty: TERMINAL_IS_WINDOWS_HOST ? "conpty" : "",
     });
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+    let terminalScrollDiagnosticLastAt = 0;
+    let terminalScrollModeSignature = "";
+    let terminalWheelDiagnosticCount = 0;
+    const logTerminalScrollDiagnostic = (phase, fields = {}, options = {}) => {
+      if (!windowsTerminalDiagnosticsEnabled) {
+        return;
+      }
+
+      const now = performance.now();
+      const throttleMs = options.throttleMs ?? TERMINAL_SCROLL_DIAGNOSTIC_THROTTLE_MS;
+      if (
+        !options.force
+        && throttleMs > 0
+        && now - terminalScrollDiagnosticLastAt < throttleMs
+      ) {
+        return;
+      }
+      terminalScrollDiagnosticLastAt = now;
+
+      logWindowsTerminalDiagnosticEvent(phase, {
+        isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
+        paneId,
+        rendererMode,
+        scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
+        terminalIndex,
+        ...getTerminalScrollDiagnostics(terminal, container, terminalScrollableElement),
+        ...fields,
+      });
+    };
+    const logTerminalScrollModeIfChanged = (reason, options = {}) => {
+      if (!windowsTerminalDiagnosticsEnabled) {
+        return;
+      }
+
+      const diagnostics = getTerminalScrollDiagnostics(terminal, container, terminalScrollableElement);
+      const nextSignature = [
+        diagnostics.bufferType,
+        diagnostics.bufferHasScrollback ? "scrollback" : "no_scrollback",
+        diagnostics.mouse?.mouseTrackingMode || "",
+        diagnostics.nativeViewport?.overflowY || "",
+        diagnostics.scrollable?.pointerEvents || "",
+        diagnostics.windowsPtyBackend || "",
+      ].join("|");
+
+      if (!options.force && nextSignature === terminalScrollModeSignature) {
+        return;
+      }
+
+      terminalScrollModeSignature = nextSignature;
+      logTerminalScrollDiagnostic(
+        "frontend.scroll_mode",
+        {
+          reason,
+          signature: nextSignature,
+        },
+        {
+          force: options.force,
+          throttleMs: 0,
+        },
+      );
+    };
+
+    if (windowsTerminalDiagnosticsEnabled) {
+      const handleTerminalWheelCapture = (event) => {
+        terminalWheelDiagnosticCount += 1;
+        const beforeViewportY = Number(terminal.buffer?.active?.viewportY || 0);
+        const beforeBufferType = terminal.buffer?.active?.type || "";
+        const wheelCount = terminalWheelDiagnosticCount;
+
+        logTerminalScrollDiagnostic(
+          "frontend.scroll_wheel_capture",
+          {
+            beforeBufferType,
+            beforeViewportY,
+            wheel: getTerminalWheelEventDiagnostics(event),
+            wheelCount,
+          },
+          { force: wheelCount <= 3 },
+        );
+
+        window.setTimeout(() => {
+          if (isDisposed) {
+            return;
+          }
+
+          const afterViewportY = Number(terminal.buffer?.active?.viewportY || 0);
+          logTerminalScrollDiagnostic(
+            "frontend.scroll_wheel_result",
+            {
+              afterViewportY,
+              beforeBufferType,
+              beforeViewportY,
+              defaultPreventedAfterDispatch: Boolean(event.defaultPrevented),
+              viewportChanged: afterViewportY !== beforeViewportY,
+              wheelCount,
+            },
+            { force: wheelCount <= 3 },
+          );
+        }, 0);
+      };
+      container.addEventListener("wheel", handleTerminalWheelCapture, { capture: true, passive: true });
+      disposables.push(() => {
+        container.removeEventListener("wheel", handleTerminalWheelCapture, true);
+      });
+
+      if (typeof terminal.attachCustomWheelEventHandler === "function") {
+        terminal.attachCustomWheelEventHandler((event) => {
+          logTerminalScrollDiagnostic(
+            "frontend.scroll_wheel_xterm_handler",
+            {
+              wheel: getTerminalWheelEventDiagnostics(event),
+              wheelCount: terminalWheelDiagnosticCount,
+            },
+            { force: terminalWheelDiagnosticCount <= 3 },
+          );
+          return true;
+        });
+        disposables.push(() => {
+          try {
+            terminal.attachCustomWheelEventHandler(() => true);
+          } catch (_) {
+            // Terminal may already be disposed during teardown.
+          }
+        });
+      }
+
+      disposables.push(terminal.onScroll((viewportY) => {
+        logTerminalScrollDiagnostic(
+          "frontend.scroll_viewport",
+          { viewportY: Number(viewportY || 0) },
+          { throttleMs: 80 },
+        );
+      }));
+      disposables.push(terminal.onWriteParsed(() => logTerminalScrollModeIfChanged("write_parsed")));
+      disposables.push(terminal.onResize(() => logTerminalScrollModeIfChanged("resize")));
+      logTerminalScrollModeIfChanged("mount", { force: true });
+    }
 
     const flushOutputDiagnosticWindow = (reason = "window") => {
       if (!terminalDiagnosticsEnabled) {
@@ -3854,6 +4096,52 @@ function WorkspaceTerminal({
     setRestartKey((key) => key + 1);
   }, [isGenericTerminal, onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
 
+  const canSplitTerminal = terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
+  const splitTerminal = useCallback((direction) => {
+    if (terminalClosed || terminalClosing || !canSplitTerminal) {
+      return;
+    }
+
+    onSplitTerminal?.({
+      direction,
+      paneId,
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    canSplitTerminal,
+    onSplitTerminal,
+    paneId,
+    terminalClosed,
+    terminalClosing,
+    terminalIndex,
+    workspace?.id,
+  ]);
+  const splitTerminalHorizontal = useCallback(() => {
+    splitTerminal("horizontal");
+  }, [splitTerminal]);
+  const splitTerminalVertical = useCallback(() => {
+    splitTerminal("vertical");
+  }, [splitTerminal]);
+  const toggleTerminalFullscreen = useCallback(() => {
+    if (terminalClosed || terminalClosing) {
+      return;
+    }
+
+    onToggleFullscreenTerminal?.({
+      paneId,
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    onToggleFullscreenTerminal,
+    paneId,
+    terminalClosed,
+    terminalClosing,
+    terminalIndex,
+    workspace?.id,
+  ]);
+
   const terminalStatusErrorDetails = [
     workspaceError,
     terminalError,
@@ -3940,16 +4228,38 @@ function WorkspaceTerminal({
           data-agent={terminalAgentKind}
           data-slot={getTerminalAgentColorSlot(terminalIndex)}
           title={terminalAgentTitle}
+        />
+        <TerminalRestartButton
+          aria-label="Split terminal horizontally"
+          disabled={terminalClosed || terminalClosing || !canSplitTerminal}
+          onClick={splitTerminalHorizontal}
+          title={canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
+          type="button"
         >
-          {terminalAgentId}
-        </TerminalAgentIdBadge>
-        <TerminalProjectBadge
-          aria-label={projectBadgeLabel}
-          title={projectBadgeTitle}
+          <ButtonSplitHorizontalIcon aria-hidden="true" />
+        </TerminalRestartButton>
+        <TerminalRestartButton
+          aria-label="Split terminal vertically"
+          disabled={terminalClosed || terminalClosing || !canSplitTerminal}
+          onClick={splitTerminalVertical}
+          title={canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
+          type="button"
         >
-          <strong>{projectLabel}</strong>
-          <span>{isolationLabel}</span>
-        </TerminalProjectBadge>
+          <ButtonSplitVerticalIcon aria-hidden="true" />
+        </TerminalRestartButton>
+        <TerminalRestartButton
+          aria-label={isFullscreen ? "Exit terminal fullscreen" : "Make terminal fullscreen"}
+          disabled={terminalClosed || terminalClosing}
+          onClick={toggleTerminalFullscreen}
+          title={isFullscreen ? "Exit fullscreen" : "Make terminal fullscreen"}
+          type="button"
+        >
+          {isFullscreen ? (
+            <ButtonFullscreenExitIcon aria-hidden="true" />
+          ) : (
+            <ButtonFullscreenIcon aria-hidden="true" />
+          )}
+        </TerminalRestartButton>
         <TerminalRestartMenu
           data-terminal-control="true"
           ref={restartMenuRef}

@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
 
-const TERMINAL_DIAGNOSTIC_STORAGE_KEY = "diffforge.terminalDiagnostics";
 const TERMINAL_DIAGNOSTIC_HEARTBEAT_MS = 100;
 const TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS = 120;
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT = 512;
@@ -25,18 +24,8 @@ function cleanDiagnosticText(value) {
     .slice(0, TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT);
 }
 
-function readStorageEnabled() {
-  try {
-    const value = window.localStorage?.getItem(TERMINAL_DIAGNOSTIC_STORAGE_KEY);
-
-    return value === "1" || value === "true" || value === "yes";
-  } catch {
-    return false;
-  }
-}
-
 export function isTerminalDiagnosticLoggingEnabled() {
-  return TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || readStorageEnabled();
+  return TERMINAL_DIAGNOSTIC_LOGGING_ENABLED;
 }
 
 export function syncTerminalDiagnosticLogging() {

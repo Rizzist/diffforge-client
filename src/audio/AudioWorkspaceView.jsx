@@ -180,7 +180,6 @@ import {
   AudioSetupPanel,
   AudioHeroRow,
   AudioStatePill,
-  AudioStatusGrid,
   AudioModeGrid,
   AudioModeButton,
   AudioDevicePanel,
@@ -199,8 +198,6 @@ import {
   AudioShortcutActions,
   AudioResultsPanel,
   AudioResultLine,
-  AudioPathBlock,
-  AudioCodePath,
   AudioRuntimeHint,
   AudioProgressPanel,
   AudioProgressTopline,
@@ -293,7 +290,6 @@ import {
   SettingsValue,
   SettingsHint,
   SettingsIdentityGrid,
-  SettingsIdentityItem,
   LoginCard,
   LoginPanel,
   SessionPanel,
@@ -749,26 +745,15 @@ export default function AudioWorkspaceView({
     : audioActionState === "opening"
       ? "Opening..."
       : "Open recorder";
+  const recorderOpenDisabled = isBusy || recorderOpen || (isCloudMode ? !deepgramReady : !installed);
   const canUninstall = Boolean(audioModelStatus?.managedAssetsInstalled || audioModelStatus?.modelInstalled);
   const downloadPercent = audioDownloadProgress?.percent;
-  const modelBytes = Number(audioModelStatus?.bytes || 0);
-  const modelPath = audioModelStatus?.modelPath || "App data";
-  const runtimePath = audioModelStatus?.runtimePath || "";
-  const modelLabel = audioModelStatus?.modelName || "Whisper base.en";
-  const runtimeLabel = audioModelStatus?.runtimePackageName || audioModelStatus?.runtimeName || "whisper.cpp CLI";
-  const diskLabel = audioModelStatus?.approximateDiskMb
-    ? `${audioModelStatus.approximateDiskMb} MB`
-    : formatFileSize(modelBytes);
-  const memoryLabel = audioModelStatus?.approximateMemoryMb
-    ? `~${audioModelStatus.approximateMemoryMb} MB`
-    : "Local CPU";
   const installLabel = audioModelStatus?.runtimeInstallable === false ? "Install model" : "Install Whisper";
   const missingLabel = audioModelStatus?.modelInstalled
     ? "Runtime missing"
     : audioModelStatus?.runtimeInstalled
       ? "Model missing"
       : "Not installed";
-  const cloudLanguageLabel = DEEPGRAM_LANGUAGE_OPTIONS.find((option) => option.value === deepgramLanguage)?.label || deepgramLanguage || "English";
   const audioModeStatusLabel = isCloudMode
     ? (deepgramReady ? "Cloud ready" : "API key needed")
     : (installed ? "Local ready" : audioActionState === "downloading" ? "Downloading" : missingLabel);
@@ -1254,39 +1239,16 @@ export default function AudioWorkspaceView({
           </AudioModeButton>
         </AudioModeGrid>
 
-        <AudioStatusGrid>
-          {isCloudMode ? (
-            <>
-              <SettingsIdentityItem>
-                <span>Provider</span>
-                <strong>Deepgram</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Model</span>
-                <strong>Nova-3</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Language</span>
-                <strong>{cloudLanguageLabel}</strong>
-              </SettingsIdentityItem>
-            </>
-          ) : (
-            <>
-              <SettingsIdentityItem>
-                <span>Model</span>
-                <strong>{modelLabel}</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Runtime</span>
-                <strong>{audioModelStatus?.runtimeInstalled ? runtimeLabel : "Not detected"}</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Shortcut</span>
-                <strong>{formatShortcutLabel(pushToTalkShortcut)}</strong>
-              </SettingsIdentityItem>
-            </>
-          )}
-        </AudioStatusGrid>
+        <AudioRecorderOptionRow>
+          <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
+            <span aria-hidden="true" />
+            Auto-open after startup
+          </McpSwitchButton>
+          <RecorderOpenButton disabled={recorderOpenDisabled} onClick={onOpenWidget} type="button">
+            <ButtonMicIcon aria-hidden="true" />
+            <span>{recorderButtonLabel}</span>
+          </RecorderOpenButton>
+        </AudioRecorderOptionRow>
 
         {isCloudMode && (
           <AudioDevicePanel aria-label="Deepgram cloud settings">
@@ -1381,13 +1343,6 @@ export default function AudioWorkspaceView({
           <AudioInputMeta>
             {selectedAudioInputLabel} / level {formatAudioLevel(audioInputLevel)} / buffer {Math.round((audioInputStats.bufferMs || 0) / 1000)}s
           </AudioInputMeta>
-          <AudioRecorderOptionRow>
-            <SettingsHint>Recorder window</SettingsHint>
-            <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
-              <span aria-hidden="true" />
-              Auto-open after startup
-            </McpSwitchButton>
-          </AudioRecorderOptionRow>
         </AudioDevicePanel>
 
         <AudioDevicePanel aria-label="Audio shortcut settings">
@@ -1406,6 +1361,13 @@ export default function AudioWorkspaceView({
                     : "Ready"}
             </AudioStatePill>
           </AudioDeviceHeader>
+
+          <AudioCloudField>
+            Mode
+            <AudioDeviceSelect aria-label="Recorder mode" disabled value="push-to-talk">
+              <option value="push-to-talk">Push to Talk</option>
+            </AudioDeviceSelect>
+          </AudioCloudField>
 
           <AudioShortcutGrid>
             <AudioShortcutCard data-error={Boolean(pushToTalkShortcutError)}>
@@ -1501,86 +1463,48 @@ export default function AudioWorkspaceView({
           )}
         </AudioResultsPanel>
 
-        {!isCloudMode && (
-          <>
-            <AudioPathBlock>
-              <span>Local model path</span>
-              <AudioCodePath>{modelPath}</AudioCodePath>
-              <span>Runtime path</span>
-              <AudioCodePath>{runtimePath || audioModelStatus?.runtimeInstallHint || "Not detected"}</AudioCodePath>
-            </AudioPathBlock>
+        {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
+          <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
+        )}
 
-            <AudioStatusGrid>
-              <SettingsIdentityItem>
-                <span>Model file</span>
-                <strong>{audioModelStatus?.modelInstalled ? formatFileSize(modelBytes) || diskLabel || "Ready" : diskLabel || "142 MB"}</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Memory</span>
-                <strong>{memoryLabel}</strong>
-              </SettingsIdentityItem>
-              <SettingsIdentityItem>
-                <span>Mode</span>
-                <strong>Push to talk</strong>
-              </SettingsIdentityItem>
-            </AudioStatusGrid>
-
-            {audioModelStatus && !audioModelStatus.runtimeInstalled && (
-              <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
-            )}
-
-            {audioDownloadProgress && (
-              <AudioProgressPanel>
-                <AudioProgressTopline>
-                  <strong>{audioDownloadProgress.message || "Downloading local Whisper weights."}</strong>
-                  <span>{formatAudioPercent(downloadPercent)}</span>
-                </AudioProgressTopline>
-                <AudioProgressTrack aria-hidden="true">
-                  <AudioProgressBar $progress={Number(downloadPercent) || 0} />
-                </AudioProgressTrack>
-                <AudioProgressMeta>
-                  {formatFileSize(audioDownloadProgress.downloadedBytes || 0)}
-                  {audioDownloadProgress.totalBytes ? ` / ${formatFileSize(audioDownloadProgress.totalBytes)}` : ""}
-                </AudioProgressMeta>
-              </AudioProgressPanel>
-            )}
-          </>
+        {!isCloudMode && audioDownloadProgress && (
+          <AudioProgressPanel>
+            <AudioProgressTopline>
+              <strong>{audioDownloadProgress.message || "Downloading local Whisper weights."}</strong>
+              <span>{formatAudioPercent(downloadPercent)}</span>
+            </AudioProgressTopline>
+            <AudioProgressTrack aria-hidden="true">
+              <AudioProgressBar $progress={Number(downloadPercent) || 0} />
+            </AudioProgressTrack>
+            <AudioProgressMeta>
+              {formatFileSize(audioDownloadProgress.downloadedBytes || 0)}
+              {audioDownloadProgress.totalBytes ? ` / ${formatFileSize(audioDownloadProgress.totalBytes)}` : ""}
+            </AudioProgressMeta>
+          </AudioProgressPanel>
         )}
 
         {audioError && <FormMessage $state="error">{audioError}</FormMessage>}
 
-        <AudioActionRow>
-          {isCloudMode ? (
-            <RecorderOpenButton disabled={isBusy || recorderOpen || !deepgramReady} onClick={onOpenWidget} type="button">
-              <ButtonMicIcon aria-hidden="true" />
-              <span>{recorderButtonLabel}</span>
-            </RecorderOpenButton>
-          ) : installed ? (
-            <RecorderOpenButton disabled={isBusy || recorderOpen} onClick={onOpenWidget} type="button">
-              <ButtonMicIcon aria-hidden="true" />
-              <span>{recorderButtonLabel}</span>
-            </RecorderOpenButton>
-          ) : (
-            <PrimaryButton disabled={isBusy} onClick={onDownloadModel} type="button">
-              <ButtonMicIcon aria-hidden="true" />
-              <span>{audioActionState === "downloading" ? "Downloading..." : installLabel}</span>
-            </PrimaryButton>
-          )}
-          {!isCloudMode && (
-            <>
-              <SecondaryButton disabled={isBusy} onClick={onRefreshStatus} type="button">
-                <ButtonRefreshIcon aria-hidden="true" />
-                <span>{audioStatusState === "checking" ? "Checking..." : "Recheck"}</span>
-              </SecondaryButton>
-              {canUninstall && (
-                <PrimaryDangerButton disabled={isBusy} onClick={() => setUninstallModalOpen(true)} type="button">
-                  <ButtonDeleteIcon aria-hidden="true" />
-                  <span>{audioActionState === "uninstalling" ? "Uninstalling..." : "Uninstall Whisper"}</span>
-                </PrimaryDangerButton>
-              )}
-            </>
-          )}
-        </AudioActionRow>
+        {!isCloudMode && (
+          <AudioActionRow>
+            {!installed && (
+              <PrimaryButton disabled={isBusy} onClick={onDownloadModel} type="button">
+                <ButtonMicIcon aria-hidden="true" />
+                <span>{audioActionState === "downloading" ? "Downloading..." : installLabel}</span>
+              </PrimaryButton>
+            )}
+            <SecondaryButton disabled={isBusy} onClick={onRefreshStatus} type="button">
+              <ButtonRefreshIcon aria-hidden="true" />
+              <span>{audioStatusState === "checking" ? "Checking..." : "Recheck"}</span>
+            </SecondaryButton>
+            {canUninstall && (
+              <PrimaryDangerButton disabled={isBusy} onClick={() => setUninstallModalOpen(true)} type="button">
+                <ButtonDeleteIcon aria-hidden="true" />
+                <span>{audioActionState === "uninstalling" ? "Uninstalling..." : "Uninstall Whisper"}</span>
+              </PrimaryDangerButton>
+            )}
+          </AudioActionRow>
+        )}
       </AudioSetupPanel>
 
       {isUninstallModalOpen && (

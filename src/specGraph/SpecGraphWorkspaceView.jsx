@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
 import styled from "styled-components";
+import { createWorkspaceDisplayIdentity } from "../workspace/workspaceDisplayIdentity.js";
 import GraphRendererHost from "./renderers/GraphRendererHost.jsx";
 import {
   field,
@@ -27,6 +28,10 @@ export default function SpecGraphWorkspaceView({
   workspace,
 }) {
   const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const workspaceDisplayIdentity = useMemo(
+    () => createWorkspaceDisplayIdentity(repoPath, workspace?.name || "Workspace"),
+    [repoPath, workspace?.name],
+  );
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [state, setState] = useState("idle");
@@ -117,10 +122,15 @@ export default function SpecGraphWorkspaceView({
     if (showLocalIgnored) loadLocalIgnoredOverlay();
   }, [loadLocalIgnoredOverlay, showLocalIgnored]);
 
-  const baseSpecGraph = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
+  const baseSpecGraph = useMemo(
+    () => normalizeSnapshot(snapshot, { workspaceDisplayIdentity }),
+    [snapshot, workspaceDisplayIdentity],
+  );
   const specGraph = useMemo(
-    () => mergeLocalIgnoredOverlay(baseSpecGraph, localIgnoredOverlay, showLocalIgnored),
-    [baseSpecGraph, localIgnoredOverlay, showLocalIgnored],
+    () => mergeLocalIgnoredOverlay(baseSpecGraph, localIgnoredOverlay, showLocalIgnored, {
+      workspaceDisplayIdentity,
+    }),
+    [baseSpecGraph, localIgnoredOverlay, showLocalIgnored, workspaceDisplayIdentity],
   );
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
   const localIgnoredCount = Array.isArray(localIgnoredOverlay?.nodes)
@@ -189,7 +199,7 @@ function SpecInspector({ node }) {
   return (
     <Inspector>
       <InspectorHeader>
-        <h2>{node.title}</h2>
+        <h2>{node.display_title || node.displayTitle || node.title}</h2>
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
           {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}

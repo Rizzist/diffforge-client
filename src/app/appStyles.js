@@ -13,6 +13,7 @@ import { Description } from "@styled-icons/material-rounded/Description";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { FolderOpen } from "@styled-icons/material-rounded/FolderOpen";
+import { Fullscreen } from "@styled-icons/material-rounded/Fullscreen";
 import { FullscreenExit } from "@styled-icons/material-rounded/FullscreenExit";
 import { Hub } from "@styled-icons/material-rounded/Hub";
 import { Key } from "@styled-icons/material-rounded/Key";
@@ -26,6 +27,8 @@ import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
+import { HorizontalSplit } from "@styled-icons/material-rounded/HorizontalSplit";
+import { VerticalSplit } from "@styled-icons/material-rounded/VerticalSplit";
 
 export const TITLE_BAR_HEIGHT = "34px";
 export const VIEW_TRANSITION_MS = 170;
@@ -1524,31 +1527,6 @@ export const WorkspaceLabel = styled.div`
   }
 `;
 
-export const WorkspaceRailMeta = styled.div`
-  display: flex;
-  min-width: 0;
-  gap: 5px;
-  overflow: hidden;
-
-  span {
-    display: inline-flex;
-    min-width: 0;
-    max-width: 74px;
-    align-items: center;
-    overflow: hidden;
-    padding: 2px 6px;
-    border: 1px solid rgba(230, 236, 245, 0.08);
-    border-radius: 6px;
-    color: var(--forge-text-muted);
-    background: rgba(230, 236, 245, 0.035);
-    font-size: 10px;
-    font-weight: 760;
-    line-height: 1;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-`;
-
 export const WorkspaceSettingsButton = styled.button`
   position: absolute;
   top: 50%;
@@ -1561,9 +1539,9 @@ export const WorkspaceSettingsButton = styled.button`
   border-radius: 8px;
   color: var(--forge-text-muted);
   background: rgba(7, 9, 13, 0.74);
-  opacity: 0.72;
-  pointer-events: auto;
-  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(4px, -50%);
   transition:
     opacity 160ms ease,
     color 160ms ease,
@@ -1585,6 +1563,7 @@ export const WorkspaceSettingsButton = styled.button`
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
     opacity: 1;
+    pointer-events: auto;
     transform: translateY(-50%);
   }
 `;
@@ -1951,6 +1930,10 @@ export const WorkspaceTerminalPanels = styled.div`
   ${TerminalWorkspaceSurface} {
     min-height: 0;
   }
+
+  &[data-terminal-fullscreen="true"] {
+    background: ${TERMINAL_THEME_BACKGROUND};
+  }
 `;
 
 export const ResizePanelGroup = styled(Group)`
@@ -1974,6 +1957,20 @@ export const ResizePanel = styled(Panel)`
   &[data-terminal-leaf="true"] {
     min-width: ${TERMINAL_PANE_MIN_WIDTH_PX}px;
   }
+
+  &[data-terminal-fullscreen-hidden="true"] {
+    display: none !important;
+    flex: 0 0 0 !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden;
+  }
+
+  &[data-terminal-fullscreen-active="true"] {
+    flex: 1 1 100% !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+  }
 `;
 
 export const ResizeHandle = styled(Separator)`
@@ -1995,6 +1992,10 @@ export const ResizeHandle = styled(Separator)`
     height: 5px;
     margin: -2px 0;
     cursor: row-resize;
+  }
+
+  ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
+    display: none !important;
   }
 
   &::after {
@@ -2501,93 +2502,56 @@ export const TerminalClosingOverlay = styled.div`
 
 export const TerminalRestartPill = styled.div`
   position: absolute;
-  top: 10px;
+  top: 5px;
   left: 50%;
   z-index: 80;
   display: inline-flex;
   max-width: calc(100% - 24px);
-  min-height: 38px;
+  height: 26px;
+  min-height: 26px;
   align-items: center;
-  gap: 4px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  gap: 2px;
+  padding: 2px 5px;
+  border: 0;
   border-radius: 999px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02)),
-    rgba(6, 9, 16, 0.88);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.34);
+  background: rgba(65, 71, 82, 0.58);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
   transform: translateX(-50%);
-  backdrop-filter: blur(16px);
+  backdrop-filter: blur(10px);
 `;
 
 export const TerminalAgentIdBadge = styled.span`
-  --agent-id-bg: rgba(143, 157, 183, 0.1);
-  --agent-id-border: rgba(143, 157, 183, 0.28);
-  --agent-id-text: #e8eef8;
   --terminal-slot-accent: #62a0ff;
 
-  position: relative;
   display: inline-flex;
-  width: 38px;
-  height: 30px;
+  width: 10px;
+  height: 10px;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
   overflow: hidden;
-  border: 1px solid var(--agent-id-border);
+  border: 1px solid rgba(255, 255, 255, 0.34);
   border-radius: 999px;
-  color: var(--agent-id-text);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.015)),
-    var(--agent-id-bg);
-  font-family:
-    "Cascadia Mono",
-    "SFMono-Regular",
-    Consolas,
-    monospace;
-  font-size: 11px;
-  font-weight: 950;
-  letter-spacing: 0;
+  color: transparent;
+  background: var(--terminal-slot-accent);
+  font-size: 0;
   line-height: 1;
-  text-transform: uppercase;
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.035),
-    0 0 18px rgba(0, 0, 0, 0.22);
-
-  &::after {
-    position: absolute;
-    right: 8px;
-    bottom: 4px;
-    left: 8px;
-    height: 2px;
-    border-radius: 999px;
-    background: var(--terminal-slot-accent);
-    box-shadow: 0 0 10px var(--terminal-slot-accent);
-    content: "";
-  }
+  box-shadow: 0 0 10px var(--terminal-slot-accent);
 
   &[data-agent="codex"] {
-    --agent-id-bg: rgba(47, 128, 255, 0.14);
-    --agent-id-border: rgba(98, 160, 255, 0.44);
-    --agent-id-text: #d9e7ff;
+    border-color: rgba(170, 203, 255, 0.46);
   }
 
   &[data-agent="claude"] {
-    --agent-id-bg: rgba(255, 122, 24, 0.13);
-    --agent-id-border: rgba(255, 157, 72, 0.44);
-    --agent-id-text: #ffd1a1;
+    border-color: rgba(255, 199, 142, 0.5);
   }
 
   &[data-agent="opencode"] {
-    --agent-id-bg: rgba(37, 211, 154, 0.13);
-    --agent-id-border: rgba(67, 229, 176, 0.42);
-    --agent-id-text: #baf8df;
+    border-color: rgba(155, 250, 211, 0.46);
   }
 
   &[data-agent="generic"] {
-    --agent-id-bg: rgba(143, 157, 183, 0.12);
-    --agent-id-border: rgba(143, 157, 183, 0.34);
-    --agent-id-text: #dbe4ee;
+    border-color: rgba(220, 228, 239, 0.44);
   }
 
   &[data-slot="1"] {
@@ -2684,54 +2648,56 @@ export const TerminalProjectBadge = styled.div`
 
 export const TerminalRestartButton = styled.button`
   display: inline-flex;
-  width: 30px;
-  height: 30px;
+  width: 22px;
+  height: 22px;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
   padding: 0;
-  border: 1px solid rgba(47, 128, 255, 0.34);
+  border: 0;
   border-radius: 999px;
-  color: #d9e7ff;
-  background: rgba(47, 128, 255, 0.16);
+  color: rgba(255, 255, 255, 0.82);
+  background: transparent;
   font-size: 11px;
   font-weight: 900;
   cursor: pointer;
   transition:
-    border-color 160ms ease,
-    background 160ms ease,
+    color 160ms ease,
+    opacity 160ms ease,
     transform 160ms ease;
 
   svg {
-    width: 14px;
-    height: 14px;
+    width: 15px;
+    height: 15px;
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(98, 160, 255, 0.58);
-    background: rgba(47, 128, 255, 0.26);
+    color: #fff;
     transform: translateY(-1px);
+  }
+
+  &:focus-visible {
+    color: #fff;
+    outline: none;
+    filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.28));
   }
 
   &:disabled {
     cursor: not-allowed;
-    opacity: 0.48;
+    opacity: 0.3;
     transform: none;
   }
 `;
 
 export const TerminalCloseButton = styled(TerminalRestartButton)`
-  border-color: rgba(255, 255, 255, 0.12);
-  color: #9aa5b5;
-  background: rgba(255, 255, 255, 0.045);
+  color: rgba(255, 255, 255, 0.58);
 
   &:hover:not(:disabled) {
-    border-color: rgba(255, 255, 255, 0.2);
-    background: rgba(255, 255, 255, 0.07);
+    color: #fff;
   }
 
   &:disabled {
-    opacity: 0.42;
+    opacity: 0.28;
   }
 `;
 
@@ -4510,6 +4476,12 @@ export const AudioDeviceSelect = styled.select`
     outline: none;
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
+
+  &:disabled {
+    color: var(--forge-text-muted);
+    cursor: not-allowed;
+    opacity: 0.72;
+  }
 `;
 
 const audioInputBarFlow = keyframes`
@@ -5438,6 +5410,55 @@ export const McpTitleRow = styled.div`
   }
 `;
 
+export const McpHeaderMetrics = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+`;
+
+export const McpMetricPill = styled.span`
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: rgba(21, 27, 35, 0.62);
+  font-size: 10px;
+  font-weight: 780;
+  white-space: nowrap;
+
+  strong {
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  span {
+    color: inherit;
+    font-size: 10px;
+    font-weight: 780;
+    text-transform: uppercase;
+  }
+
+  &[data-state="enabled"] {
+    border-color: rgba(59, 130, 246, 0.3);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  &[data-state="blocked"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    color: #ffb4b4;
+    background: rgba(239, 107, 107, 0.1);
+  }
+`;
+
 export const McpStatsGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -5615,6 +5636,12 @@ export const McpStatusBadge = styled.span`
     border-color: var(--forge-border);
     color: var(--forge-text-muted);
     background: rgba(21, 27, 35, 0.72);
+  }
+
+  &[data-state="blocked"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    color: #ffb4b4;
+    background: rgba(239, 107, 107, 0.1);
   }
 `;
 
@@ -5840,6 +5867,32 @@ export const McpAccessTopline = styled.div`
   }
 `;
 
+export const McpToolList = styled.div`
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+  flex-wrap: wrap;
+`;
+
+export const McpToolChip = styled.span`
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid rgba(125, 160, 205, 0.18);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: rgba(13, 17, 23, 0.48);
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  font-size: 11px;
+  font-weight: 760;
+  white-space: nowrap;
+`;
+
 export const McpInlineActions = styled.span`
   display: inline-flex;
   gap: 5px;
@@ -5920,6 +5973,90 @@ export const McpEmptyAccess = styled.p`
   background: rgba(21, 27, 35, 0.48);
   font-size: 12px;
   font-weight: 650;
+`;
+
+export const McpIdentityStatusLine = styled.div`
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 30px;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: rgba(13, 17, 23, 0.46);
+
+  strong {
+    overflow: hidden;
+    color: inherit;
+    font-size: 12px;
+    font-weight: 860;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-state="enabled"] {
+    border-color: rgba(59, 130, 246, 0.28);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  &[data-state="blocked"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    color: #ffb4b4;
+    background: rgba(239, 107, 107, 0.1);
+  }
+`;
+
+export const McpMountList = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+`;
+
+export const McpMountRow = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 34px;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(125, 160, 205, 0.14);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.36);
+
+  ${TerminalAgentIdBadge} {
+    justify-self: center;
+  }
+`;
+
+export const McpMountCopy = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 820;
+  }
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 720;
+    text-transform: uppercase;
+  }
 `;
 
 export const McpScopePreview = styled.div`
@@ -7684,6 +7821,22 @@ export const TitleCloseIcon = styled(Close)`
 `;
 
 export const ButtonRefreshIcon = styled(Refresh)`
+  ${buttonIconSize}
+`;
+
+export const ButtonSplitHorizontalIcon = styled(HorizontalSplit)`
+  ${buttonIconSize}
+`;
+
+export const ButtonSplitVerticalIcon = styled(VerticalSplit)`
+  ${buttonIconSize}
+`;
+
+export const ButtonFullscreenIcon = styled(Fullscreen)`
+  ${buttonIconSize}
+`;
+
+export const ButtonFullscreenExitIcon = styled(FullscreenExit)`
   ${buttonIconSize}
 `;
 

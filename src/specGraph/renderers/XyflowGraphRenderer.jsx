@@ -296,7 +296,8 @@ function SpecGraphNode({ data, selected }) {
   const liveAgentCount = liveAgents.length;
   const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
   const active = Boolean(selected || data.selected);
-  const path = text(node.path);
+  const title = text(node.display_title || node.displayTitle || node.title);
+  const path = text(node.display_path || node.displayPath || node.path);
   const leased = isLeasedFileNode(node);
   const worktree = isWorktreeFileNode(node);
 
@@ -348,7 +349,7 @@ function SpecGraphNode({ data, selected }) {
       {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
       {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
       <NodeKindLabel $kind={kind}>{isUnspecifiedStructuralNode(node) ? "no spec" : leased ? "leased" : kind}</NodeKindLabel>
-      <NodeTitle $kind={kind}>{node.title}</NodeTitle>
+      <NodeTitle $kind={kind} title={title}>{title}</NodeTitle>
       {path && kind !== "workspace" && <NodePath>{path}</NodePath>}
     </FlowNodeCard>
   );

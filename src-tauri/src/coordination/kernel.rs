@@ -3961,7 +3961,9 @@ impl CoordinationKernel {
 
     pub fn mcp_client_mount_summary(&self) -> Result<Value, String> {
         let sessions = self.query_json(
-            "SELECT s.*, a.name AS agent_name, sl.slot_key
+            "SELECT s.*, COALESCE(sl.agent_name, a.name) AS agent_name,
+                    COALESCE(sl.agent_kind, a.kind) AS agent_kind,
+                    sl.slot_key
              FROM agent_sessions s
              LEFT JOIN agents a ON a.id = s.agent_id
              LEFT JOIN agent_slots sl ON sl.id = s.agent_slot_id
@@ -4019,6 +4021,7 @@ impl CoordinationKernel {
                 "session_id": session_id,
                 "agent_id": session["agent_id"].clone(),
                 "agent_name": session["agent_name"].clone(),
+                "agent_kind": session["agent_kind"].clone(),
                 "agent_slot_id": session["agent_slot_id"].clone(),
                 "slot_key": session["slot_key"].clone(),
                 "worktree_id": session["worktree_id"].clone(),

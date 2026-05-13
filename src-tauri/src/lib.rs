@@ -92,6 +92,8 @@ const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
+const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "windows-terminal-diagnostics.jsonl";
 const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
@@ -119,6 +121,7 @@ const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
 const WHISPER_RUNTIME_PACKAGE_NAME: &str = "whisper.cpp v1.8.4 x64";
@@ -220,6 +223,10 @@ struct TerminalDiagnosticState {
     enabled: AtomicBool,
 }
 
+struct WindowsTerminalDiagnosticState {
+    enabled: AtomicBool,
+}
+
 impl TerminalDiagnosticState {
     fn new() -> Self {
         Self {
@@ -229,6 +236,18 @@ impl TerminalDiagnosticState {
 
     fn is_enabled(&self) -> bool {
         TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || self.enabled.load(Ordering::Relaxed)
+    }
+}
+
+impl WindowsTerminalDiagnosticState {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || self.enabled.load(Ordering::Relaxed)
     }
 }
 
@@ -1097,6 +1116,48 @@ fn terminal_diagnostic_log_path() -> PathBuf {
     PathBuf::from(DIAGNOSTIC_LOG_DIR).join(TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
 
+fn windows_terminal_diagnostic_log_path() -> PathBuf {
+    if let Ok(path) = env::var("DIFFFORGE_WINDOWS_TERMINAL_DIAGNOSTIC_LOG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        if current_dir.join("package.json").is_file()
+            || current_dir.join("src-tauri").is_dir()
+            || current_dir.join(".git").is_dir()
+        {
+            return current_dir
+                .join(DIAGNOSTIC_LOG_DIR)
+                .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
+        }
+    }
+
+    let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = tauri_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(tauri_root);
+
+    if project_root.exists() {
+        return project_root
+            .join(DIAGNOSTIC_LOG_DIR)
+            .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
+    }
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            return exe_dir
+                .join(DIAGNOSTIC_LOG_DIR)
+                .join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE);
+        }
+    }
+
+    PathBuf::from(DIAGNOSTIC_LOG_DIR).join(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
+}
+
 fn clean_terminal_diagnostic_log_text(value: &str) -> String {
     value
         .replace(|character: char| character.is_control(), " ")
@@ -1124,6 +1185,32 @@ fn write_terminal_diagnostic_log_entry(entry: Value) {
     }
 
     let lock = TERMINAL_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn write_windows_terminal_diagnostic_log_entry(entry: Value) {
+    let log_path = windows_terminal_diagnostic_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
     let Ok(_guard) = lock.lock() else {
         return;
     };
@@ -1197,6 +1284,52 @@ fn terminal_diagnostic_log(
     }
 
     write_terminal_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn windows_terminal_set_diagnostic_logging(
+    state: State<'_, WindowsTerminalDiagnosticState>,
+    enabled: bool,
+) -> bool {
+    let resolved_enabled = WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || enabled;
+    state.enabled.store(resolved_enabled, Ordering::Relaxed);
+
+    if resolved_enabled {
+        write_windows_terminal_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.windows_terminal_diagnostic_logging.enabled",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "log_file": windows_terminal_diagnostic_log_path().display().to_string(),
+            },
+        }));
+    }
+
+    resolved_enabled
+}
+
+#[tauri::command]
+fn windows_terminal_diagnostic_log(
+    state: State<'_, WindowsTerminalDiagnosticState>,
+    phase: String,
+    fields: Value,
+) -> Result<(), String> {
+    if !state.is_enabled() {
+        return Ok(());
+    }
+
+    write_windows_terminal_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
         "source": "frontend",
@@ -1444,6 +1577,7 @@ pub fn run() {
             next_terminal_instance_id: AtomicU64::new(1),
         })
         .manage(TerminalDiagnosticState::new())
+        .manage(WindowsTerminalDiagnosticState::new())
         .manage(CloudMcpState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
@@ -1547,6 +1681,8 @@ pub fn run() {
             terminal_write,
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,
+            windows_terminal_set_diagnostic_logging,
+            windows_terminal_diagnostic_log,
             terminal_delete_selection,
             terminal_cancel_parked_task,
             terminal_interrupt_agent,

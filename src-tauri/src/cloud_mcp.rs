@@ -3075,6 +3075,24 @@ fn cloud_mcp_spec_graph_sync_request(
     }
 }
 
+fn cloud_mcp_repo_display_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| workspace_path_display(root))
+}
+
+fn cloud_mcp_repo_display_root(root: &Path) -> String {
+    let name = cloud_mcp_repo_display_name(root);
+    if name.trim().is_empty() {
+        "Workspace".to_string()
+    } else {
+        format!("/{name}")
+    }
+}
+
 fn cloud_mcp_spec_graph_cache_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("spec-graph")
 }
@@ -3209,6 +3227,8 @@ fn cloud_mcp_local_ignored_overlay_node(
 fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value, String> {
     let repo_id = cloud_mcp_repo_id_for_root(root);
     let root_display = workspace_path_display(root);
+    let repo_name = cloud_mcp_repo_display_name(root);
+    let display_root = cloud_mcp_repo_display_root(root);
     let cache_path = cloud_mcp_local_ignored_overlay_cache_path(root);
     let candidates = cloud_mcp_local_ignored_whitelist_candidates(root);
     let signatures = candidates
@@ -3235,6 +3255,8 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
         if let Some(object) = cached.as_object_mut() {
             object.insert("cache_hit".to_string(), json!(true));
             object.insert("cache_path".to_string(), json!(workspace_path_display(&cache_path)));
+            object.insert("repo_name".to_string(), json!(repo_name.clone()));
+            object.insert("display_root".to_string(), json!(display_root.clone()));
         }
         return Ok(cached);
     }
@@ -3254,6 +3276,8 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
         "cache_path": workspace_path_display(&cache_path),
         "repo_id": repo_id,
         "repo_path": root_display,
+        "repo_name": repo_name,
+        "display_root": display_root,
         "allowed_paths": ["AGENTS.md", "CLAUDE.md", ".mcp.json", ".gitignore", ".agents", ".codex"],
         "nodes": nodes,
         "edges": [],
@@ -3299,6 +3323,8 @@ fn cloud_mcp_spec_graph_snapshot_from_data(
     sync_state: &str,
     sync_error: &str,
 ) -> Value {
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
     let nodes = data.get("nodes").cloned().unwrap_or_else(|| json!([]));
     let edges = data.get("edges").cloned().unwrap_or_else(|| json!([]));
     let agent_work = data.get("agent_work").cloned().unwrap_or_else(|| json!({}));
@@ -3334,6 +3360,13 @@ fn cloud_mcp_spec_graph_snapshot_from_data(
         "ok": true,
         "repoId": req.repo_id.clone(),
         "repoPath": req.root_display.clone(),
+        "repoName": repo_name.clone(),
+        "displayRoot": display_root.clone(),
+        "workspaceDisplay": {
+            "repoName": repo_name,
+            "displayRoot": display_root,
+            "repoPath": req.root_display.clone(),
+        },
         "workspaceId": req.workspace_id.clone(),
         "workspaceName": req.workspace_name.clone(),
         "cachePath": workspace_path_display(cache_path),
@@ -3377,9 +3410,21 @@ fn cloud_mcp_stamp_spec_graph_snapshot(
         );
     }
     if let Some(object) = snapshot.as_object_mut() {
+        let repo_name = cloud_mcp_repo_display_name(&req.root);
+        let display_root = cloud_mcp_repo_display_root(&req.root);
         object.insert("ok".to_string(), json!(true));
         object.insert("repoId".to_string(), json!(req.repo_id.clone()));
         object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+        object.insert("repoName".to_string(), json!(repo_name.clone()));
+        object.insert("displayRoot".to_string(), json!(display_root.clone()));
+        object.insert(
+            "workspaceDisplay".to_string(),
+            json!({
+                "repoName": repo_name,
+                "displayRoot": display_root,
+                "repoPath": req.root_display.clone(),
+            }),
+        );
         object.insert("workspaceId".to_string(), json!(req.workspace_id.clone()));
         object.insert(
             "workspaceName".to_string(),
@@ -3659,10 +3704,14 @@ fn cloud_mcp_apply_spec_graph_delta(
 }
 
 fn cloud_mcp_spec_graph_sync_payload(req: &CloudMcpSpecGraphSyncRequest, cache: &Value) -> Value {
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
     json!({
         "source": "rust-diffforge-spec-graph-cache",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
+        "repo_name": repo_name,
+        "display_root": display_root,
         "agent_id": "rust-diffforge",
         "self_agent_id": "rust-diffforge",
         "current_agent_id": "rust-diffforge",
@@ -3687,10 +3736,14 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
     req: &CloudMcpSpecGraphSyncRequest,
 ) -> Result<Value, String> {
     cloud_mcp_connected_or_connect(state).await?;
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
     let payload = json!({
         "source": "rust-diffforge-spec-graph",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
+        "repo_name": repo_name,
+        "display_root": display_root,
         "agent_id": "rust-diffforge",
         "self_agent_id": "rust-diffforge",
         "current_agent_id": "rust-diffforge",

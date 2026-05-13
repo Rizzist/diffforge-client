@@ -1,3 +1,12 @@
+import {
+  createWorkspaceDisplayIdentity,
+  getWorkspacePathDisplayLabel,
+  isWorkspacePathLike,
+  normalizeWorkspacePathSeparators,
+  workspacePathLeaf,
+  workspaceRelativePath,
+} from "../workspace/workspaceDisplayIdentity.js";
+
 export const NODE_DIMENSIONS = {
   workspace: { width: 172, height: 172 },
   folder: { width: 150, height: 92 },
@@ -72,6 +81,53 @@ function jsonArray(value) {
 
 function metadata(item) {
   return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
+}
+
+function displayTitleForNode(title, path, nodeType, displayIdentity) {
+  if (isWorkspaceNodeType(nodeType)) {
+    return displayIdentity?.repoName
+      ? displayIdentity.displayRoot
+      : getWorkspacePathDisplayLabel(title, { fallback: "Workspace", includeChildPath: false });
+  }
+
+  const normalizedTitle = normalizeWorkspacePathSeparators(title);
+  const absoluteTitle = /^(?:[A-Za-z]:\/|\/|\/\/|~\/)/.test(normalizedTitle)
+    || normalizedTitle.includes("/.agents/");
+
+  if ((isFileNodeType(nodeType) || isFolderNodeType(nodeType)) && isWorkspacePathLike(title)) {
+    return workspacePathLeaf(title) || title;
+  }
+
+  if (absoluteTitle) {
+    return getWorkspacePathDisplayLabel(title, {
+      identity: displayIdentity,
+      includeChildPath: true,
+    });
+  }
+
+  if (!title && path) {
+    return workspacePathLeaf(path) || path;
+  }
+
+  return title;
+}
+
+function displayPathForNode(path, title, nodeType, displayIdentity) {
+  const source = text(path) || (isWorkspacePathLike(title) ? title : "");
+  if (!source || isWorkspaceNodeType(nodeType)) return "";
+
+  const relative = workspaceRelativePath(source, displayIdentity);
+  if (relative !== null) return relative;
+
+  const normalized = normalizeWorkspacePathSeparators(source).replace(/^\.\/+/, "");
+  if (/^(?:[A-Za-z]:\/|\/|\/\/|~\/)/.test(normalized)) {
+    return workspacePathLeaf(normalized) || getWorkspacePathDisplayLabel(normalized, {
+      fallback: "",
+      includeChildPath: false,
+    });
+  }
+
+  return normalized;
 }
 
 export function isFileNodeType(nodeType) {
@@ -201,11 +257,15 @@ export function liveAgentsFor(node) {
   return Array.from({ length: Math.max(0, count) }, (_, index) => ({ id: `live-agent-${index}` }));
 }
 
-function normalizeNode(raw, index = 0) {
+function normalizeNode(raw, index = 0, options = {}) {
+  const displayIdentity = options.workspaceDisplayIdentity || createWorkspaceDisplayIdentity(options.repoPath || "");
   const meta = metadata(raw);
   const id = text(field(raw, "id", "node_id", "nodeId", "task_id", "taskId"), `spec-${index}`);
   const title = text(field(raw, "title", "summary"), "Untitled spec");
   const nodeType = text(field(raw, "node_type", "nodeType", "type"), "feature").toLowerCase();
+  const path = text(field(raw, "path") || field(meta, "path"));
+  const displayTitle = displayTitleForNode(title, path, nodeType, displayIdentity);
+  const displayPath = displayPathForNode(path, title, nodeType, displayIdentity);
   const summary = text(field(raw, "summary", "current_summary", "body", "description"), "");
   const purpose = text(field(raw, "purpose"), summary || "Intentional behavior captured from prompts, checkpoints, and patch history.");
   const rawMarkdown = field(raw, "markdown");
@@ -247,8 +307,12 @@ function normalizeNode(raw, index = 0) {
     ...raw,
     id,
     title,
+    display_title: displayTitle,
+    display_path: displayPath,
+    displayTitle,
+    displayPath,
     node_type: nodeType,
-    path: text(field(raw, "path") || field(meta, "path")),
+    path,
     summary,
     purpose,
     freshness_state: freshnessState,
@@ -327,14 +391,20 @@ export function splitSpecHistory(activeSpecs, supersededSpecs) {
   };
 }
 
-export function normalizeSnapshot(snapshot) {
+export function normalizeSnapshot(snapshot, options = {}) {
+  const displayIdentity = options.workspaceDisplayIdentity || createWorkspaceDisplayIdentity(
+    options.repoPath || snapshot?.repoPath || snapshot?.repo_path || "",
+    options.fallbackWorkspaceName || snapshot?.workspaceName || snapshot?.workspace_name || "Workspace",
+  );
   const matrix = snapshot?.specGraph || snapshot?.raw || {};
   const specNodes = Array.isArray(snapshot?.specNodes)
     ? snapshot.specNodes
     : Array.isArray(matrix?.nodes)
       ? matrix.nodes
       : [];
-  const nodes = specNodes.map((node, index) => normalizeNode(node, index));
+  const nodes = specNodes.map((node, index) => normalizeNode(node, index, {
+    workspaceDisplayIdentity: displayIdentity,
+  }));
   const edgeSource = Array.isArray(snapshot?.specEdges)
     ? snapshot.specEdges
     : Array.isArray(matrix?.edges)
@@ -362,10 +432,11 @@ export function normalizeSnapshot(snapshot) {
     edges,
     agentWork: snapshot?.agentWork || matrix?.agent_work || {},
     graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
+    workspaceDisplayIdentity: displayIdentity,
   };
 }
 
-export function mergeLocalIgnoredOverlay(graph, overlay, enabled) {
+export function mergeLocalIgnoredOverlay(graph, overlay, enabled, options = {}) {
   if (!enabled || !overlay || typeof overlay !== "object") return graph;
   const overlayNodes = Array.isArray(overlay.nodes) ? overlay.nodes : [];
   if (!overlayNodes.length) return graph;
@@ -373,7 +444,9 @@ export function mergeLocalIgnoredOverlay(graph, overlay, enabled) {
   const existingPaths = new Set(graph.nodes.map((node) => text(node.path)).filter(Boolean));
   const existingIds = new Set(graph.nodes.map((node) => node.id));
   const localNodes = overlayNodes
-    .map((node, index) => normalizeNode(node, graph.nodes.length + index))
+    .map((node, index) => normalizeNode(node, graph.nodes.length + index, {
+      workspaceDisplayIdentity: options.workspaceDisplayIdentity || graph.workspaceDisplayIdentity,
+    }))
     .filter((node) => node.id && !existingIds.has(node.id))
     .filter((node) => {
       const path = text(node.path);
