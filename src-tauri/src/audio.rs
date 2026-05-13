@@ -8,7 +8,7 @@ fn whisper_local_audio_log_path() -> PathBuf {
         .unwrap_or(tauri_root);
 
     project_root
-        .join(TERMINAL_TELEMETRY_LOG_DIR)
+        .join(DIAGNOSTIC_LOG_DIR)
         .join(WHISPER_LOCAL_AUDIO_LOG_FILE)
 }
 
@@ -415,7 +415,8 @@ fn native_audio_error_message(error: impl std::fmt::Display) -> String {
     if lowercase.contains("permission") || lowercase.contains("denied") {
         "Diff Forge cannot access that input through the operating system right now. Check system microphone access, then use Enable input here.".to_string()
     } else if lowercase.contains("not found") || lowercase.contains("no input") {
-        "That input source is not available. Choose another microphone and refresh sources.".to_string()
+        "That input source is not available. Choose another microphone and refresh sources."
+            .to_string()
     } else if lowercase.contains("busy")
         || lowercase.contains("in use")
         || lowercase.contains("could not start")
@@ -481,15 +482,17 @@ fn cpal_input_device_by_id(device_id: &str) -> Result<(cpal::Device, String, Str
         return Ok((device, "default".to_string(), label));
     }
 
-    let target_index = device_id
-        .parse::<usize>()
-        .map_err(|_| "That input source is not available. Choose another microphone and refresh sources.".to_string())?;
+    let target_index = device_id.parse::<usize>().map_err(|_| {
+        "That input source is not available. Choose another microphone and refresh sources."
+            .to_string()
+    })?;
     let mut input_devices = host
         .input_devices()
         .map_err(|error| native_audio_error_message(error))?;
-    let device = input_devices
-        .nth(target_index)
-        .ok_or_else(|| "That input source is not available. Choose another microphone and refresh sources.".to_string())?;
+    let device = input_devices.nth(target_index).ok_or_else(|| {
+        "That input source is not available. Choose another microphone and refresh sources."
+            .to_string()
+    })?;
     let label = device
         .name()
         .unwrap_or_else(|_| format!("Microphone {}", target_index + 1));
@@ -594,7 +597,11 @@ fn process_native_audio_samples(
             samples,
             timestamp: now,
         });
-        shared.total_samples += shared.chunks.back().map(|chunk| chunk.samples.len()).unwrap_or(0);
+        shared.total_samples += shared
+            .chunks
+            .back()
+            .map(|chunk| chunk.samples.len())
+            .unwrap_or(0);
         native_audio_trim(&mut shared);
 
         if shared.capture_started_at.is_some() {
@@ -886,7 +893,8 @@ fn finish_native_whisper_audio_capture(
     } else {
         captured_samples
     };
-    let audio_ms = ((bounded_samples.len() as f64 / shared.sample_rate as f64) * 1000.0).round() as u64;
+    let audio_ms =
+        ((bounded_samples.len() as f64 / shared.sample_rate as f64) * 1000.0).round() as u64;
     let resample_started_at = Instant::now();
     let resampled = match resample_whisper_audio_to_16khz(&bounded_samples, shared.sample_rate) {
         Ok(samples) => samples,
@@ -1175,8 +1183,9 @@ fn begin_native_audio_capture_for_session(
     session: Option<&NativeAudioSession>,
 ) -> Result<(), String> {
     let started_at = Instant::now();
-    let session = session
-        .ok_or_else(|| "Choose and enable a microphone in the Audio tab before recording.".to_string())?;
+    let session = session.ok_or_else(|| {
+        "Choose and enable a microphone in the Audio tab before recording.".to_string()
+    })?;
     let mut shared = session
         .shared
         .lock()
@@ -1185,8 +1194,8 @@ fn begin_native_audio_capture_for_session(
     let capture_started_at = now
         .checked_sub(Duration::from_millis(AUDIO_CAPTURE_PREROLL_MS))
         .unwrap_or(now);
-    let buffered_ms = ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0)
-        .round() as u64;
+    let buffered_ms =
+        ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0).round() as u64;
     let realtime_audio_tx = shared.realtime_audio_tx.clone();
     let mut preroll_audio = Vec::new();
     let mut preroll_chunk_count = 0u64;
@@ -1248,8 +1257,9 @@ fn finish_native_audio_capture_for_session(
     session: Option<&NativeAudioSession>,
 ) -> Result<AudioInputCaptureResult, String> {
     let started_at = Instant::now();
-    let session = session
-        .ok_or_else(|| "Choose and enable a microphone in the Audio tab before recording.".to_string())?;
+    let session = session.ok_or_else(|| {
+        "Choose and enable a microphone in the Audio tab before recording.".to_string()
+    })?;
     let mut shared = session
         .shared
         .lock()
@@ -1533,8 +1543,10 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
     let model_installed = bytes > 0;
     let runtime_installed = runtime_path.is_some();
     let managed_runtime_installed = managed_runtime_path.is_some();
-    let managed_assets_installed =
-        model_installed || managed_runtime_installed || runtime_directory.exists() || runtime_zip_path.exists();
+    let managed_assets_installed = model_installed
+        || managed_runtime_installed
+        || runtime_directory.exists()
+        || runtime_zip_path.exists();
 
     Ok(WhisperModelStatus {
         installed: model_installed && runtime_installed,
@@ -1548,9 +1560,7 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
         runtime_package_name: WHISPER_RUNTIME_PACKAGE_NAME,
         runtime_path: runtime_path
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| {
-                runtime_directory.display().to_string()
-            }),
+            .unwrap_or_else(|| runtime_directory.display().to_string()),
         runtime_installable: whisper_runtime_installable(),
         managed_runtime_installed,
         managed_assets_installed,
@@ -1708,7 +1718,8 @@ impl WhisperTranscriptPolicy {
         }
 
         if self.suppress_bracketted_markers_max_chars == 0 {
-            self.suppress_bracketted_markers_max_chars = default.suppress_bracketted_markers_max_chars;
+            self.suppress_bracketted_markers_max_chars =
+                default.suppress_bracketted_markers_max_chars;
         }
 
         if self.low_energy_max_chars == 0 {
@@ -1763,25 +1774,29 @@ fn whisper_transcript_policy() -> &'static WhisperTranscriptPolicy {
 
     POLICY.get_or_init(|| {
         let default = WhisperTranscriptPolicy::default();
-        let policy: WhisperTranscriptPolicy = serde_json::from_str(whisper_transcript_policy_path()).unwrap_or_else(|error| {
-            log_whisper_local_audio_event(
-                "whisper.policy.load_failed",
-                None,
-                json!({
-                    "policy_name": &default.name,
-                    "policy_path": "whisper-transcript-policy.json",
-                    "error": clean_whisper_local_audio_log_text(&error.to_string()),
-                }),
-            );
+        let policy: WhisperTranscriptPolicy =
+            serde_json::from_str(whisper_transcript_policy_path()).unwrap_or_else(|error| {
+                log_whisper_local_audio_event(
+                    "whisper.policy.load_failed",
+                    None,
+                    json!({
+                        "policy_name": &default.name,
+                        "policy_path": "whisper-transcript-policy.json",
+                        "error": clean_whisper_local_audio_log_text(&error.to_string()),
+                    }),
+                );
 
-            default
-        });
+                default
+            });
 
         policy.merged_with_default()
     })
 }
 
-fn is_low_energy_capture(policy: &WhisperTranscriptPolicy, request: &WhisperTranscriptionRequest) -> bool {
+fn is_low_energy_capture(
+    policy: &WhisperTranscriptPolicy,
+    request: &WhisperTranscriptionRequest,
+) -> bool {
     let rms = request
         .capture_rms
         .map(|value| value.max(0.0f32))
@@ -1815,7 +1830,11 @@ fn whisper_local_transcript_drop_reason(
     }
 
     let normalized_lower = normalized.to_lowercase();
-    if policy.no_speech_markers.iter().any(|marker| normalized_lower == marker.to_lowercase()) {
+    if policy
+        .no_speech_markers
+        .iter()
+        .any(|marker| normalized_lower == marker.to_lowercase())
+    {
         return Some("no_speech_marker".to_string());
     }
 
@@ -1927,8 +1946,7 @@ fn deepgram_realtime_url(language: &str, sample_rate: u32) -> String {
 }
 
 fn deepgram_error_from_body(body: &Value) -> Option<String> {
-    body
-        .get("err_msg")
+    body.get("err_msg")
         .or_else(|| body.get("message"))
         .or_else(|| body.get("error"))
         .and_then(Value::as_str)
@@ -2255,9 +2273,9 @@ fn transcribe_whisper_audio_for(
 
     if capture.exit_code != Some(0) && text.is_empty() {
         let error = first_output_line(&command_output_text(&capture.stdout, &capture.stderr))
-                .chars()
-                .take(240)
-                .collect::<String>();
+            .chars()
+            .take(240)
+            .collect::<String>();
         log_whisper_local_audio_event(
             "whisper.transcribe.error",
             Some(started_at.elapsed()),
@@ -2991,8 +3009,8 @@ async fn transcribe_whisper_audio(
     tauri::async_runtime::spawn_blocking(move || {
         transcribe_whisper_audio_for(&app, &engine, request, cancel_token, cancel_generation)
     })
-        .await
-        .map_err(|error| format!("Unable to run local Whisper transcription: {error}"))?
+    .await
+    .map_err(|error| format!("Unable to run local Whisper transcription: {error}"))?
 }
 
 #[tauri::command]
@@ -3094,9 +3112,19 @@ async fn run_deepgram_realtime_stream(
 
     if stream_error.is_none() {
         loop {
-            match timeout(Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS), read.next()).await {
+            match timeout(
+                Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
+                read.next(),
+            )
+            .await
+            {
                 Ok(Some(Ok(message))) => {
-                    match handle_deepgram_realtime_message(&app, message, &mut final_segments, &mut latest_interim) {
+                    match handle_deepgram_realtime_message(
+                        &app,
+                        message,
+                        &mut final_segments,
+                        &mut latest_interim,
+                    ) {
                         Ok(true) => break,
                         Ok(false) => {}
                         Err(error) => {
@@ -3125,7 +3153,11 @@ async fn run_deepgram_realtime_stream(
         final_segments.join(" ")
     };
     let segments = if final_segments.is_empty() {
-        if transcript.trim().is_empty() { 0 } else { 1 }
+        if transcript.trim().is_empty() {
+            0
+        } else {
+            1
+        }
     } else {
         final_segments.len()
     };
@@ -3243,7 +3275,9 @@ async fn stop_deepgram_realtime_transcription(
     )
     .await
     .map_err(|_| "Deepgram realtime transcription timed out.".to_string())?
-    .map_err(|_| "Deepgram realtime transcription stopped before a result was returned.".to_string())??;
+    .map_err(|_| {
+        "Deepgram realtime transcription stopped before a result was returned.".to_string()
+    })??;
     log_audio_diagnostic_event(
         "audio.deepgram.stop.done",
         json!({

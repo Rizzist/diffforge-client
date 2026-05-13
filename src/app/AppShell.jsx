@@ -14,7 +14,7 @@ import "@vscode/codicons/dist/codicon.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
-import { TerminalDevMetrics, addTerminalMetrics, getWorkspaceOpenTelemetryFields, patchTerminalMetrics, startWorkspaceOpenTelemetry, useTerminalDevMetrics, writeTerminalTelemetry } from "../terminals/terminalTelemetry.jsx";
+import { TerminalDevMetrics, useTerminalDevMetrics } from "../terminals/terminalTelemetry.jsx";
 import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
@@ -431,13 +431,6 @@ const TERMINAL_WEBGL_IDLE_DELAY_MS = 420;
 const TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS = 80;
 const TERMINAL_WEBGL_STAGGER_MS = 90;
 const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
-const TERMINAL_RENDER_PROBE_AFTER_WRITE_MS = 80;
-const TERMINAL_RENDER_PROBE_AFTER_WEBGL_MS = 140;
-const TERMINAL_RENDER_PROBE_AFTER_RESIZE_MS = 80;
-const TERMINAL_RESIZE_DEBUG_IDLE_MS = 140;
-const TERMINAL_RESIZE_DEBUG_RECENT_MS = 1800;
-const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
-const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const WORKSPACE_CLOSE_TERMINAL_TIMEOUT_MS = 18000;
@@ -805,10 +798,6 @@ function closeErrorMessage(error) {
 async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
   const nativeExitStartedAt = performance.now();
 
-  writeTerminalTelemetry({
-    phase: "frontend.workspace.close_app_exit_start",
-    fields: { method: "native_command" },
-  });
 
   try {
     await withTimeout(
@@ -816,27 +805,13 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
       WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
       "Native app exit timed out.",
     );
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.close_app_exit_done",
-      elapsedMs: performance.now() - nativeExitStartedAt,
-      fields: { method: "native_command" },
-    });
     return;
   } catch (nativeExitError) {
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.close_app_exit_failed",
-      elapsedMs: performance.now() - nativeExitStartedAt,
-      fields: { error: closeErrorMessage(nativeExitError), method: "native_command" },
-    });
   }
 
   const closeStartedAt = performance.now();
   let closeSucceeded = false;
 
-  writeTerminalTelemetry({
-    phase: "frontend.workspace.close_window_start",
-    fields: { method: "close" },
-  });
 
   try {
     await withTimeout(
@@ -844,18 +819,8 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
       WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
       "Window close timed out.",
     );
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.close_window_done",
-      elapsedMs: performance.now() - closeStartedAt,
-      fields: { method: "close" },
-    });
     closeSucceeded = true;
   } catch (closeError) {
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.close_window_close_failed",
-      elapsedMs: performance.now() - closeStartedAt,
-      fields: { error: closeErrorMessage(closeError) },
-    });
 
     if (typeof appWindow.destroy !== "function") {
       throw closeError;
@@ -871,13 +836,6 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
   }
 
   const destroyStartedAt = performance.now();
-  writeTerminalTelemetry({
-    phase: "frontend.workspace.close_window_destroy_start",
-    fields: {
-      closeSucceeded,
-      method: "destroy",
-    },
-  });
 
   try {
     await withTimeout(
@@ -886,26 +844,9 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
       "Window destroy timed out.",
     );
   } catch (destroyError) {
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.close_window_destroy_failed",
-      elapsedMs: performance.now() - destroyStartedAt,
-      fields: {
-        closeSucceeded,
-        error: closeErrorMessage(destroyError),
-        method: "destroy",
-      },
-    });
     throw destroyError;
   }
 
-  writeTerminalTelemetry({
-    phase: "frontend.workspace.close_window_destroy_done",
-    elapsedMs: performance.now() - destroyStartedAt,
-    fields: {
-      closeSucceeded,
-      method: "destroy",
-    },
-  });
 }
 
 async function readWindowFrameState(appWindow = getSafeCurrentWindow()) {
@@ -1715,14 +1656,6 @@ export default function App() {
       return;
     }
 
-    writeTerminalTelemetry({
-      phase: "frontend.agent_status.cache_hit",
-      fields: {
-        authenticatedCount: agentStatuses.filter((agent) => agent.cached && agent.authenticated).length,
-        installedCount: agentStatuses.filter((agent) => agent.cached && agent.installed).length,
-        statusCount: agentStatuses.filter((agent) => agent.cached).length,
-      },
-    });
   }, []);
 
   useEffect(() => {
@@ -1894,15 +1827,6 @@ export default function App() {
     window.clearTimeout(viewTransitionTimeoutRef.current);
     setWorkspaceSettingsModalId("");
     if (nextView === DEFAULT_WORKSPACE_VIEW && telemetryWorkspaceId) {
-      startWorkspaceOpenTelemetry({
-        source: telemetrySource,
-        workspaceId: telemetryWorkspaceId,
-        fields: {
-          activeView,
-          nextView,
-          visibleView,
-        },
-      });
     }
     setActiveView(nextView);
     setViewMotion("exiting");
@@ -1954,14 +1878,6 @@ export default function App() {
     const nextDefaultWorkspaceId = nextDefaultWorkspace?.id || "";
 
     updateWorkspaceLifecycleSettings({ defaultWorkspaceId: nextDefaultWorkspaceId });
-    writeTerminalTelemetry({
-      paneId: nextDefaultWorkspaceId,
-      phase: "frontend.workspace.auto_activate_workspace_set",
-      fields: {
-        defaultWorkspaceId: nextDefaultWorkspaceId,
-        source,
-      },
-    });
   }, [updateWorkspaceLifecycleSettings, workspaces]);
 
   const activateWorkspace = useCallback((workspaceId, source = "manual") => {
@@ -1984,30 +1900,8 @@ export default function App() {
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
       setWorkspaceAgentBatchSentKey("");
-      writeTerminalTelemetry({
-        paneId: workspace.id,
-        phase: "frontend.workspace.activate",
-        fields: {
-          activeView,
-          previousActivatedWorkspaceId,
-          source,
-          visibleView,
-          workspaceCount: workspaces.length,
-          ...getWorkspaceOpenTelemetryFields(workspace.id),
-        },
-      });
     }
 
-    startWorkspaceOpenTelemetry({
-      source,
-      workspaceId: workspace.id,
-      fields: {
-        activeView,
-        previousActivatedWorkspaceId,
-        visibleView,
-        workspaceCount: workspaces.length,
-      },
-    });
   }, [activeView, clearPreparedWorkspaceTerminals, visibleView, workspaces]);
 
   const activateWorkspaceFromRail = useCallback((workspaceId) => {
@@ -2031,17 +1925,6 @@ export default function App() {
     workspaceAgentBatchInFlightKeyRef.current = "";
     setWorkspaceAgentBatchSentKey("");
     setActivatedWorkspaceId("");
-    writeTerminalTelemetry({
-      paneId: targetWorkspaceId,
-      phase: "frontend.workspace.deactivate",
-      fields: {
-        activeView,
-        clearedPreparedCount,
-        source,
-        visibleView,
-        ...getWorkspaceOpenTelemetryFields(targetWorkspaceId),
-      },
-    });
   }, [activeView, clearPreparedWorkspaceTerminals, visibleView]);
 
   const completeAuthStartup = useCallback(() => {
@@ -2242,9 +2125,6 @@ export default function App() {
     const agentStatusStartedAt = performance.now();
     setAgentStatusState("checking");
     setAgentStatusError("");
-    writeTerminalTelemetry({
-      phase: "frontend.agent_status.start",
-    });
 
     try {
       const statuses = await invoke("agent_statuses");
@@ -2257,25 +2137,10 @@ export default function App() {
       persistAgentStatusCache(nextStatuses);
       setAgentStatuses(nextStatuses);
       setAgentStatusState("idle");
-      writeTerminalTelemetry({
-        phase: "frontend.agent_status.done",
-        elapsedMs: performance.now() - agentStatusStartedAt,
-        fields: {
-          updateAvailableCount: nextStatuses.filter((status) => status.npmUpdateAvailable).length,
-          authenticatedCount: nextStatuses.filter((status) => status.authenticated).length,
-          installedCount: nextStatuses.filter((status) => status.installed).length,
-          statusCount: nextStatuses.length,
-        },
-      });
       return nextStatuses;
     } catch (error) {
       setAgentStatusState("error");
       setAgentStatusError(getErrorMessage(error, "Unable to check terminal CLIs."));
-      writeTerminalTelemetry({
-        phase: "frontend.agent_status.error",
-        elapsedMs: performance.now() - agentStatusStartedAt,
-        fields: { error: getErrorMessage(error, "Unable to check terminal CLIs.") },
-      });
       return null;
     }
   }, []);
@@ -2489,14 +2354,6 @@ export default function App() {
     startupAgentSettingsPendingRef.current = readyCount === 0;
     setStartupAgentGateState("complete");
     setStartupAgentUpdateMessage("");
-    writeTerminalTelemetry({
-      phase: "frontend.agent_status.startup_gate_done",
-      fields: {
-        readyCount,
-        reason,
-        updateAvailableCount,
-      },
-    });
   }, [agentStatuses]);
 
   const enterWorkspaceAfterAgentCheck = useCallback(() => {
@@ -2514,13 +2371,6 @@ export default function App() {
     const updateStartedAt = performance.now();
     setStartupAgentGateState("updating");
     setStartupAgentUpdateMessage(`Updating ${formatAgentList(updates)}...`);
-    writeTerminalTelemetry({
-      phase: "frontend.agent_status.startup_update_start",
-      fields: {
-        providers: updates.map((agent) => agent.id),
-        updateCount: updates.length,
-      },
-    });
 
     for (const agent of updates) {
       setStartupAgentUpdateMessage(`Updating ${agent.label}...`);
@@ -2551,14 +2401,6 @@ export default function App() {
 
     setStartupAgentUpdateMessage("Refreshing terminal CLI status...");
     const nextStatuses = await refreshAgentStatuses();
-    writeTerminalTelemetry({
-      phase: "frontend.agent_status.startup_update_done",
-      elapsedMs: performance.now() - updateStartedAt,
-      fields: {
-        providers: updates.map((agent) => agent.id),
-        updateCount: updates.length,
-      },
-    });
     finishStartupAgentGate(nextStatuses || agentStatuses, "updated");
   }, [agentStatuses, finishStartupAgentGate, refreshAgentStatuses]);
 
@@ -2624,13 +2466,6 @@ export default function App() {
       return;
     }
 
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.load_start",
-      fields: {
-        selectedWorkspaceId: selectedWorkspaceIdRef.current,
-        activatedWorkspaceId: activatedWorkspaceIdRef.current,
-      },
-    });
     setWorkspaceSyncState("loading");
     setWorkspaceError("");
 
@@ -2653,18 +2488,6 @@ export default function App() {
             ? recoveryReport.interruptedTasks
             : [];
 
-          writeTerminalTelemetry({
-            phase: "frontend.crash_recovery.scan_done",
-            elapsedMs: performance.now() - recoveryStartedAt,
-            fields: {
-              interruptedTasks: interruptedTasks.length,
-              requestedRoots: recoveryRoots.length,
-              scannedSessions: recoveryReport?.scannedSessions ?? null,
-              idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted ?? null,
-              finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted ?? null,
-              errors: Array.isArray(recoveryReport?.errors) ? recoveryReport.errors.length : 0,
-            },
-          });
 
           if (interruptedTasks.length > 0) {
             setCrashRecoveryModal({
@@ -2675,14 +2498,6 @@ export default function App() {
             });
           }
         } catch (error) {
-          writeTerminalTelemetry({
-            phase: "frontend.crash_recovery.scan_error",
-            elapsedMs: performance.now() - recoveryStartedAt,
-            fields: {
-              error: getErrorMessage(error, "Unable to recover crashed terminal sessions."),
-              requestedRoots: recoveryRoots.length,
-            },
-          });
         }
       }
       const currentSelectedId = selectedWorkspaceIdRef.current;
@@ -2704,29 +2519,8 @@ export default function App() {
         setWorkspaceLifecycleSettings(nextLifecycleSettings);
       }
 
-      writeTerminalTelemetry({
-        phase: "frontend.workspace.load_done",
-        elapsedMs: performance.now() - loadStartedAt,
-        fields: {
-          selectedWorkspaceId: currentSelectedId,
-          nextWorkspaceId: nextSelected?.id || "",
-          nextActivatedWorkspaceId: nextActivated?.id || "",
-          defaultWorkspaceId: nextDefaultWorkspaceId,
-          workspaceCount: nextWorkspaces.length,
-        },
-      });
 
       if (nextActivated) {
-        startWorkspaceOpenTelemetry({
-          source: "workspace_load",
-          workspaceId: nextActivated.id,
-          fields: {
-            selectedWorkspaceId: currentSelectedId,
-            defaultWorkspaceId: nextDefaultWorkspaceId,
-            activatedWorkspaceId: currentActivatedId,
-            workspaceCount: nextWorkspaces.length,
-          },
-        });
       }
 
       setWorkspaces(nextWorkspaces);
@@ -2748,13 +2542,6 @@ export default function App() {
         return;
       }
 
-      writeTerminalTelemetry({
-        phase: "frontend.workspace.load_error",
-        elapsedMs: performance.now() - loadStartedAt,
-        fields: {
-          error: getErrorMessage(error, "Unable to load workspaces."),
-        },
-      });
       setWorkspaceSyncState("error");
       setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
     }
@@ -2790,13 +2577,6 @@ export default function App() {
         throw new Error("Workspace was not returned by the API.");
       }
 
-      startWorkspaceOpenTelemetry({
-        source: "workspace_create",
-        workspaceId: workspace.id,
-        fields: {
-          workspaceCount: 1,
-        },
-      });
       setWorkspaces([workspace]);
       setSelectedWorkspaceId(workspace.id);
       setActivatedWorkspaceId(workspace.id);
@@ -2876,35 +2656,12 @@ export default function App() {
       return;
     }
 
-    writeTerminalTelemetry({
-      paneId: selectedWorkspace.id,
-      phase: "frontend.workspace_settings.directory_save_start",
-      fields: {
-        currentRootDirectory,
-        currentTerminalCount,
-        requestedRootDirectory: cleanedRoot,
-        requestedTerminalCount: terminalCount,
-        requestedTerminalRoles: terminalRoles,
-        rootChanged: cleanedRoot !== currentRootDirectory,
-        terminalCountChanged: terminalCount !== currentTerminalCount,
-        terminalRolesChanged,
-        workspaceId: selectedWorkspace.id,
-      },
-    });
     setWorkspaceSettingsState("saving");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
 
     try {
       if (cleanedRoot) {
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.directory_validate_start",
-          fields: {
-            requestedRootDirectory: cleanedRoot,
-            workspaceId: selectedWorkspace.id,
-          },
-        });
       }
 
       const normalizedRoot = cleanedRoot
@@ -2938,34 +2695,10 @@ export default function App() {
         ]));
       let nextWorkspace = selectedWorkspace;
 
-      writeTerminalTelemetry({
-        paneId: selectedWorkspace.id,
-        phase: cleanedRoot
-          ? "frontend.workspace_settings.directory_validate_done"
-          : "frontend.workspace_settings.directory_clear",
-        fields: {
-          currentRootDirectory,
-          requestedRootDirectory: cleanedRoot,
-          resolvedRootDirectory: rootDirectory,
-          rootChanged,
-          workspaceId: selectedWorkspace.id,
-        },
-      });
 
       if (rootChanged) {
         const cleanupStartedAt = performance.now();
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.terminal_cleanup_start",
-          fields: {
-            mode: "close_all_for_root_change",
-            requestedRootDirectory: cleanedRoot,
-            resolvedRootDirectory: rootDirectory,
-            terminalIndexes: terminalIndexesToClose,
-            workspaceId: selectedWorkspace.id,
-          },
-        });
 
         const cleanupResult = await withTimeout(
           invoke("terminal_close_all"),
@@ -2973,31 +2706,10 @@ export default function App() {
           "Terminal cleanup timed out.",
         );
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.terminal_cleanup_done",
-          elapsedMs: performance.now() - cleanupStartedAt,
-          fields: {
-            closed: normalizeCloseCount(cleanupResult?.closed),
-            mode: "close_all_for_root_change",
-            terminalIndexes: terminalIndexesToClose,
-            workspaceId: selectedWorkspace.id,
-          },
-        });
 
         if (previousMcpRepoPath && previousMcpRepoPath !== nextMcpRepoPath) {
           const mcpCleanupStartedAt = performance.now();
 
-          writeTerminalTelemetry({
-            paneId: selectedWorkspace.id,
-            phase: "frontend.workspace_settings.shared_mcp_cleanup_start",
-            fields: {
-              previousRepoPath: previousMcpRepoPath,
-              reason: "workspace_root_change",
-              resolvedRootDirectory: rootDirectory,
-              workspaceId: selectedWorkspace.id,
-            },
-          });
 
           const mcpCleanupResult = await withTimeout(
             invoke("coordination_deactivate_shared_mcp_daemon", {
@@ -3009,32 +2721,10 @@ export default function App() {
           );
           const mcpCleanupData = mcpCleanupResult?.data || mcpCleanupResult || {};
 
-          writeTerminalTelemetry({
-            paneId: selectedWorkspace.id,
-            phase: "frontend.workspace_settings.shared_mcp_cleanup_done",
-            elapsedMs: performance.now() - mcpCleanupStartedAt,
-            fields: {
-              previousRepoPath: previousMcpRepoPath,
-              reason: "workspace_root_change",
-              stopped: Boolean(mcpCleanupData?.stopped),
-              workspaceId: selectedWorkspace.id,
-            },
-          });
         }
       } else if (terminalIndexesToClose.length) {
         const cleanupStartedAt = performance.now();
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.terminal_cleanup_start",
-          fields: {
-            mode: "close_selected_for_count_or_role_change",
-            removedTerminalIndexes,
-            roleChangedTerminalIndexes,
-            terminalIndexes: terminalIndexesToClose,
-            workspaceId: selectedWorkspace.id,
-          },
-        });
 
         const cleanupResults = await withTimeout(
           Promise.all(terminalIndexesToClose.map((terminalIndex) => {
@@ -3055,21 +2745,6 @@ export default function App() {
         );
         const failedCleanup = cleanupResults.filter((result) => !result?.closed);
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: failedCleanup.length
-            ? "frontend.workspace_settings.terminal_cleanup_error"
-            : "frontend.workspace_settings.terminal_cleanup_done",
-          elapsedMs: performance.now() - cleanupStartedAt,
-          fields: {
-            failedCount: failedCleanup.length,
-            mode: "close_selected_for_count_or_role_change",
-            removedTerminalIndexes,
-            roleChangedTerminalIndexes,
-            terminalIndexes: terminalIndexesToClose,
-            workspaceId: selectedWorkspace.id,
-          },
-        });
 
         if (failedCleanup.length) {
           throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
@@ -3113,15 +2788,6 @@ export default function App() {
       if (rootChanged && selectedWorkspace.id === activatedWorkspaceIdRef.current && nextMcpRepoPath) {
         const mcpActivateStartedAt = performance.now();
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.shared_mcp_restart_start",
-          fields: {
-            repoPath: nextMcpRepoPath,
-            reason: "workspace_root_change",
-            workspaceId: selectedWorkspace.id,
-          },
-        });
 
         const mcpActivateResult = await withTimeout(
           invoke("coordination_activate_shared_mcp_daemon", {
@@ -3134,17 +2800,6 @@ export default function App() {
         );
         const mcpActivateData = mcpActivateResult?.data || mcpActivateResult || {};
 
-        writeTerminalTelemetry({
-          paneId: selectedWorkspace.id,
-          phase: "frontend.workspace_settings.shared_mcp_restart_done",
-          elapsedMs: performance.now() - mcpActivateStartedAt,
-          fields: {
-            daemonStarted: Boolean(mcpActivateData?.daemon?.started ?? mcpActivateData?.started),
-            repoPath: nextMcpRepoPath,
-            reason: "workspace_root_change",
-            workspaceId: selectedWorkspace.id,
-          },
-        });
       }
 
       setWorkspaceNameDraft(nextWorkspace.name);
@@ -3153,21 +2808,6 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceSettingsState("idle");
       setWorkspaceSettingsMessage("Workspace settings saved.");
-      writeTerminalTelemetry({
-        paneId: selectedWorkspace.id,
-        phase: "frontend.workspace_settings.directory_save_done",
-        fields: {
-          removedTerminalIndexes,
-          roleChangedTerminalIndexes,
-          resolvedRootDirectory: rootDirectory,
-          rootChanged,
-          terminalCount,
-          terminalCountChanged: terminalCount !== currentTerminalCount,
-          terminalRoles,
-          terminalRolesChanged,
-          workspaceId: selectedWorkspace.id,
-        },
-      });
       closeWorkspaceSettings();
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
@@ -3175,17 +2815,6 @@ export default function App() {
         return;
       }
 
-      writeTerminalTelemetry({
-        paneId: selectedWorkspace.id,
-        phase: "frontend.workspace_settings.directory_save_error",
-        fields: {
-          error: getErrorMessage(error, "Unable to update workspace settings."),
-          requestedRootDirectory: cleanedRoot,
-          requestedTerminalCount: terminalCount,
-          requestedTerminalRoles: terminalRoles,
-          workspaceId: selectedWorkspace.id,
-        },
-      });
       setWorkspaceSettingsState("error");
       setWorkspaceSettingsError(getErrorMessage(error, "Unable to update workspace settings."));
     }
@@ -3526,10 +3155,6 @@ export default function App() {
         workspaceCloseAllowNativeRef.current = true;
         await closeWorkspaceWindowAfterTerminalShutdown(appWindow);
       } catch (closeError) {
-        writeTerminalTelemetry({
-          phase: "frontend.workspace.close_sequence_failed",
-          fields: { error: closeErrorMessage(closeError) },
-        });
         workspaceCloseAllowNativeRef.current = false;
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
@@ -3818,9 +3443,6 @@ export default function App() {
       return undefined;
     }
 
-    writeTerminalTelemetry({
-      phase: "frontend.workspace.ready_immediate",
-    });
     setWorkspaceState("ready");
     authStore.setMessage("Workspace ready.");
 
@@ -3841,12 +3463,6 @@ export default function App() {
       agentInitialStatusUserRef.current = userKey;
       setStartupAgentGateState("checking");
       setStartupAgentUpdateMessage("");
-      writeTerminalTelemetry({
-        phase: "frontend.agent_status.startup_gate_start",
-        fields: {
-          userKeyPresent: Boolean(userKey),
-        },
-      });
       refreshAudioModelStatus();
       loadWorkspaces();
 
@@ -3864,13 +3480,6 @@ export default function App() {
 
         if (updates.length) {
           setStartupAgentGateState("choice");
-          writeTerminalTelemetry({
-            phase: "frontend.agent_status.startup_update_choice",
-            fields: {
-              providers: updates.map((agent) => agent.id),
-              updateCount: updates.length,
-            },
-          });
           return;
         }
 
@@ -4149,15 +3758,6 @@ export default function App() {
     const activateStartedAt = performance.now();
 
     sharedMcpActiveRepoRef.current = repoPath;
-    writeTerminalTelemetry({
-      paneId: workspaceId,
-      phase: "frontend.workspace.shared_mcp.activate_start",
-      fields: {
-        repoPath,
-        workspaceId,
-        workspaceName,
-      },
-    });
 
     withTimeout(
       invoke("coordination_activate_shared_mcp_daemon", {
@@ -4180,32 +3780,12 @@ export default function App() {
         }
 
         const data = response?.data || response || {};
-        writeTerminalTelemetry({
-          paneId: workspaceId,
-          phase: "frontend.workspace.shared_mcp.activate_done",
-          elapsedMs: performance.now() - activateStartedAt,
-          fields: {
-            daemonStarted: Boolean(data?.daemon?.started ?? data?.started),
-            repoPath,
-            workspaceId,
-          },
-        });
       })
       .catch((error) => {
         if (disposed) {
           return;
         }
 
-        writeTerminalTelemetry({
-          paneId: workspaceId,
-          phase: "frontend.workspace.shared_mcp.activate_error",
-          elapsedMs: performance.now() - activateStartedAt,
-          fields: {
-            error: getErrorMessage(error, "Unable to activate shared MCP daemon."),
-            repoPath,
-            workspaceId,
-          },
-        });
       });
 
     return () => {
@@ -4216,15 +3796,6 @@ export default function App() {
       }
 
       const deactivateStartedAt = performance.now();
-      writeTerminalTelemetry({
-        paneId: workspaceId,
-        phase: "frontend.workspace.shared_mcp.deactivate_start",
-        fields: {
-          repoPath,
-          workspaceId,
-          workspaceName,
-        },
-      });
 
       withTimeout(
         invoke("coordination_deactivate_shared_mcp_daemon", {
@@ -4236,28 +3807,8 @@ export default function App() {
       )
         .then((response) => {
           const data = response?.data || response || {};
-          writeTerminalTelemetry({
-            paneId: workspaceId,
-            phase: "frontend.workspace.shared_mcp.deactivate_done",
-            elapsedMs: performance.now() - deactivateStartedAt,
-            fields: {
-              repoPath,
-              stopped: Boolean(data?.stopped),
-              workspaceId,
-            },
-          });
         })
         .catch((error) => {
-          writeTerminalTelemetry({
-            paneId: workspaceId,
-            phase: "frontend.workspace.shared_mcp.deactivate_error",
-            elapsedMs: performance.now() - deactivateStartedAt,
-            fields: {
-              error: getErrorMessage(error, "Unable to deactivate shared MCP daemon."),
-              repoPath,
-              workspaceId,
-            },
-          });
         });
     };
   }, [activatedWorkspace?.id, activatedWorkspace?.name, activatedWorkspaceTerminalWorkingDirectory]);
@@ -4309,14 +3860,6 @@ export default function App() {
         }
       })
       .catch((error) => {
-        writeTerminalTelemetry({
-          phase: "frontend.spec_graph.background_sync_start_error",
-          fields: {
-            error: getErrorMessage(error, "Unable to start Spec Graph background sync."),
-            repoPath,
-            workspaceId: selectedWorkspaceIdForSpecSync,
-          },
-        });
       });
 
     return () => {
@@ -4335,13 +3878,6 @@ export default function App() {
       ? crashRecoveryModal.interruptedTasks
       : [];
 
-    writeTerminalTelemetry({
-      phase: "frontend.crash_recovery.choice",
-      fields: {
-        choice,
-        interruptedTasks: interruptedTasks.length,
-      },
-    });
     setCrashRecoveryModal(null);
 
     if (choice === "resume") {
@@ -4437,18 +3973,6 @@ export default function App() {
     workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
     const batchStartedAt = performance.now();
-    writeTerminalTelemetry({
-      paneId: activatedWorkspace?.id || "",
-      phase: "frontend.agent_launch.batch_start",
-      fields: {
-        agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
-        preparedTerminalCount: preparedWorkspaceTerminalCount,
-        providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
-        terminalCount: activatedWorkspaceVisibleTerminalCount,
-        terminalIndexes: activatedWorkspaceTerminalIndexes,
-        ...getWorkspaceOpenTelemetryFields(activatedWorkspace?.id),
-      },
-    });
 
     invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
       .then((result) => {
@@ -4463,20 +3987,6 @@ export default function App() {
           }
         });
         setPreparedTerminalVersion((version) => version + 1);
-        writeTerminalTelemetry({
-          paneId: activatedWorkspace?.id || "",
-          phase: "frontend.agent_launch.batch_done",
-          elapsedMs: performance.now() - batchStartedAt,
-          fields: {
-            agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
-            preparedTerminalCount: preparedWorkspaceTerminalCount,
-            providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
-            started: result?.started ?? null,
-            skipped: result?.skipped ?? null,
-            terminalCount: activatedWorkspaceVisibleTerminalCount,
-            ...getWorkspaceOpenTelemetryFields(activatedWorkspace?.id),
-          },
-        });
       })
       .catch((error) => {
         workspaceAgentBatchInFlightKeyRef.current = "";
@@ -4490,19 +4000,6 @@ export default function App() {
           }
         });
         setPreparedTerminalVersion((version) => version + 1);
-        writeTerminalTelemetry({
-          paneId: activatedWorkspace?.id || "",
-          phase: "frontend.agent_launch.batch_error",
-          elapsedMs: performance.now() - batchStartedAt,
-          fields: {
-            agentIds: Array.from(new Set(preparedWorkspaceTerminalRequests.map((request) => request.provider))).join(","),
-            error: getErrorMessage(error, "Unable to start terminal agents."),
-            preparedTerminalCount: preparedWorkspaceTerminalCount,
-            providerTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
-            terminalCount: activatedWorkspaceVisibleTerminalCount,
-            ...getWorkspaceOpenTelemetryFields(activatedWorkspace?.id),
-          },
-        });
       });
   }, [
     activatedWorkspace?.id,
@@ -4547,29 +4044,6 @@ export default function App() {
       return;
     }
 
-    writeTerminalTelemetry({
-      paneId: activatedWorkspace.id,
-      phase: "frontend.workspace.terminals_surface_commit",
-      fields: {
-        activeView,
-        agentId: Array.from(new Set(activatedWorkspaceAgentTerminalEntries.map(({ role }) => (
-          normalizeWorkspaceTerminalRole(role, activeAgent)
-        )))).join(","),
-        agentStatusState,
-        hasAgent: activatedWorkspaceAgentTerminalEntries.length > 0,
-        rootSelected: Boolean(activatedWorkspaceRootDirectory),
-        rowCount: terminalPanelRows.length,
-        surfaceVisible: visibleView === DEFAULT_WORKSPACE_VIEW,
-        terminalCount: activatedWorkspaceVisibleTerminalCount,
-        terminalIndexes: activatedWorkspaceTerminalIndexes,
-        terminalRoles: activatedWorkspaceTerminalRoleEntries.map(({ role }) => role),
-        viewMotion,
-        visibleView,
-        workspaceState,
-        workspaceSyncState,
-        ...getWorkspaceOpenTelemetryFields(activatedWorkspace.id),
-      },
-    });
   }, [
     activeView,
     activeAgent,

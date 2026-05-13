@@ -28,7 +28,6 @@ import {
   writeDeepgramLanguage,
   writeSelectedAudioInputDeviceId,
 } from "./audioCapture";
-import { writeTerminalTelemetry } from "../terminals/terminalTelemetry.jsx";
 import {
   GlobalStyle,
   AppFrame,
@@ -2227,28 +2226,10 @@ export function AudioWidgetWindow() {
   }, [closeWarmBuffer, resetWidgetToStartState]);
 
   const forwardEscapeToActiveTerminal = useCallback((fields = {}) => {
-    writeTerminalTelemetry({
-      phase: "frontend.audio_widget.escape.forward_start",
-      fields,
-    });
     invoke("terminal_write_to_audio_input_target", { data: "\x1b" })
       .then((wrote) => {
-        writeTerminalTelemetry({
-          phase: "frontend.audio_widget.escape.forward_done",
-          fields: {
-            ...fields,
-            wrote: Boolean(wrote),
-          },
-        });
       })
       .catch((error) => {
-        writeTerminalTelemetry({
-          phase: "frontend.audio_widget.escape.forward_error",
-          fields: {
-            ...fields,
-            error: getErrorMessage(error, "Unable to forward Escape to active terminal."),
-          },
-        });
       });
   }, []);
 
@@ -2492,10 +2473,6 @@ export function AudioWidgetWindow() {
         event.preventDefault();
         event.stopPropagation();
         event.stopImmediatePropagation?.();
-        writeTerminalTelemetry({
-          phase: "frontend.audio_widget.escape",
-          fields,
-        });
         forwardEscapeToActiveTerminal(fields);
         if (canCancelAudioRequest) {
           cancelRecording();

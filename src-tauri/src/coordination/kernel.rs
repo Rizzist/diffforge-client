@@ -118,21 +118,6 @@ pub fn api_error(code: &str, message: impl Into<String>, details: Value) -> Valu
     .unwrap_or_else(|_| json!({"ok": false, "error": {"code": code, "message": "Coordination error", "details": {}}}))
 }
 
-fn terminal_coordination_log(
-    phase: &str,
-    pane_id: Option<&str>,
-    elapsed: Option<Duration>,
-    fields: Value,
-) {
-    let Some(pane_id) = pane_id
-        .map(str::trim)
-        .filter(|value| value.starts_with("workspace-terminal-"))
-    else {
-        return;
-    };
-    crate::log_terminal_event(phase, Some(pane_id), None, elapsed, fields);
-}
-
 pub struct CoordinationKernel {
     pub paths: StoragePaths,
     pub conn: Connection,
@@ -2327,30 +2312,8 @@ impl CoordinationKernel {
         context_run_id: Option<&str>,
         context_role: Option<&str>,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.create_slot_session.start",
-            pty_id,
-            None,
-            json!({
-                "agent_kind": agent_kind,
-                "slot_key": slot_key,
-                "write_enabled": write_enabled,
-            }),
-        );
-        let slot_started_at = Instant::now();
         let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
         let agent_slot_id_for_log = slot["id"].as_str().unwrap_or_default().to_string();
-        terminal_coordination_log(
-            "terminal.coordination.create_slot_session.slot_ready",
-            pty_id,
-            Some(slot_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id_for_log,
-                "slot_key": slot_key,
-            }),
-        );
-        let session_started_at = Instant::now();
         let session = self.create_session_for_slot_with_options(
             &slot,
             task_id,
@@ -2364,19 +2327,6 @@ impl CoordinationKernel {
                 replace_active_session: true,
             },
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.create_slot_session.done",
-            pty_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id_for_log,
-                "create_session_ms": session_started_at.elapsed().as_secs_f64() * 1000.0,
-                "enforcement_mode": session["enforcementMode"].as_str(),
-                "session_id": session["id"].as_str(),
-                "slot_key": slot_key,
-                "worktree_id": session["worktreeId"].as_str(),
-            }),
-        );
         Ok(session)
     }
 
@@ -2410,37 +2360,11 @@ impl CoordinationKernel {
         context_role: Option<&str>,
         options: SessionSlotOptions,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
         let agent_id = required_string(slot, "agent_id")?;
         let agent_slot_id = required_string(slot, "id")?;
         let slot_key = required_string(slot, "slot_key")?;
-        terminal_coordination_log(
-            "terminal.coordination.session.start",
-            pty_id,
-            None,
-            json!({
-                "agent_id": agent_id,
-                "agent_slot_id": agent_slot_id,
-                "prepared_worktree_only": options.prepared_worktree_only,
-                "refresh_worktree": options.refresh_worktree,
-                "replace_active_session": options.replace_active_session,
-                "slot_key": slot_key,
-                "write_enabled": write_enabled,
-            }),
-        );
-        let ensure_agent_started_at = Instant::now();
         self.ensure_agent_exists(agent_id)?;
-        terminal_coordination_log(
-            "terminal.coordination.session.agent_ready",
-            pty_id,
-            Some(ensure_agent_started_at.elapsed()),
-            json!({
-                "agent_id": agent_id,
-                "slot_key": slot_key,
-            }),
-        );
 
-        let active_slot_started_at = Instant::now();
         if let Some(active_session_id) = slot["active_session_id"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -2508,19 +2432,8 @@ impl CoordinationKernel {
                         return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
                     }
                     if options.replace_active_session {
-                        let interrupt_started_at = Instant::now();
                         let _ =
                             self.interrupt_session(active_session_id, "terminal_slot_replaced")?;
-                        terminal_coordination_log(
-                            "terminal.coordination.session.active_slot_interrupted",
-                            pty_id,
-                            Some(interrupt_started_at.elapsed()),
-                            json!({
-                                "active_session_id": active_session_id,
-                                "reason": "terminal_slot_replaced",
-                                "slot_key": slot_key,
-                            }),
-                        );
                     } else {
                         self.emit_event(
                             "agent_slot_busy",
@@ -2551,32 +2464,11 @@ impl CoordinationKernel {
                 }
 
                 if existing["status"].as_str() == Some("active") {
-                    let interrupt_started_at = Instant::now();
                     let _ = self.interrupt_session(active_session_id, "stale_slot_session")?;
-                    terminal_coordination_log(
-                        "terminal.coordination.session.active_slot_interrupted",
-                        pty_id,
-                        Some(interrupt_started_at.elapsed()),
-                        json!({
-                            "active_session_id": active_session_id,
-                            "reason": "stale_slot_session",
-                            "slot_key": slot_key,
-                        }),
-                    );
                 }
             }
         }
-        terminal_coordination_log(
-            "terminal.coordination.session.active_slot_checked",
-            pty_id,
-            Some(active_slot_started_at.elapsed()),
-            json!({
-                "had_active_slot_session": slot["active_session_id"].as_str().is_some(),
-                "slot_key": slot_key,
-            }),
-        );
 
-        let active_sessions_started_at = Instant::now();
         let active_sessions = self.query_json(
             "SELECT * FROM agent_sessions
              WHERE agent_slot_id=?1 AND status='active'
@@ -2655,18 +2547,7 @@ impl CoordinationKernel {
             }
 
             if options.replace_active_session {
-                let interrupt_started_at = Instant::now();
                 let _ = self.interrupt_session(existing_session_id, "terminal_slot_replaced")?;
-                terminal_coordination_log(
-                    "terminal.coordination.session.active_session_interrupted",
-                    pty_id,
-                    Some(interrupt_started_at.elapsed()),
-                    json!({
-                        "existing_session_id": existing_session_id,
-                        "reason": "terminal_slot_replaced",
-                        "slot_key": slot_key,
-                    }),
-                );
                 continue;
             }
 
@@ -2702,15 +2583,6 @@ impl CoordinationKernel {
                 "slot_busy: agent slot {slot_key} already has active session {existing_session_id}."
             ));
         }
-        terminal_coordination_log(
-            "terminal.coordination.session.active_sessions_checked",
-            pty_id,
-            Some(active_sessions_started_at.elapsed()),
-            json!({
-                "active_session_count": active_session_count,
-                "slot_key": slot_key,
-            }),
-        );
 
         let id = uuid();
         let now = now_rfc3339();
@@ -2726,24 +2598,9 @@ impl CoordinationKernel {
         let mut warnings = Vec::new();
 
         if write_enabled {
-            let worktree_started_at = Instant::now();
             let worktree_result = if options.prepared_worktree_only {
-                let prepared_started_at = Instant::now();
                 match self.prepared_worktree_for_slot_with_telemetry(agent_slot_id, pty_id) {
-                    Ok(worktree) => {
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.prepared_hit",
-                            pty_id,
-                            Some(prepared_started_at.elapsed()),
-                            json!({
-                                "agent_slot_id": agent_slot_id,
-                                "path": worktree["path"].as_str(),
-                                "slot_key": slot_key,
-                                "worktree_id": worktree["id"].as_str(),
-                            }),
-                        );
-                        Ok(worktree)
-                    }
+                    Ok(worktree) => Ok(worktree),
                     Err(error) => {
                         self.emit_event(
                             "prepared_worktree_fast_path_miss",
@@ -2756,57 +2613,13 @@ impl CoordinationKernel {
                             },
                             json!({"slot_key": slot_key, "error": error}),
                         )?;
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.prepared_miss",
-                            pty_id,
-                            Some(prepared_started_at.elapsed()),
-                            json!({
-                                "agent_slot_id": agent_slot_id,
-                                "error": error,
-                                "slot_key": slot_key,
-                            }),
-                        );
                         let mutation_lock = worktree_mutation_lock_for_repo(&self.paths.repo_path);
-                        let lock_wait_started_at = Instant::now();
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.creation_lock_wait_start",
-                            pty_id,
-                            None,
-                            json!({
-                                "agent_slot_id": agent_slot_id,
-                                "repo_path": process_path_text(&self.paths.repo_path),
-                                "slot_key": slot_key,
-                            }),
-                        );
                         let _mutation_guard = mutation_lock
                             .lock()
                             .map_err(|_| "Unable to lock worktree creation gate.".to_string())?;
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.creation_lock_acquired",
-                            pty_id,
-                            Some(lock_wait_started_at.elapsed()),
-                            json!({
-                                "agent_slot_id": agent_slot_id,
-                                "repo_path": process_path_text(&self.paths.repo_path),
-                                "slot_key": slot_key,
-                            }),
-                        );
                         match self.prepared_worktree_for_slot_with_telemetry(agent_slot_id, pty_id)
                         {
-                            Ok(worktree) => {
-                                terminal_coordination_log(
-                                    "terminal.coordination.worktree.prepared_hit_after_creation_wait",
-                                    pty_id,
-                                    Some(lock_wait_started_at.elapsed()),
-                                    json!({
-                                        "agent_slot_id": agent_slot_id,
-                                        "path": worktree["path"].as_str(),
-                                        "slot_key": slot_key,
-                                        "worktree_id": worktree["id"].as_str(),
-                                    }),
-                                );
-                                Ok(worktree)
-                            }
+                            Ok(worktree) => Ok(worktree),
                             Err(_) => self.create_or_reuse_worktree_for_slot_with_refresh(
                                 agent_slot_id,
                                 options.refresh_worktree,
@@ -2863,22 +2676,8 @@ impl CoordinationKernel {
                     )?;
                 }
             }
-            terminal_coordination_log(
-                "terminal.coordination.worktree.done",
-                pty_id,
-                Some(worktree_started_at.elapsed()),
-                json!({
-                    "agent_slot_id": agent_slot_id,
-                    "enforcement_mode": enforcement_mode,
-                    "slot_key": slot_key,
-                    "warning_count": warnings.len(),
-                    "worktree_id": worktree_id,
-                    "write_root": write_root,
-                }),
-            );
         }
 
-        let insert_session_started_at = Instant::now();
         self.conn
             .execute(
                 "INSERT INTO agent_sessions(
@@ -2902,16 +2701,6 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to create agent session: {error}"))?;
-        terminal_coordination_log(
-            "terminal.coordination.session.inserted",
-            pty_id,
-            Some(insert_session_started_at.elapsed()),
-            json!({
-                "session_id": id.clone(),
-                "slot_key": slot_key,
-            }),
-        );
-        let update_slot_started_at = Instant::now();
         self.conn
             .execute(
                 "UPDATE agent_slots
@@ -2920,18 +2709,7 @@ impl CoordinationKernel {
                 params![id, worktree_id, now_rfc3339(), agent_slot_id],
             )
             .map_err(|error| format!("Unable to attach session to agent slot: {error}"))?;
-        terminal_coordination_log(
-            "terminal.coordination.session.slot_updated",
-            pty_id,
-            Some(update_slot_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "session_id": id.clone(),
-                "slot_key": slot_key,
-            }),
-        );
 
-        let mcp_config_started_at = Instant::now();
         let mcp_config = self.write_or_update_slot_mcp_config(
             agent_slot_id,
             &id,
@@ -2946,19 +2724,7 @@ impl CoordinationKernel {
             context_run_id,
             context_role,
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.session.mcp_config_ready",
-            pty_id,
-            Some(mcp_config_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "config_path": mcp_config.generic_path.clone(),
-                "session_id": id.clone(),
-                "slot_key": slot_key,
-            }),
-        );
 
-        let agent_started_event_started_at = Instant::now();
         self.emit_event(
             "agent_started",
             "agent",
@@ -2981,62 +2747,20 @@ impl CoordinationKernel {
                 "enforcement_mode": enforcement_mode,
             }),
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.session.agent_started_event",
-            pty_id,
-            Some(agent_started_event_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "session_id": id.clone(),
-                "slot_key": slot_key,
-            }),
-        );
 
         if task_id.is_none() {
-            let recover_started_at = Instant::now();
             let _ = self.recover_resume_ready_task_for_session(
                 &id,
                 "new_terminal_session_started_for_slot",
             );
-            terminal_coordination_log(
-                "terminal.coordination.session.resume_recovery_checked",
-                pty_id,
-                Some(recover_started_at.elapsed()),
-                json!({
-                    "session_id": id.clone(),
-                    "slot_key": slot_key,
-                }),
-            );
         }
 
-        let query_started_at = Instant::now();
         let session = self.query_one(
             "SELECT * FROM agent_sessions WHERE id=?1",
             &[&id],
             "Session does not exist after creation.",
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.session.query_created",
-            pty_id,
-            Some(query_started_at.elapsed()),
-            json!({
-                "session_id": id.clone(),
-                "slot_key": slot_key,
-            }),
-        );
         let response = self.session_response(&session, slot, &mcp_config, warnings);
-        terminal_coordination_log(
-            "terminal.coordination.session.done",
-            pty_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "enforcement_mode": response["enforcementMode"].as_str(),
-                "session_id": response["id"].as_str(),
-                "slot_key": slot_key,
-                "worktree_id": response["worktreeId"].as_str(),
-            }),
-        );
         Ok(response)
     }
 
@@ -3149,51 +2873,11 @@ impl CoordinationKernel {
         context_run_id: Option<&str>,
         context_role: Option<&str>,
     ) -> Result<TerminalCoordinationContext, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.start",
-            pty_id,
-            None,
-            json!({
-                "agent_kind": agent_kind,
-                "requested_slot_key": slot_key,
-                "workspace_id": workspace_id,
-            }),
-        );
-        let objective_started_at = Instant::now();
         let objective_key = require_workspace_objective_key(workspace_id)?;
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.objective_ready",
-            pty_id,
-            Some(objective_started_at.elapsed()),
-            json!({
-                "objective_key": objective_key,
-                "workspace_id": workspace_id,
-            }),
-        );
-        let workspace_mcp_started_at = Instant::now();
         let _workspace_mcp =
             self.ensure_workspace_mcp_config_with_telemetry(workspace_id, workspace_name, pty_id)?;
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.workspace_mcp_ready",
-            pty_id,
-            Some(workspace_mcp_started_at.elapsed()),
-            json!({
-                "workspace_id": workspace_id,
-            }),
-        );
-        let normalize_started_at = Instant::now();
         let slot_key = normalize_agent_slot_key(slot_key)?;
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.slot_normalized",
-            pty_id,
-            Some(normalize_started_at.elapsed()),
-            json!({
-                "slot_key": slot_key,
-            }),
-        );
         let terminal_agent_name = terminal_agent_name_for_slot(agent_name, &slot_key);
-        let session_started_at = Instant::now();
         let session = self.create_terminal_session_for_slot_key(
             &slot_key,
             &terminal_agent_name,
@@ -3205,18 +2889,6 @@ impl CoordinationKernel {
             context_run_id,
             context_role,
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.session_ready",
-            pty_id,
-            Some(session_started_at.elapsed()),
-            json!({
-                "enforcement_mode": session["enforcementMode"].as_str(),
-                "session_id": session["id"].as_str(),
-                "slot_key": slot_key,
-                "worktree_id": session["worktreeId"].as_str(),
-            }),
-        );
-        let context_started_at = Instant::now();
         let context = self.terminal_context_from_session(
             session,
             workspace_id,
@@ -3225,28 +2897,6 @@ impl CoordinationKernel {
             context_run_id,
             context_role,
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.context_built",
-            pty_id,
-            Some(context_started_at.elapsed()),
-            json!({
-                "enforcement_mode": context.enforcement_mode,
-                "slot_key": context.slot_key,
-                "worktree_id": context.worktree_id,
-            }),
-        );
-        terminal_coordination_log(
-            "terminal.coordination.prepare_context.done",
-            pty_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "agent_id": context.agent_id,
-                "enforcement_mode": context.enforcement_mode,
-                "session_id": context.session_id,
-                "slot_key": context.slot_key,
-                "worktree_id": context.worktree_id,
-            }),
-        );
         Ok(context)
     }
 
@@ -3507,64 +3157,18 @@ impl CoordinationKernel {
     }
 
     pub fn interrupt_session(&self, session_id: &str, reason: &str) -> Result<Value, String> {
-        let interrupt_started_at = Instant::now();
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.enter",
-            None,
-            None,
-            None,
-            json!({
-                "db_path": self.paths.db_path.display().to_string(),
-                "reason": reason,
-                "session_id": session_id,
-            }),
-        );
-
-        let session_query_started_at = Instant::now();
         let session = match self.query_one(
             "SELECT * FROM agent_sessions WHERE id=?1",
             &[&session_id],
             "Session does not exist.",
         ) {
-            Ok(session) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.session_query_done",
-                    None,
-                    None,
-                    Some(session_query_started_at.elapsed()),
-                    json!({
-                        "session_id": session_id,
-                    }),
-                );
-                session
-            }
+            Ok(session) => session,
             Err(error) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.session_query_error",
-                    None,
-                    None,
-                    Some(session_query_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         };
         let current_status = session["status"].as_str().unwrap_or("unknown");
         if current_status != "active" {
-            crate::log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.kernel_interrupt.already_not_active",
-                None,
-                None,
-                Some(interrupt_started_at.elapsed()),
-                json!({
-                    "current_status": current_status,
-                    "reason": reason,
-                    "session_id": session_id,
-                }),
-            );
             return Ok(json!({
                 "id": session_id,
                 "status": current_status,
@@ -3573,202 +3177,71 @@ impl CoordinationKernel {
             }));
         }
 
-        let active_leases_started_at = Instant::now();
         let active_leases = match self.query_json(
             "SELECT id, task_id, agent_id, agent_slot_id, session_id, resource_id FROM leases WHERE session_id=?1 AND status='active'",
             &[&session_id],
         ) {
             Ok(active_leases) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.active_leases_query_done",
-                    None,
-                    None,
-                    Some(active_leases_started_at.elapsed()),
-                    json!({
-                        "active_lease_count": active_leases.len(),
-                        "session_id": session_id,
-                    }),
-                );
                 active_leases
             }
             Err(error) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.active_leases_query_error",
-                    None,
-                    None,
-                    Some(active_leases_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         };
-        let active_worktrees_started_at = Instant::now();
         let active_worktrees = match self.query_json(
             "SELECT id, path, branch_name FROM worktrees WHERE session_id=?1 AND status='active'",
             &[&session_id],
         ) {
-            Ok(active_worktrees) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.active_worktrees_query_done",
-                    None,
-                    None,
-                    Some(active_worktrees_started_at.elapsed()),
-                    json!({
-                        "active_worktree_count": active_worktrees.len(),
-                        "session_id": session_id,
-                    }),
-                );
-                active_worktrees
-            }
+            Ok(active_worktrees) => active_worktrees,
             Err(error) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.active_worktrees_query_error",
-                    None,
-                    None,
-                    Some(active_worktrees_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         };
         let now = now_rfc3339();
-        let session_update_started_at = Instant::now();
         match self.conn.execute(
                 "UPDATE agent_sessions SET status='interrupted', updated_at=?1 WHERE id=?2 AND status='active'",
                 params![now, session_id],
             ) {
             Ok(updated) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.session_update_done",
-                    None,
-                    None,
-                    Some(session_update_started_at.elapsed()),
-                    json!({
-                        "session_id": session_id,
-                        "updated": updated,
-                    }),
-                );
             }
             Err(error) => {
                 let error = format!("Unable to interrupt session: {error}");
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.session_update_error",
-                    None,
-                    None,
-                    Some(session_update_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         }
-        let leases_update_started_at = Instant::now();
         match self.conn.execute(
             "UPDATE leases
                  SET status='expired', expires_at=?1, last_heartbeat_at=?1
                  WHERE session_id=?2 AND status='active'",
             params![now, session_id],
         ) {
-            Ok(updated) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.leases_update_done",
-                    None,
-                    None,
-                    Some(leases_update_started_at.elapsed()),
-                    json!({
-                        "session_id": session_id,
-                        "updated": updated,
-                    }),
-                );
-            }
+            Ok(updated) => {}
             Err(error) => {
                 let error = format!("Unable to expire interrupted session leases: {error}");
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.leases_update_error",
-                    None,
-                    None,
-                    Some(leases_update_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         }
-        let worktrees_update_started_at = Instant::now();
         match self.conn.execute(
             "UPDATE worktrees
                  SET status='interrupted', updated_at=?1
                  WHERE session_id=?2 AND status='active'",
             params![now, session_id],
         ) {
-            Ok(updated) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.worktrees_update_done",
-                    None,
-                    None,
-                    Some(worktrees_update_started_at.elapsed()),
-                    json!({
-                        "session_id": session_id,
-                        "updated": updated,
-                    }),
-                );
-            }
+            Ok(updated) => {}
             Err(error) => {
                 let error = format!("Unable to mark interrupted session worktrees: {error}");
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.worktrees_update_error",
-                    None,
-                    None,
-                    Some(worktrees_update_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         }
-        let slot_update_started_at = Instant::now();
         match self.conn.execute(
             "UPDATE agent_slots
                  SET active_session_id=NULL, status='available', updated_at=?1
                  WHERE active_session_id=?2",
             params![now, session_id],
         ) {
-            Ok(updated) => {
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.slot_update_done",
-                    None,
-                    None,
-                    Some(slot_update_started_at.elapsed()),
-                    json!({
-                        "session_id": session_id,
-                        "updated": updated,
-                    }),
-                );
-            }
+            Ok(updated) => {}
             Err(error) => {
                 let error = format!("Unable to release interrupted session slot: {error}");
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.slot_update_error",
-                    None,
-                    None,
-                    Some(slot_update_started_at.elapsed()),
-                    json!({
-                        "error": &error,
-                        "session_id": session_id,
-                    }),
-                );
                 return Err(error);
             }
         }
@@ -3781,17 +3254,6 @@ impl CoordinationKernel {
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
             {
-                let parked_task_started_at = Instant::now();
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.parked_task_check_start",
-                    None,
-                    None,
-                    None,
-                    json!({
-                        "session_id": session_id,
-                        "task_id": task_id,
-                    }),
-                );
                 let parked_intent_count: i64 = self
                     .conn
                     .query_row(
@@ -3803,19 +3265,7 @@ impl CoordinationKernel {
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
-                crate::log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.kernel_interrupt.parked_task_check_done",
-                    None,
-                    None,
-                    Some(parked_task_started_at.elapsed()),
-                    json!({
-                        "parked_intent_count": parked_intent_count,
-                        "session_id": session_id,
-                        "task_id": task_id,
-                    }),
-                );
                 if parked_intent_count > 0 {
-                    let parked_task_update_started_at = Instant::now();
                     let task_updated = self
                         .conn
                         .execute(
@@ -3829,19 +3279,7 @@ impl CoordinationKernel {
                         .map_err(|error| {
                             format!("Unable to discard closed parked task: {error}")
                         })?;
-                    crate::log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.kernel_interrupt.parked_task_update_done",
-                        None,
-                        None,
-                        Some(parked_task_update_started_at.elapsed()),
-                        json!({
-                            "session_id": session_id,
-                            "task_id": task_id,
-                            "task_updated": task_updated,
-                        }),
-                    );
                     if task_updated > 0 {
-                        let parked_intents_update_started_at = Instant::now();
                         let intent_updated = self
                             .conn
                             .execute(
@@ -3854,23 +3292,11 @@ impl CoordinationKernel {
                             .map_err(|error| {
                                 format!("Unable to discard closed parked task intents: {error}")
                             })?;
-                        crate::log_terminal_shutdown_detail_event(
-                            "terminal.shutdown_detail.kernel_interrupt.parked_intents_update_done",
-                            None,
-                            None,
-                            Some(parked_intents_update_started_at.elapsed()),
-                            json!({
-                                "intent_updated": intent_updated,
-                                "session_id": session_id,
-                                "task_id": task_id,
-                            }),
-                        );
                         discarded_parked_task = Some(json!({
                             "task_id": task_id,
                             "parked_intent_count": parked_intent_count,
                             "updated_resource_intents": intent_updated,
                         }));
-                        let parked_event_started_at = Instant::now();
                         self.emit_event(
                             "terminal_parked_task_discarded_on_session_close",
                             "kernel",
@@ -3890,32 +3316,11 @@ impl CoordinationKernel {
                                 "resume_policy": "do_not_resurrect_closed_terminal_parked_tasks_on_app_restart",
                             }),
                         )?;
-                        crate::log_terminal_shutdown_detail_event(
-                            "terminal.shutdown_detail.kernel_interrupt.parked_task_event_done",
-                            None,
-                            None,
-                            Some(parked_event_started_at.elapsed()),
-                            json!({
-                                "session_id": session_id,
-                                "task_id": task_id,
-                            }),
-                        );
                     }
                 }
             }
         }
 
-        let lease_events_started_at = Instant::now();
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.lease_events_start",
-            None,
-            None,
-            None,
-            json!({
-                "lease_count": active_leases.len(),
-                "session_id": session_id,
-            }),
-        );
         for lease in &active_leases {
             self.emit_event(
                 "lease_expired",
@@ -3936,27 +3341,7 @@ impl CoordinationKernel {
                 }),
             )?;
         }
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.lease_events_done",
-            None,
-            None,
-            Some(lease_events_started_at.elapsed()),
-            json!({
-                "lease_count": active_leases.len(),
-                "session_id": session_id,
-            }),
-        );
 
-        let agent_event_started_at = Instant::now();
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.agent_event_start",
-            None,
-            None,
-            None,
-            json!({
-                "session_id": session_id,
-            }),
-        );
         self.emit_event(
             "agent_interrupted",
             "kernel",
@@ -3976,28 +3361,6 @@ impl CoordinationKernel {
                 "discarded_parked_task": discarded_parked_task,
             }),
         )?;
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.agent_event_done",
-            None,
-            None,
-            Some(agent_event_started_at.elapsed()),
-            json!({
-                "session_id": session_id,
-            }),
-        );
-
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_interrupt.done",
-            None,
-            None,
-            Some(interrupt_started_at.elapsed()),
-            json!({
-                "expired_leases": active_leases.len(),
-                "interrupted_worktrees": active_worktrees.len(),
-                "reason": reason,
-                "session_id": session_id,
-            }),
-        );
         Ok(json!({
             "id": session_id,
             "status": "interrupted",
@@ -4012,19 +3375,6 @@ impl CoordinationKernel {
         session_ids: &[String],
         reason: &str,
     ) -> Result<Value, String> {
-        let batch_started_at = Instant::now();
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_shutdown_batch.enter",
-            None,
-            None,
-            None,
-            json!({
-                "db_path": self.paths.db_path.display().to_string(),
-                "reason": reason,
-                "session_count": session_ids.len(),
-            }),
-        );
-
         let mut sessions = Vec::new();
         let mut interrupted = 0usize;
         let mut already_not_active = 0usize;
@@ -4056,21 +3406,6 @@ impl CoordinationKernel {
                 }
             }
         }
-
-        crate::log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.kernel_shutdown_batch.done",
-            None,
-            None,
-            Some(batch_started_at.elapsed()),
-            json!({
-                "already_not_active": already_not_active,
-                "db_path": self.paths.db_path.display().to_string(),
-                "errors": errors,
-                "interrupted": interrupted,
-                "reason": reason,
-                "session_count": session_ids.len(),
-            }),
-        );
 
         Ok(json!({
             "already_not_active": already_not_active,
@@ -4284,27 +3619,7 @@ impl CoordinationKernel {
         workspace_name: Option<&str>,
         telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.start",
-            telemetry_pane_id,
-            None,
-            json!({
-                "workspace_id": workspace_id,
-            }),
-        );
-        let objective_started_at = Instant::now();
         let objective_key = require_workspace_objective_key(workspace_id)?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.objective_ready",
-            telemetry_pane_id,
-            Some(objective_started_at.elapsed()),
-            json!({
-                "objective_key": objective_key.clone(),
-                "workspace_id": workspace_id,
-            }),
-        );
-        let command_started_at = Instant::now();
         let (command, mut args) = self.coordination_mcp_command_spec();
         args.extend([
             "--repo-path".to_string(),
@@ -4317,16 +3632,6 @@ impl CoordinationKernel {
         if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
             args.extend(["--workspace-id".to_string(), value.to_string()]);
         }
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.command_built",
-            telemetry_pane_id,
-            Some(command_started_at.elapsed()),
-            json!({
-                "arg_count": args.len(),
-                "command": command.clone(),
-                "workspace_id": workspace_id,
-            }),
-        );
         let generic_config = json!({
             "mcpServers": {
                 "coordination-kernel": {
@@ -4370,85 +3675,22 @@ impl CoordinationKernel {
                 let cached_response = cached.response;
                 let cached_hash = cached.config_hash;
                 let cache_age_ms = cached.cached_at.elapsed().as_secs_f64() * 1000.0;
-                terminal_coordination_log(
-                    "terminal.coordination.workspace_mcp.cache_hit",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "cache_age_ms": cache_age_ms,
-                        "config_hash": cached_hash,
-                        "workspace_id": workspace_id,
-                    }),
-                );
-                terminal_coordination_log(
-                    "terminal.coordination.workspace_mcp.done",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "cached": true,
-                        "config_path": cached_response["config_path"].as_str(),
-                        "repo_mcp_path": cached_response["repo_mcp_path"].as_str(),
-                        "workspace_id": workspace_id,
-                    }),
-                );
                 return Ok(cached_response);
             }
         }
-        let daemon_started_at = Instant::now();
         let daemon = crate::coordination::mcp::ensure_shared_daemon_for_paths(
             &self.paths.repo_path,
             &self.paths.db_path,
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.daemon_ready",
-            telemetry_pane_id,
-            Some(daemon_started_at.elapsed()),
-            json!({
-                "endpoint": daemon["endpoint"].as_str(),
-                "started": daemon["started"].as_bool(),
-            }),
-        );
         let generic_path = self.paths.mcp_root.join("coordination.json");
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
-        let workspace_files_started_at = Instant::now();
         write_json_file_atomic(&generic_path, &generic_config)?;
         write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
         write_json_file_atomic(&claude_path, &generic_config)?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.workspace_files_written",
-            telemetry_pane_id,
-            Some(workspace_files_started_at.elapsed()),
-            json!({
-                "codex_path": process_path_text(&codex_path),
-                "generic_path": process_path_text(&generic_path),
-                "workspace_id": workspace_id,
-            }),
-        );
-        let contract_started_at = Instant::now();
         self.write_agent_contract_files(&self.paths.repo_path)?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.contract_files_written",
-            telemetry_pane_id,
-            Some(contract_started_at.elapsed()),
-            json!({
-                "repo_path": process_path_text(&self.paths.repo_path),
-                "workspace_id": workspace_id,
-            }),
-        );
-        let repo_activation_started_at = Instant::now();
         let (repo_mcp_path, repo_codex_path) =
             self.write_repo_root_mcp_activation_files(&generic_config, &command, &args)?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.repo_activation_written",
-            telemetry_pane_id,
-            Some(repo_activation_started_at.elapsed()),
-            json!({
-                "repo_codex_path": process_path_text(&repo_codex_path),
-                "repo_mcp_path": process_path_text(&repo_mcp_path),
-                "workspace_id": workspace_id,
-            }),
-        );
 
         let response = json!({
             "server_name": "coordination-kernel",
@@ -4471,18 +3713,6 @@ impl CoordinationKernel {
             "repo_codex_config_path": process_path_text(&repo_codex_path),
         });
         remember_workspace_mcp_activation(cache_key, config_hash.clone(), &response);
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.done",
-            telemetry_pane_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "cached": false,
-                "config_hash": config_hash,
-                "config_path": response["config_path"].as_str(),
-                "repo_mcp_path": response["repo_mcp_path"].as_str(),
-                "workspace_id": workspace_id,
-            }),
-        );
         Ok(response)
     }
 
@@ -4684,32 +3914,9 @@ impl CoordinationKernel {
         _context_run_id: Option<&str>,
         _context_role: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.start",
-            pty_id,
-            None,
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "has_worktree": worktree_id.is_some(),
-                "session_id": session_id,
-            }),
-        );
-        let slot_started_at = Instant::now();
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
         let slot_key = required_string(&slot, "slot_key")?;
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.slot_loaded",
-            pty_id,
-            Some(slot_started_at.elapsed()),
-            json!({
-                "agent_id": agent_id,
-                "agent_slot_id": agent_slot_id,
-                "slot_key": slot_key,
-            }),
-        );
-        let command_started_at = Instant::now();
         let (command, mut args) = self.coordination_mcp_command_spec();
         args.extend([
             "--repo-path".to_string(),
@@ -4729,16 +3936,6 @@ impl CoordinationKernel {
         if let Some(value) = worktree_path {
             args.extend(["--worktree-path".to_string(), value.to_string()]);
         }
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.command_built",
-            pty_id,
-            Some(command_started_at.elapsed()),
-            json!({
-                "arg_count": args.len(),
-                "command": command.clone(),
-                "slot_key": slot_key,
-            }),
-        );
         let generic_config = json!({
             "mcpServers": {
                 "coordination-kernel": {
@@ -4810,69 +4007,25 @@ impl CoordinationKernel {
             && repo_activation_ready;
 
         if files_reused {
-            terminal_coordination_log(
-                "terminal.coordination.mcp_config.files_reused",
-                pty_id,
-                Some(total_started_at.elapsed()),
-                json!({
-                    "codex_path": process_path_text(&codex_path),
-                    "generic_path": process_path_text(&generic_path),
-                    "repo_activation_ready": repo_activation_ready,
-                    "slot_key": slot_key,
-                    "worktree_activation_ready": worktree_path.is_some(),
-                }),
-            );
         } else {
-            let write_agent_configs_started_at = Instant::now();
             write_json_file_atomic(&generic_path, &generic_config)?;
             write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
             write_json_file_atomic(&claude_path, &claude_config)?;
-            terminal_coordination_log(
-                "terminal.coordination.mcp_config.agent_files_written",
-                pty_id,
-                Some(write_agent_configs_started_at.elapsed()),
-                json!({
-                    "codex_path": process_path_text(&codex_path),
-                    "generic_path": process_path_text(&generic_path),
-                    "slot_key": slot_key,
-                }),
-            );
-            let repo_activation_started_at = Instant::now();
             self.write_repo_root_dynamic_mcp_activation_files()?;
-            terminal_coordination_log(
-                "terminal.coordination.mcp_config.repo_activation_written",
-                pty_id,
-                Some(repo_activation_started_at.elapsed()),
-                json!({
-                    "already_present": repo_activation_ready,
-                    "slot_key": slot_key,
-                }),
-            );
             if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
                 if !path_text_under_path(worktree_path, &self.paths.worktrees_root) {
                     return Err(format!(
                         "Refusing to write MCP activation files outside .agents/worktrees: {worktree_path}"
                     ));
                 }
-                let worktree_activation_started_at = Instant::now();
                 self.write_worktree_mcp_activation_files(
                     worktree_path,
                     &generic_config,
                     &command,
                     &args,
                 )?;
-                terminal_coordination_log(
-                    "terminal.coordination.mcp_config.worktree_activation_written",
-                    pty_id,
-                    Some(worktree_activation_started_at.elapsed()),
-                    json!({
-                        "slot_key": slot_key,
-                        "worktree_path": worktree_path,
-                    }),
-                );
             }
         }
-        let db_started_at = Instant::now();
         let config_id = existing_config
             .as_ref()
             .map(|(id, _)| id.clone())
@@ -4900,16 +4053,6 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to record MCP config: {error}"))?;
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.db_recorded",
-            pty_id,
-            Some(db_started_at.elapsed()),
-            json!({
-                "config_id": config_id,
-                "slot_key": slot_key,
-            }),
-        );
-        let event_started_at = Instant::now();
         self.emit_event(
             if files_reused {
                 "mcp_config_reused"
@@ -4926,24 +4069,6 @@ impl CoordinationKernel {
             },
             json!({"slot_key": slot_key, "path": process_path_text(&generic_path)}),
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.event_written",
-            pty_id,
-            Some(event_started_at.elapsed()),
-            json!({
-                "slot_key": slot_key,
-            }),
-        );
-        terminal_coordination_log(
-            "terminal.coordination.mcp_config.done",
-            pty_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "files_reused": files_reused,
-                "slot_key": slot_key,
-                "worktree_activation": worktree_id.is_some(),
-            }),
-        );
         Ok(SessionMcpConfigPaths {
             generic_path: process_path_text(&generic_path),
             codex_path: process_path_text(&codex_path),
@@ -9045,15 +8170,6 @@ impl CoordinationKernel {
                     Some(entry.clone())
                 }
                 Some(entry) => {
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.cache_expired",
-                        telemetry_pane_id,
-                        Some(total_started_at.elapsed()),
-                        json!({
-                            "branch": entry.branch.clone(),
-                            "path": process_path_text(&entry.path),
-                        }),
-                    );
                     guard.remove(&cache_key);
                     None
                 }
@@ -9067,20 +8183,9 @@ impl CoordinationKernel {
             if let Ok(mut guard) = integration_worktree_cache().lock() {
                 guard.remove(&cache_key);
             }
-            terminal_coordination_log(
-                "terminal.coordination.integration_worktree.cache_stale",
-                telemetry_pane_id,
-                Some(total_started_at.elapsed()),
-                json!({
-                    "branch": cached.branch.clone(),
-                    "path": process_path_text(&cached.path),
-                    "reason": "cached_path_missing",
-                }),
-            );
             return Ok(None);
         }
 
-        let head_started_at = Instant::now();
         let branch_commit = format!("{}^{{commit}}", cached.branch);
         match run_git(
             &self.paths.repo_path,
@@ -9088,59 +8193,17 @@ impl CoordinationKernel {
         ) {
             Ok(head_sha) => {
                 let head_sha = head_sha.trim().to_string();
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.cache_hit",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "branch": cached.branch.clone(),
-                        "head_sha": head_sha.clone(),
-                        "path": process_path_text(&cached.path),
-                    }),
-                );
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.head_read",
-                    telemetry_pane_id,
-                    Some(head_started_at.elapsed()),
-                    json!({
-                        "branch": cached.branch.clone(),
-                        "head_sha": head_sha.clone(),
-                        "path": process_path_text(&cached.path),
-                    }),
-                );
                 let integration = IntegrationWorktree {
                     path: cached.path,
                     branch: cached.branch,
                     head_sha,
                 };
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.done",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "branch": integration.branch.clone(),
-                        "cache_hit": true,
-                        "head_sha": integration.head_sha.clone(),
-                        "path": process_path_text(&integration.path),
-                    }),
-                );
                 Ok(Some(integration))
             }
             Err(error) => {
                 if let Ok(mut guard) = integration_worktree_cache().lock() {
                     guard.remove(&cache_key);
                 }
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.cache_stale",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "branch": cached.branch,
-                        "error": error,
-                        "path": process_path_text(&cached.path),
-                        "reason": "cached_branch_head_unreadable",
-                    }),
-                );
                 Ok(None)
             }
         }
@@ -9169,67 +8232,22 @@ impl CoordinationKernel {
         telemetry_pane_id: Option<&str>,
     ) -> Result<IntegrationWorktree, String> {
         let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.start",
-            telemetry_pane_id,
-            None,
-            json!({
-                "branch": INTEGRATION_BRANCH,
-            }),
-        );
         if let Some(integration) =
             self.try_cached_integration_worktree(telemetry_pane_id, total_started_at)?
         {
             return Ok(integration);
         }
-        let repo_has_git_started_at = Instant::now();
         if !repo_has_git(&self.paths.repo_path) {
             return Err("Repo has no .git; integration branch is unavailable.".to_string());
         }
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.repo_has_git_checked",
-            telemetry_pane_id,
-            Some(repo_has_git_started_at.elapsed()),
-            json!({
-                "repo_path": process_path_text(&self.paths.repo_path),
-            }),
-        );
-        let rev_parse_started_at = Instant::now();
         run_git(&self.paths.repo_path, &["rev-parse", "--show-toplevel"])?;
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.repo_root_checked",
-            telemetry_pane_id,
-            Some(rev_parse_started_at.elapsed()),
-            json!({
-                "repo_path": process_path_text(&self.paths.repo_path),
-            }),
-        );
-        let branch_exists_started_at = Instant::now();
         let branch_existed = self.branch_exists(INTEGRATION_BRANCH)?;
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.branch_checked",
-            telemetry_pane_id,
-            Some(branch_exists_started_at.elapsed()),
-            json!({
-                "branch": INTEGRATION_BRANCH,
-                "existed": branch_existed,
-            }),
-        );
         if !branch_existed {
-            let branch_create_started_at = Instant::now();
             match run_git(
                 &self.paths.repo_path,
                 &["branch", INTEGRATION_BRANCH, "HEAD"],
             ) {
                 Ok(_) => {
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.branch_created",
-                        telemetry_pane_id,
-                        Some(branch_create_started_at.elapsed()),
-                        json!({
-                            "branch": INTEGRATION_BRANCH,
-                        }),
-                    );
                     self.emit_event(
                         "integration_branch_created",
                         "kernel",
@@ -9242,15 +8260,6 @@ impl CoordinationKernel {
                     if Self::git_branch_create_already_exists(&error)
                         || self.branch_exists(INTEGRATION_BRANCH)?
                     {
-                        terminal_coordination_log(
-                            "terminal.coordination.integration_worktree.branch_create_race_recovered",
-                            telemetry_pane_id,
-                            Some(branch_create_started_at.elapsed()),
-                            json!({
-                                "branch": INTEGRATION_BRANCH,
-                                "error": error.clone(),
-                            }),
-                        );
                         self.emit_event(
                             "integration_branch_create_race_recovered",
                             "kernel",
@@ -9271,18 +8280,7 @@ impl CoordinationKernel {
         let path = self.paths.worktrees_root.join(INTEGRATION_WORKTREE_NAME);
         let path_text = process_path_text(&path);
         if path.exists() {
-            let validate_started_at = Instant::now();
             if let Err(error) = self.validate_git_worktree_path(&path, INTEGRATION_BRANCH) {
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.validation_failed",
-                    telemetry_pane_id,
-                    Some(validate_started_at.elapsed()),
-                    json!({
-                        "branch": INTEGRATION_BRANCH,
-                        "error": error.clone(),
-                        "path": path_text.clone(),
-                    }),
-                );
                 self.emit_event(
                     "integration_worktree_validation_failed",
                     "kernel",
@@ -9301,32 +8299,12 @@ impl CoordinationKernel {
                     )
                 })?;
                 if path.exists() {
-                    let revalidate_started_at = Instant::now();
                     self.validate_git_worktree_path(&path, INTEGRATION_BRANCH)?;
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.revalidated_after_prune",
-                        telemetry_pane_id,
-                        Some(revalidate_started_at.elapsed()),
-                        json!({
-                            "branch": INTEGRATION_BRANCH,
-                            "path": path_text.clone(),
-                        }),
-                    );
                 } else {
-                    let recreate_started_at = Instant::now();
                     run_git(
                         &self.paths.repo_path,
                         &["worktree", "add", &path_text, INTEGRATION_BRANCH],
                     )?;
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.recreated_after_prune",
-                        telemetry_pane_id,
-                        Some(recreate_started_at.elapsed()),
-                        json!({
-                            "branch": INTEGRATION_BRANCH,
-                            "path": path_text.clone(),
-                        }),
-                    );
                     self.emit_event(
                         "integration_worktree_recreated_after_prune",
                         "kernel",
@@ -9336,18 +8314,8 @@ impl CoordinationKernel {
                     )?;
                 }
             } else {
-                terminal_coordination_log(
-                    "terminal.coordination.integration_worktree.validation_ok",
-                    telemetry_pane_id,
-                    Some(validate_started_at.elapsed()),
-                    json!({
-                        "branch": INTEGRATION_BRANCH,
-                        "path": path_text.clone(),
-                    }),
-                );
             }
         } else {
-            let create_started_at = Instant::now();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
                     format!("Unable to create integration worktree root: {error}")
@@ -9362,16 +8330,6 @@ impl CoordinationKernel {
                         .validate_git_worktree_path(&path, INTEGRATION_BRANCH)
                         .is_ok()
                 {
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.create_race_recovered",
-                        telemetry_pane_id,
-                        Some(create_started_at.elapsed()),
-                        json!({
-                            "branch": INTEGRATION_BRANCH,
-                            "error": error.clone(),
-                            "path": path_text.clone(),
-                        }),
-                    );
                     self.emit_event(
                         "integration_worktree_create_race_recovered",
                         "kernel",
@@ -9422,15 +8380,6 @@ impl CoordinationKernel {
                         )?;
                         return Err(retry_error);
                     }
-                    terminal_coordination_log(
-                        "terminal.coordination.integration_worktree.create_recovered_after_prune",
-                        telemetry_pane_id,
-                        Some(create_started_at.elapsed()),
-                        json!({
-                            "branch": INTEGRATION_BRANCH,
-                            "path": path_text.clone(),
-                        }),
-                    );
                     self.emit_event(
                         "integration_worktree_create_recovered_after_prune",
                         "kernel",
@@ -9440,15 +8389,6 @@ impl CoordinationKernel {
                     )?;
                 }
             }
-            terminal_coordination_log(
-                "terminal.coordination.integration_worktree.created",
-                telemetry_pane_id,
-                Some(create_started_at.elapsed()),
-                json!({
-                    "branch": INTEGRATION_BRANCH,
-                    "path": path_text.clone(),
-                }),
-            );
             self.emit_event(
                 "integration_worktree_created",
                 "kernel",
@@ -9457,33 +8397,12 @@ impl CoordinationKernel {
                 json!({"branch": INTEGRATION_BRANCH, "path": path_text}),
             )?;
         }
-        let head_started_at = Instant::now();
         let head_sha = run_git(&path, &["rev-parse", "HEAD"])?.trim().to_string();
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.head_read",
-            telemetry_pane_id,
-            Some(head_started_at.elapsed()),
-            json!({
-                "branch": INTEGRATION_BRANCH,
-                "head_sha": head_sha.clone(),
-                "path": process_path_text(&path),
-            }),
-        );
         let integration = IntegrationWorktree {
             path,
             branch: INTEGRATION_BRANCH.to_string(),
             head_sha,
         };
-        terminal_coordination_log(
-            "terminal.coordination.integration_worktree.done",
-            telemetry_pane_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "branch": integration.branch.clone(),
-                "head_sha": integration.head_sha.clone(),
-                "path": process_path_text(&integration.path),
-            }),
-        );
         self.remember_integration_worktree(&integration, telemetry_pane_id);
         Ok(integration)
     }
@@ -14077,82 +12996,28 @@ impl CoordinationKernel {
         agent_slot_id: &str,
         telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.start",
-            telemetry_pane_id,
-            None,
-            json!({
-                "agent_slot_id": agent_slot_id,
-            }),
-        );
-        let slot_started_at = Instant::now();
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
         let slot_key = required_string(&slot, "slot_key")?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.slot_loaded",
-            telemetry_pane_id,
-            Some(slot_started_at.elapsed()),
-            json!({
-                "agent_id": agent_id,
-                "agent_slot_id": agent_slot_id,
-                "slot_key": slot_key,
-            }),
-        );
         let existing_id = slot["worktree_id"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("Slot {slot_key} has no prepared worktree."))?;
-        let worktree_started_at = Instant::now();
         let existing = self.get_worktree(existing_id)?;
         let existing_path = existing["path"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("Slot {slot_key} worktree has no path."))?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.worktree_loaded",
-            telemetry_pane_id,
-            Some(worktree_started_at.elapsed()),
-            json!({
-                "path": existing_path,
-                "slot_key": slot_key,
-                "worktree_id": existing_id,
-            }),
-        );
-        let path_scope_started_at = Instant::now();
         if !path_text_under_path(existing_path, &self.paths.worktrees_root) {
             return Err(format!(
                 "Prepared worktree for slot {slot_key} escapes .agents/worktrees."
             ));
         }
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.path_scope_checked",
-            telemetry_pane_id,
-            Some(path_scope_started_at.elapsed()),
-            json!({
-                "path": existing_path,
-                "slot_key": slot_key,
-                "worktree_id": existing_id,
-            }),
-        );
-        let path_exists_started_at = Instant::now();
         if !PathBuf::from(existing_path).exists() {
             return Err(format!(
                 "Prepared worktree for slot {slot_key} is missing: {existing_path}"
             ));
         }
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.path_exists_checked",
-            telemetry_pane_id,
-            Some(path_exists_started_at.elapsed()),
-            json!({
-                "path": existing_path,
-                "slot_key": slot_key,
-                "worktree_id": existing_id,
-            }),
-        );
-        let db_started_at = Instant::now();
         self.conn
             .execute(
                 "UPDATE worktrees
@@ -14161,15 +13026,6 @@ impl CoordinationKernel {
                 params![agent_id, now_rfc3339(), existing_id],
             )
             .map_err(|error| format!("Unable to mark prepared worktree active: {error}"))?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.db_recorded",
-            telemetry_pane_id,
-            Some(db_started_at.elapsed()),
-            json!({
-                "slot_key": slot_key,
-                "worktree_id": existing_id,
-            }),
-        );
         let response = json!({
             "id": existing_id,
             "agentId": agent_id,
@@ -14181,16 +13037,6 @@ impl CoordinationKernel {
             "status": "active",
             "prepared": true,
         });
-        terminal_coordination_log(
-            "terminal.coordination.worktree.prepared_lookup.done",
-            telemetry_pane_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "path": response["path"].as_str(),
-                "slot_key": response["slotKey"].as_str(),
-                "worktree_id": response["id"].as_str(),
-            }),
-        );
         Ok(response)
     }
 
@@ -14200,54 +13046,14 @@ impl CoordinationKernel {
         refresh_existing: bool,
         telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.worktree.create_or_reuse.start",
-            telemetry_pane_id,
-            None,
-            json!({
-                "agent_slot_id": agent_slot_id,
-                "refresh_existing": refresh_existing,
-            }),
-        );
-        let slot_started_at = Instant::now();
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let agent_id = required_string(&slot, "agent_id")?;
         let slot_key = required_string(&slot, "slot_key")?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.slot_loaded",
-            telemetry_pane_id,
-            Some(slot_started_at.elapsed()),
-            json!({
-                "agent_id": agent_id,
-                "agent_slot_id": agent_slot_id,
-                "slot_key": slot_key,
-            }),
-        );
-        let repo_check_started_at = Instant::now();
         if !self.paths.repo_path.join(".git").exists() {
             return Err("Repo has no .git; worktree isolation is unavailable.".to_string());
         }
         run_git(&self.paths.repo_path, &["rev-parse", "--show-toplevel"])?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.repo_checked",
-            telemetry_pane_id,
-            Some(repo_check_started_at.elapsed()),
-            json!({
-                "slot_key": slot_key,
-            }),
-        );
-        let integration_started_at = Instant::now();
         let integration = self.ensure_integration_worktree_with_telemetry(telemetry_pane_id)?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.integration_ready",
-            telemetry_pane_id,
-            Some(integration_started_at.elapsed()),
-            json!({
-                "head_sha": integration.head_sha.clone(),
-                "slot_key": slot_key,
-            }),
-        );
         let base_sha = integration.head_sha.clone();
         let mut branch = format!("agent/{slot_key}");
         let stable_path = self.paths.worktrees_root.join(slot_key);
@@ -14257,7 +13063,6 @@ impl CoordinationKernel {
             .as_str()
             .filter(|value| !value.trim().is_empty())
         {
-            let existing_started_at = Instant::now();
             if let Ok(existing) = self.get_worktree(existing_id) {
                 let existing_path = PathBuf::from(existing["path"].as_str().unwrap_or_default());
                 let existing_path_text = process_path_text(&existing_path);
@@ -14287,18 +13092,6 @@ impl CoordinationKernel {
                     if let Err(error) =
                         self.validate_git_worktree_path(&existing_path, &existing_branch)
                     {
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.existing_invalid",
-                            telemetry_pane_id,
-                            Some(existing_started_at.elapsed()),
-                            json!({
-                                "branch_name": existing_branch.clone(),
-                                "error": error.clone(),
-                                "path": process_path_text(&existing_path),
-                                "slot_key": slot_key,
-                                "worktree_id": existing_id,
-                            }),
-                        );
                         self.emit_event(
                             "worktree_reuse_failed",
                             "kernel",
@@ -14318,7 +13111,6 @@ impl CoordinationKernel {
                             }),
                         )?;
                     } else {
-                        let refresh_started_at = Instant::now();
                         let refresh = if refresh_existing {
                             self.refresh_agent_worktree_from_integration_with_telemetry(
                                 &existing_path,
@@ -14331,18 +13123,6 @@ impl CoordinationKernel {
                                 "current_sha": existing["current_sha"].as_str().unwrap_or(base_sha.as_str()),
                             })
                         };
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.existing_refresh_done",
-                            telemetry_pane_id,
-                            Some(refresh_started_at.elapsed()),
-                            json!({
-                                "branch_name": existing_branch.clone(),
-                                "path": process_path_text(&existing_path),
-                                "refresh_status": refresh["status"].as_str(),
-                                "slot_key": slot_key,
-                                "worktree_id": existing_id,
-                            }),
-                        );
                         self.conn
                             .execute(
                                 "UPDATE worktrees
@@ -14383,17 +13163,6 @@ impl CoordinationKernel {
                             "baseSha": integration.head_sha,
                             "status": "active",
                         });
-                        terminal_coordination_log(
-                            "terminal.coordination.worktree.create_or_reuse.done",
-                            telemetry_pane_id,
-                            Some(total_started_at.elapsed()),
-                            json!({
-                                "path": response["path"].as_str(),
-                                "reused_existing": true,
-                                "slot_key": slot_key,
-                                "worktree_id": response["id"].as_str(),
-                            }),
-                        );
                         return Ok(response);
                     }
                 } else {
@@ -14450,13 +13219,11 @@ impl CoordinationKernel {
         }
 
         if !path.exists() {
-            let add_started_at = Instant::now();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("Unable to create worktree root: {error}"))?;
             }
             let path_string = process_path_text(&path);
-            let branch_exists_started_at = Instant::now();
             let args = if self.branch_exists(&branch)? {
                 vec!["worktree", "add", &path_string, &branch]
             } else {
@@ -14469,17 +13236,6 @@ impl CoordinationKernel {
                     INTEGRATION_BRANCH,
                 ]
             };
-            terminal_coordination_log(
-                "terminal.coordination.worktree.add_args_ready",
-                telemetry_pane_id,
-                Some(branch_exists_started_at.elapsed()),
-                json!({
-                    "branch_name": branch.clone(),
-                    "path": path_string.clone(),
-                    "slot_key": slot_key,
-                    "used_existing_branch": args.len() == 4,
-                }),
-            );
             if let Err(error) = run_git(&self.paths.repo_path, &args) {
                 self.emit_event(
                     "worktree_create_failed",
@@ -14537,19 +13293,8 @@ impl CoordinationKernel {
                     json!({"slot_key": slot_key, "path": path_string, "branch_name": branch}),
                 )?;
             }
-            terminal_coordination_log(
-                "terminal.coordination.worktree.add_done",
-                telemetry_pane_id,
-                Some(add_started_at.elapsed()),
-                json!({
-                    "branch_name": branch.clone(),
-                    "path": path_string.clone(),
-                    "slot_key": slot_key,
-                }),
-            );
         }
         let canonical_worktree = path.canonicalize().unwrap_or(path);
-        let refresh_started_at = Instant::now();
         let integration_refresh = if refresh_existing {
             self.refresh_agent_worktree_from_integration_with_telemetry(
                 &canonical_worktree,
@@ -14562,16 +13307,6 @@ impl CoordinationKernel {
                 "current_sha": base_sha.as_str(),
             })
         };
-        terminal_coordination_log(
-            "terminal.coordination.worktree.final_refresh_done",
-            telemetry_pane_id,
-            Some(refresh_started_at.elapsed()),
-            json!({
-                "path": process_path_text(&canonical_worktree),
-                "refresh_status": integration_refresh["status"].as_str(),
-                "slot_key": slot_key,
-            }),
-        );
         let recorded_sha = integration_refresh["current_sha"]
             .as_str()
             .unwrap_or(base_sha.as_str())
@@ -14593,7 +13328,6 @@ impl CoordinationKernel {
                 "Stable worktree path escapes .agents/worktrees for slot {slot_key}."
             ));
         }
-        let db_started_at = Instant::now();
         let existing_row_id = self
             .conn
             .query_row(
@@ -14647,17 +13381,6 @@ impl CoordinationKernel {
                 params![id, now_rfc3339(), agent_slot_id],
             )
             .map_err(|error| format!("Unable to attach worktree to slot: {error}"))?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.db_recorded",
-            telemetry_pane_id,
-            Some(db_started_at.elapsed()),
-            json!({
-                "existing_row": existing_row_id.is_some(),
-                "slot_key": slot_key,
-                "worktree_id": id,
-            }),
-        );
-        let event_started_at = Instant::now();
         self.emit_event(
             if slot["worktree_id"].as_str().is_some() {
                 "worktree_recovered"
@@ -14680,15 +13403,6 @@ impl CoordinationKernel {
                 "integration_refresh": integration_refresh,
             }),
         )?;
-        terminal_coordination_log(
-            "terminal.coordination.worktree.event_written",
-            telemetry_pane_id,
-            Some(event_started_at.elapsed()),
-            json!({
-                "slot_key": slot_key,
-                "worktree_id": id,
-            }),
-        );
 
         let response = json!({
             "id": id,
@@ -14700,17 +13414,6 @@ impl CoordinationKernel {
             "baseSha": recorded_sha,
             "status": "active",
         });
-        terminal_coordination_log(
-            "terminal.coordination.worktree.create_or_reuse.done",
-            telemetry_pane_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "path": response["path"].as_str(),
-                "reused_existing": false,
-                "slot_key": slot_key,
-                "worktree_id": response["id"].as_str(),
-            }),
-        );
         Ok(response)
     }
 
@@ -14958,17 +13661,6 @@ impl CoordinationKernel {
         worktree_path: &Path,
         telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
-        let total_started_at = Instant::now();
-        terminal_coordination_log(
-            "terminal.coordination.worktree.refresh.start",
-            telemetry_pane_id,
-            None,
-            json!({
-                "path": process_path_text(worktree_path),
-                "target_branch": INTEGRATION_BRANCH,
-            }),
-        );
-        let dirty_started_at = Instant::now();
         let dirty = self
             .changed_files(worktree_path)
             .map(|changes| {
@@ -14979,101 +13671,33 @@ impl CoordinationKernel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        terminal_coordination_log(
-            "terminal.coordination.worktree.refresh.dirty_checked",
-            telemetry_pane_id,
-            Some(dirty_started_at.elapsed()),
-            json!({
-                "changed_file_count": dirty.len(),
-                "path": process_path_text(worktree_path),
-            }),
-        );
         if !dirty.is_empty() {
             let response = json!({
                 "status": "deferred_dirty_worktree",
                 "changed_files": dirty.iter().map(|change| change.path.clone()).collect::<Vec<_>>(),
                 "resume_instruction": "Worktree has local edits; fetch Cloud merge context and resolve against the accepted integration patch before continuing blocked files.",
             });
-            terminal_coordination_log(
-                "terminal.coordination.worktree.refresh.done",
-                telemetry_pane_id,
-                Some(total_started_at.elapsed()),
-                json!({
-                    "changed_file_count": dirty.len(),
-                    "path": process_path_text(worktree_path),
-                    "status": response["status"].as_str(),
-                }),
-            );
             return Ok(response);
         }
-        let merge_started_at = Instant::now();
         match run_git(worktree_path, &["merge", "--ff-only", INTEGRATION_BRANCH]) {
             Ok(output) => {
-                terminal_coordination_log(
-                    "terminal.coordination.worktree.refresh.merge_done",
-                    telemetry_pane_id,
-                    Some(merge_started_at.elapsed()),
-                    json!({
-                        "path": process_path_text(worktree_path),
-                        "target_branch": INTEGRATION_BRANCH,
-                    }),
-                );
-                let head_started_at = Instant::now();
                 let current_sha =
                     run_git(worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
-                terminal_coordination_log(
-                    "terminal.coordination.worktree.refresh.head_read",
-                    telemetry_pane_id,
-                    Some(head_started_at.elapsed()),
-                    json!({
-                        "current_sha": current_sha.trim(),
-                        "path": process_path_text(worktree_path),
-                    }),
-                );
                 let response = json!({
                     "status": "refreshed",
                     "target_branch": INTEGRATION_BRANCH,
                     "current_sha": current_sha.trim(),
                     "output": output.trim(),
                 });
-                terminal_coordination_log(
-                    "terminal.coordination.worktree.refresh.done",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "current_sha": response["current_sha"].as_str(),
-                        "path": process_path_text(worktree_path),
-                        "status": response["status"].as_str(),
-                    }),
-                );
                 Ok(response)
             }
             Err(error) => {
-                terminal_coordination_log(
-                    "terminal.coordination.worktree.refresh.merge_failed",
-                    telemetry_pane_id,
-                    Some(merge_started_at.elapsed()),
-                    json!({
-                        "error": error.clone(),
-                        "path": process_path_text(worktree_path),
-                        "target_branch": INTEGRATION_BRANCH,
-                    }),
-                );
                 let response = json!({
                     "status": "refresh_failed",
                     "target_branch": INTEGRATION_BRANCH,
                     "error": error,
                     "resume_instruction": "Refresh failed; fetch Cloud merge context and use merge-resolution flow before editing blocked files.",
                 });
-                terminal_coordination_log(
-                    "terminal.coordination.worktree.refresh.done",
-                    telemetry_pane_id,
-                    Some(total_started_at.elapsed()),
-                    json!({
-                        "path": process_path_text(worktree_path),
-                        "status": response["status"].as_str(),
-                    }),
-                );
                 Ok(response)
             }
         }

@@ -159,7 +159,10 @@ fn cloud_mcp_short_hash(value: &str) -> String {
 }
 
 fn cloud_mcp_repo_id_for_root(root: &Path) -> String {
-    format!("repo-{}", cloud_mcp_short_hash(&workspace_path_display(root)))
+    format!(
+        "repo-{}",
+        cloud_mcp_short_hash(&workspace_path_display(root))
+    )
 }
 
 fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
@@ -193,24 +196,14 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
     cloud_mcp_snapshot(&runtime)
 }
 
-async fn cloud_mcp_connect_state(state: &CloudMcpState, reason: &str) -> Result<CloudMcpStatus, String> {
-    let connect_started_at = Instant::now();
+async fn cloud_mcp_connect_state(
+    state: &CloudMcpState,
+    reason: &str,
+) -> Result<CloudMcpStatus, String> {
     let base_url = {
         let runtime = state.inner.lock().await;
         runtime.base_url.clone()
     };
-
-    log_terminal_event(
-        "cloud_mcp.connect.start",
-        None,
-        None,
-        None,
-        json!({
-            "base_url": clean_terminal_telemetry_text(&base_url),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
-
     let mut last_error = String::new();
     for endpoint in ["/v1/dev/connection", "/v1/status"] {
         let url = format!("{base_url}{endpoint}");
@@ -231,20 +224,6 @@ async fn cloud_mcp_connect_state(state: &CloudMcpState, reason: &str) -> Result<
                 runtime.last_connected_ms = Some(cloud_mcp_now_ms());
                 let snapshot = cloud_mcp_snapshot(&runtime);
                 drop(runtime);
-
-                log_terminal_event(
-                    "cloud_mcp.connect.done",
-                    None,
-                    None,
-                    Some(connect_started_at.elapsed()),
-                    json!({
-                        "base_url": clean_terminal_telemetry_text(&base_url),
-                        "endpoint": endpoint,
-                        "reason": clean_terminal_telemetry_text(reason),
-                        "server_response": server_response,
-                    }),
-                );
-
                 return Ok(snapshot);
             }
             Ok(response) => {
@@ -262,18 +241,6 @@ async fn cloud_mcp_connect_state(state: &CloudMcpState, reason: &str) -> Result<
     }
 
     let snapshot = cloud_mcp_set_connection_error(state, last_error.clone()).await;
-    log_terminal_event(
-        "cloud_mcp.connect.error",
-        None,
-        None,
-        Some(connect_started_at.elapsed()),
-        json!({
-            "base_url": clean_terminal_telemetry_text(&base_url),
-            "reason": clean_terminal_telemetry_text(reason),
-            "error": clean_terminal_telemetry_text(&last_error),
-        }),
-    );
-
     Err(format!(
         "Cloud MCP is required before terminals can start. {}",
         snapshot.last_error
@@ -292,7 +259,9 @@ async fn cloud_mcp_connected_or_connect(
     cloud_mcp_connect_state(state, reason).await
 }
 
-async fn require_cloud_mcp_connected_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
+async fn require_cloud_mcp_connected_state(
+    state: &CloudMcpState,
+) -> Result<CloudMcpStatus, String> {
     Ok(cloud_mcp_status_snapshot(state).await)
 }
 
@@ -446,14 +415,7 @@ fn cloud_mcp_file_references(path: &Path, size: Option<u64>) -> Vec<String> {
         cloud_mcp_extract_quoted_references(
             line,
             &[
-                "import",
-                "export",
-                "require(",
-                " from ",
-                "src=",
-                "href=",
-                "@import",
-                "url(",
+                "import", "export", "require(", " from ", "src=", "href=", "@import", "url(",
             ],
             &mut references,
         );
@@ -516,7 +478,10 @@ fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
                     relative_path,
                     kind: "directory".to_string(),
                     size: None,
-                    modified_ms: entry.metadata().ok().and_then(|metadata| cloud_mcp_modified_ms(&metadata)),
+                    modified_ms: entry
+                        .metadata()
+                        .ok()
+                        .and_then(|metadata| cloud_mcp_modified_ms(&metadata)),
                     references: Vec::new(),
                 });
                 queue.push_back((path, depth + 1));
@@ -778,7 +743,8 @@ fn cloud_mcp_post_log_context(
         .or_else(|| cloud_mcp_payload_text(payload, &["workspace_root"]))
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_path"]))
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_root"]))?;
-    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let root = resolve_workspace_root_directory(Some(&repo_path))
+        .unwrap_or_else(|_| PathBuf::from(&repo_path));
     let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id"])
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
         .unwrap_or_default();
@@ -795,8 +761,16 @@ fn cloud_mcp_post_log_context(
     let terminal_instance_id = payload
         .get("terminal_instance_id")
         .or_else(|| payload.get("instance_id"))
-        .or_else(|| payload.get("payload").and_then(|payload| payload.get("terminal_instance_id")))
-        .or_else(|| payload.get("payload").and_then(|payload| payload.get("instance_id")))
+        .or_else(|| {
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("terminal_instance_id"))
+        })
+        .or_else(|| {
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("instance_id"))
+        })
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
@@ -822,12 +796,7 @@ fn cloud_mcp_post_log_context(
         fields["terminalInstanceId"] = terminal_instance_id;
     }
 
-    Some((
-        root,
-        workspace_id,
-        workspace_name,
-        fields,
-    ))
+    Some((root, workspace_id, workspace_name, fields))
 }
 
 fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
@@ -882,8 +851,7 @@ async fn cloud_mcp_register_prepared_workspace(
             "context_pack_model": true,
         }
     });
-    let server_response =
-        cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
+    let server_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
     let filetree_response = cloud_mcp_push_filetree_snapshot(
         state,
         &repo_id,
@@ -969,11 +937,10 @@ async fn cloud_mcp_push_current_filetree_snapshot(
     reason: &str,
 ) -> Result<Value, String> {
     let root = workspace_root.to_path_buf();
-    let (filetree, filetree_truncated) = tauri::async_runtime::spawn_blocking(move || {
-        cloud_mcp_collect_filetree(&root)
-    })
-    .await
-    .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
+    let (filetree, filetree_truncated) =
+        tauri::async_runtime::spawn_blocking(move || cloud_mcp_collect_filetree(&root))
+            .await
+            .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
     cloud_mcp_push_filetree_snapshot(
         state,
         repo_id,
@@ -1050,9 +1017,8 @@ fn cloud_mcp_terminal_claimed_paths(
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
-    let rows = match statement.query_map(
-        rusqlite::params![coordination.session_id.as_str()],
-        |row| {
+    let rows =
+        match statement.query_map(rusqlite::params![coordination.session_id.as_str()], |row| {
             let resource_key: String = row.get(0)?;
             let mode: String = row.get(1)?;
             let reason: Option<String> = row.get(2)?;
@@ -1066,11 +1032,10 @@ fn cloud_mcp_terminal_claimed_paths(
                 "mode": mode,
                 "reason": reason,
             }))
-        },
-    ) {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
     for row in rows.filter_map(Result::ok) {
         let key = row["resource_key"]
             .as_str()
@@ -1202,7 +1167,12 @@ fn cloud_mcp_terminal_repo_id(
         .map(|coordination| coordination.repo_path.clone())
         .filter(|value| !value.trim().is_empty())
         .map(|value| format!("repo-{}", cloud_mcp_short_hash(&value)))
-        .unwrap_or_else(|| format!("repo-{}", cloud_mcp_short_hash(&workspace_path_display(working_directory))))
+        .unwrap_or_else(|| {
+            format!(
+                "repo-{}",
+                cloud_mcp_short_hash(&workspace_path_display(working_directory))
+            )
+        })
 }
 
 fn cloud_mcp_strip_terminal_sequences(value: &str) -> String {
@@ -1345,7 +1315,9 @@ fn cloud_mcp_extract_agent_work_brief(text: &str) -> Option<String> {
         brief.truncate(index + 1);
     }
     let brief = brief
-        .trim_matches(|character: char| character == '•' || character == '-' || character.is_whitespace())
+        .trim_matches(|character: char| {
+            character == '•' || character == '-' || character.is_whitespace()
+        })
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -1372,7 +1344,9 @@ fn cloud_mcp_work_title_from_brief(brief: &str) -> String {
         }
     }
     let title = title
-        .trim_matches(|character: char| character == '.' || character == ':' || character.is_whitespace())
+        .trim_matches(|character: char| {
+            character == '.' || character == ':' || character.is_whitespace()
+        })
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -1435,7 +1409,10 @@ fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
     }
 
     let mut files = Vec::new();
-    let mut parts = output.stdout.split(|byte| *byte == 0).filter(|part| !part.is_empty());
+    let mut parts = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty());
     while let Some(entry) = parts.next() {
         if entry.len() < 4 {
             continue;
@@ -1552,19 +1529,7 @@ async fn cloud_mcp_claim_terminal_lane(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_claimed", &payload).await {
-        log_terminal_event(
-            "cloud_mcp.context_pack.claim_lane.error",
-            None,
-            None,
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(agent_id),
-                "lane": clean_terminal_telemetry_text(lane),
-                "error": clean_terminal_telemetry_text(&error),
-            }),
-        );
-    }
+    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_claimed", &payload).await {}
 }
 
 async fn cloud_mcp_release_terminal_lane(
@@ -1599,21 +1564,7 @@ async fn cloud_mcp_release_terminal_lane(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_released", &payload).await {
-        log_terminal_event(
-            "cloud_mcp.agent_lifecycle.release_lane_error",
-            Some(pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(agent_id),
-                "repo_id": clean_terminal_telemetry_text(repo_id),
-                "lane": clean_terminal_telemetry_text(lane),
-                "reason": clean_terminal_telemetry_text(reason),
-                "error": clean_terminal_telemetry_text(&error),
-            }),
-        );
-    }
+    if let Err(error) = cloud_mcp_post_event_endpoint(state, "lane_released", &payload).await {}
 }
 
 async fn cloud_mcp_sync_terminal_agent_status(
@@ -1669,37 +1620,8 @@ async fn cloud_mcp_sync_terminal_agent_status(
         "ts_ms": cloud_mcp_now_ms(),
     });
     match cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await {
-        Ok(_) => {
-            log_terminal_event(
-                "cloud_mcp.agent_lifecycle.synced",
-                Some(pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(agent_id),
-                    "repo_id": clean_terminal_telemetry_text(repo_id),
-                    "status": status,
-                    "lane": clean_terminal_telemetry_text(lane),
-                    "reason": clean_terminal_telemetry_text(reason),
-                    "local_task_id": local_task_id.map(clean_terminal_telemetry_text),
-                }),
-            );
-        }
-        Err(error) => {
-            log_terminal_event(
-                "cloud_mcp.agent_lifecycle.sync_error",
-                Some(pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(agent_id),
-                    "repo_id": clean_terminal_telemetry_text(repo_id),
-                    "status": status,
-                    "reason": clean_terminal_telemetry_text(reason),
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-        }
+        Ok(_) => {}
+        Err(error) => {}
     }
 }
 
@@ -1738,7 +1660,10 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     lane: &str,
     brief: &str,
 ) -> Option<String> {
-    if cloud_mcp_connected_or_connect(state, "terminal_task_lifecycle").await.is_err() {
+    if cloud_mcp_connected_or_connect(state, "terminal_task_lifecycle")
+        .await
+        .is_err()
+    {
         return None;
     }
 
@@ -1750,7 +1675,9 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     } else {
         Vec::new()
     };
-    if matches!(status, "done" | "review" | "merged" | "completed") && !lifecycle_changed_files.is_empty() {
+    if matches!(status, "done" | "review" | "merged" | "completed")
+        && !lifecycle_changed_files.is_empty()
+    {
         if let Err(error) = cloud_mcp_push_current_filetree_snapshot(
             state,
             &repo_id,
@@ -1823,41 +1750,15 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     close_context: &TerminalCloudMcpCloseContext,
     reason: &str,
 ) {
-    let closed_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.closed_start",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
-    let connect_started_at = Instant::now();
-    if cloud_mcp_connected_or_connect(state, "terminal_closed").await.is_err() {
+    if cloud_mcp_connected_or_connect(state, "terminal_closed")
+        .await
+        .is_err()
+    {
         let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.remove(&terminal_key);
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cloud_mcp.connect_error",
-            Some(pane_id),
-            Some(instance_id),
-            Some(connect_started_at.elapsed()),
-            json!({
-                "reason": clean_terminal_telemetry_text(reason),
-            }),
-        );
         return;
     }
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.connect_done",
-        Some(pane_id),
-        Some(instance_id),
-        Some(connect_started_at.elapsed()),
-        json!({
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
 
     let coordination = close_context.coordination.as_ref();
     let working_directory = close_context.working_directory.as_ref();
@@ -1878,25 +1779,16 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     let local_task_id = active_task
         .as_ref()
         .map(|task| task.task_id.as_str())
-        .or_else(|| context_entry.as_ref().and_then(|entry| entry.local_task_id.as_deref()));
+        .or_else(|| {
+            context_entry
+                .as_ref()
+                .and_then(|entry| entry.local_task_id.as_deref())
+        });
     let title = active_task.as_ref().map(|task| task.title.as_str());
     let last_prompt = context_entry
         .as_ref()
         .map(|entry| entry.last_prompt.as_str())
         .filter(|prompt| !prompt.trim().is_empty());
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.context_loaded",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "has_active_task": active_task.is_some(),
-            "has_context_entry": context_entry.is_some(),
-            "has_coordination": coordination.is_some(),
-            "lane": clean_terminal_telemetry_text(&lane),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
     let work_subject = context_entry
         .as_ref()
         .map(|entry| cloud_mcp_work_subject(&entry.work_brief))
@@ -1911,17 +1803,6 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     );
 
     if let Some(active_task) = active_task.as_ref() {
-        let task_lifecycle_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cloud_mcp.task_lifecycle_start",
-            Some(pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "local_task_id": clean_terminal_telemetry_text(&active_task.task_id),
-                "reason": clean_terminal_telemetry_text(reason),
-            }),
-        );
         cloud_mcp_mark_terminal_task_lifecycle(
             state,
             pane_id,
@@ -1935,30 +1816,8 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
             &brief,
         )
         .await;
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cloud_mcp.task_lifecycle_done",
-            Some(pane_id),
-            Some(instance_id),
-            Some(task_lifecycle_started_at.elapsed()),
-            json!({
-                "local_task_id": clean_terminal_telemetry_text(&active_task.task_id),
-                "reason": clean_terminal_telemetry_text(reason),
-            }),
-        );
     }
 
-    let status_sync_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.closed_status_sync_start",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&agent_id),
-            "lane": clean_terminal_telemetry_text(&lane),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
     cloud_mcp_sync_terminal_agent_status(
         state,
         &repo_id,
@@ -1975,29 +1834,6 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         reason,
     )
     .await;
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.closed_status_sync_done",
-        Some(pane_id),
-        Some(instance_id),
-        Some(status_sync_started_at.elapsed()),
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&agent_id),
-            "lane": clean_terminal_telemetry_text(&lane),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
-    let release_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.lane_release_start",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&agent_id),
-            "lane": clean_terminal_telemetry_text(&lane),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
     cloud_mcp_release_terminal_lane(
         state,
         &repo_id,
@@ -2009,29 +1845,9 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         reason,
     )
     .await;
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.lane_release_done",
-        Some(pane_id),
-        Some(instance_id),
-        Some(release_started_at.elapsed()),
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&agent_id),
-            "lane": clean_terminal_telemetry_text(&lane),
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
 
     let mut runtime = state.inner.lock().await;
     runtime.terminal_contexts.remove(&terminal_key);
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cloud_mcp.closed_done",
-        Some(pane_id),
-        Some(instance_id),
-        Some(closed_started_at.elapsed()),
-        json!({
-            "reason": clean_terminal_telemetry_text(reason),
-        }),
-    );
 }
 
 fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
@@ -2067,7 +1883,9 @@ async fn cloud_mcp_observe_terminal_output(
     chunk: &[u8],
 ) {
     let text = String::from_utf8_lossy(chunk);
-    if !cloud_mcp_terminal_output_looks_active(&text) && !cloud_mcp_terminal_output_looks_ready(&text) {
+    if !cloud_mcp_terminal_output_looks_active(&text)
+        && !cloud_mcp_terminal_output_looks_ready(&text)
+    {
         return;
     }
 
@@ -2142,18 +1960,19 @@ async fn cloud_mcp_observe_terminal_output(
         .await;
     }
 
-    let Some((local_task_id, repo_id, agent_id, lane, _prompt, work_brief, working_directory)) = completion else {
+    let Some((local_task_id, repo_id, agent_id, lane, _prompt, work_brief, working_directory)) =
+        completion
+    else {
         return;
     };
     let scan_root = working_directory.clone();
-    let changed_files = match tauri::async_runtime::spawn_blocking(move || {
-        cloud_mcp_git_changed_files(&scan_root)
-    })
-    .await
-    {
-        Ok(files) => files,
-        Err(_) => Vec::new(),
-    };
+    let changed_files =
+        match tauri::async_runtime::spawn_blocking(move || cloud_mcp_git_changed_files(&scan_root))
+            .await
+        {
+            Ok(files) => files,
+            Err(_) => Vec::new(),
+        };
     let brief = format!(
         "Ready for patch submission: {}",
         cloud_mcp_work_subject(&work_brief)
@@ -2310,10 +2129,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 .or_else(|| data["suggested_lane"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            let active_agent_count = data["peers"]
-                .as_array()
-                .map(Vec::len)
-                .unwrap_or(0);
+            let active_agent_count = data["peers"].as_array().map(Vec::len).unwrap_or(0);
             let lane_conflict_count = data["conflicts"]["lanes"]
                 .as_array()
                 .map(Vec::len)
@@ -2416,12 +2232,10 @@ async fn cloud_mcp_track_terminal_file_changes(
         tokio::time::sleep(Duration::from_secs(8)).await;
         if let Some((local_task_id, work_brief)) = {
             let runtime = state.inner.lock().await;
-            runtime.terminal_contexts.get(&terminal_key).map(|entry| {
-                (
-                    entry.local_task_id.clone(),
-                    entry.work_brief.clone(),
-                )
-            })
+            runtime
+                .terminal_contexts
+                .get(&terminal_key)
+                .map(|entry| (entry.local_task_id.clone(), entry.work_brief.clone()))
         } {
             let heartbeat_brief = if work_brief.trim().is_empty() {
                 "Terminal task is active.".to_string()
@@ -2452,8 +2266,10 @@ async fn cloud_mcp_track_terminal_file_changes(
                 .get(&terminal_key)
                 .and_then(|entry| entry.local_task_id.clone())
         };
-        let scopes =
-            cloud_mcp_terminal_claimed_paths(coordination.as_ref(), local_task_id_for_scope.as_deref());
+        let scopes = cloud_mcp_terminal_claimed_paths(
+            coordination.as_ref(),
+            local_task_id_for_scope.as_deref(),
+        );
         let scan_root = working_directory.clone();
         let changed_files = match tauri::async_runtime::spawn_blocking(move || {
             cloud_mcp_git_changed_files_for_scope(&scan_root, &scopes)
@@ -2483,7 +2299,9 @@ async fn cloud_mcp_track_terminal_file_changes(
                     }
                     Some((
                         false,
-                        entry.reported_change && !entry.done_reported && entry.stable_change_cycles >= 4,
+                        entry.reported_change
+                            && !entry.done_reported
+                            && entry.stable_change_cycles >= 4,
                         local_task_id,
                         work_brief,
                     ))
@@ -2564,7 +2382,10 @@ async fn cloud_mcp_track_terminal_file_changes(
         if !should_report {
             continue;
         }
-        if cloud_mcp_connected_or_connect(&state, "terminal_subtask_checkpoint").await.is_err() {
+        if cloud_mcp_connected_or_connect(&state, "terminal_subtask_checkpoint")
+            .await
+            .is_err()
+        {
             continue;
         }
         let brief = format!(
@@ -2706,7 +2527,8 @@ async fn cloud_mcp_sync_workspace(
 
 #[tauri::command]
 async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
-    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let root = resolve_workspace_root_directory(Some(&repo_path))
+        .unwrap_or_else(|_| PathBuf::from(&repo_path));
     let log_path = root
         .join(".agents")
         .join("cloud-mcp")
@@ -2752,7 +2574,8 @@ fn cloud_mcp_spec_graph_sync_request(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
 ) -> CloudMcpSpecGraphSyncRequest {
-    let root = resolve_workspace_root_directory(Some(&repo_path)).unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let root = resolve_workspace_root_directory(Some(&repo_path))
+        .unwrap_or_else(|_| PathBuf::from(&repo_path));
     let root_display = workspace_path_display(&root);
     let repo_id = cloud_mcp_repo_id_for_root(&root);
     CloudMcpSpecGraphSyncRequest {
@@ -2793,18 +2616,9 @@ fn cloud_mcp_spec_graph_snapshot_from_data(
     sync_state: &str,
     sync_error: &str,
 ) -> Value {
-    let nodes = data
-        .get("nodes")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let edges = data
-        .get("edges")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let agent_work = data
-        .get("agent_work")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let nodes = data.get("nodes").cloned().unwrap_or_else(|| json!([]));
+    let edges = data.get("edges").cloned().unwrap_or_else(|| json!([]));
+    let agent_work = data.get("agent_work").cloned().unwrap_or_else(|| json!({}));
     let graph_stats = data
         .get("graph_stats")
         .cloned()
@@ -2884,16 +2698,25 @@ fn cloud_mcp_stamp_spec_graph_snapshot(
         object.insert("repoId".to_string(), json!(req.repo_id.clone()));
         object.insert("repoPath".to_string(), json!(req.root_display.clone()));
         object.insert("workspaceId".to_string(), json!(req.workspace_id.clone()));
-        object.insert("workspaceName".to_string(), json!(req.workspace_name.clone()));
-        object.insert("cachePath".to_string(), json!(workspace_path_display(cache_path)));
+        object.insert(
+            "workspaceName".to_string(),
+            json!(req.workspace_name.clone()),
+        );
+        object.insert(
+            "cachePath".to_string(),
+            json!(workspace_path_display(cache_path)),
+        );
         object.insert("syncState".to_string(), json!(sync_state));
         object.insert("syncError".to_string(), json!(sync_error));
-        object.insert("sourceOfTruth".to_string(), json!({
-            "kind": "spec_graph",
-            "repo_id": req.repo_id.clone(),
-            "markdown_backed": true,
-            "cached_under_agents": true
-        }));
+        object.insert(
+            "sourceOfTruth".to_string(),
+            json!({
+                "kind": "spec_graph",
+                "repo_id": req.repo_id.clone(),
+                "markdown_backed": true,
+                "cached_under_agents": true
+            }),
+        );
     }
     snapshot
 }
@@ -2955,7 +2778,12 @@ fn cloud_mcp_spec_graph_array(snapshot: &Value, camel_key: &str, raw_key: &str) 
     snapshot
         .get(camel_key)
         .and_then(Value::as_array)
-        .or_else(|| snapshot.get("raw").and_then(|raw| raw.get(raw_key)).and_then(Value::as_array))
+        .or_else(|| {
+            snapshot
+                .get("raw")
+                .and_then(|raw| raw.get(raw_key))
+                .and_then(Value::as_array)
+        })
         .cloned()
         .unwrap_or_default()
 }
@@ -3031,22 +2859,38 @@ fn cloud_mcp_apply_spec_graph_delta(
         cloud_mcp_spec_graph_delta_array(&delta, "changed_edges"),
         cloud_mcp_spec_graph_delta_string_array(&delta, "removed_edge_ids"),
     );
-    let agent_work = if delta.get("agent_work").is_some_and(|value| !value.is_null()) {
+    let agent_work = if delta
+        .get("agent_work")
+        .is_some_and(|value| !value.is_null())
+    {
         delta["agent_work"].clone()
     } else {
         cache
             .get("agentWork")
             .cloned()
-            .or_else(|| cache.get("raw").and_then(|raw| raw.get("agent_work")).cloned())
+            .or_else(|| {
+                cache
+                    .get("raw")
+                    .and_then(|raw| raw.get("agent_work"))
+                    .cloned()
+            })
             .unwrap_or_else(|| json!({}))
     };
-    let graph_stats = if delta.get("graph_stats").is_some_and(|value| !value.is_null()) {
+    let graph_stats = if delta
+        .get("graph_stats")
+        .is_some_and(|value| !value.is_null())
+    {
         delta["graph_stats"].clone()
     } else {
         cache
             .get("graphStats")
             .cloned()
-            .or_else(|| cache.get("raw").and_then(|raw| raw.get("graph_stats")).cloned())
+            .or_else(|| {
+                cache
+                    .get("raw")
+                    .and_then(|raw| raw.get("graph_stats"))
+                    .cloned()
+            })
             .unwrap_or_else(|| json!({}))
     };
     let raw = json!({
@@ -3068,19 +2912,31 @@ fn cloud_mcp_apply_spec_graph_delta(
         );
         object.insert(
             "nodeHashes".to_string(),
-            delta.get("node_hashes").cloned().unwrap_or_else(|| json!({})),
+            delta
+                .get("node_hashes")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         );
         object.insert(
             "edgeHashes".to_string(),
-            delta.get("edge_hashes").cloned().unwrap_or_else(|| json!({})),
+            delta
+                .get("edge_hashes")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         );
         object.insert(
             "agentWorkHash".to_string(),
-            delta.get("agent_work_hash").cloned().unwrap_or_else(|| json!("")),
+            delta
+                .get("agent_work_hash")
+                .cloned()
+                .unwrap_or_else(|| json!("")),
         );
         object.insert(
             "graphStatsHash".to_string(),
-            delta.get("graph_stats_hash").cloned().unwrap_or_else(|| json!("")),
+            delta
+                .get("graph_stats_hash")
+                .cloned()
+                .unwrap_or_else(|| json!("")),
         );
     }
     snapshot
@@ -3142,11 +2998,12 @@ async fn cloud_mcp_sync_spec_graph_once(
     let current_cache = cloud_mcp_read_spec_graph_cache(req, "syncing", "");
     cloud_mcp_connected_or_connect(state, "spec_graph_background_sync").await?;
     let payload = cloud_mcp_spec_graph_sync_payload(req, &current_cache);
-    let delta_response = match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph/delta", &payload).await {
-        Ok(response) => Some(response),
-        Err(error) if error.contains("HTTP 404") => None,
-        Err(error) => return Err(error),
-    };
+    let delta_response =
+        match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph/delta", &payload).await {
+            Ok(response) => Some(response),
+            Err(error) if error.contains("HTTP 404") => None,
+            Err(error) => return Err(error),
+        };
     let next_snapshot = if let Some(response) = delta_response {
         let delta = cloud_mcp_response_data(&response);
         if delta["requires_full_resync"].as_bool().unwrap_or(false) {
@@ -3159,9 +3016,7 @@ async fn cloud_mcp_sync_spec_graph_once(
         let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
         cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
     };
-    let changed = current_cache
-        .get("cursor")
-        .and_then(Value::as_str)
+    let changed = current_cache.get("cursor").and_then(Value::as_str)
         != next_snapshot.get("cursor").and_then(Value::as_str)
         || current_cache.get("syncState").and_then(Value::as_str) == Some("error");
     if changed {
@@ -3356,36 +3211,44 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
         if let Some(guard_detail) =
             cloud_mcp_proxy_apply_completion_guard(&mut request, &identity, &tool_name)
         {
-                identity.log(
-                "cloud_mcp.work.completion_guard",
-                &tool_name,
-                guard_detail,
-            );
+            identity.log("cloud_mcp.work.completion_guard", &tool_name, guard_detail);
         }
-        identity.log("cloud_mcp.tool_call.start", &tool_name, json!({
-            "method": method,
-            "tool": tool_name,
-            "baseUrl": base_url
-        }));
+        identity.log(
+            "cloud_mcp.tool_call.start",
+            &tool_name,
+            json!({
+                "method": method,
+                "tool": tool_name,
+                "baseUrl": base_url
+            }),
+        );
 
         match cloud_mcp_proxy_post_json(&base_url, &request.to_string()) {
             Ok(response) => {
-                identity.log("cloud_mcp.tool_call.done", &tool_name, json!({
-                    "method": method,
-                    "tool": tool_name,
-                    "baseUrl": base_url
-                }));
+                identity.log(
+                    "cloud_mcp.tool_call.done",
+                    &tool_name,
+                    json!({
+                        "method": method,
+                        "tool": tool_name,
+                        "baseUrl": base_url
+                    }),
+                );
                 if expects_response {
                     cloud_mcp_proxy_write_message(&mut writer, &response, framed)?;
                 }
             }
             Err(error) => {
-                identity.log("cloud_mcp.tool_call.error", &tool_name, json!({
-                    "method": method,
-                    "tool": tool_name,
-                    "baseUrl": base_url,
-                    "error": error
-                }));
+                identity.log(
+                    "cloud_mcp.tool_call.error",
+                    &tool_name,
+                    json!({
+                        "method": method,
+                        "tool": tool_name,
+                        "baseUrl": base_url,
+                        "error": error
+                    }),
+                );
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let response = json!({
                     "jsonrpc": "2.0",
@@ -3445,7 +3308,11 @@ impl CloudMcpProxyIdentity {
             .get("repo-path")
             .cloned()
             .or_else(|| env::var("CLOUD_MCP_REPO_PATH").ok())
-            .or_else(|| env::current_dir().ok().map(|path| path.to_string_lossy().to_string()))
+            .or_else(|| {
+                env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().to_string())
+            })
             .map(PathBuf::from);
 
         let repo_id = values
@@ -3568,7 +3435,10 @@ impl CloudMcpProxyIdentity {
             payload.insert("agentLabel".to_string(), json!(agent_label));
         }
         if let Some(terminal_instance_id) = self.terminal_instance_id.as_deref() {
-            payload.insert("terminalInstanceId".to_string(), json!(terminal_instance_id));
+            payload.insert(
+                "terminalInstanceId".to_string(),
+                json!(terminal_instance_id),
+            );
         }
         if let Some(extra) = fields.as_object() {
             for (key, value) in extra {
@@ -3633,9 +3503,15 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     };
     let event_kind = "checkpoint_recorded";
     let mut metadata = serde_json::Map::new();
-    metadata.insert("reported_by".to_string(), json!("coordination-kernel.checkpoint"));
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.checkpoint"),
+    );
     if let Some(local_task_id) = local_task_id {
-        metadata.insert("local_coordination_task_id".to_string(), json!(local_task_id));
+        metadata.insert(
+            "local_coordination_task_id".to_string(),
+            json!(local_task_id),
+        );
         metadata.insert("coordination_task_id".to_string(), json!(local_task_id));
     }
     if let Some(worktree_id) = worktree_id {
@@ -3646,7 +3522,10 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     }
 
     let mut arguments = serde_json::Map::new();
-    arguments.insert("source".to_string(), json!("rust-diffforge-agent-checkpoint"));
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-agent-checkpoint"),
+    );
     arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
     arguments.insert("subtask".to_string(), json!(summary));
     arguments.insert("brief".to_string(), json!(summary));
@@ -3656,7 +3535,10 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
     }
-    if let Some(local_task_id) = local_task_id.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(local_task_id) = local_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("task_id".to_string(), json!(local_task_id));
         arguments.insert("run_id".to_string(), json!(local_task_id));
     }
@@ -3685,27 +3567,39 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
         "payload": Value::Object(arguments),
         "ts_ms": cloud_mcp_now_ms(),
     });
-    identity.log("cloud_mcp.agent_checkpoint.start", event_kind, json!({
-        "activity": "agent checkpoint",
-        "baseUrl": base_url,
-        "summary": clean_terminal_telemetry_text(summary),
-    }));
+    identity.log(
+        "cloud_mcp.agent_checkpoint.start",
+        event_kind,
+        json!({
+            "activity": "agent checkpoint",
+            "baseUrl": base_url,
+            "summary": clean_terminal_telemetry_text(summary),
+        }),
+    );
     match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
         Ok(response) => {
-            identity.log("cloud_mcp.agent_checkpoint.done", event_kind, json!({
-                "activity": "agent checkpoint synced",
-                "baseUrl": base_url,
-            }));
+            identity.log(
+                "cloud_mcp.agent_checkpoint.done",
+                event_kind,
+                json!({
+                    "activity": "agent checkpoint synced",
+                    "baseUrl": base_url,
+                }),
+            );
             let parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
             Ok(parsed)
         }
         Err(error) => {
-            identity.log("cloud_mcp.agent_checkpoint.error", event_kind, json!({
-                "activity": "agent checkpoint sync failed",
-                "baseUrl": base_url,
-                "error": clean_terminal_telemetry_text(&error),
-            }));
+            identity.log(
+                "cloud_mcp.agent_checkpoint.error",
+                event_kind,
+                json!({
+                    "activity": "agent checkpoint sync failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
             Err(error)
         }
     }
@@ -3769,11 +3663,17 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         .unwrap_or_else(|| cloud_mcp_prompt_summary(&plan));
     let event_kind = "agent_started_work";
     let mut metadata = serde_json::Map::new();
-    metadata.insert("reported_by".to_string(), json!("coordination-kernel.start_task"));
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.start_task"),
+    );
     metadata.insert("intent_phase".to_string(), json!("agent_start_task_plan"));
     metadata.insert("start_task_plan".to_string(), json!(plan.clone()));
     if let Some(local_task_id) = local_task_id {
-        metadata.insert("local_coordination_task_id".to_string(), json!(local_task_id));
+        metadata.insert(
+            "local_coordination_task_id".to_string(),
+            json!(local_task_id),
+        );
         metadata.insert("coordination_task_id".to_string(), json!(local_task_id));
     }
     if let Some(worktree_id) = worktree_id {
@@ -3784,7 +3684,10 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     }
 
     let mut arguments = serde_json::Map::new();
-    arguments.insert("source".to_string(), json!("rust-diffforge-agent-start-task"));
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-agent-start-task"),
+    );
     arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
     arguments.insert("title".to_string(), json!(title));
     arguments.insert("body".to_string(), json!(plan.clone()));
@@ -3799,7 +3702,10 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
     }
-    if let Some(local_task_id) = local_task_id.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(local_task_id) = local_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("run_id".to_string(), json!(local_task_id));
         arguments.insert("task_id".to_string(), json!(local_task_id));
     }
@@ -3828,15 +3734,19 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         "payload": Value::Object(arguments.clone()),
         "ts_ms": cloud_mcp_now_ms(),
     });
-    identity.log("cloud_mcp.agent_start_task.start", event_kind, json!({
-        "activity": "agent start_task plan",
-        "baseUrl": base_url,
-        "plan": clean_terminal_telemetry_text(&plan),
-    }));
+    identity.log(
+        "cloud_mcp.agent_start_task.start",
+        event_kind,
+        json!({
+            "activity": "agent start_task plan",
+            "baseUrl": base_url,
+            "plan": clean_terminal_telemetry_text(&plan),
+        }),
+    );
     let event_response =
         cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &event_request.to_string())?;
-    let event_parsed =
-        serde_json::from_str::<Value>(&event_response).unwrap_or_else(|_| json!({"raw_response": event_response}));
+    let event_parsed = serde_json::from_str::<Value>(&event_response)
+        .unwrap_or_else(|_| json!({"raw_response": event_response}));
     let event_data = event_parsed
         .get("data")
         .cloned()
@@ -3853,12 +3763,7 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     )
     .ok()
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
-    .map(|value| {
-        value
-            .get("data")
-            .cloned()
-            .unwrap_or(value)
-    })
+    .map(|value| value.get("data").cloned().unwrap_or(value))
     .unwrap_or_else(|| json!({"ok": false, "error": "context_pack_refresh_failed"}));
     let spec_graph = cloud_mcp_proxy_post_json_endpoint(
         &base_url,
@@ -3867,20 +3772,19 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     )
     .ok()
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
-    .map(|value| {
-        value
-            .get("data")
-            .cloned()
-            .unwrap_or(value)
-    })
+    .map(|value| value.get("data").cloned().unwrap_or(value))
     .unwrap_or_else(|| json!({"ok": false, "error": "spec_graph_refresh_failed"}));
 
-    identity.log("cloud_mcp.agent_start_task.done", event_kind, json!({
-        "activity": "agent start_task synced",
-        "baseUrl": base_url,
-        "specRecorded": event_data["spec_activity"]["recorded"].as_bool(),
-        "specNodeCount": event_data["spec_activity"]["node_ids"].as_array().map(Vec::len),
-    }));
+    identity.log(
+        "cloud_mcp.agent_start_task.done",
+        event_kind,
+        json!({
+            "activity": "agent start_task synced",
+            "baseUrl": base_url,
+            "specRecorded": event_data["spec_activity"]["recorded"].as_bool(),
+            "specNodeCount": event_data["spec_activity"]["node_ids"].as_array().map(Vec::len),
+        }),
+    );
 
     Ok(json!({
         "event": event_data,
@@ -3912,7 +3816,10 @@ fn cloud_mcp_proxy_read_message<R: std::io::BufRead>(
         return cloud_mcp_proxy_read_message(reader);
     }
 
-    if !first_line.to_ascii_lowercase().starts_with("content-length:") {
+    if !first_line
+        .to_ascii_lowercase()
+        .starts_with("content-length:")
+    {
         return Ok(Some((first_line, false)));
     }
 
@@ -3944,7 +3851,8 @@ fn cloud_mcp_proxy_read_message<R: std::io::BufRead>(
     reader
         .read_exact(&mut body)
         .map_err(|error| format!("failed to read MCP body: {error}"))?;
-    let body = String::from_utf8(body).map_err(|error| format!("invalid MCP UTF-8 body: {error}"))?;
+    let body =
+        String::from_utf8(body).map_err(|error| format!("invalid MCP UTF-8 body: {error}"))?;
     Ok(Some((body, true)))
 }
 
@@ -3954,10 +3862,16 @@ fn cloud_mcp_proxy_write_message<W: std::io::Write>(
     framed: bool,
 ) -> Result<(), String> {
     if framed {
-        write!(writer, "Content-Length: {}\r\n\r\n{}", body.as_bytes().len(), body)
-            .map_err(|error| format!("failed to write MCP response: {error}"))?;
+        write!(
+            writer,
+            "Content-Length: {}\r\n\r\n{}",
+            body.as_bytes().len(),
+            body
+        )
+        .map_err(|error| format!("failed to write MCP response: {error}"))?;
     } else {
-        writeln!(writer, "{body}").map_err(|error| format!("failed to write MCP response: {error}"))?;
+        writeln!(writer, "{body}")
+            .map_err(|error| format!("failed to write MCP response: {error}"))?;
     }
     writer
         .flush()
@@ -3995,13 +3909,21 @@ fn cloud_mcp_proxy_enrich_request(
     cloud_mcp_proxy_insert_if_missing(arguments, "client_id", Some(identity.client_id.as_str()));
     cloud_mcp_proxy_insert_if_missing(arguments, "repo_id", identity.repo_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "workspace_id", identity.workspace_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "workspace_name", identity.workspace_name.as_deref());
+    cloud_mcp_proxy_insert_if_missing(
+        arguments,
+        "workspace_name",
+        identity.workspace_name.as_deref(),
+    );
     cloud_mcp_proxy_insert_if_missing(arguments, "agent_id", cloud_agent_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "self_agent_id", cloud_agent_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "current_agent_id", cloud_agent_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "actor", cloud_agent_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "session_id", identity.session_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "desktop_session_id", identity.session_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(
+        arguments,
+        "desktop_session_id",
+        identity.session_id.as_deref(),
+    );
     cloud_mcp_proxy_insert_if_missing(arguments, "slot_key", identity.slot_key.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "slotKey", identity.slot_key.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "agent_label", identity.agent_label.as_deref());
@@ -4013,8 +3935,16 @@ fn cloud_mcp_proxy_enrich_request(
     cloud_mcp_proxy_insert_if_missing(arguments, "pane_id", identity.pane_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "paneId", identity.pane_id.as_deref());
     cloud_mcp_proxy_insert_if_missing(arguments, "terminal_id", identity.pane_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "terminal_instance_id", identity.terminal_instance_id.as_deref());
-    cloud_mcp_proxy_insert_if_missing(arguments, "terminalInstanceId", identity.terminal_instance_id.as_deref());
+    cloud_mcp_proxy_insert_if_missing(
+        arguments,
+        "terminal_instance_id",
+        identity.terminal_instance_id.as_deref(),
+    );
+    cloud_mcp_proxy_insert_if_missing(
+        arguments,
+        "terminalInstanceId",
+        identity.terminal_instance_id.as_deref(),
+    );
     if let Some(repo_path) = identity.repo_path.as_ref() {
         let value = repo_path.to_string_lossy().to_string();
         arguments
@@ -4086,7 +4016,10 @@ fn cloud_mcp_proxy_insert_local_file_scope(
         && json_array_argument_empty(arguments, "changed_files")
         && json_array_argument_empty(arguments, "changedFiles")
     {
-        arguments.insert("changed_files".to_string(), json!(git_changed_files.clone()));
+        arguments.insert(
+            "changed_files".to_string(),
+            json!(git_changed_files.clone()),
+        );
     }
     if matches!(
         tool_name,
@@ -4313,12 +4246,18 @@ fn cloud_mcp_proxy_apply_completion_guard(
         metadata
             .entry("local_patch_applied".to_string())
             .or_insert_with(|| json!(true));
-        if let Some(task_id) = submission.as_ref().and_then(|value| value.task_id.as_deref()) {
+        if let Some(task_id) = submission
+            .as_ref()
+            .and_then(|value| value.task_id.as_deref())
+        {
             metadata
                 .entry("local_coordination_task_id".to_string())
                 .or_insert_with(|| json!(task_id));
         }
-        if let Some(patch_id) = submission.as_ref().and_then(|value| value.patch_id.as_deref()) {
+        if let Some(patch_id) = submission
+            .as_ref()
+            .and_then(|value| value.patch_id.as_deref())
+        {
             metadata
                 .entry("local_patch_id".to_string())
                 .or_insert_with(|| json!(patch_id));
@@ -4331,9 +4270,7 @@ fn cloud_mcp_proxy_apply_completion_guard(
                 .entry("changed_files".to_string())
                 .or_insert_with(|| json!(changed_files));
         }
-        let local_task_id = submission
-            .as_ref()
-            .and_then(|value| value.task_id.clone());
+        let local_task_id = submission.as_ref().and_then(|value| value.task_id.clone());
         return Some(json!({
             "activity": "completion allowed",
             "reason": "local_patch_applied",
@@ -4344,8 +4281,14 @@ fn cloud_mcp_proxy_apply_completion_guard(
     arguments.insert(status_key.to_string(), json!("review"));
     let metadata = cloud_mcp_proxy_completion_metadata(arguments);
     metadata.insert("requested_status".to_string(), json!("done"));
-    metadata.insert("completion_blocked_until_submit_patch".to_string(), json!(true));
-    metadata.insert("completion_gate".to_string(), json!("submit_patch_required"));
+    metadata.insert(
+        "completion_blocked_until_submit_patch".to_string(),
+        json!(true),
+    );
+    metadata.insert(
+        "completion_gate".to_string(),
+        json!("submit_patch_required"),
+    );
     if let Some(submission) = submission {
         if let Some(task_id) = submission.task_id {
             metadata.insert("local_coordination_task_id".to_string(), json!(task_id));
@@ -4532,7 +4475,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
         cloud_mcp_payload_text(value, &["workspace_id"])
             .or_else(|| cloud_mcp_payload_text(value, &["payload", "workspace_id"]))
     }) {
-        headers.push_str(&format!("x-diffforge-workspace-id: {}\r\n", workspace_id.trim()));
+        headers.push_str(&format!(
+            "x-diffforge-workspace-id: {}\r\n",
+            workspace_id.trim()
+        ));
     }
     if let Some(repo_id) = body_value.as_ref().and_then(|value| {
         cloud_mcp_payload_text(value, &["repo_id"])
@@ -4540,7 +4486,9 @@ fn cloud_mcp_proxy_post_json_endpoint(
     }) {
         headers.push_str(&format!("x-diffforge-repo-id: {}\r\n", repo_id.trim()));
     }
-    if let Ok(token) = env::var("CLOUD_DIFFFORGE_DEV_TOKEN").or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN")) {
+    if let Ok(token) =
+        env::var("CLOUD_DIFFFORGE_DEV_TOKEN").or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN"))
+    {
         if !token.trim().is_empty() {
             headers.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
         }
@@ -4570,7 +4518,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let head = String::from_utf8_lossy(&response[..header_end]).to_string();
     let body = &response[header_end + 4..];
     if !head.starts_with("HTTP/1.1 2") && !head.starts_with("HTTP/1.0 2") {
-        return Err(format!("Cloud MCP returned {}", head.lines().next().unwrap_or("non-2xx status")));
+        return Err(format!(
+            "Cloud MCP returned {}",
+            head.lines().next().unwrap_or("non-2xx status")
+        ));
     }
     let body = if cloud_mcp_proxy_header_contains(&head, "transfer-encoding", "chunked") {
         cloud_mcp_proxy_decode_chunked_body(body)?
@@ -4609,8 +4560,9 @@ fn cloud_mcp_proxy_decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
             .map(|(size, _)| size)
             .unwrap_or(size_line)
             .trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|error| format!("invalid chunked Cloud MCP chunk size '{size_text}': {error}"))?;
+        let size = usize::from_str_radix(size_text, 16).map_err(|error| {
+            format!("invalid chunked Cloud MCP chunk size '{size_text}': {error}")
+        })?;
         cursor = line_end + 2;
 
         if size == 0 {
@@ -4645,16 +4597,20 @@ fn cloud_mcp_proxy_parse_http_url(
     endpoint_path: &str,
 ) -> Result<CloudMcpProxyEndpoint, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
-    let without_scheme = trimmed
-        .strip_prefix("http://")
-        .ok_or_else(|| "Cloud MCP stdio proxy currently supports local http:// URLs only".to_string())?;
+    let without_scheme = trimmed.strip_prefix("http://").ok_or_else(|| {
+        "Cloud MCP stdio proxy currently supports local http:// URLs only".to_string()
+    })?;
     let (authority, prefix) = without_scheme
         .split_once('/')
         .map(|(authority, path)| (authority, format!("/{path}")))
         .unwrap_or((without_scheme, String::new()));
     let (host, port) = authority
         .rsplit_once(':')
-        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host.to_string(), port)))
+        .and_then(|(host, port)| {
+            port.parse::<u16>()
+                .ok()
+                .map(|port| (host.to_string(), port))
+        })
         .unwrap_or_else(|| (authority.to_string(), 80));
     let path = format!(
         "{}/{}",

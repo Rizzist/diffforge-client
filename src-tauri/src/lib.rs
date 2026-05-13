@@ -87,12 +87,7 @@ const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
-const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = false;
-const TERMINAL_RESIZE_LOGGING_ENABLED: bool = false;
-const TERMINAL_PARKED_LOGGING_ENABLED: bool = false;
-const TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED: bool = false;
-const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
-const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
+const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
 const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
@@ -175,7 +170,6 @@ const AUDIO_STATS_INTERVAL_MS: u64 = 140;
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
     OnceLock::new();
 static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
-static TERMINAL_TELEMETRY_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -218,7 +212,6 @@ struct TerminalState {
 
 impl Drop for TerminalState {
     fn drop(&mut self) {
-        let drop_started_at = Instant::now();
         let mut terminal_lock_failed = false;
         let instances = match self.terminals.try_write() {
             Ok(mut terminals) => terminals
@@ -232,19 +225,6 @@ impl Drop for TerminalState {
         let active_total = instances.len();
         let warm_ptys = self.pty_pool.drain_for_shutdown();
         let warm_total = warm_ptys.len();
-
-        log_terminal_event(
-            "terminal.state.drop.start",
-            None,
-            None,
-            None,
-            json!({
-                "active_count": active_total,
-                "app_pid": std::process::id(),
-                "terminal_lock_failed": terminal_lock_failed,
-                "warm_count": warm_total,
-            }),
-        );
 
         for (pane_id, instance) in instances {
             cleanup_terminal_instance_with_context(
@@ -263,22 +243,6 @@ impl Drop for TerminalState {
         let refill_idle = self.pty_pool.wait_for_refill_idle();
         let login_closed = cleanup_login_terminal_children_with_context("drop_fallback");
         let console_hosts_closed = cleanup_windows_headless_console_hosts("drop_fallback");
-
-        log_terminal_event(
-            "terminal.state.drop.done",
-            None,
-            None,
-            Some(drop_started_at.elapsed()),
-            json!({
-                "active_count": active_total,
-                "app_pid": std::process::id(),
-                "console_hosts_closed": console_hosts_closed,
-                "login_closed": login_closed,
-                "refill_idle": refill_idle,
-                "terminal_lock_failed": terminal_lock_failed,
-                "warm_count": warm_total,
-            }),
-        );
     }
 }
 
@@ -527,7 +491,6 @@ impl PtyPool {
                 pixel_width: 0,
                 pixel_height: 0,
             };
-            let started_at = Instant::now();
 
             match create_warm_shell_pty(size) {
                 Ok(warm_pty) => {
@@ -538,13 +501,6 @@ impl PtyPool {
                             && warm.len() < TERMINAL_PTY_POOL_TARGET
                         {
                             warm.push(warm_pty);
-                            log_terminal_event(
-                                "terminal.pool.refill_ready",
-                                None,
-                                None,
-                                Some(started_at.elapsed()),
-                                json!({ "warm_count": warm.len() }),
-                            );
                         } else {
                             should_cleanup = Some(warm_pty);
                         }
@@ -558,13 +514,6 @@ impl PtyPool {
                     }
                 }
                 Err(error) => {
-                    log_terminal_event(
-                        "terminal.pool.refill_error",
-                        None,
-                        None,
-                        Some(started_at.elapsed()),
-                        json!({ "error": clean_terminal_telemetry_text(&error) }),
-                    );
                     break;
                 }
             }
@@ -863,20 +812,6 @@ struct TerminalCloseAllProgressPayload {
     instance_id: Option<u64>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalTelemetryLogRequest {
-    ts_ms: Option<u64>,
-    pane_id: Option<String>,
-    instance_id: Option<u64>,
-    phase: String,
-    message: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
-    elapsed_ms: Option<f64>,
-    fields: Option<Value>,
-}
-
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AudioInputDeviceSummary {
@@ -1119,8 +1054,6 @@ fn install_app_panic_log_hook() {
                 "thread_id": thread_id,
                 "thread_name": clean_terminal_telemetry_text(&thread_name),
             });
-
-            log_terminal_event("app.panic", None, None, None, fields.clone());
             log_audio_diagnostic_event("app.panic", fields);
             previous_hook(panic_info);
         }));
@@ -1132,49 +1065,15 @@ fn schedule_app_exit_after_terminal_shutdown(
     app_pid: u32,
     window_label: String,
 ) -> Result<(), String> {
-    log_terminal_event(
-        "terminal.app_close.exit_schedule",
-        None,
-        None,
-        None,
-        json!({
-            "app_pid": app_pid,
-            "window_label": clean_terminal_telemetry_text(&window_label),
-        }),
-    );
-
     thread::Builder::new()
         .name("diffforge-app-close".to_string())
         .spawn(move || {
             thread::sleep(Duration::from_millis(APP_CLOSE_EXIT_REQUEST_DELAY_MS));
-
-            log_terminal_event(
-                "terminal.app_close.exit_request",
-                None,
-                None,
-                None,
-                json!({
-                    "app_pid": app_pid,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             app_for_exit.exit(0);
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
 
             if let Some(window) = app_for_exit.get_webview_window(&window_label) {
-                let destroy_started_at = Instant::now();
-                log_terminal_event(
-                    "terminal.app_close.window_destroy_fallback_start",
-                    None,
-                    None,
-                    None,
-                    json!({
-                        "app_pid": app_pid,
-                        "window_label": clean_terminal_telemetry_text(&window_label),
-                    }),
-                );
-
                 let destroy_result = window.destroy();
                 let (destroy_ok, destroy_error) = match destroy_result {
                     Ok(()) => (true, None),
@@ -1183,35 +1082,11 @@ fn schedule_app_exit_after_terminal_shutdown(
                         Some(clean_terminal_telemetry_text(&error.to_string())),
                     ),
                 };
-
-                log_terminal_event(
-                    "terminal.app_close.window_destroy_fallback_done",
-                    None,
-                    None,
-                    Some(destroy_started_at.elapsed()),
-                    json!({
-                        "app_pid": app_pid,
-                        "destroy_ok": destroy_ok,
-                        "error": destroy_error,
-                        "window_label": clean_terminal_telemetry_text(&window_label),
-                    }),
-                );
             }
 
             thread::sleep(Duration::from_millis(
                 APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
             ));
-
-            log_terminal_event(
-                "terminal.app_close.process_exit_fallback",
-                None,
-                None,
-                None,
-                json!({
-                    "app_pid": app_pid,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             std::process::exit(0);
         })
         .map(|_| ())
@@ -1227,188 +1102,40 @@ fn close_app_after_terminal_shutdown(
     let window_label = window.label().to_string();
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        log_terminal_event(
-            "terminal.app_close.already_in_flight",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": app_pid,
-                "window_label": clean_terminal_telemetry_text(&window_label),
-            }),
-        );
         return Ok(());
     }
 
     let app_for_shutdown = app.clone();
     tauri::async_runtime::spawn(async move {
-        let cleanup_started_at = Instant::now();
-        log_terminal_event(
-            "terminal.app_close.cleanup_start",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": app_pid,
-                "window_label": clean_terminal_telemetry_text(&window_label),
-            }),
-        );
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.app_close.cleanup_start",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": app_pid,
-                "window_label": clean_terminal_telemetry_text(&window_label),
-            }),
-        );
-
         let closed = {
             let terminal_state = app_for_shutdown.state::<TerminalState>();
             let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
             let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
-            let lifecycle_lock_started_at = Instant::now();
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.app_close.lifecycle_lock_wait_start",
-                None,
-                None,
-                None,
-                json!({
-                    "app_pid": app_pid,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             let _lifecycle_guard = lifecycle_lock.lock().await;
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.app_close.lifecycle_lock_wait_done",
-                None,
-                None,
-                Some(lifecycle_lock_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
-            let close_all_started_at = Instant::now();
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.app_close.close_all_start",
-                None,
-                None,
-                None,
-                json!({
-                    "app_pid": app_pid,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             let close_all_result = close_all_terminal_sessions(
                 app_for_shutdown.clone(),
                 &terminal_state,
                 cloud_mcp_state.inner(),
             )
             .await;
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.app_close.close_all_done",
-                None,
-                None,
-                Some(close_all_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "closed": close_all_result.as_ref().ok().copied(),
-                    "error": close_all_result.as_ref().err().map(|error| clean_terminal_telemetry_text(error)),
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             close_all_result
         };
 
         match closed {
-            Ok(closed) => log_terminal_event(
-                "terminal.app_close.cleanup_done",
-                None,
-                None,
-                Some(cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "closed": closed,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            ),
-            Err(error) => log_terminal_event(
-                "terminal.app_close.cleanup_error",
-                None,
-                None,
-                Some(cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            ),
+            Ok(closed) => (),
+            Err(error) => (),
         }
 
-        let mcp_cleanup_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.app_close.shared_mcp_cleanup_start",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": app_pid,
-                "window_label": clean_terminal_telemetry_text(&window_label),
-            }),
-        );
         match coordination::mcp::stop_all_shared_daemons("app_close") {
-            Ok(summary) => log_terminal_event(
-                "terminal.app_close.shared_mcp_cleanup_done",
-                None,
-                None,
-                Some(mcp_cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "summary": summary,
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            ),
-            Err(error) => log_terminal_event(
-                "terminal.app_close.shared_mcp_cleanup_error",
-                None,
-                None,
-                Some(mcp_cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            ),
+            Ok(summary) => (),
+            Err(error) => (),
         }
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.app_close.shared_mcp_cleanup_done",
-            None,
-            None,
-            Some(mcp_cleanup_started_at.elapsed()),
-            json!({
-                "app_pid": app_pid,
-                "window_label": clean_terminal_telemetry_text(&window_label),
-            }),
-        );
 
         if let Err(error) = schedule_app_exit_after_terminal_shutdown(
             app_for_shutdown.clone(),
             app_pid,
             window_label.clone(),
         ) {
-            log_terminal_event(
-                "terminal.app_close.exit_schedule_error",
-                None,
-                None,
-                Some(cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": app_pid,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "window_label": clean_terminal_telemetry_text(&window_label),
-                }),
-            );
             app_for_shutdown.exit(0);
         }
     });
@@ -1526,14 +1253,6 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
-
-    log_terminal_event(
-        "terminal.app.process_start",
-        None,
-        None,
-        None,
-        json!({ "app_pid": std::process::id() }),
-    );
     log_audio_diagnostic_event(
         "audio.debug.process_start",
         json!({
@@ -1578,15 +1297,7 @@ pub fn run() {
             pty_pool.ensure_warm_async();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = cloud_mcp_connect_state(&cloud_mcp_state, "startup").await {
-                    log_terminal_event(
-                        "cloud_mcp.startup_connect.error",
-                        None,
-                        None,
-                        None,
-                        json!({ "error": clean_terminal_telemetry_text(&error) }),
-                    );
-                }
+                if let Err(error) = cloud_mcp_connect_state(&cloud_mcp_state, "startup").await {}
             });
 
             register_audio_shortcuts(app.handle());
@@ -1651,8 +1362,6 @@ pub fn run() {
             insert_transcribed_text,
             insert_handsfree_transcribed_text,
             note_main_window_minimize_requested,
-            terminal_telemetry_log,
-            terminal_telemetry_log_many,
             terminal_recover_crashed_sessions,
             cloud_mcp_connect,
             cloud_mcp_get_status,

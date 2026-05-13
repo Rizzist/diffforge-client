@@ -247,21 +247,7 @@ fn spawn_npm_package_version_check(
     definition: AgentDefinition,
 ) -> thread::JoinHandle<Option<String>> {
     thread::spawn(move || {
-        let started_at = Instant::now();
         let package_version = npm_global_package_version(definition);
-
-        log_terminal_event(
-            "agent.status.npm_package_done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "detected": package_version.is_some(),
-                "package": definition.install_package,
-                "provider": definition.id,
-            }),
-        );
-
         package_version
     })
 }
@@ -270,21 +256,7 @@ fn spawn_npm_latest_package_version_check(
     definition: AgentDefinition,
 ) -> thread::JoinHandle<Option<String>> {
     thread::spawn(move || {
-        let started_at = Instant::now();
         let latest_version = npm_latest_package_version(definition);
-
-        log_terminal_event(
-            "agent.status.npm_latest_done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "detected": latest_version.is_some(),
-                "package": definition.install_package,
-                "provider": definition.id,
-            }),
-        );
-
         latest_version
     })
 }
@@ -576,7 +548,11 @@ fn terminal_agent_launch_command(
     let mut command = terminal_idle_shell_command();
     let invocation = terminal_agent_invocation(command_path, args);
     let command_text = if let Some(banner) = banner {
-        format!("Write-Host {}; {}", quote_powershell_literal(banner), invocation)
+        format!(
+            "Write-Host {}; {}",
+            quote_powershell_literal(banner),
+            invocation
+        )
     } else {
         invocation
     };
@@ -661,10 +637,9 @@ fn terminal_args_with_codex_mcp_identity(
     };
 
     let env_value = |key: &str| -> Option<String> {
-        coordination
-            .env_vars
-            .iter()
-            .find_map(|(candidate, value)| (candidate == key && !value.trim().is_empty()).then(|| value.clone()))
+        coordination.env_vars.iter().find_map(|(candidate, value)| {
+            (candidate == key && !value.trim().is_empty()).then(|| value.clone())
+        })
     };
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
@@ -939,7 +914,6 @@ fn create_agent_terminal_pty(
 }
 
 fn cleanup_warm_pty_with_context(warm_pty: WarmPty, reason: &'static str) {
-    let cleanup_started_at = Instant::now();
     let WarmPty {
         mut child,
         master,
@@ -948,72 +922,13 @@ fn cleanup_warm_pty_with_context(warm_pty: WarmPty, reason: &'static str) {
         size,
     } = warm_pty;
     let pid = child.process_id();
-
-    log_terminal_event(
-        "terminal.warm_cleanup.start",
-        None,
-        None,
-        None,
-        json!({
-            "app_pid": std::process::id(),
-            "cols": size.cols,
-            "pid": pid,
-            "reason": reason,
-            "rows": size.rows,
-        }),
-    );
-
     let kill_report = kill_terminal_process_tree(child.as_mut());
     let final_exit_observed = poll_terminal_child_exit(child.as_mut());
-
-    log_terminal_event(
-        "terminal.warm_cleanup.process_done",
-        None,
-        None,
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "app_pid": std::process::id(),
-            "final_exit_observed": final_exit_observed,
-            "kill_report": kill_report.to_json(),
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
-
-    log_terminal_event(
-        "terminal.warm_cleanup.done",
-        None,
-        None,
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "app_pid": std::process::id(),
-            "final_exit_observed": final_exit_observed,
-            "handle_drop_detached": true,
-            "kill_report": kill_report.to_json(),
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
-
     thread::spawn(move || {
-        let drop_started_at = Instant::now();
-
         drop(child);
         drop(reader);
         drop(writer);
         drop(master);
-
-        log_terminal_event(
-            "terminal.warm_cleanup.handle_drop_done",
-            None,
-            None,
-            Some(drop_started_at.elapsed()),
-            json!({
-                "app_pid": std::process::id(),
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
     });
 }
 
@@ -1125,20 +1040,7 @@ fn terminate_windows_process(process_id: u32) -> bool {
 
 #[cfg(windows)]
 fn cleanup_windows_headless_console_hosts(reason: &'static str) -> usize {
-    let cleanup_started_at = Instant::now();
     let app_pid = std::process::id();
-
-    log_terminal_event(
-        "terminal.windows_conhost_cleanup.start",
-        None,
-        None,
-        None,
-        json!({
-            "app_pid": app_pid,
-            "reason": reason,
-        }),
-    );
-
     let process_ids = app_child_process_ids_by_name(app_pid, "conhost.exe");
     let mut closed_process_ids = Vec::new();
     let mut failed_process_ids = Vec::new();
@@ -1152,20 +1054,6 @@ fn cleanup_windows_headless_console_hosts(reason: &'static str) -> usize {
     }
 
     let closed_count = closed_process_ids.len();
-
-    log_terminal_event(
-        "terminal.windows_conhost_cleanup.done",
-        None,
-        None,
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "app_pid": app_pid,
-            "closed_process_ids": closed_process_ids,
-            "failed_process_ids": failed_process_ids,
-            "reason": reason,
-        }),
-    );
-
     closed_count
 }
 
@@ -1199,56 +1087,23 @@ fn run_agent_command_capture(
 }
 
 fn agent_runtime_status_for(provider: AgentProvider) -> AgentRuntimeStatus {
-    let started_at = Instant::now();
     let definition = agent_definition(provider);
-
-    log_terminal_event(
-        "agent.status.start",
-        None,
-        None,
-        None,
-        json!({
-            "provider": definition.id,
-        }),
-    );
-
     let auth_check = thread::spawn(move || {
-        let auth_started_at = Instant::now();
         let auth_status = agent_auth_status_for(provider, definition);
-        log_terminal_event(
-            "agent.status.auth_done",
-            None,
-            None,
-            Some(auth_started_at.elapsed()),
-            json!({
-                "authenticated": auth_status.0,
-                "provider": definition.id,
-            }),
-        );
         auth_status
     });
 
-    let version_started_at = Instant::now();
     let version_result = match provider {
-        AgentProvider::Codex | AgentProvider::Claude | AgentProvider::OpenCode => run_agent_command_capture(
-            definition,
-            &["--version"],
-            None,
-            Duration::from_secs(AGENT_STATUS_TIMEOUT_SECS),
-            None,
-        ),
+        AgentProvider::Codex | AgentProvider::Claude | AgentProvider::OpenCode => {
+            run_agent_command_capture(
+                definition,
+                &["--version"],
+                None,
+                Duration::from_secs(AGENT_STATUS_TIMEOUT_SECS),
+                None,
+            )
+        }
     };
-    log_terminal_event(
-        "agent.status.version_done",
-        None,
-        None,
-        Some(version_started_at.elapsed()),
-        json!({
-            "provider": definition.id,
-            "success": version_result.is_ok(),
-        }),
-    );
-
     let Ok(version_capture) = version_result else {
         let _ = auth_check.join();
         let status = AgentRuntimeStatus {
@@ -1258,18 +1113,6 @@ fn agent_runtime_status_for(provider: AgentProvider) -> AgentRuntimeStatus {
             auth_message: format!("Install {} and recheck.", definition.label),
             recommend_native_install: true,
         };
-        log_terminal_event(
-            "agent.status.runtime_done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "authenticated": status.authenticated,
-                "installed": status.installed,
-                "provider": definition.id,
-            }),
-        );
-
         return status;
     };
 
@@ -1296,18 +1139,6 @@ fn agent_runtime_status_for(provider: AgentProvider) -> AgentRuntimeStatus {
         auth_message,
         recommend_native_install: true,
     };
-    log_terminal_event(
-        "agent.status.runtime_done",
-        None,
-        None,
-        Some(started_at.elapsed()),
-        json!({
-            "authenticated": status.authenticated,
-            "installed": status.installed,
-            "provider": definition.id,
-        }),
-    );
-
     status
 }
 
@@ -1422,7 +1253,9 @@ fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
     match provider {
         AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
         AgentProvider::Claude => run_login_terminal(definition.label, &binary, &[]),
-        AgentProvider::OpenCode => run_login_terminal(definition.label, &binary, &["auth", "login"]),
+        AgentProvider::OpenCode => {
+            run_login_terminal(definition.label, &binary, &["auth", "login"])
+        }
     }
 }
 
@@ -1543,18 +1376,6 @@ fn track_login_terminal_child(mut child: std::process::Child) {
     let Ok(mut children) = children.lock() else {
         let kill_report = kill_login_terminal_child(&mut child);
         let final_exit_observed = poll_login_terminal_child_exit(&mut child);
-        log_terminal_event(
-            "terminal.login.track_lock_failed",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": std::process::id(),
-                "final_exit_observed": final_exit_observed,
-                "kill_report": kill_report.to_json(),
-                "pid": pid,
-            }),
-        );
         return;
     };
 
@@ -1573,36 +1394,11 @@ fn track_login_terminal_child(mut child: std::process::Child) {
         .unwrap_or(false)
     {
         children.push(child);
-        log_terminal_event(
-            "terminal.login.track",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": std::process::id(),
-                "pid": pid,
-                "removed_exited": removed_exited,
-                "tracked_count": children.len(),
-            }),
-        );
     } else {
-        log_terminal_event(
-            "terminal.login.track_already_exited",
-            None,
-            None,
-            None,
-            json!({
-                "app_pid": std::process::id(),
-                "pid": pid,
-                "removed_exited": removed_exited,
-                "tracked_count": children.len(),
-            }),
-        );
     }
 }
 
 fn cleanup_login_terminal_children_with_context(reason: &'static str) -> usize {
-    let cleanup_started_at = Instant::now();
     let children = LOGIN_TERMINAL_CHILDREN.get_or_init(|| StdMutex::new(Vec::new()));
     let mut lock_failed = false;
     let tracked_children = match children.lock() {
@@ -1613,26 +1409,11 @@ fn cleanup_login_terminal_children_with_context(reason: &'static str) -> usize {
         }
     };
     let tracked_count = tracked_children.len();
-
-    log_terminal_event(
-        "terminal.login_cleanup.start",
-        None,
-        None,
-        None,
-        json!({
-            "app_pid": std::process::id(),
-            "lock_failed": lock_failed,
-            "reason": reason,
-            "tracked_count": tracked_count,
-        }),
-    );
-
     let mut already_exited_count = 0usize;
     let mut killed_count = 0usize;
     let mut exit_observed_count = 0usize;
 
     for mut child in tracked_children {
-        let child_cleanup_started_at = Instant::now();
         let pid = child.id();
         let mut already_exited = false;
         let mut exit_code = None;
@@ -1660,41 +1441,7 @@ fn cleanup_login_terminal_children_with_context(reason: &'static str) -> usize {
         if final_exit_observed {
             exit_observed_count += 1;
         }
-
-        log_terminal_event(
-            "terminal.login_cleanup.child_done",
-            None,
-            None,
-            Some(child_cleanup_started_at.elapsed()),
-            json!({
-                "already_exited": already_exited,
-                "app_pid": std::process::id(),
-                "exit_code": exit_code,
-                "final_exit_observed": final_exit_observed,
-                "kill_report": kill_report.as_ref().map(TerminalKillReport::to_json),
-                "pid": pid,
-                "reason": reason,
-                "try_wait_error": try_wait_error,
-            }),
-        );
     }
-
-    log_terminal_event(
-        "terminal.login_cleanup.done",
-        None,
-        None,
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "already_exited": already_exited_count,
-            "app_pid": std::process::id(),
-            "exit_observed": exit_observed_count,
-            "killed": killed_count,
-            "lock_failed": lock_failed,
-            "reason": reason,
-            "tracked_count": tracked_count,
-        }),
-    );
-
     tracked_count
 }
 

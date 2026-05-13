@@ -5,18 +5,6 @@ fn terminal_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn terminal_telemetry_log_path() -> PathBuf {
-    let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = tauri_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(tauri_root);
-
-    project_root
-        .join(TERMINAL_TELEMETRY_LOG_DIR)
-        .join(TERMINAL_TELEMETRY_LOG_FILE)
-}
-
 fn clean_terminal_telemetry_text(value: &str) -> String {
     value
         .replace(|character: char| character.is_control(), " ")
@@ -24,155 +12,6 @@ fn clean_terminal_telemetry_text(value: &str) -> String {
         .chars()
         .take(TERMINAL_TELEMETRY_MAX_TEXT)
         .collect()
-}
-
-fn terminal_input_contains_escape(data: &str) -> bool {
-    data.as_bytes().contains(&0x1b)
-}
-
-fn terminal_input_debug_fields(data: &str) -> Value {
-    let bytes = data.as_bytes();
-    let control_byte_hex = bytes
-        .iter()
-        .copied()
-        .filter(|byte| *byte < 32 || *byte == 127)
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>();
-    let prefix_hex = bytes
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>();
-    let escape_count = bytes.iter().filter(|byte| **byte == 0x1b).count();
-
-    json!({
-        "bytes": bytes.len(),
-        "chars": data.chars().count(),
-        "controlByteHex": control_byte_hex,
-        "escapeCount": escape_count,
-        "hasEscape": escape_count > 0,
-        "isBareEscape": bytes == b"\x1b",
-        "prefixHex": prefix_hex,
-        "startsWithEscape": bytes.first().is_some_and(|byte| *byte == 0x1b),
-    })
-}
-
-fn write_terminal_telemetry_entries_with_gate(entries: Vec<Value>, enabled: bool) {
-    if !enabled || entries.is_empty() {
-        return;
-    }
-
-    let log_path = terminal_telemetry_log_path();
-    let Some(log_dir) = log_path.parent() else {
-        return;
-    };
-
-    if fs::create_dir_all(log_dir).is_err() {
-        return;
-    }
-
-    let lock = TERMINAL_TELEMETRY_LOCK.get_or_init(|| StdMutex::new(()));
-    let Ok(_guard) = lock.lock() else {
-        return;
-    };
-
-    let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    else {
-        return;
-    };
-
-    for entry in entries {
-        let _ = writeln!(file, "{entry}");
-    }
-}
-
-fn write_terminal_telemetry_entries(entries: Vec<Value>) {
-    write_terminal_telemetry_entries_with_gate(entries, true);
-}
-
-fn write_terminal_telemetry(entry: Value) {
-    write_terminal_telemetry_entries(vec![entry]);
-}
-
-fn terminal_parked_logging_enabled() -> bool {
-    TERMINAL_PARKED_LOGGING_ENABLED
-}
-
-fn terminal_shutdown_detail_logging_enabled() -> bool {
-    TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED
-}
-
-fn terminal_resize_logging_enabled() -> bool {
-    TERMINAL_RESIZE_LOGGING_ENABLED
-}
-
-fn terminal_phase_is_parked_log(phase: &str) -> bool {
-    let phase = phase.to_ascii_lowercase();
-    phase.contains("parked")
-        || phase.contains("parking")
-        || phase.ends_with(".partial_park")
-}
-
-fn terminal_phase_is_resize_log(phase: &str) -> bool {
-    phase.to_ascii_lowercase().contains("resize")
-}
-
-fn terminal_phase_logging_enabled(phase: &str) -> bool {
-    TERMINAL_TELEMETRY_LOGGING_ENABLED
-        || (terminal_resize_logging_enabled() && terminal_phase_is_resize_log(phase))
-}
-
-fn log_terminal_event(
-    phase: &str,
-    pane_id: Option<&str>,
-    instance_id: Option<u64>,
-    elapsed: Option<Duration>,
-    fields: Value,
-) {
-    if !terminal_parked_logging_enabled() && terminal_phase_is_parked_log(phase) {
-        return;
-    }
-
-    if !terminal_phase_logging_enabled(phase) {
-        return;
-    }
-
-    write_terminal_telemetry(json!({
-        "ts_ms": terminal_now_ms(),
-        "phase": clean_terminal_telemetry_text(phase),
-        "pane_id": pane_id.map(clean_terminal_telemetry_text),
-        "instance_id": instance_id,
-        "elapsed_ms": elapsed.map(|duration| duration.as_secs_f64() * 1000.0),
-        "fields": fields,
-    }));
-}
-
-fn log_terminal_shutdown_detail_event(
-    phase: &str,
-    pane_id: Option<&str>,
-    instance_id: Option<u64>,
-    elapsed: Option<Duration>,
-    fields: Value,
-) {
-    if !terminal_shutdown_detail_logging_enabled() {
-        return;
-    }
-
-    write_terminal_telemetry_entries_with_gate(
-        vec![json!({
-            "ts_ms": terminal_now_ms(),
-            "phase": clean_terminal_telemetry_text(phase),
-            "pane_id": pane_id.map(clean_terminal_telemetry_text),
-            "instance_id": instance_id,
-            "elapsed_ms": elapsed.map(|duration| duration.as_secs_f64() * 1000.0),
-            "fields": fields,
-        })],
-        TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED,
-    );
 }
 
 fn validate_terminal_size(cols: u16, rows: u16) -> Result<PtySize, String> {
@@ -396,20 +235,9 @@ async fn write_terminal_input(
     pane_id: &str,
     instance_id: Option<u64>,
     data: &str,
-    skipped_phase: &str,
+    _skipped_phase: &str,
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
-    let has_escape = terminal_input_contains_escape(data);
-
-    if has_escape {
-        log_terminal_event(
-            "terminal.input.escape.write_start",
-            Some(pane_id),
-            instance_id,
-            None,
-            terminal_input_debug_fields(data),
-        );
-    }
 
     if data.is_empty() {
         return Ok(true);
@@ -421,22 +249,6 @@ async fn write_terminal_input(
 
     let Some(instance) = get_terminal_instance_if_current(state, pane_id, instance_id).await?
     else {
-        if has_escape {
-            log_terminal_event(
-                "terminal.input.escape.write_skipped_stale_or_missing",
-                Some(pane_id),
-                instance_id,
-                None,
-                terminal_input_debug_fields(data),
-            );
-        }
-        log_terminal_event(
-            skipped_phase,
-            Some(pane_id),
-            instance_id,
-            None,
-            json!({ "bytes": data.len() }),
-        );
         return Ok(false);
     };
     let mut writer = instance.writer.lock().await;
@@ -447,16 +259,6 @@ async fn write_terminal_input(
     writer
         .flush()
         .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
-
-    if has_escape {
-        log_terminal_event(
-            "terminal.input.escape.write_done",
-            Some(pane_id),
-            instance_id,
-            None,
-            terminal_input_debug_fields(data),
-        );
-    }
 
     Ok(true)
 }
@@ -471,13 +273,6 @@ async fn write_to_active_terminal_audio_input_target(
     };
 
     if !app_has_focused_audio_input_window(app) {
-        log_terminal_event(
-            "terminal.audio_input.skipped_app_unfocused",
-            Some(&target.pane_id),
-            target.instance_id,
-            None,
-            json!({ "bytes": data.len() }),
-        );
         clear_terminal_audio_input_target_if_matches(state, &target.pane_id, target.instance_id)?;
         return Ok(false);
     }
@@ -597,128 +392,19 @@ fn interrupt_terminal_coordination_session(
     instance_id: Option<u64>,
     reason: &str,
 ) {
-    let interrupt_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.coordination_interrupt.start",
-        pane_id,
-        instance_id,
-        None,
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-            "db_path": clean_terminal_telemetry_text(&coordination.db_path),
-            "reason": clean_terminal_telemetry_text(reason),
-            "repo_path": clean_terminal_telemetry_text(&coordination.repo_path),
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-        }),
-    );
-
-    let open_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.coordination_interrupt.open_start",
-        pane_id,
-        instance_id,
-        None,
-        json!({
-            "db_path": clean_terminal_telemetry_text(&coordination.db_path),
-            "repo_path": clean_terminal_telemetry_text(&coordination.repo_path),
-        }),
-    );
-
     let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
     ) {
-        Ok(kernel) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.coordination_interrupt.open_done",
-                pane_id,
-                instance_id,
-                Some(open_started_at.elapsed()),
-                json!({}),
-            );
-            kernel
-        }
+        Ok(kernel) => kernel,
         Err(error) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.coordination_interrupt.open_error",
-                pane_id,
-                instance_id,
-                Some(open_started_at.elapsed()),
-                json!({
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            log_terminal_event(
-                "terminal.coordination_session_interrupt_error",
-                pane_id,
-                instance_id,
-                Some(interrupt_started_at.elapsed()),
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                    "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    "reason": clean_terminal_telemetry_text(reason),
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
             return;
         }
     };
 
-    let session_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.coordination_interrupt.session_start",
-        pane_id,
-        instance_id,
-        None,
-        json!({
-            "reason": clean_terminal_telemetry_text(reason),
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-        }),
-    );
     match kernel.interrupt_session(&coordination.session_id, reason) {
-        Ok(_) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.coordination_interrupt.session_done",
-                pane_id,
-                instance_id,
-                Some(session_started_at.elapsed()),
-                json!({}),
-            );
-            log_terminal_event(
-                "terminal.coordination_session_interrupted",
-                pane_id,
-                instance_id,
-                Some(interrupt_started_at.elapsed()),
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                    "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    "reason": clean_terminal_telemetry_text(reason),
-                }),
-            );
-        }
-        Err(error) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.coordination_interrupt.session_error",
-                pane_id,
-                instance_id,
-                Some(session_started_at.elapsed()),
-                json!({
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            log_terminal_event(
-                "terminal.coordination_session_interrupt_error",
-                pane_id,
-                instance_id,
-                Some(interrupt_started_at.elapsed()),
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                    "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    "reason": clean_terminal_telemetry_text(reason),
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-        }
+        Ok(_) => {}
+        Err(error) => {}
     }
 }
 
@@ -784,16 +470,6 @@ fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
 ) -> Value {
     let total = cleanups.len();
     if total == 0 {
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.coordination_batch_skipped",
-            None,
-            None,
-            None,
-            json!({
-                "reason": reason,
-                "session_count": 0,
-            }),
-        );
         return json!({
             "completed": true,
             "errors": 0,
@@ -804,18 +480,6 @@ fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
         });
     }
 
-    let wait_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.coordination_batch_wait_start",
-        None,
-        None,
-        None,
-        json!({
-            "reason": reason,
-            "session_count": total,
-            "timeout_ms": timeout.as_secs_f64() * 1000.0,
-        }),
-    );
     let (summary_tx, summary_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let summary = cleanup_terminal_shutdown_coordination_batch(cleanups, reason);
@@ -823,32 +487,8 @@ fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
     });
 
     match summary_rx.recv_timeout(timeout) {
-        Ok(summary) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.coordination_batch_wait_done",
-                None,
-                None,
-                Some(wait_started_at.elapsed()),
-                json!({
-                    "reason": reason,
-                    "summary": summary.clone(),
-                    "timed_out": false,
-                }),
-            );
-            summary
-        }
+        Ok(summary) => summary,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.coordination_batch_wait_timeout",
-                None,
-                None,
-                Some(wait_started_at.elapsed()),
-                json!({
-                    "reason": reason,
-                    "session_count": total,
-                    "timeout_ms": timeout.as_secs_f64() * 1000.0,
-                }),
-            );
             json!({
                 "completed": false,
                 "errors": 0,
@@ -859,16 +499,6 @@ fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
             })
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.coordination_batch_wait_disconnected",
-                None,
-                None,
-                Some(wait_started_at.elapsed()),
-                json!({
-                    "reason": reason,
-                    "session_count": total,
-                }),
-            );
             json!({
                 "completed": false,
                 "errors": total,
@@ -885,7 +515,6 @@ fn cleanup_terminal_shutdown_coordination_batch(
     cleanups: Vec<TerminalShutdownCoordinationCleanup>,
     reason: &'static str,
 ) -> Value {
-    let batch_started_at = Instant::now();
     let mut grouped: HashMap<(String, String), Vec<TerminalShutdownCoordinationCleanup>> =
         HashMap::new();
     for cleanup in cleanups {
@@ -901,87 +530,24 @@ fn cleanup_terminal_shutdown_coordination_batch(
     let mut already_not_active = 0usize;
     let mut errors = 0usize;
 
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.coordination_batch_start",
-        None,
-        None,
-        None,
-        json!({
-            "groups": group_count,
-            "reason": reason,
-            "session_count": session_count,
-        }),
-    );
-
     for ((repo_path, db_path), group) in grouped {
-        let group_started_at = Instant::now();
         let session_ids = group
             .iter()
             .map(|cleanup| cleanup.session_id.clone())
             .collect::<Vec<_>>();
 
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.coordination_group_open_start",
-            None,
-            None,
-            None,
-            json!({
-                "db_path": clean_terminal_telemetry_text(&db_path),
-                "repo_path": clean_terminal_telemetry_text(&repo_path),
-                "session_count": session_ids.len(),
-            }),
-        );
-
         let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
             &repo_path,
             Some(PathBuf::from(&db_path)),
         ) {
-            Ok(kernel) => {
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.coordination_group_open_done",
-                    None,
-                    None,
-                    Some(group_started_at.elapsed()),
-                    json!({
-                        "db_path": clean_terminal_telemetry_text(&db_path),
-                        "repo_path": clean_terminal_telemetry_text(&repo_path),
-                    }),
-                );
-                kernel
-            }
+            Ok(kernel) => kernel,
             Err(error) => {
                 errors += group.len();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.coordination_group_open_error",
-                    None,
-                    None,
-                    Some(group_started_at.elapsed()),
-                    json!({
-                        "db_path": clean_terminal_telemetry_text(&db_path),
-                        "error": clean_terminal_telemetry_text(&error),
-                        "repo_path": clean_terminal_telemetry_text(&repo_path),
-                        "session_count": group.len(),
-                    }),
-                );
-                for cleanup in group {
-                    log_terminal_event(
-                        "terminal.coordination_session_interrupt_error",
-                        Some(&cleanup.pane_id),
-                        Some(cleanup.instance_id),
-                        Some(group_started_at.elapsed()),
-                        json!({
-                            "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
-                            "error": clean_terminal_telemetry_text(&error),
-                            "reason": clean_terminal_telemetry_text(reason),
-                            "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
-                        }),
-                    );
-                }
+                for cleanup in group {}
                 continue;
             }
         };
 
-        let interrupt_started_at = Instant::now();
         match kernel.interrupt_sessions_for_shutdown(&session_ids, reason) {
             Ok(summary) => {
                 interrupted += summary["interrupted"].as_u64().unwrap_or(0) as usize;
@@ -1000,80 +566,14 @@ fn cleanup_terminal_shutdown_coordination_batch(
                             continue;
                         };
                         if session["ok"].as_bool().unwrap_or(false) {
-                            log_terminal_event(
-                                "terminal.coordination_session_interrupted",
-                                Some(&cleanup.pane_id),
-                                Some(cleanup.instance_id),
-                                Some(interrupt_started_at.elapsed()),
-                                json!({
-                                    "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
-                                    "interrupted": session["interrupted"].as_bool().unwrap_or(false),
-                                    "reason": clean_terminal_telemetry_text(reason),
-                                    "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
-                                    "status": session["status"].as_str().unwrap_or("unknown"),
-                                }),
-                            );
                         } else {
-                            log_terminal_event(
-                                "terminal.coordination_session_interrupt_error",
-                                Some(&cleanup.pane_id),
-                                Some(cleanup.instance_id),
-                                Some(interrupt_started_at.elapsed()),
-                                json!({
-                                    "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
-                                    "error": clean_terminal_telemetry_text(
-                                        session["error"].as_str().unwrap_or("unknown error"),
-                                    ),
-                                    "reason": clean_terminal_telemetry_text(reason),
-                                    "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
-                                }),
-                            );
                         }
                     }
                 }
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.coordination_group_done",
-                    None,
-                    None,
-                    Some(group_started_at.elapsed()),
-                    json!({
-                        "already_not_active": summary["already_not_active"],
-                        "db_path": clean_terminal_telemetry_text(&db_path),
-                        "errors": summary["errors"],
-                        "interrupted": summary["interrupted"],
-                        "repo_path": clean_terminal_telemetry_text(&repo_path),
-                        "session_count": session_ids.len(),
-                    }),
-                );
             }
             Err(error) => {
                 errors += group.len();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.coordination_group_error",
-                    None,
-                    None,
-                    Some(group_started_at.elapsed()),
-                    json!({
-                        "db_path": clean_terminal_telemetry_text(&db_path),
-                        "error": clean_terminal_telemetry_text(&error),
-                        "repo_path": clean_terminal_telemetry_text(&repo_path),
-                        "session_count": group.len(),
-                    }),
-                );
-                for cleanup in group {
-                    log_terminal_event(
-                        "terminal.coordination_session_interrupt_error",
-                        Some(&cleanup.pane_id),
-                        Some(cleanup.instance_id),
-                        Some(group_started_at.elapsed()),
-                        json!({
-                            "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
-                            "error": clean_terminal_telemetry_text(&error),
-                            "reason": clean_terminal_telemetry_text(reason),
-                            "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
-                        }),
-                    );
-                }
+                for cleanup in group {}
             }
         }
     }
@@ -1087,16 +587,6 @@ fn cleanup_terminal_shutdown_coordination_batch(
         "session_count": session_count,
         "timed_out": false,
     });
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.coordination_batch_done",
-        None,
-        None,
-        Some(batch_started_at.elapsed()),
-        json!({
-            "reason": reason,
-            "summary": summary.clone(),
-        }),
-    );
     summary
 }
 
@@ -1118,28 +608,7 @@ fn interrupt_terminal_coordination_after_process_cleanup(
         return;
     };
 
-    let coordination_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.coordination_interrupt_start",
-        pane_id,
-        Some(instance_id),
-        None,
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-            "reason": reason,
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-        }),
-    );
     interrupt_terminal_coordination_session(coordination, pane_id, Some(instance_id), reason);
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.coordination_interrupt_done",
-        pane_id,
-        Some(instance_id),
-        Some(coordination_started_at.elapsed()),
-        json!({
-            "reason": reason,
-        }),
-    );
 }
 
 fn cleanup_terminal_instance_with_context(
@@ -1149,7 +618,6 @@ fn cleanup_terminal_instance_with_context(
     reason: &'static str,
     coordination_cleanup_mode: TerminalCoordinationCleanupMode,
 ) {
-    let cleanup_started_at = Instant::now();
     let TerminalInstance {
         id: instance_id,
         child,
@@ -1163,103 +631,19 @@ fn cleanup_terminal_instance_with_context(
         coordination,
     } = instance;
 
-    log_terminal_event(
-        "terminal.cleanup.start",
-        pane_id.as_deref(),
-        Some(instance_id),
-        None,
-        json!({
-            "app_pid": std::process::id(),
-            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
-            "kill_first": kill_first,
-            "reason": reason,
-        }),
-    );
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.instance_start",
-        pane_id.as_deref(),
-        Some(instance_id),
-        None,
-        json!({
-            "app_pid": std::process::id(),
-            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
-            "has_coordination": coordination.is_some(),
-            "kill_first": kill_first,
-            "reason": reason,
-        }),
-    );
-
     if let Some(coordination) = coordination.as_ref() {
         match coordination_cleanup_mode {
-            TerminalCoordinationCleanupMode::InterruptAfterProcess => {
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.cleanup.coordination_interrupt_deferred",
-                    pane_id.as_deref(),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                        "reason": reason,
-                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    }),
-                );
-            }
-            TerminalCoordinationCleanupMode::Preserve => {
-                log_terminal_event(
-                    "terminal.coordination_session_preserved",
-                    pane_id.as_deref(),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                        "reason": clean_terminal_telemetry_text(reason),
-                    }),
-                );
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.cleanup.coordination_preserved",
-                    pane_id.as_deref(),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                        "reason": reason,
-                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    }),
-                );
-            }
-            TerminalCoordinationCleanupMode::DeferToShutdownBatch => {
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.cleanup.coordination_deferred_to_batch",
-                    pane_id.as_deref(),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                        "reason": reason,
-                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                    }),
-                );
-            }
+            TerminalCoordinationCleanupMode::InterruptAfterProcess => {}
+            TerminalCoordinationCleanupMode::Preserve => {}
+            TerminalCoordinationCleanupMode::DeferToShutdownBatch => {}
         }
     }
 
-    let child_take_started_at = Instant::now();
     let maybe_child = {
         let mut child = child.blocking_lock();
         child.take()
     };
     let Some(mut child) = maybe_child else {
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.child_take_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(child_take_started_at.elapsed()),
-            json!({
-                "has_child": false,
-                "reason": reason,
-            }),
-        );
         drop(writer);
         drop(master);
         drop(size);
@@ -1267,16 +651,6 @@ fn cleanup_terminal_instance_with_context(
         drop(agent_started);
         drop(input_gate);
         drop(active_task);
-        log_terminal_event(
-            "terminal.cleanup.no_child",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(cleanup_started_at.elapsed()),
-            json!({
-                "app_pid": std::process::id(),
-                "reason": reason,
-            }),
-        );
         interrupt_terminal_coordination_after_process_cleanup(
             coordination.as_ref(),
             pane_id.as_deref(),
@@ -1285,182 +659,31 @@ fn cleanup_terminal_instance_with_context(
             coordination_cleanup_mode,
         );
         drop(coordination);
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.instance_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(cleanup_started_at.elapsed()),
-            json!({
-                "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
-                "reason": reason,
-            }),
-        );
         return;
     };
     let pid = child.process_id();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.child_take_done",
-        pane_id.as_deref(),
-        Some(instance_id),
-        Some(child_take_started_at.elapsed()),
-        json!({
-            "has_child": true,
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
     let mut initial_exit_observed = false;
     let mut final_exit_observed;
     let mut primary_kill = None;
     let mut fallback_kill = None;
 
     if kill_first {
-        let primary_kill_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.primary_kill_start",
-            pane_id.as_deref(),
-            Some(instance_id),
-            None,
-            json!({
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
         primary_kill = Some(kill_terminal_process_tree(child.as_mut()));
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.primary_kill_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(primary_kill_started_at.elapsed()),
-            json!({
-                "pid": pid,
-                "primary_kill": primary_kill.as_ref().map(TerminalKillReport::to_json),
-                "reason": reason,
-            }),
-        );
     } else {
-        let initial_poll_started_at = Instant::now();
         initial_exit_observed = poll_terminal_child_exit(child.as_mut());
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.initial_poll_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(initial_poll_started_at.elapsed()),
-            json!({
-                "initial_exit_observed": initial_exit_observed,
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
 
         if !initial_exit_observed {
-            let primary_kill_started_at = Instant::now();
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.cleanup.primary_kill_start",
-                pane_id.as_deref(),
-                Some(instance_id),
-                None,
-                json!({
-                    "pid": pid,
-                    "reason": reason,
-                }),
-            );
             primary_kill = Some(kill_terminal_process_tree(child.as_mut()));
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.cleanup.primary_kill_done",
-                pane_id.as_deref(),
-                Some(instance_id),
-                Some(primary_kill_started_at.elapsed()),
-                json!({
-                    "pid": pid,
-                    "primary_kill": primary_kill.as_ref().map(TerminalKillReport::to_json),
-                    "reason": reason,
-                }),
-            );
         }
     }
 
-    let final_poll_started_at = Instant::now();
     final_exit_observed = poll_terminal_child_exit(child.as_mut());
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.final_poll_done",
-        pane_id.as_deref(),
-        Some(instance_id),
-        Some(final_poll_started_at.elapsed()),
-        json!({
-            "final_exit_observed": final_exit_observed,
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
 
     if !final_exit_observed {
-        let fallback_kill_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.fallback_kill_start",
-            pane_id.as_deref(),
-            Some(instance_id),
-            None,
-            json!({
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
         fallback_kill = Some(kill_terminal_process_tree(child.as_mut()));
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.fallback_kill_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(fallback_kill_started_at.elapsed()),
-            json!({
-                "fallback_kill": fallback_kill.as_ref().map(TerminalKillReport::to_json),
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
-        let fallback_poll_started_at = Instant::now();
         final_exit_observed = poll_terminal_child_exit(child.as_mut());
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.fallback_poll_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(fallback_poll_started_at.elapsed()),
-            json!({
-                "final_exit_observed": final_exit_observed,
-                "pid": pid,
-                "reason": reason,
-            }),
-        );
     }
 
-    log_terminal_event(
-        "terminal.cleanup.done",
-        pane_id.as_deref(),
-        Some(instance_id),
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "app_pid": std::process::id(),
-            "fallback_kill": fallback_kill.as_ref().map(TerminalKillReport::to_json),
-            "final_exit_observed": final_exit_observed,
-            "initial_exit_observed": initial_exit_observed,
-            "kill_first": kill_first,
-            "pid": pid,
-            "primary_kill": primary_kill.as_ref().map(TerminalKillReport::to_json),
-            "reason": reason,
-        }),
-    );
-
-    let drop_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.drop_handles_start",
-        pane_id.as_deref(),
-        Some(instance_id),
-        None,
-        json!({
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
     drop(child);
     drop(writer);
     drop(master);
@@ -1469,16 +692,6 @@ fn cleanup_terminal_instance_with_context(
     drop(agent_started);
     drop(input_gate);
     drop(active_task);
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.drop_handles_done",
-        pane_id.as_deref(),
-        Some(instance_id),
-        Some(drop_started_at.elapsed()),
-        json!({
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
     interrupt_terminal_coordination_after_process_cleanup(
         coordination.as_ref(),
         pane_id.as_deref(),
@@ -1487,17 +700,6 @@ fn cleanup_terminal_instance_with_context(
         coordination_cleanup_mode,
     );
     drop(coordination);
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.cleanup.instance_done",
-        pane_id.as_deref(),
-        Some(instance_id),
-        Some(cleanup_started_at.elapsed()),
-        json!({
-            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
-            "pid": pid,
-            "reason": reason,
-        }),
-    );
 }
 
 fn cleanup_terminal_instance_async(
@@ -1554,7 +756,8 @@ struct WorkspaceGitBootstrapFlight {
     future: Shared<BoxFuture<'static, WorkspaceGitBootstrapResult>>,
 }
 
-fn workspace_git_bootstrap_flights() -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
+fn workspace_git_bootstrap_flights(
+) -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
     static FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>>> =
         OnceLock::new();
     FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -1611,25 +814,7 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
     pane_id: &str,
     instance_id: Option<u64>,
 ) -> Result<WorkspaceGitBootstrap, String> {
-    let total_started_at = Instant::now();
     if let Some(bootstrap) = cached_workspace_git_bootstrap(root) {
-        log_terminal_event(
-            "terminal.open.git_bootstrap_cache_hit",
-            Some(pane_id),
-            instance_id,
-            Some(total_started_at.elapsed()),
-            json!({
-                "cache_scope": "process",
-                "working_directory": workspace_path_display(root),
-            }),
-        );
-        log_terminal_event(
-            "terminal.open.git_bootstrap_ready",
-            Some(pane_id),
-            instance_id,
-            Some(total_started_at.elapsed()),
-            workspace_git_bootstrap_fields(&bootstrap, true),
-        );
         return Ok(bootstrap);
     }
 
@@ -1669,18 +854,6 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
         }
     };
 
-    log_terminal_event(
-        "terminal.open.git_bootstrap_singleflight_wait_start",
-        Some(pane_id),
-        instance_id,
-        None,
-        json!({
-            "flight_id": flight_id,
-            "role": role,
-            "working_directory": workspace_path_display(root),
-        }),
-    );
-
     let result = flight.await;
     forget_workspace_git_bootstrap_flight(&key, flight_id);
 
@@ -1696,32 +869,11 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
                     json!(flight_started_at.elapsed().as_secs_f64() * 1000.0),
                 );
             }
-            log_terminal_event(
-                "terminal.open.git_bootstrap_ready",
-                Some(pane_id),
-                instance_id,
-                Some(total_started_at.elapsed()),
-                fields,
-            );
             Ok(bootstrap)
         }
-        Err(error) => {
-            log_terminal_event(
-                "terminal.open.git_bootstrap_error",
-                Some(pane_id),
-                instance_id,
-                Some(total_started_at.elapsed()),
-                json!({
-                    "error": clean_terminal_telemetry_text(&error),
-                    "flight_id": flight_id,
-                    "role": role,
-                    "working_directory": workspace_path_display(root),
-                }),
-            );
-            Err(format!(
-                "Unable to initialize workspace Git for terminal isolation: {error}"
-            ))
-        }
+        Err(error) => Err(format!(
+            "Unable to initialize workspace Git for terminal isolation: {error}"
+        )),
     }
 }
 
@@ -1743,21 +895,8 @@ async fn prepare_terminal_coordination_launch(
     ),
     String,
 > {
-    let task_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.open.coordination_blocking_task_start",
-        Some(&pane_id),
-        instance_id,
-        None,
-        json!({
-            "slot_key": clean_terminal_telemetry_text(&terminal_slot_key),
-            "working_directory": workspace_path_display(&working_directory),
-        }),
-    );
-
     let log_pane_id = pane_id.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        let kernel_started_at = Instant::now();
         let (coordination_kernel, kernel_open_mode) =
             match crate::coordination::CoordinationKernel::open_for_terminal_launch(
                 &working_directory,
@@ -1765,58 +904,18 @@ async fn prepare_terminal_coordination_launch(
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    log_terminal_event(
-                        "terminal.open.coordination_kernel_error",
-                        Some(&log_pane_id),
-                        instance_id,
-                        Some(kernel_started_at.elapsed()),
-                        json!({
-                            "error": clean_terminal_telemetry_text(&error),
-                            "working_directory": workspace_path_display(&working_directory),
-                        }),
-                    );
                     return Err(format!(
                         "Unable to open terminal coordination kernel: {error}"
                     ));
                 }
             };
-        log_terminal_event(
-            "terminal.open.coordination_kernel_ready",
-            Some(&log_pane_id),
-            instance_id,
-            Some(kernel_started_at.elapsed()),
-            json!({
-                "db_path": workspace_path_display(&coordination_kernel.paths.db_path),
-                "open_mode": kernel_open_mode,
-                "repo_path": workspace_path_display(&coordination_kernel.paths.repo_path),
-            }),
-        );
 
-        let daemon_started_at = Instant::now();
         match crate::coordination::mcp::ensure_shared_daemon_for_paths(
             &coordination_kernel.paths.repo_path,
             &coordination_kernel.paths.db_path,
         ) {
-            Ok(status) => {
-                log_terminal_event(
-                    "terminal.open.shared_mcp_daemon_ready",
-                    Some(&log_pane_id),
-                    instance_id,
-                    Some(daemon_started_at.elapsed()),
-                    status,
-                );
-            }
+            Ok(status) => {}
             Err(error) => {
-                log_terminal_event(
-                    "terminal.open.shared_mcp_daemon_error",
-                    Some(&log_pane_id),
-                    instance_id,
-                    Some(daemon_started_at.elapsed()),
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "working_directory": workspace_path_display(&working_directory),
-                    }),
-                );
                 return Err(format!(
                     "Unable to start shared coordination MCP daemon: {error}"
                 ));
@@ -1833,7 +932,6 @@ async fn prepare_terminal_coordination_launch(
             });
         let agent_kind = launch_provider_id.as_str();
         let agent_name = label.clone();
-        let worktree_started_at = Instant::now();
         match coordination_kernel.prepare_terminal_context_for_slot(
             &agent_name,
             agent_kind,
@@ -1855,7 +953,8 @@ async fn prepare_terminal_coordination_launch(
                     .worktree_path
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty());
-                let write_root_display = workspace_path_display(&PathBuf::from(&context.write_root));
+                let write_root_display =
+                    workspace_path_display(&PathBuf::from(&context.write_root));
                 let repo_root_display = workspace_path_display(&working_directory);
                 #[cfg(windows)]
                 let write_root_matches_repo_root =
@@ -1883,24 +982,7 @@ async fn prepare_terminal_coordination_launch(
                     } else {
                         "coordination did not return a worktree path"
                     };
-                    log_terminal_event(
-                        "terminal.open.coordination_rejected",
-                        Some(&log_pane_id),
-                        instance_id,
-                        Some(worktree_started_at.elapsed()),
-                        json!({
-                            "agent_kind": clean_terminal_telemetry_text(agent_kind),
-                            "enforcement_mode": clean_terminal_telemetry_text(&context.enforcement_mode),
-                            "reason": clean_terminal_telemetry_text(reason),
-                            "slot_key": context.slot_key.as_deref().map(clean_terminal_telemetry_text),
-                            "worktree_id": context.worktree_id.as_deref().map(clean_terminal_telemetry_text),
-                            "worktree_path": context.worktree_path.as_deref().map(clean_terminal_telemetry_text),
-                            "write_root": clean_terminal_telemetry_text(&context.write_root),
-                        }),
-                    );
-                    return Err(format!(
-                        "Terminal isolation failed for {label}: {reason}."
-                    ));
+                    return Err(format!("Terminal isolation failed for {label}: {reason}."));
                 }
 
                 let process_working_directory =
@@ -1917,52 +999,15 @@ async fn prepare_terminal_coordination_launch(
                     "sessionId": context.session_id.clone(),
                     "slotKey": context.slot_key.clone(),
                 });
-                log_terminal_event(
-                    "terminal.open.coordination_ready",
-                    Some(&log_pane_id),
-                    instance_id,
-                    Some(worktree_started_at.elapsed()),
-                    json!({
-                        "agent_kind": clean_terminal_telemetry_text(agent_kind),
-                        "branch_name": branch_name.as_deref().map(clean_terminal_telemetry_text),
-                        "mcp_config_path": clean_terminal_telemetry_text(&context.mcp_config_path),
-                        "plain_shell": false,
-                        "slot_key": context.slot_key.as_deref().map(clean_terminal_telemetry_text),
-                        "worktree_id": context.worktree_id.as_deref().map(clean_terminal_telemetry_text),
-                        "working_directory": workspace_path_display(&process_working_directory),
-                    }),
-                );
                 Ok((context, launch_worktree, process_working_directory))
             }
-            Err(error) => {
-                log_terminal_event(
-                    "terminal.open.coordination_error",
-                    Some(&log_pane_id),
-                    instance_id,
-                    Some(worktree_started_at.elapsed()),
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "slot_key": clean_terminal_telemetry_text(&terminal_slot_key),
-                    }),
-                );
-                Err(format!(
-                    "Unable to prepare terminal coordination MCP/worktree: {error}"
-                ))
-            }
+            Err(error) => Err(format!(
+                "Unable to prepare terminal coordination MCP/worktree: {error}"
+            )),
         }
     })
     .await
     .map_err(|error| format!("Terminal coordination worker failed before completion: {error}"))?;
-
-    log_terminal_event(
-        "terminal.open.coordination_blocking_task_done",
-        Some(&pane_id),
-        instance_id,
-        Some(task_started_at.elapsed()),
-        json!({
-            "success": task_result.is_ok(),
-        }),
-    );
     task_result
 }
 
@@ -2103,19 +1148,7 @@ fn spawn_terminal_reader(
         });
 
         *sent_frame_sequence += 1;
-        if *sent_frame_sequence <= frame_log_limit {
-            log_terminal_event(
-                "terminal.reader.frame_sent",
-                Some(pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "sequence": *sent_frame_sequence,
-                    "frame": terminal_output_debug_fields(&chunk),
-                    "flush_reason": reason,
-                }),
-            );
-        }
+        if *sent_frame_sequence <= frame_log_limit {}
 
         if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
             return false;
@@ -2130,14 +1163,6 @@ fn spawn_terminal_reader(
     const FRAME_LOG_LIMIT: usize = 10;
 
     thread::spawn(move || {
-        log_terminal_event(
-            "terminal.reader.thread_start",
-            Some(&reader_pane_id),
-            Some(instance_id),
-            None,
-            json!({}),
-        );
-
         let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
         let mut saw_first_output = false;
         let mut saw_first_visible_output = false;
@@ -2158,49 +1183,13 @@ fn spawn_terminal_reader(
 
                     if !saw_first_output {
                         saw_first_output = true;
-                        log_terminal_event(
-                            "terminal.reader.first_pty_frame",
-                            Some(&reader_pane_id),
-                            Some(instance_id),
-                            None,
-                            debug_fields.clone(),
-                        );
-                        log_terminal_event(
-                            "terminal.reader.first_output",
-                            Some(&reader_pane_id),
-                            Some(instance_id),
-                            None,
-                            json!({
-                                "bytes": bytes_read,
-                                "classification": "pty_bytes",
-                                "frame": debug_fields.clone(),
-                            }),
-                        );
                     }
 
                     if has_visible_output && !saw_first_visible_output {
                         saw_first_visible_output = true;
-                        log_terminal_event(
-                            "terminal.reader.first_visible_output",
-                            Some(&reader_pane_id),
-                            Some(instance_id),
-                            None,
-                            debug_fields.clone(),
-                        );
                     }
 
-                    if read_frame_sequence <= FRAME_LOG_LIMIT {
-                        log_terminal_event(
-                            "terminal.reader.frame_read",
-                            Some(&reader_pane_id),
-                            Some(instance_id),
-                            None,
-                            json!({
-                                "sequence": read_frame_sequence,
-                                "frame": debug_fields,
-                            }),
-                        );
-                    }
+                    if read_frame_sequence <= FRAME_LOG_LIMIT {}
 
                     if !send_terminal_output_frame(
                         chunk.to_vec(),
@@ -2219,53 +1208,22 @@ fn spawn_terminal_reader(
                     }
                 }
                 Err(error) => {
-                    log_terminal_event(
-                        "terminal.reader.error",
-                        Some(&reader_pane_id),
-                        Some(instance_id),
-                        None,
-                        json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
-                    );
                     break;
                 }
             }
         }
-
-        log_terminal_event(
-            "terminal.reader.closed",
-            Some(&reader_pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "readFrames": read_frame_sequence,
-                "saw_first_output": saw_first_output,
-                "saw_first_visible_output": saw_first_visible_output,
-            }),
-        );
-
-        log_terminal_event(
-            "terminal.reader.frame_flush_closed",
-            Some(&reader_pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "channel_failed": channel_failed,
-                "direct_send": true,
-                "flushed_bytes": flushed_bytes,
-                "flushed_chunks": flushed_chunks,
-                "frame_micros": TERMINAL_OUTPUT_FRAME_MICROS,
-                "sent_frames": sent_frame_sequence,
-            }),
-        );
 
         let cleanup_app = app.clone();
         let cleanup_terminals = Arc::clone(&terminals);
         let cleanup_state = cloud_mcp_state.clone();
         let cleanup_pane_id = reader_pane_id.clone();
         tauri::async_runtime::spawn(async move {
-            if let Some(instance) =
-                remove_terminal_instance_if_current(&cleanup_terminals, &cleanup_pane_id, instance_id)
-                    .await
+            if let Some(instance) = remove_terminal_instance_if_current(
+                &cleanup_terminals,
+                &cleanup_pane_id,
+                instance_id,
+            )
+            .await
             {
                 let notify_state = cleanup_state.clone();
                 let notify_pane_id = cleanup_pane_id.clone();
@@ -2331,7 +1289,6 @@ async fn close_terminal_session(
     };
 
     if let Some(instance) = instance {
-        let cleanup_started_at = Instant::now();
         let cleanup_instance_id = instance.id;
         let cleanup_pane_id = pane_id.to_string();
         if let Some(cloud_mcp_state) = cloud_mcp_state {
@@ -2368,17 +1325,6 @@ async fn close_terminal_session(
             );
         });
         if !wait_for_cleanup {
-            log_terminal_event(
-                "terminal.close.cleanup_scheduled",
-                Some(pane_id),
-                Some(cleanup_instance_id),
-                Some(cleanup_started_at.elapsed()),
-                json!({
-                    "app_pid": std::process::id(),
-                    "detached": true,
-                    "preserve_coordination_session": preserve_coordination_session,
-                }),
-            );
             tauri::async_runtime::spawn(async move {
                 let mut join_error = None;
                 let cleanup_finished = match tokio::time::timeout(
@@ -2394,19 +1340,6 @@ async fn close_terminal_session(
                     }
                     Err(_) => false,
                 };
-                log_terminal_event(
-                    "terminal.close.cleanup_wait",
-                    Some(&cleanup_pane_id),
-                    Some(cleanup_instance_id),
-                    Some(cleanup_started_at.elapsed()),
-                    json!({
-                        "app_pid": std::process::id(),
-                        "cleanup_finished": cleanup_finished,
-                        "detached": !cleanup_finished,
-                        "join_error": join_error,
-                        "timeout_ms": TERMINAL_CLOSE_COMMAND_WAIT_MS,
-                    }),
-                );
             });
             return Ok(true);
         }
@@ -2424,19 +1357,6 @@ async fn close_terminal_session(
             }
             Err(_) => false,
         };
-        log_terminal_event(
-            "terminal.close.cleanup_wait",
-            Some(pane_id),
-            Some(cleanup_instance_id),
-            Some(cleanup_started_at.elapsed()),
-            json!({
-                "app_pid": std::process::id(),
-                "cleanup_finished": cleanup_finished,
-                "detached": !cleanup_finished,
-                "join_error": join_error,
-                "timeout_ms": TERMINAL_CLOSE_COMMAND_WAIT_MS,
-            }),
-        );
 
         return Ok(true);
     }
@@ -2449,7 +1369,6 @@ async fn close_all_terminal_sessions(
     state: &TerminalState,
     cloud_mcp_state: &CloudMcpState,
 ) -> Result<usize, String> {
-    let close_started_at = Instant::now();
     let instances = {
         let mut terminals = state.terminals.write().await;
         terminals
@@ -2468,29 +1387,6 @@ async fn close_all_terminal_sessions(
         })
         .collect::<Vec<_>>();
 
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.enter",
-        None,
-        None,
-        Some(close_started_at.elapsed()),
-        json!({
-            "active_count": closed,
-            "app_pid": std::process::id(),
-            "warm_count": warm_total,
-        }),
-    );
-
-    let lifecycle_started_at = Instant::now();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.lifecycle_notifications_start",
-        None,
-        None,
-        None,
-        json!({
-            "active_count": closed,
-            "detached": true,
-        }),
-    );
     let lifecycle_scheduled = instances
         .iter()
         .map(|(pane_id, instance)| {
@@ -2500,17 +1396,6 @@ async fn close_all_terminal_sessions(
             let has_coordination = instance.coordination.is_some();
             let notify_context = TerminalCloudMcpCloseContext::from_instance(instance);
             tauri::async_runtime::spawn(async move {
-                let notify_started_at = Instant::now();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.lifecycle_notify_start",
-                    Some(&notify_pane_id),
-                    Some(notify_instance_id),
-                    None,
-                    json!({
-                        "has_coordination": has_coordination,
-                        "reason": "close_all",
-                    }),
-                );
                 cloud_mcp_mark_terminal_closed(
                     &notify_state,
                     &notify_pane_id,
@@ -2519,42 +1404,11 @@ async fn close_all_terminal_sessions(
                     "close_all",
                 )
                 .await;
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.lifecycle_notify_done",
-                    Some(&notify_pane_id),
-                    Some(notify_instance_id),
-                    Some(notify_started_at.elapsed()),
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
             })
         })
         .count();
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.lifecycle_notifications_scheduled",
-        None,
-        None,
-        Some(lifecycle_started_at.elapsed()),
-        json!({
-            "detached": true,
-            "scheduled": lifecycle_scheduled,
-        }),
-    );
 
     emit_terminal_close_all_progress(&app, 0, total, None, None);
-
-    log_terminal_event(
-        "terminal.close_all.start",
-        None,
-        None,
-        None,
-        json!({
-            "active_count": closed,
-            "app_pid": std::process::id(),
-            "warm_count": warm_total,
-        }),
-    );
 
     let cleanup_summary = tauri::async_runtime::spawn_blocking(move || {
         enum CleanupSignal {
@@ -2563,21 +1417,8 @@ async fn close_all_terminal_sessions(
             Login(usize),
         }
 
-        let cleanup_started_at = Instant::now();
         let closed_count = Arc::new(AtomicUsize::new(0));
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel::<CleanupSignal>();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.cleanup_worker_start",
-            None,
-            None,
-            None,
-            json!({
-                "active_count": total,
-                "app_pid": std::process::id(),
-                "coordination_count": coordination_cleanups.len(),
-                "warm_count": warm_total,
-            }),
-        );
 
         for (pane_id, instance) in instances {
             let app = app.clone();
@@ -2586,16 +1427,6 @@ async fn close_all_terminal_sessions(
 
             thread::spawn(move || {
                 let instance_id = instance.id;
-                let thread_started_at = Instant::now();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.active_cleanup_thread_start",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
 
                 cleanup_terminal_instance_with_context(
                     instance,
@@ -2604,23 +1435,7 @@ async fn close_all_terminal_sessions(
                     "close_all",
                     TerminalCoordinationCleanupMode::DeferToShutdownBatch,
                 );
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.active_cleanup_thread_done",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(thread_started_at.elapsed()),
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
                 let closed = closed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                log_terminal_event(
-                    "terminal.close_all.cleanup_done",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({}),
-                );
                 emit_terminal_close_all_progress(
                     &app,
                     closed,
@@ -2636,26 +1451,7 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
-                let thread_started_at = Instant::now();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.warm_cleanup_thread_start",
-                    None,
-                    None,
-                    None,
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
                 cleanup_warm_pty_with_context(warm_pty, "close_all");
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.warm_cleanup_thread_done",
-                    None,
-                    None,
-                    Some(thread_started_at.elapsed()),
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
                 let _ = cleanup_tx.send(CleanupSignal::Warm);
             });
         }
@@ -2664,27 +1460,7 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
-                let thread_started_at = Instant::now();
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.login_cleanup_thread_start",
-                    None,
-                    None,
-                    None,
-                    json!({
-                        "reason": "close_all",
-                    }),
-                );
                 let login_closed = cleanup_login_terminal_children_with_context("close_all");
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.login_cleanup_thread_done",
-                    None,
-                    None,
-                    Some(thread_started_at.elapsed()),
-                    json!({
-                        "login_closed": login_closed,
-                        "reason": "close_all",
-                    }),
-                );
                 let _ = cleanup_tx.send(CleanupSignal::Login(login_closed));
             });
         }
@@ -2697,136 +1473,36 @@ async fn close_all_terminal_sessions(
         let mut warm_done = 0usize;
         let mut login_closed = None;
         let mut timed_out = false;
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.cleanup_wait_start",
-            None,
-            None,
-            None,
-            json!({
-                "active_total": total,
-                "timeout_ms": TERMINAL_CLOSE_ALL_WAIT_MS,
-                "warm_total": warm_total,
-            }),
-        );
 
         while active_done < total || warm_done < warm_total || login_closed.is_none() {
             let elapsed = wait_started_at.elapsed();
 
             if elapsed >= wait_timeout {
                 timed_out = true;
-                log_terminal_shutdown_detail_event(
-                    "terminal.shutdown_detail.close_all.cleanup_wait_timeout",
-                    None,
-                    None,
-                    Some(wait_started_at.elapsed()),
-                    json!({
-                        "active_done": active_done,
-                        "active_total": total,
-                        "login_done": login_closed.is_some(),
-                        "warm_done": warm_done,
-                        "warm_total": warm_total,
-                    }),
-                );
                 break;
             }
 
             match cleanup_rx.recv_timeout(wait_timeout.saturating_sub(elapsed)) {
                 Ok(CleanupSignal::Active) => {
                     active_done += 1;
-                    log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.close_all.cleanup_wait_signal",
-                        None,
-                        None,
-                        Some(wait_started_at.elapsed()),
-                        json!({
-                            "active_done": active_done,
-                            "active_total": total,
-                            "signal": "active",
-                            "warm_done": warm_done,
-                            "warm_total": warm_total,
-                        }),
-                    );
                 }
                 Ok(CleanupSignal::Warm) => {
                     warm_done += 1;
-                    log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.close_all.cleanup_wait_signal",
-                        None,
-                        None,
-                        Some(wait_started_at.elapsed()),
-                        json!({
-                            "active_done": active_done,
-                            "active_total": total,
-                            "signal": "warm",
-                            "warm_done": warm_done,
-                            "warm_total": warm_total,
-                        }),
-                    );
                 }
                 Ok(CleanupSignal::Login(closed)) => {
                     login_closed = Some(closed);
-                    log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.close_all.cleanup_wait_signal",
-                        None,
-                        None,
-                        Some(wait_started_at.elapsed()),
-                        json!({
-                            "active_done": active_done,
-                            "active_total": total,
-                            "login_closed": closed,
-                            "signal": "login",
-                            "warm_done": warm_done,
-                            "warm_total": warm_total,
-                        }),
-                    );
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     timed_out = true;
-                    log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.close_all.cleanup_wait_timeout",
-                        None,
-                        None,
-                        Some(wait_started_at.elapsed()),
-                        json!({
-                            "active_done": active_done,
-                            "active_total": total,
-                            "login_done": login_closed.is_some(),
-                            "warm_done": warm_done,
-                            "warm_total": warm_total,
-                        }),
-                    );
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    log_terminal_shutdown_detail_event(
-                        "terminal.shutdown_detail.close_all.cleanup_wait_disconnected",
-                        None,
-                        None,
-                        Some(wait_started_at.elapsed()),
-                        json!({
-                            "active_done": active_done,
-                            "active_total": total,
-                            "login_done": login_closed.is_some(),
-                            "warm_done": warm_done,
-                            "warm_total": warm_total,
-                        }),
-                    );
                     break;
                 }
             }
         }
 
         let coordination_summary = if timed_out {
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.coordination_batch_skipped",
-                None,
-                None,
-                Some(wait_started_at.elapsed()),
-                json!({
-                    "reason": "cleanup_wait_timed_out",
-                    "session_count": coordination_cleanups.len(),
-                }),
-            );
             json!({
                 "completed": false,
                 "errors": 0,
@@ -2847,85 +1523,11 @@ async fn close_all_terminal_sessions(
         let refill_idle = if timed_out {
             false
         } else {
-            let refill_started_at = Instant::now();
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.refill_idle_wait_start",
-                None,
-                None,
-                None,
-                json!({}),
-            );
             let refill_idle = pty_pool.wait_for_refill_idle();
-            log_terminal_shutdown_detail_event(
-                "terminal.shutdown_detail.close_all.refill_idle_wait_done",
-                None,
-                None,
-                Some(refill_started_at.elapsed()),
-                json!({
-                    "refill_idle": refill_idle,
-                }),
-            );
             refill_idle
         };
         let login_closed = login_closed.unwrap_or(0);
-        let conhost_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.conhost_cleanup_start",
-            None,
-            None,
-            None,
-            json!({
-                "reason": "close_all",
-            }),
-        );
         let console_hosts_closed = cleanup_windows_headless_console_hosts("close_all");
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.conhost_cleanup_done",
-            None,
-            None,
-            Some(conhost_started_at.elapsed()),
-            json!({
-                "console_hosts_closed": console_hosts_closed,
-                "reason": "close_all",
-            }),
-        );
-
-        log_terminal_event(
-            "terminal.close_all.cleanup_finished",
-            None,
-            None,
-            Some(cleanup_started_at.elapsed()),
-            json!({
-                "app_pid": std::process::id(),
-                "closed": active_done,
-                "console_hosts_closed": console_hosts_closed,
-                "coordination": coordination_summary.clone(),
-                "detached_active": total.saturating_sub(active_done),
-                "detached_warm": warm_total.saturating_sub(warm_done),
-                "login_closed": login_closed,
-                "total": total,
-                "refill_idle": refill_idle,
-                "timed_out": timed_out,
-                "warm_closed": warm_done,
-            }),
-        );
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.close_all.cleanup_worker_done",
-            None,
-            None,
-            Some(cleanup_started_at.elapsed()),
-            json!({
-                "active_done": active_done,
-                "active_total": total,
-                "console_hosts_closed": console_hosts_closed,
-                "coordination": coordination_summary.clone(),
-                "login_closed": login_closed,
-                "refill_idle": refill_idle,
-                "timed_out": timed_out,
-                "warm_done": warm_done,
-                "warm_total": warm_total,
-            }),
-        );
         (
             active_done,
             warm_done,
@@ -2947,42 +1549,6 @@ async fn close_all_terminal_sessions(
         timed_out,
         coordination_summary,
     ) = cleanup_summary;
-    log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.cleanup_worker_join_done",
-        None,
-        None,
-        Some(close_started_at.elapsed()),
-        json!({
-            "active_done": active_done,
-            "closed": closed,
-            "cleanup_detached": timed_out,
-            "console_hosts_closed": console_hosts_closed,
-            "coordination": coordination_summary.clone(),
-            "login_closed": login_closed,
-            "refill_idle": refill_idle,
-            "warm_closed": warm_done,
-            "warm_total": warm_total,
-        }),
-    );
-
-    log_terminal_event(
-        "terminal.close_all.done",
-        None,
-        None,
-        Some(close_started_at.elapsed()),
-        json!({
-            "active_done": active_done,
-            "app_pid": std::process::id(),
-            "closed": closed,
-            "console_hosts_closed": console_hosts_closed,
-            "coordination": coordination_summary,
-            "warm_closed": warm_done,
-            "warm_total": warm_total,
-            "login_closed": login_closed,
-            "refill_idle": refill_idle,
-            "cleanup_detached": timed_out,
-        }),
-    );
 
     Ok(closed)
 }
@@ -3066,15 +1632,7 @@ async fn terminal_open(
     output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
     validate_terminal_pane_id(&request.pane_id)?;
-    log_terminal_event(
-        "terminal.open.lifecycle_lock_skipped",
-        Some(&request.pane_id),
-        request.instance_id,
-        None,
-        json!({"reason": "persistent_numbered_slots_fast_attach"}),
-    );
     let pane_id = request.pane_id;
-    let open_started_at = Instant::now();
     let requested_cols = request.cols;
     let requested_rows = request.rows;
     let kind = request.kind;
@@ -3091,44 +1649,8 @@ async fn terminal_open(
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
 
-    log_terminal_event(
-        "terminal.open.start",
-        Some(&pane_id),
-        request.instance_id,
-        None,
-        json!({
-            "kind": clean_terminal_telemetry_text(&kind),
-            "provider": provider.as_deref().map(clean_terminal_telemetry_text),
-            "plain_shell": plain_shell,
-            "cols": requested_cols,
-            "rows": requested_rows,
-            "has_working_directory": working_directory_request
-                .as_deref()
-                .map(|directory| !directory.trim().is_empty())
-                .unwrap_or(false),
-            "working_directory_request": working_directory_request
-                .as_deref()
-                .map(clean_terminal_telemetry_text),
-            "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-            "terminal_index": terminal_index,
-            "slot_key": clean_terminal_telemetry_text(&terminal_slot_key),
-        }),
-    );
-
-    log_terminal_event(
-        "terminal.open.cloud_mcp_gate_skipped",
-        Some(&pane_id),
-        request.instance_id,
-        None,
-        json!({
-            "reason": "simple_worktree_launch",
-            "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-        }),
-    );
-
     let preserve_coordination_session =
         request.preserve_coordination_session.unwrap_or(false) && !plain_shell;
-    let close_started_at = Instant::now();
     let closed_existing = close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
@@ -3139,50 +1661,19 @@ async fn terminal_open(
     )
     .await
     .unwrap_or(false);
-    log_terminal_event(
-        "terminal.open.close_existing",
-        Some(&pane_id),
-        request.instance_id,
-        Some(close_started_at.elapsed()),
-        json!({
-            "closed_existing": closed_existing,
-            "preserve_coordination_session": preserve_coordination_session,
-        }),
-    );
 
-    let resolve_started_at = Instant::now();
     let working_directory =
         match resolve_workspace_root_directory(working_directory_request.as_deref()) {
             Ok(working_directory) => working_directory,
             Err(error) => {
-                log_terminal_event(
-                    "terminal.open.resolve_working_directory_error",
-                    Some(&pane_id),
-                    request.instance_id,
-                    Some(resolve_started_at.elapsed()),
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "working_directory_request": working_directory_request
-                            .as_deref()
-                            .map(clean_terminal_telemetry_text),
-                    }),
-                );
                 return Err(error);
             }
         };
-    log_terminal_event(
-        "terminal.open.resolve_working_directory",
-        Some(&pane_id),
-        request.instance_id,
-        Some(resolve_started_at.elapsed()),
-        json!({ "working_directory": workspace_path_display(&working_directory) }),
-    );
     let mut process_working_directory = workspace_path_for_process(&working_directory);
     let mut launch_worktree: Option<Value> = None;
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let command_started_at = Instant::now();
     let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
     let (command_candidates, args, label) = if is_prewarm_pty || plain_shell {
         (Vec::new(), Vec::new(), "Prepared PTY".to_string())
@@ -3190,17 +1681,6 @@ async fn terminal_open(
         terminal_launch(&kind, provider, model)?
     };
     if plain_shell {
-        log_terminal_event(
-            "terminal.open.plain_shell_project_root_ready",
-            Some(&pane_id),
-            request.instance_id,
-            Some(command_started_at.elapsed()),
-            json!({
-                "plain_shell": plain_shell,
-                "slot_key": clean_terminal_telemetry_text(&terminal_slot_key),
-                "working_directory": workspace_path_display(&process_working_directory),
-            }),
-        );
     } else if !is_prewarm_pty {
         ensure_workspace_git_bootstrap_for_terminal(
             &working_directory,
@@ -3209,54 +1689,32 @@ async fn terminal_open(
         )
         .await?;
 
-        let (context, worktree, prepared_working_directory) =
-            prepare_terminal_coordination_launch(
-                pane_id.clone(),
-                request.instance_id,
-                working_directory.clone(),
-                kind.clone(),
-                provider_for_coordination.clone(),
-                label.clone(),
-                terminal_slot_key.clone(),
-                workspace_id.clone(),
-                workspace_name.clone(),
-            )
-            .await?;
+        let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
+            pane_id.clone(),
+            request.instance_id,
+            working_directory.clone(),
+            kind.clone(),
+            provider_for_coordination.clone(),
+            label.clone(),
+            terminal_slot_key.clone(),
+            workspace_id.clone(),
+            workspace_name.clone(),
+        )
+        .await?;
         process_working_directory = prepared_working_directory;
         launch_worktree = Some(worktree);
         coordination_context = Some(context);
     }
-    log_terminal_event(
-        "terminal.open.resolve_command",
-        Some(&pane_id),
-        request.instance_id,
-        Some(command_started_at.elapsed()),
-        json!({
-            "label": label,
-            "candidate_count": command_candidates.len(),
-            "arg_count": args.len(),
-            "prewarm_pty": is_prewarm_pty,
-        }),
-    );
 
-    let size_started_at = Instant::now();
     let size = terminal_size_from_request(requested_cols, requested_rows)?;
     let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
         state
             .next_terminal_instance_id
             .fetch_add(1, Ordering::Relaxed)
     });
-    log_terminal_event(
-        "terminal.open.size",
-        Some(&pane_id),
-        Some(instance_id),
-        Some(size_started_at.elapsed()),
-        json!({ "cols": size.cols, "rows": size.rows }),
-    );
 
     let mut command = "prepared-shell".to_string();
     let mut agent_started = false;
-    let spawn_started_at = Instant::now();
     let mut launch_arg_count = args.len();
     let terminal_coordination = coordination_context
         .as_ref()
@@ -3267,26 +1725,12 @@ async fn terminal_open(
         match create_warm_shell_pty_in_directory(size, &process_working_directory) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
-                log_terminal_event(
-                    "terminal.open.prewarm_spawn_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(spawn_started_at.elapsed()),
-                    json!({ "error": clean_terminal_telemetry_text(&error) }),
-                );
                 return Err(error);
             }
         }
     } else {
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
             let error = format!("{label} is not installed or not available on PATH.");
-            log_terminal_event(
-                "terminal.open.error",
-                Some(&pane_id),
-                Some(instance_id),
-                Some(open_started_at.elapsed()),
-                json!({ "error": clean_terminal_telemetry_text(&error) }),
-            );
             return Err(error);
         };
 
@@ -3322,16 +1766,6 @@ async fn terminal_open(
         ) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
-                log_terminal_event(
-                    "terminal.open.agent_spawn_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    Some(spawn_started_at.elapsed()),
-                    json!({
-                        "command": clean_terminal_telemetry_text(&command_path),
-                        "error": clean_terminal_telemetry_text(&error),
-                    }),
-                );
                 return Err(error);
             }
         };
@@ -3341,35 +1775,6 @@ async fn terminal_open(
         warm_pty
     };
 
-    log_terminal_event(
-        if is_prewarm_pty {
-            "terminal.open.prewarm_spawn"
-        } else {
-            "terminal.open.agent_spawn"
-        },
-        Some(&pane_id),
-        Some(instance_id),
-        Some(spawn_started_at.elapsed()),
-        json!({
-            "agent_started": agent_started,
-            "arg_count": args.len(),
-            "launch_arg_count": launch_arg_count,
-            "command": clean_terminal_telemetry_text(&command),
-            "prewarm_pty": is_prewarm_pty,
-            "repo_working_directory": workspace_path_display(&working_directory),
-            "working_directory": workspace_path_display(&process_working_directory),
-            "agent_branch_root": launch_worktree
-                .as_ref()
-                .and_then(|worktree| worktree["path"].as_str())
-                .map(clean_terminal_telemetry_text),
-            "cwd_policy": if launch_worktree.is_some() {
-                "worktree_only"
-            } else {
-                "project_root"
-            },
-        }),
-    );
-
     let (instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
         warm_pty,
@@ -3378,7 +1783,6 @@ async fn terminal_open(
         terminal_coordination.clone(),
     );
 
-    let insert_started_at = Instant::now();
     let displaced_instance = state
         .terminals
         .write()
@@ -3394,17 +1798,6 @@ async fn terminal_open(
             preserve_coordination_session,
         );
     }
-    log_terminal_event(
-        "terminal.open.insert_instance",
-        Some(&pane_id),
-        Some(instance_id),
-        Some(insert_started_at.elapsed()),
-        json!({
-            "prewarm_pty": is_prewarm_pty,
-            "agent_started": agent_started,
-            "displaced_existing": displaced_existing,
-        }),
-    );
 
     spawn_terminal_reader(
         app.clone(),
@@ -3429,30 +1822,6 @@ async fn terminal_open(
             );
         }
     }
-    log_terminal_event(
-        if is_prewarm_pty {
-            "terminal.open.prewarm_ready"
-        } else {
-            "terminal.open.success"
-        },
-        Some(&pane_id),
-        Some(instance_id),
-        Some(open_started_at.elapsed()),
-        json!({
-            "command": clean_terminal_telemetry_text(&command),
-            "repo_working_directory": workspace_path_display(&working_directory),
-            "working_directory": workspace_path_display(&process_working_directory),
-            "agent_branch_root": launch_worktree
-                .as_ref()
-                .and_then(|worktree| worktree["path"].as_str())
-                .map(clean_terminal_telemetry_text),
-            "cwd_policy": if launch_worktree.is_some() {
-                "worktree_only"
-            } else {
-                "project_root"
-            },
-        }),
-    );
 
     Ok(TerminalOpenResult {
         pane_id,
@@ -3505,56 +1874,8 @@ async fn terminal_open(
     })
 }
 
-fn terminal_telemetry_entry(request: TerminalTelemetryLogRequest) -> Option<Value> {
-    if request.phase.trim().is_empty() {
-        return None;
-    }
-
-    if !terminal_parked_logging_enabled() && terminal_phase_is_parked_log(&request.phase) {
-        return None;
-    }
-
-    if !terminal_phase_logging_enabled(&request.phase) {
-        return None;
-    }
-
-    Some(json!({
-        "ts_ms": request.ts_ms.unwrap_or_else(terminal_now_ms),
-        "phase": clean_terminal_telemetry_text(&request.phase),
-        "pane_id": request.pane_id.as_deref().map(clean_terminal_telemetry_text),
-        "instance_id": request.instance_id,
-        "message": request.message.as_deref().map(clean_terminal_telemetry_text),
-        "cols": request.cols,
-        "rows": request.rows,
-        "elapsed_ms": request.elapsed_ms,
-        "fields": request.fields.unwrap_or_else(|| json!({})),
-    }))
-}
-
-#[tauri::command]
-fn terminal_telemetry_log(request: TerminalTelemetryLogRequest) -> Result<(), String> {
-    if let Some(entry) = terminal_telemetry_entry(request) {
-        write_terminal_telemetry(entry);
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn terminal_telemetry_log_many(requests: Vec<TerminalTelemetryLogRequest>) -> Result<(), String> {
-    let entries = requests
-        .into_iter()
-        .filter_map(terminal_telemetry_entry)
-        .collect::<Vec<_>>();
-
-    write_terminal_telemetry_entries(entries);
-
-    Ok(())
-}
-
 #[tauri::command]
 async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result<Value, String> {
-    let recovery_started_at = Instant::now();
     let mut requested_roots = roots.unwrap_or_default();
 
     if requested_roots.is_empty() {
@@ -3624,22 +1945,6 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
         }
     }
 
-    log_terminal_event(
-        "terminal.crash_recovery.scan_completed",
-        None,
-        None,
-        Some(recovery_started_at.elapsed()),
-        json!({
-            "workspace_count": workspace_reports.len(),
-            "scanned_sessions": scanned_sessions,
-            "interrupted_tasks": interrupted_tasks.len(),
-            "idle_sessions_interrupted": idle_sessions_interrupted,
-            "finished_sessions_interrupted": finished_sessions_interrupted,
-            "errors": errors.len(),
-            "modal_policy": "frontend_modal_only_for_interrupted_tasks_with_active_work_signals_no_auto_input",
-        }),
-    );
-
     Ok(json!({
         "interruptedTasks": interrupted_tasks,
         "idleSessionsInterrupted": idle_sessions_interrupted,
@@ -3692,29 +1997,14 @@ async fn terminal_start_agent(
 
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
-        log_terminal_event(
-            "terminal.agent_start.skipped_stale_or_missing",
-            Some(&pane_id),
-            instance_id,
-            None,
-            json!({ "provider": definition.id }),
-        );
         return Err("Terminal session is not running.".to_string());
     };
     if instance.coordination.is_none() {
-        log_terminal_event(
-            "terminal.agent_start.blocked_uncoordinated",
-            Some(&pane_id),
-            Some(instance.id),
-            None,
-            json!({ "provider": definition.id }),
-        );
         return Err(
             "Deferred agent start is blocked because this terminal has no coordination session."
                 .to_string(),
         );
     }
-    let cloud_gate_started_at = Instant::now();
     match require_cloud_mcp_terminal_gate_for_path(
         cloud_mcp_state.inner(),
         instance.working_directory.as_ref(),
@@ -3723,27 +2013,8 @@ async fn terminal_start_agent(
     )
     .await
     {
-        Ok(status) => log_terminal_event(
-            "terminal.agent_start.cloud_mcp_gate_ready",
-            Some(&pane_id),
-            Some(instance.id),
-            Some(cloud_gate_started_at.elapsed()),
-            json!({
-                "base_url": clean_terminal_telemetry_text(&status.base_url),
-                "provider": definition.id,
-            }),
-        ),
+        Ok(status) => (),
         Err(error) => {
-            log_terminal_event(
-                "terminal.agent_start.cloud_mcp_gate_blocked",
-                Some(&pane_id),
-                Some(instance.id),
-                Some(cloud_gate_started_at.elapsed()),
-                json!({
-                    "provider": definition.id,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
             return Err(error);
         }
     }
@@ -3769,17 +2040,9 @@ async fn terminal_start_agent(
         return Err("Terminal launch input is too large.".to_string());
     }
 
-    let write_started_at = Instant::now();
     let mut agent_started = instance.agent_started.lock().await;
 
     if *agent_started {
-        log_terminal_event(
-            "terminal.agent_start.skipped_already_started",
-            Some(&pane_id),
-            Some(instance.id),
-            Some(write_started_at.elapsed()),
-            json!({ "provider": definition.id }),
-        );
         return Ok(());
     }
 
@@ -3799,20 +2062,6 @@ async fn terminal_start_agent(
             "terminal_start_agent",
         );
     }
-    log_terminal_event(
-        "terminal.agent_start.write",
-        Some(&pane_id),
-        Some(instance.id),
-        Some(write_started_at.elapsed()),
-        json!({
-            "provider": definition.id,
-            "command": clean_terminal_telemetry_text(&command_path),
-            "arg_count": args.len(),
-            "launch_arg_count": launch_args.len(),
-            "bytes": input.len(),
-            "working_directory": workspace_path_display(instance.working_directory.as_ref()),
-        }),
-    );
 
     Ok(())
 }
@@ -3827,7 +2076,6 @@ async fn start_terminal_agent_in_prepared_pty(
     let pane_id = request.pane_id;
     let instance_id = request.instance_id;
     let workspace_id = request.workspace_id;
-    let start_started_at = Instant::now();
 
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
         return TerminalStartAgentPaneResult {
@@ -3875,16 +2123,6 @@ async fn start_terminal_agent_in_prepared_pty(
         let terminals = terminals.read().await;
         terminals.get(&pane_id).cloned()
     }) else {
-        log_terminal_event(
-            "terminal.agent_start_many.skipped_missing",
-            Some(&pane_id),
-            instance_id,
-            Some(start_started_at.elapsed()),
-            json!({
-                "provider": definition.id,
-                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-            }),
-        );
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
@@ -3895,17 +2133,6 @@ async fn start_terminal_agent_in_prepared_pty(
     };
 
     if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
-        log_terminal_event(
-            "terminal.agent_start_many.skipped_stale",
-            Some(&pane_id),
-            instance_id,
-            Some(start_started_at.elapsed()),
-            json!({
-                "current_instance_id": instance.id,
-                "provider": definition.id,
-                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-            }),
-        );
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
@@ -3916,16 +2143,6 @@ async fn start_terminal_agent_in_prepared_pty(
     }
 
     if instance.coordination.is_none() {
-        log_terminal_event(
-            "terminal.agent_start_many.blocked_uncoordinated",
-            Some(&pane_id),
-            Some(instance.id),
-            Some(start_started_at.elapsed()),
-            json!({
-                "provider": definition.id,
-                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-            }),
-        );
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
@@ -3940,16 +2157,6 @@ async fn start_terminal_agent_in_prepared_pty(
     let mut agent_started_guard = instance.agent_started.lock().await;
 
     if *agent_started_guard {
-        log_terminal_event(
-            "terminal.agent_start_many.skipped_already_started",
-            Some(&pane_id),
-            Some(instance.id),
-            Some(start_started_at.elapsed()),
-            json!({
-                "provider": definition.id,
-                "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-            }),
-        );
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
@@ -4004,7 +2211,6 @@ async fn start_terminal_agent_in_prepared_pty(
         }
 
         drop(child_guard);
-        let write_started_at = Instant::now();
         let mut writer = instance.writer.lock().await;
 
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
@@ -4022,21 +2228,6 @@ async fn start_terminal_agent_in_prepared_pty(
                         "terminal_start_agent_many",
                     );
                 }
-                log_terminal_event(
-                    "terminal.agent_start_many.write_done",
-                    Some(&pane_id),
-                    Some(instance.id),
-                    Some(write_started_at.elapsed()),
-                    json!({
-                        "provider": definition.id,
-                        "command": clean_terminal_telemetry_text(&command_path),
-                        "arg_count": args.len(),
-                        "launch_arg_count": launch_args.len(),
-                        "bytes": input.len(),
-                        "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-                        "working_directory": workspace_path_display(instance.working_directory.as_ref()),
-                    }),
-                );
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
@@ -4046,18 +2237,6 @@ async fn start_terminal_agent_in_prepared_pty(
                 };
             }
             Err(error) => {
-                log_terminal_event(
-                    "terminal.agent_start_many.write_error",
-                    Some(&pane_id),
-                    Some(instance.id),
-                    Some(write_started_at.elapsed()),
-                    json!({
-                        "provider": definition.id,
-                        "command": clean_terminal_telemetry_text(&command_path),
-                        "error": clean_terminal_telemetry_text(&error),
-                        "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-                    }),
-                );
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
@@ -4068,17 +2247,6 @@ async fn start_terminal_agent_in_prepared_pty(
             }
         }
     }
-
-    log_terminal_event(
-        "terminal.agent_start_many.skipped_not_warm_shell",
-        Some(&pane_id),
-        Some(instance.id),
-        Some(start_started_at.elapsed()),
-        json!({
-            "provider": definition.id,
-            "workspace_id": workspace_id.as_deref().map(clean_terminal_telemetry_text),
-        }),
-    );
     TerminalStartAgentPaneResult {
         pane_id,
         instance_id: Some(instance.id),
@@ -4102,41 +2270,12 @@ async fn terminal_start_agent_many(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
         ));
     }
-    let cloud_gate_started_at = Instant::now();
     match require_cloud_mcp_connected_state(cloud_mcp_state.inner()).await {
-        Ok(status) => log_terminal_event(
-            "terminal.agent_start_many.cloud_mcp_gate_ready",
-            None,
-            None,
-            Some(cloud_gate_started_at.elapsed()),
-            json!({
-                "base_url": clean_terminal_telemetry_text(&status.base_url),
-                "request_count": requests.len(),
-            }),
-        ),
+        Ok(status) => (),
         Err(error) => {
-            log_terminal_event(
-                "terminal.agent_start_many.cloud_mcp_gate_blocked",
-                None,
-                None,
-                Some(cloud_gate_started_at.elapsed()),
-                json!({
-                    "request_count": requests.len(),
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
             return Err(error);
         }
     }
-
-    let batch_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.agent_start_many.start",
-        None,
-        None,
-        None,
-        json!({ "request_count": requests.len() }),
-    );
 
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -4176,18 +2315,6 @@ async fn terminal_start_agent_many(
     let started = results.iter().filter(|result| result.started).count();
     let skipped = results.iter().filter(|result| result.skipped).count();
 
-    log_terminal_event(
-        "terminal.agent_start_many.done",
-        None,
-        None,
-        Some(batch_started_at.elapsed()),
-        json!({
-            "request_count": results.len(),
-            "started": started,
-            "skipped": skipped,
-        }),
-    );
-
     Ok(TerminalStartAgentManyResult {
         started,
         skipped,
@@ -4212,43 +2339,10 @@ async fn terminal_write_to_audio_input_target(
     data: String,
 ) -> Result<bool, String> {
     let Some(target) = active_terminal_audio_input_target(&state)? else {
-        log_terminal_event(
-            "terminal.audio_input.write.skipped_no_target",
-            None,
-            None,
-            None,
-            json!({
-                "bytes": data.len(),
-                "has_escape": terminal_input_contains_escape(&data),
-            }),
-        );
         return Ok(false);
     };
 
-    if terminal_input_contains_escape(&data) {
-        log_terminal_event(
-            "terminal.audio_input.escape.command_received",
-            Some(&target.pane_id),
-            target.instance_id,
-            None,
-            terminal_input_debug_fields(&data),
-        );
-    }
-
     let wrote = write_to_active_terminal_audio_input_target(&app, &state, &data).await?;
-
-    if terminal_input_contains_escape(&data) {
-        log_terminal_event(
-            "terminal.audio_input.escape.command_done",
-            Some(&target.pane_id),
-            target.instance_id,
-            None,
-            json!({
-                "wrote": wrote,
-                "bytes": data.len(),
-            }),
-        );
-    }
 
     Ok(wrote)
 }
@@ -5129,56 +3223,6 @@ async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
     .await;
 }
 
-fn emit_terminal_monitor_coordination_event(
-    coordination: &TerminalCoordinationSession,
-    event_type: &str,
-    pane_id: &str,
-    instance_id: u64,
-    task_id: Option<&str>,
-    payload: Value,
-) {
-    if !terminal_parked_logging_enabled() {
-        return;
-    }
-
-    log_terminal_event(
-        "terminal.coordination_monitor_event",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "event_type": clean_terminal_telemetry_text(event_type),
-            "task_id": task_id.map(clean_terminal_telemetry_text),
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-            "source": "terminal_parking_supervisor",
-            "payload": payload.clone(),
-        }),
-    );
-    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
-        &coordination.repo_path,
-        Some(PathBuf::from(&coordination.db_path)),
-    ) {
-        let _ = kernel.emit_event(
-            event_type,
-            "terminal",
-            &coordination.session_id,
-            crate::coordination::kernel::EventRefs {
-                task_id: task_id.map(str::to_string),
-                agent_id: Some(coordination.agent_id.clone()),
-                session_id: Some(coordination.session_id.clone()),
-                ..crate::coordination::kernel::EventRefs::default()
-            },
-            json!({
-                "pane_id": pane_id,
-                "instance_id": instance_id,
-                "source": "terminal_parking_supervisor",
-                "payload": payload,
-            }),
-        );
-    }
-}
-
 fn spawn_terminal_session_parking_monitor(
     app: AppHandle,
     cloud_mcp_state: CloudMcpState,
@@ -5189,17 +3233,6 @@ fn spawn_terminal_session_parking_monitor(
     coordination: TerminalCoordinationSession,
     source: &'static str,
 ) {
-    emit_terminal_monitor_coordination_event(
-        &coordination,
-        "terminal_session_parking_monitor_spawned",
-        &pane_id,
-        instance_id,
-        None,
-        json!({
-            "source": source,
-            "session_id": coordination.session_id.clone(),
-        }),
-    );
     tauri::async_runtime::spawn(terminal_monitor_session_parking(
         app,
         cloud_mcp_state,
@@ -5335,18 +3368,6 @@ fn terminal_prepare_coordination_task_for_prompt(
     instance_id: u64,
 ) -> Result<Option<TerminalPreparedCoordinationTask>, String> {
     if terminal_prompt_is_agent_command(prompt) {
-        log_terminal_event(
-            "terminal.prompt.coordination_task_skipped",
-            Some(pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                "reason": "agent_slash_command",
-                "prompt": clean_terminal_telemetry_text(prompt),
-            }),
-        );
         return Ok(None);
     }
 
@@ -5358,27 +3379,6 @@ fn terminal_prepare_coordination_task_for_prompt(
         terminal_existing_session_task_with_active_leases(&kernel, coordination)?
     {
         terminal_attach_session_to_reused_task(&kernel, coordination, &task_id)?;
-        log_terminal_event(
-            "terminal.prompt.coordination_task_ready",
-            Some(pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                "task_id": clean_terminal_telemetry_text(&task_id),
-                "title": clean_terminal_telemetry_text(&title),
-                "intent_resources": [],
-                "parked": false,
-                "partial": false,
-                "runnable_resources": [],
-                "parked_resources": [],
-                "parking_details": [],
-                "reused_existing_session_task": true,
-                "reuse_reason": "same terminal session already owns active leases",
-                "active_lease_count": active_lease_count,
-            }),
-        );
         return Ok(Some(TerminalPreparedCoordinationTask {
             task_id,
             title,
@@ -5407,26 +3407,6 @@ fn terminal_prepare_coordination_task_for_prompt(
     };
     kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
     let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
-    log_terminal_event(
-        "terminal.prompt.coordination_task_ready",
-        Some(pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            "task_id": clean_terminal_telemetry_text(&task_id),
-            "title": clean_terminal_telemetry_text(&title),
-            "intent_resources": [],
-            "parked": false,
-            "partial": false,
-            "runnable_resources": [],
-            "parked_resources": [],
-            "parking_details": [],
-            "reused_existing_session_task": false,
-            "prompt_resource_parking": "disabled",
-        }),
-    );
     Ok(Some(TerminalPreparedCoordinationTask {
         task_id,
         title,
@@ -5453,17 +3433,6 @@ async fn terminal_resume_parked_prompt_when_ready(
 ) {
     let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
     let mut last_resume_snapshot_signature: Option<String> = None;
-    log_terminal_event(
-        "terminal.prompt.parked",
-        Some(&pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "task_id": clean_terminal_telemetry_text(&task_id),
-            "title": clean_terminal_telemetry_text(&title),
-            "resume_policy": "wait_for_dependency_then_refresh_worktree",
-        }),
-    );
     for _ in 0..7200 {
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let still_parked = {
@@ -5471,16 +3440,6 @@ async fn terminal_resume_parked_prompt_when_ready(
             guard.contains_key(&parked_key)
         };
         if !still_parked {
-            log_terminal_event(
-                "terminal.prompt.parked_resume_abandoned",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "reason": "parked_task_removed",
-                }),
-            );
             return;
         }
         let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
@@ -5490,22 +3449,6 @@ async fn terminal_resume_parked_prompt_when_ready(
         };
         let resume_snapshot_signature = terminal_parking_snapshot_signature(&snapshot);
         if last_resume_snapshot_signature.as_deref() != Some(resume_snapshot_signature.as_str()) {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_snapshot",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "task_status": snapshot.task_status.clone(),
-                    "session_status": snapshot.session_status.clone(),
-                    "ready": snapshot.ready,
-                    "terminal": snapshot.terminal,
-                    "waiting_on_count": snapshot.waiting_on.len(),
-                    "waiting_on": snapshot.waiting_on.clone(),
-                    "signature": resume_snapshot_signature.clone(),
-                }),
-            );
             last_resume_snapshot_signature = Some(resume_snapshot_signature);
         }
         if !snapshot.ready {
@@ -5535,18 +3478,6 @@ async fn terminal_resume_parked_prompt_when_ready(
             }
             continue;
         }
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_resume_ready_to_write",
-            &pane_id,
-            instance_id,
-            Some(&task_id),
-            json!({
-                "title": clean_terminal_telemetry_text(&title),
-                "prompt_bytes": prompt.len(),
-                "resume_input_policy": "submit_structured_parked_resume_context_to_existing_terminal",
-            }),
-        );
         let resume_state = if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
             &coordination.repo_path,
             Some(PathBuf::from(&coordination.db_path)),
@@ -5561,26 +3492,6 @@ async fn terminal_resume_parked_prompt_when_ready(
             let guard = terminals.read().await;
             guard.get(&pane_id).cloned()
         }) else {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_abandoned",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "reason": "terminal_missing",
-                }),
-            );
-            log_terminal_event(
-                "terminal.prompt.parked_resume_abandoned",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "reason": "terminal_missing",
-                }),
-            );
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -5599,28 +3510,6 @@ async fn terminal_resume_parked_prompt_when_ready(
             return;
         };
         if instance.id != instance_id {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_abandoned",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "reason": "terminal_replaced",
-                    "current_instance_id": instance.id,
-                }),
-            );
-            log_terminal_event(
-                "terminal.prompt.parked_resume_abandoned",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "reason": "terminal_replaced",
-                    "current_instance_id": instance.id,
-                }),
-            );
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -5643,28 +3532,6 @@ async fn terminal_resume_parked_prompt_when_ready(
         let resume_input_bytes =
             resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
         if resume_input_bytes > MAX_TERMINAL_WRITE_BYTES {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_abandoned",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "reason": "resume_input_too_large",
-                    "bytes": resume_input_bytes,
-                }),
-            );
-            log_terminal_event(
-                "terminal.prompt.parked_resume_abandoned",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "reason": "resume_input_too_large",
-                    "bytes": resume_input_bytes,
-                }),
-            );
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -5685,28 +3552,6 @@ async fn terminal_resume_parked_prompt_when_ready(
         {
             let mut writer = instance.writer.lock().await;
             if let Err(error) = writer.write_all(resume_request.as_bytes()) {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_parked_resume_write_failed",
-                    &pane_id,
-                    instance_id,
-                    Some(&task_id),
-                    json!({
-                        "stage": "text",
-                        "error": clean_terminal_telemetry_text(&error.to_string()),
-                    }),
-                );
-                log_terminal_event(
-                    "terminal.prompt.parked_resume_write_failed",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "task_id": clean_terminal_telemetry_text(&task_id),
-                        "stage": "text",
-                        "error": clean_terminal_telemetry_text(&error.to_string()),
-                    }),
-                );
                 if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                     mark_terminal_parked_prompt_lifecycle_in_cloud(
                         &cloud_mcp_state,
@@ -5725,28 +3570,6 @@ async fn terminal_resume_parked_prompt_when_ready(
                 return;
             }
             if let Err(error) = writer.flush() {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_parked_resume_write_failed",
-                    &pane_id,
-                    instance_id,
-                    Some(&task_id),
-                    json!({
-                        "stage": "text_flush",
-                        "error": clean_terminal_telemetry_text(&error.to_string()),
-                    }),
-                );
-                log_terminal_event(
-                    "terminal.prompt.parked_resume_write_failed",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "task_id": clean_terminal_telemetry_text(&task_id),
-                        "stage": "text_flush",
-                        "error": clean_terminal_telemetry_text(&error.to_string()),
-                    }),
-                );
                 if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                     mark_terminal_parked_prompt_lifecycle_in_cloud(
                         &cloud_mcp_state,
@@ -5765,60 +3588,12 @@ async fn terminal_resume_parked_prompt_when_ready(
                 return;
             }
         }
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_resume_text_written",
-            &pane_id,
-            instance_id,
-            Some(&task_id),
-            json!({
-                "title": clean_terminal_telemetry_text(&title),
-                "text_bytes": resume_request.len(),
-                "submit_delay_ms": TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
-                "submit_policy": "split_text_then_enter",
-            }),
-        );
-        log_terminal_event(
-            "terminal.prompt.parked_resume_text_written",
-            Some(&pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "task_id": clean_terminal_telemetry_text(&task_id),
-                "title": clean_terminal_telemetry_text(&title),
-                "text_bytes": resume_request.len(),
-                "submit_delay_ms": TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
-                "submit_policy": "split_text_then_enter",
-            }),
-        );
         tokio::time::sleep(Duration::from_millis(
             TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
         ))
         .await;
         let mut writer = instance.writer.lock().await;
         if let Err(error) = writer.write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes()) {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_write_failed",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "stage": "submit",
-                    "error": clean_terminal_telemetry_text(&error.to_string()),
-                }),
-            );
-            log_terminal_event(
-                "terminal.prompt.parked_resume_write_failed",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "stage": "submit",
-                    "error": clean_terminal_telemetry_text(&error.to_string()),
-                }),
-            );
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -5837,28 +3612,6 @@ async fn terminal_resume_parked_prompt_when_ready(
             return;
         }
         if let Err(error) = writer.flush() {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_resume_write_failed",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "stage": "submit_flush",
-                    "error": clean_terminal_telemetry_text(&error.to_string()),
-                }),
-            );
-            log_terminal_event(
-                "terminal.prompt.parked_resume_write_failed",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "stage": "submit_flush",
-                    "error": clean_terminal_telemetry_text(&error.to_string()),
-                }),
-            );
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -5896,53 +3649,8 @@ async fn terminal_resume_parked_prompt_when_ready(
             .await;
             emit_terminal_parked_prompt_event(&app, &parked, "resumed", Some("dependency_ready"));
         }
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_resume_sent",
-            &pane_id,
-            instance_id,
-            Some(&task_id),
-            json!({
-                "title": clean_terminal_telemetry_text(&title),
-                "resume_input_bytes": resume_input_bytes,
-                "submit_policy": "split_text_then_enter",
-            }),
-        );
-        log_terminal_event(
-            "terminal.prompt.parked_resume_sent",
-            Some(&pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "task_id": clean_terminal_telemetry_text(&task_id),
-                "title": clean_terminal_telemetry_text(&title),
-                "resume_input_bytes": resume_input_bytes,
-                "submit_policy": "split_text_then_enter",
-            }),
-        );
         return;
     }
-    emit_terminal_monitor_coordination_event(
-        &coordination,
-        "terminal_parked_resume_timeout",
-        &pane_id,
-        instance_id,
-        Some(&task_id),
-        json!({
-            "title": clean_terminal_telemetry_text(&title),
-            "reason": "dependency_did_not_become_ready_before_timeout",
-        }),
-    );
-    log_terminal_event(
-        "terminal.prompt.parked_resume_timeout",
-        Some(&pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "task_id": clean_terminal_telemetry_text(&task_id),
-            "title": clean_terminal_telemetry_text(&title),
-        }),
-    );
     if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
         mark_terminal_parked_prompt_lifecycle_in_cloud(
             &cloud_mcp_state,
@@ -6025,19 +3733,6 @@ async fn terminal_monitor_active_task_for_late_parking(
             "Parked: the agent hit a local coordination lease block after the prompt was already running.",
         )
         .await;
-        log_terminal_event(
-            "terminal.prompt.late_parked_from_kernel_state",
-            Some(&pane_id),
-            Some(instance_id),
-            None,
-            json!({
-                "task_id": clean_terminal_telemetry_text(&task_id),
-                "title": clean_terminal_telemetry_text(&title),
-                "task_status": snapshot.task_status,
-                "session_status": snapshot.session_status,
-                "ready": snapshot.ready,
-            }),
-        );
         tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
             app,
             cloud_mcp_state,
@@ -6063,28 +3758,6 @@ async fn terminal_monitor_session_parking(
     mut instance_id: u64,
     coordination: TerminalCoordinationSession,
 ) {
-    log_terminal_event(
-        "terminal.prompt.session_parking_monitor_started",
-        Some(&pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-        }),
-    );
-    emit_terminal_monitor_coordination_event(
-        &coordination,
-        "terminal_session_parking_monitor_started",
-        &pane_id,
-        instance_id,
-        None,
-        json!({
-            "session_id": coordination.session_id.clone(),
-            "agent_id": coordination.agent_id.clone(),
-        }),
-    );
-
     let mut registered_parked_keys = HashSet::new();
     let mut missing_pane_ticks = 0usize;
     let mut last_observed_task_id: Option<String> = None;
@@ -6099,17 +3772,6 @@ async fn terminal_monitor_session_parking(
         }) else {
             missing_pane_ticks += 1;
             if missing_pane_ticks >= 10 {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_stopped",
-                    &pane_id,
-                    instance_id,
-                    None,
-                    json!({
-                        "reason": "pane_missing",
-                        "missing_ticks": missing_pane_ticks,
-                    }),
-                );
                 return;
             }
             continue;
@@ -6123,31 +3785,7 @@ async fn terminal_monitor_session_parking(
             if same_session {
                 let previous_instance_id = instance_id;
                 instance_id = instance.id;
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_rebound_instance",
-                    &pane_id,
-                    instance_id,
-                    None,
-                    json!({
-                        "previous_instance_id": previous_instance_id,
-                        "current_instance_id": instance_id,
-                        "reason": "same_session_new_terminal_instance",
-                    }),
-                );
             } else {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_stopped",
-                    &pane_id,
-                    instance_id,
-                    None,
-                    json!({
-                        "reason": "terminal_instance_replaced_by_different_session",
-                        "current_instance_id": instance.id,
-                        "current_session_id": instance.coordination.as_ref().map(|active| active.session_id.clone()),
-                    }),
-                );
                 return;
             }
         }
@@ -6157,43 +3795,11 @@ async fn terminal_monitor_session_parking(
             Ok(None) => {
                 let skip_signature = format!("no_snapshot:{tick}");
                 if tick < 5 || tick % 30 == 0 {
-                    emit_terminal_monitor_coordination_event(
-                        &coordination,
-                        "terminal_session_parking_monitor_no_snapshot",
-                        &pane_id,
-                        instance_id,
-                        None,
-                        json!({
-                            "reason": "session_has_no_attached_task_or_missing_task",
-                            "tick": tick,
-                            "session_id": coordination.session_id.clone(),
-                        }),
-                    );
                     last_skip_signature = Some(skip_signature);
                 }
                 continue;
             }
             Err(error) => {
-                log_terminal_event(
-                    "terminal.prompt.session_parking_monitor_error",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                    }),
-                );
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_snapshot_error",
-                    &pane_id,
-                    instance_id,
-                    None,
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "tick": tick,
-                    }),
-                );
                 continue;
             }
         };
@@ -6201,39 +3807,9 @@ async fn terminal_monitor_session_parking(
         let task_id = snapshot.task_id.clone();
         let snapshot_signature = terminal_parking_snapshot_signature(&snapshot);
         if last_snapshot_signature.as_deref() != Some(snapshot_signature.as_str()) {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_session_parking_monitor_snapshot",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "tick": tick,
-                    "task_status": snapshot.task_status.clone(),
-                    "session_status": snapshot.session_status.clone(),
-                    "ready": snapshot.ready,
-                    "terminal": snapshot.terminal,
-                    "waiting_on_count": snapshot.waiting_on.len(),
-                    "waiting_on": snapshot.waiting_on.clone(),
-                    "signature": snapshot_signature.clone(),
-                }),
-            );
             last_snapshot_signature = Some(snapshot_signature.clone());
         }
         if last_observed_task_id.as_deref() != Some(task_id.as_str()) {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_session_parking_monitor_task_observed",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "previous_task_id": last_observed_task_id.clone(),
-                    "task_id": task_id.clone(),
-                    "task_status": snapshot.task_status.clone(),
-                    "session_status": snapshot.session_status.clone(),
-                }),
-            );
             last_observed_task_id = Some(task_id.clone());
         }
         let title = snapshot.title.clone();
@@ -6243,20 +3819,6 @@ async fn terminal_monitor_session_parking(
         if snapshot.terminal {
             let skip_signature = format!("terminal:{snapshot_signature}");
             if last_skip_signature.as_deref() != Some(skip_signature.as_str()) {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_skip",
-                    &pane_id,
-                    instance_id,
-                    Some(&task_id),
-                    json!({
-                        "reason": "task_status_is_terminal",
-                        "task_status": task_status.clone(),
-                        "session_status": snapshot.session_status.clone(),
-                        "ready": snapshot.ready,
-                        "waiting_on_count": snapshot.waiting_on.len(),
-                    }),
-                );
                 last_skip_signature = Some(skip_signature);
             }
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
@@ -6291,21 +3853,6 @@ async fn terminal_monitor_session_parking(
         if !should_register_parked_prompt {
             let skip_signature = format!("empty:{snapshot_signature}");
             if last_skip_signature.as_deref() != Some(skip_signature.as_str()) {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parking_monitor_skip",
-                    &pane_id,
-                    instance_id,
-                    Some(&task_id),
-                    json!({
-                        "reason": "no_waiting_on_and_not_ready",
-                        "task_status": task_status.clone(),
-                        "session_status": snapshot.session_status.clone(),
-                        "ready": ready,
-                        "terminal": snapshot.terminal,
-                        "waiting_on_count": snapshot.waiting_on.len(),
-                    }),
-                );
                 last_skip_signature = Some(skip_signature);
             }
             continue;
@@ -6321,20 +3868,6 @@ async fn terminal_monitor_session_parking(
                     updated = Some(existing.clone());
                 }
             } else if registered_parked_keys.contains(&parked_key) {
-                emit_terminal_monitor_coordination_event(
-                    &coordination,
-                    "terminal_session_parked_prompt_duplicate_suppressed",
-                    &pane_id,
-                    instance_id,
-                    Some(&task_id),
-                    json!({
-                        "reason": "registered_key_already_seen_without_in_memory_prompt",
-                        "ready": ready,
-                        "task_status": task_status.clone(),
-                        "session_status": snapshot.session_status.clone(),
-                        "waiting_on_count": snapshot.waiting_on.len(),
-                    }),
-                );
                 continue;
             } else {
                 let parked = TerminalParkedPrompt {
@@ -6369,20 +3902,6 @@ async fn terminal_monitor_session_parking(
                 "session_task_blocked"
             };
             emit_terminal_parked_prompt_event(&app, &parked, "parked", Some(reason));
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_session_parked_prompt_registered",
-                &pane_id,
-                instance_id,
-                Some(&task_id),
-                json!({
-                    "reason": reason,
-                    "ready": ready,
-                    "task_status": task_status,
-                    "session_status": snapshot.session_status,
-                    "waiting_on": parked.waiting_on.clone(),
-                }),
-            );
             mark_terminal_parked_prompt_lifecycle_in_cloud(
                 &cloud_mcp_state,
                 &parked,
@@ -6394,19 +3913,6 @@ async fn terminal_monitor_session_parking(
                 },
             )
             .await;
-            log_terminal_event(
-                "terminal.prompt.session_parked_from_kernel_state",
-                Some(&pane_id),
-                Some(instance_id),
-                None,
-                json!({
-                    "task_id": clean_terminal_telemetry_text(&task_id),
-                    "title": clean_terminal_telemetry_text(&title),
-                    "task_status": task_status,
-                    "ready": ready,
-                    "reason": reason,
-                }),
-            );
             tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
                 app.clone(),
                 cloud_mcp_state.clone(),
@@ -6421,17 +3927,6 @@ async fn terminal_monitor_session_parking(
             ));
         }
     }
-
-    log_terminal_event(
-        "terminal.prompt.session_parking_monitor_timeout",
-        Some(&pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-        }),
-    );
 }
 
 #[tauri::command]
@@ -6444,58 +3939,28 @@ async fn terminal_write(
     data: String,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
-    if terminal_input_contains_escape(&data) {
-        log_terminal_event(
-            "terminal.write.escape.command_received",
-            Some(&pane_id),
-            instance_id,
-            None,
-            terminal_input_debug_fields(&data),
-        );
-    }
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
-        log_terminal_event(
-            "terminal.write.skipped_stale_or_missing",
-            Some(&pane_id),
-            instance_id,
-            None,
-            json!({ "bytes": data.len() }),
-        );
         return Ok(());
     };
     let mut data_to_write = data.clone();
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
         if *instance.agent_started.lock().await {
-            let prepared_coordination_task = if let Some(coordination) =
-                instance.coordination.as_ref()
-            {
-                match terminal_prepare_coordination_task_for_prompt(
-                    coordination,
-                    &prompt,
-                    &pane_id,
-                    instance.id,
-                ) {
-                    Ok(task) => task,
-                    Err(error) => {
-                        log_terminal_event(
-                            "terminal.prompt.coordination_task_error",
-                            Some(&pane_id),
-                            Some(instance.id),
-                            None,
-                            json!({
-                                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                                "error": clean_terminal_telemetry_text(&error),
-                            }),
-                        );
-                        None
+            let prepared_coordination_task =
+                if let Some(coordination) = instance.coordination.as_ref() {
+                    match terminal_prepare_coordination_task_for_prompt(
+                        coordination,
+                        &prompt,
+                        &pane_id,
+                        instance.id,
+                    ) {
+                        Ok(task) => task,
+                        Err(error) => None,
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             let cloud_state = cloud_mcp_state.inner().clone();
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
@@ -6512,17 +3977,6 @@ async fn terminal_write(
                         &prompt,
                         &task.runnable_resources,
                         &task.parked_resources,
-                    );
-                    log_terminal_event(
-                        "terminal.prompt.partial_park",
-                        Some(&pane_id),
-                        Some(instance.id),
-                        None,
-                        json!({
-                            "task_id": clean_terminal_telemetry_text(&task.task_id),
-                            "runnable_resources": task.runnable_resources.clone(),
-                            "parked_resources": task.parked_resources.clone(),
-                        }),
                     );
                 }
             }
@@ -6621,18 +4075,6 @@ async fn terminal_write(
                     )
                     .await;
                 });
-                log_terminal_event(
-                    "terminal.prompt.write_parked",
-                    Some(&pane_id),
-                    Some(instance.id),
-                    None,
-                    json!({
-                        "task_id": clean_terminal_telemetry_text(&task_id),
-                        "title": clean_terminal_telemetry_text(&title),
-                        "intent_resources": intent_resources,
-                        "parking_details": parking_details,
-                    }),
-                );
                 tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
                     app.clone(),
                     cloud_mcp_state.inner().clone(),
@@ -6650,16 +4092,6 @@ async fn terminal_write(
                 }
             }
         }
-    }
-
-    if terminal_input_contains_escape(&data_to_write) {
-        log_terminal_event(
-            "terminal.write.escape.forward_to_pty",
-            Some(&pane_id),
-            instance_id,
-            None,
-            terminal_input_debug_fields(&data_to_write),
-        );
     }
 
     write_terminal_input(
@@ -6695,13 +4127,6 @@ async fn terminal_delete_selection(
 
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
-        log_terminal_event(
-            "terminal.selection_delete.skipped_stale_or_missing",
-            Some(&pane_id),
-            instance_id,
-            None,
-            json!({ "selected_chars": selected_text.chars().count() }),
-        );
         return Ok(json!({
             "deleted": false,
             "reason": "stale_or_missing_terminal",
@@ -6711,16 +4136,6 @@ async fn terminal_delete_selection(
     let mut gate = instance.input_gate.lock().await;
     let current_line = gate.current_line.clone();
     let Some(start) = current_line.rfind(&selected_text) else {
-        log_terminal_event(
-            "terminal.selection_delete.selection_not_in_current_input",
-            Some(&pane_id),
-            Some(instance.id),
-            None,
-            json!({
-                "current_line_chars": current_line.chars().count(),
-                "selected_chars": selected_text.chars().count(),
-            }),
-        );
         return Ok(json!({
             "deleted": false,
             "reason": "selection_not_in_current_input",
@@ -6747,16 +4162,6 @@ async fn terminal_delete_selection(
 
     gate.current_line = next_line;
     gate.current_line_user_touched = true;
-    log_terminal_event(
-        "terminal.selection_delete.applied",
-        Some(&pane_id),
-        Some(instance.id),
-        None,
-        json!({
-            "remaining_chars": gate.current_line.chars().count(),
-            "removed_chars": selected_text.chars().count(),
-        }),
-    );
 
     Ok(json!({
         "deleted": true,
@@ -6818,15 +4223,6 @@ async fn terminal_cancel_parked_task(
     )
     .await;
     emit_terminal_parked_prompt_event(&app, &parked, "cancelled", Some("cancel_button"));
-    log_terminal_event(
-        "terminal.prompt.parked_cancelled",
-        Some(&pane_id),
-        Some(instance_id),
-        None,
-        json!({
-            "task_id": clean_terminal_telemetry_text(&task_id),
-        }),
-    );
 
     Ok(())
 }
@@ -6850,19 +4246,6 @@ async fn terminal_get_parked_prompt(
             })
             .cloned()
     } {
-        emit_terminal_monitor_coordination_event(
-            &existing.coordination,
-            "terminal_parked_prompt_poll_existing",
-            &existing.pane_id,
-            existing.instance_id,
-            Some(&existing.task_id),
-            json!({
-                "reason": "existing_backend_prompt",
-                "waiting_on_count": existing.waiting_on.len(),
-                "waiting_on": existing.waiting_on.clone(),
-                "requested_instance_id": instance_id,
-            }),
-        );
         return Ok(Some(TerminalParkedPromptPayload {
             pane_id: existing.pane_id,
             instance_id: existing.instance_id,
@@ -6881,45 +4264,12 @@ async fn terminal_get_parked_prompt(
     let Some(coordination) = instance.coordination.clone() else {
         return Ok(None);
     };
-    emit_terminal_monitor_coordination_event(
-        &coordination,
-        "terminal_parked_prompt_poll_invoked",
-        &pane_id,
-        instance.id,
-        None,
-        json!({
-            "requested_instance_id": instance_id,
-            "session_id": coordination.session_id.clone(),
-            "agent_id": coordination.agent_id.clone(),
-        }),
-    );
     let snapshot = match terminal_parking_snapshot_from_kernel(&coordination) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_prompt_poll_skip",
-                &pane_id,
-                instance.id,
-                None,
-                json!({
-                    "reason": "no_snapshot",
-                    "session_id": coordination.session_id.clone(),
-                }),
-            );
             return Ok(None);
         }
         Err(error) => {
-            emit_terminal_monitor_coordination_event(
-                &coordination,
-                "terminal_parked_prompt_poll_error",
-                &pane_id,
-                instance.id,
-                None,
-                json!({
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
             return Err(error);
         }
     };
@@ -6929,41 +4279,12 @@ async fn terminal_get_parked_prompt(
     let task_status = snapshot.task_status.clone();
     let session_status = snapshot.session_status.clone();
     if snapshot.terminal {
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_prompt_poll_skip",
-            &pane_id,
-            instance.id,
-            Some(&task_id),
-            json!({
-                "reason": "task_status_is_terminal",
-                "task_status": task_status,
-                "session_status": session_status,
-                "ready": snapshot.ready,
-                "waiting_on_count": snapshot.waiting_on.len(),
-            }),
-        );
         return Ok(None);
     }
 
     let waiting_on = snapshot.waiting_on.clone();
     let ready = snapshot.ready;
     if waiting_on.is_empty() && !ready {
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_prompt_poll_skip",
-            &pane_id,
-            instance.id,
-            Some(&task_id),
-            json!({
-                "reason": "no_waiting_on_and_not_ready",
-                "task_status": task_status,
-                "session_status": session_status,
-                "ready": ready,
-                "waiting_on_count": waiting_on.len(),
-                "signature": terminal_parking_snapshot_signature(&snapshot),
-            }),
-        );
         return Ok(None);
     }
 
@@ -6989,19 +4310,6 @@ async fn terminal_get_parked_prompt(
     };
     if inserted {
         emit_terminal_parked_prompt_event(&app, &parked, "parked", Some("frontend_poll_recovered"));
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_session_parked_prompt_recovered_by_poll",
-            &pane_id,
-            instance.id,
-            Some(&task_id),
-            json!({
-                "ready": ready,
-                "task_status": task_status,
-                "session_status": session_status,
-                "waiting_on": waiting_on.clone(),
-            }),
-        );
         tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
             app.clone(),
             cloud_mcp_state.inner().clone(),
@@ -7015,19 +4323,6 @@ async fn terminal_get_parked_prompt(
             parked.prompt.clone(),
         ));
     } else {
-        emit_terminal_monitor_coordination_event(
-            &coordination,
-            "terminal_parked_prompt_poll_existing_after_race",
-            &pane_id,
-            instance.id,
-            Some(&task_id),
-            json!({
-                "ready": ready,
-                "task_status": task_status,
-                "session_status": session_status,
-                "waiting_on_count": waiting_on.len(),
-            }),
-        );
     }
 
     Ok(Some(TerminalParkedPromptPayload {
@@ -7134,17 +4429,6 @@ async fn terminal_interrupt_agent(
         emit_terminal_parked_prompt_event(&app, &parked, "interrupted", Some("escape_key"));
     }
 
-    log_terminal_event(
-        "terminal.agent_interrupted_by_escape",
-        Some(&pane_id),
-        Some(instance.id),
-        None,
-        json!({
-            "reason": clean_terminal_telemetry_text(&reason),
-            "task_id": active_task.as_ref().map(|task| clean_terminal_telemetry_text(&task.task_id)),
-        }),
-    );
-
     Ok(())
 }
 
@@ -7239,92 +4523,28 @@ async fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let resize_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.resize_terminal.start",
-        pane_id.as_deref(),
-        instance_id,
-        None,
-        json!({ "cols": cols, "rows": rows }),
-    );
-
     let size = match validate_terminal_size(cols, rows) {
         Ok(size) => size,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize_terminal.invalid_size",
-                pane_id.as_deref(),
-                instance_id,
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
     let resolved = match resolve_terminal_for_resize(&state, pane_id.clone(), instance_id).await {
         Ok(resolved) => resolved,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize_terminal.resolve_error",
-                pane_id.as_deref(),
-                instance_id,
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
     let Some((resolved_pane_id, instance)) = resolved else {
-        log_terminal_event(
-            "terminal.resize_terminal.skipped_stale",
-            pane_id.as_deref(),
-            instance_id,
-            Some(resize_started_at.elapsed()),
-            json!({ "cols": cols, "rows": rows }),
-        );
         return Ok(());
     };
 
     let resize_result = match resize_terminal_instance(&instance, size).await {
         Ok(result) => result,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize_terminal.apply_error",
-                Some(&resolved_pane_id),
-                Some(instance.id),
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
-    log_terminal_event(
-        "terminal.resize_terminal.done",
-        Some(&resolved_pane_id),
-        Some(instance.id),
-        Some(resize_started_at.elapsed()),
-        json!({
-            "applied": resize_result.applied,
-            "cols": cols,
-            "next_cols": resize_result.next_cols,
-            "next_rows": resize_result.next_rows,
-            "previous_cols": resize_result.previous_cols,
-            "previous_rows": resize_result.previous_rows,
-            "rows": rows,
-        }),
-    );
 
     Ok(())
 }
@@ -7336,95 +4556,28 @@ async fn terminal_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let resize_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.resize.start",
-        Some(&pane_id),
-        None,
-        None,
-        json!({ "cols": cols, "rows": rows }),
-    );
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
-        log_terminal_event(
-            "terminal.resize.invalid_pane",
-            Some(&pane_id),
-            None,
-            Some(resize_started_at.elapsed()),
-            json!({
-                "cols": cols,
-                "error": clean_terminal_telemetry_text(&error),
-                "rows": rows,
-            }),
-        );
         return Err(error);
     }
 
     let size = match validate_terminal_size(cols, rows) {
         Ok(size) => size,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize.invalid_size",
-                Some(&pane_id),
-                None,
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
     let instance = match get_terminal_instance(&state, &pane_id).await {
         Ok(instance) => instance,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize.resolve_error",
-                Some(&pane_id),
-                None,
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
     let resize_result = match resize_terminal_instance(&instance, size).await {
         Ok(result) => result,
         Err(error) => {
-            log_terminal_event(
-                "terminal.resize.apply_error",
-                Some(&pane_id),
-                Some(instance.id),
-                Some(resize_started_at.elapsed()),
-                json!({
-                    "cols": cols,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "rows": rows,
-                }),
-            );
             return Err(error);
         }
     };
-    log_terminal_event(
-        "terminal.resize.done",
-        Some(&pane_id),
-        Some(instance.id),
-        Some(resize_started_at.elapsed()),
-        json!({
-            "applied": resize_result.applied,
-            "cols": cols,
-            "next_cols": resize_result.next_cols,
-            "next_rows": resize_result.next_rows,
-            "previous_cols": resize_result.previous_cols,
-            "previous_rows": resize_result.previous_rows,
-            "rows": rows,
-        }),
-    );
 
     Ok(())
 }
@@ -7441,40 +4594,8 @@ async fn terminal_close(
     validate_terminal_pane_id(&pane_id)?;
     let preserve_coordination_session = preserve_coordination_session.unwrap_or(false);
     let wait_for_cleanup = wait_for_cleanup.unwrap_or(false);
-    let lifecycle_wait_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.close.lifecycle_lock_wait_start",
-        Some(&pane_id),
-        instance_id,
-        None,
-        json!({
-            "preserve_coordination_session": preserve_coordination_session,
-            "wait_for_cleanup": wait_for_cleanup,
-        }),
-    );
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
-    log_terminal_event(
-        "terminal.close.lifecycle_lock_acquired",
-        Some(&pane_id),
-        instance_id,
-        Some(lifecycle_wait_started_at.elapsed()),
-        json!({
-            "preserve_coordination_session": preserve_coordination_session,
-            "wait_for_cleanup": wait_for_cleanup,
-        }),
-    );
-    let close_started_at = Instant::now();
-    log_terminal_event(
-        "terminal.close.start",
-        Some(&pane_id),
-        instance_id,
-        None,
-        json!({
-            "preserve_coordination_session": preserve_coordination_session,
-            "wait_for_cleanup": wait_for_cleanup,
-        }),
-    );
 
     match close_terminal_session(
         &state,
@@ -7486,27 +4607,8 @@ async fn terminal_close(
     )
     .await
     {
-        Ok(closed) => {
-            log_terminal_event(
-                "terminal.close.done",
-                Some(&pane_id),
-                instance_id,
-                Some(close_started_at.elapsed()),
-                json!({
-                    "closed": closed,
-                    "preserve_coordination_session": preserve_coordination_session,
-                    "wait_for_cleanup": wait_for_cleanup,
-                }),
-            );
-        }
+        Ok(closed) => {}
         Err(error) => {
-            log_terminal_event(
-                "terminal.close.error",
-                Some(&pane_id),
-                instance_id,
-                Some(close_started_at.elapsed()),
-                json!({ "error": error }),
-            );
             return Err(error);
         }
     }
@@ -7661,7 +4763,9 @@ mod terminal_tests {
         assert!(args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") }));
-        assert!(args.iter().any(|arg| arg.contains("--coordination-mcp-proxy")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("--coordination-mcp-proxy")));
         assert!(!args.iter().any(|arg| arg.contains("--coordination-mcp''")));
         assert!(args
             .iter()

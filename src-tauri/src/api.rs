@@ -194,21 +194,8 @@ async fn update_workspace(
 #[tauri::command]
 async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let started_at = Instant::now();
-        log_terminal_event("agent.statuses.start", None, None, None, json!({}));
-
         let npm_version_handle = thread::spawn(|| {
-            let npm_started_at = Instant::now();
             let version = npm_version();
-            log_terminal_event(
-                "agent.statuses.npm_version_done",
-                None,
-                None,
-                Some(npm_started_at.elapsed()),
-                json!({
-                    "npmAvailable": version.is_some(),
-                }),
-            );
             version
         });
         let codex_package_version =
@@ -268,20 +255,6 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             codex_npm_latest_version,
             codex_npm_update_available,
         );
-        log_terminal_event(
-            "agent.status.done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "authenticated": codex_status.authenticated,
-                "installed": codex_status.installed,
-                "npmInstalled": codex_status.npm_installed,
-                "npmUpdateAvailable": codex_status.npm_update_available,
-                "provider": codex_status.id,
-            }),
-        );
-
         let claude_status = build_agent_status(
             AgentProvider::Claude,
             claude_runtime,
@@ -292,20 +265,6 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             claude_npm_latest_version,
             claude_npm_update_available,
         );
-        log_terminal_event(
-            "agent.status.done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "authenticated": claude_status.authenticated,
-                "installed": claude_status.installed,
-                "npmInstalled": claude_status.npm_installed,
-                "npmUpdateAvailable": claude_status.npm_update_available,
-                "provider": claude_status.id,
-            }),
-        );
-
         let opencode_status = build_agent_status(
             AgentProvider::OpenCode,
             opencode_runtime,
@@ -316,34 +275,7 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
             opencode_npm_latest_version,
             opencode_npm_update_available,
         );
-        log_terminal_event(
-            "agent.status.done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "authenticated": opencode_status.authenticated,
-                "installed": opencode_status.installed,
-                "npmInstalled": opencode_status.npm_installed,
-                "npmUpdateAvailable": opencode_status.npm_update_available,
-                "provider": opencode_status.id,
-            }),
-        );
-
         let statuses = vec![codex_status, claude_status, opencode_status];
-        log_terminal_event(
-            "agent.statuses.done",
-            None,
-            None,
-            Some(started_at.elapsed()),
-            json!({
-                "authenticatedCount": statuses.iter().filter(|status| status.authenticated).count(),
-                "installedCount": statuses.iter().filter(|status| status.installed).count(),
-                "statusCount": statuses.len(),
-                "updateAvailableCount": statuses.iter().filter(|status| status.npm_update_available).count(),
-            }),
-        );
-
         Ok(statuses)
     })
     .await
@@ -427,65 +359,19 @@ async fn forge_working_directory() -> Result<ForgeWorkingDirectory, String> {
 #[tauri::command]
 async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingDirectory, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let validate_started_at = Instant::now();
-
-        log_terminal_event(
-            "workspace.root.validate.start",
-            None,
-            None,
-            None,
-            json!({
-                "has_path": !path.trim().is_empty(),
-                "requested_path": clean_terminal_telemetry_text(&path),
-            }),
-        );
-
         let working_directory = match resolve_workspace_root_directory(Some(&path)) {
             Ok(working_directory) => working_directory,
             Err(error) => {
-                log_terminal_event(
-                    "workspace.root.validate.error",
-                    None,
-                    None,
-                    Some(validate_started_at.elapsed()),
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "requested_path": clean_terminal_telemetry_text(&path),
-                    }),
-                );
                 return Err(error);
             }
         };
         let agents_gitignore_update = match ensure_workspace_agents_gitignore(&working_directory) {
             Ok(update) => update,
             Err(error) => {
-                log_terminal_event(
-                    "workspace.root.agents_gitignore.error",
-                    None,
-                    None,
-                    Some(validate_started_at.elapsed()),
-                    json!({
-                        "error": clean_terminal_telemetry_text(&error),
-                        "requested_path": clean_terminal_telemetry_text(&path),
-                    }),
-                );
                 return Err(error);
             }
         };
         let resolved_directory = workspace_path_display(&working_directory);
-
-        log_terminal_event(
-            "workspace.root.validate.done",
-            None,
-            None,
-            Some(validate_started_at.elapsed()),
-            json!({
-                "requested_path": clean_terminal_telemetry_text(&path),
-                "working_directory": resolved_directory,
-                "agents_gitignore": workspace_agents_gitignore_update_label(agents_gitignore_update),
-            }),
-        );
-
         Ok(ForgeWorkingDirectory {
             working_directory: resolved_directory,
         })
