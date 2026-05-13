@@ -243,9 +243,7 @@ async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus
     ))
 }
 
-async fn cloud_mcp_connected_or_connect(
-    state: &CloudMcpState,
-) -> Result<CloudMcpStatus, String> {
+async fn cloud_mcp_connected_or_connect(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
     let current = cloud_mcp_status_snapshot(state).await;
     if current.connected {
         return Ok(current);

@@ -140,8 +140,6 @@ struct CachedIntegrationWorktree {
 #[derive(Clone)]
 struct CachedWorkspaceMcpActivation {
     response: Value,
-    config_hash: String,
-    cached_at: Instant,
 }
 
 type WorkspaceMcpActivationCache = HashMap<String, CachedWorkspaceMcpActivation>;
@@ -215,7 +213,7 @@ fn cached_workspace_mcp_activation(key: &str) -> Option<CachedWorkspaceMcpActiva
         .and_then(|cache| cache.get(key).cloned())
 }
 
-fn remember_workspace_mcp_activation(key: String, config_hash: String, response: &Value) {
+fn remember_workspace_mcp_activation(key: String, response: &Value) {
     if let Ok(mut cache) = workspace_mcp_activation_cache().lock() {
         if cache.len() > 128 {
             cache.clear();
@@ -224,8 +222,6 @@ fn remember_workspace_mcp_activation(key: String, config_hash: String, response:
             key,
             CachedWorkspaceMcpActivation {
                 response: response.clone(),
-                config_hash,
-                cached_at: Instant::now(),
             },
         );
     }
@@ -3707,7 +3703,7 @@ impl CoordinationKernel {
             "repo_mcp_path": process_path_text(&repo_mcp_path),
             "repo_codex_config_path": process_path_text(&repo_codex_path),
         });
-        remember_workspace_mcp_activation(cache_key, config_hash.clone(), &response);
+        remember_workspace_mcp_activation(cache_key, &response);
         Ok(response)
     }
 
@@ -8053,10 +8049,6 @@ impl CoordinationKernel {
         Ok(())
     }
 
-    fn repo_is_clean(&self) -> Result<bool, String> {
-        Ok(self.repo_dirty_project_files()?.is_empty())
-    }
-
     fn integration_worktree_is_clean(&self) -> Result<bool, String> {
         let integration = self.ensure_integration_worktree()?;
         Ok(self
@@ -8163,7 +8155,7 @@ impl CoordinationKernel {
                 Some(entry) if entry.cached_at.elapsed() <= INTEGRATION_WORKTREE_CACHE_TTL => {
                     Some(entry.clone())
                 }
-                Some(entry) => {
+                Some(_) => {
                     guard.remove(&cache_key);
                     None
                 }

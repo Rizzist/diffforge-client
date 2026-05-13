@@ -373,7 +373,10 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     report
 }
 
-fn interrupt_terminal_coordination_session(coordination: &TerminalCoordinationSession, reason: &str) {
+fn interrupt_terminal_coordination_session(
+    coordination: &TerminalCoordinationSession,
+    reason: &str,
+) {
     let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
@@ -494,12 +497,11 @@ fn interrupt_terminal_coordination_after_process_cleanup(
 fn cleanup_terminal_instance_with_context(
     instance: TerminalInstance,
     kill_first: bool,
-    pane_id: Option<String>,
     reason: &'static str,
     coordination_cleanup_mode: TerminalCoordinationCleanupMode,
 ) {
     let TerminalInstance {
-        id: instance_id,
+        id: _,
         child,
         master,
         writer,
@@ -510,14 +512,6 @@ fn cleanup_terminal_instance_with_context(
         active_task,
         coordination,
     } = instance;
-
-    if let Some(coordination) = coordination.as_ref() {
-        match coordination_cleanup_mode {
-            TerminalCoordinationCleanupMode::InterruptAfterProcess => {}
-            TerminalCoordinationCleanupMode::Preserve => {}
-            TerminalCoordinationCleanupMode::DeferToShutdownBatch => {}
-        }
-    }
 
     let maybe_child = {
         let mut child = child.blocking_lock();
@@ -569,7 +563,6 @@ fn cleanup_terminal_instance_with_context(
 fn cleanup_terminal_instance_async(
     instance: TerminalInstance,
     kill_first: bool,
-    pane_id: Option<String>,
     reason: &'static str,
     preserve_coordination_session: bool,
 ) {
@@ -582,7 +575,6 @@ fn cleanup_terminal_instance_async(
         cleanup_terminal_instance_with_context(
             instance,
             kill_first,
-            pane_id,
             reason,
             coordination_cleanup_mode,
         );
@@ -661,22 +653,8 @@ fn forget_workspace_git_bootstrap_flight(key: &str, id: u64) {
     }
 }
 
-fn workspace_git_bootstrap_fields(bootstrap: &WorkspaceGitBootstrap, cached: bool) -> Value {
-    json!({
-        "repoPath": bootstrap.repo_path,
-        "branch": bootstrap.branch,
-        "headSha": bootstrap.head_sha,
-        "initializedRepo": bootstrap.initialized_repo,
-        "createdInitialCommit": bootstrap.created_initial_commit,
-        "gitignoreUpdate": bootstrap.gitignore_update,
-        "cached": cached,
-    })
-}
-
 async fn ensure_workspace_git_bootstrap_for_terminal(
     root: &Path,
-    pane_id: &str,
-    instance_id: Option<u64>,
 ) -> Result<WorkspaceGitBootstrap, String> {
     if let Some(bootstrap) = cached_workspace_git_bootstrap(root) {
         return Ok(bootstrap);
@@ -684,13 +662,12 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
 
     let key = workspace_git_bootstrap_cache_key(root);
     let root_for_flight = root.to_path_buf();
-    let flight_started_at = Instant::now();
-    let (flight_id, flight, role) = {
+    let (flight_id, flight) = {
         let mut flights = workspace_git_bootstrap_flights()
             .lock()
             .map_err(|_| "Unable to lock workspace Git bootstrap flight registry.".to_string())?;
         if let Some(existing) = flights.get(&key).cloned() {
-            (existing.id, existing.future, "waiter")
+            (existing.id, existing.future)
         } else {
             let id = WORKSPACE_GIT_BOOTSTRAP_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
             let future = async move {
@@ -714,7 +691,7 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
                     future: future.clone(),
                 },
             );
-            (id, future, "leader")
+            (id, future)
         }
     };
 
@@ -724,15 +701,6 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
     match result {
         Ok(bootstrap) => {
             remember_workspace_git_bootstrap(root, &bootstrap);
-            let mut fields = workspace_git_bootstrap_fields(&bootstrap, false);
-            if let Some(object) = fields.as_object_mut() {
-                object.insert("flightId".to_string(), json!(flight_id));
-                object.insert("singleflightRole".to_string(), json!(role));
-                object.insert(
-                    "singleflightWaitMs".to_string(),
-                    json!(flight_started_at.elapsed().as_secs_f64() * 1000.0),
-                );
-            }
             Ok(bootstrap)
         }
         Err(error) => Err(format!(
@@ -743,7 +711,6 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
 
 async fn prepare_terminal_coordination_launch(
     pane_id: String,
-    instance_id: Option<u64>,
     working_directory: PathBuf,
     kind: String,
     provider_for_coordination: Option<String>,
@@ -761,7 +728,7 @@ async fn prepare_terminal_coordination_launch(
 > {
     let log_pane_id = pane_id.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        let (coordination_kernel, kernel_open_mode) =
+        let (coordination_kernel, _) =
             match crate::coordination::CoordinationKernel::open_for_terminal_launch(
                 &working_directory,
                 None,
@@ -959,13 +926,7 @@ fn spawn_terminal_reader(
                     .await;
                 });
                 let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
-                cleanup_terminal_instance_async(
-                    instance,
-                    false,
-                    Some(cleanup_pane_id.clone()),
-                    "reader_exit",
-                    false,
-                );
+                cleanup_terminal_instance_async(instance, false, "reader_exit", false);
             }
 
             let _ = cleanup_app.emit(
@@ -1010,7 +971,6 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
-        let cleanup_pane_id = pane_id.to_string();
         if let Some(cloud_mcp_state) = cloud_mcp_state {
             let notify_state = cloud_mcp_state.clone();
             let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
@@ -1029,7 +989,6 @@ async fn close_terminal_session(
                 let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
             }
         }
-        let cleanup_task_pane_id = cleanup_pane_id.clone();
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
             let coordination_cleanup_mode = if preserve_coordination_session {
                 TerminalCoordinationCleanupMode::Preserve
@@ -1039,7 +998,6 @@ async fn close_terminal_session(
             cleanup_terminal_instance_with_context(
                 instance,
                 true,
-                Some(cleanup_task_pane_id),
                 "terminal_close",
                 coordination_cleanup_mode,
             );
@@ -1127,7 +1085,6 @@ async fn close_all_terminal_sessions(
                 cleanup_terminal_instance_with_context(
                     instance,
                     true,
-                    Some(pane_id.clone()),
                     "close_all",
                     TerminalCoordinationCleanupMode::DeferToShutdownBatch,
                 );
@@ -1343,16 +1300,10 @@ async fn terminal_open(
     };
     if plain_shell {
     } else if !is_prewarm_pty {
-        ensure_workspace_git_bootstrap_for_terminal(
-            &working_directory,
-            &pane_id,
-            request.instance_id,
-        )
-        .await?;
+        ensure_workspace_git_bootstrap_for_terminal(&working_directory).await?;
 
         let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
             pane_id.clone(),
-            request.instance_id,
             working_directory.clone(),
             kind.clone(),
             provider_for_coordination.clone(),
@@ -1451,7 +1402,6 @@ async fn terminal_open(
         cleanup_terminal_instance_async(
             displaced_instance,
             true,
-            Some(pane_id.clone()),
             "terminal_open_displaced",
             preserve_coordination_session,
         );
@@ -1476,7 +1426,6 @@ async fn terminal_open(
                 pane_id.clone(),
                 instance_id,
                 coordination,
-                "terminal_open",
             );
         }
     }
@@ -1711,7 +1660,6 @@ async fn terminal_start_agent(
             pane_id.clone(),
             instance.id,
             coordination,
-            "terminal_start_agent",
         );
     }
 
@@ -1727,7 +1675,6 @@ async fn start_terminal_agent_in_prepared_pty(
 ) -> TerminalStartAgentPaneResult {
     let pane_id = request.pane_id;
     let instance_id = request.instance_id;
-    let workspace_id = request.workspace_id;
 
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
         return TerminalStartAgentPaneResult {
@@ -1877,7 +1824,6 @@ async fn start_terminal_agent_in_prepared_pty(
                         pane_id.clone(),
                         instance.id,
                         coordination,
-                        "terminal_start_agent_many",
                     );
                 }
                 return TerminalStartAgentPaneResult {
@@ -2855,7 +2801,6 @@ fn spawn_terminal_session_parking_monitor(
     pane_id: String,
     instance_id: u64,
     coordination: TerminalCoordinationSession,
-    source: &'static str,
 ) {
     tauri::async_runtime::spawn(terminal_monitor_session_parking(
         app,
@@ -2988,8 +2933,6 @@ Original request:\n{prompt}\r"
 fn terminal_prepare_coordination_task_for_prompt(
     coordination: &TerminalCoordinationSession,
     prompt: &str,
-    pane_id: &str,
-    instance_id: u64,
 ) -> Result<Option<TerminalPreparedCoordinationTask>, String> {
     if terminal_prompt_is_agent_command(prompt) {
         return Ok(None);
@@ -2999,7 +2942,7 @@ fn terminal_prepare_coordination_task_for_prompt(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
     )?;
-    if let Some((task_id, title, active_lease_count)) =
+    if let Some((task_id, title, _)) =
         terminal_existing_session_task_with_active_leases(&kernel, coordination)?
     {
         terminal_attach_session_to_reused_task(&kernel, coordination, &task_id)?;
@@ -3175,7 +3118,7 @@ async fn terminal_resume_parked_prompt_when_ready(
         }
         {
             let mut writer = instance.writer.lock().await;
-            if let Err(error) = writer.write_all(resume_request.as_bytes()) {
+            if writer.write_all(resume_request.as_bytes()).is_err() {
                 if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                     mark_terminal_parked_prompt_lifecycle_in_cloud(
                         &cloud_mcp_state,
@@ -3193,7 +3136,7 @@ async fn terminal_resume_parked_prompt_when_ready(
                 }
                 return;
             }
-            if let Err(error) = writer.flush() {
+            if writer.flush().is_err() {
                 if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                     mark_terminal_parked_prompt_lifecycle_in_cloud(
                         &cloud_mcp_state,
@@ -3217,7 +3160,10 @@ async fn terminal_resume_parked_prompt_when_ready(
         ))
         .await;
         let mut writer = instance.writer.lock().await;
-        if let Err(error) = writer.write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes()) {
+        if writer
+            .write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes())
+            .is_err()
+        {
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -3235,7 +3181,7 @@ async fn terminal_resume_parked_prompt_when_ready(
             }
             return;
         }
-        if let Err(error) = writer.flush() {
+        if writer.flush().is_err() {
             if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
                 mark_terminal_parked_prompt_lifecycle_in_cloud(
                     &cloud_mcp_state,
@@ -3407,7 +3353,6 @@ async fn terminal_monitor_session_parking(
                 .as_ref()
                 .is_some_and(|active| active.session_id == coordination.session_id);
             if same_session {
-                let previous_instance_id = instance_id;
                 instance_id = instance.id;
             } else {
                 return;
@@ -3423,7 +3368,7 @@ async fn terminal_monitor_session_parking(
                 }
                 continue;
             }
-            Err(error) => {
+            Err(_) => {
                 continue;
             }
         };
@@ -3437,7 +3382,6 @@ async fn terminal_monitor_session_parking(
             last_observed_task_id = Some(task_id.clone());
         }
         let title = snapshot.title.clone();
-        let task_status = snapshot.task_status.clone();
         let parked_key = terminal_parked_prompt_key(&pane_id, instance_id, &task_id);
 
         if snapshot.terminal {
@@ -3573,14 +3517,9 @@ async fn terminal_write(
         if *instance.agent_started.lock().await {
             let prepared_coordination_task =
                 if let Some(coordination) = instance.coordination.as_ref() {
-                    match terminal_prepare_coordination_task_for_prompt(
-                        coordination,
-                        &prompt,
-                        &pane_id,
-                        instance.id,
-                    ) {
+                    match terminal_prepare_coordination_task_for_prompt(coordination, &prompt) {
                         Ok(task) => task,
-                        Err(error) => None,
+                        Err(_) => None,
                     }
                 } else {
                     None
@@ -3656,7 +3595,7 @@ async fn terminal_write(
             }
             if let (
                 Some(coordination),
-                Some((task_id, title, parking_details, intent_resources, fully_parked)),
+                Some((task_id, title, parking_details, _intent_resources, fully_parked)),
             ) = (instance.coordination.clone(), parked_task)
             {
                 let waiting_on = terminal_parked_waiting_on_from_details(&parking_details);
@@ -3900,8 +3839,6 @@ async fn terminal_get_parked_prompt(
 
     let task_id = snapshot.task_id.clone();
     let title = snapshot.title.clone();
-    let task_status = snapshot.task_status.clone();
-    let session_status = snapshot.session_status.clone();
     if snapshot.terminal {
         return Ok(None);
     }
@@ -3946,7 +3883,6 @@ async fn terminal_get_parked_prompt(
             title.clone(),
             parked.prompt.clone(),
         ));
-    } else {
     }
 
     Ok(Some(TerminalParkedPromptPayload {
@@ -4056,7 +3992,10 @@ async fn terminal_interrupt_agent(
     Ok(())
 }
 
-async fn resize_terminal_instance(instance: &TerminalInstance, size: PtySize) -> Result<(), String> {
+async fn resize_terminal_instance(
+    instance: &TerminalInstance,
+    size: PtySize,
+) -> Result<(), String> {
     let mut current_size = instance.size.lock().await;
 
     if *current_size == size {
@@ -4429,8 +4368,6 @@ mod terminal_tests {
         let first = terminal_prepare_coordination_task_for_prompt(
             &coordination,
             "make an index.html entry page for icecream wishlist",
-            "pane",
-            1,
         )
         .unwrap()
         .unwrap();
@@ -4462,8 +4399,6 @@ mod terminal_tests {
         let first = terminal_prepare_coordination_task_for_prompt(
             &coordination,
             "make an index.html entry page for icecream wishlist",
-            "pane",
-            1,
         )
         .unwrap()
         .unwrap();
@@ -4490,8 +4425,6 @@ mod terminal_tests {
         let retry = terminal_prepare_coordination_task_for_prompt(
             &coordination,
             "make the index.html for my icecream page",
-            "pane",
-            1,
         )
         .unwrap()
         .unwrap();

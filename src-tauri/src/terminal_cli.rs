@@ -575,19 +575,6 @@ fn terminal_set_working_directory_input(working_directory: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn terminal_agent_start_input_in_directory(
-    command_path: &str,
-    args: &[String],
-    working_directory: &Path,
-) -> String {
-    format!(
-        "{}{}",
-        terminal_set_working_directory_input(working_directory),
-        terminal_agent_start_input(command_path, args)
-    )
-}
-
-#[cfg(windows)]
 fn terminal_agent_start_input_with_env_in_directory(
     command_path: &str,
     args: &[String],
@@ -796,19 +783,6 @@ fn terminal_set_working_directory_input(working_directory: &Path) -> String {
     let directory = working_directory.to_string_lossy();
 
     format!("cd {}\n", quote_shell_literal(&directory))
-}
-
-#[cfg(not(windows))]
-fn terminal_agent_start_input_in_directory(
-    command_path: &str,
-    args: &[String],
-    working_directory: &Path,
-) -> String {
-    format!(
-        "{}{}",
-        terminal_set_working_directory_input(working_directory),
-        terminal_agent_start_input(command_path, args)
-    )
 }
 
 #[cfg(not(windows))]

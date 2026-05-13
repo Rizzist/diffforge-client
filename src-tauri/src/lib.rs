@@ -219,11 +219,10 @@ impl Drop for TerminalState {
         };
         let warm_ptys = self.pty_pool.drain_for_shutdown();
 
-        for (pane_id, instance) in instances {
+        for (_, instance) in instances {
             cleanup_terminal_instance_with_context(
                 instance,
                 true,
-                Some(pane_id),
                 "drop_fallback",
                 TerminalCoordinationCleanupMode::InterruptAfterProcess,
             );
@@ -351,9 +350,6 @@ struct TerminalParkedPromptPayload {
 struct TerminalInputGate {
     current_line: String,
     current_line_user_touched: bool,
-    model_command_followup_pending: bool,
-    model_command_empty_submit_seen: bool,
-    control_command_bypass_submits: usize,
     ansi_escape_active: bool,
     ansi_csi_active: bool,
     ansi_osc_active: bool,
@@ -744,7 +740,6 @@ struct TerminalStartAgentRequest {
     instance_id: Option<u64>,
     provider: String,
     model: Option<String>,
-    workspace_id: Option<String>,
 }
 
 #[derive(Serialize)]
