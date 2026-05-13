@@ -181,7 +181,22 @@ function freshnessTone(value) {
 
 function isWorktreeFileNode(node) {
   if (!isFileNodeType(node?.node_type)) return false;
+  if (isLeasedFileNode(node)) return false;
   return node.file_source === "worktree" || node.provisional || node.pending_main_sync;
+}
+
+function isLeasedFileNode(node) {
+  if (!isFileNodeType(node?.node_type)) return false;
+  return node.file_source === "lease"
+    || node.file_origin === "lease"
+    || node.file_state === "lease"
+    || node.lease_state === "active";
+}
+
+function isLocalOnlyNode(node) {
+  return node?.local_only === true
+    || node?.ignored_overlay === true
+    || node?.file_source === "local_ignored";
 }
 
 function hasActiveSpecs(node) {
@@ -194,6 +209,7 @@ function isUnspecifiedStructuralNode(node) {
 
 function nodeTone(node) {
   if (isUnspecifiedStructuralNode(node)) return "#64748b";
+  if (isLeasedFileNode(node)) return "#f59e0b";
   if (isWorktreeFileNode(node)) return "#38bdf8";
   if (isWorkspaceNodeType(node?.node_type)) return "#2dd4bf";
   if (isFolderNodeType(node?.node_type)) return "#a78bfa";
@@ -231,6 +247,16 @@ function normalizeNode(raw, index = 0) {
   const provisional = booleanField(raw, "provisional", "isProvisional") || booleanField(meta, "provisional", "isProvisional");
   const pendingMainSync = booleanField(raw, "pending_main_sync", "pendingMainSync")
     || booleanField(meta, "pending_main_sync", "pendingMainSync");
+  const fileState = text(
+    field(raw, "file_state", "fileState") || field(meta, "file_state", "fileState"),
+  ).toLowerCase();
+  const leaseState = text(
+    field(raw, "lease_state", "leaseState") || field(meta, "lease_state", "leaseState"),
+  ).toLowerCase();
+  const localOnly = booleanField(raw, "local_only", "localOnly")
+    || booleanField(meta, "local_only", "localOnly");
+  const ignoredOverlay = booleanField(raw, "ignored_overlay", "ignoredOverlay")
+    || booleanField(meta, "ignored_overlay", "ignoredOverlay");
   const notificationCount = Math.max(
     0,
     Number(field(raw, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
@@ -261,6 +287,10 @@ function normalizeNode(raw, index = 0) {
     out_of_spec_count: outOfSpecCount,
     file_source: fileSource,
     file_origin: fileOrigin,
+    file_state: fileState,
+    lease_state: leaseState,
+    local_only: localOnly,
+    ignored_overlay: ignoredOverlay,
     provisional,
     pending_main_sync: pendingMainSync,
     markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
@@ -354,6 +384,52 @@ function normalizeSnapshot(snapshot) {
     edges,
     agentWork: snapshot?.agentWork || matrix?.agent_work || {},
     graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
+  };
+}
+
+function mergeLocalIgnoredOverlay(graph, overlay, enabled) {
+  if (!enabled || !overlay || typeof overlay !== "object") return graph;
+  const overlayNodes = Array.isArray(overlay.nodes) ? overlay.nodes : [];
+  if (!overlayNodes.length) return graph;
+
+  const existingPaths = new Set(graph.nodes.map((node) => text(node.path)).filter(Boolean));
+  const existingIds = new Set(graph.nodes.map((node) => node.id));
+  const localNodes = overlayNodes
+    .map((node, index) => normalizeNode(node, graph.nodes.length + index))
+    .filter((node) => node.id && !existingIds.has(node.id))
+    .filter((node) => {
+      const path = text(node.path);
+      return !path || !existingPaths.has(path);
+    });
+  if (!localNodes.length) return graph;
+
+  const root = graphRootNode(graph.nodes, graph.edges);
+  const localEdges = root
+    ? localNodes.map((node) => ({
+      id: `local-ignored-edge-${root.id}-${node.id}`,
+      from: root.id,
+      to: node.id,
+      kind: "contains",
+      metadata: {
+        source: "local_ignored_overlay",
+        visible: true,
+        containment: true,
+        local_only: true,
+        ignored_overlay: true,
+        path: node.path,
+      },
+    }))
+    : [];
+
+  return {
+    ...graph,
+    nodes: [...graph.nodes, ...localNodes],
+    edges: [...graph.edges, ...localEdges],
+    graphStats: {
+      ...graph.graphStats,
+      localIgnoredOverlayCount: localNodes.length,
+      localIgnoredOverlayCacheHit: overlay.cache_hit === true,
+    },
   };
 }
 
@@ -616,6 +692,10 @@ export default function SpecGraphWorkspaceView({
   const [error, setError] = useState("");
   const [state, setState] = useState("idle");
   const [selectedNodeId, setSelectedNodeId] = useState("");
+  const [showLocalIgnored, setShowLocalIgnored] = useState(false);
+  const [localIgnoredOverlay, setLocalIgnoredOverlay] = useState(null);
+  const [localIgnoredState, setLocalIgnoredState] = useState("idle");
+  const [localIgnoredError, setLocalIgnoredError] = useState("");
 
   const applySnapshot = useCallback((next) => {
     if (!next || typeof next !== "object") return;
@@ -623,6 +703,21 @@ export default function SpecGraphWorkspaceView({
     setError(text(next.syncError || next.sync_error));
     setState(text(next.syncState || next.sync_state, "ready"));
   }, []);
+
+  const loadLocalIgnoredOverlay = useCallback(() => {
+    if (!repoPath) return;
+    setLocalIgnoredState("loading");
+    setLocalIgnoredError("");
+    invoke("cloud_mcp_get_local_ignored_spec_graph_overlay", { repoPath })
+      .then((overlay) => {
+        setLocalIgnoredOverlay(overlay);
+        setLocalIgnoredState("ready");
+      })
+      .catch((nextError) => {
+        setLocalIgnoredError(nextError?.message || String(nextError));
+        setLocalIgnoredState("error");
+      });
+  }, [repoPath]);
 
   useEffect(() => {
     if (!repoPath) return undefined;
@@ -679,8 +774,19 @@ export default function SpecGraphWorkspaceView({
     };
   }, [applySnapshot, repoPath, workspace?.id, workspace?.name]);
 
-  const specGraph = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
+  useEffect(() => {
+    if (showLocalIgnored) loadLocalIgnoredOverlay();
+  }, [loadLocalIgnoredOverlay, showLocalIgnored]);
+
+  const baseSpecGraph = useMemo(() => normalizeSnapshot(snapshot), [snapshot]);
+  const specGraph = useMemo(
+    () => mergeLocalIgnoredOverlay(baseSpecGraph, localIgnoredOverlay, showLocalIgnored),
+    [baseSpecGraph, localIgnoredOverlay, showLocalIgnored],
+  );
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
+  const localIgnoredCount = Array.isArray(localIgnoredOverlay?.nodes)
+    ? localIgnoredOverlay.nodes.length
+    : 0;
 
   useEffect(() => {
     if (specGraph.nodes.length && !specGraph.nodes.some((node) => node.id === selectedNodeId)) {
@@ -692,6 +798,26 @@ export default function SpecGraphWorkspaceView({
   return (
     <SpecGraphSurface aria-label={`${workspace?.name || "Workspace"} Spec Graph`} data-state={state}>
       {error && <SpecGraphError>{error}</SpecGraphError>}
+      {localIgnoredError && <SpecGraphError>{localIgnoredError}</SpecGraphError>}
+
+      <SpecGraphToolbar>
+        <LocalIgnoredToggle
+          type="button"
+          data-active={showLocalIgnored ? "true" : "false"}
+          onClick={() => {
+            setShowLocalIgnored((current) => !current);
+          }}
+        >
+          {showLocalIgnored ? "Hide local ignored" : "Show local ignored"}
+        </LocalIgnoredToggle>
+        <LocalIgnoredHint>
+          {localIgnoredState === "loading"
+            ? "checking .agents cache"
+            : showLocalIgnored
+              ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
+              : "local only, not synced"}
+        </LocalIgnoredHint>
+      </SpecGraphToolbar>
 
       <SpecGraphShell>
         <SpecGraphMain>
@@ -817,6 +943,8 @@ function SpecGraphNode({ data, selected }) {
   const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
   const active = Boolean(selected || data.selected);
   const path = text(node.path);
+  const leased = isLeasedFileNode(node);
+  const worktree = isWorktreeFileNode(node);
 
   return (
     <FlowNodeCard
@@ -826,7 +954,8 @@ function SpecGraphNode({ data, selected }) {
       $kind={kind}
       $tone={tone}
       $live={liveAgentCount > 0}
-      $provisional={isWorktreeFileNode(node)}
+      $provisional={worktree}
+      $leased={leased}
       $unspecified={isUnspecifiedStructuralNode(node)}
       onClick={(event) => {
         event.stopPropagation();
@@ -846,7 +975,7 @@ function SpecGraphNode({ data, selected }) {
       ))}
       {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
       {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
-      <NodeKindLabel $kind={kind}>{isUnspecifiedStructuralNode(node) ? "no spec" : kind}</NodeKindLabel>
+      <NodeKindLabel $kind={kind}>{isUnspecifiedStructuralNode(node) ? "no spec" : leased ? "leased" : kind}</NodeKindLabel>
       <NodeTitle $kind={kind}>{node.title}</NodeTitle>
       {path && kind !== "workspace" && <NodePath>{path}</NodePath>}
     </FlowNodeCard>
@@ -871,6 +1000,8 @@ function SpecInspector({ node }) {
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
           {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}
+          {isLocalOnlyNode(node) && <span data-state="local_only">local only</span>}
+          {isLeasedFileNode(node) && <span data-state="leased">leased</span>}
           {isWorktreeFileNode(node) && <span data-state="worktree">worktree</span>}
           <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
           {(Number(node.out_of_spec_count || node.notification_count) || 0) > 0 && (
@@ -974,6 +1105,45 @@ const SpecGraphError = styled.div`
   padding: 10px;
 `;
 
+const SpecGraphToolbar = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-start;
+  min-height: 34px;
+`;
+
+const LocalIgnoredToggle = styled.button`
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.84);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  padding: 8px 12px;
+  text-transform: uppercase;
+  transition: border-color 160ms ease, color 160ms ease, transform 160ms ease;
+
+  &[data-active="true"] {
+    border-color: rgba(251, 191, 36, 0.68);
+    color: #fde68a;
+  }
+
+  &:hover {
+    border-color: rgba(251, 191, 36, 0.72);
+    color: #fef3c7;
+    transform: translateY(-1px);
+  }
+`;
+
+const LocalIgnoredHint = styled.span`
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 11px;
+  font-weight: 760;
+`;
+
 const SpecGraphShell = styled.div`
   align-items: stretch;
   display: grid;
@@ -1044,7 +1214,7 @@ const FlowFrame = styled.div`
 
 const FlowNodeCard = styled.button`
   align-items: center;
-  border: 1px solid ${({ $active, $provisional, $tone }) => ($active || $provisional ? $tone : "rgba(230, 236, 245, 0.14)")};
+  border: 1px solid ${({ $active, $leased, $provisional, $tone }) => ($active || $leased || $provisional ? $tone : "rgba(230, 236, 245, 0.14)")};
   border-radius: ${({ $kind }) => {
     if ($kind === "folder") return "12px";
     if ($kind === "file") return "9px";
@@ -1053,8 +1223,9 @@ const FlowNodeCard = styled.button`
   background:
     radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}26`}, rgba(13, 17, 23, 0.88) 62%),
     rgba(13, 17, 23, 0.94);
-  box-shadow: ${({ $active, $live, $provisional, $tone }) => {
+  box-shadow: ${({ $active, $leased, $live, $provisional, $tone }) => {
     if ($active) return `0 0 0 2px ${$tone}55, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    if ($leased) return `0 0 0 1px ${$tone}55, 0 0 26px ${$tone}22, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     if ($provisional) return `0 0 0 1px ${$tone}44, 0 0 24px ${$tone}22, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     if ($live) return `0 0 0 1px ${$tone}33, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     return "0 12px 30px rgba(0, 0, 0, 0.2)";
@@ -1067,7 +1238,7 @@ const FlowNodeCard = styled.button`
   height: 100%;
   justify-content: center;
   opacity: ${({ $unspecified }) => ($unspecified ? 0.68 : 1)};
-  outline: ${({ $provisional, $tone }) => ($provisional ? `1px dashed ${$tone}66` : "none")};
+  outline: ${({ $leased, $provisional, $tone }) => ($leased || $provisional ? `1px dashed ${$tone}66` : "none")};
   outline-offset: 4px;
   overflow: visible;
   padding: ${({ $kind }) => ($kind === "workspace" ? "20px" : "10px 12px")};

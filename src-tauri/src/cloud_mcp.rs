@@ -8,6 +8,8 @@ const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_SPEC_GRAPH_SYNC_INTERVAL_MS: u64 = 1_500;
 const CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS: u64 = 4_000;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
+const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
+const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE: &str = "local-ignored-whitelist.json";
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -328,6 +330,7 @@ fn cloud_mcp_skip_filetree_name(name: &str) -> bool {
             | ".next"
             | ".turbo"
             | ".cache"
+            | ".agents"
             | "node_modules"
             | "target"
             | "dist"
@@ -468,6 +471,9 @@ fn cloud_mcp_collect_gitignore_signatures(root: &Path) -> Vec<String> {
                 continue;
             };
             if metadata.is_dir() {
+                if cloud_mcp_skip_filetree_name(&name) {
+                    continue;
+                }
                 queue.push_back((path, depth + 1));
                 continue;
             }
@@ -503,7 +509,7 @@ fn cloud_mcp_gitignore_signature(root: &Path) -> String {
 }
 
 async fn cloud_mcp_wait_for_initial_gitignore(root: &Path) {
-    if !root.join(".git").exists() || root.join(".gitignore").exists() {
+    if root.join(".gitignore").exists() {
         return;
     }
     let started = cloud_mcp_now_ms();
@@ -524,6 +530,225 @@ fn cloud_mcp_parent_folders_for_relative_path(path: &str) -> Vec<String> {
         return Vec::new();
     }
     (1..parts.len()).map(|end| parts[..end].join("/")).collect()
+}
+
+#[derive(Clone, Debug)]
+struct CloudMcpIgnoreRule {
+    base_path: String,
+    pattern: String,
+    negated: bool,
+    directory_only: bool,
+    anchored: bool,
+    has_slash: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CloudMcpIgnoreMatcher {
+    rules: Vec<CloudMcpIgnoreRule>,
+}
+
+impl CloudMcpIgnoreMatcher {
+    fn from_root(root: &Path) -> Self {
+        let mut rules = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((root.to_path_buf(), 0usize));
+
+        while let Some((directory, depth)) = queue.pop_front() {
+            if depth > CLOUD_MCP_FILETREE_MAX_DEPTH {
+                continue;
+            }
+
+            let ignore_path = directory.join(".gitignore");
+            if let Ok(contents) = fs::read_to_string(&ignore_path) {
+                let base_path = directory
+                    .strip_prefix(root)
+                    .ok()
+                    .map(workspace_path_display)
+                    .map(|path| path.replace('\\', "/").trim_matches('/').to_string())
+                    .unwrap_or_default();
+                rules.extend(cloud_mcp_parse_gitignore_rules(&base_path, &contents));
+            }
+
+            let Ok(read_dir) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if cloud_mcp_skip_filetree_name(&name) {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() && !file_type.is_symlink() {
+                    queue.push_back((entry.path(), depth + 1));
+                }
+            }
+        }
+
+        if let Ok(contents) = fs::read_to_string(root.join(".git").join("info").join("exclude")) {
+            rules.extend(cloud_mcp_parse_gitignore_rules("", &contents));
+        }
+
+        Self { rules }
+    }
+
+    fn ignores(&self, relative_path: &str, is_dir: bool) -> bool {
+        let normalized = relative_path.replace('\\', "/");
+        let normalized = normalized.trim().trim_matches('/');
+        if normalized.is_empty() {
+            return false;
+        }
+
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matches(normalized, is_dir) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
+    }
+}
+
+impl CloudMcpIgnoreRule {
+    fn matches(&self, relative_path: &str, is_dir: bool) -> bool {
+        let path_in_base = if self.base_path.is_empty() {
+            relative_path
+        } else if let Some(rest) = relative_path.strip_prefix(&format!("{}/", self.base_path)) {
+            rest
+        } else {
+            return false;
+        };
+        if path_in_base.is_empty() {
+            return false;
+        }
+
+        if self.directory_only {
+            if is_dir && self.matches_relative(path_in_base) {
+                return true;
+            }
+            return cloud_mcp_parent_folders_for_relative_path(path_in_base)
+                .iter()
+                .any(|parent| self.matches_relative(parent));
+        }
+
+        self.matches_relative(path_in_base)
+    }
+
+    fn matches_relative(&self, path: &str) -> bool {
+        if self.has_slash || self.anchored {
+            return cloud_mcp_gitignore_glob_matches(&self.pattern, path);
+        }
+        path.split('/')
+            .any(|component| cloud_mcp_gitignore_glob_matches(&self.pattern, component))
+    }
+}
+
+fn cloud_mcp_parse_gitignore_rules(base_path: &str, contents: &str) -> Vec<CloudMcpIgnoreRule> {
+    contents
+        .lines()
+        .filter_map(|line| cloud_mcp_parse_gitignore_rule(base_path, line))
+        .collect()
+}
+
+fn cloud_mcp_parse_gitignore_rule(base_path: &str, line: &str) -> Option<CloudMcpIgnoreRule> {
+    let mut pattern = line.trim();
+    if pattern.is_empty() || pattern.starts_with('#') {
+        return None;
+    }
+
+    let mut negated = false;
+    if let Some(rest) = pattern.strip_prefix('!') {
+        negated = true;
+        pattern = rest.trim_start();
+    }
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let anchored = pattern.starts_with('/');
+    pattern = pattern.trim_start_matches('/');
+    let directory_only = pattern.ends_with('/');
+    pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let pattern = pattern.replace('\\', "/");
+    Some(CloudMcpIgnoreRule {
+        base_path: base_path.trim_matches('/').to_string(),
+        has_slash: pattern.contains('/'),
+        pattern,
+        negated,
+        directory_only,
+        anchored,
+    })
+}
+
+fn cloud_mcp_gitignore_glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = value.chars().collect::<Vec<_>>();
+    let mut memo = vec![vec![None; value.len() + 1]; pattern.len() + 1];
+
+    fn matches_from(
+        pattern: &[char],
+        value: &[char],
+        memo: &mut [Vec<Option<bool>>],
+        pattern_index: usize,
+        value_index: usize,
+    ) -> bool {
+        if let Some(result) = memo[pattern_index][value_index] {
+            return result;
+        }
+
+        let result = if pattern_index == pattern.len() {
+            value_index == value.len()
+        } else {
+            match pattern[pattern_index] {
+                '*' => {
+                    let is_double_star = pattern.get(pattern_index + 1) == Some(&'*');
+                    let next_pattern_index = pattern_index + if is_double_star { 2 } else { 1 };
+                    if matches_from(pattern, value, memo, next_pattern_index, value_index) {
+                        true
+                    } else {
+                        let mut next_value_index = value_index;
+                        let mut matched = false;
+                        while next_value_index < value.len()
+                            && (is_double_star || value[next_value_index] != '/')
+                        {
+                            next_value_index += 1;
+                            if matches_from(
+                                pattern,
+                                value,
+                                memo,
+                                next_pattern_index,
+                                next_value_index,
+                            ) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        matched
+                    }
+                }
+                '?' => {
+                    value_index < value.len()
+                        && value[value_index] != '/'
+                        && matches_from(pattern, value, memo, pattern_index + 1, value_index + 1)
+                }
+                expected => {
+                    value_index < value.len()
+                        && expected == value[value_index]
+                        && matches_from(pattern, value, memo, pattern_index + 1, value_index + 1)
+                }
+            }
+        };
+
+        memo[pattern_index][value_index] = Some(result);
+        result
+    }
+
+    matches_from(&pattern, &value, &mut memo, 0, 0)
 }
 
 fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
@@ -605,6 +830,7 @@ fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
         return filetree;
     }
 
+    let ignore_matcher = CloudMcpIgnoreMatcher::from_root(root);
     let mut entries = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back((root.to_path_buf(), 0usize));
@@ -648,6 +874,13 @@ fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
                 .unwrap_or(path.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
+            let Some(relative_path) = cloud_mcp_normalized_git_path(relative_path.as_bytes())
+            else {
+                continue;
+            };
+            if ignore_matcher.ignores(&relative_path, file_type.is_dir()) {
+                continue;
+            }
 
             if file_type.is_dir() {
                 entries.push(CloudMcpFileEntry {
@@ -1101,6 +1334,7 @@ async fn cloud_mcp_push_filetree_snapshot(
         "reason": reason,
         "filetree": filetree,
         "filetree_truncated": filetree_truncated,
+        "filetree_authoritative": true,
         "ts_ms": cloud_mcp_now_ms(),
     });
     cloud_mcp_post_event_endpoint(state, "filetree_snapshot", &payload).await
@@ -1209,6 +1443,8 @@ fn cloud_mcp_terminal_claimed_paths(
                 "path": path,
                 "mode": mode,
                 "reason": reason,
+                "lease_state": "active",
+                "file_state": "lease",
             }))
         }) {
             Ok(rows) => rows,
@@ -1834,6 +2070,10 @@ fn cloud_mcp_lifecycle_status_releases_lane(status: &str) -> bool {
     !matches!(status, "starting" | "active" | "busy")
 }
 
+fn cloud_mcp_lifecycle_status_resyncs_main_filetree(status: &str) -> bool {
+    matches!(status, "cancelled" | "interrupted")
+}
+
 pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     state: &CloudMcpState,
     pane_id: &str,
@@ -1859,16 +2099,23 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     } else {
         Vec::new()
     };
-    let should_sync_filetree = matches!(status, "done" | "merged" | "completed")
+    let should_sync_main_filetree = cloud_mcp_lifecycle_status_resyncs_main_filetree(status);
+    let should_sync_filetree = should_sync_main_filetree
+        || matches!(status, "done" | "merged" | "completed")
         || (status == "review" && !lifecycle_changed_files.is_empty());
     if should_sync_filetree {
+        let sync_reason = if should_sync_main_filetree {
+            "terminal_task_stopped_main_repo_resync"
+        } else {
+            "terminal_work_filetree_update"
+        };
         if let Err(error) = cloud_mcp_push_current_filetree_snapshot(
             state,
             &repo_id,
             &repo_root,
             None,
             None,
-            "terminal_work_filetree_update",
+            sync_reason,
         )
         .await
         {
@@ -2775,6 +3022,201 @@ fn cloud_mcp_spec_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
     cloud_mcp_spec_graph_cache_dir(root).join(format!("{repo_id}.json"))
 }
 
+fn cloud_mcp_local_ignored_overlay_cache_path(root: &Path) -> PathBuf {
+    cloud_mcp_spec_graph_cache_dir(root).join(CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE)
+}
+
+fn cloud_mcp_local_ignored_whitelist_candidates(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for relative_path in [
+        "AGENTS.md",
+        "agents.md",
+        "CLAUDE.md",
+        "claude.md",
+        ".mcp.json",
+        ".gitignore",
+        ".agents",
+        ".codex",
+    ] {
+        let path = root.join(relative_path);
+        if !path.exists() {
+            continue;
+        }
+        let normalized = relative_path.to_ascii_lowercase();
+        if seen.insert(normalized) {
+            candidates.push((relative_path.to_string(), path));
+        }
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates
+}
+
+fn cloud_mcp_local_ignored_entry_signature(relative_path: &str, path: &Path) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    let kind = if metadata.is_dir() {
+        "folder"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        return None;
+    };
+    Some(json!({
+        "path": relative_path,
+        "kind": kind,
+        "size": metadata.is_file().then_some(metadata.len()),
+        "modified_ms": metadata.is_file().then(|| cloud_mcp_modified_ms(&metadata)).flatten(),
+    }))
+}
+
+fn cloud_mcp_local_ignored_title(relative_path: &str) -> String {
+    Path::new(relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(relative_path)
+        .to_string()
+}
+
+fn cloud_mcp_local_ignored_summary(relative_path: &str, kind: &str) -> String {
+    match relative_path {
+        ".gitignore" => "Local git ignore rules file.".to_string(),
+        ".mcp.json" => "Local MCP configuration file.".to_string(),
+        ".agents" => "Local Diff Forge agent cache and coordination folder.".to_string(),
+        ".codex" => "Local Codex configuration folder.".to_string(),
+        "AGENTS.md" | "agents.md" => "Local agent instructions document.".to_string(),
+        "CLAUDE.md" | "claude.md" => "Local Claude instructions document.".to_string(),
+        _ if kind == "folder" => format!("Local ignored folder `{relative_path}`."),
+        _ => format!("Local ignored file `{relative_path}`."),
+    }
+}
+
+fn cloud_mcp_local_ignored_overlay_node(
+    repo_id: &str,
+    relative_path: &str,
+    path: &Path,
+) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    let kind = if metadata.is_dir() {
+        "folder"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        return None;
+    };
+    let title = cloud_mcp_local_ignored_title(relative_path);
+    let summary = cloud_mcp_local_ignored_summary(relative_path, kind);
+    let id = format!(
+        "local-ignored-{}",
+        cloud_mcp_short_hash(&format!("{repo_id}:{relative_path}"))
+    );
+    Some(json!({
+        "id": id,
+        "repo_id": repo_id,
+        "node_type": kind,
+        "title": title,
+        "summary": summary,
+        "purpose": summary,
+        "path": relative_path,
+        "freshness_state": "no_spec",
+        "spec_state": "no_spec",
+        "file_source": "local_ignored",
+        "file_origin": "local",
+        "local_only": true,
+        "ignored_overlay": true,
+        "provisional": false,
+        "pending_main_sync": false,
+        "active_agent_count": 0,
+        "active_agents": [],
+        "active_specs": [],
+        "superseded_specs": [],
+        "specs": [],
+        "metadata": {
+            "path": relative_path,
+            "source": "local_ignored",
+            "origin": "local",
+            "local_only": true,
+            "ignored_overlay": true,
+            "whitelisted_ignored_path": true,
+            "kind": kind,
+            "size": metadata.is_file().then_some(metadata.len()),
+            "modified_ms": metadata.is_file().then(|| cloud_mcp_modified_ms(&metadata)).flatten(),
+        },
+    }))
+}
+
+fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value, String> {
+    let repo_id = cloud_mcp_repo_id_for_root(root);
+    let root_display = workspace_path_display(root);
+    let cache_path = cloud_mcp_local_ignored_overlay_cache_path(root);
+    let candidates = cloud_mcp_local_ignored_whitelist_candidates(root);
+    let signatures = candidates
+        .iter()
+        .filter_map(|(relative_path, path)| {
+            cloud_mcp_local_ignored_entry_signature(relative_path, path)
+        })
+        .collect::<Vec<_>>();
+    let cache_key = cloud_mcp_short_hash(
+        &json!({
+            "version": CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION,
+            "repo_id": repo_id,
+            "root": root_display,
+            "signatures": signatures,
+        })
+        .to_string(),
+    );
+
+    if let Some(mut cached) = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .filter(|cached| cached["cache_key"].as_str() == Some(cache_key.as_str()))
+    {
+        if let Some(object) = cached.as_object_mut() {
+            object.insert("cache_hit".to_string(), json!(true));
+            object.insert("cache_path".to_string(), json!(workspace_path_display(&cache_path)));
+        }
+        return Ok(cached);
+    }
+
+    let nodes = candidates
+        .iter()
+        .filter_map(|(relative_path, path)| {
+            cloud_mcp_local_ignored_overlay_node(&repo_id, relative_path, path)
+        })
+        .collect::<Vec<_>>();
+    let overlay = json!({
+        "ok": true,
+        "source": "rust-diffforge-local-ignored-overlay",
+        "local_only": true,
+        "cache_hit": false,
+        "cache_key": cache_key,
+        "cache_path": workspace_path_display(&cache_path),
+        "repo_id": repo_id,
+        "repo_path": root_display,
+        "allowed_paths": ["AGENTS.md", "CLAUDE.md", ".mcp.json", ".gitignore", ".agents", ".codex"],
+        "nodes": nodes,
+        "edges": [],
+        "updated_at_ms": cloud_mcp_now_ms(),
+    });
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create local ignored Spec Graph cache directory {}: {error}",
+                workspace_path_display(parent)
+            )
+        })?;
+    }
+    let body = serde_json::to_vec_pretty(&overlay)
+        .map_err(|error| format!("Unable to encode local ignored Spec Graph overlay: {error}"))?;
+    fs::write(&cache_path, body).map_err(|error| {
+        format!(
+            "Unable to write local ignored Spec Graph overlay cache {}: {error}",
+            workspace_path_display(&cache_path)
+        )
+    })?;
+    Ok(overlay)
+}
+
 fn cloud_mcp_spec_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
     json!({
         "kind": "project_spec_graph",
@@ -3281,13 +3723,18 @@ async fn cloud_mcp_spec_graph_sync_loop(
                     cloud_mcp_wait_for_initial_gitignore(&req.root).await;
                 }
                 let current_signature = cloud_mcp_gitignore_signature(&req.root);
+                let reason = if first_sync {
+                    "spec_graph_first_sync"
+                } else {
+                    "spec_graph_filetree_resync"
+                };
                 cloud_mcp_push_current_filetree_snapshot(
                     &state,
                     &req.repo_id,
                     &req.root,
                     req.workspace_id.as_deref(),
                     req.workspace_name.as_deref(),
-                    "spec_graph_first_sync",
+                    reason,
                 )
                 .await?;
                 last_gitignore_signature = current_signature;
@@ -3331,6 +3778,18 @@ async fn cloud_mcp_get_cached_spec_graph(
     Ok(cloud_mcp_read_spec_graph_cache_preserving_state(
         &req, "empty", "",
     ))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_local_ignored_spec_graph_overlay(repo_path: String) -> Result<Value, String> {
+    let root = resolve_workspace_root_directory(Some(&repo_path))
+        .unwrap_or_else(|_| PathBuf::from(&repo_path));
+    let root = workspace_path_for_process(&root);
+    tauri::async_runtime::spawn_blocking(move || {
+        cloud_mcp_build_local_ignored_spec_graph_overlay(&root)
+    })
+    .await
+    .map_err(|error| format!("Unable to scan local ignored Spec Graph overlay: {error}"))?
 }
 
 #[tauri::command]
@@ -3534,6 +3993,133 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod cloud_mcp_tests {
     use super::*;
+
+    #[test]
+    fn stopped_terminal_lifecycle_resyncs_main_filetree() {
+        assert!(cloud_mcp_lifecycle_status_resyncs_main_filetree(
+            "cancelled"
+        ));
+        assert!(cloud_mcp_lifecycle_status_resyncs_main_filetree(
+            "interrupted"
+        ));
+        assert!(!cloud_mcp_lifecycle_status_resyncs_main_filetree("review"));
+        assert!(!cloud_mcp_lifecycle_status_resyncs_main_filetree("done"));
+        assert!(!cloud_mcp_lifecycle_status_resyncs_main_filetree("active"));
+    }
+
+    #[test]
+    fn local_ignored_overlay_only_returns_whitelisted_paths() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-local-ignored-overlay-{suffix}"));
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".gitignore"), "*\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "agent instructions\n").unwrap();
+        fs::write(root.join("CLAUDE.md"), "claude instructions\n").unwrap();
+        fs::write(root.join(".mcp.json"), "{}\n").unwrap();
+        fs::write(root.join("ignored.log"), "nope\n").unwrap();
+
+        let first = cloud_mcp_build_local_ignored_spec_graph_overlay(&root).unwrap();
+        let first_paths = first["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|node| node["path"].as_str().map(str::to_string))
+            .collect::<HashSet<_>>();
+        assert_eq!(first["local_only"].as_bool(), Some(true));
+        assert_eq!(first["cache_hit"].as_bool(), Some(false));
+        assert!(first["cache_path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".agents/spec-graph"));
+        for allowed in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".mcp.json",
+            ".gitignore",
+            ".agents",
+            ".codex",
+        ] {
+            assert!(first_paths.contains(allowed), "missing {allowed}");
+        }
+        assert!(!first_paths.contains("ignored.log"));
+
+        let second = cloud_mcp_build_local_ignored_spec_graph_overlay(&root).unwrap();
+        assert_eq!(second["cache_hit"].as_bool(), Some(true));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloud_mcp_filetree_fallback_respects_gitignore_without_git_repo() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-no-git-{suffix}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "logs/\n.codex/\n.mcp.json\nignored.log\n",
+        )
+        .unwrap();
+        fs::write(root.join("src").join("app.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("README.md"), "# visible\n").unwrap();
+        fs::write(root.join("logs").join("events.jsonl"), "{}\n").unwrap();
+        fs::write(root.join(".codex").join("config.toml"), "model = 'x'\n").unwrap();
+        fs::write(root.join(".agents").join("cache.json"), "{}\n").unwrap();
+        fs::write(root.join(".mcp.json"), "{}\n").unwrap();
+        fs::write(root.join("ignored.log"), "ignored\n").unwrap();
+
+        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
+        let paths = entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(!truncated);
+        assert!(paths.contains("src"));
+        assert!(paths.contains("src/app.rs"));
+        assert!(paths.contains("README.md"));
+        assert!(!paths.contains(".gitignore"));
+        assert!(!paths.contains("logs"));
+        assert!(!paths.contains("logs/events.jsonl"));
+        assert!(!paths.contains(".codex"));
+        assert!(!paths.contains(".codex/config.toml"));
+        assert!(!paths.contains(".agents"));
+        assert!(!paths.contains(".agents/cache.json"));
+        assert!(!paths.contains(".mcp.json"));
+        assert!(!paths.contains("ignored.log"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloud_mcp_filetree_fallback_all_ignored_can_be_empty() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-empty-{suffix}"));
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join(".gitignore"), "*\n").unwrap();
+        fs::write(root.join("logs").join("events.jsonl"), "{}\n").unwrap();
+        fs::write(root.join("CLAUDE.md"), "ignored locally\n").unwrap();
+
+        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
+
+        assert!(!truncated);
+        assert!(entries.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cloud_mcp_filetree_uses_git_visible_paths() {
@@ -3932,6 +4518,233 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     }
 }
 
+fn cloud_mcp_proxy_push_current_filetree_snapshot(
+    base_url: &str,
+    repo_id: &str,
+    workspace_root: &Path,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    reason: &str,
+) -> Result<Value, String> {
+    let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(workspace_root);
+    let payload = json!({
+        "source": "rust-diffforge-filetree",
+        "repo_id": repo_id,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "workspace_root": workspace_path_display(workspace_root),
+        "reason": reason,
+        "filetree": filetree,
+        "filetree_truncated": filetree_truncated,
+        "filetree_authoritative": true,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let request = json!({
+        "event_kind": "filetree_snapshot",
+        "payload": payload,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response = cloud_mcp_proxy_post_json_endpoint(base_url, "/v1/events", &request.to_string())?;
+    Ok(serde_json::from_str::<Value>(&response).unwrap_or_else(|_| json!({"raw_response": response})))
+}
+
+fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> {
+    let trimmed = resource_key.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("glob:")
+        || trimmed.starts_with("route:")
+        || trimmed.starts_with("db:")
+    {
+        return None;
+    }
+    let path = trimmed.strip_prefix("file:").unwrap_or(trimmed);
+    cloud_mcp_normalized_git_path(path.as_bytes())
+}
+
+pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    worktree_id: Option<&str>,
+    worktree_path: Option<&str>,
+    resource_key: &str,
+    mode: &str,
+    reason: Option<&str>,
+    acquire_result: &Value,
+) -> Result<Value, String> {
+    if acquire_result["ok"].as_bool() != Some(true) {
+        return Ok(json!({"skipped": true, "reason": "lease_not_acquired"}));
+    }
+    let Some(path) = cloud_mcp_lease_path_from_resource_key(resource_key) else {
+        return Ok(json!({"skipped": true, "reason": "non_file_resource"}));
+    };
+    let repo_path_text = repo_path
+        .or(worktree_path)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = cloud_mcp_base_url();
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let data = acquire_result.get("data").unwrap_or(&Value::Null);
+    let lease_id = data["lease_id"]
+        .as_str()
+        .or_else(|| data["lease"]["id"].as_str());
+    let reason_text = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Lease acquired for local agent work.");
+    let lease_scope = json!({
+        "resource_key": resource_key,
+        "path": path,
+        "mode": mode,
+        "reason": reason_text,
+        "lease_id": lease_id,
+        "lease_state": "active",
+        "file_state": "lease",
+    });
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.acquire_lease"),
+    );
+    metadata.insert("resource_key".to_string(), json!(resource_key));
+    metadata.insert("path".to_string(), json!(path));
+    metadata.insert("mode".to_string(), json!(mode));
+    metadata.insert("lease_state".to_string(), json!("active"));
+    metadata.insert("file_state".to_string(), json!("lease"));
+    metadata.insert("local_lease_file_evidence".to_string(), json!(true));
+    metadata.insert("local_active_leases".to_string(), json!([lease_scope.clone()]));
+    metadata.insert("acquire_result".to_string(), acquire_result.clone());
+    if let Some(lease_id) = lease_id {
+        metadata.insert("lease_id".to_string(), json!(lease_id));
+    }
+    if let Some(task_id) = task_id {
+        metadata.insert("cloud_task_id".to_string(), json!(task_id));
+        metadata.insert("coordination_task_id".to_string(), json!(task_id));
+        metadata.insert("local_coordination_task_id".to_string(), json!(task_id));
+    }
+    if let Some(worktree_id) = worktree_id {
+        metadata.insert("worktree_id".to_string(), json!(worktree_id));
+    }
+    if let Some(worktree_path) = worktree_path {
+        metadata.insert("worktree_path".to_string(), json!(worktree_path));
+    }
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-agent-acquire-lease"),
+    );
+    arguments.insert(
+        "spec_source".to_string(),
+        json!("rust_terminal_lease_scope"),
+    );
+    arguments.insert("record_spec_activity".to_string(), json!(true));
+    arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
+    arguments.insert("status".to_string(), json!("active"));
+    arguments.insert("task_status".to_string(), json!("active"));
+    arguments.insert("current_prompt".to_string(), json!(reason_text));
+    arguments.insert("progress_summary".to_string(), json!(reason_text));
+    arguments.insert("summary".to_string(), json!(reason_text));
+    arguments.insert("claimed_paths".to_string(), json!([lease_scope]));
+    arguments.insert("metadata".to_string(), Value::Object(metadata));
+    if let Some(repo_id) = identity.repo_id.as_deref() {
+        arguments.insert("repo_id".to_string(), json!(repo_id));
+    }
+    if let Some(repo_path) = identity.repo_path.as_ref() {
+        let repo_path = repo_path.to_string_lossy().to_string();
+        arguments.insert("repo_path".to_string(), json!(repo_path.clone()));
+        arguments.insert("workspace_root".to_string(), json!(repo_path));
+    }
+    if let Some(workspace_id) = identity.workspace_id.as_deref() {
+        arguments.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    if let Some(agent_id) = identity.cloud_agent_id() {
+        arguments.insert("agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("self_agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("current_agent_id".to_string(), json!(agent_id));
+    }
+    if let Some(session_id) = identity.session_id.as_deref() {
+        arguments.insert("session_id".to_string(), json!(session_id));
+    }
+    if let Some(task_id) = task_id.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("task_id".to_string(), json!(task_id));
+        arguments.insert("run_id".to_string(), json!(task_id));
+    }
+
+    let request = json!({
+        "event_kind": "agent_heartbeat",
+        "payload": Value::Object(arguments),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    identity.log(
+        "cloud_mcp.agent_acquire_lease.start",
+        "acquire_lease",
+        json!({
+            "activity": "agent acquire_lease",
+            "baseUrl": base_url,
+            "resourceKey": resource_key,
+            "path": path,
+            "taskId": task_id,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
+        Ok(response) => {
+            identity.log(
+                "cloud_mcp.agent_acquire_lease.done",
+                "acquire_lease",
+                json!({
+                    "activity": "agent acquire_lease synced",
+                    "baseUrl": base_url,
+                }),
+            );
+            Ok(serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response})))
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.agent_acquire_lease.error",
+                "acquire_lease",
+                json!({
+                    "activity": "agent acquire_lease sync failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     repo_path: Option<&str>,
     db_path: Option<&Path>,
@@ -3946,6 +4759,10 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     local_task_status: Option<&str>,
     submit_result: &Value,
 ) -> Result<Value, String> {
+    let main_repo_path = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     let repo_path_text = repo_path
         .or(worktree_path)
         .map(str::trim)
@@ -4085,16 +4902,44 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     );
     match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
         Ok(response) => {
+            let filetree_sync = if ok
+                && (auto_merge_status == "applied"
+                    || matches!(task_status.as_str(), "merged" | "done" | "completed"))
+            {
+                if let (Some(repo_id), Some(repo_path)) =
+                    (identity.repo_id.as_deref(), main_repo_path.as_ref())
+                {
+                    match cloud_mcp_proxy_push_current_filetree_snapshot(
+                        &base_url,
+                        repo_id,
+                        repo_path,
+                        identity.workspace_id.as_deref(),
+                        identity.workspace_name.as_deref(),
+                        "submit_patch_main_repo_resync",
+                    ) {
+                        Ok(response) => json!({"ok": true, "response": response}),
+                        Err(error) => json!({"ok": false, "error": error}),
+                    }
+                } else {
+                    json!({"ok": false, "error": "missing_repo_for_filetree_resync"})
+                }
+            } else {
+                json!({"ok": false, "skipped": true, "reason": "patch_not_applied_to_main"})
+            };
             identity.log(
                 "cloud_mcp.agent_submit_patch.done",
                 "submit_patch",
                 json!({
                     "activity": "agent submit_patch synced",
                     "baseUrl": base_url,
+                    "filetreeSync": filetree_sync,
                 }),
             );
-            let parsed = serde_json::from_str::<Value>(&response)
+            let mut parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
+            if let Some(object) = parsed.as_object_mut() {
+                object.insert("filetree_sync".to_string(), filetree_sync);
+            }
             Ok(parsed)
         }
         Err(error) => {
@@ -4655,6 +5500,7 @@ fn cloud_mcp_proxy_active_leases_for_session(
             "mode": mode,
             "reason": reason,
             "lease_state": "active",
+            "file_state": "lease",
         }))
     }) {
         Ok(rows) => rows,

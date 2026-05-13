@@ -1028,15 +1028,7 @@ fn dispatch_tool_result(
     apply_live_session_defaults(&kernel, &mut input);
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
-        "acquire_lease" => kernel.acquire_lease(
-            req(&input, "task_id")?,
-            req(&input, "agent_id")?,
-            req(&input, "session_id")?,
-            req(&input, "resource_key")?,
-            input["mode"].as_str().unwrap_or("write"),
-            input["ttl_seconds"].as_i64(),
-            input["reason"].as_str(),
-        ),
+        "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "submit_patch" => kernel_submit_patch(&kernel, &input),
         _ => Ok(api_error(
@@ -1141,6 +1133,71 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         }
     }
     Ok(api_ok(data))
+}
+
+fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let task_id = req(input, "task_id")?;
+    let agent_id = req(input, "agent_id")?;
+    let session_id = req(input, "session_id")?;
+    let resource_key = req(input, "resource_key")?;
+    let mode = input["mode"].as_str().unwrap_or("write");
+    let acquired = kernel.acquire_lease(
+        task_id,
+        agent_id,
+        session_id,
+        resource_key,
+        mode,
+        input["ttl_seconds"].as_i64(),
+        input["reason"].as_str(),
+    )?;
+    let task_intent = input["reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            kernel
+                .query_json(
+                    "SELECT title, body FROM tasks WHERE id=?1 LIMIT 1",
+                    &[&task_id],
+                )
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|task| {
+                    [
+                        task["title"].as_str().unwrap_or_default(),
+                        task["body"].as_str().unwrap_or_default(),
+                    ]
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(": ")
+                })
+                .filter(|value| !value.trim().is_empty())
+        });
+    let cloud = match crate::cloud_mcp_forward_agent_acquire_lease(
+        input["repo_path"].as_str(),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        Some(agent_id),
+        Some(session_id),
+        Some(task_id),
+        input["worktree_id"].as_str(),
+        input["worktree_path"].as_str(),
+        resource_key,
+        mode,
+        task_intent.as_deref(),
+        &acquired,
+    ) {
+        Ok(response) => json!({"ok": true, "response": response}),
+        Err(error) => json!({"ok": false, "error": error}),
+    };
+    let mut response = acquired;
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
 }
 
 fn existing_local_task_id_for_start(

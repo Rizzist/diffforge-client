@@ -1534,6 +1534,7 @@ pub fn run() {
             cloud_mcp_sync_workspace,
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,
+            cloud_mcp_get_local_ignored_spec_graph_overlay,
             cloud_mcp_start_spec_graph_sync,
             cloud_mcp_stop_spec_graph_sync,
             cloud_mcp_get_spec_graph,
