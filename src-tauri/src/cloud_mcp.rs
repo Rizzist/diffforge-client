@@ -1823,12 +1823,41 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     instance: &TerminalInstance,
     reason: &str,
 ) {
+    let closed_started_at = Instant::now();
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.closed_start",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
+    let connect_started_at = Instant::now();
     if cloud_mcp_connected_or_connect(state, "terminal_closed").await.is_err() {
         let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.remove(&terminal_key);
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.cloud_mcp.connect_error",
+            Some(pane_id),
+            Some(instance_id),
+            Some(connect_started_at.elapsed()),
+            json!({
+                "reason": clean_terminal_telemetry_text(reason),
+            }),
+        );
         return;
     }
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.connect_done",
+        Some(pane_id),
+        Some(instance_id),
+        Some(connect_started_at.elapsed()),
+        json!({
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
 
     let coordination = instance.coordination.as_ref();
     let working_directory = instance.working_directory.as_ref();
@@ -1855,6 +1884,19 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         .as_ref()
         .map(|entry| entry.last_prompt.as_str())
         .filter(|prompt| !prompt.trim().is_empty());
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.context_loaded",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "has_active_task": active_task.is_some(),
+            "has_context_entry": context_entry.is_some(),
+            "has_coordination": coordination.is_some(),
+            "lane": clean_terminal_telemetry_text(&lane),
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
     let work_subject = context_entry
         .as_ref()
         .map(|entry| cloud_mcp_work_subject(&entry.work_brief))
@@ -1869,6 +1911,17 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     );
 
     if let Some(active_task) = active_task.as_ref() {
+        let task_lifecycle_started_at = Instant::now();
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.cloud_mcp.task_lifecycle_start",
+            Some(pane_id),
+            Some(instance_id),
+            None,
+            json!({
+                "local_task_id": clean_terminal_telemetry_text(&active_task.task_id),
+                "reason": clean_terminal_telemetry_text(reason),
+            }),
+        );
         cloud_mcp_mark_terminal_task_lifecycle(
             state,
             pane_id,
@@ -1882,8 +1935,30 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
             &brief,
         )
         .await;
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.cloud_mcp.task_lifecycle_done",
+            Some(pane_id),
+            Some(instance_id),
+            Some(task_lifecycle_started_at.elapsed()),
+            json!({
+                "local_task_id": clean_terminal_telemetry_text(&active_task.task_id),
+                "reason": clean_terminal_telemetry_text(reason),
+            }),
+        );
     }
 
+    let status_sync_started_at = Instant::now();
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.closed_status_sync_start",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&agent_id),
+            "lane": clean_terminal_telemetry_text(&lane),
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
     cloud_mcp_sync_terminal_agent_status(
         state,
         &repo_id,
@@ -1900,6 +1975,29 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         reason,
     )
     .await;
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.closed_status_sync_done",
+        Some(pane_id),
+        Some(instance_id),
+        Some(status_sync_started_at.elapsed()),
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&agent_id),
+            "lane": clean_terminal_telemetry_text(&lane),
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
+    let release_started_at = Instant::now();
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.lane_release_start",
+        Some(pane_id),
+        Some(instance_id),
+        None,
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&agent_id),
+            "lane": clean_terminal_telemetry_text(&lane),
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
     cloud_mcp_release_terminal_lane(
         state,
         &repo_id,
@@ -1911,9 +2009,29 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         reason,
     )
     .await;
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.lane_release_done",
+        Some(pane_id),
+        Some(instance_id),
+        Some(release_started_at.elapsed()),
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&agent_id),
+            "lane": clean_terminal_telemetry_text(&lane),
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
 
     let mut runtime = state.inner.lock().await;
     runtime.terminal_contexts.remove(&terminal_key);
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cloud_mcp.closed_done",
+        Some(pane_id),
+        Some(instance_id),
+        Some(closed_started_at.elapsed()),
+        json!({
+            "reason": clean_terminal_telemetry_text(reason),
+        }),
+    );
 }
 
 fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {

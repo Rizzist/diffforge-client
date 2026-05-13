@@ -13,7 +13,10 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    future::{BoxFuture, FutureExt, Shared},
+    SinkExt, StreamExt,
+};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -85,6 +88,7 @@ const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
 const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = true;
 const TERMINAL_PARKED_LOGGING_ENABLED: bool = false;
+const TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED: bool = true;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
@@ -206,7 +210,6 @@ struct TerminalState {
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
-    workspace_bootstrap_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     pty_pool: Arc<PtyPool>,
     next_terminal_instance_id: AtomicU64,
 }
@@ -1231,18 +1234,73 @@ fn close_app_after_terminal_shutdown(
                 "window_label": clean_terminal_telemetry_text(&window_label),
             }),
         );
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.app_close.cleanup_start",
+            None,
+            None,
+            None,
+            json!({
+                "app_pid": app_pid,
+                "window_label": clean_terminal_telemetry_text(&window_label),
+            }),
+        );
 
         let closed = {
             let terminal_state = app_for_shutdown.state::<TerminalState>();
             let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
             let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
+            let lifecycle_lock_started_at = Instant::now();
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.app_close.lifecycle_lock_wait_start",
+                None,
+                None,
+                None,
+                json!({
+                    "app_pid": app_pid,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
             let _lifecycle_guard = lifecycle_lock.lock().await;
-            close_all_terminal_sessions(
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.app_close.lifecycle_lock_wait_done",
+                None,
+                None,
+                Some(lifecycle_lock_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+            let close_all_started_at = Instant::now();
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.app_close.close_all_start",
+                None,
+                None,
+                None,
+                json!({
+                    "app_pid": app_pid,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+            let close_all_result = close_all_terminal_sessions(
                 app_for_shutdown.clone(),
                 &terminal_state,
                 cloud_mcp_state.inner(),
             )
-            .await
+            .await;
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.app_close.close_all_done",
+                None,
+                None,
+                Some(close_all_started_at.elapsed()),
+                json!({
+                    "app_pid": app_pid,
+                    "closed": close_all_result.as_ref().ok().copied(),
+                    "error": close_all_result.as_ref().err().map(|error| clean_terminal_telemetry_text(error)),
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+            close_all_result
         };
 
         match closed {
@@ -1271,6 +1329,16 @@ fn close_app_after_terminal_shutdown(
         }
 
         let mcp_cleanup_started_at = Instant::now();
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.app_close.shared_mcp_cleanup_start",
+            None,
+            None,
+            None,
+            json!({
+                "app_pid": app_pid,
+                "window_label": clean_terminal_telemetry_text(&window_label),
+            }),
+        );
         match coordination::mcp::stop_all_shared_daemons("app_close") {
             Ok(summary) => log_terminal_event(
                 "terminal.app_close.shared_mcp_cleanup_done",
@@ -1295,6 +1363,16 @@ fn close_app_after_terminal_shutdown(
                 }),
             ),
         }
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.app_close.shared_mcp_cleanup_done",
+            None,
+            None,
+            Some(mcp_cleanup_started_at.elapsed()),
+            json!({
+                "app_pid": app_pid,
+                "window_label": clean_terminal_telemetry_text(&window_label),
+            }),
+        );
 
         if let Err(error) = schedule_app_exit_after_terminal_shutdown(
             app_for_shutdown.clone(),
@@ -1461,7 +1539,6 @@ pub fn run() {
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
-            workspace_bootstrap_locks: Arc::new(StdMutex::new(HashMap::new())),
             pty_pool: Arc::clone(&pty_pool),
             next_terminal_instance_id: AtomicU64::new(1),
         })

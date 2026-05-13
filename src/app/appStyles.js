@@ -2420,6 +2420,19 @@ export const TerminalStatusOverlay = styled.div`
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
   }
 
+  &[data-mode="compact"] {
+    background: transparent;
+
+    > div {
+      max-width: none;
+      gap: 0;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+  }
+
   &[data-tone="error"] {
     background: rgba(18, 5, 8, 0.58);
 
@@ -2431,12 +2444,20 @@ export const TerminalStatusOverlay = styled.div`
 `;
 
 export const TerminalStatusSpinner = styled.span`
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border: 2px solid rgba(143, 157, 183, 0.24);
   border-top-color: #4fd1c5;
   border-radius: 999px;
   animation: ${workspaceCloseSpin} 760ms linear infinite;
+
+  ${TerminalStatusOverlay}[data-mode="compact"] & {
+    width: 18px;
+    height: 18px;
+    border-color: rgba(143, 157, 183, 0.2);
+    border-top-color: rgba(232, 238, 248, 0.86);
+    filter: drop-shadow(0 0 10px rgba(2, 3, 4, 0.52));
+  }
 `;
 
 export const TerminalStatusCopy = styled.div`

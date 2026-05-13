@@ -356,6 +356,7 @@ const TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS = [0, 16, 80, 180, 360];
 const TERMINAL_XTERM_RENDER_LOG_MIN_MS = 120;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
+const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
 const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
 const TERMINAL_SCROLLBAR_INTENT_MS = 900;
 const TERMINAL_SCROLL_ANCHOR_TARGET_FRACTION = 0.6;
@@ -1786,6 +1787,7 @@ export default function WorkspaceTerminal({
     let startupControlReplyBridgeOpen = false;
     let activeWebglAddon = null;
     let resizeController = null;
+    let backendPrepDetailTimer = 0;
     let lastResizeMeasureAt = 0;
     let lastResizeMeasureSize = null;
     let lastXtermRenderLogAt = 0;
@@ -2670,11 +2672,6 @@ export default function WorkspaceTerminal({
         };
 
         if (!previousProbe) {
-          setTerminalStatus({
-            detail: "PTY is connected; waiting for printable terminal output.",
-            title: "Waiting For Visible Output",
-            visible: true,
-          });
           writeTerminalTelemetry({
             paneId,
             instanceId: terminalInstanceId,
@@ -3973,6 +3970,12 @@ export default function WorkspaceTerminal({
         });
 
         const openStartedAt = performance.now();
+        const clearBackendPrepDetailTimer = () => {
+          if (backendPrepDetailTimer) {
+            window.clearTimeout(backendPrepDetailTimer);
+            backendPrepDetailTimer = 0;
+          }
+        };
         if (isGenericTerminal) {
           setPaneStage(
             "starting",
@@ -4072,7 +4075,32 @@ export default function WorkspaceTerminal({
             outputChannel,
           });
         };
+        if (!isGenericTerminal && !shouldPrewarmShell) {
+          backendPrepDetailTimer = window.setTimeout(() => {
+            backendPrepDetailTimer = 0;
+            if (isDisposed || hasOpenPty || runtimeTerminalState !== "starting") {
+              return;
+            }
+            setTerminalStatus({
+              detail: "Initial Git/worktree setup is still running.",
+              mode: "detail",
+              title: "Preparing Isolated Worktree",
+              visible: true,
+            });
+            writeTerminalTelemetry({
+              paneId,
+              instanceId: terminalInstanceId,
+              phase: "frontend.open.backend_prep_detail",
+              elapsedMs: performance.now() - openStartedAt,
+              fields: {
+                terminalIndex,
+                ...getWorkspaceOpenTelemetryFields(workspace?.id),
+              },
+            });
+          }, TERMINAL_BACKEND_PREP_DETAIL_MS);
+        }
         const openResult = await invokeTerminalOpen();
+        clearBackendPrepDetailTimer();
 
         if (isDisposed) {
           startupControlReplyBridgeOpen = false;
@@ -4091,18 +4119,18 @@ export default function WorkspaceTerminal({
         setTerminalLaunchInfo(openResult || null);
         if (shouldPrewarmShell) {
           runtimeTerminalState = "prewarmed";
-          setTerminalState("starting");
+          setTerminalState("prewarmed");
           setTerminalStatus({
             detail: "Waiting for the agent launch gate.",
             title: "Terminal Prepared",
-            visible: true,
+            visible: false,
           });
         } else {
-          setPaneStage("running", "Terminal Running", "Waiting for visible terminal output.");
+          setPaneStage("running", "Terminal Running", "Terminal is connected.");
           setTerminalStatus({
-            detail: "Waiting for printable terminal output.",
-            title: "Waiting For Visible Output",
-            visible: true,
+            detail: "Terminal is connected.",
+            title: "Terminal Running",
+            visible: false,
           });
         }
         patchTerminalMetrics({ startupMs: performance.now() - openStartedAt });
@@ -4167,6 +4195,10 @@ export default function WorkspaceTerminal({
         scheduleBlankStartupWatch("terminal_open_done");
       } catch (error) {
         startupControlReplyBridgeOpen = false;
+        if (backendPrepDetailTimer) {
+          window.clearTimeout(backendPrepDetailTimer);
+          backendPrepDetailTimer = 0;
+        }
         if (!isDisposed) {
           const errorMessage = getErrorMessage(error, `Unable to launch ${agent.label}.`);
           setPaneStage("error", "Terminal Launch Failed", errorMessage);
@@ -4193,6 +4225,9 @@ export default function WorkspaceTerminal({
       }
       if (resizeIdleDebugTimer) {
         window.clearTimeout(resizeIdleDebugTimer);
+      }
+      if (backendPrepDetailTimer) {
+        window.clearTimeout(backendPrepDetailTimer);
       }
       startupMetricTimers.forEach((timer) => window.clearTimeout(timer));
       startupMetricTimers.clear();
@@ -4432,6 +4467,9 @@ export default function WorkspaceTerminal({
   const terminalStatusDetail = terminalState === "error" && terminalError
     ? terminalError
     : terminalStatus?.detail || "";
+  const terminalStatusMode = terminalState === "error"
+    ? "detail"
+    : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
 
   if (!agent) {
     return (
@@ -4588,15 +4626,18 @@ export default function WorkspaceTerminal({
             {showTerminalStatusOverlay && (
               <TerminalStatusOverlay
                 aria-live={terminalState === "error" ? "assertive" : "polite"}
+                data-mode={terminalStatusMode}
                 data-tone={terminalState === "error" ? "error" : "neutral"}
                 role="status"
               >
                 <div>
                   {terminalState !== "error" && <TerminalStatusSpinner aria-hidden="true" />}
-                  <TerminalStatusCopy>
-                    <strong>{terminalStatusTitle}</strong>
-                    {terminalStatusDetail && <span>{terminalStatusDetail}</span>}
-                  </TerminalStatusCopy>
+                  {terminalStatusMode !== "compact" && (
+                    <TerminalStatusCopy>
+                      <strong>{terminalStatusTitle}</strong>
+                      {terminalStatusDetail && <span>{terminalStatusDetail}</span>}
+                    </TerminalStatusCopy>
+                  )}
                 </div>
               </TerminalStatusOverlay>
             )}

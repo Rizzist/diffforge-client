@@ -217,12 +217,15 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
     let key = shared_daemon_registry_key(&repo_path_text);
 
     let daemons = SHARED_DAEMONS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut guard = daemons
-        .lock()
-        .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
-    if let Some(info) = guard.get(&key) {
-        write_shared_daemon_info_file(info)?;
-        return Ok(shared_daemon_info_value(info, false));
+    let existing = {
+        let guard = daemons
+            .lock()
+            .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
+        guard.get(&key).cloned()
+    };
+    if let Some(info) = existing {
+        write_shared_daemon_info_file(&info)?;
+        return Ok(shared_daemon_info_value(&info, false));
     }
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -242,11 +245,38 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
         started_at_ms: mcp_now_ms(),
         shutdown: Arc::new(AtomicBool::new(false)),
     };
-    write_shared_daemon_info_file(&info)?;
 
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("Unable to configure shared MCP daemon listener: {error}"))?;
+    let installed = {
+        let mut guard = daemons
+            .lock()
+            .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
+        if let Some(existing) = guard.get(&key).cloned() {
+            Some(existing)
+        } else {
+            guard.insert(key.clone(), info.clone());
+            None
+        }
+    };
+    if let Some(existing) = installed {
+        write_shared_daemon_info_file(&existing)?;
+        return Ok(shared_daemon_info_value(&existing, false));
+    }
+
+    if let Err(error) = write_shared_daemon_info_file(&info) {
+        if let Ok(mut guard) = daemons.lock() {
+            if guard
+                .get(&key)
+                .is_some_and(|current| current.token == info.token)
+            {
+                guard.remove(&key);
+            }
+        }
+        return Err(error);
+    }
+
     let listener_repo_path = repo_path_text.clone();
     let listener_db_path = db_path_text.clone();
     let listener_token = token.clone();
@@ -279,7 +309,6 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
     }
 
     let value = shared_daemon_info_value(&info, true);
-    guard.insert(key, info);
     Ok(value)
 }
 

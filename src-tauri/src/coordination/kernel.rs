@@ -3487,13 +3487,64 @@ impl CoordinationKernel {
     }
 
     pub fn interrupt_session(&self, session_id: &str, reason: &str) -> Result<Value, String> {
-        let session = self.query_one(
+        let interrupt_started_at = Instant::now();
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.enter",
+            None,
+            None,
+            None,
+            json!({
+                "db_path": self.paths.db_path.display().to_string(),
+                "reason": reason,
+                "session_id": session_id,
+            }),
+        );
+
+        let session_query_started_at = Instant::now();
+        let session = match self.query_one(
             "SELECT * FROM agent_sessions WHERE id=?1",
             &[&session_id],
             "Session does not exist.",
-        )?;
+        ) {
+            Ok(session) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.session_query_done",
+                    None,
+                    None,
+                    Some(session_query_started_at.elapsed()),
+                    json!({
+                        "session_id": session_id,
+                    }),
+                );
+                session
+            }
+            Err(error) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.session_query_error",
+                    None,
+                    None,
+                    Some(session_query_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        };
         let current_status = session["status"].as_str().unwrap_or("unknown");
         if current_status != "active" {
+            crate::log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.kernel_interrupt.already_not_active",
+                None,
+                None,
+                Some(interrupt_started_at.elapsed()),
+                json!({
+                    "current_status": current_status,
+                    "reason": reason,
+                    "session_id": session_id,
+                }),
+            );
             return Ok(json!({
                 "id": session_id,
                 "status": current_status,
@@ -3502,45 +3553,205 @@ impl CoordinationKernel {
             }));
         }
 
-        let active_leases = self.query_json(
+        let active_leases_started_at = Instant::now();
+        let active_leases = match self.query_json(
             "SELECT id, task_id, agent_id, agent_slot_id, session_id, resource_id FROM leases WHERE session_id=?1 AND status='active'",
             &[&session_id],
-        )?;
-        let active_worktrees = self.query_json(
+        ) {
+            Ok(active_leases) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.active_leases_query_done",
+                    None,
+                    None,
+                    Some(active_leases_started_at.elapsed()),
+                    json!({
+                        "active_lease_count": active_leases.len(),
+                        "session_id": session_id,
+                    }),
+                );
+                active_leases
+            }
+            Err(error) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.active_leases_query_error",
+                    None,
+                    None,
+                    Some(active_leases_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        let active_worktrees_started_at = Instant::now();
+        let active_worktrees = match self.query_json(
             "SELECT id, path, branch_name FROM worktrees WHERE session_id=?1 AND status='active'",
             &[&session_id],
-        )?;
+        ) {
+            Ok(active_worktrees) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.active_worktrees_query_done",
+                    None,
+                    None,
+                    Some(active_worktrees_started_at.elapsed()),
+                    json!({
+                        "active_worktree_count": active_worktrees.len(),
+                        "session_id": session_id,
+                    }),
+                );
+                active_worktrees
+            }
+            Err(error) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.active_worktrees_query_error",
+                    None,
+                    None,
+                    Some(active_worktrees_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        };
         let now = now_rfc3339();
-        self.conn
-            .execute(
+        let session_update_started_at = Instant::now();
+        match self.conn.execute(
                 "UPDATE agent_sessions SET status='interrupted', updated_at=?1 WHERE id=?2 AND status='active'",
                 params![now, session_id],
-            )
-            .map_err(|error| format!("Unable to interrupt session: {error}"))?;
-        self.conn
-            .execute(
-                "UPDATE leases
+            ) {
+            Ok(updated) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.session_update_done",
+                    None,
+                    None,
+                    Some(session_update_started_at.elapsed()),
+                    json!({
+                        "session_id": session_id,
+                        "updated": updated,
+                    }),
+                );
+            }
+            Err(error) => {
+                let error = format!("Unable to interrupt session: {error}");
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.session_update_error",
+                    None,
+                    None,
+                    Some(session_update_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+        let leases_update_started_at = Instant::now();
+        match self.conn.execute(
+            "UPDATE leases
                  SET status='expired', expires_at=?1, last_heartbeat_at=?1
                  WHERE session_id=?2 AND status='active'",
-                params![now, session_id],
-            )
-            .map_err(|error| format!("Unable to expire interrupted session leases: {error}"))?;
-        self.conn
-            .execute(
-                "UPDATE worktrees
+            params![now, session_id],
+        ) {
+            Ok(updated) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.leases_update_done",
+                    None,
+                    None,
+                    Some(leases_update_started_at.elapsed()),
+                    json!({
+                        "session_id": session_id,
+                        "updated": updated,
+                    }),
+                );
+            }
+            Err(error) => {
+                let error = format!("Unable to expire interrupted session leases: {error}");
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.leases_update_error",
+                    None,
+                    None,
+                    Some(leases_update_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+        let worktrees_update_started_at = Instant::now();
+        match self.conn.execute(
+            "UPDATE worktrees
                  SET status='interrupted', updated_at=?1
                  WHERE session_id=?2 AND status='active'",
-                params![now, session_id],
-            )
-            .map_err(|error| format!("Unable to mark interrupted session worktrees: {error}"))?;
-        self.conn
-            .execute(
-                "UPDATE agent_slots
+            params![now, session_id],
+        ) {
+            Ok(updated) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.worktrees_update_done",
+                    None,
+                    None,
+                    Some(worktrees_update_started_at.elapsed()),
+                    json!({
+                        "session_id": session_id,
+                        "updated": updated,
+                    }),
+                );
+            }
+            Err(error) => {
+                let error = format!("Unable to mark interrupted session worktrees: {error}");
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.worktrees_update_error",
+                    None,
+                    None,
+                    Some(worktrees_update_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+        let slot_update_started_at = Instant::now();
+        match self.conn.execute(
+            "UPDATE agent_slots
                  SET active_session_id=NULL, status='available', updated_at=?1
                  WHERE active_session_id=?2",
-                params![now, session_id],
-            )
-            .map_err(|error| format!("Unable to release interrupted session slot: {error}"))?;
+            params![now, session_id],
+        ) {
+            Ok(updated) => {
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.slot_update_done",
+                    None,
+                    None,
+                    Some(slot_update_started_at.elapsed()),
+                    json!({
+                        "session_id": session_id,
+                        "updated": updated,
+                    }),
+                );
+            }
+            Err(error) => {
+                let error = format!("Unable to release interrupted session slot: {error}");
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.slot_update_error",
+                    None,
+                    None,
+                    Some(slot_update_started_at.elapsed()),
+                    json!({
+                        "error": &error,
+                        "session_id": session_id,
+                    }),
+                );
+                return Err(error);
+            }
+        }
 
         let close_discards_parked_task =
             matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
@@ -3550,6 +3761,17 @@ impl CoordinationKernel {
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
             {
+                let parked_task_started_at = Instant::now();
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.parked_task_check_start",
+                    None,
+                    None,
+                    None,
+                    json!({
+                        "session_id": session_id,
+                        "task_id": task_id,
+                    }),
+                );
                 let parked_intent_count: i64 = self
                     .conn
                     .query_row(
@@ -3561,7 +3783,19 @@ impl CoordinationKernel {
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
+                crate::log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.kernel_interrupt.parked_task_check_done",
+                    None,
+                    None,
+                    Some(parked_task_started_at.elapsed()),
+                    json!({
+                        "parked_intent_count": parked_intent_count,
+                        "session_id": session_id,
+                        "task_id": task_id,
+                    }),
+                );
                 if parked_intent_count > 0 {
+                    let parked_task_update_started_at = Instant::now();
                     let task_updated = self
                         .conn
                         .execute(
@@ -3575,7 +3809,19 @@ impl CoordinationKernel {
                         .map_err(|error| {
                             format!("Unable to discard closed parked task: {error}")
                         })?;
+                    crate::log_terminal_shutdown_detail_event(
+                        "terminal.shutdown_detail.kernel_interrupt.parked_task_update_done",
+                        None,
+                        None,
+                        Some(parked_task_update_started_at.elapsed()),
+                        json!({
+                            "session_id": session_id,
+                            "task_id": task_id,
+                            "task_updated": task_updated,
+                        }),
+                    );
                     if task_updated > 0 {
+                        let parked_intents_update_started_at = Instant::now();
                         let intent_updated = self
                             .conn
                             .execute(
@@ -3588,11 +3834,23 @@ impl CoordinationKernel {
                             .map_err(|error| {
                                 format!("Unable to discard closed parked task intents: {error}")
                             })?;
+                        crate::log_terminal_shutdown_detail_event(
+                            "terminal.shutdown_detail.kernel_interrupt.parked_intents_update_done",
+                            None,
+                            None,
+                            Some(parked_intents_update_started_at.elapsed()),
+                            json!({
+                                "intent_updated": intent_updated,
+                                "session_id": session_id,
+                                "task_id": task_id,
+                            }),
+                        );
                         discarded_parked_task = Some(json!({
                             "task_id": task_id,
                             "parked_intent_count": parked_intent_count,
                             "updated_resource_intents": intent_updated,
                         }));
+                        let parked_event_started_at = Instant::now();
                         self.emit_event(
                             "terminal_parked_task_discarded_on_session_close",
                             "kernel",
@@ -3612,11 +3870,32 @@ impl CoordinationKernel {
                                 "resume_policy": "do_not_resurrect_closed_terminal_parked_tasks_on_app_restart",
                             }),
                         )?;
+                        crate::log_terminal_shutdown_detail_event(
+                            "terminal.shutdown_detail.kernel_interrupt.parked_task_event_done",
+                            None,
+                            None,
+                            Some(parked_event_started_at.elapsed()),
+                            json!({
+                                "session_id": session_id,
+                                "task_id": task_id,
+                            }),
+                        );
                     }
                 }
             }
         }
 
+        let lease_events_started_at = Instant::now();
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.lease_events_start",
+            None,
+            None,
+            None,
+            json!({
+                "lease_count": active_leases.len(),
+                "session_id": session_id,
+            }),
+        );
         for lease in &active_leases {
             self.emit_event(
                 "lease_expired",
@@ -3637,7 +3916,27 @@ impl CoordinationKernel {
                 }),
             )?;
         }
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.lease_events_done",
+            None,
+            None,
+            Some(lease_events_started_at.elapsed()),
+            json!({
+                "lease_count": active_leases.len(),
+                "session_id": session_id,
+            }),
+        );
 
+        let agent_event_started_at = Instant::now();
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.agent_event_start",
+            None,
+            None,
+            None,
+            json!({
+                "session_id": session_id,
+            }),
+        );
         self.emit_event(
             "agent_interrupted",
             "kernel",
@@ -3657,7 +3956,28 @@ impl CoordinationKernel {
                 "discarded_parked_task": discarded_parked_task,
             }),
         )?;
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.agent_event_done",
+            None,
+            None,
+            Some(agent_event_started_at.elapsed()),
+            json!({
+                "session_id": session_id,
+            }),
+        );
 
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_interrupt.done",
+            None,
+            None,
+            Some(interrupt_started_at.elapsed()),
+            json!({
+                "expired_leases": active_leases.len(),
+                "interrupted_worktrees": active_worktrees.len(),
+                "reason": reason,
+                "session_id": session_id,
+            }),
+        );
         Ok(json!({
             "id": session_id,
             "status": "interrupted",
