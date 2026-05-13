@@ -893,6 +893,61 @@ fn spawn_terminal_reader(
     output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
 ) {
+    fn flush_terminal_output_frame(
+        pending: &mut Vec<u8>,
+        pane_id: &str,
+        instance_id: u64,
+        cloud_mcp_state: &CloudMcpState,
+        output_channel: &Channel<InvokeResponseBody>,
+        sent_frame_sequence: &mut usize,
+        flushed_chunks: &mut usize,
+        flushed_bytes: &mut usize,
+        frame_log_limit: usize,
+        reason: &str,
+    ) -> bool {
+        if pending.is_empty() {
+            return true;
+        }
+
+        let bytes = pending.len();
+        let chunk = std::mem::take(pending);
+        let observer_state = cloud_mcp_state.clone();
+        let observer_pane_id = pane_id.to_string();
+        let observer_chunk = chunk.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_observe_terminal_output(
+                observer_state,
+                &observer_pane_id,
+                instance_id,
+                &observer_chunk,
+            )
+            .await;
+        });
+
+        *sent_frame_sequence += 1;
+        if *sent_frame_sequence <= frame_log_limit {
+            log_terminal_event(
+                "terminal.reader.frame_sent",
+                Some(pane_id),
+                Some(instance_id),
+                None,
+                json!({
+                    "sequence": *sent_frame_sequence,
+                    "frame": terminal_output_debug_fields(&chunk),
+                    "flush_reason": reason,
+                }),
+            );
+        }
+
+        if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
+            return false;
+        }
+
+        *flushed_chunks += 1;
+        *flushed_bytes += bytes;
+        true
+    }
+
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let reader_pane_id = pane_id.clone();
     const FRAME_LOG_LIMIT: usize = 10;
@@ -1000,6 +1055,7 @@ fn spawn_terminal_reader(
         let mut ticker = interval(Duration::from_micros(TERMINAL_OUTPUT_FRAME_MICROS));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_READ_BUFFER_BYTES * 2);
+        let mut pending_since: Option<Instant> = None;
         let mut reader_closed = false;
         let mut flushed_chunks = 0usize;
         let mut flushed_bytes = 0usize;
@@ -1008,86 +1064,96 @@ fn spawn_terminal_reader(
 
         loop {
             tokio::select! {
-                maybe_chunk = output_rx.recv(), if !reader_closed => {
-                    match maybe_chunk {
-                        Some(chunk) => pending.extend_from_slice(&chunk),
-                        None => reader_closed = true,
-                    }
-                }
+                biased;
                 _ = ticker.tick() => {
                     while let Ok(chunk) = output_rx.try_recv() {
                         pending.extend_from_slice(&chunk);
                     }
 
-                    if !pending.is_empty() {
-                        let bytes = pending.len();
-                        let chunk = std::mem::take(&mut pending);
-                        let observer_state = cloud_mcp_state.clone();
-                        let observer_pane_id = pane_id.clone();
-                        let observer_chunk = chunk.clone();
-                        tauri::async_runtime::spawn(async move {
-                            cloud_mcp_observe_terminal_output(
-                                observer_state,
-                                &observer_pane_id,
-                                instance_id,
-                                &observer_chunk,
-                            )
-                            .await;
-                        });
-
-                        sent_frame_sequence += 1;
-                        if sent_frame_sequence <= FRAME_LOG_LIMIT {
-                            log_terminal_event(
-                                "terminal.reader.frame_sent",
-                                Some(&pane_id),
-                                Some(instance_id),
-                                None,
-                                json!({
-                                    "sequence": sent_frame_sequence,
-                                    "frame": terminal_output_debug_fields(&chunk),
-                                }),
-                            );
-                        }
-
-                        if output_channel.send(InvokeResponseBody::Raw(chunk)).is_err() {
+                    if !pending.is_empty()
+                        && !flush_terminal_output_frame(
+                            &mut pending,
+                            &pane_id,
+                            instance_id,
+                            &cloud_mcp_state,
+                            &output_channel,
+                            &mut sent_frame_sequence,
+                            &mut flushed_chunks,
+                            &mut flushed_bytes,
+                            FRAME_LOG_LIMIT,
+                            "frame_tick",
+                        )
+                    {
                             channel_failed = true;
                             break;
-                        }
-
-                        flushed_chunks += 1;
-                        flushed_bytes += bytes;
                     }
+                    pending_since = None;
 
                     if reader_closed {
                         break;
+                    }
+                }
+                maybe_chunk = output_rx.recv(), if !reader_closed => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            if pending.is_empty() {
+                                pending_since = Some(Instant::now());
+                            }
+                            pending.extend_from_slice(&chunk);
+                            while let Ok(chunk) = output_rx.try_recv() {
+                                pending.extend_from_slice(&chunk);
+                            }
+
+                            let pending_is_over_frame_budget = pending_since
+                                .map(|started| {
+                                    started.elapsed()
+                                        >= Duration::from_micros(TERMINAL_OUTPUT_FRAME_MICROS)
+                                })
+                                .unwrap_or(false);
+                            let pending_is_large = pending.len() >= TERMINAL_OUTPUT_READ_BUFFER_BYTES;
+                            if pending_is_over_frame_budget || pending_is_large {
+                                let reason = if pending_is_large {
+                                    "max_frame_bytes"
+                                } else {
+                                    "max_frame_latency"
+                                };
+                                if !flush_terminal_output_frame(
+                                    &mut pending,
+                                    &pane_id,
+                                    instance_id,
+                                    &cloud_mcp_state,
+                                    &output_channel,
+                                    &mut sent_frame_sequence,
+                                    &mut flushed_chunks,
+                                    &mut flushed_bytes,
+                                    FRAME_LOG_LIMIT,
+                                    reason,
+                                ) {
+                                    channel_failed = true;
+                                    break;
+                                }
+                                pending_since = None;
+                            }
+                        }
+                        None => reader_closed = true,
                     }
                 }
             }
         }
 
         if !channel_failed && !pending.is_empty() {
-            let bytes = pending.len();
-            sent_frame_sequence += 1;
-            if sent_frame_sequence <= FRAME_LOG_LIMIT {
-                log_terminal_event(
-                    "terminal.reader.frame_sent",
-                    Some(&pane_id),
-                    Some(instance_id),
-                    None,
-                    json!({
-                        "sequence": sent_frame_sequence,
-                        "frame": terminal_output_debug_fields(&pending),
-                    }),
-                );
-            }
-
-            if output_channel
-                .send(InvokeResponseBody::Raw(std::mem::take(&mut pending)))
-                .is_ok()
-            {
-                flushed_chunks += 1;
-                flushed_bytes += bytes;
-            } else {
+            if !flush_terminal_output_frame(
+                &mut pending,
+                &pane_id,
+                instance_id,
+                &cloud_mcp_state,
+                &output_channel,
+                &mut sent_frame_sequence,
+                &mut flushed_chunks,
+                &mut flushed_bytes,
+                FRAME_LOG_LIMIT,
+                "reader_closed",
+            ) {
                 channel_failed = true;
             }
         }

@@ -151,8 +151,22 @@ struct CachedIntegrationWorktree {
     cached_at: Instant,
 }
 
+#[derive(Clone)]
+struct CachedWorkspaceMcpActivation {
+    response: Value,
+    config_hash: String,
+    cached_at: Instant,
+}
+
+type WorkspaceMcpActivationCache = HashMap<String, CachedWorkspaceMcpActivation>;
+
 fn integration_worktree_cache() -> &'static Mutex<HashMap<String, CachedIntegrationWorktree>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedIntegrationWorktree>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn workspace_mcp_activation_cache() -> &'static Mutex<WorkspaceMcpActivationCache> {
+    static CACHE: OnceLock<Mutex<WorkspaceMcpActivationCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -177,6 +191,51 @@ fn remember_initialized_kernel_db(paths: &StoragePaths) -> Result<(), String> {
 fn forget_initialized_kernel_db_key(key: &str) {
     if let Ok(mut initialized) = initialized_kernel_dbs().lock() {
         initialized.remove(key);
+    }
+}
+
+fn workspace_mcp_activation_cache_key(
+    repo_path: &Path,
+    db_path: &Path,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    command: &str,
+    args: &[String],
+    config_hash: &str,
+) -> String {
+    let payload = json!({
+        "repo_path": process_path_text(repo_path),
+        "db_path": process_path_text(db_path),
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "command": command,
+        "args": args,
+        "config_hash": config_hash,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    sha256_hex(&bytes)
+}
+
+fn cached_workspace_mcp_activation(key: &str) -> Option<CachedWorkspaceMcpActivation> {
+    workspace_mcp_activation_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).cloned())
+}
+
+fn remember_workspace_mcp_activation(key: String, config_hash: String, response: &Value) {
+    if let Ok(mut cache) = workspace_mcp_activation_cache().lock() {
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CachedWorkspaceMcpActivation {
+                response: response.clone(),
+                config_hash,
+                cached_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -3759,20 +3818,6 @@ impl CoordinationKernel {
                 "workspace_id": workspace_id,
             }),
         );
-        let daemon_started_at = Instant::now();
-        let daemon = crate::coordination::mcp::ensure_shared_daemon_for_paths(
-            &self.paths.repo_path,
-            &self.paths.db_path,
-        )?;
-        terminal_coordination_log(
-            "terminal.coordination.workspace_mcp.daemon_ready",
-            telemetry_pane_id,
-            Some(daemon_started_at.elapsed()),
-            json!({
-                "endpoint": daemon["endpoint"].as_str(),
-                "started": daemon["started"].as_bool(),
-            }),
-        );
         let objective_started_at = Instant::now();
         let objective_key = require_workspace_objective_key(workspace_id)?;
         terminal_coordination_log(
@@ -3832,6 +3877,62 @@ impl CoordinationKernel {
                 }
             }
         });
+        let config_bytes = serde_json::to_vec(&generic_config).map_err(|error| {
+            format!("Unable to serialize workspace MCP config for hashing: {error}")
+        })?;
+        let config_hash = sha256_hex(&config_bytes);
+        let cache_key = workspace_mcp_activation_cache_key(
+            &self.paths.repo_path,
+            &self.paths.db_path,
+            workspace_id,
+            workspace_name,
+            &command,
+            &args,
+            &config_hash,
+        );
+        if telemetry_pane_id.is_some() {
+            if let Some(cached) = cached_workspace_mcp_activation(&cache_key) {
+                let cached_response = cached.response;
+                let cached_hash = cached.config_hash;
+                let cache_age_ms = cached.cached_at.elapsed().as_secs_f64() * 1000.0;
+                terminal_coordination_log(
+                    "terminal.coordination.workspace_mcp.cache_hit",
+                    telemetry_pane_id,
+                    Some(total_started_at.elapsed()),
+                    json!({
+                        "cache_age_ms": cache_age_ms,
+                        "config_hash": cached_hash,
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                terminal_coordination_log(
+                    "terminal.coordination.workspace_mcp.done",
+                    telemetry_pane_id,
+                    Some(total_started_at.elapsed()),
+                    json!({
+                        "cached": true,
+                        "config_path": cached_response["config_path"].as_str(),
+                        "repo_mcp_path": cached_response["repo_mcp_path"].as_str(),
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                return Ok(cached_response);
+            }
+        }
+        let daemon_started_at = Instant::now();
+        let daemon = crate::coordination::mcp::ensure_shared_daemon_for_paths(
+            &self.paths.repo_path,
+            &self.paths.db_path,
+        )?;
+        terminal_coordination_log(
+            "terminal.coordination.workspace_mcp.daemon_ready",
+            telemetry_pane_id,
+            Some(daemon_started_at.elapsed()),
+            json!({
+                "endpoint": daemon["endpoint"].as_str(),
+                "started": daemon["started"].as_bool(),
+            }),
+        );
         let generic_path = self.paths.mcp_root.join("coordination.json");
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
@@ -3894,11 +3995,14 @@ impl CoordinationKernel {
             "repo_mcp_path": process_path_text(&repo_mcp_path),
             "repo_codex_config_path": process_path_text(&repo_codex_path),
         });
+        remember_workspace_mcp_activation(cache_key, config_hash.clone(), &response);
         terminal_coordination_log(
             "terminal.coordination.workspace_mcp.done",
             telemetry_pane_id,
             Some(total_started_at.elapsed()),
             json!({
+                "cached": false,
+                "config_hash": config_hash,
                 "config_path": response["config_path"].as_str(),
                 "repo_mcp_path": response["repo_mcp_path"].as_str(),
                 "workspace_id": workspace_id,
@@ -16322,6 +16426,36 @@ mod tests {
         assert_eq!(status["always_on"].as_bool(), Some(true));
         assert_eq!(status["toggleable"].as_bool(), Some(false));
         assert!(PathBuf::from(status["config_path"].as_str().unwrap()).exists());
+    }
+
+    #[test]
+    fn terminal_workspace_mcp_activation_reuses_workspace_cache() {
+        let repo = init_git_repo("workspace_mcp_terminal_cache");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let status = kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        let repo_mcp_path = PathBuf::from(status["repo_mcp_path"].as_str().unwrap());
+        assert!(repo_mcp_path.exists());
+        fs::remove_file(&repo_mcp_path).unwrap();
+
+        let cached = kernel
+            .ensure_workspace_mcp_config_with_telemetry(
+                Some("workspace-server-uuid"),
+                Some("Workspace"),
+                Some("workspace-terminal-cache-test"),
+            )
+            .unwrap();
+        assert_eq!(
+            cached["repo_mcp_path"].as_str(),
+            status["repo_mcp_path"].as_str()
+        );
+        assert!(!repo_mcp_path.exists());
+
+        kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        assert!(repo_mcp_path.exists());
     }
 
     #[test]
