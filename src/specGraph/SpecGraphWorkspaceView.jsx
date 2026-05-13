@@ -27,6 +27,28 @@ const NODE_DIMENSIONS = {
   abstract: { width: 166, height: 104 },
 };
 
+const NODE_COLLISION_PADDING = {
+  workspace: 34,
+  folder: 26,
+  file: 24,
+  abstract: 30,
+};
+
+const EDGE_ANCHORS = [
+  { id: "top-left", position: Position.Top, x: 0.24, y: 0 },
+  { id: "top", position: Position.Top, x: 0.5, y: 0 },
+  { id: "top-right", position: Position.Top, x: 0.76, y: 0 },
+  { id: "right-top", position: Position.Right, x: 1, y: 0.24 },
+  { id: "right", position: Position.Right, x: 1, y: 0.5 },
+  { id: "right-bottom", position: Position.Right, x: 1, y: 0.76 },
+  { id: "bottom-right", position: Position.Bottom, x: 0.76, y: 1 },
+  { id: "bottom", position: Position.Bottom, x: 0.5, y: 1 },
+  { id: "bottom-left", position: Position.Bottom, x: 0.24, y: 1 },
+  { id: "left-bottom", position: Position.Left, x: 0, y: 0.76 },
+  { id: "left", position: Position.Left, x: 0, y: 0.5 },
+  { id: "left-top", position: Position.Left, x: 0, y: 0.24 },
+];
+
 function cleanText(value) {
   return String(value || "")
     .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, " ")
@@ -482,6 +504,109 @@ function centerFor(layout, node) {
   };
 }
 
+function collisionPaddingForNode(node) {
+  return NODE_COLLISION_PADDING[nodeKind(node)] ?? NODE_COLLISION_PADDING.abstract;
+}
+
+function rectForCenter(node, center) {
+  const dimensions = dimensionsForNode(node);
+  const padding = collisionPaddingForNode(node);
+  return {
+    left: center.x - dimensions.width / 2 - padding,
+    right: center.x + dimensions.width / 2 + padding,
+    top: center.y - dimensions.height / 2 - padding,
+    bottom: center.y + dimensions.height / 2 + padding,
+  };
+}
+
+function rectForLayoutNode(layout, node) {
+  return rectForCenter(node, centerFor(layout, node));
+}
+
+function overlapArea(left, right) {
+  const width = Math.min(left.right, right.right) - Math.max(left.left, right.left);
+  const height = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top);
+  return width > 0 && height > 0 ? width * height : 0;
+}
+
+function collisionScore(rect, occupiedRects) {
+  return occupiedRects.reduce((score, occupied) => score + overlapArea(rect, occupied), 0);
+}
+
+function averageCenterForNodes(layout, nodes) {
+  if (!nodes.length) return null;
+  const total = nodes.reduce(
+    (acc, node) => {
+      const center = centerFor(layout, node);
+      return { x: acc.x + center.x, y: acc.y + center.y };
+    },
+    { x: 0, y: 0 },
+  );
+  return {
+    x: total.x / nodes.length,
+    y: total.y / nodes.length,
+  };
+}
+
+function angleBetween(from, to, fallbackAngle) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  return Math.hypot(dx, dy) > 1 ? Math.atan2(dy, dx) : fallbackAngle;
+}
+
+function abstractPlacementDistance(node, linkedStructural) {
+  const nodeDimensions = dimensionsForNode(node);
+  const nodeRadius = Math.max(nodeDimensions.width, nodeDimensions.height) / 2;
+  const linkedRadius = linkedStructural.reduce((radius, target) => {
+    const dimensions = dimensionsForNode(target);
+    return Math.max(radius, Math.max(dimensions.width, dimensions.height) / 2);
+  }, 86);
+  return nodeRadius + linkedRadius + 78 + Math.min(72, Math.max(0, linkedStructural.length - 1) * 18);
+}
+
+function spiralCandidateCenters(origin, angle, baseDistance) {
+  const angleOffsets = [0, -0.46, 0.46, -0.92, 0.92, -1.38, 1.38, Math.PI, Math.PI - 0.55, -Math.PI + 0.55];
+  const distances = [
+    baseDistance,
+    baseDistance + 56,
+    baseDistance + 116,
+    baseDistance + 184,
+    baseDistance + 264,
+    baseDistance + 360,
+    baseDistance + 480,
+    baseDistance + 640,
+    baseDistance + 840,
+  ];
+  return distances.flatMap((distance) => angleOffsets.map((offset) => ({
+    x: origin.x + Math.cos(angle + offset) * distance,
+    y: origin.y + Math.sin(angle + offset) * distance,
+  })));
+}
+
+function placeNodeAvoidingCollisions(layout, node, candidates, occupiedRects) {
+  let bestCenter = candidates[0] || { x: 0, y: 0 };
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const [index, center] of candidates.entries()) {
+    const rect = rectForCenter(node, center);
+    const score = collisionScore(rect, occupiedRects);
+    if (score <= 0) {
+      setNodeCenter(layout, node, center);
+      occupiedRects.push(rect);
+      return;
+    }
+
+    const weightedScore = score * 1000 + index;
+    if (weightedScore < bestScore) {
+      bestScore = weightedScore;
+      bestCenter = center;
+    }
+  }
+
+  setNodeCenter(layout, node, bestCenter);
+  occupiedRects.push(rectForCenter(node, bestCenter));
+}
+
 function sortedChildren(children, nodeById) {
   return [...children].sort((leftId, rightId) => {
     const left = nodeById.get(leftId);
@@ -557,6 +682,10 @@ function radialHierarchyLayout(nodes, edges) {
   const structuralKinds = new Set(["workspace", "folder", "file"]);
   const abstractNodes = nodes.filter((node) => !structuralKinds.has(nodeKind(node)));
   const rootCenter = centerFor(layout, root);
+  const occupiedRects = nodes
+    .filter((node) => placed.has(node.id) && layout.has(node.id))
+    .map((node) => rectForLayoutNode(layout, node));
+
   abstractNodes.forEach((node, index) => {
     const linkedStructural = edges
       .filter((edge) => !isContainmentEdge(edge) && (edge.from === node.id || edge.to === node.id))
@@ -565,33 +694,23 @@ function radialHierarchyLayout(nodes, edges) {
       .filter((target) => target && ["workspace", "folder", "file"].includes(nodeKind(target)) && layout.has(target.id));
 
     if (linkedStructural.length) {
-      const direction = linkedStructural.reduce(
-        (acc, target) => {
-          const center = centerFor(layout, target);
-          const dx = center.x - rootCenter.x;
-          const dy = center.y - rootCenter.y;
-          const length = Math.hypot(dx, dy);
-          if (length < 1) return acc;
-          return { x: acc.x + dx / length, y: acc.y + dy / length };
-        },
-        { x: 0, y: 0 },
+      const anchorCenter = averageCenterForNodes(layout, linkedStructural) || rootCenter;
+      const fallbackAngle = -Math.PI / 2 + ((index + 0.5) / Math.max(abstractNodes.length, 1)) * Math.PI * 2;
+      const angle = angleBetween(rootCenter, anchorCenter, fallbackAngle);
+      placeNodeAvoidingCollisions(
+        layout,
+        node,
+        spiralCandidateCenters(anchorCenter, angle, abstractPlacementDistance(node, linkedStructural)),
+        occupiedRects,
       );
-      const directionLength = Math.hypot(direction.x, direction.y);
-      const angle = directionLength > 0.25
-        ? Math.atan2(direction.y, direction.x)
-        : -Math.PI / 2 + ((index + 0.5) / Math.max(abstractNodes.length, 1)) * Math.PI * 2;
-      const radius = 214 + Math.min(96, Math.max(0, linkedStructural.length - 1) * 18);
-      const offset = ((index % 3) - 1) * 52;
-      setNodeCenter(layout, node, {
-        x: rootCenter.x + Math.cos(angle) * radius + Math.cos(angle + Math.PI / 2) * offset,
-        y: rootCenter.y + Math.sin(angle) * radius + Math.sin(angle + Math.PI / 2) * offset,
-      });
     } else {
       const angle = Math.PI / 5 + (index / Math.max(abstractNodes.length, 1)) * Math.PI * 2;
-      setNodeCenter(layout, node, {
-        x: Math.cos(angle) * 238,
-        y: Math.sin(angle) * 238,
-      });
+      placeNodeAvoidingCollisions(
+        layout,
+        node,
+        spiralCandidateCenters(rootCenter, angle, abstractPlacementDistance(node, [])),
+        occupiedRects,
+      );
     }
     placed.add(node.id);
   });
@@ -599,10 +718,12 @@ function radialHierarchyLayout(nodes, edges) {
   const unplaced = nodes.filter((node) => !placed.has(node.id));
   unplaced.forEach((node, index) => {
     const angle = -Math.PI / 2 + (index / Math.max(unplaced.length, 1)) * Math.PI * 2;
-    setNodeCenter(layout, node, {
-      x: Math.cos(angle) * 460,
-      y: Math.sin(angle) * 460,
-    });
+    placeNodeAvoidingCollisions(
+      layout,
+      node,
+      spiralCandidateCenters(rootCenter, angle, 460),
+      occupiedRects,
+    );
   });
 
   return layout;
@@ -657,14 +778,99 @@ function flowEdgeStyle(edge) {
   };
 }
 
-function toFlowEdges(edges) {
+function prefixedHandleId(type, anchorId) {
+  return `${type}-${anchorId}`;
+}
+
+function anchorPointForNode(layout, node, anchor) {
+  const dimensions = dimensionsForNode(node);
+  const position = layout.get(node.id) || { x: 0, y: 0 };
+  return {
+    x: position.x + dimensions.width * anchor.x,
+    y: position.y + dimensions.height * anchor.y,
+  };
+}
+
+function outwardVectorForPosition(position) {
+  switch (position) {
+    case Position.Top:
+      return { x: 0, y: -1 };
+    case Position.Right:
+      return { x: 1, y: 0 };
+    case Position.Bottom:
+      return { x: 0, y: 1 };
+    case Position.Left:
+      return { x: -1, y: 0 };
+    default:
+      return { x: 0, y: 0 };
+  }
+}
+
+function normalizedVector(vector, fallback = { x: 0, y: 1 }) {
+  const length = Math.hypot(vector.x, vector.y);
+  if (length < 0.001) return fallback;
+  return {
+    x: vector.x / length,
+    y: vector.y / length,
+  };
+}
+
+function dotProduct(left, right) {
+  return left.x * right.x + left.y * right.y;
+}
+
+function closestEdgeHandles(edge, nodeById, layout) {
+  const sourceNode = nodeById.get(edge.from);
+  const targetNode = nodeById.get(edge.to);
+  if (!sourceNode || !targetNode) {
+    return {
+      sourceHandle: prefixedHandleId("source", "bottom"),
+      targetHandle: prefixedHandleId("target", "top"),
+    };
+  }
+
+  const sourceCenter = centerFor(layout, sourceNode);
+  const targetCenter = centerFor(layout, targetNode);
+  const sourceDirection = normalizedVector({
+    x: targetCenter.x - sourceCenter.x,
+    y: targetCenter.y - sourceCenter.y,
+  });
+  const targetDirection = { x: -sourceDirection.x, y: -sourceDirection.y };
+  let best = null;
+
+  for (const sourceAnchor of EDGE_ANCHORS) {
+    const sourcePoint = anchorPointForNode(layout, sourceNode, sourceAnchor);
+    const sourceAlignment = dotProduct(outwardVectorForPosition(sourceAnchor.position), sourceDirection);
+
+    for (const targetAnchor of EDGE_ANCHORS) {
+      const targetPoint = anchorPointForNode(layout, targetNode, targetAnchor);
+      const targetAlignment = dotProduct(outwardVectorForPosition(targetAnchor.position), targetDirection);
+      const distance = Math.hypot(targetPoint.x - sourcePoint.x, targetPoint.y - sourcePoint.y);
+      const alignmentPenalty = (2 - sourceAlignment - targetAlignment) * 42;
+      const score = distance + alignmentPenalty;
+
+      if (!best || score < best.score) {
+        best = { sourceAnchor, targetAnchor, score };
+      }
+    }
+  }
+
+  return {
+    sourceHandle: prefixedHandleId("source", best?.sourceAnchor.id || "bottom"),
+    targetHandle: prefixedHandleId("target", best?.targetAnchor.id || "top"),
+  };
+}
+
+function toFlowEdges(edges, nodes, layout) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
   return edges.map((edge) => ({
     id: edge.id,
     source: edge.from,
     target: edge.to,
+    ...closestEdgeHandles(edge, nodeById, layout),
     type: isContainmentEdge(edge) ? "straight" : "bezier",
     animated: !isContainmentEdge(edge),
-    zIndex: isContainmentEdge(edge) ? 1 : 2,
+    zIndex: 0,
     interactionWidth: 18,
     markerEnd: {
       type: MarkerType.ArrowClosed,
@@ -681,6 +887,16 @@ const INVISIBLE_HANDLE_STYLE = {
   opacity: 0,
   pointerEvents: "none",
 };
+
+function edgeHandleStyle(anchor) {
+  const style = { ...INVISIBLE_HANDLE_STYLE };
+  if (anchor.position === Position.Top || anchor.position === Position.Bottom) {
+    style.left = `${anchor.x * 100}%`;
+  } else {
+    style.top = `${anchor.y * 100}%`;
+  }
+  return style;
+}
 
 export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
@@ -863,6 +1079,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
           id: node.id,
           type: "specGraphNode",
           position: layout.get(node.id) || { x: 0, y: 0 },
+          zIndex: 10,
           data: {
             node,
             onSelect,
@@ -877,7 +1094,7 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
         };
       });
       setFlowNodes(nextNodes);
-      setFlowEdges(toFlowEdges(edges));
+      setFlowEdges(toFlowEdges(edges, nodes, layout));
       if (topologyKey !== lastFitTopologyRef.current) {
         lastFitTopologyRef.current = topologyKey;
         window.requestAnimationFrame(() => {
@@ -922,10 +1139,12 @@ function GraphView({ nodes, edges, selectedNodeId, onSelect, state }) {
         fitViewOptions={{ padding: 0.18, duration: 360 }}
         minZoom={0.18}
         maxZoom={1.8}
+        elevateEdgesOnSelect={false}
         nodesConnectable={false}
         nodesDraggable={false}
         panOnScroll
         proOptions={{ hideAttribution: true }}
+        zIndexMode="manual"
       >
         <Background color="rgba(148, 163, 184, 0.08)" gap={28} size={1} />
         <Controls showInteractive={false} />
@@ -962,8 +1181,26 @@ function SpecGraphNode({ data, selected }) {
         data.onSelect(node.id);
       }}
     >
-      <Handle type="target" position={Position.Top} isConnectable={false} style={INVISIBLE_HANDLE_STYLE} />
-      <Handle type="source" position={Position.Bottom} isConnectable={false} style={INVISIBLE_HANDLE_STYLE} />
+      {EDGE_ANCHORS.map((anchor) => (
+        <Handle
+          key={`target-${anchor.id}`}
+          id={prefixedHandleId("target", anchor.id)}
+          type="target"
+          position={anchor.position}
+          isConnectable={false}
+          style={edgeHandleStyle(anchor)}
+        />
+      ))}
+      {EDGE_ANCHORS.map((anchor) => (
+        <Handle
+          key={`source-${anchor.id}`}
+          id={prefixedHandleId("source", anchor.id)}
+          type="source"
+          position={anchor.position}
+          isConnectable={false}
+          style={edgeHandleStyle(anchor)}
+        />
+      ))}
       {liveAgents.slice(0, MAX_VISIBLE_AGENT_ORBITS).map((agent, index) => (
         <ActiveAgentOrbit
           key={`${node.id}-orbit-${field(agent, "agent_id", "agentId", "id") || index}`}
@@ -1185,11 +1422,15 @@ const FlowFrame = styled.div`
   }
 
   .react-flow__edges {
-    z-index: 3;
+    z-index: 1;
+  }
+
+  .react-flow__nodes {
+    z-index: 2;
   }
 
   .react-flow__edge {
-    z-index: 3 !important;
+    z-index: 1 !important;
   }
 
   .react-flow__edge-path {
