@@ -490,7 +490,7 @@ fn handle_shared_daemon_connection(
     if context.db_path.is_none() {
         context.db_path = Some(db_path);
     }
-    record_mcp_client_event(
+    record_mcp_client_event_async(
         &context,
         "mcp_agent_daemon_connection_opened",
         json!({"transport": "stdio_proxy_tcp", "daemon": "shared"}),
@@ -534,7 +534,7 @@ fn handle_shared_daemon_connection(
 
 pub fn run_shared_daemon_stdio_proxy(args: Vec<String>) -> Result<(), String> {
     let context = McpContext::from_args(&args);
-    record_mcp_client_event(
+    record_mcp_client_event_async(
         &context,
         "mcp_agent_server_started",
         json!({"transport": "stdio_proxy", "daemon": "shared"}),
@@ -793,7 +793,7 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
     }
     match method {
         "initialize" => {
-            record_mcp_client_event(
+            record_mcp_client_event_async(
                 context,
                 "mcp_agent_client_initialized",
                 json!({
@@ -813,7 +813,7 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
             })
         }
         "tools/list" => {
-            record_mcp_client_event(
+            record_mcp_client_event_async(
                 context,
                 "mcp_agent_tools_listed",
                 json!({
@@ -926,6 +926,13 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
             "details": details,
         }),
     );
+}
+
+fn record_mcp_client_event_async(context: &McpContext, event_type: &'static str, details: Value) {
+    let context = context.clone();
+    thread::spawn(move || {
+        record_mcp_client_event(&context, event_type, details);
+    });
 }
 
 pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Value {
