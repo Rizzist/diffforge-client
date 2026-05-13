@@ -44,6 +44,19 @@ function getPositiveNumber(value) {
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 0;
 }
 
+function getContainerResizeSnapshot(container) {
+  if (!container || typeof container.getBoundingClientRect !== "function") {
+    return {};
+  }
+
+  const bounds = container.getBoundingClientRect();
+
+  return {
+    containerHeight: Number(bounds.height),
+    containerWidth: Number(bounds.width),
+  };
+}
+
 export function getTerminalActualCellSize(term) {
   const dimensions = term?._core?._renderService?.dimensions;
   const actualCellWidth = getPositiveNumber(dimensions?.actualCellWidth);
@@ -178,6 +191,7 @@ export function createTerminalResizeController({
   minRows = DEFAULT_MIN_ROWS,
   onDone,
   onError,
+  onSchedule,
   onSkip,
   onStart,
   paneId,
@@ -213,11 +227,26 @@ export function createTerminalResizeController({
       return;
     }
 
+    const normalizedDelayMs = Math.max(0, delayMs);
+    callSafely(onSchedule, {
+      ...getContainerResizeSnapshot(container),
+      canResize: getCanResize(),
+      cols: term.cols,
+      delayMs: normalizedDelayMs,
+      hasDebounceTimer: Boolean(debounceTimer),
+      inFlight,
+      lastAppliedCols: lastAppliedSize?.cols ?? null,
+      lastAppliedRows: lastAppliedSize?.rows ?? null,
+      pendingAfterFlight,
+      reason,
+      rows: term.rows,
+    });
+
     clearDebounce();
     debounceTimer = window.setTimeout(() => {
       debounceTimer = 0;
       resizeNow(reason);
-    }, Math.max(0, delayMs));
+    }, normalizedDelayMs);
   };
 
   const observer = new ResizeObserver(() => {
@@ -232,6 +261,17 @@ export function createTerminalResizeController({
     if (inFlight) {
       pendingAfterFlight = true;
       pendingReason = reason;
+      callSafely(onSkip, {
+        ...getContainerResizeSnapshot(container),
+        cols: term.cols,
+        inFlight: true,
+        lastAppliedCols: lastAppliedSize?.cols ?? null,
+        lastAppliedRows: lastAppliedSize?.rows ?? null,
+        pendingAfterFlight,
+        reason,
+        rows: term.rows,
+        skipped: "in_flight",
+      });
       return false;
     }
 

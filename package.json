@@ -13,6 +13,7 @@
     "build:web": "vite build",
     "package": "tauri build",
     "package:macos:stable": "APPLE_SIGNING_IDENTITY=\"Diff Forge AI Local Development\" tauri build --bundles app",
+    "register:windows:dev-deeplink": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-windows-dev-deeplink.ps1",
     "preview": "vite preview",
     "macos:accessibility:reset": "tccutil reset Accessibility ai.diffforge.desktop",
     "tauri": "tauri",

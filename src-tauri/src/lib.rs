@@ -83,12 +83,14 @@ const TERMINAL_SHUTDOWN_POLL_ATTEMPTS: usize = 40;
 const TERMINAL_SHUTDOWN_POLL_INTERVAL_MS: u64 = 25;
 const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
+const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
-const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = true;
+const TERMINAL_TELEMETRY_LOGGING_ENABLED: bool = false;
+const TERMINAL_RESIZE_LOGGING_ENABLED: bool = false;
 const TERMINAL_PARKED_LOGGING_ENABLED: bool = false;
-const TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED: bool = true;
+const TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED: bool = false;
 const TERMINAL_TELEMETRY_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_LOG_FILE: &str = "terminal-telemetry.jsonl";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
@@ -250,7 +252,7 @@ impl Drop for TerminalState {
                 true,
                 Some(pane_id),
                 "drop_fallback",
-                false,
+                TerminalCoordinationCleanupMode::InterruptAfterProcess,
             );
         }
 
@@ -319,6 +321,23 @@ struct TerminalInstance {
     input_gate: Arc<Mutex<TerminalInputGate>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
+}
+
+#[derive(Clone)]
+struct TerminalCloudMcpCloseContext {
+    working_directory: Arc<PathBuf>,
+    active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
+    coordination: Option<TerminalCoordinationSession>,
+}
+
+impl TerminalCloudMcpCloseContext {
+    fn from_instance(instance: &TerminalInstance) -> Self {
+        Self {
+            working_directory: Arc::clone(&instance.working_directory),
+            active_task: Arc::clone(&instance.active_task),
+            coordination: instance.coordination.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]

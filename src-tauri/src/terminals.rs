@@ -91,7 +91,7 @@ fn write_terminal_telemetry_entries_with_gate(entries: Vec<Value>, enabled: bool
 }
 
 fn write_terminal_telemetry_entries(entries: Vec<Value>) {
-    write_terminal_telemetry_entries_with_gate(entries, TERMINAL_TELEMETRY_LOGGING_ENABLED);
+    write_terminal_telemetry_entries_with_gate(entries, true);
 }
 
 fn write_terminal_telemetry(entry: Value) {
@@ -106,11 +106,24 @@ fn terminal_shutdown_detail_logging_enabled() -> bool {
     TERMINAL_SHUTDOWN_DETAIL_LOGGING_ENABLED
 }
 
+fn terminal_resize_logging_enabled() -> bool {
+    TERMINAL_RESIZE_LOGGING_ENABLED
+}
+
 fn terminal_phase_is_parked_log(phase: &str) -> bool {
     let phase = phase.to_ascii_lowercase();
     phase.contains("parked")
         || phase.contains("parking")
         || phase.ends_with(".partial_park")
+}
+
+fn terminal_phase_is_resize_log(phase: &str) -> bool {
+    phase.to_ascii_lowercase().contains("resize")
+}
+
+fn terminal_phase_logging_enabled(phase: &str) -> bool {
+    TERMINAL_TELEMETRY_LOGGING_ENABLED
+        || (terminal_resize_logging_enabled() && terminal_phase_is_resize_log(phase))
 }
 
 fn log_terminal_event(
@@ -121,6 +134,10 @@ fn log_terminal_event(
     fields: Value,
 ) {
     if !terminal_parked_logging_enabled() && terminal_phase_is_parked_log(phase) {
+        return;
+    }
+
+    if !terminal_phase_logging_enabled(phase) {
         return;
     }
 
@@ -607,7 +624,7 @@ fn interrupt_terminal_coordination_session(
         }),
     );
 
-    let kernel = match crate::coordination::CoordinationKernel::open(
+    let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
         &coordination.repo_path,
         Some(PathBuf::from(&coordination.db_path)),
     ) {
@@ -718,12 +735,419 @@ fn terminal_coordination_session_from_context(
     }
 }
 
+#[derive(Clone, Copy)]
+enum TerminalCoordinationCleanupMode {
+    InterruptAfterProcess,
+    Preserve,
+    DeferToShutdownBatch,
+}
+
+impl TerminalCoordinationCleanupMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InterruptAfterProcess => "interrupt_after_process",
+            Self::Preserve => "preserve",
+            Self::DeferToShutdownBatch => "defer_to_shutdown_batch",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TerminalShutdownCoordinationCleanup {
+    pane_id: String,
+    instance_id: u64,
+    repo_path: String,
+    db_path: String,
+    agent_id: String,
+    session_id: String,
+}
+
+fn terminal_shutdown_coordination_cleanup_from_instance(
+    pane_id: &str,
+    instance: &TerminalInstance,
+) -> Option<TerminalShutdownCoordinationCleanup> {
+    let coordination = instance.coordination.as_ref()?;
+    Some(TerminalShutdownCoordinationCleanup {
+        pane_id: pane_id.to_string(),
+        instance_id: instance.id,
+        repo_path: coordination.repo_path.clone(),
+        db_path: coordination.db_path.clone(),
+        agent_id: coordination.agent_id.clone(),
+        session_id: coordination.session_id.clone(),
+    })
+}
+
+fn cleanup_terminal_shutdown_coordination_batch_with_timeout(
+    cleanups: Vec<TerminalShutdownCoordinationCleanup>,
+    reason: &'static str,
+    timeout: Duration,
+) -> Value {
+    let total = cleanups.len();
+    if total == 0 {
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.close_all.coordination_batch_skipped",
+            None,
+            None,
+            None,
+            json!({
+                "reason": reason,
+                "session_count": 0,
+            }),
+        );
+        return json!({
+            "completed": true,
+            "errors": 0,
+            "groups": 0,
+            "interrupted": 0,
+            "session_count": 0,
+            "timed_out": false,
+        });
+    }
+
+    let wait_started_at = Instant::now();
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.close_all.coordination_batch_wait_start",
+        None,
+        None,
+        None,
+        json!({
+            "reason": reason,
+            "session_count": total,
+            "timeout_ms": timeout.as_secs_f64() * 1000.0,
+        }),
+    );
+    let (summary_tx, summary_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let summary = cleanup_terminal_shutdown_coordination_batch(cleanups, reason);
+        let _ = summary_tx.send(summary);
+    });
+
+    match summary_rx.recv_timeout(timeout) {
+        Ok(summary) => {
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.close_all.coordination_batch_wait_done",
+                None,
+                None,
+                Some(wait_started_at.elapsed()),
+                json!({
+                    "reason": reason,
+                    "summary": summary.clone(),
+                    "timed_out": false,
+                }),
+            );
+            summary
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.close_all.coordination_batch_wait_timeout",
+                None,
+                None,
+                Some(wait_started_at.elapsed()),
+                json!({
+                    "reason": reason,
+                    "session_count": total,
+                    "timeout_ms": timeout.as_secs_f64() * 1000.0,
+                }),
+            );
+            json!({
+                "completed": false,
+                "errors": 0,
+                "groups": null,
+                "interrupted": null,
+                "session_count": total,
+                "timed_out": true,
+            })
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.close_all.coordination_batch_wait_disconnected",
+                None,
+                None,
+                Some(wait_started_at.elapsed()),
+                json!({
+                    "reason": reason,
+                    "session_count": total,
+                }),
+            );
+            json!({
+                "completed": false,
+                "errors": total,
+                "groups": null,
+                "interrupted": 0,
+                "session_count": total,
+                "timed_out": false,
+            })
+        }
+    }
+}
+
+fn cleanup_terminal_shutdown_coordination_batch(
+    cleanups: Vec<TerminalShutdownCoordinationCleanup>,
+    reason: &'static str,
+) -> Value {
+    let batch_started_at = Instant::now();
+    let mut grouped: HashMap<(String, String), Vec<TerminalShutdownCoordinationCleanup>> =
+        HashMap::new();
+    for cleanup in cleanups {
+        grouped
+            .entry((cleanup.repo_path.clone(), cleanup.db_path.clone()))
+            .or_default()
+            .push(cleanup);
+    }
+
+    let group_count = grouped.len();
+    let session_count = grouped.values().map(Vec::len).sum::<usize>();
+    let mut interrupted = 0usize;
+    let mut already_not_active = 0usize;
+    let mut errors = 0usize;
+
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.close_all.coordination_batch_start",
+        None,
+        None,
+        None,
+        json!({
+            "groups": group_count,
+            "reason": reason,
+            "session_count": session_count,
+        }),
+    );
+
+    for ((repo_path, db_path), group) in grouped {
+        let group_started_at = Instant::now();
+        let session_ids = group
+            .iter()
+            .map(|cleanup| cleanup.session_id.clone())
+            .collect::<Vec<_>>();
+
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.close_all.coordination_group_open_start",
+            None,
+            None,
+            None,
+            json!({
+                "db_path": clean_terminal_telemetry_text(&db_path),
+                "repo_path": clean_terminal_telemetry_text(&repo_path),
+                "session_count": session_ids.len(),
+            }),
+        );
+
+        let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
+            &repo_path,
+            Some(PathBuf::from(&db_path)),
+        ) {
+            Ok(kernel) => {
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.close_all.coordination_group_open_done",
+                    None,
+                    None,
+                    Some(group_started_at.elapsed()),
+                    json!({
+                        "db_path": clean_terminal_telemetry_text(&db_path),
+                        "repo_path": clean_terminal_telemetry_text(&repo_path),
+                    }),
+                );
+                kernel
+            }
+            Err(error) => {
+                errors += group.len();
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.close_all.coordination_group_open_error",
+                    None,
+                    None,
+                    Some(group_started_at.elapsed()),
+                    json!({
+                        "db_path": clean_terminal_telemetry_text(&db_path),
+                        "error": clean_terminal_telemetry_text(&error),
+                        "repo_path": clean_terminal_telemetry_text(&repo_path),
+                        "session_count": group.len(),
+                    }),
+                );
+                for cleanup in group {
+                    log_terminal_event(
+                        "terminal.coordination_session_interrupt_error",
+                        Some(&cleanup.pane_id),
+                        Some(cleanup.instance_id),
+                        Some(group_started_at.elapsed()),
+                        json!({
+                            "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
+                            "error": clean_terminal_telemetry_text(&error),
+                            "reason": clean_terminal_telemetry_text(reason),
+                            "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
+                        }),
+                    );
+                }
+                continue;
+            }
+        };
+
+        let interrupt_started_at = Instant::now();
+        match kernel.interrupt_sessions_for_shutdown(&session_ids, reason) {
+            Ok(summary) => {
+                interrupted += summary["interrupted"].as_u64().unwrap_or(0) as usize;
+                already_not_active += summary["already_not_active"].as_u64().unwrap_or(0) as usize;
+                errors += summary["errors"].as_u64().unwrap_or(0) as usize;
+                let mut cleanups_by_session = group
+                    .into_iter()
+                    .map(|cleanup| (cleanup.session_id.clone(), cleanup))
+                    .collect::<HashMap<_, _>>();
+                if let Some(sessions) = summary["sessions"].as_array() {
+                    for session in sessions {
+                        let Some(session_id) = session["session_id"].as_str() else {
+                            continue;
+                        };
+                        let Some(cleanup) = cleanups_by_session.remove(session_id) else {
+                            continue;
+                        };
+                        if session["ok"].as_bool().unwrap_or(false) {
+                            log_terminal_event(
+                                "terminal.coordination_session_interrupted",
+                                Some(&cleanup.pane_id),
+                                Some(cleanup.instance_id),
+                                Some(interrupt_started_at.elapsed()),
+                                json!({
+                                    "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
+                                    "interrupted": session["interrupted"].as_bool().unwrap_or(false),
+                                    "reason": clean_terminal_telemetry_text(reason),
+                                    "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
+                                    "status": session["status"].as_str().unwrap_or("unknown"),
+                                }),
+                            );
+                        } else {
+                            log_terminal_event(
+                                "terminal.coordination_session_interrupt_error",
+                                Some(&cleanup.pane_id),
+                                Some(cleanup.instance_id),
+                                Some(interrupt_started_at.elapsed()),
+                                json!({
+                                    "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
+                                    "error": clean_terminal_telemetry_text(
+                                        session["error"].as_str().unwrap_or("unknown error"),
+                                    ),
+                                    "reason": clean_terminal_telemetry_text(reason),
+                                    "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
+                                }),
+                            );
+                        }
+                    }
+                }
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.close_all.coordination_group_done",
+                    None,
+                    None,
+                    Some(group_started_at.elapsed()),
+                    json!({
+                        "already_not_active": summary["already_not_active"],
+                        "db_path": clean_terminal_telemetry_text(&db_path),
+                        "errors": summary["errors"],
+                        "interrupted": summary["interrupted"],
+                        "repo_path": clean_terminal_telemetry_text(&repo_path),
+                        "session_count": session_ids.len(),
+                    }),
+                );
+            }
+            Err(error) => {
+                errors += group.len();
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.close_all.coordination_group_error",
+                    None,
+                    None,
+                    Some(group_started_at.elapsed()),
+                    json!({
+                        "db_path": clean_terminal_telemetry_text(&db_path),
+                        "error": clean_terminal_telemetry_text(&error),
+                        "repo_path": clean_terminal_telemetry_text(&repo_path),
+                        "session_count": group.len(),
+                    }),
+                );
+                for cleanup in group {
+                    log_terminal_event(
+                        "terminal.coordination_session_interrupt_error",
+                        Some(&cleanup.pane_id),
+                        Some(cleanup.instance_id),
+                        Some(group_started_at.elapsed()),
+                        json!({
+                            "agent_id": clean_terminal_telemetry_text(&cleanup.agent_id),
+                            "error": clean_terminal_telemetry_text(&error),
+                            "reason": clean_terminal_telemetry_text(reason),
+                            "session_id": clean_terminal_telemetry_text(&cleanup.session_id),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    let summary = json!({
+        "already_not_active": already_not_active,
+        "completed": true,
+        "errors": errors,
+        "groups": group_count,
+        "interrupted": interrupted,
+        "session_count": session_count,
+        "timed_out": false,
+    });
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.close_all.coordination_batch_done",
+        None,
+        None,
+        Some(batch_started_at.elapsed()),
+        json!({
+            "reason": reason,
+            "summary": summary.clone(),
+        }),
+    );
+    summary
+}
+
+fn interrupt_terminal_coordination_after_process_cleanup(
+    coordination: Option<&TerminalCoordinationSession>,
+    pane_id: Option<&str>,
+    instance_id: u64,
+    reason: &'static str,
+    coordination_cleanup_mode: TerminalCoordinationCleanupMode,
+) {
+    if !matches!(
+        coordination_cleanup_mode,
+        TerminalCoordinationCleanupMode::InterruptAfterProcess
+    ) {
+        return;
+    }
+
+    let Some(coordination) = coordination else {
+        return;
+    };
+
+    let coordination_started_at = Instant::now();
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cleanup.coordination_interrupt_start",
+        pane_id,
+        Some(instance_id),
+        None,
+        json!({
+            "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+            "reason": reason,
+            "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+        }),
+    );
+    interrupt_terminal_coordination_session(coordination, pane_id, Some(instance_id), reason);
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cleanup.coordination_interrupt_done",
+        pane_id,
+        Some(instance_id),
+        Some(coordination_started_at.elapsed()),
+        json!({
+            "reason": reason,
+        }),
+    );
+}
+
 fn cleanup_terminal_instance_with_context(
     instance: TerminalInstance,
     kill_first: bool,
     pane_id: Option<String>,
     reason: &'static str,
-    preserve_coordination_session: bool,
+    coordination_cleanup_mode: TerminalCoordinationCleanupMode,
 ) {
     let cleanup_started_at = Instant::now();
     let TerminalInstance {
@@ -746,8 +1170,8 @@ fn cleanup_terminal_instance_with_context(
         None,
         json!({
             "app_pid": std::process::id(),
+            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
             "kill_first": kill_first,
-            "preserve_coordination_session": preserve_coordination_session,
             "reason": reason,
         }),
     );
@@ -758,67 +1182,66 @@ fn cleanup_terminal_instance_with_context(
         None,
         json!({
             "app_pid": std::process::id(),
+            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
             "has_coordination": coordination.is_some(),
             "kill_first": kill_first,
-            "preserve_coordination_session": preserve_coordination_session,
             "reason": reason,
         }),
     );
 
-    if let Some(coordination) = coordination
-        .as_ref()
-        .filter(|_| !preserve_coordination_session)
-    {
-        let coordination_started_at = Instant::now();
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.coordination_interrupt_start",
-            pane_id.as_deref(),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                "reason": reason,
-                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            }),
-        );
-        interrupt_terminal_coordination_session(
-            coordination,
-            pane_id.as_deref(),
-            Some(instance_id),
-            reason,
-        );
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.coordination_interrupt_done",
-            pane_id.as_deref(),
-            Some(instance_id),
-            Some(coordination_started_at.elapsed()),
-            json!({
-                "reason": reason,
-            }),
-        );
-    } else if let Some(coordination) = coordination.as_ref() {
-        log_terminal_event(
-            "terminal.coordination_session_preserved",
-            pane_id.as_deref(),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-                "reason": clean_terminal_telemetry_text(reason),
-            }),
-        );
-        log_terminal_shutdown_detail_event(
-            "terminal.shutdown_detail.cleanup.coordination_preserved",
-            pane_id.as_deref(),
-            Some(instance_id),
-            None,
-            json!({
-                "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
-                "reason": reason,
-                "session_id": clean_terminal_telemetry_text(&coordination.session_id),
-            }),
-        );
+    if let Some(coordination) = coordination.as_ref() {
+        match coordination_cleanup_mode {
+            TerminalCoordinationCleanupMode::InterruptAfterProcess => {
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.cleanup.coordination_interrupt_deferred",
+                    pane_id.as_deref(),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                        "reason": reason,
+                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                    }),
+                );
+            }
+            TerminalCoordinationCleanupMode::Preserve => {
+                log_terminal_event(
+                    "terminal.coordination_session_preserved",
+                    pane_id.as_deref(),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                        "reason": clean_terminal_telemetry_text(reason),
+                    }),
+                );
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.cleanup.coordination_preserved",
+                    pane_id.as_deref(),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                        "reason": reason,
+                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                    }),
+                );
+            }
+            TerminalCoordinationCleanupMode::DeferToShutdownBatch => {
+                log_terminal_shutdown_detail_event(
+                    "terminal.shutdown_detail.cleanup.coordination_deferred_to_batch",
+                    pane_id.as_deref(),
+                    Some(instance_id),
+                    None,
+                    json!({
+                        "agent_id": clean_terminal_telemetry_text(&coordination.agent_id),
+                        "reason": reason,
+                        "session_id": clean_terminal_telemetry_text(&coordination.session_id),
+                    }),
+                );
+            }
+        }
     }
 
     let child_take_started_at = Instant::now();
@@ -844,7 +1267,6 @@ fn cleanup_terminal_instance_with_context(
         drop(agent_started);
         drop(input_gate);
         drop(active_task);
-        drop(coordination);
         log_terminal_event(
             "terminal.cleanup.no_child",
             pane_id.as_deref(),
@@ -852,6 +1274,24 @@ fn cleanup_terminal_instance_with_context(
             Some(cleanup_started_at.elapsed()),
             json!({
                 "app_pid": std::process::id(),
+                "reason": reason,
+            }),
+        );
+        interrupt_terminal_coordination_after_process_cleanup(
+            coordination.as_ref(),
+            pane_id.as_deref(),
+            instance_id,
+            reason,
+            coordination_cleanup_mode,
+        );
+        drop(coordination);
+        log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.cleanup.instance_done",
+            pane_id.as_deref(),
+            Some(instance_id),
+            Some(cleanup_started_at.elapsed()),
+            json!({
+                "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
                 "reason": reason,
             }),
         );
@@ -1029,13 +1469,31 @@ fn cleanup_terminal_instance_with_context(
     drop(agent_started);
     drop(input_gate);
     drop(active_task);
-    drop(coordination);
     log_terminal_shutdown_detail_event(
         "terminal.shutdown_detail.cleanup.drop_handles_done",
         pane_id.as_deref(),
         Some(instance_id),
         Some(drop_started_at.elapsed()),
         json!({
+            "pid": pid,
+            "reason": reason,
+        }),
+    );
+    interrupt_terminal_coordination_after_process_cleanup(
+        coordination.as_ref(),
+        pane_id.as_deref(),
+        instance_id,
+        reason,
+        coordination_cleanup_mode,
+    );
+    drop(coordination);
+    log_terminal_shutdown_detail_event(
+        "terminal.shutdown_detail.cleanup.instance_done",
+        pane_id.as_deref(),
+        Some(instance_id),
+        Some(cleanup_started_at.elapsed()),
+        json!({
+            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
             "pid": pid,
             "reason": reason,
         }),
@@ -1050,12 +1508,17 @@ fn cleanup_terminal_instance_async(
     preserve_coordination_session: bool,
 ) {
     thread::spawn(move || {
+        let coordination_cleanup_mode = if preserve_coordination_session {
+            TerminalCoordinationCleanupMode::Preserve
+        } else {
+            TerminalCoordinationCleanupMode::InterruptAfterProcess
+        };
         cleanup_terminal_instance_with_context(
             instance,
             kill_first,
             pane_id,
             reason,
-            preserve_coordination_session,
+            coordination_cleanup_mode,
         );
     });
 }
@@ -1806,13 +2269,13 @@ fn spawn_terminal_reader(
             {
                 let notify_state = cleanup_state.clone();
                 let notify_pane_id = cleanup_pane_id.clone();
-                let notify_instance = instance.clone();
+                let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
                 let notify_task = tauri::async_runtime::spawn(async move {
                     cloud_mcp_mark_terminal_closed(
                         &notify_state,
                         &notify_pane_id,
                         instance_id,
-                        &notify_instance,
+                        &notify_context,
                         "reader_exit",
                     )
                     .await;
@@ -1873,14 +2336,14 @@ async fn close_terminal_session(
         let cleanup_pane_id = pane_id.to_string();
         if let Some(cloud_mcp_state) = cloud_mcp_state {
             let notify_state = cloud_mcp_state.clone();
-            let notify_instance = instance.clone();
+            let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
             let notify_pane_id = pane_id.to_string();
             let notify_task = tauri::async_runtime::spawn(async move {
                 cloud_mcp_mark_terminal_closed(
                     &notify_state,
                     &notify_pane_id,
                     cleanup_instance_id,
-                    &notify_instance,
+                    &notify_context,
                     "terminal_close",
                 )
                 .await;
@@ -1891,12 +2354,17 @@ async fn close_terminal_session(
         }
         let cleanup_task_pane_id = cleanup_pane_id.clone();
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
+            let coordination_cleanup_mode = if preserve_coordination_session {
+                TerminalCoordinationCleanupMode::Preserve
+            } else {
+                TerminalCoordinationCleanupMode::InterruptAfterProcess
+            };
             cleanup_terminal_instance_with_context(
                 instance,
                 true,
                 Some(cleanup_task_pane_id),
                 "terminal_close",
-                preserve_coordination_session,
+                coordination_cleanup_mode,
             );
         });
         if !wait_for_cleanup {
@@ -1993,6 +2461,12 @@ async fn close_all_terminal_sessions(
     let closed = instances.len();
     let total = closed;
     let warm_total = warm_ptys.len();
+    let coordination_cleanups = instances
+        .iter()
+        .filter_map(|(pane_id, instance)| {
+            terminal_shutdown_coordination_cleanup_from_instance(pane_id, instance)
+        })
+        .collect::<Vec<_>>();
 
     log_terminal_shutdown_detail_event(
         "terminal.shutdown_detail.close_all.enter",
@@ -2014,39 +2488,41 @@ async fn close_all_terminal_sessions(
         None,
         json!({
             "active_count": closed,
-            "timeout_ms": 2_000,
+            "detached": true,
         }),
     );
-    let lifecycle_notifications = instances
+    let lifecycle_scheduled = instances
         .iter()
         .map(|(pane_id, instance)| {
             let notify_state = cloud_mcp_state.clone();
             let notify_pane_id = pane_id.clone();
-            let notify_instance = instance.clone();
+            let notify_instance_id = instance.id;
+            let has_coordination = instance.coordination.is_some();
+            let notify_context = TerminalCloudMcpCloseContext::from_instance(instance);
             tauri::async_runtime::spawn(async move {
                 let notify_started_at = Instant::now();
                 log_terminal_shutdown_detail_event(
                     "terminal.shutdown_detail.close_all.lifecycle_notify_start",
                     Some(&notify_pane_id),
-                    Some(notify_instance.id),
+                    Some(notify_instance_id),
                     None,
                     json!({
-                        "has_coordination": notify_instance.coordination.is_some(),
+                        "has_coordination": has_coordination,
                         "reason": "close_all",
                     }),
                 );
                 cloud_mcp_mark_terminal_closed(
                     &notify_state,
                     &notify_pane_id,
-                    notify_instance.id,
-                    &notify_instance,
+                    notify_instance_id,
+                    &notify_context,
                     "close_all",
                 )
                 .await;
                 log_terminal_shutdown_detail_event(
                     "terminal.shutdown_detail.close_all.lifecycle_notify_done",
                     Some(&notify_pane_id),
-                    Some(notify_instance.id),
+                    Some(notify_instance_id),
                     Some(notify_started_at.elapsed()),
                     json!({
                         "reason": "close_all",
@@ -2054,30 +2530,15 @@ async fn close_all_terminal_sessions(
                 );
             })
         })
-        .collect::<Vec<_>>();
-    let lifecycle_wait = tokio::time::timeout(
-        Duration::from_millis(2_000),
-        futures_util::future::join_all(lifecycle_notifications),
-    )
-    .await;
-    let (lifecycle_completed, lifecycle_join_errors, lifecycle_timed_out) = match lifecycle_wait {
-        Ok(results) => (
-            results.len(),
-            results.iter().filter(|result| result.is_err()).count(),
-            false,
-        ),
-        Err(_) => (0, 0, true),
-    };
+        .count();
     log_terminal_shutdown_detail_event(
-        "terminal.shutdown_detail.close_all.lifecycle_notifications_done",
+        "terminal.shutdown_detail.close_all.lifecycle_notifications_scheduled",
         None,
         None,
         Some(lifecycle_started_at.elapsed()),
         json!({
-            "completed": lifecycle_completed,
-            "join_errors": lifecycle_join_errors,
-            "timed_out": lifecycle_timed_out,
-            "timeout_ms": 2_000,
+            "detached": true,
+            "scheduled": lifecycle_scheduled,
         }),
     );
 
@@ -2113,6 +2574,7 @@ async fn close_all_terminal_sessions(
             json!({
                 "active_count": total,
                 "app_pid": std::process::id(),
+                "coordination_count": coordination_cleanups.len(),
                 "warm_count": warm_total,
             }),
         );
@@ -2140,7 +2602,7 @@ async fn close_all_terminal_sessions(
                     true,
                     Some(pane_id.clone()),
                     "close_all",
-                    false,
+                    TerminalCoordinationCleanupMode::DeferToShutdownBatch,
                 );
                 log_terminal_shutdown_detail_event(
                     "terminal.shutdown_detail.close_all.active_cleanup_thread_done",
@@ -2354,6 +2816,34 @@ async fn close_all_terminal_sessions(
             }
         }
 
+        let coordination_summary = if timed_out {
+            log_terminal_shutdown_detail_event(
+                "terminal.shutdown_detail.close_all.coordination_batch_skipped",
+                None,
+                None,
+                Some(wait_started_at.elapsed()),
+                json!({
+                    "reason": "cleanup_wait_timed_out",
+                    "session_count": coordination_cleanups.len(),
+                }),
+            );
+            json!({
+                "completed": false,
+                "errors": 0,
+                "groups": null,
+                "interrupted": null,
+                "session_count": coordination_cleanups.len(),
+                "skipped_reason": "cleanup_wait_timed_out",
+                "timed_out": false,
+            })
+        } else {
+            cleanup_terminal_shutdown_coordination_batch_with_timeout(
+                coordination_cleanups,
+                "close_all",
+                Duration::from_millis(TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS),
+            )
+        };
+
         let refill_idle = if timed_out {
             false
         } else {
@@ -2409,6 +2899,7 @@ async fn close_all_terminal_sessions(
                 "app_pid": std::process::id(),
                 "closed": active_done,
                 "console_hosts_closed": console_hosts_closed,
+                "coordination": coordination_summary.clone(),
                 "detached_active": total.saturating_sub(active_done),
                 "detached_warm": warm_total.saturating_sub(warm_done),
                 "login_closed": login_closed,
@@ -2427,6 +2918,7 @@ async fn close_all_terminal_sessions(
                 "active_done": active_done,
                 "active_total": total,
                 "console_hosts_closed": console_hosts_closed,
+                "coordination": coordination_summary.clone(),
                 "login_closed": login_closed,
                 "refill_idle": refill_idle,
                 "timed_out": timed_out,
@@ -2441,12 +2933,20 @@ async fn close_all_terminal_sessions(
             console_hosts_closed,
             refill_idle,
             timed_out,
+            coordination_summary,
         )
     })
     .await
     .map_err(|error| format!("Unable to join terminal shutdown cleanup: {error}"))?;
-    let (active_done, warm_done, login_closed, console_hosts_closed, refill_idle, timed_out) =
-        cleanup_summary;
+    let (
+        active_done,
+        warm_done,
+        login_closed,
+        console_hosts_closed,
+        refill_idle,
+        timed_out,
+        coordination_summary,
+    ) = cleanup_summary;
     log_terminal_shutdown_detail_event(
         "terminal.shutdown_detail.close_all.cleanup_worker_join_done",
         None,
@@ -2457,6 +2957,7 @@ async fn close_all_terminal_sessions(
             "closed": closed,
             "cleanup_detached": timed_out,
             "console_hosts_closed": console_hosts_closed,
+            "coordination": coordination_summary.clone(),
             "login_closed": login_closed,
             "refill_idle": refill_idle,
             "warm_closed": warm_done,
@@ -2474,6 +2975,7 @@ async fn close_all_terminal_sessions(
             "app_pid": std::process::id(),
             "closed": closed,
             "console_hosts_closed": console_hosts_closed,
+            "coordination": coordination_summary,
             "warm_closed": warm_done,
             "warm_total": warm_total,
             "login_closed": login_closed,
@@ -3009,6 +3511,10 @@ fn terminal_telemetry_entry(request: TerminalTelemetryLogRequest) -> Option<Valu
     }
 
     if !terminal_parked_logging_enabled() && terminal_phase_is_parked_log(&request.phase) {
+        return None;
+    }
+
+    if !terminal_phase_logging_enabled(&request.phase) {
         return None;
     }
 
@@ -6642,14 +7148,32 @@ async fn terminal_interrupt_agent(
     Ok(())
 }
 
+struct TerminalResizeApplyResult {
+    applied: bool,
+    previous_cols: u16,
+    previous_rows: u16,
+    next_cols: u16,
+    next_rows: u16,
+}
+
 async fn resize_terminal_instance(
     instance: &TerminalInstance,
     size: PtySize,
-) -> Result<bool, String> {
+) -> Result<TerminalResizeApplyResult, String> {
     let mut current_size = instance.size.lock().await;
+    let previous_cols = current_size.cols;
+    let previous_rows = current_size.rows;
+    let next_cols = size.cols;
+    let next_rows = size.rows;
 
     if *current_size == size {
-        return Ok(false);
+        return Ok(TerminalResizeApplyResult {
+            applied: false,
+            previous_cols,
+            previous_rows,
+            next_cols,
+            next_rows,
+        });
     }
 
     let master = instance.master.lock().await;
@@ -6659,7 +7183,13 @@ async fn resize_terminal_instance(
         .map_err(|error| format!("Unable to resize terminal: {error}"))?;
     *current_size = size;
 
-    Ok(true)
+    Ok(TerminalResizeApplyResult {
+        applied: true,
+        previous_cols,
+        previous_rows,
+        next_cols,
+        next_rows,
+    })
 }
 
 async fn resolve_terminal_for_resize(
@@ -6718,10 +7248,41 @@ async fn resize_terminal(
         json!({ "cols": cols, "rows": rows }),
     );
 
-    let size = validate_terminal_size(cols, rows)?;
-    let Some((resolved_pane_id, instance)) =
-        resolve_terminal_for_resize(&state, pane_id.clone(), instance_id).await?
-    else {
+    let size = match validate_terminal_size(cols, rows) {
+        Ok(size) => size,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize_terminal.invalid_size",
+                pane_id.as_deref(),
+                instance_id,
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let resolved = match resolve_terminal_for_resize(&state, pane_id.clone(), instance_id).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize_terminal.resolve_error",
+                pane_id.as_deref(),
+                instance_id,
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let Some((resolved_pane_id, instance)) = resolved else {
         log_terminal_event(
             "terminal.resize_terminal.skipped_stale",
             pane_id.as_deref(),
@@ -6732,13 +7293,37 @@ async fn resize_terminal(
         return Ok(());
     };
 
-    let applied = resize_terminal_instance(&instance, size).await?;
+    let resize_result = match resize_terminal_instance(&instance, size).await {
+        Ok(result) => result,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize_terminal.apply_error",
+                Some(&resolved_pane_id),
+                Some(instance.id),
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
     log_terminal_event(
         "terminal.resize_terminal.done",
         Some(&resolved_pane_id),
         Some(instance.id),
         Some(resize_started_at.elapsed()),
-        json!({ "cols": cols, "rows": rows, "applied": applied }),
+        json!({
+            "applied": resize_result.applied,
+            "cols": cols,
+            "next_cols": resize_result.next_cols,
+            "next_rows": resize_result.next_rows,
+            "previous_cols": resize_result.previous_cols,
+            "previous_rows": resize_result.previous_rows,
+            "rows": rows,
+        }),
     );
 
     Ok(())
@@ -6759,17 +7344,86 @@ async fn terminal_resize(
         None,
         json!({ "cols": cols, "rows": rows }),
     );
-    validate_terminal_pane_id(&pane_id)?;
+    if let Err(error) = validate_terminal_pane_id(&pane_id) {
+        log_terminal_event(
+            "terminal.resize.invalid_pane",
+            Some(&pane_id),
+            None,
+            Some(resize_started_at.elapsed()),
+            json!({
+                "cols": cols,
+                "error": clean_terminal_telemetry_text(&error),
+                "rows": rows,
+            }),
+        );
+        return Err(error);
+    }
 
-    let size = validate_terminal_size(cols, rows)?;
-    let instance = get_terminal_instance(&state, &pane_id).await?;
-    let applied = resize_terminal_instance(&instance, size).await?;
+    let size = match validate_terminal_size(cols, rows) {
+        Ok(size) => size,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize.invalid_size",
+                Some(&pane_id),
+                None,
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let instance = match get_terminal_instance(&state, &pane_id).await {
+        Ok(instance) => instance,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize.resolve_error",
+                Some(&pane_id),
+                None,
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let resize_result = match resize_terminal_instance(&instance, size).await {
+        Ok(result) => result,
+        Err(error) => {
+            log_terminal_event(
+                "terminal.resize.apply_error",
+                Some(&pane_id),
+                Some(instance.id),
+                Some(resize_started_at.elapsed()),
+                json!({
+                    "cols": cols,
+                    "error": clean_terminal_telemetry_text(&error),
+                    "rows": rows,
+                }),
+            );
+            return Err(error);
+        }
+    };
     log_terminal_event(
         "terminal.resize.done",
         Some(&pane_id),
         Some(instance.id),
         Some(resize_started_at.elapsed()),
-        json!({ "cols": cols, "rows": rows, "applied": applied }),
+        json!({
+            "applied": resize_result.applied,
+            "cols": cols,
+            "next_cols": resize_result.next_cols,
+            "next_rows": resize_result.next_rows,
+            "previous_cols": resize_result.previous_cols,
+            "previous_rows": resize_result.previous_rows,
+            "rows": rows,
+        }),
     );
 
     Ok(())

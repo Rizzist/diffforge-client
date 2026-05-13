@@ -6,6 +6,8 @@ import { TerminalDevMetric, TerminalDevMetricsBar } from "../app/appStyles";
 const TERMINAL_METRICS_NOTIFY_MS = 250;
 const TERMINAL_TELEMETRY_FLUSH_MS = 60;
 const TERMINAL_TELEMETRY_MAX_BATCH = 80;
+const TERMINAL_TELEMETRY_LOGGING_ENABLED = false;
+const TERMINAL_RESIZE_TELEMETRY_LOGGING_ENABLED = false;
 
 const pendingTerminalTelemetry = [];
 const terminalMetricsSubscribers = new Set();
@@ -111,6 +113,15 @@ export function addTerminalMetrics(delta) {
   emitTerminalMetricsSoon();
 }
 
+function isTerminalResizeTelemetryPhase(phase) {
+  return String(phase || "").toLowerCase().includes("resize");
+}
+
+export function isTerminalTelemetryPhaseEnabled(phase) {
+  return TERMINAL_TELEMETRY_LOGGING_ENABLED
+    || (TERMINAL_RESIZE_TELEMETRY_LOGGING_ENABLED && isTerminalResizeTelemetryPhase(phase));
+}
+
 function subscribeTerminalMetrics(subscriber) {
   terminalMetricsSubscribers.add(subscriber);
   subscriber(getTerminalMetricsSnapshot());
@@ -138,6 +149,10 @@ export function writeTerminalTelemetry({
   elapsedMs,
   fields = {},
 }) {
+  if (!isTerminalTelemetryPhaseEnabled(phase)) {
+    return;
+  }
+
   pendingTerminalTelemetry.push({
     tsMs: Date.now(),
     paneId,

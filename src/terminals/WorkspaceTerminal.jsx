@@ -324,7 +324,13 @@ import {
   getTerminalActualCellSize,
   measureTerminalGrid,
 } from "./terminalResizeController";
-import { addTerminalMetrics, getWorkspaceOpenTelemetryFields, patchTerminalMetrics, writeTerminalTelemetry } from "./terminalTelemetry.jsx";
+import {
+  addTerminalMetrics,
+  getWorkspaceOpenTelemetryFields,
+  isTerminalTelemetryPhaseEnabled,
+  patchTerminalMetrics,
+  writeTerminalTelemetry,
+} from "./terminalTelemetry.jsx";
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
@@ -1531,10 +1537,35 @@ export default function WorkspaceTerminal({
   const projectBadgeTitle = isGenericTerminal
     ? `${projectLabel} - generic shell with normal terminal controls`
     : `${projectLabel} - edits are isolated in the agent worktree until merge`;
+  const focusTerminalKeyboardInput = useCallback(() => {
+    const terminal = xtermRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    try {
+      terminal.focus();
+    } catch (_) {
+      return;
+    }
+
+    window.setTimeout(() => {
+      if (terminal !== xtermRef.current) {
+        return;
+      }
+
+      try {
+        terminal.focus();
+      } catch (_) {
+        // Terminal may have been disposed between activation and the deferred focus pass.
+      }
+    }, 0);
+  }, []);
   const selectTerminalPane = useCallback(() => {
     const instanceId = terminalInstanceIdRef.current || 0;
     setActiveTerminalKeyboardTarget(paneId, instanceId);
     setTerminalFocused(true);
+    focusTerminalKeyboardInput();
     window.dispatchEvent(new CustomEvent(TERMINAL_ACTIVE_PANE_EVENT, {
       detail: {
         instanceId,
@@ -1543,7 +1574,7 @@ export default function WorkspaceTerminal({
         workspaceId: workspace?.id || "",
       },
     }));
-  }, [paneId, terminalIndex, workspace?.id]);
+  }, [focusTerminalKeyboardInput, paneId, terminalIndex, workspace?.id]);
   const requestTerminalAudioInputTarget = useCallback((active) => {
     const instanceId = terminalInstanceIdRef.current || undefined;
 
@@ -1930,6 +1961,7 @@ export default function WorkspaceTerminal({
       }
 
       if (!isDisposed) {
+        focusTerminalKeyboardInput();
         requestTerminalAudioInputTarget(true);
       }
     };
@@ -2453,6 +2485,18 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      const isResizeProbe = `${reason || ""} ${extraFields.resizeReason || ""}`
+        .toLowerCase()
+        .includes("resize");
+      const probePhase = isResizeProbe ? "frontend.resize.render_probe" : "frontend.render.probe";
+      const blankPhase = isResizeProbe
+        ? "frontend.resize.possible_visual_blank"
+        : "frontend.render.possible_visual_blank";
+
+      if (!isTerminalTelemetryPhaseEnabled(probePhase) && !isTerminalTelemetryPhaseEnabled(blankPhase)) {
+        return;
+      }
+
       let renderDiagnostics = {};
 
       try {
@@ -2466,7 +2510,7 @@ export default function WorkspaceTerminal({
       writeTerminalTelemetry({
         paneId,
         instanceId: terminalInstanceId,
-        phase: "frontend.render.probe",
+        phase: probePhase,
         cols: terminal.cols,
         rows: terminal.rows,
         fields: {
@@ -2483,7 +2527,7 @@ export default function WorkspaceTerminal({
         writeTerminalTelemetry({
           paneId,
           instanceId: terminalInstanceId,
-          phase: "frontend.render.possible_visual_blank",
+          phase: blankPhase,
           cols: terminal.cols,
           rows: terminal.rows,
           fields: {
@@ -2518,6 +2562,10 @@ export default function WorkspaceTerminal({
         return;
       }
 
+      if (!isTerminalTelemetryPhaseEnabled("frontend.resize.render_probe")) {
+        return;
+      }
+
       TERMINAL_RESIZE_DEBUG_PROBE_DELAYS_MS.forEach((delayMs) => {
         const timer = window.setTimeout(() => {
           resizeDebugProbeTimers.delete(timer);
@@ -2540,6 +2588,13 @@ export default function WorkspaceTerminal({
 
     const scheduleResizeIdleDebugProbes = (extraFields = {}) => {
       if (isDisposed) {
+        return;
+      }
+
+      if (
+        !isTerminalTelemetryPhaseEnabled("frontend.resize.idle")
+        && !isTerminalTelemetryPhaseEnabled("frontend.resize.render_probe")
+      ) {
         return;
       }
 
@@ -2777,7 +2832,7 @@ export default function WorkspaceTerminal({
       writeTerminalTelemetry({
         paneId,
         instanceId: terminalInstanceId,
-        phase: "frontend.xterm.render",
+        phase: "frontend.resize.xterm_render",
         cols: terminal.cols,
         rows: terminal.rows,
         fields: {
@@ -3298,6 +3353,28 @@ export default function WorkspaceTerminal({
           },
         });
       },
+      onSchedule: (event) => {
+        writeTerminalTelemetry({
+          paneId,
+          instanceId: terminalInstanceId,
+          phase: "frontend.resize.schedule",
+          cols: event.cols,
+          rows: event.rows,
+          fields: {
+            canResize: event.canResize,
+            containerHeight: Math.round(event.containerHeight || 0),
+            containerWidth: Math.round(event.containerWidth || 0),
+            delayMs: event.delayMs,
+            hasDebounceTimer: event.hasDebounceTimer,
+            inFlight: event.inFlight,
+            lastAppliedCols: event.lastAppliedCols,
+            lastAppliedRows: event.lastAppliedRows,
+            pendingAfterFlight: event.pendingAfterFlight,
+            reason: event.reason,
+            terminalIndex,
+          },
+        });
+      },
       onSkip: (event) => {
         writeTerminalTelemetry({
           paneId,
@@ -3310,7 +3387,11 @@ export default function WorkspaceTerminal({
             actualCellWidth: event.actualCellWidth ?? null,
             containerHeight: Math.round(event.containerHeight || 0),
             containerWidth: Math.round(event.containerWidth || 0),
+            inFlight: event.inFlight,
+            lastAppliedCols: event.lastAppliedCols ?? null,
+            lastAppliedRows: event.lastAppliedRows ?? null,
             metricSource: event.metricSource ?? null,
+            pendingAfterFlight: event.pendingAfterFlight,
             reason: event.reason,
             skipped: event.skipped,
             terminalIndex,
@@ -3948,6 +4029,7 @@ export default function WorkspaceTerminal({
             initialCols: initialSize.cols,
             initialRows: initialSize.rows,
             reason,
+            resizeReason: "agent_launch_done",
           });
           scheduleBlankStartupWatch("agent_launch_done");
         };
@@ -4155,6 +4237,7 @@ export default function WorkspaceTerminal({
           initialCols: initialSize.cols,
           initialRows: initialSize.rows,
           prewarmShell: shouldPrewarmShell,
+          resizeReason: "terminal_open_done",
         });
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);

@@ -1820,7 +1820,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     state: &CloudMcpState,
     pane_id: &str,
     instance_id: u64,
-    instance: &TerminalInstance,
+    close_context: &TerminalCloudMcpCloseContext,
     reason: &str,
 ) {
     let closed_started_at = Instant::now();
@@ -1859,12 +1859,12 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         }),
     );
 
-    let coordination = instance.coordination.as_ref();
-    let working_directory = instance.working_directory.as_ref();
+    let coordination = close_context.coordination.as_ref();
+    let working_directory = close_context.working_directory.as_ref();
     let agent_id = cloud_mcp_terminal_agent_id(pane_id, instance_id, coordination);
     let repo_id = cloud_mcp_terminal_repo_id(working_directory, coordination);
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
-    let active_task = instance.active_task.lock().await.clone();
+    let active_task = close_context.active_task.lock().await.clone();
     let context_entry = {
         let runtime = state.inner.lock().await;
         runtime.terminal_contexts.get(&terminal_key).cloned()

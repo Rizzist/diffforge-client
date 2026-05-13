@@ -33,6 +33,7 @@ use super::{
 
 const SESSION_STALE_SECONDS: i64 = 1800;
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 1800;
+const SHUTDOWN_COORDINATION_BUSY_TIMEOUT_MS: u64 = 250;
 const INTEGRATION_BRANCH: &str = "diff-forge/integration";
 const INTEGRATION_WORKTREE_NAME: &str = "diff-forge-integration";
 const INTEGRATION_WORKTREE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -306,6 +307,18 @@ impl CoordinationKernel {
         }
     }
 
+    pub fn open_for_shutdown_cleanup(
+        repo_path: impl AsRef<Path>,
+        db_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let repo_path = canonical_repo_path(repo_path)?;
+        let paths = StoragePaths::new(repo_path, db_path);
+        Self::open_lightweight_with_paths_and_timeout(
+            paths,
+            Duration::from_millis(SHUTDOWN_COORDINATION_BUSY_TIMEOUT_MS),
+        )
+    }
+
     fn init_with_options(
         repo_path: impl AsRef<Path>,
         db_path: Option<PathBuf>,
@@ -383,6 +396,13 @@ impl CoordinationKernel {
     }
 
     fn open_lightweight_with_paths(paths: StoragePaths) -> Result<Self, String> {
+        Self::open_lightweight_with_paths_and_timeout(paths, Duration::from_millis(30_000))
+    }
+
+    fn open_lightweight_with_paths_and_timeout(
+        paths: StoragePaths,
+        busy_timeout: Duration,
+    ) -> Result<Self, String> {
         if !paths.db_path.exists() {
             return Err(format!(
                 "Coordination database does not exist: {}",
@@ -392,7 +412,7 @@ impl CoordinationKernel {
 
         let conn = Connection::open(&paths.db_path)
             .map_err(|error| format!("Unable to open {}: {error}", paths.db_path.display()))?;
-        conn.busy_timeout(Duration::from_millis(30_000))
+        conn.busy_timeout(busy_timeout)
             .map_err(|error| format!("Unable to set SQLite busy timeout: {error}"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("Unable to enable SQLite foreign keys: {error}"))?;
@@ -3984,6 +4004,80 @@ impl CoordinationKernel {
             "interrupted": true,
             "expired_leases": active_leases.len(),
             "interrupted_worktrees": active_worktrees.len(),
+        }))
+    }
+
+    pub fn interrupt_sessions_for_shutdown(
+        &self,
+        session_ids: &[String],
+        reason: &str,
+    ) -> Result<Value, String> {
+        let batch_started_at = Instant::now();
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_shutdown_batch.enter",
+            None,
+            None,
+            None,
+            json!({
+                "db_path": self.paths.db_path.display().to_string(),
+                "reason": reason,
+                "session_count": session_ids.len(),
+            }),
+        );
+
+        let mut sessions = Vec::new();
+        let mut interrupted = 0usize;
+        let mut already_not_active = 0usize;
+        let mut errors = 0usize;
+
+        for session_id in session_ids {
+            match self.interrupt_session(session_id, reason) {
+                Ok(result) => {
+                    let was_interrupted = result["interrupted"].as_bool().unwrap_or(false);
+                    if was_interrupted {
+                        interrupted += 1;
+                    } else {
+                        already_not_active += 1;
+                    }
+                    sessions.push(json!({
+                        "ok": true,
+                        "interrupted": was_interrupted,
+                        "session_id": session_id,
+                        "status": result["status"].as_str().unwrap_or("unknown"),
+                    }));
+                }
+                Err(error) => {
+                    errors += 1;
+                    sessions.push(json!({
+                        "ok": false,
+                        "error": error,
+                        "session_id": session_id,
+                    }));
+                }
+            }
+        }
+
+        crate::log_terminal_shutdown_detail_event(
+            "terminal.shutdown_detail.kernel_shutdown_batch.done",
+            None,
+            None,
+            Some(batch_started_at.elapsed()),
+            json!({
+                "already_not_active": already_not_active,
+                "db_path": self.paths.db_path.display().to_string(),
+                "errors": errors,
+                "interrupted": interrupted,
+                "reason": reason,
+                "session_count": session_ids.len(),
+            }),
+        );
+
+        Ok(json!({
+            "already_not_active": already_not_active,
+            "errors": errors,
+            "interrupted": interrupted,
+            "sessions": sessions,
+            "total": session_ids.len(),
         }))
     }
 
