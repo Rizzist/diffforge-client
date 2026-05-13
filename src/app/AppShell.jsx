@@ -1629,6 +1629,22 @@ function removeLogicalTerminalFromDisplayRows(rows, terminalIndex) {
     .filter((row) => row.length);
 }
 
+function getWorkspaceDisplayRowValues(rows) {
+  return normalizeWorkspaceDisplayTerminalRows(rows, flattenWorkspaceDisplayRows(rows))
+    .map((row) => row.terminalIndexes.slice());
+}
+
+function areWorkspaceDisplayRowsEqual(leftRows, rightRows) {
+  const leftValues = getWorkspaceDisplayRowValues(leftRows);
+  const rightValues = getWorkspaceDisplayRowValues(rightRows);
+
+  return leftValues.length === rightValues.length
+    && leftValues.every((leftRow, rowIndex) => (
+      leftRow.length === rightValues[rowIndex].length
+      && leftRow.every((terminalIndex, columnIndex) => terminalIndex === rightValues[rowIndex][columnIndex])
+    ));
+}
+
 function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const nextSettings = { ...(settings || {}) };
 
@@ -3257,6 +3273,49 @@ export default function App() {
     workspaceTerminalRoleOptions,
   ]);
 
+  const reorderWorkspaceTerminalDisplayLayout = useCallback(({ displayRows, workspaceId }) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const logicalIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+
+    if (!logicalIndexes.length) {
+      return;
+    }
+
+    const nextDisplayRows = getWorkspaceDisplayTerminalRows(
+      { [workspaceId]: displayRows },
+      workspaceId,
+      logicalIndexes,
+    ).map((row) => row.terminalIndexes.slice());
+    const currentDisplayRows = getWorkspaceDisplayTerminalRows(
+      currentDisplayLayouts,
+      workspaceId,
+      logicalIndexes,
+    ).map((row) => row.terminalIndexes.slice());
+
+    if (areWorkspaceDisplayRowsEqual(currentDisplayRows, nextDisplayRows)) {
+      return;
+    }
+
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
+    };
+
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+  }, []);
+
   const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, workspaceId }) => {
     if (!workspaceId) {
       return;
@@ -4778,6 +4837,7 @@ export default function App() {
                       createFirstWorkspace={createFirstWorkspace}
                       handlePreparedTerminalChange={handlePreparedTerminalChange}
                       refreshAgentStatuses={refreshAgentStatuses}
+                      reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
                       setWorkspaceName={setWorkspaceName}
                       shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
                       shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}

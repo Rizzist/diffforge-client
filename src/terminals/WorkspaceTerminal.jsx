@@ -294,6 +294,7 @@ import {
   TitleRestoreIcon,
   TitleCloseIcon,
   ButtonRefreshIcon,
+  ButtonDragIcon,
   ButtonSplitHorizontalIcon,
   ButtonSplitVerticalIcon,
   ButtonFullscreenIcon,
@@ -1735,6 +1736,7 @@ function WorkspaceTerminal({
   onOpenSettings,
   onPreparedTerminalChange,
   onRecheckAgents,
+  onBeginTerminalDrag,
   onSplitTerminal,
   onToggleFullscreenTerminal,
   prewarmShell = false,
@@ -4226,6 +4228,43 @@ function WorkspaceTerminal({
     terminalIndex,
     workspace?.id,
   ]);
+  const beginTerminalDrag = useCallback((event) => {
+    if (
+      terminalClosed
+      || terminalClosing
+      || isFullscreen
+      || terminalCount <= 1
+      || event.button !== 0
+    ) {
+      return;
+    }
+
+    const surfaceElement = surfaceRef.current;
+    const panelElement = surfaceElement?.parentElement || null;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    onBeginTerminalDrag?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      paneId,
+      panelRect: getPlainDomRect(panelElement?.getBoundingClientRect?.()),
+      pointerId: event.pointerId,
+      surfaceRect: getPlainDomRect(surfaceElement?.getBoundingClientRect?.()),
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    isFullscreen,
+    onBeginTerminalDrag,
+    paneId,
+    terminalClosed,
+    terminalClosing,
+    terminalCount,
+    terminalIndex,
+    workspace?.id,
+  ]);
 
   const terminalStatusErrorDetails = [
     workspaceError,
@@ -4317,6 +4356,16 @@ function WorkspaceTerminal({
           data-slot={getTerminalAgentColorSlot(terminalIndex)}
           title={terminalAgentTitle}
         />
+        <TerminalRestartButton
+          aria-label="Drag terminal"
+          data-terminal-drag-handle="true"
+          disabled={terminalClosed || terminalClosing || isFullscreen || terminalCount <= 1}
+          onPointerDown={beginTerminalDrag}
+          title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
+          type="button"
+        >
+          <ButtonDragIcon aria-hidden="true" />
+        </TerminalRestartButton>
         <TerminalRestartButton
           aria-label="Split terminal horizontally"
           disabled={terminalClosed || terminalClosing || !canSplitTerminal}

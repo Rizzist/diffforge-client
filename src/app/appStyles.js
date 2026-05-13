@@ -10,6 +10,7 @@ import { Code } from "@styled-icons/material-rounded/Code";
 import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
+import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { FolderOpen } from "@styled-icons/material-rounded/FolderOpen";
@@ -2016,7 +2017,16 @@ export const WorkspaceTerminalPanels = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND};
   }
 
+  &[data-terminal-dragging="true"] {
+    overflow: visible;
+    cursor: grabbing;
+  }
+
   &[data-terminal-fullscreen="true"] [data-panel] {
+    overflow: visible !important;
+  }
+
+  &[data-terminal-dragging="true"] [data-panel] {
     overflow: visible !important;
   }
 
@@ -2763,6 +2773,14 @@ export const TerminalRestartButton = styled.button`
     cursor: not-allowed;
     opacity: 0.3;
     transform: none;
+  }
+
+  &[data-terminal-drag-handle="true"]:not(:disabled) {
+    cursor: grab;
+  }
+
+  &[data-terminal-drag-handle="true"]:active:not(:disabled) {
+    cursor: grabbing;
   }
 `;
 
@@ -7947,6 +7965,10 @@ export const ButtonSplitHorizontalIcon = styled(LayoutSplit)`
 `;
 
 export const ButtonSplitVerticalIcon = styled(LayoutRow)`
+  ${buttonIconSize}
+`;
+
+export const ButtonDragIcon = styled(DragIndicator)`
   ${buttonIconSize}
 `;
 
