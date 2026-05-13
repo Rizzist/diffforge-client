@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import styled from "styled-components";
 
@@ -537,7 +537,7 @@ function CloudMcpTerminalDock({ workingDirectory }) {
   );
 }
 
-export default function TerminalView({
+function TerminalView({
   terminalWorkspace,
   terminalAgentsByIndex = {},
   terminalRolesByIndex = {},
@@ -568,15 +568,15 @@ export default function TerminalView({
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
   const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && terminalPanelRows.length > 0;
   const [activeTerminalPaneId, setActiveTerminalPaneId] = useState("");
-  const getTerminalAgent = (terminalIndex) => (
+  const getTerminalAgent = useCallback((terminalIndex) => (
     Object.prototype.hasOwnProperty.call(terminalAgentsByIndex, terminalIndex)
       ? terminalAgentsByIndex[terminalIndex]
       : workspaceTerminalRenderAgent
-  );
-  const getTerminalRole = (terminalIndex) => (
+  ), [terminalAgentsByIndex, workspaceTerminalRenderAgent]);
+  const getTerminalRole = useCallback((terminalIndex) => (
     terminalRolesByIndex[terminalIndex] || getTerminalAgent(terminalIndex)?.id || ""
-  );
-  const getTerminalPaneId = (terminalIndex) => {
+  ), [getTerminalAgent, terminalRolesByIndex]);
+  const getTerminalPaneId = useCallback((terminalIndex) => {
     const role = getTerminalRole(terminalIndex);
     const agent = getTerminalAgent(terminalIndex);
     const paneAgentId = String(role || "").toLowerCase() === "generic"
@@ -584,10 +584,14 @@ export default function TerminalView({
       : agent?.id;
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
-  };
-  const visibleTerminalPaneIds = terminalWorkspace
-    ? terminalWorkspaceTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
-    : [];
+  }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+  const visibleTerminalPaneIds = useMemo(() => (
+    terminalWorkspace
+      ? terminalWorkspaceTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
+      : []
+  ), [getTerminalPaneId, terminalWorkspace, terminalWorkspaceTerminalIndexes]);
+  const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
+  const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
 
   useEffect(() => {
     setActiveTerminalPaneId((currentPaneId) => (
@@ -595,7 +599,7 @@ export default function TerminalView({
         ? currentPaneId
         : visibleTerminalPaneIds[0] || ""
     ));
-  }, [visibleTerminalPaneIds.join("|")]);
+  }, [visibleTerminalPaneIdSignature]);
 
   const handleActivateTerminalPane = useCallback(({ paneId }) => {
     if (paneId) {
@@ -668,13 +672,14 @@ export default function TerminalView({
                                 minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
                               >
                                 <WorkspaceTerminal
+                                  key={`${terminalWorkspace.id}-${terminalIndex}-${getTerminalRole(terminalIndex)}-${terminalWorkspaceWorkingDirectory || ""}`}
                                   agent={getTerminalAgent(terminalIndex)}
                                   agentLaunchEpoch={workspaceAgentLaunchEpoch}
                                   agentLaunchReady={workspaceTerminalAgentLaunchReady}
                                   agentStatuses={agentStatuses}
                                   agentStatusError={agentStatusError}
                                   agentStatusState={agentStatusState}
-                                  isActive={(activeTerminalPaneId || visibleTerminalPaneIds[0] || "") === getTerminalPaneId(terminalIndex)}
+                                  isActive={activePaneId === getTerminalPaneId(terminalIndex)}
                                   onActivateTerminal={handleActivateTerminalPane}
                                   onChangeTerminalRole={changeWorkspaceTerminalRole}
                                   onCloseTerminal={closeWorkspaceTerminal}
@@ -700,13 +705,14 @@ export default function TerminalView({
               </WorkspaceTerminalPanels>
             ) : !hasWorkspaceTerminals ? (
               <WorkspaceTerminal
+                key={`${terminalWorkspace?.id || "empty"}-${terminalWorkspaceTerminalIndexes[0] || 0}-${getTerminalRole(terminalWorkspaceTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
                 agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
                 agentStatuses={agentStatuses}
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
-                isActive={(activeTerminalPaneId || visibleTerminalPaneIds[0] || "") === getTerminalPaneId(terminalWorkspaceTerminalIndexes[0] || 0)}
+                isActive={activePaneId === getTerminalPaneId(terminalWorkspaceTerminalIndexes[0] || 0)}
                 onActivateTerminal={handleActivateTerminalPane}
                 onChangeTerminalRole={changeWorkspaceTerminalRole}
                 onCloseTerminal={closeWorkspaceTerminal}
@@ -729,3 +735,5 @@ export default function TerminalView({
     </ForgeWorkspace>
   );
 }
+
+export default memo(TerminalView);

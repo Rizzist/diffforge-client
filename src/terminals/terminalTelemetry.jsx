@@ -24,6 +24,10 @@ function getTerminalMetricsSnapshot() {
 }
 
 function emitTerminalMetricsSoon() {
+  if (!terminalMetricsSubscribers.size) {
+    return;
+  }
+
   if (terminalMetricsNotifyTimer) {
     return;
   }

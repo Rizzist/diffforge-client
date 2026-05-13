@@ -2351,6 +2351,7 @@ export const TerminalStatusOverlay = styled.div`
   padding: 24px;
   background: rgba(2, 3, 4, 0.5);
   pointer-events: none;
+  user-select: none;
 
   > div {
     display: grid;
@@ -2387,6 +2388,18 @@ export const TerminalStatusOverlay = styled.div`
       border-color: rgba(248, 113, 113, 0.34);
       background: rgba(24, 10, 14, 0.88);
     }
+  }
+
+  &[data-copyable="true"] {
+    pointer-events: auto;
+  }
+
+  &[data-copyable="true"] > div,
+  &[data-copyable="true"] strong,
+  &[data-copyable="true"] span {
+    cursor: text;
+    user-select: text;
+    -webkit-user-select: text;
   }
 `;
 

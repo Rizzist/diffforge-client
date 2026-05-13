@@ -88,7 +88,7 @@ const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
 const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
-const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
@@ -1464,6 +1464,7 @@ pub fn run() {
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
             register_terminal_input_event_listener(app);
+            register_terminal_coordination_event_bridge(app);
 
             register_audio_shortcuts(app.handle());
 
@@ -1547,7 +1548,6 @@ pub fn run() {
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,
             terminal_delete_selection,
-            terminal_get_parked_prompt,
             terminal_cancel_parked_task,
             terminal_interrupt_agent,
             resize_terminal,

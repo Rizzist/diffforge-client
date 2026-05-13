@@ -14,7 +14,6 @@ import "@vscode/codicons/dist/codicon.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
-import { TerminalDevMetrics, useTerminalDevMetrics } from "../terminals/terminalTelemetry.jsx";
 import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
@@ -1767,7 +1766,6 @@ export default function App() {
       }
     };
   }, []);
-  const terminalMetrics = useTerminalDevMetrics();
   const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
   const activatedWorkspace = findWorkspaceById(workspaces, activatedWorkspaceId);
 
@@ -1888,6 +1886,10 @@ export default function App() {
       });
     }, VIEW_TRANSITION_MS);
   }, [activeView, visibleView]);
+
+  const showSettingsView = useCallback(() => {
+    showView("settings");
+  }, [showView]);
 
   const clearPreparedWorkspaceTerminals = useCallback((workspaceId) => {
     if (!workspaceId) {
@@ -2714,10 +2716,11 @@ export default function App() {
       if (cleanedRoot) {
       }
 
-      const normalizedRoot = cleanedRoot
-        ? await invoke("validate_workspace_root_directory", { path: cleanedRoot })
+      const rootValidationPath = cleanedRoot || defaultWorkingDirectory;
+      const normalizedRoot = rootValidationPath
+        ? await invoke("validate_workspace_root_directory", { path: rootValidationPath })
         : null;
-      const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const rootDirectory = cleanedRoot ? normalizedRoot?.workingDirectory || "" : "";
       const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
@@ -2747,6 +2750,11 @@ export default function App() {
 
 
       if (rootChanged) {
+        clearPreparedWorkspaceTerminals(selectedWorkspace.id);
+        workspaceAgentLaunchKeyRef.current = "";
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        setWorkspaceAgentBatchSentKey("");
+
         const cleanupStartedAt = performance.now();
 
 
@@ -2824,15 +2832,18 @@ export default function App() {
           terminalCount,
           terminalRoles,
         });
+        workspaceSettingsRef.current = nextSettings;
         persistWorkspaceSettings(nextSettings);
         return nextSettings;
       });
 
       if (rootChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
-        setWorkspaceTerminalSlots((slots) => ({
-          ...slots,
+        const nextSlots = {
+          ...workspaceTerminalSlots,
           [selectedWorkspace.id]: nextTerminalIndexes,
-        }));
+        };
+        workspaceTerminalSlotsRef.current = nextSlots;
+        setWorkspaceTerminalSlots(nextSlots);
       }
 
       if (rootChanged && selectedWorkspace.id === activatedWorkspaceIdRef.current && nextMcpRepoPath) {
@@ -2881,6 +2892,7 @@ export default function App() {
     defaultWorkingDirectory,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
+    clearPreparedWorkspaceTerminals,
     closeWorkspaceSettings,
   ]);
 
@@ -3878,6 +3890,7 @@ export default function App() {
   const workspaceAgentLaunchKey = workspaceTerminalAgentLaunchReady && activatedWorkspace
     ? [
       activatedWorkspace.id,
+      activatedWorkspaceTerminalWorkingDirectory,
       activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => `${terminalIndex}:${role}`).join(","),
     ].join(":")
     : "";
@@ -4492,8 +4505,7 @@ export default function App() {
                       setWorkspaceName={setWorkspaceName}
                       shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
                       shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
-                      showSettingsView={() => showView("settings")}
-                      terminalMetrics={terminalMetrics}
+                      showSettingsView={showSettingsView}
                       terminalPanelRows={terminalPanelRows}
                       viewMotion={viewMotion}
                       workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}

@@ -365,10 +365,12 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 return Err(error);
             }
         };
-        match ensure_workspace_agents_gitignore(&working_directory) {
+        match ensure_workspace_git_ready_for_coordination(&working_directory) {
             Ok(_) => {}
             Err(error) => {
-                return Err(error);
+                return Err(format!(
+                    "Unable to prepare workspace Git for terminal isolation: {error}"
+                ));
             }
         }
         let resolved_directory = workspace_path_display(&working_directory);

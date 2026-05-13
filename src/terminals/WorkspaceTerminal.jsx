@@ -3,7 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   collapseFunctionalRepoPathToCoreRepoPath,
@@ -228,7 +228,6 @@ import {
   SetupHeader,
   SetupField,
   SetupInput,
-  BlankStatusStack,
   WorkspaceSettingsOverlay,
   WorkspaceSettingsDialog,
   WorkspaceSettingsDialogHeader,
@@ -323,6 +322,7 @@ import {
 } from "./terminalResizeController";
 import {
   getTerminalDiagnosticEnvironment,
+  isTerminalDiagnosticLoggingEnabled,
   logTerminalDiagnosticDuration,
   logTerminalDiagnosticEvent,
   startTerminalDiagnosticHeartbeat,
@@ -369,6 +369,7 @@ const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
+const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
 const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
 const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
@@ -601,6 +602,130 @@ function getTerminalOutputDebugFields(data) {
       .trim(),
     startsWithEscape: bytes[0] === 0x1b,
     visibleChars: displayChars.filter((character) => !/\s/.test(character)).length,
+  };
+}
+
+function getTerminalOutputVisibleCharCount(data, maxCount = Number.POSITIVE_INFINITY) {
+  if (!data?.length) {
+    return 0;
+  }
+
+  let visibleChars = 0;
+  let escapeMode = "";
+
+  for (let index = 0; index < data.length; index += 1) {
+    const byte = data[index];
+
+    if (escapeMode === "csi") {
+      if (byte >= 0x40 && byte <= 0x7e) {
+        escapeMode = "";
+      }
+      continue;
+    }
+
+    if (escapeMode === "osc") {
+      if (byte === 0x07) {
+        escapeMode = "";
+        continue;
+      }
+      if (byte === 0x1b && data[index + 1] === 0x5c) {
+        index += 1;
+        escapeMode = "";
+      }
+      continue;
+    }
+
+    if (byte === 0x1b) {
+      const nextByte = data[index + 1];
+      if (nextByte === 0x5b) {
+        escapeMode = "csi";
+        index += 1;
+      } else if (nextByte === 0x5d) {
+        escapeMode = "osc";
+        index += 1;
+      } else if (nextByte != null) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (byte > 0x20 && byte !== 0x7f) {
+      visibleChars += 1;
+      if (visibleChars >= maxCount) {
+        return visibleChars;
+      }
+    }
+  }
+
+  return visibleChars;
+}
+
+function getTerminalOutputByteStats(data) {
+  if (!data?.length) {
+    return {
+      controlBytes: 0,
+      escapeBytes: 0,
+      visibleChars: 0,
+    };
+  }
+
+  let controlBytes = 0;
+  let escapeBytes = 0;
+  let visibleChars = 0;
+  let escapeMode = "";
+
+  for (let index = 0; index < data.length; index += 1) {
+    const byte = data[index];
+
+    if (byte < 0x20 || byte === 0x7f) {
+      controlBytes += 1;
+      if (byte === 0x1b) {
+        escapeBytes += 1;
+      }
+    }
+
+    if (escapeMode === "csi") {
+      if (byte >= 0x40 && byte <= 0x7e) {
+        escapeMode = "";
+      }
+      continue;
+    }
+
+    if (escapeMode === "osc") {
+      if (byte === 0x07) {
+        escapeMode = "";
+        continue;
+      }
+      if (byte === 0x1b && data[index + 1] === 0x5c) {
+        index += 1;
+        escapeMode = "";
+      }
+      continue;
+    }
+
+    if (byte === 0x1b) {
+      const nextByte = data[index + 1];
+      if (nextByte === 0x5b) {
+        escapeMode = "csi";
+        index += 1;
+      } else if (nextByte === 0x5d) {
+        escapeMode = "osc";
+        index += 1;
+      } else if (nextByte != null) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (byte > 0x20 && byte !== 0x7f) {
+      visibleChars += 1;
+    }
+  }
+
+  return {
+    controlBytes,
+    escapeBytes,
+    visibleChars,
   };
 }
 
@@ -1210,7 +1335,7 @@ function restoreTerminalScrollAnchor(terminal, anchor) {
   };
 }
 
-export default function WorkspaceTerminal({
+function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
   agentLaunchReady = true,
@@ -1529,47 +1654,6 @@ export default function WorkspaceTerminal({
   }, [paneId]);
 
   useEffect(() => {
-    if (terminalClosed || terminalClosing) {
-      return undefined;
-    }
-
-    let disposed = false;
-    const syncParkedPrompt = async () => {
-      const instanceId = Number(terminalInstanceIdRef.current || 0);
-      if (!instanceId || disposed) {
-        return;
-      }
-      try {
-        const payload = await invoke("terminal_get_parked_prompt", {
-          paneId,
-          instanceId,
-        });
-        if (disposed) {
-          return;
-        }
-        const promptKey = `${Number(payload?.instanceId || 0)}:${payload?.taskId || ""}`;
-        if (
-          payload?.status === "parked"
-          && !cancellingParkedPromptKeysRef.current.has(promptKey)
-        ) {
-          setParkedPrompt(payload);
-        } else {
-          setParkedPrompt(null);
-        }
-      } catch {
-        // Best-effort recovery path; the event listener remains the primary path.
-      }
-    };
-
-    syncParkedPrompt();
-    const intervalId = window.setInterval(syncParkedPrompt, 1000);
-    return () => {
-      disposed = true;
-      window.clearInterval(intervalId);
-    };
-  }, [paneId, terminalClosed, terminalClosing, terminalState, restartKey]);
-
-  useEffect(() => {
     if (!agent) {
       startAgentInPrewarmedTerminalRef.current = null;
       preserveCoordinationOnNextCleanupRef.current = false;
@@ -1648,6 +1732,27 @@ export default function WorkspaceTerminal({
     let outputChunks = 0;
     let visibleOutputBytes = 0;
     let visibleOutputChunks = 0;
+    let outputDiagnosticWindowStartedAt = performance.now();
+    let outputDiagnosticChunks = 0;
+    let outputDiagnosticInputBytes = 0;
+    let outputDiagnosticDisplayBytes = 0;
+    let outputDiagnosticVisibleChars = 0;
+    let outputDiagnosticVisibleChunks = 0;
+    let outputDiagnosticEscapeBytes = 0;
+    let outputDiagnosticControlBytes = 0;
+    let outputDiagnosticMaskMs = 0;
+    let outputDiagnosticMaskMaxMs = 0;
+    let outputDiagnosticDebugMs = 0;
+    let outputDiagnosticDebugMaxMs = 0;
+    let outputDiagnosticWriteBatches = 0;
+    let outputDiagnosticWriteBytes = 0;
+    let outputDiagnosticWriteChunks = 0;
+    let outputDiagnosticWriteCallbackMs = 0;
+    let outputDiagnosticWriteCallbackMaxMs = 0;
+    let outputDiagnosticCombineMs = 0;
+    let outputDiagnosticCombineMaxMs = 0;
+    let outputDiagnosticQueuedMaxMs = 0;
+    const outputDiagnosticFlushReasons = {};
     const disposables = [];
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
@@ -1732,6 +1837,7 @@ export default function WorkspaceTerminal({
     xtermRef.current = terminal;
 
     terminal.open(container);
+    const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
     syncTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
     logTerminalDiagnosticEvent("frontend.terminal_mount", {
@@ -1746,6 +1852,75 @@ export default function WorkspaceTerminal({
       windowsPty: TERMINAL_IS_WINDOWS_HOST ? "conpty" : "",
     });
     const terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+
+    const flushOutputDiagnosticWindow = (reason = "window") => {
+      if (!terminalDiagnosticsEnabled) {
+        return;
+      }
+
+      const elapsedMs = performance.now() - outputDiagnosticWindowStartedAt;
+      if (
+        elapsedMs < TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS
+        && outputDiagnosticChunks === 0
+        && outputDiagnosticWriteBatches === 0
+      ) {
+        return;
+      }
+
+      logTerminalDiagnosticEvent("frontend.output_window", {
+        chunks: outputDiagnosticChunks,
+        combineMaxMs: outputDiagnosticCombineMaxMs,
+        combineMs: outputDiagnosticCombineMs,
+        controlBytes: outputDiagnosticControlBytes,
+        debugMaxMs: outputDiagnosticDebugMaxMs,
+        debugMs: outputDiagnosticDebugMs,
+        displayBytes: outputDiagnosticDisplayBytes,
+        elapsedMs,
+        escapeBytes: outputDiagnosticEscapeBytes,
+        flushReasons: { ...outputDiagnosticFlushReasons },
+        inputBytes: outputDiagnosticInputBytes,
+        maskMaxMs: outputDiagnosticMaskMaxMs,
+        maskMs: outputDiagnosticMaskMs,
+        paneId,
+        queuedMaxMs: outputDiagnosticQueuedMaxMs,
+        reason,
+        rendererMode,
+        terminalIndex,
+        visibleChars: outputDiagnosticVisibleChars,
+        visibleChunks: outputDiagnosticVisibleChunks,
+        writeBatches: outputDiagnosticWriteBatches,
+        writeBytes: outputDiagnosticWriteBytes,
+        writeCallbackMaxMs: outputDiagnosticWriteCallbackMaxMs,
+        writeCallbackMs: outputDiagnosticWriteCallbackMs,
+        writeChunks: outputDiagnosticWriteChunks,
+      });
+
+      outputDiagnosticWindowStartedAt = performance.now();
+      outputDiagnosticChunks = 0;
+      outputDiagnosticInputBytes = 0;
+      outputDiagnosticDisplayBytes = 0;
+      outputDiagnosticVisibleChars = 0;
+      outputDiagnosticVisibleChunks = 0;
+      outputDiagnosticEscapeBytes = 0;
+      outputDiagnosticControlBytes = 0;
+      outputDiagnosticMaskMs = 0;
+      outputDiagnosticMaskMaxMs = 0;
+      outputDiagnosticDebugMs = 0;
+      outputDiagnosticDebugMaxMs = 0;
+      outputDiagnosticWriteBatches = 0;
+      outputDiagnosticWriteBytes = 0;
+      outputDiagnosticWriteChunks = 0;
+      outputDiagnosticWriteCallbackMs = 0;
+      outputDiagnosticWriteCallbackMaxMs = 0;
+      outputDiagnosticCombineMs = 0;
+      outputDiagnosticCombineMaxMs = 0;
+      outputDiagnosticQueuedMaxMs = 0;
+      Object.keys(outputDiagnosticFlushReasons).forEach((key) => {
+        delete outputDiagnosticFlushReasons[key];
+      });
+    };
+
+    disposables.push(() => flushOutputDiagnosticWindow("dispose"));
 
     let terminalFocusClearTimer = 0;
     const markTerminalAudioInputTarget = () => {
@@ -2239,9 +2414,28 @@ export default function WorkspaceTerminal({
       const combineMs = performance.now() - combineStartedAt;
       const isFirstOutputChunk = writes.some((write) => write.isFirstOutputChunk);
       const isFirstVisibleOutputChunk = writes.some((write) => write.isFirstVisibleOutputChunk);
-      const debugStartedAt = performance.now();
-      const outputDebug = getTerminalOutputDebugFields(batchData);
-      const debugMs = performance.now() - debugStartedAt;
+      const batchVisibleChars = writes.reduce(
+        (total, write) => total + (Number(write.outputDebug?.visibleChars) || 0),
+        0,
+      );
+      const shouldCollectOutputDebug = isFirstOutputChunk
+        || isFirstVisibleOutputChunk;
+      const debugStartedAt = shouldCollectOutputDebug ? performance.now() : 0;
+      const outputDebug = shouldCollectOutputDebug
+        ? getTerminalOutputDebugFields(batchData)
+        : { visibleChars: batchVisibleChars };
+      const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
+      if (terminalDiagnosticsEnabled) {
+        outputDiagnosticWriteBatches += 1;
+        outputDiagnosticWriteBytes += batchBytes;
+        outputDiagnosticWriteChunks += writes.length;
+        outputDiagnosticCombineMs += combineMs;
+        outputDiagnosticCombineMaxMs = Math.max(outputDiagnosticCombineMaxMs, combineMs);
+        outputDiagnosticDebugMs += debugMs;
+        outputDiagnosticDebugMaxMs = Math.max(outputDiagnosticDebugMaxMs, debugMs);
+        outputDiagnosticQueuedMaxMs = Math.max(outputDiagnosticQueuedMaxMs, queuedMs);
+        outputDiagnosticFlushReasons[reason] = (outputDiagnosticFlushReasons[reason] || 0) + 1;
+      }
       const shouldLogWrite = outputChunks <= 10
         || isFirstOutputChunk
         || isFirstVisibleOutputChunk
@@ -2254,6 +2448,16 @@ export default function WorkspaceTerminal({
       terminal.write(batchData, () => {
         const writeCallbackMs = performance.now() - writeStartedAt;
         const elapsedMs = performance.now() - flushStartedAt;
+        if (terminalDiagnosticsEnabled) {
+          outputDiagnosticWriteCallbackMs += writeCallbackMs;
+          outputDiagnosticWriteCallbackMaxMs = Math.max(
+            outputDiagnosticWriteCallbackMaxMs,
+            writeCallbackMs,
+          );
+          if (performance.now() - outputDiagnosticWindowStartedAt >= TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS) {
+            flushOutputDiagnosticWindow("write_callback");
+          }
+        }
         logTerminalDiagnosticEvent(
           "frontend.output_write.slow",
           {
@@ -2327,7 +2531,9 @@ export default function WorkspaceTerminal({
 
       const isFirstOutputChunk = options.isFirstOutputChunk === true;
       const isFirstVisibleOutputChunk = options.isFirstVisibleOutputChunk === true;
-      const outputDebug = options.outputDebug || getTerminalOutputDebugFields(data);
+      const outputDebug = options.outputDebug || {
+        visibleChars: getTerminalOutputVisibleCharCount(data),
+      };
 
       if (resizeWriteBarrierActive && !options.fromResizeBarrier) {
         const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
@@ -2544,11 +2750,39 @@ export default function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
           outputBytes += displayData.byteLength;
-          const debugStartedAt = performance.now();
-          const outputDebug = getTerminalOutputDebugFields(displayData);
-          const debugMs = performance.now() - debugStartedAt;
-          const hasVisibleOutput = outputDebug.visibleChars > 0;
+          const outputByteStats = terminalDiagnosticsEnabled
+            ? getTerminalOutputByteStats(displayData)
+            : null;
+          const visibleChars = outputByteStats
+            ? outputByteStats.visibleChars
+            : getTerminalOutputVisibleCharCount(displayData, 1);
+          const hasVisibleOutput = visibleChars > 0;
           const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
+          const shouldCollectOutputDebug = isFirstOutputChunk
+            || isFirstVisibleOutputChunk;
+          const debugStartedAt = shouldCollectOutputDebug ? performance.now() : 0;
+          const outputDebug = shouldCollectOutputDebug
+            ? getTerminalOutputDebugFields(displayData)
+            : { visibleChars };
+          const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
+          if (terminalDiagnosticsEnabled) {
+            outputDiagnosticChunks += 1;
+            outputDiagnosticInputBytes += data.byteLength;
+            outputDiagnosticDisplayBytes += displayData.byteLength;
+            outputDiagnosticVisibleChars += outputByteStats.visibleChars;
+            outputDiagnosticEscapeBytes += outputByteStats.escapeBytes;
+            outputDiagnosticControlBytes += outputByteStats.controlBytes;
+            outputDiagnosticMaskMs += maskMs;
+            outputDiagnosticMaskMaxMs = Math.max(outputDiagnosticMaskMaxMs, maskMs);
+            outputDiagnosticDebugMs += debugMs;
+            outputDiagnosticDebugMaxMs = Math.max(outputDiagnosticDebugMaxMs, debugMs);
+            if (hasVisibleOutput) {
+              outputDiagnosticVisibleChunks += 1;
+            }
+            if (performance.now() - outputDiagnosticWindowStartedAt >= TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS) {
+              flushOutputDiagnosticWindow("chunk");
+            }
+          }
 
           if (hasVisibleOutput) {
             visibleOutputBytes += displayData.byteLength;
@@ -3343,19 +3577,30 @@ export default function WorkspaceTerminal({
     setRestartKey((key) => key + 1);
   }, [isGenericTerminal, onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
 
+  const terminalStatusErrorDetails = [
+    workspaceError,
+    terminalError,
+    agentStatusError,
+  ].filter(Boolean);
+  const hasTerminalStatusError = terminalStatusErrorDetails.length > 0;
+  const isTerminalStatusErrorOverlay = hasTerminalStatusError || terminalState === "error";
   const showTerminalStatusOverlay = Boolean(
-    terminalStatus?.visible
+    (isTerminalStatusErrorOverlay || terminalStatus?.visible)
     && !terminalClosed
     && !terminalClosing
     && !parkedPrompt,
   );
-  const terminalStatusTitle = terminalState === "error" && terminalError
+  const terminalStatusTitle = terminalError
     ? "Terminal Launch Failed"
-    : terminalStatus?.title || "Preparing Terminal";
-  const terminalStatusDetail = terminalState === "error" && terminalError
-    ? terminalError
-    : terminalStatus?.detail || "";
-  const terminalStatusMode = terminalState === "error"
+    : hasTerminalStatusError
+      ? "Terminal Error"
+      : terminalStatus?.title || "Preparing Terminal";
+  const terminalStatusDetails = hasTerminalStatusError
+    ? terminalStatusErrorDetails
+    : terminalStatus?.detail
+      ? [terminalStatus.detail]
+      : [];
+  const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
 
@@ -3471,14 +3716,6 @@ export default function WorkspaceTerminal({
         </TerminalCloseButton>
       </TerminalRestartPill>
 
-      {(terminalError || agentStatusError || workspaceError) && (
-        <BlankStatusStack>
-          {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
-          {terminalError && <FormMessage $state="error">{terminalError}</FormMessage>}
-          {agentStatusError && <FormMessage $state="error">{agentStatusError}</FormMessage>}
-        </BlankStatusStack>
-      )}
-
       <TerminalFrame
         aria-busy={terminalClosing ? "true" : "false"}
         data-state={terminalState}
@@ -3506,17 +3743,21 @@ export default function WorkspaceTerminal({
             />
             {showTerminalStatusOverlay && (
               <TerminalStatusOverlay
-                aria-live={terminalState === "error" ? "assertive" : "polite"}
+                aria-live={isTerminalStatusErrorOverlay ? "assertive" : "polite"}
+                data-copyable={isTerminalStatusErrorOverlay ? "true" : "false"}
                 data-mode={terminalStatusMode}
-                data-tone={terminalState === "error" ? "error" : "neutral"}
+                data-terminal-control={isTerminalStatusErrorOverlay ? "true" : undefined}
+                data-tone={isTerminalStatusErrorOverlay ? "error" : "neutral"}
                 role="status"
               >
                 <div>
-                  {terminalState !== "error" && <TerminalStatusSpinner aria-hidden="true" />}
+                  {!isTerminalStatusErrorOverlay && <TerminalStatusSpinner aria-hidden="true" />}
                   {terminalStatusMode !== "compact" && (
                     <TerminalStatusCopy>
                       <strong>{terminalStatusTitle}</strong>
-                      {terminalStatusDetail && <span>{terminalStatusDetail}</span>}
+                      {terminalStatusDetails.map((detail, index) => (
+                        <span key={`${detail}-${index}`}>{detail}</span>
+                      ))}
                     </TerminalStatusCopy>
                   )}
                 </div>
@@ -3565,3 +3806,5 @@ export default function WorkspaceTerminal({
     </TerminalWorkspaceSurface>
   );
 }
+
+export default memo(WorkspaceTerminal);

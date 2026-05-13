@@ -700,6 +700,13 @@ impl CoordinationKernel {
                             );
                         }
                     }
+                    crate::observe_terminal_coordination_event(
+                        self.paths.repo_path.clone(),
+                        self.paths.db_path.clone(),
+                        event_type.to_string(),
+                        refs.clone(),
+                        payload.clone(),
+                    );
                     return Ok(id);
                 }
                 Err(error) if is_retryable_event_insert_error(&error) && attempt < 11 => {
@@ -14575,7 +14582,7 @@ impl CoordinationKernel {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EventRefs {
     pub task_id: Option<String>,
     pub agent_id: Option<String>,

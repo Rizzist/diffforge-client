@@ -2307,26 +2307,67 @@ fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
 }
 
 async fn cloud_mcp_observe_terminal_output(
+    app: AppHandle,
     state: CloudMcpState,
     pane_id: &str,
     instance_id: u64,
     chunk: &[u8],
 ) {
+    let observe_started_at = Instant::now();
+    let decode_started_at = Instant::now();
     let text = String::from_utf8_lossy(chunk);
-    if !cloud_mcp_terminal_output_looks_active(&text)
-        && !cloud_mcp_terminal_output_looks_ready(&text)
-    {
+    let decode_ms = terminal_diagnostic_elapsed_ms(decode_started_at);
+    let scan_started_at = Instant::now();
+    let looks_active = cloud_mcp_terminal_output_looks_active(&text);
+    let looks_ready = cloud_mcp_terminal_output_looks_ready(&text);
+    let scan_ms = terminal_diagnostic_elapsed_ms(scan_started_at);
+    if !looks_active && !looks_ready {
+        let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
+        if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+            log_terminal_diagnostic_event(
+                &app,
+                "backend.output_observer.inactive_slow",
+                json!({
+                    "bytes": chunk.len(),
+                    "decode_ms": decode_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "scan_ms": scan_ms,
+                }),
+            );
+        }
         return;
     }
 
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
     let work_brief = cloud_mcp_extract_agent_work_brief(&text);
     let (work_update, completion) = {
+        let lock_started_at = Instant::now();
         let mut runtime = state.inner.lock().await;
+        let lock_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
         let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) else {
+            let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
+            if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+                log_terminal_diagnostic_event(
+                    &app,
+                    "backend.output_observer.missing_context_slow",
+                    json!({
+                        "bytes": chunk.len(),
+                        "decode_ms": decode_ms,
+                        "elapsed_ms": elapsed_ms,
+                        "instance_id": instance_id,
+                        "lock_ms": lock_ms,
+                        "looks_active": looks_active,
+                        "looks_ready": looks_ready,
+                        "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                        "scan_ms": scan_ms,
+                    }),
+                );
+            }
             return;
         };
-        if cloud_mcp_terminal_output_looks_active(&text) {
+        if looks_active {
             entry.saw_agent_activity = true;
         }
         let work_update = if let Some(brief) = work_brief.clone() {
@@ -2353,7 +2394,7 @@ async fn cloud_mcp_observe_terminal_output(
         let completion = if entry.saw_agent_activity
             && !entry.done_reported
             && old_enough
-            && cloud_mcp_terminal_output_looks_ready(&text)
+            && looks_ready
         {
             entry.done_reported = true;
             Some((
@@ -2368,6 +2409,26 @@ async fn cloud_mcp_observe_terminal_output(
         } else {
             None
         };
+        let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
+        if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+            log_terminal_diagnostic_event(
+                &app,
+                "backend.output_observer.match_slow",
+                json!({
+                    "bytes": chunk.len(),
+                    "decode_ms": decode_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "instance_id": instance_id,
+                    "lock_ms": lock_ms,
+                    "looks_active": looks_active,
+                    "looks_ready": looks_ready,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "scan_ms": scan_ms,
+                    "will_complete": completion.is_some(),
+                    "will_update": work_update.is_some(),
+                }),
+            );
+        }
         (work_update, completion)
     };
 

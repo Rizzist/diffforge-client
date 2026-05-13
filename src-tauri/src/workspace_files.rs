@@ -215,6 +215,35 @@ fn workspace_agents_gitignore_update_label(update: WorkspaceAgentsGitignoreUpdat
     }
 }
 
+fn workspace_git_marker_description(root: &Path) -> String {
+    let marker = root.join(".git");
+
+    match fs::metadata(&marker) {
+        Ok(metadata) if metadata.is_dir() => "directory".to_string(),
+        Ok(metadata) if metadata.is_file() => {
+            let first_line = fs::read_to_string(&marker)
+                .ok()
+                .and_then(|contents| {
+                    contents
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+
+            if first_line.is_empty() {
+                "file".to_string()
+            } else {
+                format!("file ({first_line})")
+            }
+        }
+        Ok(_) => "special filesystem entry".to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+        Err(error) => format!("unreadable ({error})"),
+    }
+}
+
 fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitignoreUpdate, String> {
     let agents_path = root.join(".agents");
     match fs::metadata(&agents_path) {
@@ -374,8 +403,9 @@ fn ensure_workspace_git_ready_for_coordination(root: &Path) -> Result<WorkspaceG
         .unwrap_or_else(|_| normalized_path_key(root));
     let mut initialized_repo = false;
     let mut created_initial_commit = false;
+    let had_git_marker = root.join(".git").exists();
 
-    if !root.join(".git").exists() {
+    if !had_git_marker {
         let capture =
             run_git_for_workspace(root, &["init"], Duration::from_secs(GIT_INIT_TIMEOUT_SECS))?;
         ensure_git_success(&capture, "git init")?;
@@ -383,12 +413,28 @@ fn ensure_workspace_git_ready_for_coordination(root: &Path) -> Result<WorkspaceG
     }
 
     let gitignore_update = ensure_workspace_agents_gitignore(root)?;
-    let top_level = run_git_text(
+    let top_level = match run_git_text(
         root,
         &["rev-parse", "--show-toplevel"],
         Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
         "git rev-parse --show-toplevel",
-    )?;
+    ) {
+        Ok(top_level) => top_level,
+        Err(error) => {
+            let setup = if initialized_repo {
+                "created a new .git directory"
+            } else if had_git_marker {
+                "found an existing .git marker"
+            } else {
+                "checked the workspace Git marker"
+            };
+            return Err(format!(
+                "{error}. Selected workspace root: {}. Diff Forge {setup}; current .git marker is {}.",
+                workspace_path_display(root),
+                workspace_git_marker_description(root)
+            ));
+        }
+    };
     let top_level_path = PathBuf::from(top_level.trim());
     let top_level_key = top_level_path
         .canonicalize()
@@ -1019,6 +1065,28 @@ mod workspace_files_tests {
         let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gitignore.contains(".agents/"));
         assert!(gitignore.contains("/logs/"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_preflight_reports_existing_invalid_git_marker() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-invalid-git-marker-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".git"), "gitdir: missing\n").unwrap();
+
+        let error = match ensure_workspace_git_ready_for_coordination(&root) {
+            Ok(_) => panic!("expected invalid .git marker to fail workspace Git preflight"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("found an existing .git marker"));
+        assert!(error.contains("gitdir: missing"));
+        assert!(error.contains("Selected workspace root"));
 
         let _ = fs::remove_dir_all(root);
     }
