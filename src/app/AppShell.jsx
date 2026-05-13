@@ -1507,6 +1507,48 @@ function getWorkspaceTerminalRoles(
   );
 }
 
+function normalizeWorkspaceTerminalSlotIndexes(indexes) {
+  const usedIndexes = new Set();
+
+  if (!Array.isArray(indexes)) {
+    return [];
+  }
+
+  return indexes.reduce((normalizedIndexes, index) => {
+    const terminalIndex = Number.parseInt(index, 10);
+
+    if (
+      Number.isInteger(terminalIndex)
+      && terminalIndex >= 0
+      && terminalIndex < MAX_WORKSPACE_TERMINAL_COUNT
+      && !usedIndexes.has(terminalIndex)
+    ) {
+      usedIndexes.add(terminalIndex);
+      normalizedIndexes.push(terminalIndex);
+    }
+
+    return normalizedIndexes;
+  }, []);
+}
+
+function getWorkspaceVisibleTerminalIndexes(workspaceTerminalSlots, workspaceId, terminalCount) {
+  if (Object.prototype.hasOwnProperty.call(workspaceTerminalSlots || {}, workspaceId)) {
+    return normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalSlots[workspaceId]);
+  }
+
+  return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
+}
+
+function getWorkspaceVisibleTerminalCount(workspaceSettings, workspaceTerminalSlots, workspaceId) {
+  const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+
+  if (Object.prototype.hasOwnProperty.call(workspaceTerminalSlots || {}, workspaceId)) {
+    return getWorkspaceVisibleTerminalIndexes(workspaceTerminalSlots, workspaceId, terminalCount).length;
+  }
+
+  return terminalCount;
+}
+
 function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const nextSettings = { ...(settings || {}) };
 
@@ -1619,6 +1661,8 @@ export default function App() {
   const audioAutoOpenStartupKeyRef = useRef("");
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
+  const workspaceSettingsRef = useRef(workspaceSettings);
+  const workspaceTerminalSlotsRef = useRef(workspaceTerminalSlots);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
   const preparedTerminalsRef = useRef(new Map());
@@ -1644,6 +1688,14 @@ export default function App() {
   useEffect(() => {
     activatedWorkspaceIdRef.current = activatedWorkspaceId;
   }, [activatedWorkspaceId]);
+
+  useEffect(() => {
+    workspaceSettingsRef.current = workspaceSettings;
+  }, [workspaceSettings]);
+
+  useEffect(() => {
+    workspaceTerminalSlotsRef.current = workspaceTerminalSlots;
+  }, [workspaceTerminalSlots]);
 
   useEffect(() => {
     workspaceLifecycleSettingsRef.current = workspaceLifecycleSettings;
@@ -2837,20 +2889,19 @@ export default function App() {
       return;
     }
 
-    const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+    const currentSettings = workspaceSettingsRef.current;
+    const currentSlots = workspaceTerminalSlotsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
-      workspaceSettings,
+      currentSettings,
       workspaceId,
       terminalCount,
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const currentIndexes = normalizeWorkspaceTerminalIndexes(
-      workspaceTerminalSlots[workspaceId],
-      terminalCount,
-    );
+    const currentIndexes = getWorkspaceVisibleTerminalIndexes(currentSlots, workspaceId, terminalCount);
 
-    if (currentIndexes.length <= MIN_WORKSPACE_TERMINAL_COUNT) {
+    if (currentIndexes.length === 0) {
       return;
     }
 
@@ -2865,31 +2916,41 @@ export default function App() {
       const roleIndex = currentIndexes.indexOf(index);
       return currentTerminalRoles[roleIndex] || workspaceTerminalFallbackRole;
     });
-
-    setWorkspaceTerminalSlots((slots) => ({
-      ...slots,
+    const nextSlots = {
+      ...currentSlots,
       [workspaceId]: nextIndexes,
-    }));
-    setWorkspaceSettings((settings) => {
-      const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
-        terminalCount: nextTerminalCount,
-        terminalRoles: nextTerminalRoles,
-      });
-
-      persistWorkspaceSettings(nextSettings);
-      return nextSettings;
+    };
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      terminalCount: nextTerminalCount,
+      terminalRoles: nextTerminalRoles,
     });
+    let clearedPreparedTerminal = false;
+
+    preparedTerminalsRef.current.forEach((session, key) => {
+      if (session.workspaceId === workspaceId && session.terminalIndex === terminalIndex) {
+        preparedTerminalsRef.current.delete(key);
+        clearedPreparedTerminal = true;
+      }
+    });
+
+    workspaceTerminalSlotsRef.current = nextSlots;
+    workspaceSettingsRef.current = nextSettings;
+    setWorkspaceTerminalSlots(nextSlots);
+    setWorkspaceSettings(nextSettings);
+    persistWorkspaceSettings(nextSettings);
+
+    if (clearedPreparedTerminal) {
+      setPreparedTerminalVersion((version) => version + 1);
+    }
 
     if (workspaceSettingsModalId === workspaceId) {
       setWorkspaceTerminalCountDraft(String(nextTerminalCount));
       setWorkspaceTerminalRolesDraft(nextTerminalRoles);
     }
   }, [
-    workspaceSettings,
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
-    workspaceTerminalSlots,
   ]);
 
   const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, workspaceId }) => {
@@ -3672,8 +3733,9 @@ export default function App() {
   const activatedWorkspaceTerminalIndexes = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
-        ? normalizeWorkspaceTerminalIndexes(
-          workspaceTerminalSlots[activatedWorkspace.id],
+        ? getWorkspaceVisibleTerminalIndexes(
+          workspaceTerminalSlots,
+          activatedWorkspace.id,
           activatedWorkspaceTerminalCount,
         )
         : getDefaultTerminalIndexes(MIN_WORKSPACE_TERMINAL_COUNT)
@@ -3820,7 +3882,11 @@ export default function App() {
     ].join(":")
     : "";
   const terminalPanelRows = useMemo(
-    () => getTerminalPanelRows(activatedWorkspaceTerminalIndexes),
+    () => (
+      activatedWorkspaceTerminalIndexes.length
+        ? getTerminalPanelRows(activatedWorkspaceTerminalIndexes)
+        : []
+    ),
     [activatedWorkspaceTerminalIndexes],
   );
   const selectedWorkspaceFileRoot = selectedWorkspaceRootDirectory || defaultWorkingDirectory;
@@ -4268,7 +4334,11 @@ export default function App() {
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
-                      const workspaceTerminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
+                      const workspaceTerminalCount = getWorkspaceVisibleTerminalCount(
+                        workspaceSettings,
+                        workspaceTerminalSlots,
+                        workspace.id,
+                      );
                       const workspaceRuntimeState = workspace.id === activatedWorkspaceId
                         ? workspaceState === "ready"
                           ? "activated"

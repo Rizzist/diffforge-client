@@ -20,7 +20,10 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
-import WorkspaceTerminal, { getTerminalPaneMinSizePercent } from "./WorkspaceTerminal.jsx";
+import WorkspaceTerminal, {
+  getTerminalPaneMinSizePercent,
+  getWorkspaceTerminalPaneId,
+} from "./WorkspaceTerminal.jsx";
 
 const TerminalWorkspaceWithCloudDock = styled.div`
   width: 100%;
@@ -563,6 +566,8 @@ export default function TerminalView({
   workspaceTerminalRenderAgent,
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
+  const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && terminalPanelRows.length > 0;
+  const [activeTerminalPaneId, setActiveTerminalPaneId] = useState("");
   const getTerminalAgent = (terminalIndex) => (
     Object.prototype.hasOwnProperty.call(terminalAgentsByIndex, terminalIndex)
       ? terminalAgentsByIndex[terminalIndex]
@@ -571,6 +576,32 @@ export default function TerminalView({
   const getTerminalRole = (terminalIndex) => (
     terminalRolesByIndex[terminalIndex] || getTerminalAgent(terminalIndex)?.id || ""
   );
+  const getTerminalPaneId = (terminalIndex) => {
+    const role = getTerminalRole(terminalIndex);
+    const agent = getTerminalAgent(terminalIndex);
+    const paneAgentId = String(role || "").toLowerCase() === "generic"
+      ? "generic"
+      : agent?.id;
+
+    return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
+  };
+  const visibleTerminalPaneIds = terminalWorkspace
+    ? terminalWorkspaceTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
+    : [];
+
+  useEffect(() => {
+    setActiveTerminalPaneId((currentPaneId) => (
+      currentPaneId && visibleTerminalPaneIds.includes(currentPaneId)
+        ? currentPaneId
+        : visibleTerminalPaneIds[0] || ""
+    ));
+  }, [visibleTerminalPaneIds.join("|")]);
+
+  const handleActivateTerminalPane = useCallback(({ paneId }) => {
+    if (paneId) {
+      setActiveTerminalPaneId(paneId);
+    }
+  }, []);
 
   return (
     <ForgeWorkspace aria-label="Forge workspace" data-motion={viewMotion}>
@@ -599,7 +630,7 @@ export default function TerminalView({
       ) : (
         <TerminalWorkspaceWithCloudDock>
           <TerminalWorkspaceMain>
-            {hasWorkspaceTerminals ? (
+            {hasVisibleWorkspaceTerminalPanes ? (
               <WorkspaceTerminalPanels>
                 <ResizePanelGroup
                   id={`workspace-terminal-rows-${terminalWorkspace.id}`}
@@ -643,6 +674,8 @@ export default function TerminalView({
                                   agentStatuses={agentStatuses}
                                   agentStatusError={agentStatusError}
                                   agentStatusState={agentStatusState}
+                                  isActive={(activeTerminalPaneId || visibleTerminalPaneIds[0] || "") === getTerminalPaneId(terminalIndex)}
+                                  onActivateTerminal={handleActivateTerminalPane}
                                   onChangeTerminalRole={changeWorkspaceTerminalRole}
                                   onCloseTerminal={closeWorkspaceTerminal}
                                   onOpenSettings={showSettingsView}
@@ -665,7 +698,7 @@ export default function TerminalView({
                   ))}
                 </ResizePanelGroup>
               </WorkspaceTerminalPanels>
-            ) : (
+            ) : !hasWorkspaceTerminals ? (
               <WorkspaceTerminal
                 agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
@@ -673,6 +706,8 @@ export default function TerminalView({
                 agentStatuses={agentStatuses}
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
+                isActive={(activeTerminalPaneId || visibleTerminalPaneIds[0] || "") === getTerminalPaneId(terminalWorkspaceTerminalIndexes[0] || 0)}
+                onActivateTerminal={handleActivateTerminalPane}
                 onChangeTerminalRole={changeWorkspaceTerminalRole}
                 onCloseTerminal={closeWorkspaceTerminal}
                 onOpenSettings={showSettingsView}
@@ -686,7 +721,7 @@ export default function TerminalView({
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
               />
-            )}
+            ) : null}
           </TerminalWorkspaceMain>
           <CloudMcpTerminalDock workingDirectory={terminalWorkspaceWorkingDirectory} />
         </TerminalWorkspaceWithCloudDock>

@@ -25,7 +25,7 @@ use sha2::Sha256;
 use tauri::{
     ipc::{Channel, InvokeResponseBody},
     utils::config::Color,
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -93,6 +93,8 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
+const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
+const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -275,6 +277,7 @@ struct TerminalInstance {
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
     input_gate: Arc<Mutex<TerminalInputGate>>,
+    input_queue: Arc<Mutex<()>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
 }
@@ -383,6 +386,7 @@ impl TerminalInstance {
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
                 input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
+                input_queue: Arc::new(Mutex::new(())),
                 active_task: Arc::new(Mutex::new(None)),
                 coordination,
             },
@@ -783,6 +787,22 @@ struct TerminalExitPayload {
     instance_id: u64,
     exit_code: Option<i32>,
     exited_at_ms: u64,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInputEventPayload {
+    pane_id: String,
+    instance_id: Option<u64>,
+    data: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInputErrorPayload {
+    pane_id: String,
+    instance_id: Option<u64>,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -1268,6 +1288,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
+            register_terminal_input_event_listener(app);
 
             register_audio_shortcuts(app.handle());
 

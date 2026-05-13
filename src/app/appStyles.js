@@ -2245,12 +2245,15 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND} !important;
   }
 
+  &[data-active="false"] .xterm-cursor,
+  &[data-active="false"] .xterm-cursor-layer,
   &[data-parked="true"] .xterm-cursor,
   &[data-parked="true"] .xterm-cursor-layer {
     display: none !important;
     opacity: 0 !important;
   }
 
+  &[data-active="false"] .xterm-helper-textarea,
   &[data-parked="true"] .xterm-helper-textarea {
     pointer-events: none !important;
   }

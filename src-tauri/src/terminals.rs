@@ -509,6 +509,7 @@ fn cleanup_terminal_instance_with_context(
         working_directory,
         agent_started,
         input_gate,
+        input_queue,
         active_task,
         coordination,
     } = instance;
@@ -524,6 +525,7 @@ fn cleanup_terminal_instance_with_context(
         drop(working_directory);
         drop(agent_started);
         drop(input_gate);
+        drop(input_queue);
         drop(active_task);
         interrupt_terminal_coordination_after_process_cleanup(
             coordination.as_ref(),
@@ -551,6 +553,7 @@ fn cleanup_terminal_instance_with_context(
     drop(working_directory);
     drop(agent_started);
     drop(input_gate);
+    drop(input_queue);
     drop(active_task);
     interrupt_terminal_coordination_after_process_cleanup(
         coordination.as_ref(),
@@ -2772,6 +2775,61 @@ fn emit_terminal_parked_prompt_event(
     );
 }
 
+fn emit_terminal_input_error(
+    app: &AppHandle,
+    pane_id: String,
+    instance_id: Option<u64>,
+    message: String,
+) {
+    let _ = app.emit(
+        TERMINAL_INPUT_ERROR_EVENT,
+        TerminalInputErrorPayload {
+            pane_id,
+            instance_id,
+            message,
+        },
+    );
+}
+
+fn register_terminal_input_event_listener(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+
+    app.listen(TERMINAL_INPUT_EVENT, move |event| {
+        let payload = match serde_json::from_str::<TerminalInputEventPayload>(event.payload()) {
+            Ok(payload) => payload,
+            Err(error) => {
+                emit_terminal_input_error(
+                    &app_handle,
+                    String::new(),
+                    None,
+                    format!("Unable to parse terminal input event: {error}"),
+                );
+                return;
+            }
+        };
+        let app = app_handle.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let pane_id = payload.pane_id.clone();
+            let instance_id = payload.instance_id;
+            let state = app.state::<TerminalState>();
+            let cloud_mcp_state = app.state::<CloudMcpState>();
+            if let Err(error) = terminal_write_inner(
+                app.clone(),
+                state.inner(),
+                cloud_mcp_state.inner(),
+                payload.pane_id,
+                payload.instance_id,
+                payload.data,
+            )
+            .await
+            {
+                emit_terminal_input_error(&app, pane_id, instance_id, error);
+            }
+        });
+    });
+}
+
 async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
     cloud_mcp_state: &CloudMcpState,
     parked: &TerminalParkedPrompt,
@@ -3497,20 +3555,20 @@ async fn terminal_monitor_session_parking(
     }
 }
 
-#[tauri::command]
-async fn terminal_write(
+async fn terminal_write_inner(
     app: AppHandle,
-    state: State<'_, TerminalState>,
-    cloud_mcp_state: State<'_, CloudMcpState>,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
-    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
         return Ok(());
     };
+    let _input_guard = instance.input_queue.lock().await;
     let mut data_to_write = data.clone();
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
@@ -3524,7 +3582,7 @@ async fn terminal_write(
                 } else {
                     None
                 };
-            let cloud_state = cloud_mcp_state.inner().clone();
+            let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
             let coordination = instance.coordination.clone();
@@ -3581,7 +3639,7 @@ async fn terminal_write(
                 if !task.parked && !task.partial {
                     tauri::async_runtime::spawn(terminal_monitor_active_task_for_late_parking(
                         app.clone(),
-                        cloud_mcp_state.inner().clone(),
+                        cloud_mcp_state.clone(),
                         state.terminals.clone(),
                         state.parked_prompts.clone(),
                         pane_id.clone(),
@@ -3621,7 +3679,7 @@ async fn terminal_write(
                     "parked",
                     Some("waiting_for_dependency"),
                 );
-                let cloud_state_for_parked = cloud_mcp_state.inner().clone();
+                let cloud_state_for_parked = cloud_mcp_state.clone();
                 let parked_for_cloud = parked.clone();
                 tauri::async_runtime::spawn(async move {
                     cloud_mcp_mark_terminal_task_lifecycle(
@@ -3640,7 +3698,7 @@ async fn terminal_write(
                 });
                 tauri::async_runtime::spawn(terminal_resume_parked_prompt_when_ready(
                     app.clone(),
-                    cloud_mcp_state.inner().clone(),
+                    cloud_mcp_state.clone(),
                     state.terminals.clone(),
                     state.parked_prompts.clone(),
                     pane_id.clone(),
@@ -3658,7 +3716,7 @@ async fn terminal_write(
     }
 
     write_terminal_input(
-        &state,
+        state,
         &pane_id,
         instance_id,
         &data_to_write,
@@ -3666,6 +3724,26 @@ async fn terminal_write(
     )
     .await
     .map(|_| ())
+}
+
+#[tauri::command]
+async fn terminal_write(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    data: String,
+) -> Result<(), String> {
+    terminal_write_inner(
+        app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        pane_id,
+        instance_id,
+        data,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3696,6 +3774,7 @@ async fn terminal_delete_selection(
         }));
     };
 
+    let _input_guard = instance.input_queue.lock().await;
     let mut gate = instance.input_gate.lock().await;
     let current_line = gate.current_line.clone();
     let Some(start) = current_line.rfind(&selected_text) else {

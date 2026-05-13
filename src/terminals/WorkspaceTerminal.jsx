@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -359,7 +359,8 @@ const TERMINAL_SCROLL_ANCHOR_MAX_TEXT_CHARS = 360;
 const TERMINAL_SCROLL_ANCHOR_MIN_ALNUM_CHARS = 2;
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
-const TERMINAL_ACTIVE_PANE_EVENT = "forge-terminal-active-pane-change";
+const TERMINAL_INPUT_EVENT = "forge-terminal-input";
+const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
@@ -431,6 +432,7 @@ const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "generic", label: "Terminal", shortLabel: "SH" },
   { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
+const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -705,6 +707,22 @@ function getTerminalAgentColorSlot(terminalIndex) {
   const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
 
   return String(safeIndex % TERMINAL_AGENT_COLOR_SLOT_COUNT);
+}
+
+function getEventTargetElement(target) {
+  if (typeof Element !== "undefined" && target instanceof Element) {
+    return target;
+  }
+
+  if (typeof Node !== "undefined" && target instanceof Node) {
+    return target.parentElement;
+  }
+
+  return null;
+}
+
+function isTerminalControlEventTarget(target) {
+  return Boolean(getEventTargetElement(target)?.closest?.(TERMINAL_CONTROL_SELECTOR));
 }
 
 export function getDefaultTerminalIndexes(count) {
@@ -1189,6 +1207,8 @@ export default function WorkspaceTerminal({
   agentStatuses,
   agentStatusError,
   agentStatusState,
+  isActive = false,
+  onActivateTerminal,
   onChangeTerminalRole,
   onCloseTerminal,
   onOpenSettings,
@@ -1204,10 +1224,12 @@ export default function WorkspaceTerminal({
   workspaceError,
 }) {
   const containerRef = useRef(null);
+  const restartMenuRef = useRef(null);
   const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
+  const terminalActiveRef = useRef(Boolean(isActive));
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupProbeCountRef = useRef(0);
@@ -1228,7 +1250,7 @@ export default function WorkspaceTerminal({
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
-  const [terminalFocused, setTerminalFocused] = useState(false);
+  const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -1256,7 +1278,25 @@ export default function WorkspaceTerminal({
   const projectBadgeTitle = isGenericTerminal
     ? `${projectLabel} - generic shell with normal terminal controls`
     : `${projectLabel} - edits are isolated in the agent worktree until merge`;
-  const focusTerminalKeyboardInput = useCallback(() => {
+  const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
+    const terminal = xtermRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    const acceptsInteractiveInput = Boolean(active) && !parked;
+    terminal.options.disableStdin = Boolean(parked);
+    terminal.options.cursorBlink = acceptsInteractiveInput;
+
+    if (!acceptsInteractiveInput) {
+      terminal.blur?.();
+    }
+  }, []);
+  const focusTerminalKeyboardInput = useCallback((force = false) => {
+    if (!force && !terminalActiveRef.current) {
+      return;
+    }
+
     const terminal = xtermRef.current;
     if (!terminal) {
       return;
@@ -1280,31 +1320,33 @@ export default function WorkspaceTerminal({
       }
     }, 0);
   }, []);
-  const selectTerminalPane = useCallback(() => {
+  const activateTerminalPane = useCallback((source = "terminal_activation") => {
     const instanceId = terminalInstanceIdRef.current || 0;
+    terminalActiveRef.current = true;
     setActiveTerminalKeyboardTarget(paneId, instanceId);
     setTerminalFocused(true);
-    focusTerminalKeyboardInput();
-    window.dispatchEvent(new CustomEvent(TERMINAL_ACTIVE_PANE_EVENT, {
-      detail: {
-        instanceId,
-        paneId,
-        terminalIndex,
-        workspaceId: workspace?.id || "",
-      },
-    }));
-  }, [focusTerminalKeyboardInput, paneId, terminalIndex, workspace?.id]);
+    updateTerminalInteractiveState(true);
+    onActivateTerminal?.({
+      instanceId,
+      paneId,
+      source,
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
+    focusTerminalKeyboardInput(true);
+  }, [
+    focusTerminalKeyboardInput,
+    onActivateTerminal,
+    paneId,
+    terminalIndex,
+    updateTerminalInteractiveState,
+    workspace?.id,
+  ]);
   const requestTerminalAudioInputTarget = useCallback((active) => {
     const instanceId = terminalInstanceIdRef.current || undefined;
 
     if (active && !instanceId) {
-      clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
-      setTerminalFocused(false);
       return Promise.resolve(false);
-    }
-
-    if (active) {
-      setActiveTerminalKeyboardTarget(paneId, instanceId);
     }
 
     return invoke("set_terminal_audio_input_target", {
@@ -1313,11 +1355,8 @@ export default function WorkspaceTerminal({
       paneId,
     })
       .then(() => {
-        if (active) {
-          selectTerminalPane();
-        } else {
+        if (!active) {
           clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
-          setTerminalFocused(false);
         }
 
         return true;
@@ -1325,42 +1364,84 @@ export default function WorkspaceTerminal({
       .catch(() => {
         if (active) {
           clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
-          setTerminalFocused(false);
         }
 
         return false;
       });
-  }, [paneId, selectTerminalPane]);
-
-  useEffect(() => {
-    const handleActivePaneChange = (event) => {
-      setTerminalFocused(
-        event.detail?.paneId === paneId
-        && Number(event.detail?.instanceId || 0) === Number(terminalInstanceIdRef.current || 0),
-      );
-    };
-
-    window.addEventListener(TERMINAL_ACTIVE_PANE_EVENT, handleActivePaneChange);
-
-    return () => {
-      window.removeEventListener(TERMINAL_ACTIVE_PANE_EVENT, handleActivePaneChange);
-    };
   }, [paneId]);
 
-  useEffect(() => {
-    parkedPromptRef.current = parkedPrompt;
-    const terminal = xtermRef.current;
-    if (!terminal) {
+  const handleTerminalSurfaceFocusCapture = useCallback((event) => {
+    if (isTerminalControlEventTarget(event.target)) {
       return;
     }
 
-    const isParked = Boolean(parkedPrompt);
-    terminal.options.disableStdin = isParked;
-    terminal.options.cursorBlink = !isParked;
-    if (isParked) {
-      terminal.blur?.();
+    activateTerminalPane("terminal_focus");
+    requestTerminalAudioInputTarget(true);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+
+  const handleTerminalSurfacePointerDownCapture = useCallback((event) => {
+    if (isTerminalControlEventTarget(event.target)) {
+      return;
     }
-  }, [parkedPrompt]);
+
+    activateTerminalPane("terminal_pointer");
+    requestTerminalAudioInputTarget(true);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+
+  useEffect(() => {
+    terminalActiveRef.current = Boolean(isActive);
+    setTerminalFocused(Boolean(isActive));
+    updateTerminalInteractiveState(Boolean(isActive));
+
+    if (isActive) {
+      setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
+      return undefined;
+    }
+
+    clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
+    requestTerminalAudioInputTarget(false);
+    return undefined;
+  }, [isActive, paneId, requestTerminalAudioInputTarget, updateTerminalInteractiveState]);
+
+  useEffect(() => {
+    if (!restartRoleMenuOpen) {
+      return undefined;
+    }
+
+    const handleRestartMenuPointerDown = (event) => {
+      const menu = restartMenuRef.current;
+
+      if (
+        menu
+        && typeof Node !== "undefined"
+        && event.target instanceof Node
+        && menu.contains(event.target)
+      ) {
+        return;
+      }
+
+      setRestartRoleMenuOpen(false);
+    };
+
+    const handleRestartMenuKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setRestartRoleMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", handleRestartMenuPointerDown, true);
+    document.addEventListener("keydown", handleRestartMenuKeyDown, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", handleRestartMenuPointerDown, true);
+      document.removeEventListener("keydown", handleRestartMenuKeyDown, true);
+    };
+  }, [restartRoleMenuOpen]);
+
+  useEffect(() => {
+    parkedPromptRef.current = parkedPrompt;
+    updateTerminalInteractiveState(terminalActiveRef.current, Boolean(parkedPrompt));
+  }, [parkedPrompt, updateTerminalInteractiveState]);
 
   useEffect(() => {
     setTerminalClosed(false);
@@ -1547,6 +1628,9 @@ export default function WorkspaceTerminal({
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     terminalInstanceIdRef.current = terminalInstanceId;
+    if (terminalActiveRef.current) {
+      setActiveTerminalKeyboardTarget(paneId, terminalInstanceId);
+    }
     const lifecycleStartedAt = performance.now();
     const setPaneStage = (state, title, detail = "", fields = {}) => {
       if (isDisposed) {
@@ -1583,7 +1667,7 @@ export default function WorkspaceTerminal({
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: true,
-      cursorBlink: !parkedPromptRef.current,
+      cursorBlink: terminalActiveRef.current && !parkedPromptRef.current,
       cursorStyle: "block",
       disableStdin: Boolean(parkedPromptRef.current),
       fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
@@ -1634,7 +1718,7 @@ export default function WorkspaceTerminal({
       }
 
       if (!isDisposed) {
-        focusTerminalKeyboardInput();
+        activateTerminalPane("terminal_dom_focus");
         requestTerminalAudioInputTarget(true);
       }
     };
@@ -1822,13 +1906,10 @@ export default function WorkspaceTerminal({
         return;
       }
 
-      markTerminalAudioInputTarget();
-      terminal.focus();
-      window.setTimeout(() => {
-        if (!isDisposed) {
-          terminal.focus();
-        }
-      }, 0);
+      if (terminalActiveRef.current) {
+        requestTerminalAudioInputTarget(true);
+        focusTerminalKeyboardInput();
+      }
     })
       .then((unlisten) => {
         if (isDisposed) {
@@ -1996,9 +2077,7 @@ export default function WorkspaceTerminal({
       startupWatchTimers.add(timer);
     };
 
-    if (terminalIndex === 0) {
-      terminal.focus();
-    }
+    focusTerminalKeyboardInput();
 
     runtimeTerminalState = "starting";
     setTerminalState("starting");
@@ -2388,6 +2467,15 @@ export default function WorkspaceTerminal({
             );
           }
         }));
+        disposables.push(await listen(TERMINAL_INPUT_ERROR_EVENT, (event) => {
+          if (
+            event.payload?.paneId === paneId
+            && event.payload?.instanceId === terminalInstanceId
+            && !isDisposed
+          ) {
+            setTerminalError(getErrorMessage(event.payload?.message, "Unable to write to terminal."));
+          }
+        }));
         let terminalInputBuffer = "";
         let terminalInputFlushTimer = 0;
         let terminalInputWriteChain = Promise.resolve();
@@ -2407,7 +2495,7 @@ export default function WorkspaceTerminal({
               if (escapeDebugFields) {
               }
 
-              return invoke("terminal_write", {
+              return emit(TERMINAL_INPUT_EVENT, {
                 paneId,
                 instanceId: terminalInstanceId,
                 data,
@@ -2835,9 +2923,7 @@ export default function WorkspaceTerminal({
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);
 
-        if (terminalIndex === 0) {
-          terminal.focus();
-        }
+        focusTerminalKeyboardInput();
 
         if (shouldPrewarmShell) {
           onPreparedTerminalChange?.({
@@ -2932,7 +3018,7 @@ export default function WorkspaceTerminal({
       }).catch(() => {});
       terminal.dispose();
     };
-  }, [agent?.id, agent?.label, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
 
@@ -3169,10 +3255,10 @@ export default function WorkspaceTerminal({
       data-focused={terminalFocused ? "true" : "false"}
       data-pane-id={paneId}
       data-terminal-index={terminalIndex}
-      onFocusCapture={() => requestTerminalAudioInputTarget(true)}
-      onPointerDownCapture={() => requestTerminalAudioInputTarget(true)}
+      onFocusCapture={handleTerminalSurfaceFocusCapture}
+      onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
     >
-      <TerminalRestartPill>
+      <TerminalRestartPill data-terminal-control="true">
         <TerminalAgentIdBadge
           aria-label={terminalAgentTitle}
           data-agent={terminalAgentKind}
@@ -3189,11 +3275,8 @@ export default function WorkspaceTerminal({
           <span>{isolationLabel}</span>
         </TerminalProjectBadge>
         <TerminalRestartMenu
-          onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) {
-              setRestartRoleMenuOpen(false);
-            }
-          }}
+          data-terminal-control="true"
+          ref={restartMenuRef}
         >
           <TerminalRestartButton
             aria-expanded={restartRoleMenuOpen ? "true" : "false"}
@@ -3258,6 +3341,7 @@ export default function WorkspaceTerminal({
         ) : (
           <>
             <XtermSurface
+              data-active={terminalFocused ? "true" : "false"}
               data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
               data-parked={parkedPrompt ? "true" : "false"}
               onDragEnter={isGenericTerminal ? undefined : handleTerminalTodoDragEnter}
