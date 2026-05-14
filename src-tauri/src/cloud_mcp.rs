@@ -2606,23 +2606,6 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         return;
     }
 
-    cloud_mcp_sync_terminal_agent_status(
-        &state,
-        &repo_id,
-        &agent_id,
-        "terminal-agent",
-        "starting",
-        Some(&prompt),
-        "Terminal prompt submitted; preparing Spec Graph context.",
-        &working_directory,
-        &pane_id,
-        instance_id,
-        coordination.as_ref(),
-        local_task_id.as_deref(),
-        "terminal_prompt_submitted",
-    )
-    .await;
-
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
@@ -2631,6 +2614,8 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "current_agent_id": agent_id,
         "terminal_id": pane_id,
         "terminal_instance_id": instance_id,
+        "task_id": local_task_id.clone(),
+        "run_id": local_task_id.clone(),
         "prompt": prompt,
         "workspace_root": workspace_path_display(&working_directory),
         "coordination": coordination.as_ref().map(|coordination| json!({
@@ -2642,6 +2627,25 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         })),
         "ts_ms": cloud_mcp_now_ms(),
     });
+
+    let _ = cloud_mcp_post_event_endpoint(&state, "terminal_prompt_submitted", &payload).await;
+
+    cloud_mcp_sync_terminal_agent_status(
+        &state,
+        &repo_id,
+        &agent_id,
+        "terminal-agent",
+        "starting",
+        Some(payload["prompt"].as_str().unwrap_or_default()),
+        "Terminal prompt submitted; preparing Spec Graph context.",
+        &working_directory,
+        &pane_id,
+        instance_id,
+        coordination.as_ref(),
+        local_task_id.as_deref(),
+        "terminal_prompt_submitted",
+    )
+    .await;
 
     match cloud_mcp_post_json_endpoint(&state, "/v1/context/pack", &payload).await {
         Ok(response) => {

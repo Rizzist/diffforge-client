@@ -27,10 +27,12 @@ export default function SpecGraphWorkspaceView({
   rootDirectory,
   workspace,
 }) {
-  const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const workspaceId = workspace?.id || "";
+  const workspaceName = workspace?.name || "";
+  const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
   const workspaceDisplayIdentity = useMemo(
-    () => createWorkspaceDisplayIdentity(repoPath, workspace?.name || "Workspace"),
-    [repoPath, workspace?.name],
+    () => createWorkspaceDisplayIdentity(repoPath, workspaceName || "Workspace"),
+    [repoPath, workspaceName],
   );
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
@@ -49,7 +51,7 @@ export default function SpecGraphWorkspaceView({
   }, []);
 
   const loadLocalIgnoredOverlay = useCallback(() => {
-    if (!repoPath) return;
+    if (!repoPath || !workspaceId) return;
     setLocalIgnoredState("loading");
     setLocalIgnoredError("");
     invoke("cloud_mcp_get_local_ignored_spec_graph_overlay", { repoPath })
@@ -61,10 +63,10 @@ export default function SpecGraphWorkspaceView({
         setLocalIgnoredError(nextError?.message || String(nextError));
         setLocalIgnoredState("error");
       });
-  }, [repoPath]);
+  }, [repoPath, workspaceId]);
 
   useEffect(() => {
-    if (!repoPath) return undefined;
+    if (!repoPath || !workspaceId) return undefined;
     let cancelled = false;
     let unlistenCache = null;
 
@@ -72,8 +74,8 @@ export default function SpecGraphWorkspaceView({
 
     invoke("cloud_mcp_get_cached_spec_graph", {
       repoPath,
-      workspaceId: workspace?.id || null,
-      workspaceName: workspace?.name || null,
+      workspaceId,
+      workspaceName: workspaceName || null,
     })
       .then((next) => {
         if (!cancelled) applySnapshot(next);
@@ -99,8 +101,8 @@ export default function SpecGraphWorkspaceView({
 
     invoke("cloud_mcp_start_spec_graph_sync", {
       repoPath,
-      workspaceId: workspace?.id || null,
-      workspaceName: workspace?.name || null,
+      workspaceId,
+      workspaceName: workspaceName || null,
     })
       .then((next) => {
         if (!cancelled) applySnapshot(next);
@@ -116,7 +118,7 @@ export default function SpecGraphWorkspaceView({
       cancelled = true;
       if (typeof unlistenCache === "function") unlistenCache();
     };
-  }, [applySnapshot, repoPath, workspace?.id, workspace?.name]);
+  }, [applySnapshot, repoPath, workspaceId, workspaceName]);
 
   useEffect(() => {
     if (showLocalIgnored) loadLocalIgnoredOverlay();

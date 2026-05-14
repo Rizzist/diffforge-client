@@ -637,6 +637,18 @@ function AuthSquareBackdrop() {
   );
 }
 
+function WorkspaceIdleState({ detail = "No workspace selected.", viewMotion }) {
+  return (
+    <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
+      <WorkspaceIdlePanel>
+        <WorkspaceIdleLogo src="/logo.webp" alt="" />
+        <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
+        <WorkspaceIdleDetail>{detail}</WorkspaceIdleDetail>
+      </WorkspaceIdlePanel>
+    </WorkspaceIdleSurface>
+  );
+}
+
 function createAuthState() {
   const bytes = new Uint8Array(32);
   window.crypto.getRandomValues(bytes);
@@ -4247,7 +4259,10 @@ export default function App() {
     ),
     [activatedWorkspace?.id, activatedWorkspaceLogicalTerminalIndexes, workspaceTerminalDisplayLayouts],
   );
-  const selectedWorkspaceFileRoot = selectedWorkspaceRootDirectory || defaultWorkingDirectory;
+  const selectedWorkspaceFileRoot = selectedWorkspace
+    ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
+    : "";
+  const hasSelectedWorkspace = Boolean(selectedWorkspace);
   const isSelectedWorkspaceActivated = Boolean(selectedWorkspace && activatedWorkspace?.id === selectedWorkspace.id);
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
@@ -4264,7 +4279,7 @@ export default function App() {
   const selectedWorkspaceNameForSpecSync = selectedWorkspace?.name || "";
 
   useEffect(() => {
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
+    const repoPath = selectedWorkspaceFileRoot;
     if (!repoPath || !selectedWorkspaceIdForSpecSync) {
       return undefined;
     }
@@ -4295,7 +4310,6 @@ export default function App() {
       stopSync();
     };
   }, [
-    activatedWorkspaceTerminalWorkingDirectory,
     selectedWorkspaceFileRoot,
     selectedWorkspaceIdForSpecSync,
     selectedWorkspaceNameForSpecSync,
@@ -4757,38 +4771,42 @@ export default function App() {
                 </RailTop>
 
                 <RailFooter>
-                  <RailActionButton
-                    data-active={activeView === DEFAULT_WORKSPACE_VIEW}
-                    onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
-                    type="button"
-                  >
-                    <ButtonTerminalIcon aria-hidden="true" />
-                    <span>Terminals</span>
-                  </RailActionButton>
-                  <RailActionButton
-                    data-active={activeView === "files"}
-                    onClick={() => showView("files")}
-                    type="button"
-                  >
-                    <ButtonFolderIcon aria-hidden="true" />
-                    <span>Files</span>
-                  </RailActionButton>
-                  <RailActionButton
-                    data-active={activeView === "specGraph"}
-                    onClick={() => showView("specGraph")}
-                    type="button"
-                  >
-                    <ButtonForgeIcon aria-hidden="true" />
-                    <span>Spec Graph</span>
-                  </RailActionButton>
-                  <RailActionButton
-                    data-active={activeView === "mcps"}
-                    onClick={() => showView("mcps")}
-                    type="button"
-                  >
-                    <ButtonHubIcon aria-hidden="true" />
-                    <span>MCPs</span>
-                  </RailActionButton>
+                  {hasSelectedWorkspace && (
+                    <>
+                      <RailActionButton
+                        data-active={activeView === DEFAULT_WORKSPACE_VIEW}
+                        onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                        type="button"
+                      >
+                        <ButtonTerminalIcon aria-hidden="true" />
+                        <span>Terminals</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        data-active={activeView === "files"}
+                        onClick={() => showView("files")}
+                        type="button"
+                      >
+                        <ButtonFolderIcon aria-hidden="true" />
+                        <span>Files</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        data-active={activeView === "specGraph"}
+                        onClick={() => showView("specGraph")}
+                        type="button"
+                      >
+                        <ButtonForgeIcon aria-hidden="true" />
+                        <span>Spec Graph</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        data-active={activeView === "mcps"}
+                        onClick={() => showView("mcps")}
+                        type="button"
+                      >
+                        <ButtonHubIcon aria-hidden="true" />
+                        <span>MCPs</span>
+                      </RailActionButton>
+                    </>
+                  )}
                   <RailGlobalActions aria-label="Global controls">
                     <RailActionButton
                       data-active={activeView === "audio"}
@@ -4853,13 +4871,7 @@ export default function App() {
                       workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
                     />
                   ) : (
-                    <WorkspaceIdleSurface aria-label="No active workspace" data-motion={viewMotion}>
-                      <WorkspaceIdlePanel>
-                        <WorkspaceIdleLogo src="/logo.webp" alt="" />
-                        <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
-                        <WorkspaceIdleDetail>No active workspace.</WorkspaceIdleDetail>
-                      </WorkspaceIdlePanel>
-                    </WorkspaceIdleSurface>
+                    <WorkspaceIdleState detail="No active workspace." viewMotion={viewMotion} />
                   )}
                 </WorkspaceViewPane>
 
@@ -5235,7 +5247,7 @@ export default function App() {
                         <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
                       </PrimaryButton>
                     </WorkspaceSetupPanel>
-                  ) : (
+                  ) : selectedWorkspace ? (
                     <FilesWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
@@ -5243,15 +5255,21 @@ export default function App() {
                       workspace={selectedWorkspace}
                       workspaceError={workspaceError}
                     />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to browse files." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "specGraph" ? (
                 <ForgeWorkspace aria-label="Workspace Spec Graph" data-motion={viewMotion}>
-                  <SpecGraphWorkspaceView
-                    defaultWorkingDirectory={defaultWorkingDirectory}
-                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
-                    workspace={selectedWorkspace}
-                  />
+                  {selectedWorkspace ? (
+                    <SpecGraphWorkspaceView
+                      defaultWorkingDirectory={defaultWorkingDirectory}
+                      rootDirectory={selectedWorkspaceFileRoot}
+                      workspace={selectedWorkspace}
+                    />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to view the spec graph." viewMotion={viewMotion} />
+                  )}
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (
                 <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>
@@ -5271,12 +5289,16 @@ export default function App() {
                 </ForgeWorkspace>
               ) : visibleView === "mcps" ? (
                 <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
-                  <McpsWorkspaceView
-                    defaultWorkingDirectory={defaultWorkingDirectory}
-                    onOpenSettings={() => showView("settings")}
-                    rootDirectory={selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory}
-                    workspace={selectedWorkspace}
-                  />
+                  {selectedWorkspace ? (
+                    <McpsWorkspaceView
+                      defaultWorkingDirectory={defaultWorkingDirectory}
+                      onOpenSettings={() => showView("settings")}
+                      rootDirectory={selectedWorkspaceFileRoot}
+                      workspace={selectedWorkspace}
+                    />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to inspect MCPs." viewMotion={viewMotion} />
+                  )}
                 </ForgeWorkspace>
               ) : (
                 null

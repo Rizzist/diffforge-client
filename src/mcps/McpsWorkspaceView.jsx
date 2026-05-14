@@ -129,9 +129,9 @@ export default function McpsWorkspaceView({
   rootDirectory,
   workspace,
 }) {
-  const workspaceName = workspace?.name || "Workspace";
   const workspaceId = workspace?.id || "";
-  const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const workspaceName = workspace?.name || "Workspace";
+  const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [coordinator, setCoordinator] = useState(null);

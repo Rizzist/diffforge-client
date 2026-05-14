@@ -241,6 +241,7 @@ export function createTerminalResizeController({
   let nativeInFlight = false;
   let nativePendingAfterFlight = false;
   let nativeResizeTimer = 0;
+  let pendingNativeForce = false;
   let pendingNativeRequest = null;
   let pendingNativeReason = "";
   let queuedForResizeFrame = false;
@@ -274,10 +275,14 @@ export function createTerminalResizeController({
 
     const request = pendingNativeRequest;
     const reason = pendingNativeReason;
+    const force = pendingNativeForce;
     pendingNativeRequest = null;
     pendingNativeReason = "";
+    pendingNativeForce = false;
 
     if (
+      !force
+      &&
       lastNativeAppliedSize?.cols === request.cols
       && lastNativeAppliedSize?.rows === request.rows
       && lastNativeAppliedSize?.paneId === request.paneId
@@ -325,13 +330,14 @@ export function createTerminalResizeController({
     }
   };
 
-  const scheduleNativeResize = (request, reason, delayMs) => {
+  const scheduleNativeResize = (request, reason, delayMs, force = false) => {
     if (disposed || !request?.cols || !request?.rows) {
       return;
     }
 
     pendingNativeRequest = request;
     pendingNativeReason = reason;
+    pendingNativeForce = Boolean(force);
     clearNativeResizeTimer();
     nativeResizeTimer = window.setTimeout(
       flushNativeResize,
@@ -441,7 +447,11 @@ export function createTerminalResizeController({
 
     const { cols, rows } = measurement;
 
-    if (lastAppliedSize?.cols === cols && lastAppliedSize?.rows === rows) {
+    if (
+      !options.force
+      && lastAppliedSize?.cols === cols
+      && lastAppliedSize?.rows === rows
+    ) {
       callSafely(onSkip, {
         ...measurement,
         inFlight: nativeInFlight,
@@ -453,6 +463,9 @@ export function createTerminalResizeController({
     }
 
     const request = { cols, rows };
+    if (options.forceNative) {
+      request.force = true;
+    }
     const resolvedPaneId = getPaneId();
     const resolvedInstanceId = getInstanceId();
 
@@ -526,6 +539,7 @@ export function createTerminalResizeController({
         request,
         reason,
         options.nativeDelayMs ?? 0,
+        options.forceNative || options.force,
       );
       return true;
     } catch (error) {

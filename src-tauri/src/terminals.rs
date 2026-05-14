@@ -2256,17 +2256,6 @@ fn terminal_placeholder_task_body(value: &str) -> bool {
         || lower == "the agent is preparing the requested work and has not named the task yet."
 }
 
-struct TerminalPreparedCoordinationTask {
-    task_id: String,
-    title: String,
-    parked: bool,
-    partial: bool,
-    parking_details: Value,
-    intent_resources: Vec<String>,
-    runnable_resources: Vec<String>,
-    parked_resources: Vec<String>,
-}
-
 #[derive(Clone)]
 struct TerminalParkingSnapshot {
     task_id: String,
@@ -2307,55 +2296,6 @@ fn terminal_waiting_slot_label(slot_key: &str) -> String {
     } else {
         short
     }
-}
-
-fn terminal_parked_waiting_on_from_details(details: &Value) -> Vec<TerminalParkedWaitingOn> {
-    let mut waiting_on = Vec::new();
-    let Some(items) = details.as_array() else {
-        return waiting_on;
-    };
-    for item in items {
-        let resource_key = item["error"]["details"]["resource_key"]
-            .as_str()
-            .or_else(|| item["resource_key"].as_str())
-            .map(str::to_string);
-        let mut blockers = item["error"]["details"]["blockers"]
-            .as_array()
-            .map(|items| items.iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let single_blocker = item["error"]["details"]["blocker"]
-            .as_object()
-            .map(|blocker| Value::Object(blocker.clone()));
-        if let Some(blocker) = single_blocker.as_ref() {
-            blockers.push(blocker);
-        }
-        for blocker in blockers {
-            let agent_id = blocker["agent_id"].as_str().map(str::to_string);
-            let agent_label = blocker["agent_label"]
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| agent_id.as_deref().map(terminal_waiting_agent_label))
-                .or_else(|| {
-                    blocker["slot_key"]
-                        .as_str()
-                        .map(terminal_waiting_slot_label)
-                });
-            terminal_push_unique_waiting_on(
-                &mut waiting_on,
-                TerminalParkedWaitingOn {
-                    agent_id,
-                    agent_label,
-                    task_id: blocker["task_id"].as_str().map(str::to_string),
-                    task_title: blocker["task_title"]
-                        .as_str()
-                        .or_else(|| blocker["title"].as_str())
-                        .map(str::to_string),
-                    resource_key: resource_key.clone(),
-                },
-            );
-        }
-    }
-    waiting_on
 }
 
 fn terminal_push_unique_waiting_on(
@@ -2882,12 +2822,21 @@ pub(crate) fn observe_terminal_coordination_event(
     _db_path: PathBuf,
     event_type: String,
     refs: crate::coordination::kernel::EventRefs,
-    _payload: Value,
+    payload: Value,
 ) {
     if !matches!(
         event_type.as_str(),
-        "task_parked_for_resource_queue" | "active_file_lease_queue_waiter_released"
+        "task_claimed"
+            | "mcp_agent_tool_called"
+            | "task_parked_for_resource_queue"
+            | "active_file_lease_queue_waiter_released"
     ) {
+        return;
+    }
+
+    if event_type == "mcp_agent_tool_called"
+        && payload["details"]["tool"].as_str() != Some("start_task")
+    {
         return;
     }
 
@@ -2897,7 +2846,7 @@ pub(crate) fn observe_terminal_coordination_event(
 
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(35)).await;
-        terminal_handle_coordination_event(app, event_type, refs).await;
+        terminal_handle_coordination_event(app, event_type, refs, payload).await;
     });
 }
 
@@ -2905,6 +2854,7 @@ async fn terminal_handle_coordination_event(
     app: AppHandle,
     event_type: String,
     refs: crate::coordination::kernel::EventRefs,
+    payload: Value,
 ) {
     let (terminals, parked_prompts) = {
         let state = app.state::<TerminalState>();
@@ -2923,6 +2873,12 @@ async fn terminal_handle_coordination_event(
     );
 
     match event_type.as_str() {
+        "task_claimed" => {
+            terminal_handle_task_started_event(app, terminals, refs).await;
+        }
+        "mcp_agent_tool_called" if payload["details"]["tool"].as_str() == Some("start_task") => {
+            terminal_handle_task_started_event(app, terminals, refs).await;
+        }
         "task_parked_for_resource_queue" => {
             terminal_handle_task_parked_for_resource_event(
                 app,
@@ -2945,6 +2901,80 @@ async fn terminal_handle_coordination_event(
         }
         _ => {}
     }
+}
+
+async fn terminal_handle_task_started_event(
+    app: AppHandle,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    refs: crate::coordination::kernel::EventRefs,
+) {
+    let Some(task_id) = refs
+        .task_id
+        .as_deref()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+
+    let Some((pane_id, instance)) = terminal_find_instance_for_coordination_event(
+        &terminals,
+        refs.session_id.as_deref(),
+        Some(&task_id),
+    )
+    .await
+    else {
+        return;
+    };
+
+    let title = instance
+        .coordination
+        .as_ref()
+        .and_then(|coordination| {
+            crate::coordination::CoordinationKernel::open(
+                &coordination.repo_path,
+                Some(PathBuf::from(&coordination.db_path)),
+            )
+            .ok()
+            .and_then(|kernel| {
+                kernel
+                    .query_json("SELECT title FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])
+                    .ok()
+                    .and_then(|rows| rows.into_iter().next())
+                    .and_then(|task| {
+                        task["title"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                    })
+            })
+        })
+        .unwrap_or_else(|| "Active terminal task".to_string());
+
+    let mut active_task = instance.active_task.lock().await;
+    if active_task
+        .as_ref()
+        .is_some_and(|active| active.task_id == task_id)
+    {
+        return;
+    }
+    *active_task = Some(TerminalActiveTask {
+        task_id: task_id.clone(),
+        title: title.clone(),
+    });
+    drop(active_task);
+
+    log_terminal_diagnostic_event(
+        &app,
+        "backend.terminal_active_task.started",
+        json!({
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "session_id": refs.session_id.as_deref().unwrap_or_default(),
+            "task_id": task_id,
+            "title": clean_terminal_diagnostic_log_text(&title),
+        }),
+    );
 }
 
 async fn terminal_find_instance_for_coordination_event(
@@ -3481,179 +3511,6 @@ async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
     .await;
 }
 
-fn terminal_prompt_is_agent_command(prompt: &str) -> bool {
-    let trimmed = prompt.trim();
-    if !trimmed.starts_with('/') || trimmed.starts_with("//") {
-        return false;
-    }
-    trimmed
-        .chars()
-        .nth(1)
-        .is_some_and(|character| character.is_ascii_alphabetic() || character == '?')
-}
-
-fn terminal_existing_session_task_with_active_leases(
-    kernel: &crate::coordination::CoordinationKernel,
-    coordination: &TerminalCoordinationSession,
-) -> Result<Option<(String, String, usize)>, String> {
-    let now = crate::coordination::kernel::now_rfc3339();
-    let rows = kernel.query_json(
-        "SELECT l.task_id,
-                t.title,
-                t.body,
-                t.status AS task_status,
-                COUNT(1) AS active_lease_count,
-                MAX(l.acquired_at) AS latest_lease_at,
-                CASE WHEN s.task_id=l.task_id THEN 0 ELSE 1 END AS session_task_rank
-         FROM leases l
-         LEFT JOIN tasks t ON t.id = l.task_id
-         LEFT JOIN agent_sessions s ON s.id = l.session_id
-         WHERE l.status='active'
-           AND l.expires_at >= ?1
-           AND l.agent_id=?2
-           AND l.session_id=?3
-           AND COALESCE(t.status, '') NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
-         GROUP BY l.task_id
-         ORDER BY session_task_rank ASC, latest_lease_at DESC
-         LIMIT 1",
-        &[&now, &coordination.agent_id, &coordination.session_id],
-    )?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    let Some(task_id) = row["task_id"]
-        .as_str()
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(None);
-    };
-    let title = row["title"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "Continue terminal task".to_string());
-    let active_lease_count = row["active_lease_count"].as_i64().unwrap_or(0).max(0) as usize;
-
-    Ok(Some((task_id, title, active_lease_count)))
-}
-
-fn terminal_attach_session_to_reused_task(
-    kernel: &crate::coordination::CoordinationKernel,
-    coordination: &TerminalCoordinationSession,
-    task_id: &str,
-) -> Result<(), String> {
-    let changed = kernel
-        .conn
-        .execute(
-            "UPDATE agent_sessions
-             SET task_id=?1, updated_at=?2
-             WHERE id=?3
-               AND agent_id=?4
-               AND status='active'",
-            rusqlite::params![
-                task_id,
-                crate::coordination::kernel::now_rfc3339(),
-                coordination.session_id.as_str(),
-                coordination.agent_id.as_str()
-            ],
-        )
-        .map_err(|error| format!("Unable to reattach terminal session to reused task: {error}"))?;
-    if changed == 0 {
-        return Err("Unable to reattach terminal session to reused task.".to_string());
-    }
-    Ok(())
-}
-
-fn terminal_partial_parking_prompt(
-    prompt: &str,
-    runnable_resources: &[String],
-    parked_resources: &[String],
-) -> String {
-    let runnable = if runnable_resources.is_empty() {
-        "- none".to_string()
-    } else {
-        runnable_resources
-            .iter()
-            .map(|resource| format!("- {resource}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let parked = if parked_resources.is_empty() {
-        "- none".to_string()
-    } else {
-        parked_resources
-            .iter()
-            .map(|resource| format!("- {resource}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "Diff Forge scheduler partially parked this task.\n\n\
-Work only on these granted resources now:\n{runnable}\n\n\
-Do not edit these parked resources yet:\n{parked}\n\n\
-When the runnable slice is complete, call coordination-kernel.submit_patch. Rust will resume this terminal later for the parked resources after their queue/resolver dependencies clear.\n\n\
-Original request:\n{prompt}\r"
-    )
-}
-
-fn terminal_prepare_coordination_task_for_prompt(
-    coordination: &TerminalCoordinationSession,
-    prompt: &str,
-) -> Result<Option<TerminalPreparedCoordinationTask>, String> {
-    if terminal_prompt_is_agent_command(prompt) {
-        return Ok(None);
-    }
-
-    let kernel = crate::coordination::CoordinationKernel::open(
-        &coordination.repo_path,
-        Some(PathBuf::from(&coordination.db_path)),
-    )?;
-    if let Some((task_id, title, _)) =
-        terminal_existing_session_task_with_active_leases(&kernel, coordination)?
-    {
-        terminal_attach_session_to_reused_task(&kernel, coordination, &task_id)?;
-        return Ok(Some(TerminalPreparedCoordinationTask {
-            task_id,
-            title,
-            parked: false,
-            partial: false,
-            parking_details: Value::Array(Vec::new()),
-            intent_resources: Vec::new(),
-            runnable_resources: Vec::new(),
-            parked_resources: Vec::new(),
-        }));
-    }
-
-    let title = terminal_prompt_task_title(prompt);
-    let task = kernel.create_task(
-        &title,
-        Some(prompt),
-        0,
-        1,
-        None,
-        None,
-        Some("terminal-agent"),
-        Some("Complete the direct terminal prompt in the assigned agent worktree."),
-    )?;
-    let Some(task_id) = task["id"].as_str().map(str::to_string) else {
-        return Ok(None);
-    };
-    kernel.claim_task(&task_id, &coordination.agent_id, &coordination.session_id)?;
-    let _ = kernel.task_resume_state(&task_id, &coordination.session_id);
-    Ok(Some(TerminalPreparedCoordinationTask {
-        task_id,
-        title,
-        parked: false,
-        partial: false,
-        parking_details: Value::Array(Vec::new()),
-        intent_resources: Vec::new(),
-        runnable_resources: Vec::new(),
-        parked_resources: Vec::new(),
-    }))
-}
-
 async fn terminal_write_inner(
     app: AppHandle,
     state: &TerminalState,
@@ -3668,7 +3525,6 @@ async fn terminal_write_inner(
         return Ok(());
     };
     let _input_guard = instance.input_queue.lock().await;
-    let mut data_to_write = data.clone();
 
     let escape_interrupt_task_id = if data == "\x1b" && instance.coordination.is_some() {
         instance
@@ -3705,51 +3561,18 @@ async fn terminal_write_inner(
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
         if *instance.agent_started.lock().await {
-            let prepared_coordination_task =
-                if let Some(coordination) = instance.coordination.as_ref() {
-                    match terminal_prepare_coordination_task_for_prompt(coordination, &prompt) {
-                        Ok(task) => task,
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
             let coordination = instance.coordination.clone();
             let terminal_instance_id = instance.id;
-            if let Some(task) = prepared_coordination_task.as_ref() {
-                let mut active_task = instance.active_task.lock().await;
-                *active_task = Some(TerminalActiveTask {
-                    task_id: task.task_id.clone(),
-                    title: task.title.clone(),
-                });
-                if task.partial {
-                    data_to_write = terminal_partial_parking_prompt(
-                        &prompt,
-                        &task.runnable_resources,
-                        &task.parked_resources,
-                    );
-                }
-            }
-            let local_task_id = prepared_coordination_task
+            let active_task = instance.active_task.lock().await.clone();
+            let local_task_id = active_task
                 .as_ref()
                 .map(|task| task.task_id.clone());
-            let local_task_title = prepared_coordination_task
+            let local_task_title = active_task
                 .as_ref()
                 .map(|task| task.title.clone());
-            let parked_task = prepared_coordination_task.as_ref().and_then(|task| {
-                (task.parked || task.partial).then(|| {
-                    (
-                        task.task_id.clone(),
-                        task.title.clone(),
-                        task.parking_details.clone(),
-                        task.intent_resources.clone(),
-                        task.parked,
-                    )
-                })
-            });
             let prompt_for_cloud = prompt.clone();
             tauri::async_runtime::spawn(async move {
                 cloud_mcp_terminal_context_pack_for_prompt(
@@ -3764,55 +3587,6 @@ async fn terminal_write_inner(
                 )
                 .await;
             });
-            if let (
-                Some(coordination),
-                Some((task_id, title, parking_details, _intent_resources, fully_parked)),
-            ) = (instance.coordination.clone(), parked_task)
-            {
-                let waiting_on = terminal_parked_waiting_on_from_details(&parking_details);
-                let parked = TerminalParkedPrompt {
-                    pane_id: pane_id.clone(),
-                    instance_id: instance.id,
-                    task_id: task_id.clone(),
-                    title: title.clone(),
-                    prompt: prompt.clone(),
-                    waiting_on,
-                    coordination: coordination.clone(),
-                    working_directory: instance.working_directory.as_ref().clone(),
-                };
-                let parked_key = terminal_parked_prompt_key(&pane_id, instance.id, &task_id);
-                state
-                    .parked_prompts
-                    .write()
-                    .await
-                    .insert(parked_key, parked.clone());
-                emit_terminal_parked_prompt_event(
-                    &app,
-                    &parked,
-                    "parked",
-                    Some("waiting_for_dependency"),
-                );
-                let cloud_state_for_parked = cloud_mcp_state.clone();
-                let parked_for_cloud = parked.clone();
-                tauri::async_runtime::spawn(async move {
-                    cloud_mcp_mark_terminal_task_lifecycle(
-                        &cloud_state_for_parked,
-                        &parked_for_cloud.pane_id,
-                        parked_for_cloud.instance_id,
-                        &parked_for_cloud.working_directory,
-                        Some(&parked_for_cloud.coordination),
-                        Some(&parked_for_cloud.task_id),
-                        Some(&parked_for_cloud.title),
-                        "blocked",
-                        "terminal-agent",
-                        "Parked: waiting for another agent's accepted patch before continuing.",
-                    )
-                    .await;
-                });
-                if fully_parked {
-                    return Ok(());
-                }
-            }
         }
     }
 
@@ -3821,7 +3595,7 @@ async fn terminal_write_inner(
         state,
         &pane_id,
         instance_id,
-        &data_to_write,
+        &data,
         "terminal.write.skipped_stale_or_missing",
     )
     .await
@@ -4144,11 +3918,12 @@ async fn resize_terminal_instance(
     app: Option<&AppHandle>,
     instance: &TerminalInstance,
     size: PtySize,
+    force: bool,
 ) -> Result<(), String> {
     let resize_started_at = Instant::now();
     let mut current_size = instance.size.lock().await;
 
-    if *current_size == size {
+    if *current_size == size && !force {
         return Ok(());
     }
 
@@ -4224,6 +3999,7 @@ async fn resize_terminal(
     instance_id: Option<u64>,
     cols: u16,
     rows: u16,
+    force: Option<bool>,
 ) -> Result<(), String> {
     let size = match validate_terminal_size(cols, rows) {
         Ok(size) => size,
@@ -4241,7 +4017,7 @@ async fn resize_terminal(
         return Ok(());
     };
 
-    resize_terminal_instance(Some(&app), &instance, size).await?;
+    resize_terminal_instance(Some(&app), &instance, size, force.unwrap_or(false)).await?;
 
     Ok(())
 }
@@ -4270,7 +4046,7 @@ async fn terminal_resize(
             return Err(error);
         }
     };
-    resize_terminal_instance(Some(&app), &instance, size).await?;
+    resize_terminal_instance(Some(&app), &instance, size, false).await?;
 
     Ok(())
 }
@@ -4362,13 +4138,6 @@ mod terminal_tests {
     }
 
     #[test]
-    fn slash_command_does_not_create_coordination_task() {
-        assert!(terminal_prompt_is_agent_command("/model"));
-        assert!(terminal_prompt_is_agent_command(" /fast "));
-        assert!(!terminal_prompt_is_agent_command("make /api docs page"));
-    }
-
-    #[test]
     fn shift_enter_sequence_adds_line_break_without_prompt_submission() {
         let mut gate = TerminalInputGate::default();
 
@@ -4387,13 +4156,33 @@ mod terminal_tests {
     }
 
     #[test]
+    fn submitted_prompt_observation_does_not_create_local_task() {
+        let coordination = terminal_test_coordination("prompt_observation_no_task");
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                "make an index.html entry page for icecream wishlist\r",
+            ),
+            Some("make an index.html entry page for icecream wishlist".to_string())
+        );
+
+        let inspect = crate::coordination::CoordinationKernel::open(
+            PathBuf::from(&coordination.repo_path),
+            Some(PathBuf::from(&coordination.db_path)),
+        )
+        .unwrap();
+        let tasks = inspect.query_json("SELECT id FROM tasks", &[]).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
     fn parked_resume_prompt_includes_dependency_context() {
         let snapshot = TerminalParkingSnapshot {
             task_id: "task-resume".to_string(),
             title: "Darken pricing page".to_string(),
             prompt: "Nice redesign the pricing to be more dark tones.".to_string(),
-            task_status: "ready".to_string(),
-            session_status: "active".to_string(),
             ready: true,
             terminal: false,
             waiting_on: Vec::new(),
@@ -4528,109 +4317,4 @@ mod terminal_tests {
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
     }
 
-    #[test]
-    fn prompt_preparation_does_not_create_prompt_intent_leases() {
-        let coordination = terminal_test_coordination("prompt_parking_disabled");
-
-        let first = terminal_prepare_coordination_task_for_prompt(
-            &coordination,
-            "make an index.html entry page for icecream wishlist",
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!first.parked);
-        assert!(!first.partial);
-        assert!(first.intent_resources.is_empty());
-        assert!(first.runnable_resources.is_empty());
-        assert!(first.parked_resources.is_empty());
-
-        let inspect = crate::coordination::CoordinationKernel::open(
-            PathBuf::from(&coordination.repo_path),
-            Some(PathBuf::from(&coordination.db_path)),
-        )
-        .unwrap();
-        let active_leases = inspect
-            .query_json("SELECT id FROM leases WHERE status='active'", &[])
-            .unwrap();
-        assert!(active_leases.is_empty());
-        let intents = inspect
-            .query_json("SELECT id FROM task_resource_intents", &[])
-            .unwrap();
-        assert!(intents.is_empty());
-    }
-
-    #[test]
-    fn retry_prompt_reuses_same_session_active_lease_task() {
-        let coordination = terminal_test_coordination("retry_reuses_session_lease");
-
-        let first = terminal_prepare_coordination_task_for_prompt(
-            &coordination,
-            "make an index.html entry page for icecream wishlist",
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!first.parked);
-
-        let lease_kernel = crate::coordination::CoordinationKernel::open(
-            PathBuf::from(&coordination.repo_path),
-            Some(PathBuf::from(&coordination.db_path)),
-        )
-        .unwrap();
-        lease_kernel
-            .acquire_lease(
-                &first.task_id,
-                &coordination.agent_id,
-                &coordination.session_id,
-                "file:index.html",
-                "write",
-                Some(900),
-                Some("test lease acquired by the agent after inspecting the repo"),
-            )
-            .unwrap();
-        drop(lease_kernel);
-
-        let retry = terminal_prepare_coordination_task_for_prompt(
-            &coordination,
-            "make the index.html for my icecream page",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(retry.task_id, first.task_id);
-        assert!(!retry.parked);
-        assert!(retry.intent_resources.is_empty());
-        assert!(retry.runnable_resources.is_empty());
-
-        let inspect = crate::coordination::CoordinationKernel::open(
-            PathBuf::from(&coordination.repo_path),
-            Some(PathBuf::from(&coordination.db_path)),
-        )
-        .unwrap();
-        let retry_tasks = inspect
-            .query_json(
-                "SELECT id FROM tasks WHERE body='make the index.html for my icecream page'",
-                &[],
-            )
-            .unwrap();
-        assert!(retry_tasks.is_empty());
-        let session_rows = inspect
-            .query_json(
-                "SELECT task_id FROM agent_sessions WHERE id=?1",
-                &[&coordination.session_id],
-            )
-            .unwrap();
-        assert_eq!(
-            session_rows[0]["task_id"].as_str(),
-            Some(first.task_id.as_str())
-        );
-        let active_index_leases = inspect
-            .query_json(
-                "SELECT l.id
-                 FROM leases l
-                 JOIN resources r ON r.id=l.resource_id
-                 WHERE l.status='active' AND r.resource_key='file:index.html'",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(active_index_leases.len(), 1);
-    }
 }

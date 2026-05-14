@@ -1073,8 +1073,11 @@ export default function FilesWorkspaceView({
   const [fileDiffTruncated, setFileDiffTruncated] = useState(false);
   const [filePreviewMode, setFilePreviewMode] = useState("file");
   const [reviewRulerHeight, setReviewRulerHeight] = useState(0);
-  const workspaceRoot = cleanWorkspaceRootDirectory(rootDirectory || defaultWorkingDirectory);
-  const fileExplorerLayoutOwner = workspace?.id || workspaceRoot;
+  const workspaceId = workspace?.id || "";
+  const workspaceRoot = workspaceId
+    ? cleanWorkspaceRootDirectory(rootDirectory || defaultWorkingDirectory)
+    : "";
+  const fileExplorerLayoutOwner = workspaceId || workspaceRoot;
   const fileExplorerLayoutKey = useMemo(
     () => getFileExplorerLayoutKey(fileExplorerLayoutOwner),
     [fileExplorerLayoutOwner],
