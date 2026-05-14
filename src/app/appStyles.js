@@ -6847,21 +6847,20 @@ export const TerminalRestartMenu = styled.div`
 
 export const TerminalRestartDropdown = styled.div`
   position: absolute;
-  top: calc(100% + 5px);
-  left: 50%;
+  top: calc(100% + 6px);
+  right: 0;
   z-index: 60;
-  display: inline-flex;
-  width: max-content;
+  display: grid;
+  min-width: 156px;
   max-width: min(220px, calc(100vw - 24px));
-  align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border: 0;
-  border-radius: 999px;
-  background: rgba(65, 71, 82, 0.72);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
-  transform: translateX(-50%);
-  backdrop-filter: blur(10px);
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
+    rgb(7, 9, 13);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42);
 
   &[data-open="false"] {
     display: none;
@@ -6869,87 +6868,80 @@ export const TerminalRestartDropdown = styled.div`
 `;
 
 export const TerminalRestartOption = styled.button`
-  --terminal-option-accent: rgba(255, 255, 255, 0.72);
-
-  position: relative;
-  display: inline-flex;
-  width: 28px;
-  height: 22px;
+  display: flex;
+  min-width: 0;
   align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  gap: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  color: rgba(255, 255, 255, 0.82);
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--forge-text-soft);
   background: transparent;
+  text-align: left;
   cursor: pointer;
   transition:
+    background 150ms ease,
+    border-color 150ms ease,
     color 150ms ease,
-    opacity 150ms ease,
-    transform 150ms ease;
+    opacity 150ms ease;
 
   strong {
-    position: absolute;
-    width: 1px;
-    height: 1px;
+    min-width: 0;
     overflow: hidden;
-    clip: rect(0 0 0 0);
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
-  span {
-    color: currentColor;
-    font-size: 9px;
-    font-weight: 900;
+    font-size: 11px;
+    font-weight: 820;
     letter-spacing: 0;
     line-height: 1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   &:hover,
   &:focus-visible {
+    border-color: rgba(98, 160, 255, 0.22);
     color: #fff;
-    transform: translateY(-1px);
+    background: rgba(98, 160, 255, 0.1);
     outline: none;
   }
 
-  &::after {
-    position: absolute;
-    right: 5px;
-    bottom: 3px;
-    left: 5px;
-    height: 1px;
-    border-radius: 999px;
-    background: var(--terminal-option-accent);
-    opacity: 0;
-    content: "";
-    transition: opacity 150ms ease;
+  &[data-role="claude"]:hover,
+  &[data-role="claude"]:focus-visible {
+    border-color: rgba(255, 154, 61, 0.26);
+    background: rgba(255, 122, 24, 0.11);
   }
 
-  &[data-role="codex"] {
-    --terminal-option-accent: #62a0ff;
+  &[data-role="generic"]:hover,
+  &[data-role="generic"]:focus-visible {
+    border-color: rgba(143, 157, 183, 0.24);
+    background: rgba(143, 157, 183, 0.1);
   }
 
-  &[data-role="claude"] {
-    --terminal-option-accent: #ff9d48;
-  }
-
-  &[data-role="opencode"] {
-    --terminal-option-accent: #3ccb7f;
-  }
-
-  &[data-role="generic"] {
-    --terminal-option-accent: #d0d7e6;
+  &[data-role="opencode"]:hover,
+  &[data-role="opencode"]:focus-visible {
+    border-color: rgba(67, 229, 176, 0.26);
+    background: rgba(37, 211, 154, 0.1);
   }
 
   &[data-selected="true"] {
     color: #fff;
+    border-color: rgba(98, 160, 255, 0.22);
+    background: rgba(98, 160, 255, 0.1);
   }
 
-  &[data-selected="true"]::after {
-    opacity: 0.95;
+  &[data-role="claude"][data-selected="true"] {
+    border-color: rgba(255, 154, 61, 0.26);
+    background: rgba(255, 122, 24, 0.11);
+  }
+
+  &[data-role="generic"][data-selected="true"] {
+    border-color: rgba(143, 157, 183, 0.24);
+    background: rgba(143, 157, 183, 0.1);
+  }
+
+  &[data-role="opencode"][data-selected="true"] {
+    border-color: rgba(67, 229, 176, 0.26);
+    background: rgba(37, 211, 154, 0.1);
   }
 `;
 

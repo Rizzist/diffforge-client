@@ -5204,7 +5204,6 @@ function WorkspaceTerminal({
                 type="button"
               >
                 <strong>{option.id === terminalAgentKind ? `Restart ${option.label}` : option.label}</strong>
-                <span>{option.shortLabel}</span>
               </TerminalRestartOption>
             ))}
           </TerminalRestartDropdown>
