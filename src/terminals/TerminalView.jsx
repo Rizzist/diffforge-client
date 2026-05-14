@@ -1417,6 +1417,10 @@ function TerminalView({
       const paneId = Number.isInteger(targetTerminalIndex)
         ? getTerminalPaneId(targetTerminalIndex)
         : "";
+      const targetRole = Number.isInteger(targetTerminalIndex)
+        ? String(getTerminalRole(targetTerminalIndex) || "").toLowerCase()
+        : "";
+      const shouldAutoSubmit = !["generic", "terminal", "shell"].includes(targetRole);
 
       updateTodoDragState(null);
 
@@ -1426,10 +1430,17 @@ function TerminalView({
 
       setActiveTerminalPaneId(paneId);
       invoke("terminal_write", {
-        data: `${currentDrag.text}\r`,
+        data: `${currentDrag.text}${shouldAutoSubmit ? "\r" : ""}`,
         paneId,
       })
-        .then(() => setTodoDropError(""))
+        .then(() => {
+          setTodoDropError("");
+          if (currentDrag.itemId) {
+            updateTodoQueueItems((currentItems) => (
+              currentItems.filter((item) => item.id !== currentDrag.itemId)
+            ));
+          }
+        })
         .catch((error) => {
           setTodoDropError(getTodoDropErrorMessage(error));
         });
@@ -1486,9 +1497,11 @@ function TerminalView({
   }, [
     fullscreenActive,
     fullscreenTerminalIndex,
+    getTerminalRole,
     getTerminalPaneId,
     logicalTerminalIndexes,
     todoDragActive,
+    updateTodoQueueItems,
     updateTodoDragState,
   ]);
 

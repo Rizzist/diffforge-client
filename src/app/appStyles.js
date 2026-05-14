@@ -2366,6 +2366,17 @@ export const XtermSurface = styled.div`
     height: 0 !important;
   }
 
+  &[data-resize-transient-scrollback="true"] .xterm-viewport {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  &[data-resize-transient-scrollback="true"] .xterm-viewport::-webkit-scrollbar {
+    display: none;
+    width: 0 !important;
+    height: 0 !important;
+  }
+
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
@@ -2387,6 +2398,16 @@ export const XtermSurface = styled.div`
     background: transparent !important;
     transition: opacity 180ms ease !important;
     z-index: 80 !important;
+  }
+
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .scrollbar.vertical,
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .scrollbar.vertical.visible,
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .scrollbar.vertical.invisible,
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .xterm-scrollbar,
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-visible,
+  &[data-resize-transient-scrollback="true"] .xterm .xterm-scrollable-element > .xterm-scrollbar.xterm-invisible {
+    opacity: 0 !important;
+    pointer-events: none !important;
   }
 
   &[data-scrollbar-platform="overlay"] .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider,

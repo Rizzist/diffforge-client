@@ -373,6 +373,12 @@ const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
 const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
 const TERMINAL_SCROLLBAR_INTENT_MS = 900;
 const TERMINAL_SCROLL_DIAGNOSTIC_THROTTLE_MS = 180;
+const WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS = 1600;
+const WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_DELAY_MS = 80;
+const WINDOWS_TERMINAL_RESIZE_SCROLLBACK_PURGE_DELAY_MS = 90;
+const WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBAR_HIDE_MS = 360;
+const WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS = 2500;
+const WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_AGENT_KINDS = new Set(["claude"]);
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT = "forge-terminal-input";
@@ -721,10 +727,10 @@ const TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES = new Set([
   2026,
 ]);
 const TERMINAL_ROLE_SWITCH_OPTIONS = [
-  { id: "codex", label: "Codex", shortLabel: "CX" },
-  { id: "claude", label: "Claude Code", shortLabel: "CL" },
-  { id: "generic", label: "Terminal", shortLabel: "SH" },
-  { id: "opencode", label: "OpenCode", shortLabel: "OC" },
+  { id: "codex", label: "Codex"},
+  { id: "claude", label: "Claude Code" },
+  { id: "generic", label: "Terminal" },
+  { id: "opencode", label: "OpenCode" },
 ];
 const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
 const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 80, 190, 280];
@@ -2443,6 +2449,443 @@ function WorkspaceTerminal({
     let windowsTerminalControlSequenceId = 0;
     let windowsTerminalLastEraseDisplayFrame = null;
     let windowsTerminalDuplicateEraseDisplayFrames = 0;
+    let windowsTerminalScrollOnEraseRestoreTimer = 0;
+    let windowsTerminalSuppressedEraseDisplayFrames = 0;
+    let windowsTerminalAgentRepaintTransientUntil = 0;
+    let windowsTerminalLastKnownBaseY = 0;
+    let windowsTerminalProtectedScrollbackBaseY = 0;
+    let windowsTerminalProtectScrollbackUntil = 0;
+    let windowsTerminalResizeLiveClearCount = 0;
+    let windowsTerminalResizeLiveClearPendingEvent = null;
+    let windowsTerminalResizeLiveClearTimer = 0;
+    let windowsTerminalResizeLiveClearWritesInFlight = 0;
+    let windowsTerminalResizeScrollbackPurgeReason = "";
+    let windowsTerminalResizeScrollbackPurgeTimer = 0;
+    let windowsTerminalResizeScrollbackPurgeInFlight = false;
+    let windowsTerminalResizeStartState = null;
+    let windowsTerminalResizeTransientUntil = 0;
+    let windowsTerminalResizeTransientScrollbarTimer = 0;
+    let windowsTerminalTransientResizeScrollbackRows = 0;
+    const clearWindowsTerminalTransientScrollbarMask = (reason) => {
+      if (!TERMINAL_IS_WINDOWS_HOST) {
+        return;
+      }
+
+      if (windowsTerminalResizeTransientScrollbarTimer) {
+        window.clearTimeout(windowsTerminalResizeTransientScrollbarTimer);
+        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
+        windowsTerminalResizeTransientScrollbarTimer = 0;
+      }
+
+      if (container.dataset.resizeTransientScrollback === "true") {
+        delete container.dataset.resizeTransientScrollback;
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_transient_scrollbar_unmasked", {
+          reason,
+        });
+      }
+    };
+    const markWindowsTerminalTransientScrollbar = (reason) => {
+      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
+        return;
+      }
+
+      const wasMasked = container.dataset.resizeTransientScrollback === "true";
+      container.dataset.resizeTransientScrollback = "true";
+
+      if (!wasMasked) {
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_transient_scrollbar_masked", {
+          reason,
+        });
+      }
+
+      if (windowsTerminalResizeTransientScrollbarTimer) {
+        window.clearTimeout(windowsTerminalResizeTransientScrollbarTimer);
+        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
+        windowsTerminalResizeTransientScrollbarTimer = 0;
+      }
+
+      windowsTerminalResizeTransientScrollbarTimer = window.setTimeout(() => {
+        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
+        windowsTerminalResizeTransientScrollbarTimer = 0;
+        if (!isDisposed) {
+          clearWindowsTerminalTransientScrollbarMask("transient_scrollbar_timeout");
+        }
+      }, WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBAR_HIDE_MS);
+      startupMetricTimers.add(windowsTerminalResizeTransientScrollbarTimer);
+    };
+    const protectWindowsTerminalScrollback = (baseY, reason) => {
+      const protectedBaseY = Math.max(0, Number(baseY || 0));
+      if (!TERMINAL_IS_WINDOWS_HOST || protectedBaseY <= 0) {
+        return;
+      }
+
+      const previousProtectedBaseY = windowsTerminalProtectedScrollbackBaseY;
+      windowsTerminalProtectedScrollbackBaseY = Math.max(
+        windowsTerminalProtectedScrollbackBaseY,
+        protectedBaseY,
+      );
+      windowsTerminalTransientResizeScrollbackRows = 0;
+      clearWindowsTerminalTransientScrollbarMask(reason);
+
+      if (windowsTerminalProtectedScrollbackBaseY !== previousProtectedBaseY) {
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.protected_scrollback", {
+          baseY: protectedBaseY,
+          protectedBaseY: windowsTerminalProtectedScrollbackBaseY,
+          reason,
+        });
+      }
+    };
+    const protectNextWindowsTerminalScrollbackGrowth = (reason) => {
+      if (!TERMINAL_IS_WINDOWS_HOST) {
+        return;
+      }
+
+      windowsTerminalProtectScrollbackUntil = Math.max(
+        windowsTerminalProtectScrollbackUntil,
+        performance.now() + WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS,
+      );
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.protected_scrollback_window", {
+        reason,
+      });
+    };
+    const suppressWindowsTerminalScrollOnEraseForCurrentClear = (reason) => {
+      if (!TERMINAL_IS_WINDOWS_HOST) {
+        return false;
+      }
+
+      if (windowsTerminalScrollOnEraseRestoreTimer) {
+        window.clearTimeout(windowsTerminalScrollOnEraseRestoreTimer);
+        startupMetricTimers.delete(windowsTerminalScrollOnEraseRestoreTimer);
+        windowsTerminalScrollOnEraseRestoreTimer = 0;
+      }
+
+      terminal.options.scrollOnEraseInDisplay = false;
+      windowsTerminalSuppressedEraseDisplayFrames += 1;
+      if (reason !== "resize_growth_live_viewport_clear") {
+        windowsTerminalAgentRepaintTransientUntil = Math.max(
+          windowsTerminalAgentRepaintTransientUntil,
+          performance.now() + WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS,
+        );
+      }
+
+      windowsTerminalScrollOnEraseRestoreTimer = window.setTimeout(() => {
+        startupMetricTimers.delete(windowsTerminalScrollOnEraseRestoreTimer);
+        windowsTerminalScrollOnEraseRestoreTimer = 0;
+
+        if (!isDisposed) {
+          terminal.options.scrollOnEraseInDisplay = TERMINAL_IS_WINDOWS_HOST;
+        }
+      }, 0);
+      startupMetricTimers.add(windowsTerminalScrollOnEraseRestoreTimer);
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.scroll_on_erase_suppressed", {
+        reason,
+        suppressedEraseDisplayFrames: windowsTerminalSuppressedEraseDisplayFrames,
+      });
+
+      return true;
+    };
+    const noteWindowsTerminalTransientScrollbackRows = (deltaRows, state, reason) => {
+      const baseY = Number(state?.baseY || 0);
+      if (
+        !TERMINAL_IS_WINDOWS_HOST
+        || isGenericTerminal
+        || baseY <= 0
+        || deltaRows <= 0
+        || windowsTerminalProtectedScrollbackBaseY > 0
+      ) {
+        return;
+      }
+
+      windowsTerminalTransientResizeScrollbackRows = baseY;
+      markWindowsTerminalTransientScrollbar(reason);
+      windowsTerminalResizeTransientUntil = Math.max(
+        windowsTerminalResizeTransientUntil,
+        performance.now() + WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS,
+      );
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_transient", {
+        baseY,
+        deltaRows,
+        reason,
+        transientRows: windowsTerminalTransientResizeScrollbackRows,
+      });
+    };
+    const observeWindowsTerminalBaseY = (reason, providedState = null) => {
+      const state = providedState || getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const baseY = Number(state?.baseY || 0);
+      const previousBaseY = Number(windowsTerminalLastKnownBaseY || 0);
+      const now = performance.now();
+      const reasonText = String(reason || "");
+      const insideTransientWindow = now <= windowsTerminalResizeTransientUntil
+        || now <= windowsTerminalAgentRepaintTransientUntil;
+      const isResizeObservation = reasonText.includes("resize");
+
+      if (baseY < windowsTerminalProtectedScrollbackBaseY) {
+        windowsTerminalProtectedScrollbackBaseY = baseY;
+      }
+
+      if (baseY > previousBaseY && now <= windowsTerminalProtectScrollbackUntil) {
+        protectWindowsTerminalScrollback(baseY, reason);
+      } else if (
+        baseY > previousBaseY
+        && (insideTransientWindow || isResizeObservation)
+      ) {
+        noteWindowsTerminalTransientScrollbackRows(baseY - previousBaseY, state, reason);
+      } else if (baseY < previousBaseY) {
+        windowsTerminalTransientResizeScrollbackRows = Math.min(
+          windowsTerminalTransientResizeScrollbackRows,
+          baseY,
+        );
+      }
+
+      windowsTerminalLastKnownBaseY = baseY;
+      return state;
+    };
+    const canPurgeWindowsTerminalResizeScrollback = (providedState = null) => {
+      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
+        return false;
+      }
+
+      const state = providedState || getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const baseY = Number(state?.baseY || 0);
+      const now = performance.now();
+      const insideResizeWindow = now <= windowsTerminalResizeTransientUntil;
+      const insideRepaintWindow = now <= windowsTerminalAgentRepaintTransientUntil;
+
+      if (windowsTerminalProtectedScrollbackBaseY > 0) {
+        return false;
+      }
+
+      return state?.bufferType === "normal"
+        && baseY > 0
+        && (
+          windowsTerminalTransientResizeScrollbackRows >= baseY
+          || (insideResizeWindow && windowsTerminalTransientResizeScrollbackRows > 0)
+          || insideRepaintWindow
+        );
+    };
+    const finishWindowsTerminalResizeScrollbackPurge = (reason) => {
+      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      windowsTerminalLastKnownBaseY = Number(state.baseY || 0);
+      windowsTerminalTransientResizeScrollbackRows = Math.min(
+        windowsTerminalTransientResizeScrollbackRows,
+        Number(state.baseY || 0),
+      );
+      windowsTerminalProtectedScrollbackBaseY = Math.min(
+        windowsTerminalProtectedScrollbackBaseY,
+        Number(state.baseY || 0),
+      );
+      if (Number(state.baseY || 0) <= 0) {
+        windowsTerminalTransientResizeScrollbackRows = 0;
+        windowsTerminalProtectedScrollbackBaseY = 0;
+        windowsTerminalProtectScrollbackUntil = 0;
+        windowsTerminalResizeTransientUntil = 0;
+        windowsTerminalAgentRepaintTransientUntil = 0;
+        clearWindowsTerminalTransientScrollbarMask(reason);
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_done", {
+        reason,
+        transientRows: windowsTerminalTransientResizeScrollbackRows,
+      });
+      updateTerminalScrollbarOverflow();
+      scheduleTerminalScrollbarRefresh([40, 160]);
+    };
+    const scheduleWindowsTerminalResizeScrollbackPurge = (reason) => {
+      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
+        return false;
+      }
+
+      const state = observeWindowsTerminalBaseY(`${reason}_schedule`);
+      if (!canPurgeWindowsTerminalResizeScrollback(state)) {
+        return false;
+      }
+
+      if (windowsTerminalResizeScrollbackPurgeTimer) {
+        window.clearTimeout(windowsTerminalResizeScrollbackPurgeTimer);
+        startupMetricTimers.delete(windowsTerminalResizeScrollbackPurgeTimer);
+        windowsTerminalResizeScrollbackPurgeTimer = 0;
+      }
+
+      windowsTerminalResizeScrollbackPurgeReason = reason;
+      windowsTerminalResizeScrollbackPurgeTimer = window.setTimeout(() => {
+        startupMetricTimers.delete(windowsTerminalResizeScrollbackPurgeTimer);
+        windowsTerminalResizeScrollbackPurgeTimer = 0;
+
+        if (isDisposed) {
+          return;
+        }
+
+        const purgeState = observeWindowsTerminalBaseY(`${reason}_purge`);
+        if (!canPurgeWindowsTerminalResizeScrollback(purgeState)) {
+          return;
+        }
+
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_requested", {
+          reason,
+          transientRows: windowsTerminalTransientResizeScrollbackRows,
+        });
+
+        try {
+          windowsTerminalResizeScrollbackPurgeInFlight = true;
+          terminal.write("\x1b[3J", () => {
+            windowsTerminalResizeScrollbackPurgeInFlight = false;
+            if (!isDisposed) {
+              finishWindowsTerminalResizeScrollbackPurge(reason);
+            }
+          });
+        } catch (error) {
+          windowsTerminalResizeScrollbackPurgeInFlight = false;
+          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_error", {
+            message: getErrorMessage(error, "Unable to purge transient resize scrollback."),
+            reason,
+          });
+        }
+      }, WINDOWS_TERMINAL_RESIZE_SCROLLBACK_PURGE_DELAY_MS);
+      startupMetricTimers.add(windowsTerminalResizeScrollbackPurgeTimer);
+      return true;
+    };
+    const rememberWindowsTerminalResizeStart = (event = {}) => {
+      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
+        return;
+      }
+
+      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const baseY = Number(state.baseY || 0);
+      windowsTerminalResizeStartState = {
+        baseY,
+        bufferLength: Number(state.bufferLength || 0),
+        reason: event.reason || "resize",
+        rows: Number(state.rows || 0),
+      };
+      if (baseY > 0 && windowsTerminalTransientResizeScrollbackRows < baseY) {
+        protectWindowsTerminalScrollback(baseY, "resize_start_existing_scrollback");
+      }
+      windowsTerminalLastKnownBaseY = baseY;
+      windowsTerminalResizeTransientUntil = Math.max(
+        windowsTerminalResizeTransientUntil,
+        performance.now() + WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS,
+      );
+    };
+    const shouldClearWindowsTerminalLiveViewportOnResize = (event, state) => {
+      if (
+        !TERMINAL_IS_WINDOWS_HOST
+        || isGenericTerminal
+        || !WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_AGENT_KINDS.has(terminalAgentKind)
+        || state?.bufferType !== "normal"
+      ) {
+        return false;
+      }
+
+      const previousRows = Number(event?.previousRows || windowsTerminalResizeStartState?.rows || 0);
+      const nextRows = Number(event?.rows || state?.rows || terminal.rows || 0);
+
+      return previousRows > 0 && nextRows > previousRows;
+    };
+    const runWindowsTerminalLiveViewportClear = () => {
+      const event = windowsTerminalResizeLiveClearPendingEvent;
+      windowsTerminalResizeLiveClearPendingEvent = null;
+      windowsTerminalResizeLiveClearTimer = 0;
+
+      if (isDisposed || !event) {
+        return false;
+      }
+
+      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      if (!shouldClearWindowsTerminalLiveViewportOnResize(event, state)) {
+        return false;
+      }
+
+      windowsTerminalResizeLiveClearCount += 1;
+      windowsTerminalResizeLiveClearWritesInFlight += 1;
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_requested", {
+        clearCount: windowsTerminalResizeLiveClearCount,
+        nextRows: Number(event?.rows || state?.rows || terminal.rows || 0),
+        previousRows: Number(event?.previousRows || windowsTerminalResizeStartState?.rows || 0),
+        reason: event?.reason || "resize_done",
+      });
+
+      try {
+        terminal.write("\x1b[2J", () => {
+          windowsTerminalResizeLiveClearWritesInFlight = Math.max(
+            0,
+            windowsTerminalResizeLiveClearWritesInFlight - 1,
+          );
+          if (isDisposed) {
+            return;
+          }
+
+          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_done", {
+            clearCount: windowsTerminalResizeLiveClearCount,
+            reason: event?.reason || "resize_done",
+          });
+          refreshTerminalRenderer("windows_resize_live_viewport_clear");
+        });
+      } catch (error) {
+        windowsTerminalResizeLiveClearWritesInFlight = Math.max(
+          0,
+          windowsTerminalResizeLiveClearWritesInFlight - 1,
+        );
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_error", {
+          message: getErrorMessage(error, "Unable to clear transient resize viewport."),
+          reason: event?.reason || "resize_done",
+        });
+      }
+
+      return true;
+    };
+    const clearWindowsTerminalLiveViewportForResize = (event, state) => {
+      if (!shouldClearWindowsTerminalLiveViewportOnResize(event, state)) {
+        return false;
+      }
+
+      windowsTerminalResizeLiveClearPendingEvent = {
+        ...event,
+        previousRows: Number(windowsTerminalResizeStartState?.rows || 0),
+        rows: Number(event?.rows || state?.rows || terminal.rows || 0),
+      };
+
+      if (windowsTerminalResizeLiveClearTimer) {
+        window.clearTimeout(windowsTerminalResizeLiveClearTimer);
+        startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
+        windowsTerminalResizeLiveClearTimer = 0;
+      }
+
+      windowsTerminalResizeLiveClearTimer = window.setTimeout(() => {
+        startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
+        runWindowsTerminalLiveViewportClear();
+      }, WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_DELAY_MS);
+      startupMetricTimers.add(windowsTerminalResizeLiveClearTimer);
+
+      return true;
+    };
+    const rememberWindowsTerminalResizeDone = (event = {}) => {
+      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
+        return;
+      }
+
+      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const startBaseY = Number(windowsTerminalResizeStartState?.baseY ?? windowsTerminalLastKnownBaseY);
+      const baseY = Number(state.baseY || 0);
+      const deltaRows = baseY - startBaseY;
+
+      if (deltaRows > 0) {
+        noteWindowsTerminalTransientScrollbackRows(deltaRows, state, event.reason || "resize_done");
+      } else {
+        windowsTerminalTransientResizeScrollbackRows = Math.min(
+          windowsTerminalTransientResizeScrollbackRows,
+          baseY,
+        );
+      }
+
+      windowsTerminalLastKnownBaseY = baseY;
+      clearWindowsTerminalLiveViewportForResize(event, state);
+      windowsTerminalResizeStartState = null;
+      scheduleWindowsTerminalResizeScrollbackPurge(event.reason || "resize_done");
+    };
     const scheduleWindowsTerminalControlAfterLog = (
       sequenceId,
       control,
@@ -2506,8 +2949,22 @@ function WorkspaceTerminal({
       disposables.push(terminal.parser.registerCsiHandler({ final: "J" }, (params) => {
         const actionParam = getFirstCsiParam(params, 0);
         const allParams = getCsiParamNumbers(params);
+        const observedState = observeWindowsTerminalBaseY("erase_display_control");
         const activeBufferType = getTerminalBufferDiagnostics(terminal)?.type || "";
-        const shouldBlockSavedLineErase = actionParam === 3 && activeBufferType !== "alternate";
+        const isInternalResizeLiveClear = actionParam === 2
+          && activeBufferType !== "alternate"
+          && windowsTerminalResizeLiveClearWritesInFlight > 0;
+        const shouldAllowTransientResizePurge = actionParam === 3
+          && activeBufferType !== "alternate"
+          && windowsTerminalResizeScrollbackPurgeInFlight
+          && canPurgeWindowsTerminalResizeScrollback(observedState);
+        const shouldBlockSavedLineErase = actionParam === 3
+          && activeBufferType !== "alternate"
+          && !shouldAllowTransientResizePurge;
+        const shouldSuppressScrollOnErase = isInternalResizeLiveClear;
+        const scrollOnEraseSuppressed = shouldSuppressScrollOnErase
+          ? suppressWindowsTerminalScrollOnEraseForCurrentClear("resize_growth_live_viewport_clear")
+          : false;
         const action = shouldBlockSavedLineErase ? "block" : "allow";
         const control = actionParam === 3 ? "erase_saved_lines" : "erase_display";
         const liveFrameBefore = actionParam === 2
@@ -2543,6 +3000,17 @@ function WorkspaceTerminal({
           historyTailComparison,
           params: allParams.length > 0 ? allParams : [actionParam],
           previousFrameComparison,
+          resizeScrollbackPurgeAllowed: shouldAllowTransientResizePurge,
+          resizeScrollbackPurgeReason: shouldAllowTransientResizePurge
+            ? windowsTerminalResizeScrollbackPurgeReason || "incoming_erase_saved_lines"
+            : "",
+          resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
+          resizeLiveClearInFlight: windowsTerminalResizeLiveClearWritesInFlight > 0,
+          resizeLiveClearInternal: isInternalResizeLiveClear,
+          scrollOnEraseSuppressed,
+          suppressedEraseDisplayFrames: actionParam === 2
+            ? windowsTerminalSuppressedEraseDisplayFrames
+            : undefined,
         }, true, () => ({
           frameAfter: actionParam === 2
             ? getWindowsTerminalLiveFrameFingerprint(terminal).log
@@ -2550,7 +3018,20 @@ function WorkspaceTerminal({
           historyTailAfter: actionParam === 2
             ? getWindowsTerminalHistoryTailFingerprint(terminal).log
             : null,
+          scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
+          resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
         }));
+
+        if (actionParam === 2 && !isInternalResizeLiveClear && activeBufferType !== "alternate") {
+          protectNextWindowsTerminalScrollbackGrowth("agent_erase_display");
+          if (Number(observedState?.baseY || 0) > 0) {
+            protectWindowsTerminalScrollback(observedState.baseY, "agent_erase_display_existing_scrollback");
+          }
+        }
+
+        if (shouldBlockSavedLineErase && canPurgeWindowsTerminalResizeScrollback(observedState)) {
+          scheduleWindowsTerminalResizeScrollbackPurge("blocked_erase_saved_lines_after");
+        }
 
         return shouldBlockSavedLineErase;
       }));
@@ -2558,6 +3039,7 @@ function WorkspaceTerminal({
       const registerDecPrivateModeHandler = (mode) => terminal.parser.registerCsiHandler(
         { prefix: "?", final: mode === "set" ? "h" : "l" },
         (params) => {
+          const observedState = observeWindowsTerminalBaseY(`dec_private_${mode}`);
           const allParams = getCsiParamNumbers(params);
           const interestingParams = allParams.filter((param) => (
             TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES.has(param)
@@ -2576,7 +3058,15 @@ function WorkspaceTerminal({
               action: "allow",
               mode,
               params: interestingParams,
+              resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
             }, control === "alternate_buffer");
+
+            if (
+              control === "sync_output"
+              && canPurgeWindowsTerminalResizeScrollback(observedState)
+            ) {
+              scheduleWindowsTerminalResizeScrollbackPurge(`sync_output_${mode}`);
+            }
           }
 
           return false;
@@ -2591,6 +3081,11 @@ function WorkspaceTerminal({
       const registerCursorMoveHandler = (final) => terminal.parser.registerCsiHandler(
         { final },
         (params) => {
+          const observedState = observeWindowsTerminalBaseY(`cursor_position_${final}`);
+          if (canPurgeWindowsTerminalResizeScrollback(observedState)) {
+            scheduleWindowsTerminalResizeScrollbackPurge(`cursor_position_${final}`);
+          }
+
           const now = performance.now();
           if (now - cursorMoveWindowStartedAt > 2000) {
             cursorMoveWindowStartedAt = now;
@@ -2623,8 +3118,12 @@ function WorkspaceTerminal({
         windowsTerminalLastResizeLogAt = now;
         const timer = window.setTimeout(() => {
           startupMetricTimers.delete(timer);
+          const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+          observeWindowsTerminalBaseY("xterm_resize_settled", state);
+          scheduleWindowsTerminalResizeScrollbackPurge("xterm_resize_settled");
           logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_settled", {
             reason: "xterm_resize",
+            resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
           });
         }, TERMINAL_START_GEOMETRY_POLL_MS);
         startupMetricTimers.add(timer);
@@ -3380,6 +3879,7 @@ function WorkspaceTerminal({
           return;
         }
 
+        rememberWindowsTerminalResizeDone(event);
         patchTerminalMetrics({
           gridMs: event.elapsedMs,
           resizeLagMs: event.elapsedMs,
@@ -3388,6 +3888,19 @@ function WorkspaceTerminal({
           resizeBatches: 1,
           resizePanes: 1,
         });
+      },
+      onError: () => {
+        if (windowsTerminalResizeLiveClearTimer) {
+          window.clearTimeout(windowsTerminalResizeLiveClearTimer);
+          startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
+          windowsTerminalResizeLiveClearTimer = 0;
+        }
+        windowsTerminalResizeLiveClearWritesInFlight = 0;
+        windowsTerminalResizeLiveClearPendingEvent = null;
+        windowsTerminalResizeStartState = null;
+      },
+      onStart: (event) => {
+        rememberWindowsTerminalResizeStart(event);
       },
       paneId: () => paneId,
       term: terminal,
@@ -4171,12 +4684,12 @@ function WorkspaceTerminal({
       await invoke("terminal_write", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
-        data: `${prompt}\r`,
+        data: `${prompt}${isGenericTerminal ? "" : "\r"}`,
       });
     } catch (error) {
       setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
     }
-  }, [paneId, terminalClosed, terminalClosing]);
+  }, [isGenericTerminal, paneId, terminalClosed, terminalClosing]);
 
   const pointerTodoDropVisible = Boolean(todoDropActive) && !terminalClosed && !terminalClosing;
   const nativeTodoDropVisible = terminalDropActive && !terminalClosed && !terminalClosing;
