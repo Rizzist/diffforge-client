@@ -8,6 +8,7 @@ const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT = 512;
 
 let backendLoggingSynced = null;
 let backendLoggingSyncInFlight = null;
+let backendLoggingForceEnabled = false;
 let heartbeatTimer = 0;
 let heartbeatLastMs = 0;
 
@@ -28,8 +29,12 @@ export function isTerminalDiagnosticLoggingEnabled() {
   return TERMINAL_DIAGNOSTIC_LOGGING_ENABLED;
 }
 
-export function syncTerminalDiagnosticLogging() {
-  const enabled = isTerminalDiagnosticLoggingEnabled();
+export function syncTerminalDiagnosticLogging(forceEnabled = false) {
+  if (forceEnabled) {
+    backendLoggingForceEnabled = true;
+  }
+
+  const enabled = backendLoggingForceEnabled || isTerminalDiagnosticLoggingEnabled();
 
   if (backendLoggingSynced === enabled) {
     return backendLoggingSyncInFlight || Promise.resolve(enabled);
@@ -52,7 +57,8 @@ export function syncTerminalDiagnosticLogging() {
 }
 
 export function logTerminalDiagnosticEvent(phase, fields = {}, options = {}) {
-  if (!isTerminalDiagnosticLoggingEnabled()) {
+  const force = Boolean(options.force);
+  if (!force && !isTerminalDiagnosticLoggingEnabled()) {
     return;
   }
 
@@ -64,15 +70,21 @@ export function logTerminalDiagnosticEvent(phase, fields = {}, options = {}) {
     return;
   }
 
-  syncTerminalDiagnosticLogging();
-
-  invoke("terminal_diagnostic_log", {
+  const writeDiagnostic = () => invoke("terminal_diagnostic_log", {
     phase: cleanDiagnosticText(phase),
     fields: {
       source: "frontend",
       ...fields,
     },
   }).catch(() => {});
+
+  syncTerminalDiagnosticLogging(force)
+    .then((enabled) => {
+      if (enabled) {
+        writeDiagnostic();
+      }
+    })
+    .catch(() => {});
 }
 
 export function logTerminalDiagnosticDuration(phase, startedAtMs, fields = {}, options = {}) {

@@ -309,7 +309,6 @@ import {
   ButtonForgeIcon,
   ButtonCodeIcon,
   ButtonBotIcon,
-  ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonMicIcon,
   ButtonHubIcon,
@@ -341,6 +340,17 @@ import {
   addTerminalMetrics,
   patchTerminalMetrics,
 } from "./terminalTelemetry.jsx";
+import {
+  TERMINAL_IS_MACOS_HOST,
+  TERMINAL_IS_WINDOWS_HOST,
+  TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER,
+  TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES,
+  TERMINAL_WINDOWS_PTY_BACKEND,
+  buildWindowsPtyOptions,
+  createTerminalOutputNormalizer,
+  getTerminalAgentScrollStabilityMode,
+  normalizeTerminalOutputBytes,
+} from "./terminalScrollStabilityStrategies.jsx";
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
@@ -370,15 +380,6 @@ const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
-const TERMINAL_SCROLLBAR_HIDE_DELAY_MS = 700;
-const TERMINAL_SCROLLBAR_INTENT_MS = 900;
-const TERMINAL_SCROLL_DIAGNOSTIC_THROTTLE_MS = 180;
-const WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS = 1600;
-const WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_DELAY_MS = 80;
-const WINDOWS_TERMINAL_RESIZE_SCROLLBACK_PURGE_DELAY_MS = 90;
-const WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBAR_HIDE_MS = 360;
-const WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS = 2500;
-const WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_AGENT_KINDS = new Set(["claude"]);
 const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT = "forge-terminal-input";
@@ -699,33 +700,7 @@ const TODO_DROP_OVERLAY_LABEL_STYLE = {
   letterSpacing: "0.04em",
   textTransform: "uppercase",
 };
-
-function isWindowsTerminalHost() {
-  if (typeof navigator === "undefined") {
-    return false;
-  }
-
-  const platform = String(navigator.platform || "");
-  const userAgent = String(navigator.userAgent || "");
-
-  return /windows|win32|win64|wince/i.test(`${platform} ${userAgent}`);
-}
-
-const TERMINAL_IS_WINDOWS_HOST = isWindowsTerminalHost();
-const TERMINAL_SCROLLBAR_PLATFORM = TERMINAL_IS_WINDOWS_HOST ? "native" : "overlay";
-const TERMINAL_WINDOWS_PTY_BACKEND = "conpty";
-const TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES = new Set([
-  1000,
-  1002,
-  1003,
-  1006,
-  1007,
-  1047,
-  1048,
-  1049,
-  2004,
-  2026,
-]);
+const TERMINAL_SCROLLBAR_PLATFORM = "native";
 const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "codex", label: "Codex"},
   { id: "claude", label: "Claude Code" },
@@ -734,24 +709,24 @@ const TERMINAL_ROLE_SWITCH_OPTIONS = [
 ];
 const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
 const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 80, 190, 280];
-
-function buildWindowsPtyOptions(info = null) {
-  if (!TERMINAL_IS_WINDOWS_HOST) {
-    return undefined;
-  }
-
-  const buildNumber = Number(info?.buildNumber ?? info?.build_number ?? 0);
-  if (Number.isFinite(buildNumber) && buildNumber > 0) {
-    return {
-      backend: TERMINAL_WINDOWS_PTY_BACKEND,
-      buildNumber,
-    };
-  }
-
-  return {
-    backend: TERMINAL_WINDOWS_PTY_BACKEND,
-  };
-}
+const TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS = 140;
+const TERMINAL_CODEX_RESIZE_GATE_RETRY_MS = 48;
+const TERMINAL_CODEX_RESIZE_GATE_MAX_MS = 900;
+const TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES = 768 * 1024;
+const TERMINAL_CODEX_RESIZE_REPAINT_MIN_BYTES = 180;
+const TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS = 5000;
+const TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS = [0, 34, 120, 320];
+const TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS = 160;
+const TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS = 900;
+const TERMINAL_CODEX_RESIZE_TOP_ARTIFACT_LOOKAHEAD_ROWS = 24;
+const TERMINAL_CODEX_RESIZE_TOP_BLANK_PREFIX_MAX_ROWS = 4;
+const TERMINAL_CODEX_RESIZE_ARTIFACT_PURGE_MAX_ROWS = 64;
+const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS = 1200;
+const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS = [0, 16, 50, 140, 320, 700];
+const TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER = 2;
+const TERMINAL_RENDERER_DOM_ROW_SNAPSHOT_LIMIT = 10;
+const TERMINAL_DEC2026_SET_BYTES = new Uint8Array([0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x68]);
+const TERMINAL_DEC2026_RESET_BYTES = new Uint8Array([0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x6c]);
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -966,6 +941,108 @@ function getTerminalOutputVisibleCharCount(data, maxCount = Number.POSITIVE_INFI
   }
 
   return visibleChars;
+}
+
+function findTerminalByteSequence(data, sequence, fromIndex = 0) {
+  if (!data?.length || !sequence?.length || sequence.length > data.length) {
+    return -1;
+  }
+
+  const maxStart = data.length - sequence.length;
+  for (let index = Math.max(0, fromIndex); index <= maxStart; index += 1) {
+    let matched = true;
+    for (let offset = 0; offset < sequence.length; offset += 1) {
+      if (data[index + offset] !== sequence[offset]) {
+        matched = false;
+        break;
+      }
+    }
+
+    if (matched) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function concatTerminalByteArrays(chunks) {
+  const totalBytes = chunks.reduce((total, chunk) => total + Number(chunk?.byteLength || 0), 0);
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+
+  chunks.forEach((chunk) => {
+    if (!chunk?.byteLength) {
+      return;
+    }
+
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+
+  return combined;
+}
+
+function coalesceCodexResizeRepaintBytes(data) {
+  if (!data?.byteLength) {
+    return {
+      data,
+      droppedBytes: 0,
+      framesDropped: 0,
+      framesSeen: 0,
+    };
+  }
+
+  const frames = [];
+  let searchIndex = 0;
+
+  while (searchIndex < data.length) {
+    const start = findTerminalByteSequence(data, TERMINAL_DEC2026_SET_BYTES, searchIndex);
+    if (start < 0) {
+      break;
+    }
+
+    const reset = findTerminalByteSequence(
+      data,
+      TERMINAL_DEC2026_RESET_BYTES,
+      start + TERMINAL_DEC2026_SET_BYTES.length,
+    );
+    if (reset < 0) {
+      break;
+    }
+
+    const end = reset + TERMINAL_DEC2026_RESET_BYTES.length;
+    frames.push({ end, start });
+    searchIndex = end;
+  }
+
+  if (frames.length <= 1) {
+    return {
+      data,
+      droppedBytes: 0,
+      framesDropped: 0,
+      framesSeen: frames.length,
+    };
+  }
+
+  let selectedFrameIndex = frames.length - 1;
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    if (frame.end - frame.start >= TERMINAL_CODEX_RESIZE_REPAINT_MIN_BYTES) {
+      selectedFrameIndex = index;
+      break;
+    }
+  }
+
+  const selectedFrame = frames[selectedFrameIndex];
+  const output = data.slice(selectedFrame.start);
+
+  return {
+    data: output,
+    droppedBytes: selectedFrame.start,
+    framesDropped: selectedFrameIndex,
+    framesSeen: frames.length,
+  };
 }
 
 function getTerminalOutputByteStats(data) {
@@ -1364,6 +1441,1053 @@ function getTerminalElementDiagnostics(element) {
   };
 }
 
+function hashTerminalDiagnosticText(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function sanitizeTerminalDiagnosticText(value, maxLength = 140) {
+  return String(value || "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trimEnd()
+    .slice(0, maxLength);
+}
+
+function getTerminalRowTextDiagnostic(terminal, rowIndex) {
+  const line = terminal?.buffer?.active?.getLine?.(rowIndex);
+  const text = line?.translateToString?.(false) || "";
+  const trimmed = text.trimEnd();
+
+  return {
+    hash: hashTerminalDiagnosticText(trimmed),
+    isBlank: trimmed.trim().length <= 0,
+    isWrapped: Boolean(line?.isWrapped),
+    rowIndex: Math.max(0, Math.floor(Number(rowIndex || 0))),
+    text: sanitizeTerminalDiagnosticText(trimmed),
+    textLength: trimmed.length,
+  };
+}
+
+function getTerminalRowsTextDiagnostic(terminal, startIndex, rowCount) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      available: false,
+      rows: [],
+    };
+  }
+
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const start = Math.max(0, Math.min(bufferLength, Math.floor(Number(startIndex || 0))));
+  const count = Math.max(1, Math.floor(Number(rowCount || 1)));
+  const end = Math.max(start, Math.min(bufferLength, start + count));
+  const rows = [];
+  let blankRows = 0;
+  let nonEmptyRows = 0;
+
+  for (let rowIndex = start; rowIndex < end; rowIndex += 1) {
+    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
+    rows.push({
+      ...row,
+      offset: rowIndex - start,
+    });
+
+    if (row.isBlank) {
+      blankRows += 1;
+    } else {
+      nonEmptyRows += 1;
+    }
+  }
+
+  return {
+    available: true,
+    blankRows,
+    bufferLength,
+    end,
+    nonEmptyRows,
+    rowCount: rows.length,
+    rows,
+    start,
+  };
+}
+
+function getTerminalBufferRowsDiagnostic(terminal, startIndex, rowCount) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      available: false,
+      rowHashes: [],
+    };
+  }
+
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const start = Math.max(0, Math.min(bufferLength, Math.floor(Number(startIndex || 0))));
+  const count = Math.max(1, Math.floor(Number(rowCount || terminal?.rows || TERMINAL_DEFAULT_ROWS)));
+  const end = Math.max(start, Math.min(bufferLength, start + count));
+  const rowHashes = [];
+  let aggregateHash = "811c9dc5";
+  let blankPrefixRows = 0;
+  let blankSuffixRows = 0;
+  let firstNonEmptyRow = -1;
+  let lastNonEmptyRow = -1;
+  let nonEmptyRows = 0;
+  let wrappedRows = 0;
+
+  for (let index = start; index < end; index += 1) {
+    const line = buffer.getLine?.(index);
+    const text = line?.translateToString?.(false) || "";
+    const trimmed = text.trimEnd();
+    const rowHash = hashTerminalDiagnosticText(trimmed);
+    const isNonEmpty = trimmed.trim().length > 0;
+
+    rowHashes.push(rowHash);
+    aggregateHash = hashTerminalDiagnosticText(`${aggregateHash}:${rowHash}:${line?.isWrapped ? 1 : 0}`);
+
+    if (line?.isWrapped) {
+      wrappedRows += 1;
+    }
+
+    if (isNonEmpty) {
+      nonEmptyRows += 1;
+      if (firstNonEmptyRow < 0) {
+        firstNonEmptyRow = index - start;
+      }
+      lastNonEmptyRow = index - start;
+    } else if (nonEmptyRows === 0) {
+      blankPrefixRows += 1;
+    }
+  }
+
+  for (let offset = rowHashes.length - 1; offset >= 0; offset -= 1) {
+    const line = buffer.getLine?.(start + offset);
+    const trimmed = (line?.translateToString?.(false) || "").trimEnd();
+    if (trimmed.trim().length > 0) {
+      break;
+    }
+    blankSuffixRows += 1;
+  }
+
+  return {
+    aggregateHash,
+    available: true,
+    baseY: Number(buffer.baseY || 0),
+    blankPrefixRows,
+    blankSuffixRows,
+    bufferLength,
+    cursorX: Number(buffer.cursorX || 0),
+    cursorY: Number(buffer.cursorY || 0),
+    end,
+    firstNonEmptyRow,
+    lastNonEmptyRow,
+    nonEmptyRows,
+    rowCount: end - start,
+    rowHashes,
+    start,
+    viewportY: Number(buffer.viewportY || 0),
+    wrappedRows,
+  };
+}
+
+function getTerminalRowFingerprint(terminal, rowIndex) {
+  const line = terminal?.buffer?.active?.getLine?.(rowIndex);
+  const text = line?.translateToString?.(false) || "";
+  const trimmed = text.trimEnd();
+  const semanticHash = hashTerminalDiagnosticText(trimmed);
+
+  return {
+    hash: hashTerminalDiagnosticText(`${semanticHash}:${line?.isWrapped ? 1 : 0}`),
+    isNonEmpty: trimmed.trim().length > 0,
+    isWrapped: Boolean(line?.isWrapped),
+    semanticHash,
+    textLength: trimmed.length,
+  };
+}
+
+function getTerminalViewportAnchorDiagnostic(terminal, maxAnchorRows = 6) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      available: false,
+      rows: [],
+    };
+  }
+
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const viewportY = Math.max(0, Math.min(bufferLength, Number(buffer.viewportY || 0)));
+  const visibleEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + terminalRows));
+  const rows = [];
+
+  for (let index = viewportY; index < visibleEnd && rows.length < maxAnchorRows; index += 1) {
+    const fingerprint = getTerminalRowFingerprint(terminal, index);
+    if (!fingerprint.isNonEmpty) {
+      continue;
+    }
+
+    rows.push({
+      hash: fingerprint.hash,
+      isWrapped: fingerprint.isWrapped,
+      offset: index - viewportY,
+      semanticHash: fingerprint.semanticHash,
+      textLength: fingerprint.textLength,
+    });
+  }
+
+  return {
+    available: rows.length > 0,
+    baseY: Number(buffer.baseY || 0),
+    bufferLength,
+    firstOffset: rows[0]?.offset ?? 0,
+    maxOffset: rows.reduce((max, row) => Math.max(max, Number(row.offset || 0)), 0),
+    rowCount: rows.length,
+    rows,
+    terminalRows,
+    viewportY,
+  };
+}
+
+function scoreTerminalViewportAnchorAt(terminal, anchor, candidateViewportY) {
+  const anchorRows = Array.isArray(anchor?.rows) ? anchor.rows : [];
+  if (!anchorRows.length) {
+    return {
+      matches: 0,
+      requiredMatches: 1,
+    };
+  }
+
+  let matches = 0;
+  anchorRows.forEach((anchorRow) => {
+    const rowIndex = candidateViewportY + Number(anchorRow.offset || 0);
+    const fingerprint = getTerminalRowFingerprint(terminal, rowIndex);
+    if (
+      fingerprint.hash === anchorRow.hash
+      && fingerprint.isWrapped === anchorRow.isWrapped
+    ) {
+      matches += 1;
+    }
+  });
+
+  return {
+    matches,
+    requiredMatches: Math.min(3, Math.max(1, anchorRows.length)),
+  };
+}
+
+function findTerminalViewportAnchorMatch(terminal, anchor, preferredViewportY) {
+  const buffer = terminal?.buffer?.active;
+  const anchorRows = Array.isArray(anchor?.rows) ? anchor.rows : [];
+
+  if (!buffer || !anchor?.available || !anchorRows.length) {
+    return {
+      matched: false,
+      matches: 0,
+      preferredViewportY: 0,
+      viewportY: -1,
+    };
+  }
+
+  const baseY = Math.max(0, Number(buffer.baseY || 0));
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const maxOffset = Math.max(0, Number(anchor.maxOffset || 0));
+  const maxCandidate = Math.max(0, Math.min(baseY, bufferLength - maxOffset - 1));
+  const preferred = Math.max(0, Math.min(maxCandidate, Math.floor(Number(preferredViewportY || 0))));
+  const requiredMatches = Math.min(3, Math.max(1, anchorRows.length));
+  let best = null;
+
+  const consider = (candidateViewportY) => {
+    const candidate = Math.max(0, Math.min(maxCandidate, Math.floor(Number(candidateViewportY || 0))));
+    const score = scoreTerminalViewportAnchorAt(terminal, anchor, candidate);
+    if (score.matches < requiredMatches) {
+      return;
+    }
+
+    const distance = Math.abs(candidate - preferred);
+    if (
+      !best
+      || score.matches > best.matches
+      || (score.matches === best.matches && distance < best.distance)
+    ) {
+      best = {
+        distance,
+        matches: score.matches,
+        viewportY: candidate,
+      };
+    }
+  };
+
+  const nearStart = Math.max(0, preferred - 40);
+  const nearEnd = Math.min(maxCandidate, preferred + 40);
+  for (let candidate = nearStart; candidate <= nearEnd; candidate += 1) {
+    consider(candidate);
+  }
+
+  if (!best) {
+    for (let candidate = 0; candidate <= maxCandidate; candidate += 1) {
+      if (candidate >= nearStart && candidate <= nearEnd) {
+        continue;
+      }
+      consider(candidate);
+    }
+  }
+
+  if (!best) {
+    return {
+      matched: false,
+      matches: 0,
+      preferredViewportY: preferred,
+      requiredMatches,
+      viewportY: -1,
+    };
+  }
+
+  return {
+    distance: best.distance,
+    matched: true,
+    matches: best.matches,
+    preferredViewportY: preferred,
+    requiredMatches,
+    viewportY: best.viewportY,
+  };
+}
+
+function isCodexBannerTopBorderText(value) {
+  const text = sanitizeTerminalDiagnosticText(value).trim();
+
+  return /^╭[─\s]+╮?$/.test(text);
+}
+
+function isCodexBannerBottomBorderText(value) {
+  const text = sanitizeTerminalDiagnosticText(value).trim();
+
+  return /^╰[─\s]+╯?$/.test(text);
+}
+
+function isCodexBannerTitleText(value) {
+  return /OpenAI Codex/.test(sanitizeTerminalDiagnosticText(value));
+}
+
+function isCodexResizeBannerArtifactText(value) {
+  const text = sanitizeTerminalDiagnosticText(value).trim();
+
+  return text.length <= 0
+    || isCodexBannerTopBorderText(text)
+    || isCodexBannerBottomBorderText(text)
+    || isCodexBannerTitleText(text)
+    || /^│\s*│?$/.test(text)
+    || /^│\s*model:\s+/i.test(text)
+    || /^│\s*directory:\s+/i.test(text)
+    || /^│$/.test(text);
+}
+
+function getCodexResizeTopArtifactAdjustment(terminal, candidateViewportY) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      adjusted: false,
+      reason: "buffer_unavailable",
+      viewportY: Math.max(0, Math.floor(Number(candidateViewportY || 0))),
+    };
+  }
+
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const baseY = Math.max(0, Math.min(bufferLength, Number(buffer.baseY || 0)));
+  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const maxViewportY = Math.max(0, Math.min(baseY, bufferLength - 1));
+  const viewportY = Math.max(0, Math.min(maxViewportY, Math.floor(Number(candidateViewportY || 0))));
+  const distanceToLiveTop = baseY - viewportY;
+
+  if (distanceToLiveTop <= 0) {
+    return {
+      adjusted: false,
+      baseY,
+      distanceToLiveTop,
+      reason: "at_live_top",
+      viewportY,
+    };
+  }
+
+  if (distanceToLiveTop > terminalRows + 4) {
+    return {
+      adjusted: false,
+      baseY,
+      distanceToLiveTop,
+      reason: "too_far_from_live_top",
+      viewportY,
+    };
+  }
+
+  const scanRows = Math.min(
+    TERMINAL_CODEX_RESIZE_TOP_ARTIFACT_LOOKAHEAD_ROWS,
+    Math.max(terminalRows, distanceToLiveTop + 8),
+  );
+  const scanEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + scanRows));
+  const preLiveBlankRows = [];
+  const preLiveNonBlankRows = [];
+  const preLiveTopBorderRows = [];
+  const preLiveTitleRows = [];
+  const liveTitleRows = [];
+
+  for (let rowIndex = viewportY; rowIndex < scanEnd; rowIndex += 1) {
+    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
+
+    if (rowIndex < baseY) {
+      if (row.isBlank) {
+        preLiveBlankRows.push(rowIndex);
+      } else {
+        preLiveNonBlankRows.push(rowIndex);
+      }
+
+      if (isCodexBannerTopBorderText(row.text)) {
+        preLiveTopBorderRows.push(rowIndex);
+      }
+    }
+
+    if (!isCodexBannerTitleText(row.text)) {
+      continue;
+    }
+
+    if (rowIndex < baseY) {
+      preLiveTitleRows.push(rowIndex);
+    } else {
+      liveTitleRows.push(rowIndex);
+    }
+  }
+
+  const hasRepeatedTopBorders = preLiveTopBorderRows.length >= 2;
+  const hasStrayTopBorderBeforeLive = preLiveTopBorderRows.length > 0 && liveTitleRows.length > 0;
+  const hasBlankPrefixBeforeLive = preLiveBlankRows.length > 0
+    && preLiveBlankRows.length <= TERMINAL_CODEX_RESIZE_TOP_BLANK_PREFIX_MAX_ROWS
+    && preLiveNonBlankRows.length === 0
+    && liveTitleRows.length > 0;
+  const hasSplitBannerDuplicate = preLiveTitleRows.length > 0 && liveTitleRows.length > 0;
+
+  if (
+    !hasRepeatedTopBorders
+    && !hasStrayTopBorderBeforeLive
+    && !hasBlankPrefixBeforeLive
+    && !hasSplitBannerDuplicate
+  ) {
+    return {
+      adjusted: false,
+      baseY,
+      distanceToLiveTop,
+      liveTitleRows,
+      preLiveBlankRows,
+      preLiveNonBlankRows,
+      preLiveTitleRows,
+      preLiveTopBorderRows,
+      reason: "no_transient_banner_artifact",
+      viewportY,
+    };
+  }
+
+  return {
+    adjusted: true,
+    baseY,
+    distanceToLiveTop,
+    liveTitleRows,
+    preLiveBlankRows,
+    preLiveNonBlankRows,
+    preLiveTitleRows,
+    preLiveTopBorderRows,
+    reason: hasRepeatedTopBorders
+      ? "repeated_codex_banner_top_borders"
+      : hasStrayTopBorderBeforeLive
+        ? "stray_codex_banner_top_border_before_live"
+        : hasBlankPrefixBeforeLive
+          ? "blank_prefix_before_live_codex_banner"
+          : "split_codex_banner_duplicate",
+    viewportY: baseY,
+    wasViewportY: viewportY,
+  };
+}
+
+function getTerminalInternalActiveBuffer(terminal) {
+  return terminal?._core?._bufferService?.buffer
+    || terminal?._core?._bufferService?.buffers?.active
+    || null;
+}
+
+function adjustTerminalRowAfterDeletion(rowIndex, deleteStart, deleteCount) {
+  const row = Math.max(0, Math.floor(Number(rowIndex || 0)));
+  const start = Math.max(0, Math.floor(Number(deleteStart || 0)));
+  const count = Math.max(0, Math.floor(Number(deleteCount || 0)));
+  const end = start + count;
+
+  if (count <= 0 || row < start) {
+    return row;
+  }
+
+  if (row < end) {
+    return start;
+  }
+
+  return Math.max(0, row - count);
+}
+
+function getCodexResizeTopArtifactPurgePlan(terminal, topArtifactAdjustment) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer || !topArtifactAdjustment?.adjusted) {
+    return {
+      shouldPurge: false,
+      reason: "not_adjusted",
+    };
+  }
+
+  const baseY = Math.max(0, Math.floor(Number(topArtifactAdjustment.baseY || 0)));
+  const start = Math.max(0, Math.floor(Number(
+    topArtifactAdjustment.wasViewportY ?? topArtifactAdjustment.viewportY ?? 0,
+  )));
+  const rowCount = Math.max(0, baseY - start);
+
+  if (rowCount <= 0) {
+    return {
+      shouldPurge: false,
+      reason: "empty_range",
+    };
+  }
+
+  if (rowCount > TERMINAL_CODEX_RESIZE_ARTIFACT_PURGE_MAX_ROWS) {
+    return {
+      shouldPurge: false,
+      reason: "range_too_large",
+      rowCount,
+      start,
+    };
+  }
+
+  const rows = [];
+  const nonArtifactRows = [];
+  let artifactRows = 0;
+  let nonBlankRows = 0;
+
+  for (let rowIndex = start; rowIndex < baseY; rowIndex += 1) {
+    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
+    const isArtifact = isCodexResizeBannerArtifactText(row.text);
+    rows.push(row);
+    if (!row.isBlank) {
+      nonBlankRows += 1;
+    }
+    if (isArtifact) {
+      artifactRows += 1;
+    } else {
+      nonArtifactRows.push(row);
+    }
+  }
+
+  if (nonArtifactRows.length > 0) {
+    return {
+      nonArtifactRows,
+      reason: "range_contains_non_artifact_rows",
+      rowCount,
+      rows,
+      shouldPurge: false,
+      start,
+    };
+  }
+
+  if (nonBlankRows <= 0 && !topArtifactAdjustment.liveTitleRows?.length) {
+    return {
+      reason: "blank_range_without_live_banner",
+      rowCount,
+      rows,
+      shouldPurge: false,
+      start,
+    };
+  }
+
+  return {
+    artifactRows,
+    baseY,
+    nonBlankRows,
+    reason: topArtifactAdjustment.reason || "top_artifact",
+    rowCount,
+    rows,
+    shouldPurge: true,
+    start,
+  };
+}
+
+function applyCodexResizeTopArtifactPurge(terminal, purgePlan) {
+  if (!purgePlan?.shouldPurge) {
+    return {
+      purged: false,
+      reason: purgePlan?.reason || "no_plan",
+    };
+  }
+
+  const internalBuffer = getTerminalInternalActiveBuffer(terminal);
+  const lines = internalBuffer?.lines;
+
+  if (
+    !internalBuffer
+    || !lines
+    || typeof lines.splice !== "function"
+  ) {
+    return {
+      purged: false,
+      reason: "internal_buffer_unavailable",
+    };
+  }
+
+  const deleteStart = Math.max(0, Math.floor(Number(purgePlan.start || 0)));
+  const deleteCount = Math.max(0, Math.floor(Number(purgePlan.rowCount || 0)));
+
+  if (deleteCount <= 0 || deleteStart + deleteCount > Number(lines.length || 0)) {
+    return {
+      deleteCount,
+      deleteStart,
+      purged: false,
+      reason: "invalid_delete_range",
+    };
+  }
+
+  const beforeBaseY = Math.max(0, Number(internalBuffer.ybase || 0));
+  const beforeViewportY = Math.max(0, Number(internalBuffer.ydisp || 0));
+  const beforeSavedY = Math.max(0, Number(internalBuffer.savedY || 0));
+
+  try {
+    lines.splice(deleteStart, deleteCount);
+    internalBuffer.ybase = adjustTerminalRowAfterDeletion(beforeBaseY, deleteStart, deleteCount);
+    internalBuffer.ydisp = Math.min(
+      internalBuffer.ybase,
+      adjustTerminalRowAfterDeletion(beforeViewportY, deleteStart, deleteCount),
+    );
+    internalBuffer.savedY = adjustTerminalRowAfterDeletion(beforeSavedY, deleteStart, deleteCount);
+
+    const bufferService = terminal?._core?._bufferService;
+    try {
+      bufferService?._onScroll?.fire?.(internalBuffer.ydisp);
+    } catch (_error) {
+    }
+
+    return {
+      afterBaseY: Number(internalBuffer.ybase || 0),
+      afterViewportY: Number(internalBuffer.ydisp || 0),
+      beforeBaseY,
+      beforeViewportY,
+      deleteCount,
+      deleteStart,
+      purged: true,
+      reason: purgePlan.reason,
+    };
+  } catch (_error) {
+    return {
+      deleteCount,
+      deleteStart,
+      purged: false,
+      reason: "delete_failed",
+    };
+  }
+}
+
+function getTerminalBottomBandDiagnostic(terminal) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      available: false,
+    };
+  }
+
+  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const baseY = Math.max(0, Number(buffer.baseY || 0));
+  const viewportY = Math.max(0, Number(buffer.viewportY || 0));
+  const cursorX = Math.max(0, Number(buffer.cursorX || 0));
+  const cursorY = Math.max(0, Number(buffer.cursorY || 0));
+  const cursorAbsoluteRow = Math.max(0, Math.min(bufferLength - 1, baseY + cursorY));
+  const liveEnd = Math.max(baseY, Math.min(bufferLength, baseY + terminalRows));
+  const viewportEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + terminalRows));
+  const cursorWindowStart = Math.max(baseY, cursorAbsoluteRow - 5);
+  const cursorWindowEnd = Math.min(liveEnd, cursorAbsoluteRow + 7);
+  const liveTailStart = Math.max(baseY, liveEnd - 10);
+  const viewportTailStart = Math.max(viewportY, viewportEnd - 10);
+  let blankRowsBelowCursor = 0;
+  let nonEmptyRowsBelowCursor = 0;
+  let firstNonEmptyBelowCursor = -1;
+  let lastNonEmptyBelowCursor = -1;
+
+  for (let rowIndex = cursorAbsoluteRow + 1; rowIndex < liveEnd; rowIndex += 1) {
+    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
+    if (row.isBlank) {
+      blankRowsBelowCursor += 1;
+    } else {
+      nonEmptyRowsBelowCursor += 1;
+      if (firstNonEmptyBelowCursor < 0) {
+        firstNonEmptyBelowCursor = rowIndex;
+      }
+      lastNonEmptyBelowCursor = rowIndex;
+    }
+  }
+
+  return {
+    available: true,
+    baseY,
+    blankRowsBelowCursor,
+    bufferLength,
+    cursorAbsoluteRow,
+    cursorLine: getTerminalRowTextDiagnostic(terminal, cursorAbsoluteRow),
+    cursorWindow: getTerminalRowsTextDiagnostic(terminal, cursorWindowStart, cursorWindowEnd - cursorWindowStart),
+    cursorX,
+    cursorY,
+    firstNonEmptyBelowCursor,
+    lastNonEmptyBelowCursor,
+    liveEnd,
+    liveTail: getTerminalRowsTextDiagnostic(terminal, liveTailStart, liveEnd - liveTailStart),
+    nonEmptyRowsBelowCursor,
+    terminalRows,
+    viewportEnd,
+    viewportTail: getTerminalRowsTextDiagnostic(terminal, viewportTailStart, viewportEnd - viewportTailStart),
+    viewportY,
+  };
+}
+
+function getTerminalTopBandDiagnostic(terminal) {
+  const buffer = terminal?.buffer?.active;
+
+  if (!buffer) {
+    return {
+      available: false,
+    };
+  }
+
+  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const bufferLength = Math.max(0, Number(buffer.length || 0));
+  const baseY = Math.max(0, Number(buffer.baseY || 0));
+  const viewportY = Math.max(0, Number(buffer.viewportY || 0));
+  const cursorX = Math.max(0, Number(buffer.cursorX || 0));
+  const cursorY = Math.max(0, Number(buffer.cursorY || 0));
+  const sampleRows = Math.min(12, terminalRows);
+  const viewportTop = getTerminalRowsTextDiagnostic(terminal, viewportY, sampleRows);
+  const liveTop = getTerminalRowsTextDiagnostic(terminal, baseY, sampleRows);
+  const viewportTexts = Array.isArray(viewportTop.rows)
+    ? viewportTop.rows.map((row) => row.text)
+    : [];
+  const liveTexts = Array.isArray(liveTop.rows)
+    ? liveTop.rows.map((row) => row.text)
+    : [];
+  const viewportCodexBannerRows = (viewportTop.rows || [])
+    .filter((row) => /OpenAI Codex/.test(row.text || ""))
+    .map((row) => row.rowIndex);
+  const liveCodexBannerRows = (liveTop.rows || [])
+    .filter((row) => /OpenAI Codex/.test(row.text || ""))
+    .map((row) => row.rowIndex);
+
+  return {
+    available: true,
+    baseMinusViewport: baseY - viewportY,
+    baseY,
+    bufferLength,
+    cursorX,
+    cursorY,
+    liveCodexBannerRows,
+    liveTop,
+    liveTopTextHash: hashTerminalDiagnosticText(liveTexts.join("\n")),
+    sampleRows,
+    terminalRows,
+    viewportCodexBannerRows,
+    viewportTop,
+    viewportTopTextHash: hashTerminalDiagnosticText(viewportTexts.join("\n")),
+    viewportY,
+  };
+}
+
+function isCodexComposerPromptText(value) {
+  return sanitizeTerminalDiagnosticText(value).trimStart().startsWith("›");
+}
+
+function isCodexExpectedComposerFooterText(value) {
+  const text = sanitizeTerminalDiagnosticText(value)
+    .replace(/^[│╭╰╮╯─\s]+/g, "")
+    .replace(/[│╭╰╮╯─\s]+$/g, "")
+    .trim();
+
+  return /^gpt-[\w.-]+(?:\s+[\w.-]+)?\s+·\s+\/.+/.test(text);
+}
+
+function isCodexExpectedComposerFooterBorderText(value) {
+  const text = sanitizeTerminalDiagnosticText(value).trim();
+
+  return /^[│╭╰╮╯─\s]+$/.test(text);
+}
+
+function areCodexExpectedComposerFooterRows(rows) {
+  const nonEmptyRows = Array.isArray(rows) ? rows : [];
+
+  if (
+    nonEmptyRows.length < 1
+    || nonEmptyRows.length > TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER + 1
+  ) {
+    return false;
+  }
+
+  let footerRows = 0;
+  for (const row of nonEmptyRows) {
+    const text = row?.text || "";
+    if (isCodexExpectedComposerFooterText(text)) {
+      footerRows += 1;
+      continue;
+    }
+
+    if (isCodexExpectedComposerFooterBorderText(text)) {
+      continue;
+    }
+
+    return false;
+  }
+
+  return footerRows >= 1;
+}
+
+function getCodexResizeLiveTailCleanupPlan(terminal) {
+  const bottomBand = getTerminalBottomBandDiagnostic(terminal);
+
+  if (!bottomBand.available) {
+    return {
+      bottomBand,
+      reason: "buffer_unavailable",
+      shouldClean: false,
+    };
+  }
+
+  const terminalRows = Math.max(1, Number(bottomBand.terminalRows || terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const cursorY = Math.max(0, Number(bottomBand.cursorY || 0));
+  const cursorAbsoluteRow = Math.max(0, Number(bottomBand.cursorAbsoluteRow || 0));
+  const liveEnd = Math.max(cursorAbsoluteRow, Number(bottomBand.liveEnd || 0));
+  const nonEmptyRowsBelow = [];
+
+  for (let rowIndex = cursorAbsoluteRow + 1; rowIndex < liveEnd; rowIndex += 1) {
+    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
+    if (!row.isBlank) {
+      nonEmptyRowsBelow.push(row);
+    }
+  }
+
+  const cursorText = bottomBand.cursorLine?.text || "";
+  const composerMatched = isCodexComposerPromptText(cursorText);
+  const hasOnlyExpectedFooter = areCodexExpectedComposerFooterRows(nonEmptyRowsBelow);
+
+  if (!composerMatched) {
+    return {
+      bottomBand,
+      composerMatched,
+      nonEmptyRowsBelow,
+      reason: "cursor_not_composer",
+      shouldClean: false,
+    };
+  }
+
+  if (cursorY >= terminalRows - 1) {
+    return {
+      bottomBand,
+      composerMatched,
+      nonEmptyRowsBelow,
+      reason: "cursor_on_last_row",
+      shouldClean: false,
+    };
+  }
+
+  if (!nonEmptyRowsBelow.length) {
+    return {
+      bottomBand,
+      composerMatched,
+      nonEmptyRowsBelow,
+      reason: "tail_already_blank",
+      shouldClean: false,
+    };
+  }
+
+  if (hasOnlyExpectedFooter) {
+    return {
+      bottomBand,
+      composerMatched,
+      nonEmptyRowsBelow,
+      reason: "expected_footer_only",
+      shouldClean: false,
+    };
+  }
+
+  const targetRow = Math.max(
+    1,
+    Math.min(
+      terminalRows,
+      cursorY + 2 + TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER,
+    ),
+  );
+  const nonEmptySignature = nonEmptyRowsBelow
+    .map((row) => `${row.rowIndex}:${row.hash}:${row.textLength}`)
+    .join("|");
+
+  return {
+    bottomBand,
+    composerMatched,
+    nonEmptyRowsBelow,
+    reason: "stale_live_tail",
+    preservedRowsBelowComposer: TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER,
+    sequence: `\x1b7\x1b[${targetRow};1H\x1b[0J\x1b8`,
+    shouldClean: true,
+    signature: [
+      terminal?.cols || 0,
+      terminalRows,
+      bottomBand.baseY,
+      cursorAbsoluteRow,
+      bottomBand.cursorLine?.hash || "",
+      nonEmptySignature,
+    ].join(":"),
+    targetRow,
+  };
+}
+
+function getTerminalCanvasDiagnostics(container) {
+  const canvases = Array.from(container?.querySelectorAll?.("canvas") || []);
+
+  return canvases.map((canvas, index) => {
+    const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
+      ? window.getComputedStyle(canvas)
+      : null;
+    const bounds = typeof canvas.getBoundingClientRect === "function"
+      ? canvas.getBoundingClientRect()
+      : null;
+
+    return {
+      className: String(canvas.className || ""),
+      clientHeight: Math.round(Number(canvas.clientHeight || 0)),
+      clientWidth: Math.round(Number(canvas.clientWidth || 0)),
+      height: Math.round(Number(canvas.height || 0)),
+      index,
+      opacity: style?.opacity || "",
+      rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
+      rectTop: bounds ? Math.round(Number(bounds.top || 0)) : 0,
+      rectWidth: bounds ? Math.round(Number(bounds.width || 0)) : 0,
+      styleHeight: style?.height || "",
+      styleTransform: style?.transform || "",
+      styleWidth: style?.width || "",
+      width: Math.round(Number(canvas.width || 0)),
+    };
+  });
+}
+
+function getTerminalRowsDomSnapshot(container, limit = TERMINAL_RENDERER_DOM_ROW_SNAPSHOT_LIMIT) {
+  const rowsElement = container?.querySelector?.(".xterm-rows") || null;
+  const screenElement = container?.querySelector?.(".xterm-screen") || null;
+  const textLayerElement = container?.querySelector?.(".xterm-text-layer") || null;
+  const containerBounds = typeof container?.getBoundingClientRect === "function"
+    ? container.getBoundingClientRect()
+    : null;
+  const rowsBounds = typeof rowsElement?.getBoundingClientRect === "function"
+    ? rowsElement.getBoundingClientRect()
+    : null;
+  const rowLimit = Math.max(0, Math.floor(Number(limit || 0)));
+  const rowElements = Array.from(rowsElement?.children || []).slice(0, rowLimit);
+
+  return {
+    childCount: Number(rowsElement?.children?.length || 0),
+    firstRows: rowElements.map((rowElement, index) => {
+      const bounds = typeof rowElement?.getBoundingClientRect === "function"
+        ? rowElement.getBoundingClientRect()
+        : null;
+      const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
+        ? window.getComputedStyle(rowElement)
+        : null;
+
+      return {
+        childCount: Number(rowElement?.children?.length || 0),
+        className: String(rowElement?.className || ""),
+        index,
+        rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
+        rectLeft: bounds && containerBounds
+          ? Math.round(Number(bounds.left || 0) - Number(containerBounds.left || 0))
+          : 0,
+        rectTop: bounds && containerBounds
+          ? Math.round(Number(bounds.top || 0) - Number(containerBounds.top || 0))
+          : 0,
+        styleHeight: style?.height || "",
+        styleTransform: style?.transform || "",
+        text: sanitizeTerminalDiagnosticText(rowElement?.textContent || "", 180),
+      };
+    }),
+    rowsElement: getTerminalElementDiagnostics(rowsElement),
+    rowsRectTop: rowsBounds && containerBounds
+      ? Math.round(Number(rowsBounds.top || 0) - Number(containerBounds.top || 0))
+      : 0,
+    screen: getTerminalElementDiagnostics(screenElement),
+    textLayer: getTerminalElementDiagnostics(textLayerElement),
+  };
+}
+
+function getTerminalRendererPaintDiagnostics(terminal, container, scrollableElement) {
+  const screenElement = container?.querySelector?.(".xterm-screen") || null;
+  const viewportElement = container?.querySelector?.(".xterm-viewport") || null;
+  const rowsElement = container?.querySelector?.(".xterm-rows") || null;
+  const textLayerElement = container?.querySelector?.(".xterm-text-layer") || null;
+  const cursorLayerElement = container?.querySelector?.(".xterm-cursor-layer") || null;
+  const containerBounds = typeof container?.getBoundingClientRect === "function"
+    ? container.getBoundingClientRect()
+    : null;
+  const screenBounds = typeof screenElement?.getBoundingClientRect === "function"
+    ? screenElement.getBoundingClientRect()
+    : null;
+  const dimensions = terminal?._core?._renderService?.dimensions || {};
+  const cssCanvas = dimensions?.css?.canvas || {};
+  const cssCell = dimensions?.css?.cell || {};
+  const deviceCanvas = dimensions?.device?.canvas || {};
+  const deviceCell = dimensions?.device?.cell || {};
+  const buffer = terminal?.buffer?.active;
+  const rows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
+  const baseY = Number(buffer?.baseY || 0);
+  const viewportY = Number(buffer?.viewportY || 0);
+
+  return {
+    canvasCount: Number(container?.querySelectorAll?.("canvas")?.length || 0),
+    canvases: getTerminalCanvasDiagnostics(container),
+    cursorLayer: getTerminalElementDiagnostics(cursorLayerElement),
+    liveRows: getTerminalBufferRowsDiagnostic(terminal, baseY, rows),
+    paintBounds: {
+      containerHeight: containerBounds ? Math.round(Number(containerBounds.height || 0)) : 0,
+      cssPaintedBottom: container?.style?.getPropertyValue?.("--terminal-xterm-painted-bottom") || "",
+      screenBottom: screenBounds && containerBounds
+        ? Math.round(Number(screenBounds.bottom || 0) - Number(containerBounds.top || 0))
+        : 0,
+      unpaintedBottomPx: screenBounds && containerBounds
+        ? Math.max(0, Math.round(Number(containerBounds.bottom || 0) - Number(screenBounds.bottom || 0)))
+        : 0,
+    },
+    renderService: {
+      actualCellHeight: Number(dimensions.actualCellHeight || 0),
+      actualCellWidth: Number(dimensions.actualCellWidth || 0),
+      cssCanvasHeight: Number(cssCanvas.height || 0),
+      cssCanvasWidth: Number(cssCanvas.width || 0),
+      cssCellHeight: Number(cssCell.height || 0),
+      cssCellWidth: Number(cssCell.width || 0),
+      deviceCanvasHeight: Number(deviceCanvas.height || 0),
+      deviceCanvasWidth: Number(deviceCanvas.width || 0),
+      deviceCellHeight: Number(deviceCell.height || 0),
+      deviceCellWidth: Number(deviceCell.width || 0),
+    },
+    rowsDom: getTerminalRowsDomSnapshot(container),
+    rowsElement: getTerminalElementDiagnostics(rowsElement),
+    screen: getTerminalElementDiagnostics(screenElement),
+    scrollable: getTerminalElementDiagnostics(scrollableElement),
+    textLayer: getTerminalElementDiagnostics(textLayerElement),
+    topBand: getTerminalTopBandDiagnostic(terminal),
+    viewport: getTerminalElementDiagnostics(viewportElement),
+    viewportRows: getTerminalBufferRowsDiagnostic(terminal, viewportY, rows),
+  };
+}
+
 function getTerminalModesDiagnostics(terminal) {
   try {
     const modes = terminal?.modes;
@@ -1384,36 +2508,6 @@ function getTerminalModesDiagnostics(terminal) {
       wraparoundMode: false,
     };
   }
-}
-
-function getTerminalScrollDiagnostics(terminal, container, scrollableElement) {
-  const buffer = getTerminalBufferDiagnostics(terminal) || {};
-  const viewportElement = container?.querySelector?.(".xterm-viewport") || null;
-  const screenElement = container?.querySelector?.(".xterm-screen") || null;
-  const options = terminal?.options || {};
-
-  return {
-    bufferBaseY: Number(buffer.baseY || 0),
-    bufferCursorX: Number(buffer.cursorX || 0),
-    bufferCursorY: Number(buffer.cursorY || 0),
-    bufferHasScrollback: Boolean(buffer.hasScrollback),
-    bufferLength: Number(buffer.length || 0),
-    bufferType: buffer.type || "",
-    bufferViewportY: Number(buffer.viewportY || 0),
-    cols: Number(terminal?.cols || 0),
-    container: getTerminalElementDiagnostics(container),
-    fastScrollSensitivity: Number(options.fastScrollSensitivity || 0),
-    mouse: getTerminalModesDiagnostics(terminal),
-    nativeViewport: getTerminalElementDiagnostics(viewportElement),
-    rows: Number(terminal?.rows || 0),
-    screen: getTerminalElementDiagnostics(screenElement),
-    scrollSensitivity: Number(options.scrollSensitivity || 0),
-    scrollback: Number(options.scrollback || 0),
-    scrollable: getTerminalElementDiagnostics(scrollableElement),
-    scrollOnUserInput: options.scrollOnUserInput !== false,
-    windowsPtyBackend: options.windowsPty?.backend || "",
-    windowsPtyBuildNumber: Number(options.windowsPty?.buildNumber || 0),
-  };
 }
 
 function getCsiParamNumbers(params) {
@@ -1438,6 +2532,41 @@ function getCsiParamNumbers(params) {
 function getFirstCsiParam(params, fallback = 0) {
   const numbers = getCsiParamNumbers(params);
   return numbers.length > 0 ? numbers[0] : fallback;
+}
+
+function getTerminalCursorHomeDiagnostic(params) {
+  const numbers = getCsiParamNumbers(params);
+
+  if (numbers.length === 0) {
+    return {
+      isHome: true,
+      variant: "bare",
+    };
+  }
+
+  if (numbers.length > 2) {
+    return {
+      isHome: false,
+      variant: "",
+    };
+  }
+
+  const row = numbers[0] ?? 1;
+  const column = numbers[1] ?? 1;
+  const rowIsHome = row === 0 || row === 1;
+  const columnIsHome = column === 0 || column === 1;
+
+  if (!rowIsHome || !columnIsHome) {
+    return {
+      isHome: false,
+      variant: "",
+    };
+  }
+
+  return {
+    isHome: true,
+    variant: numbers.length === 1 ? "omitted_column" : "explicit",
+  };
 }
 
 function getWindowsTerminalCompactState(terminal, container, scrollableElement) {
@@ -1530,158 +2659,6 @@ function isWindowsTerminalGeometrySettled(state, targetSize) {
     && Math.abs(Number(state.screenHeightDelta || 0)) <= heightTolerance;
 }
 
-function hashWindowsTerminalDiagnosticText(value) {
-  const text = String(value || "");
-  let hash = 2166136261;
-
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-function getWindowsTerminalFrameFingerprintForRange(terminal, startIndex, rowCount) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      log: {
-        available: false,
-      },
-      rowHashes: [],
-    };
-  }
-
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const rows = Math.max(1, Number(rowCount || terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const start = Math.max(0, Math.min(bufferLength, Math.floor(Number(startIndex || 0))));
-  const end = Math.max(start, Math.min(bufferLength, start + rows));
-  const rowHashes = [];
-  let aggregate = "811c9dc5";
-  let blankPrefixRows = 0;
-  let blankSuffixRows = 0;
-  let firstNonEmptyRow = -1;
-  let lastNonEmptyRow = -1;
-  let nonEmptyRows = 0;
-  let wrappedRows = 0;
-
-  for (let index = start; index < end; index += 1) {
-    const line = buffer.getLine?.(index);
-    const text = line?.translateToString?.(false) || "";
-    const normalized = text.trimEnd();
-    const rowHash = hashWindowsTerminalDiagnosticText(normalized);
-    const isNonEmpty = normalized.trim().length > 0;
-
-    rowHashes.push(rowHash);
-    aggregate = hashWindowsTerminalDiagnosticText(`${aggregate}:${rowHash}:${line?.isWrapped ? 1 : 0}`);
-
-    if (line?.isWrapped) {
-      wrappedRows += 1;
-    }
-
-    if (isNonEmpty) {
-      nonEmptyRows += 1;
-      if (firstNonEmptyRow < 0) {
-        firstNonEmptyRow = index - start;
-      }
-      lastNonEmptyRow = index - start;
-    } else if (nonEmptyRows === 0) {
-      blankPrefixRows += 1;
-    }
-  }
-
-  for (let offset = rowHashes.length - 1; offset >= 0; offset -= 1) {
-    const line = buffer.getLine?.(start + offset);
-    const normalized = (line?.translateToString?.(false) || "").trimEnd();
-    if (normalized.trim().length > 0) {
-      break;
-    }
-    blankSuffixRows += 1;
-  }
-
-  return {
-    log: {
-      aggregateHash: aggregate,
-      available: true,
-      baseY: Number(buffer.baseY || 0),
-      blankPrefixRows,
-      blankSuffixRows,
-      bufferLength,
-      bufferType: buffer.type || "",
-      cursorX: Number(buffer.cursorX || 0),
-      cursorY: Number(buffer.cursorY || 0),
-      end,
-      firstNonEmptyRow,
-      lastNonEmptyRow,
-      nonEmptyRows,
-      rowCount: end - start,
-      rows: Number(terminal?.rows || 0),
-      start,
-      viewportY: Number(buffer.viewportY || 0),
-      wrappedRows,
-    },
-    rowHashes,
-  };
-}
-
-function getWindowsTerminalLiveFrameFingerprint(terminal) {
-  const buffer = terminal?.buffer?.active;
-  const baseY = Number(buffer?.baseY || 0);
-  const rows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  return getWindowsTerminalFrameFingerprintForRange(terminal, baseY, rows);
-}
-
-function getWindowsTerminalHistoryTailFingerprint(terminal) {
-  const buffer = terminal?.buffer?.active;
-  const baseY = Number(buffer?.baseY || 0);
-  const rows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  if (!buffer || baseY <= 0) {
-    return {
-      log: {
-        available: false,
-        baseY,
-        reason: "no_scrollback",
-      },
-      rowHashes: [],
-    };
-  }
-
-  return getWindowsTerminalFrameFingerprintForRange(terminal, Math.max(0, baseY - rows), rows);
-}
-
-function compareWindowsTerminalFrameFingerprints(current, previous) {
-  if (!current?.log?.available || !previous?.log?.available) {
-    return {
-      comparable: false,
-      rowMatchRatio: 0,
-      sameAggregateHash: false,
-    };
-  }
-
-  const currentHashes = Array.isArray(current.rowHashes) ? current.rowHashes : [];
-  const previousHashes = Array.isArray(previous.rowHashes) ? previous.rowHashes : [];
-  const comparableRows = Math.min(currentHashes.length, previousHashes.length);
-  let matchingRows = 0;
-
-  for (let index = 0; index < comparableRows; index += 1) {
-    if (currentHashes[index] === previousHashes[index]) {
-      matchingRows += 1;
-    }
-  }
-
-  return {
-    comparable: comparableRows > 0,
-    currentNonEmptyRows: Number(current.log.nonEmptyRows || 0),
-    matchingRows,
-    previousNonEmptyRows: Number(previous.log.nonEmptyRows || 0),
-    rowCountCompared: comparableRows,
-    rowMatchRatio: comparableRows > 0 ? matchingRows / comparableRows : 0,
-    sameAggregateHash: current.log.aggregateHash === previous.log.aggregateHash,
-  };
-}
-
 function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
@@ -1748,6 +2725,14 @@ function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const terminalScrollStabilityMode = getTerminalAgentScrollStabilityMode({
+    agentKind: terminalAgentKind,
+    isMacHost: TERMINAL_IS_MACOS_HOST,
+    isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
+  });
+  const useNormalizerAgentScrollStability = terminalScrollStabilityMode
+    === TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER
+    && !isGenericTerminal;
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
     : `${agent?.label || "Agent"} terminal`;
@@ -2114,6 +3099,8 @@ function WorkspaceTerminal({
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
     terminalInstanceIdRef.current = terminalInstanceId;
+    const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
+    const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
     if (terminalActiveRef.current) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceId);
     }
@@ -2150,6 +3137,7 @@ function WorkspaceTerminal({
 
     container.dataset.scrollbarPlatform = TERMINAL_SCROLLBAR_PLATFORM;
 
+    let terminalScrollableElement = null;
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: false,
@@ -2165,7 +3153,7 @@ function WorkspaceTerminal({
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
       reflowCursorLine: false,
       scrollSensitivity: 1,
-      scrollOnEraseInDisplay: TERMINAL_IS_WINDOWS_HOST,
+      scrollOnEraseInDisplay: false,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       smoothScrollDuration: 0,
       ...(TERMINAL_IS_WINDOWS_HOST ? { windowsPty: buildWindowsPtyOptions() } : {}),
@@ -2198,12 +3186,13 @@ function WorkspaceTerminal({
     });
     xtermRef.current = terminal;
 
-    const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
-    const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
+    const terminalOutputNormalizer = createTerminalOutputNormalizer({
+      dropEraseDisplay2OutsideSync: terminalAgentKind === "codex",
+      enabled: useNormalizerAgentScrollStability,
+    });
     syncTerminalDiagnosticLogging();
     syncWindowsTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
-    let terminalScrollableElement = null;
     let terminalRendererOpened = false;
     let windowsPtyOptions = TERMINAL_IS_WINDOWS_HOST ? buildWindowsPtyOptions() : null;
     const applyWindowsPtyOptions = (info = null) => {
@@ -2282,6 +3271,8 @@ function WorkspaceTerminal({
       terminal.open(container);
       terminalRendererOpened = true;
       terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
+      syncTerminalPaintBounds("xterm_open");
+      scheduleTerminalPaintBoundsSync("xterm_open_settled", [34, 120]);
       logTerminalDiagnosticEvent("frontend.terminal_mount", {
         ...getTerminalDiagnosticEnvironment(),
         containerClientHeight: measurement.clientHeight,
@@ -2297,6 +3288,7 @@ function WorkspaceTerminal({
         paneId,
         rendererMode,
         scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
+        scrollStabilityMode: terminalScrollStabilityMode || "off",
         scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
         scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
         terminalIndex,
@@ -2304,7 +3296,6 @@ function WorkspaceTerminal({
         windowsPty: TERMINAL_IS_WINDOWS_HOST ? windowsPtyOptions?.backend || TERMINAL_WINDOWS_PTY_BACKEND : "",
         windowsPtyBuildNumber: Number(windowsPtyOptions?.buildNumber || 0),
       });
-
       return true;
     };
     const waitForTerminalRendererOpen = async (reason) => {
@@ -2360,6 +3351,16 @@ function WorkspaceTerminal({
         terminalIndex,
       });
     };
+    let markCodexResizeGateActive = () => {};
+    let scheduleCodexResizeGateFlush = () => {};
+    let scheduleCodexResizePaintProbe = () => {};
+    let logCodexResizePaintProbe = () => {};
+    let isCodexResizePaintProbeActive = () => false;
+    let applyCodexResizeScrollbackCleanup = () => false;
+    let scheduleCodexResizeLiveTailCleanup = () => false;
+    let handleCodexResizeCursorHomeSettled = () => {};
+    let syncTerminalPaintBounds = () => false;
+    let scheduleTerminalPaintBoundsSync = () => {};
 
     const waitForTerminalRenderFrame = () => new Promise((resolve) => {
       if (isDisposed) {
@@ -2447,474 +3448,7 @@ function WorkspaceTerminal({
     };
 
     let windowsTerminalControlSequenceId = 0;
-    let windowsTerminalLastEraseDisplayFrame = null;
-    let windowsTerminalDuplicateEraseDisplayFrames = 0;
-    let windowsTerminalScrollOnEraseRestoreTimer = 0;
-    let windowsTerminalSuppressedEraseDisplayFrames = 0;
-    let windowsTerminalAgentRepaintTransientUntil = 0;
-    let windowsTerminalLastKnownBaseY = 0;
-    let windowsTerminalProtectedScrollbackBaseY = 0;
-    let windowsTerminalProtectScrollbackUntil = 0;
-    let windowsTerminalResizeLiveClearCount = 0;
-    let windowsTerminalResizeLiveClearPendingEvent = null;
-    let windowsTerminalResizeLiveClearTimer = 0;
-    let windowsTerminalResizeLiveClearWritesInFlight = 0;
-    let windowsTerminalResizeScrollbackPurgeReason = "";
-    let windowsTerminalResizeScrollbackPurgeTimer = 0;
-    let windowsTerminalResizeScrollbackPurgeInFlight = false;
-    let windowsTerminalResizeStartState = null;
-    let windowsTerminalResizeTransientUntil = 0;
-    let windowsTerminalResizeTransientScrollbarTimer = 0;
-    let windowsTerminalTransientResizeScrollbackRows = 0;
-    const clearWindowsTerminalTransientScrollbarMask = (reason) => {
-      if (!TERMINAL_IS_WINDOWS_HOST) {
-        return;
-      }
-
-      if (windowsTerminalResizeTransientScrollbarTimer) {
-        window.clearTimeout(windowsTerminalResizeTransientScrollbarTimer);
-        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
-        windowsTerminalResizeTransientScrollbarTimer = 0;
-      }
-
-      if (container.dataset.resizeTransientScrollback === "true") {
-        delete container.dataset.resizeTransientScrollback;
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_transient_scrollbar_unmasked", {
-          reason,
-        });
-      }
-    };
-    const markWindowsTerminalTransientScrollbar = (reason) => {
-      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
-        return;
-      }
-
-      const wasMasked = container.dataset.resizeTransientScrollback === "true";
-      container.dataset.resizeTransientScrollback = "true";
-
-      if (!wasMasked) {
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_transient_scrollbar_masked", {
-          reason,
-        });
-      }
-
-      if (windowsTerminalResizeTransientScrollbarTimer) {
-        window.clearTimeout(windowsTerminalResizeTransientScrollbarTimer);
-        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
-        windowsTerminalResizeTransientScrollbarTimer = 0;
-      }
-
-      windowsTerminalResizeTransientScrollbarTimer = window.setTimeout(() => {
-        startupMetricTimers.delete(windowsTerminalResizeTransientScrollbarTimer);
-        windowsTerminalResizeTransientScrollbarTimer = 0;
-        if (!isDisposed) {
-          clearWindowsTerminalTransientScrollbarMask("transient_scrollbar_timeout");
-        }
-      }, WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBAR_HIDE_MS);
-      startupMetricTimers.add(windowsTerminalResizeTransientScrollbarTimer);
-    };
-    const protectWindowsTerminalScrollback = (baseY, reason) => {
-      const protectedBaseY = Math.max(0, Number(baseY || 0));
-      if (!TERMINAL_IS_WINDOWS_HOST || protectedBaseY <= 0) {
-        return;
-      }
-
-      const previousProtectedBaseY = windowsTerminalProtectedScrollbackBaseY;
-      windowsTerminalProtectedScrollbackBaseY = Math.max(
-        windowsTerminalProtectedScrollbackBaseY,
-        protectedBaseY,
-      );
-      windowsTerminalTransientResizeScrollbackRows = 0;
-      clearWindowsTerminalTransientScrollbarMask(reason);
-
-      if (windowsTerminalProtectedScrollbackBaseY !== previousProtectedBaseY) {
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.protected_scrollback", {
-          baseY: protectedBaseY,
-          protectedBaseY: windowsTerminalProtectedScrollbackBaseY,
-          reason,
-        });
-      }
-    };
-    const protectNextWindowsTerminalScrollbackGrowth = (reason) => {
-      if (!TERMINAL_IS_WINDOWS_HOST) {
-        return;
-      }
-
-      windowsTerminalProtectScrollbackUntil = Math.max(
-        windowsTerminalProtectScrollbackUntil,
-        performance.now() + WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS,
-      );
-
-      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.protected_scrollback_window", {
-        reason,
-      });
-    };
-    const suppressWindowsTerminalScrollOnEraseForCurrentClear = (reason) => {
-      if (!TERMINAL_IS_WINDOWS_HOST) {
-        return false;
-      }
-
-      if (windowsTerminalScrollOnEraseRestoreTimer) {
-        window.clearTimeout(windowsTerminalScrollOnEraseRestoreTimer);
-        startupMetricTimers.delete(windowsTerminalScrollOnEraseRestoreTimer);
-        windowsTerminalScrollOnEraseRestoreTimer = 0;
-      }
-
-      terminal.options.scrollOnEraseInDisplay = false;
-      windowsTerminalSuppressedEraseDisplayFrames += 1;
-      if (reason !== "resize_growth_live_viewport_clear") {
-        windowsTerminalAgentRepaintTransientUntil = Math.max(
-          windowsTerminalAgentRepaintTransientUntil,
-          performance.now() + WINDOWS_TERMINAL_REPAINT_TRANSIENT_SCROLLBACK_MS,
-        );
-      }
-
-      windowsTerminalScrollOnEraseRestoreTimer = window.setTimeout(() => {
-        startupMetricTimers.delete(windowsTerminalScrollOnEraseRestoreTimer);
-        windowsTerminalScrollOnEraseRestoreTimer = 0;
-
-        if (!isDisposed) {
-          terminal.options.scrollOnEraseInDisplay = TERMINAL_IS_WINDOWS_HOST;
-        }
-      }, 0);
-      startupMetricTimers.add(windowsTerminalScrollOnEraseRestoreTimer);
-
-      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.scroll_on_erase_suppressed", {
-        reason,
-        suppressedEraseDisplayFrames: windowsTerminalSuppressedEraseDisplayFrames,
-      });
-
-      return true;
-    };
-    const noteWindowsTerminalTransientScrollbackRows = (deltaRows, state, reason) => {
-      const baseY = Number(state?.baseY || 0);
-      if (
-        !TERMINAL_IS_WINDOWS_HOST
-        || isGenericTerminal
-        || baseY <= 0
-        || deltaRows <= 0
-        || windowsTerminalProtectedScrollbackBaseY > 0
-      ) {
-        return;
-      }
-
-      windowsTerminalTransientResizeScrollbackRows = baseY;
-      markWindowsTerminalTransientScrollbar(reason);
-      windowsTerminalResizeTransientUntil = Math.max(
-        windowsTerminalResizeTransientUntil,
-        performance.now() + WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS,
-      );
-
-      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_transient", {
-        baseY,
-        deltaRows,
-        reason,
-        transientRows: windowsTerminalTransientResizeScrollbackRows,
-      });
-    };
-    const observeWindowsTerminalBaseY = (reason, providedState = null) => {
-      const state = providedState || getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      const baseY = Number(state?.baseY || 0);
-      const previousBaseY = Number(windowsTerminalLastKnownBaseY || 0);
-      const now = performance.now();
-      const reasonText = String(reason || "");
-      const insideTransientWindow = now <= windowsTerminalResizeTransientUntil
-        || now <= windowsTerminalAgentRepaintTransientUntil;
-      const isResizeObservation = reasonText.includes("resize");
-
-      if (baseY < windowsTerminalProtectedScrollbackBaseY) {
-        windowsTerminalProtectedScrollbackBaseY = baseY;
-      }
-
-      if (baseY > previousBaseY && now <= windowsTerminalProtectScrollbackUntil) {
-        protectWindowsTerminalScrollback(baseY, reason);
-      } else if (
-        baseY > previousBaseY
-        && (insideTransientWindow || isResizeObservation)
-      ) {
-        noteWindowsTerminalTransientScrollbackRows(baseY - previousBaseY, state, reason);
-      } else if (baseY < previousBaseY) {
-        windowsTerminalTransientResizeScrollbackRows = Math.min(
-          windowsTerminalTransientResizeScrollbackRows,
-          baseY,
-        );
-      }
-
-      windowsTerminalLastKnownBaseY = baseY;
-      return state;
-    };
-    const canPurgeWindowsTerminalResizeScrollback = (providedState = null) => {
-      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
-        return false;
-      }
-
-      const state = providedState || getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      const baseY = Number(state?.baseY || 0);
-      const now = performance.now();
-      const insideResizeWindow = now <= windowsTerminalResizeTransientUntil;
-      const insideRepaintWindow = now <= windowsTerminalAgentRepaintTransientUntil;
-
-      if (windowsTerminalProtectedScrollbackBaseY > 0) {
-        return false;
-      }
-
-      return state?.bufferType === "normal"
-        && baseY > 0
-        && (
-          windowsTerminalTransientResizeScrollbackRows >= baseY
-          || (insideResizeWindow && windowsTerminalTransientResizeScrollbackRows > 0)
-          || insideRepaintWindow
-        );
-    };
-    const finishWindowsTerminalResizeScrollbackPurge = (reason) => {
-      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      windowsTerminalLastKnownBaseY = Number(state.baseY || 0);
-      windowsTerminalTransientResizeScrollbackRows = Math.min(
-        windowsTerminalTransientResizeScrollbackRows,
-        Number(state.baseY || 0),
-      );
-      windowsTerminalProtectedScrollbackBaseY = Math.min(
-        windowsTerminalProtectedScrollbackBaseY,
-        Number(state.baseY || 0),
-      );
-      if (Number(state.baseY || 0) <= 0) {
-        windowsTerminalTransientResizeScrollbackRows = 0;
-        windowsTerminalProtectedScrollbackBaseY = 0;
-        windowsTerminalProtectScrollbackUntil = 0;
-        windowsTerminalResizeTransientUntil = 0;
-        windowsTerminalAgentRepaintTransientUntil = 0;
-        clearWindowsTerminalTransientScrollbarMask(reason);
-      }
-
-      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_done", {
-        reason,
-        transientRows: windowsTerminalTransientResizeScrollbackRows,
-      });
-      updateTerminalScrollbarOverflow();
-      scheduleTerminalScrollbarRefresh([40, 160]);
-    };
-    const scheduleWindowsTerminalResizeScrollbackPurge = (reason) => {
-      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
-        return false;
-      }
-
-      const state = observeWindowsTerminalBaseY(`${reason}_schedule`);
-      if (!canPurgeWindowsTerminalResizeScrollback(state)) {
-        return false;
-      }
-
-      if (windowsTerminalResizeScrollbackPurgeTimer) {
-        window.clearTimeout(windowsTerminalResizeScrollbackPurgeTimer);
-        startupMetricTimers.delete(windowsTerminalResizeScrollbackPurgeTimer);
-        windowsTerminalResizeScrollbackPurgeTimer = 0;
-      }
-
-      windowsTerminalResizeScrollbackPurgeReason = reason;
-      windowsTerminalResizeScrollbackPurgeTimer = window.setTimeout(() => {
-        startupMetricTimers.delete(windowsTerminalResizeScrollbackPurgeTimer);
-        windowsTerminalResizeScrollbackPurgeTimer = 0;
-
-        if (isDisposed) {
-          return;
-        }
-
-        const purgeState = observeWindowsTerminalBaseY(`${reason}_purge`);
-        if (!canPurgeWindowsTerminalResizeScrollback(purgeState)) {
-          return;
-        }
-
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_requested", {
-          reason,
-          transientRows: windowsTerminalTransientResizeScrollbackRows,
-        });
-
-        try {
-          windowsTerminalResizeScrollbackPurgeInFlight = true;
-          terminal.write("\x1b[3J", () => {
-            windowsTerminalResizeScrollbackPurgeInFlight = false;
-            if (!isDisposed) {
-              finishWindowsTerminalResizeScrollbackPurge(reason);
-            }
-          });
-        } catch (error) {
-          windowsTerminalResizeScrollbackPurgeInFlight = false;
-          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_scrollback_purge_error", {
-            message: getErrorMessage(error, "Unable to purge transient resize scrollback."),
-            reason,
-          });
-        }
-      }, WINDOWS_TERMINAL_RESIZE_SCROLLBACK_PURGE_DELAY_MS);
-      startupMetricTimers.add(windowsTerminalResizeScrollbackPurgeTimer);
-      return true;
-    };
-    const rememberWindowsTerminalResizeStart = (event = {}) => {
-      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
-        return;
-      }
-
-      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      const baseY = Number(state.baseY || 0);
-      windowsTerminalResizeStartState = {
-        baseY,
-        bufferLength: Number(state.bufferLength || 0),
-        reason: event.reason || "resize",
-        rows: Number(state.rows || 0),
-      };
-      if (baseY > 0 && windowsTerminalTransientResizeScrollbackRows < baseY) {
-        protectWindowsTerminalScrollback(baseY, "resize_start_existing_scrollback");
-      }
-      windowsTerminalLastKnownBaseY = baseY;
-      windowsTerminalResizeTransientUntil = Math.max(
-        windowsTerminalResizeTransientUntil,
-        performance.now() + WINDOWS_TERMINAL_RESIZE_TRANSIENT_SCROLLBACK_MS,
-      );
-    };
-    const shouldClearWindowsTerminalLiveViewportOnResize = (event, state) => {
-      if (
-        !TERMINAL_IS_WINDOWS_HOST
-        || isGenericTerminal
-        || !WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_AGENT_KINDS.has(terminalAgentKind)
-        || state?.bufferType !== "normal"
-      ) {
-        return false;
-      }
-
-      const previousRows = Number(event?.previousRows || windowsTerminalResizeStartState?.rows || 0);
-      const nextRows = Number(event?.rows || state?.rows || terminal.rows || 0);
-
-      return previousRows > 0 && nextRows > previousRows;
-    };
-    const runWindowsTerminalLiveViewportClear = () => {
-      const event = windowsTerminalResizeLiveClearPendingEvent;
-      windowsTerminalResizeLiveClearPendingEvent = null;
-      windowsTerminalResizeLiveClearTimer = 0;
-
-      if (isDisposed || !event) {
-        return false;
-      }
-
-      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      if (!shouldClearWindowsTerminalLiveViewportOnResize(event, state)) {
-        return false;
-      }
-
-      windowsTerminalResizeLiveClearCount += 1;
-      windowsTerminalResizeLiveClearWritesInFlight += 1;
-
-      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_requested", {
-        clearCount: windowsTerminalResizeLiveClearCount,
-        nextRows: Number(event?.rows || state?.rows || terminal.rows || 0),
-        previousRows: Number(event?.previousRows || windowsTerminalResizeStartState?.rows || 0),
-        reason: event?.reason || "resize_done",
-      });
-
-      try {
-        terminal.write("\x1b[2J", () => {
-          windowsTerminalResizeLiveClearWritesInFlight = Math.max(
-            0,
-            windowsTerminalResizeLiveClearWritesInFlight - 1,
-          );
-          if (isDisposed) {
-            return;
-          }
-
-          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_done", {
-            clearCount: windowsTerminalResizeLiveClearCount,
-            reason: event?.reason || "resize_done",
-          });
-          refreshTerminalRenderer("windows_resize_live_viewport_clear");
-        });
-      } catch (error) {
-        windowsTerminalResizeLiveClearWritesInFlight = Math.max(
-          0,
-          windowsTerminalResizeLiveClearWritesInFlight - 1,
-        );
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_live_viewport_clear_error", {
-          message: getErrorMessage(error, "Unable to clear transient resize viewport."),
-          reason: event?.reason || "resize_done",
-        });
-      }
-
-      return true;
-    };
-    const clearWindowsTerminalLiveViewportForResize = (event, state) => {
-      if (!shouldClearWindowsTerminalLiveViewportOnResize(event, state)) {
-        return false;
-      }
-
-      windowsTerminalResizeLiveClearPendingEvent = {
-        ...event,
-        previousRows: Number(windowsTerminalResizeStartState?.rows || 0),
-        rows: Number(event?.rows || state?.rows || terminal.rows || 0),
-      };
-
-      if (windowsTerminalResizeLiveClearTimer) {
-        window.clearTimeout(windowsTerminalResizeLiveClearTimer);
-        startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
-        windowsTerminalResizeLiveClearTimer = 0;
-      }
-
-      windowsTerminalResizeLiveClearTimer = window.setTimeout(() => {
-        startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
-        runWindowsTerminalLiveViewportClear();
-      }, WINDOWS_TERMINAL_RESIZE_LIVE_CLEAR_DELAY_MS);
-      startupMetricTimers.add(windowsTerminalResizeLiveClearTimer);
-
-      return true;
-    };
-    const rememberWindowsTerminalResizeDone = (event = {}) => {
-      if (!TERMINAL_IS_WINDOWS_HOST || isGenericTerminal) {
-        return;
-      }
-
-      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-      const startBaseY = Number(windowsTerminalResizeStartState?.baseY ?? windowsTerminalLastKnownBaseY);
-      const baseY = Number(state.baseY || 0);
-      const deltaRows = baseY - startBaseY;
-
-      if (deltaRows > 0) {
-        noteWindowsTerminalTransientScrollbackRows(deltaRows, state, event.reason || "resize_done");
-      } else {
-        windowsTerminalTransientResizeScrollbackRows = Math.min(
-          windowsTerminalTransientResizeScrollbackRows,
-          baseY,
-        );
-      }
-
-      windowsTerminalLastKnownBaseY = baseY;
-      clearWindowsTerminalLiveViewportForResize(event, state);
-      windowsTerminalResizeStartState = null;
-      scheduleWindowsTerminalResizeScrollbackPurge(event.reason || "resize_done");
-    };
-    const scheduleWindowsTerminalControlAfterLog = (
-      sequenceId,
-      control,
-      action,
-      getAfterFields = null,
-    ) => {
-      if (!windowsTerminalDiagnosticsEnabled) {
-        return;
-      }
-
-      const timer = window.setTimeout(() => {
-        startupMetricTimers.delete(timer);
-        const afterFields = typeof getAfterFields === "function" ? getAfterFields() : {};
-        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.control_after", {
-          action,
-          ...afterFields,
-          control,
-          sequenceId,
-        });
-      }, 0);
-      startupMetricTimers.add(timer);
-    };
-
-    const logWindowsTerminalControl = (
-      control,
-      fields = {},
-      scheduleAfter = false,
-      getAfterFields = null,
-    ) => {
+    const logWindowsTerminalControl = (control, fields = {}) => {
       if (!windowsTerminalDiagnosticsEnabled) {
         return 0;
       }
@@ -2926,16 +3460,11 @@ function WorkspaceTerminal({
         sequenceId,
         ...fields,
       });
-
-      if (scheduleAfter) {
-        scheduleWindowsTerminalControlAfterLog(sequenceId, control, fields.action || "", getAfterFields);
-      }
-
       return sequenceId;
     };
 
     const registerWindowsTerminalControlDiagnostics = () => {
-      if (!TERMINAL_IS_WINDOWS_HOST) {
+      if (!windowsTerminalDiagnosticsEnabled) {
         return;
       }
 
@@ -2949,97 +3478,23 @@ function WorkspaceTerminal({
       disposables.push(terminal.parser.registerCsiHandler({ final: "J" }, (params) => {
         const actionParam = getFirstCsiParam(params, 0);
         const allParams = getCsiParamNumbers(params);
-        const observedState = observeWindowsTerminalBaseY("erase_display_control");
         const activeBufferType = getTerminalBufferDiagnostics(terminal)?.type || "";
-        const isInternalResizeLiveClear = actionParam === 2
-          && activeBufferType !== "alternate"
-          && windowsTerminalResizeLiveClearWritesInFlight > 0;
-        const shouldAllowTransientResizePurge = actionParam === 3
-          && activeBufferType !== "alternate"
-          && windowsTerminalResizeScrollbackPurgeInFlight
-          && canPurgeWindowsTerminalResizeScrollback(observedState);
-        const shouldBlockSavedLineErase = actionParam === 3
-          && activeBufferType !== "alternate"
-          && !shouldAllowTransientResizePurge;
-        const shouldSuppressScrollOnErase = isInternalResizeLiveClear;
-        const scrollOnEraseSuppressed = shouldSuppressScrollOnErase
-          ? suppressWindowsTerminalScrollOnEraseForCurrentClear("resize_growth_live_viewport_clear")
-          : false;
-        const action = shouldBlockSavedLineErase ? "block" : "allow";
         const control = actionParam === 3 ? "erase_saved_lines" : "erase_display";
-        const liveFrameBefore = actionParam === 2
-          ? getWindowsTerminalLiveFrameFingerprint(terminal)
-          : null;
-        const historyTailBefore = actionParam === 2
-          ? getWindowsTerminalHistoryTailFingerprint(terminal)
-          : null;
-        const previousFrameComparison = actionParam === 2
-          ? compareWindowsTerminalFrameFingerprints(liveFrameBefore, windowsTerminalLastEraseDisplayFrame)
-          : null;
-        const historyTailComparison = actionParam === 2
-          ? compareWindowsTerminalFrameFingerprints(liveFrameBefore, historyTailBefore)
-          : null;
-
-        if (actionParam === 2) {
-          if (previousFrameComparison?.sameAggregateHash) {
-            windowsTerminalDuplicateEraseDisplayFrames += 1;
-          } else {
-            windowsTerminalDuplicateEraseDisplayFrames = 0;
-          }
-          windowsTerminalLastEraseDisplayFrame = liveFrameBefore;
-        }
 
         logWindowsTerminalControl(control, {
-          action,
+          action: "allow",
           bufferType: activeBufferType,
-          duplicateEraseDisplayFrames: actionParam === 2
-            ? windowsTerminalDuplicateEraseDisplayFrames
-            : undefined,
-          frameBefore: liveFrameBefore?.log || null,
-          historyTailBefore: historyTailBefore?.log || null,
-          historyTailComparison,
           params: allParams.length > 0 ? allParams : [actionParam],
-          previousFrameComparison,
-          resizeScrollbackPurgeAllowed: shouldAllowTransientResizePurge,
-          resizeScrollbackPurgeReason: shouldAllowTransientResizePurge
-            ? windowsTerminalResizeScrollbackPurgeReason || "incoming_erase_saved_lines"
-            : "",
-          resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
-          resizeLiveClearInFlight: windowsTerminalResizeLiveClearWritesInFlight > 0,
-          resizeLiveClearInternal: isInternalResizeLiveClear,
-          scrollOnEraseSuppressed,
-          suppressedEraseDisplayFrames: actionParam === 2
-            ? windowsTerminalSuppressedEraseDisplayFrames
-            : undefined,
-        }, true, () => ({
-          frameAfter: actionParam === 2
-            ? getWindowsTerminalLiveFrameFingerprint(terminal).log
-            : null,
-          historyTailAfter: actionParam === 2
-            ? getWindowsTerminalHistoryTailFingerprint(terminal).log
-            : null,
           scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
-          resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
-        }));
+          scrollStabilityMode: terminalScrollStabilityMode || "off",
+        });
 
-        if (actionParam === 2 && !isInternalResizeLiveClear && activeBufferType !== "alternate") {
-          protectNextWindowsTerminalScrollbackGrowth("agent_erase_display");
-          if (Number(observedState?.baseY || 0) > 0) {
-            protectWindowsTerminalScrollback(observedState.baseY, "agent_erase_display_existing_scrollback");
-          }
-        }
-
-        if (shouldBlockSavedLineErase && canPurgeWindowsTerminalResizeScrollback(observedState)) {
-          scheduleWindowsTerminalResizeScrollbackPurge("blocked_erase_saved_lines_after");
-        }
-
-        return shouldBlockSavedLineErase;
+        return false;
       }));
 
       const registerDecPrivateModeHandler = (mode) => terminal.parser.registerCsiHandler(
         { prefix: "?", final: mode === "set" ? "h" : "l" },
         (params) => {
-          const observedState = observeWindowsTerminalBaseY(`dec_private_${mode}`);
           const allParams = getCsiParamNumbers(params);
           const interestingParams = allParams.filter((param) => (
             TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES.has(param)
@@ -3058,15 +3513,7 @@ function WorkspaceTerminal({
               action: "allow",
               mode,
               params: interestingParams,
-              resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
-            }, control === "alternate_buffer");
-
-            if (
-              control === "sync_output"
-              && canPurgeWindowsTerminalResizeScrollback(observedState)
-            ) {
-              scheduleWindowsTerminalResizeScrollbackPurge(`sync_output_${mode}`);
-            }
+            });
           }
 
           return false;
@@ -3078,12 +3525,68 @@ function WorkspaceTerminal({
 
       let cursorMoveWindowStartedAt = 0;
       let cursorMoveWindowCount = 0;
+      const scheduleCursorHomeSettledDiagnostic = (sequenceId, final, params, beforeState, variant) => {
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          if (isDisposed || !windowsTerminalDiagnosticsEnabled) {
+            return;
+          }
+
+          const afterState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+          logWindowsTerminalDiagnosticEvent("frontend.windows_terminal.cursor_home_settled", {
+            action: "allow",
+            beforeBaseY: Number(beforeState?.baseY || 0),
+            beforeCursorX: Number(beforeState?.cursorX || 0),
+            beforeCursorY: Number(beforeState?.cursorY || 0),
+            beforeViewportY: Number(beforeState?.viewportY || 0),
+            control: "cursor_home",
+            deltaBaseY: Number(afterState.baseY || 0) - Number(beforeState?.baseY || 0),
+            deltaCursorX: Number(afterState.cursorX || 0) - Number(beforeState?.cursorX || 0),
+            deltaCursorY: Number(afterState.cursorY || 0) - Number(beforeState?.cursorY || 0),
+            deltaViewportY: Number(afterState.viewportY || 0) - Number(beforeState?.viewportY || 0),
+            final,
+            paneId,
+            params,
+            rendererMode,
+            sequenceId,
+            source: "frontend",
+            state: afterState,
+            terminalIndex,
+            variant,
+          });
+          handleCodexResizeCursorHomeSettled({
+            afterState,
+            beforeState,
+            final,
+            params,
+            sequenceId,
+            variant,
+          });
+        }, 0);
+        startupMetricTimers.add(timer);
+      };
       const registerCursorMoveHandler = (final) => terminal.parser.registerCsiHandler(
         { final },
         (params) => {
-          const observedState = observeWindowsTerminalBaseY(`cursor_position_${final}`);
-          if (canPurgeWindowsTerminalResizeScrollback(observedState)) {
-            scheduleWindowsTerminalResizeScrollbackPurge(`cursor_position_${final}`);
+          const allParams = getCsiParamNumbers(params);
+          const homeDiagnostic = getTerminalCursorHomeDiagnostic(params);
+          if (homeDiagnostic.isHome) {
+            const beforeState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+            const sequenceId = logWindowsTerminalControl("cursor_home", {
+              action: "allow",
+              final,
+              params: allParams,
+              variant: homeDiagnostic.variant,
+            });
+            scheduleCursorHomeSettledDiagnostic(
+              sequenceId,
+              final,
+              allParams,
+              beforeState,
+              homeDiagnostic.variant,
+            );
+
+            return false;
           }
 
           const now = performance.now();
@@ -3097,7 +3600,7 @@ function WorkspaceTerminal({
             logWindowsTerminalControl("cursor_position", {
               action: "allow",
               final,
-              params: getCsiParamNumbers(params),
+              params: allParams,
             }, false);
           }
 
@@ -3111,19 +3614,67 @@ function WorkspaceTerminal({
 
     registerWindowsTerminalControlDiagnostics();
 
+    syncTerminalPaintBounds = (reason = "sync") => {
+      if (isDisposed || !container?.isConnected) {
+        return false;
+      }
+
+      const screenElement = container.querySelector(".xterm-screen");
+      if (!screenElement || typeof screenElement.getBoundingClientRect !== "function") {
+        container.style.setProperty("--terminal-xterm-painted-bottom", "100%");
+        return false;
+      }
+
+      const screenBounds = screenElement.getBoundingClientRect();
+      const containerBounds = typeof container.getBoundingClientRect === "function"
+        ? container.getBoundingClientRect()
+        : null;
+      const containerHeight = Number(containerBounds?.height || container.clientHeight || 0);
+      const screenBottom = Number(screenBounds?.bottom || 0) - Number(containerBounds?.top || 0);
+
+      if (
+        !Number.isFinite(containerHeight)
+        || containerHeight <= 0
+        || !Number.isFinite(screenBottom)
+        || screenBottom <= 0
+      ) {
+        container.style.setProperty("--terminal-xterm-painted-bottom", "100%");
+        return false;
+      }
+
+      const paintedBottom = Math.max(0, Math.min(containerHeight, Math.ceil(screenBottom)));
+      container.style.setProperty("--terminal-xterm-painted-bottom", `${paintedBottom}px`);
+      container.style.setProperty("--terminal-xterm-container-height", `${Math.ceil(containerHeight)}px`);
+
+      return true;
+    };
+
+    scheduleTerminalPaintBoundsSync = (reason = "scheduled", delaysMs = [0, 34, 120]) => {
+      if (isDisposed) {
+        return;
+      }
+
+      delaysMs.forEach((delayMs) => {
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          syncTerminalPaintBounds(reason);
+        }, Math.max(0, Number(delayMs || 0)));
+        startupMetricTimers.add(timer);
+      });
+    };
+
     let windowsTerminalLastResizeLogAt = 0;
-    disposables.push(terminal.onResize(() => {
+    disposables.push(terminal.onResize((event) => {
+      markCodexResizeGateActive("xterm_resize", event);
+      syncTerminalPaintBounds("xterm_resize");
+      scheduleTerminalPaintBoundsSync("xterm_resize_settled", [34, 120, 260]);
       const now = performance.now();
       if (windowsTerminalDiagnosticsEnabled && now - windowsTerminalLastResizeLogAt >= 250) {
         windowsTerminalLastResizeLogAt = now;
         const timer = window.setTimeout(() => {
           startupMetricTimers.delete(timer);
-          const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-          observeWindowsTerminalBaseY("xterm_resize_settled", state);
-          scheduleWindowsTerminalResizeScrollbackPurge("xterm_resize_settled");
           logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.resize_settled", {
             reason: "xterm_resize",
-            resizeTransientRows: windowsTerminalTransientResizeScrollbackRows,
           });
         }, TERMINAL_START_GEOMETRY_POLL_MS);
         startupMetricTimers.add(timer);
@@ -3277,126 +3828,6 @@ function WorkspaceTerminal({
       })
       .catch(() => {});
 
-    let updateTerminalScrollbarOverflow = () => false;
-    let scheduleTerminalScrollbarRefresh = () => {};
-
-    if (TERMINAL_SCROLLBAR_PLATFORM === "overlay" && terminalScrollableElement) {
-      let terminalScrollbarHideTimer = 0;
-      const terminalScrollbarRefreshTimers = new Set();
-      let terminalScrollIntentUntil = 0;
-      const getTerminalMaxViewportY = (activeBuffer) => Math.max(
-        0,
-        Number(activeBuffer?.baseY || 0),
-        Number(activeBuffer?.length || 0) - Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS),
-      );
-
-      updateTerminalScrollbarOverflow = () => {
-        const activeBuffer = terminal.buffer?.active;
-        const hasOverflow = Boolean(
-          activeBuffer
-          && activeBuffer.type !== "alternate"
-          && (
-            Number(activeBuffer.baseY || 0) > 0
-            || getTerminalMaxViewportY(activeBuffer) > 0
-          ),
-        );
-
-        if (hasOverflow) {
-          container.dataset.scrollbarOverflow = "true";
-        } else {
-          delete container.dataset.scrollbarOverflow;
-        }
-
-        return hasOverflow;
-      };
-      scheduleTerminalScrollbarRefresh = (delays = [0, 80, 240]) => {
-        delays.forEach((delayMs) => {
-          const refreshTimer = window.setTimeout(() => {
-            terminalScrollbarRefreshTimers.delete(refreshTimer);
-            if (!isDisposed) {
-              updateTerminalScrollbarOverflow();
-            }
-          }, Math.max(0, delayMs));
-
-          terminalScrollbarRefreshTimers.add(refreshTimer);
-        });
-      };
-      const hideTerminalScrollbar = () => {
-        terminalScrollbarHideTimer = 0;
-        if (!isDisposed) {
-          delete container.dataset.scrolling;
-        }
-      };
-      const scheduleHideTerminalScrollbar = () => {
-        if (terminalScrollbarHideTimer) {
-          window.clearTimeout(terminalScrollbarHideTimer);
-        }
-
-        terminalScrollbarHideTimer = window.setTimeout(
-          hideTerminalScrollbar,
-          TERMINAL_SCROLLBAR_HIDE_DELAY_MS,
-        );
-      };
-      const showTerminalScrollbar = () => {
-        if (isDisposed) {
-          return;
-        }
-
-        if (updateTerminalScrollbarOverflow()) {
-          container.dataset.scrolling = "true";
-          scheduleHideTerminalScrollbar();
-        }
-      };
-      const markTerminalScrollIntent = () => {
-        terminalScrollIntentUntil = performance.now() + TERMINAL_SCROLLBAR_INTENT_MS;
-      };
-      const handleTerminalScrollIntent = () => {
-        markTerminalScrollIntent();
-        showTerminalScrollbar();
-      };
-      const handleTerminalScrollKeyIntent = (event) => {
-        if (
-          event.key === "PageUp"
-          || event.key === "PageDown"
-          || event.key === "Home"
-          || event.key === "End"
-        ) {
-          handleTerminalScrollIntent();
-        }
-      };
-      const handleTerminalViewportScroll = () => {
-        updateTerminalScrollbarOverflow();
-        if (performance.now() <= terminalScrollIntentUntil) {
-          showTerminalScrollbar();
-        }
-      };
-
-      disposables.push(terminal.onWriteParsed(updateTerminalScrollbarOverflow));
-      disposables.push(terminal.onResize(updateTerminalScrollbarOverflow));
-      terminalScrollableElement.addEventListener("wheel", handleTerminalScrollIntent, { passive: true });
-      terminalScrollableElement.addEventListener("touchmove", handleTerminalScrollIntent, { passive: true });
-      container.addEventListener("keydown", handleTerminalScrollKeyIntent, true);
-      disposables.push(terminal.onScroll(handleTerminalViewportScroll));
-      updateTerminalScrollbarOverflow();
-      scheduleTerminalScrollbarRefresh([0, 80, 240, 800, 1600]);
-
-      disposables.push(() => {
-        if (terminalScrollbarHideTimer) {
-          window.clearTimeout(terminalScrollbarHideTimer);
-          terminalScrollbarHideTimer = 0;
-        }
-        terminalScrollbarRefreshTimers.forEach((timer) => window.clearTimeout(timer));
-        terminalScrollbarRefreshTimers.clear();
-
-        delete container.dataset.scrolling;
-        delete container.dataset.scrollbarOverflow;
-        delete container.dataset.scrollbarPlatform;
-
-        terminalScrollableElement.removeEventListener("wheel", handleTerminalScrollIntent);
-        terminalScrollableElement.removeEventListener("touchmove", handleTerminalScrollIntent);
-        container.removeEventListener("keydown", handleTerminalScrollKeyIntent, true);
-      });
-    }
     listen(TERMINAL_AUDIO_INPUT_REFOCUS_EVENT, (event) => {
       if (
         isDisposed
@@ -3508,13 +3939,88 @@ function WorkspaceTerminal({
 
     scheduleWebglAttach("xterm_open", 0);
 
+    const clearTerminalRendererRows = (reason, extraFields = {}) => {
+      if (isDisposed || !container?.isConnected) {
+        return {
+          cleared: false,
+          method: "unavailable",
+        };
+      }
+
+      const rowsElement = container.querySelector(".xterm-rows");
+      const screenElement = container.querySelector(".xterm-screen");
+      const rowCount = Number(rowsElement?.children?.length || 0);
+      let cleared = false;
+      let method = "";
+
+      try {
+        const renderService = terminal?._core?._renderService;
+        if (typeof renderService?.clear === "function") {
+          renderService.clear();
+          cleared = true;
+          method = "render_service_clear";
+        }
+      } catch (_error) {
+        cleared = false;
+        method = "";
+      }
+
+      if (!cleared && rowsElement?.children?.length) {
+        try {
+          Array.from(rowsElement.children).forEach((rowElement) => {
+            rowElement.replaceChildren();
+          });
+          cleared = true;
+          method = "dom_row_replace_children";
+        } catch (_error) {
+          cleared = false;
+          method = "dom_row_replace_failed";
+        }
+      }
+
+      const forcedLayoutHeight = Number(screenElement?.offsetHeight || 0);
+
+      if (windowsTerminalDiagnosticsEnabled) {
+        const diagnosticFields = { ...(extraFields || {}) };
+        if (Object.prototype.hasOwnProperty.call(diagnosticFields, "method")) {
+          diagnosticFields.scrollMethod = diagnosticFields.method;
+          delete diagnosticFields.method;
+        }
+        if (Object.prototype.hasOwnProperty.call(diagnosticFields, "reason")) {
+          diagnosticFields.cleanupReason = diagnosticFields.reason;
+          delete diagnosticFields.reason;
+        }
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.renderer_rows_clear", {
+          ...diagnosticFields,
+          action: cleared ? "clear" : "skip",
+          forcedLayoutHeight,
+          rendererClearMethod: method,
+          rendererClearReason: reason,
+          rowCount,
+        });
+      }
+
+      return {
+        cleared,
+        forcedLayoutHeight,
+        method,
+        rowCount,
+      };
+    };
+
     const refreshTerminalRenderer = (reason, extraFields = {}) => {
       if (isDisposed || typeof terminal.refresh !== "function") {
         return false;
       }
 
       try {
+        if (extraFields.clearRowsBeforeRefresh === true) {
+          clearTerminalRendererRows(`${reason}_before_refresh`, extraFields);
+        }
+        syncTerminalPaintBounds(`${reason}_before_refresh`);
         terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        syncTerminalPaintBounds(`${reason}_after_refresh`);
+        scheduleTerminalPaintBoundsSync(`${reason}_refresh_settled`, [34]);
         return true;
       } catch (error) {
       }
@@ -3700,6 +4206,11 @@ function WorkspaceTerminal({
       const combineMs = performance.now() - combineStartedAt;
       const isFirstOutputChunk = writes.some((write) => write.isFirstOutputChunk);
       const isFirstVisibleOutputChunk = writes.some((write) => write.isFirstVisibleOutputChunk);
+      const afterWriteRefreshReasons = writes
+        .map((write) => write.afterWriteRefreshReason)
+        .filter(Boolean);
+      const scrollToBottomBeforeWrite = writes.some((write) => write.scrollToBottomBeforeWrite);
+      const scrollToBottomAfterWrite = writes.some((write) => write.scrollToBottomAfterWrite);
       const batchVisibleChars = writes.reduce(
         (total, write) => total + (Number(write.outputDebug?.visibleChars) || 0),
         0,
@@ -3722,14 +4233,6 @@ function WorkspaceTerminal({
         outputDiagnosticQueuedMaxMs = Math.max(outputDiagnosticQueuedMaxMs, queuedMs);
         outputDiagnosticFlushReasons[reason] = (outputDiagnosticFlushReasons[reason] || 0) + 1;
       }
-      const shouldLogWrite = outputChunks <= 10
-        || isFirstOutputChunk
-        || isFirstVisibleOutputChunk
-        || writes.length > 1;
-
-      if (shouldLogWrite) {
-      }
-
       const writeStartedAt = performance.now();
       outputWriteInFlight = true;
       const handleTerminalWriteComplete = () => {
@@ -3770,12 +4273,106 @@ function WorkspaceTerminal({
           return;
         }
 
+        if (scrollToBottomAfterWrite && typeof terminal.scrollToBottom === "function") {
+          try {
+            terminal.scrollToBottom();
+          } catch (_error) {
+            // Best-effort: the resize repaint is already written.
+          }
+        }
+
+        if (afterWriteRefreshReasons.length) {
+          let clearedTextureAtlas = false;
+          const clearTextureAtlas = activeWebglAddon?.clearTextureAtlas;
+          if (typeof clearTextureAtlas === "function") {
+            try {
+              clearTextureAtlas.call(activeWebglAddon);
+              clearedTextureAtlas = true;
+            } catch (_error) {
+              // Renderer refresh below is the fallback when the WebGL atlas cannot be cleared.
+            }
+          }
+
+          const refreshed = refreshTerminalRenderer(afterWriteRefreshReasons[afterWriteRefreshReasons.length - 1], {
+            bytes: batchData.byteLength,
+            transport: "binary_channel",
+          });
+	          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+	            action: "after_write_refresh",
+	            clearedTextureAtlas,
+	            refreshed,
+	            reasons: afterWriteRefreshReasons,
+	            scrollToBottomAfterWrite,
+	            scrollToBottomBeforeWrite,
+	            scrolledToBottomBeforeWrite,
+	          });
+	          applyCodexResizeScrollbackCleanup("after_write_refresh", null, {
+	            batchBytes,
+	            clearedTextureAtlas,
+	            refreshed,
+	            scrollToBottomAfterWrite,
+	            scrollToBottomBeforeWrite,
+	            scrolledToBottomBeforeWrite,
+	          });
+	          const liveTailCleanedImmediately = applyCodexResizeLiveTailCleanup("after_write_refresh_immediate", {
+	            allowWithPendingOutput: true,
+	            batchBytes,
+	            clearedTextureAtlas,
+	            refreshed,
+	            scrollToBottomAfterWrite,
+	            scrollToBottomBeforeWrite,
+	            scrolledToBottomBeforeWrite,
+	          });
+	          scheduleCodexResizeLiveTailCleanup("after_write_refresh", {
+	            batchBytes,
+	            clearedTextureAtlas,
+	            liveTailCleanedImmediately,
+	            refreshed,
+	            scrollToBottomAfterWrite,
+	            scrollToBottomBeforeWrite,
+	            scrolledToBottomBeforeWrite,
+	          });
+	          scheduleCodexResizePaintProbe("codex_resize_gate_flush", "after_write_refresh", {
+	            batchBytes,
+	            clearedTextureAtlas,
+	            liveTailCleanedImmediately,
+	            refreshed,
+	            scrollToBottomAfterWrite,
+	            scrollToBottomBeforeWrite,
+	            scrolledToBottomBeforeWrite,
+	          });
+        }
+
+        if (isCodexResizePaintProbeActive()) {
+          const liveTailCleanedImmediately = applyCodexResizeLiveTailCleanup("after_output_write_immediate", {
+            allowWithPendingOutput: true,
+            batchBytes,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            reason,
+            writes: writes.length,
+          });
+          scheduleCodexResizePaintProbe("terminal_output_write", "after_output_write", {
+            batchBytes,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            liveTailCleanedImmediately,
+            reason,
+            writes: writes.length,
+          }, [0, 80]);
+          scheduleCodexResizeLiveTailCleanup("after_output_write", {
+            batchBytes,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            liveTailCleanedImmediately,
+            reason,
+            writes: writes.length,
+          }, [16, 80]);
+        }
+
         if (pendingOutputWrites.length) {
           scheduleTerminalOutputBatchFlush();
         }
-
-        updateTerminalScrollbarOverflow();
-        scheduleTerminalScrollbarRefresh([40, 160]);
 
         if (isFirstOutputChunk) {
           refreshTerminalRenderer("first_output_written", {
@@ -3795,9 +4392,17 @@ function WorkspaceTerminal({
           }));
         }
 
-        if (shouldLogWrite) {
-        }
       };
+
+      let scrolledToBottomBeforeWrite = false;
+      if (scrollToBottomBeforeWrite && typeof terminal.scrollToBottom === "function") {
+        try {
+          terminal.scrollToBottom();
+          scrolledToBottomBeforeWrite = true;
+        } catch (_error) {
+          // Best-effort: the resize repaint can still be restored after parsing.
+        }
+      }
 
       try {
         terminal.write(batchData, handleTerminalWriteComplete);
@@ -3832,7 +4437,7 @@ function WorkspaceTerminal({
     });
     disposables.push(() => terminalGlobalRenderScheduler.unregister(renderSchedulerId));
 
-    const writeTerminalOutput = (data, options = {}) => {
+    const enqueueTerminalOutputWrite = (data, options = {}) => {
       if (isDisposed || !data?.byteLength) {
         return;
       }
@@ -3848,11 +4453,14 @@ function WorkspaceTerminal({
         outputBatchQueuedAt = performance.now();
       }
       pendingOutputWrites.push({
+        afterWriteRefreshReason: options.afterWriteRefreshReason || "",
         data: queuedData,
-        isFirstOutputChunk,
-        isFirstVisibleOutputChunk,
-        outputDebug,
-      });
+	        isFirstOutputChunk,
+	        isFirstVisibleOutputChunk,
+	        outputDebug,
+	        scrollToBottomBeforeWrite: options.scrollToBottomBeforeWrite === true,
+	        scrollToBottomAfterWrite: options.scrollToBottomAfterWrite === true,
+	      });
       pendingOutputBytes += queuedData.byteLength;
 
       if (pendingOutputBytes >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
@@ -3862,6 +4470,851 @@ function WorkspaceTerminal({
 
       scheduleTerminalOutputBatchFlush();
     };
+
+    const codexResizeGate = {
+      active: false,
+      epoch: 0,
+      flushDueAt: 0,
+      flushTimer: 0,
+      lastObservedSize: null,
+      lastOutputPaintProbeAt: 0,
+      liveTailCleanupSequence: 0,
+      liveTailCleanupUntil: 0,
+      liveTailLastCleanedSignature: "",
+      paintProbeSequence: 0,
+      paintProbeUntil: 0,
+      previousSize: null,
+      queuedBytes: 0,
+      queuedWrites: [],
+      scrollbackCleanupAnchor: null,
+      scrollbackCleanupLastHandledBaseY: 0,
+      scrollbackCleanupLastTargetY: -1,
+      scrollbackCleanupStartBaseY: 0,
+      scrollbackCleanupStartedAtBottom: false,
+      scrollbackCleanupStartViewportY: 0,
+      scrollbackCleanupUntil: 0,
+      startedAtBottom: false,
+      startedAt: 0,
+      startState: null,
+      targetSize: null,
+    };
+    const isCodexResizeGateEnabled = () => (
+      terminalAgentKind === "codex"
+      && terminalOutputNormalizer.enabled
+      && !isGenericTerminal
+    );
+    const normalizeCodexResizeGateSize = (size) => {
+      const cols = Number(size?.cols || 0);
+      const rows = Number(size?.rows || 0);
+
+      if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols <= 0 || rows <= 0) {
+        return null;
+      }
+
+      return {
+        cols: Math.floor(cols),
+        rows: Math.floor(rows),
+      };
+    };
+    const getCurrentCodexResizeGateSize = () => normalizeCodexResizeGateSize({
+      cols: terminal.cols,
+      rows: terminal.rows,
+    });
+    const codexResizeGateSizesEqual = (left, right) => (
+      Boolean(left)
+      && Boolean(right)
+      && Number(left.cols || 0) === Number(right.cols || 0)
+      && Number(left.rows || 0) === Number(right.rows || 0)
+    );
+    const clearCodexResizeGateTimer = () => {
+      if (!codexResizeGate.flushTimer) {
+        return;
+      }
+
+      window.clearTimeout(codexResizeGate.flushTimer);
+      codexResizeGate.flushTimer = 0;
+      codexResizeGate.flushDueAt = 0;
+    };
+    isCodexResizePaintProbeActive = () => (
+      isCodexResizeGateEnabled()
+      && (
+        codexResizeGate.active
+        || performance.now() <= Number(codexResizeGate.paintProbeUntil || 0)
+      )
+    );
+    logCodexResizePaintProbe = (reason, action, extraFields = {}) => {
+      if (!windowsTerminalDiagnosticsEnabled || !isCodexResizeGateEnabled() || isDisposed) {
+        return;
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_paint_probe", {
+        action,
+        epoch: codexResizeGate.epoch,
+        paintProbeActive: isCodexResizePaintProbeActive(),
+        paintProbeUntil: Number(codexResizeGate.paintProbeUntil || 0),
+        reason,
+        renderer: getTerminalRendererPaintDiagnostics(terminal, container, terminalScrollableElement),
+        ...extraFields,
+      });
+    };
+    scheduleCodexResizePaintProbe = (
+      reason,
+      action,
+      extraFields = {},
+      delaysMs = TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS,
+    ) => {
+      if (!windowsTerminalDiagnosticsEnabled || !isCodexResizeGateEnabled() || isDisposed) {
+        return;
+      }
+
+      const now = performance.now();
+      if (
+        action === "after_output_write"
+        && now - codexResizeGate.lastOutputPaintProbeAt < TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS
+      ) {
+        return;
+      }
+
+      if (action === "after_output_write") {
+        codexResizeGate.lastOutputPaintProbeAt = now;
+      }
+
+      codexResizeGate.paintProbeUntil = Math.max(
+        Number(codexResizeGate.paintProbeUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS,
+      );
+      codexResizeGate.paintProbeSequence += 1;
+      const probeId = codexResizeGate.paintProbeSequence;
+
+      delaysMs.forEach((delayMs) => {
+        const normalizedDelayMs = Math.max(0, Number(delayMs || 0));
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          logCodexResizePaintProbe(reason, action, {
+            delayMs: normalizedDelayMs,
+            probeId,
+            ...extraFields,
+          });
+        }, normalizedDelayMs);
+        startupMetricTimers.add(timer);
+      });
+    };
+    const isCodexResizeLiveTailCleanupActive = () => (
+      isCodexResizeGateEnabled()
+      && (
+        codexResizeGate.active
+        || performance.now() <= Number(codexResizeGate.liveTailCleanupUntil || 0)
+      )
+    );
+    const applyCodexResizeLiveTailCleanup = (reason, extraFields = {}) => {
+      if (!isCodexResizeLiveTailCleanupActive() || isDisposed) {
+        return false;
+      }
+
+      const allowWithPendingOutput = extraFields.allowWithPendingOutput === true;
+      if (outputWriteInFlight || (!allowWithPendingOutput && pendingOutputWrites.length > 0)) {
+        return false;
+      }
+
+      const plan = getCodexResizeLiveTailCleanupPlan(terminal);
+
+      if (!plan.shouldClean) {
+        return false;
+      }
+
+      if (codexResizeGate.liveTailLastCleanedSignature === plan.signature) {
+        return false;
+      }
+
+      codexResizeGate.liveTailLastCleanedSignature = plan.signature;
+
+      try {
+        terminal.write(plan.sequence, () => {
+          if (isDisposed) {
+            return;
+          }
+
+          refreshTerminalRenderer("codex_resize_live_tail_cleanup", {
+            reason,
+            targetRow: plan.targetRow,
+          });
+        });
+        return true;
+      } catch (_error) {
+        codexResizeGate.liveTailLastCleanedSignature = "";
+      }
+
+      return false;
+    };
+    scheduleCodexResizeLiveTailCleanup = (
+      reason,
+      extraFields = {},
+      delaysMs = TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS,
+    ) => {
+      if (!isCodexResizeLiveTailCleanupActive() || isDisposed) {
+        return false;
+      }
+
+      codexResizeGate.liveTailCleanupUntil = Math.max(
+        Number(codexResizeGate.liveTailCleanupUntil || 0),
+        performance.now() + TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
+      );
+      codexResizeGate.liveTailCleanupSequence += 1;
+      const cleanupId = codexResizeGate.liveTailCleanupSequence;
+
+      delaysMs.forEach((delayMs) => {
+        const normalizedDelayMs = Math.max(0, Number(delayMs || 0));
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          applyCodexResizeLiveTailCleanup(reason, {
+            cleanupId,
+            delayMs: normalizedDelayMs,
+            ...extraFields,
+          });
+        }, normalizedDelayMs);
+        startupMetricTimers.add(timer);
+      });
+
+      return true;
+    };
+    const isCodexResizeScrollbackCleanupActive = () => (
+      isCodexResizeGateEnabled()
+      && (
+        codexResizeGate.active
+        || performance.now() <= Number(codexResizeGate.scrollbackCleanupUntil || 0)
+      )
+    );
+    applyCodexResizeScrollbackCleanup = (reason, state = null, extraFields = {}) => {
+      if (!isCodexResizeScrollbackCleanupActive() || isDisposed) {
+        return false;
+      }
+
+	      let currentState = state || getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+	      let currentBaseY = Number(currentState?.baseY || 0);
+	      let currentViewportY = Number(currentState?.viewportY || 0);
+	      const cleanupBeforeBaseY = currentBaseY;
+	      const cleanupBeforeViewportY = currentViewportY;
+	      const shouldRestoreAfterTemporaryBottom = extraFields.scrollToBottomBeforeWrite === true
+	        && !codexResizeGate.scrollbackCleanupStartedAtBottom;
+	      const startBaseY = Number(codexResizeGate.scrollbackCleanupStartBaseY || 0);
+      const startViewportY = Number(codexResizeGate.scrollbackCleanupStartViewportY || 0);
+      const initialInsertedRows = currentBaseY - startBaseY;
+      let insertedRows = initialInsertedRows;
+      const fallbackInsertedRows = Number.isFinite(insertedRows) ? Math.max(0, insertedRows) : 0;
+      let fallbackTargetViewportY = codexResizeGate.scrollbackCleanupStartedAtBottom
+        ? currentBaseY
+        : Math.max(0, Math.min(currentBaseY, startViewportY + fallbackInsertedRows));
+      const anchorMatch = codexResizeGate.scrollbackCleanupStartedAtBottom
+        ? {
+          matched: false,
+          matches: 0,
+          preferredViewportY: fallbackTargetViewportY,
+          viewportY: -1,
+        }
+        : findTerminalViewportAnchorMatch(
+          terminal,
+          codexResizeGate.scrollbackCleanupAnchor,
+          fallbackTargetViewportY,
+        );
+
+      if (!Number.isFinite(insertedRows)) {
+        return false;
+      }
+
+      let rawTargetViewportY = codexResizeGate.scrollbackCleanupStartedAtBottom
+        ? currentBaseY
+        : anchorMatch.matched
+          ? Math.max(0, Math.min(currentBaseY, anchorMatch.viewportY))
+          : fallbackTargetViewportY;
+      const artifactCandidateViewportY = codexResizeGate.scrollbackCleanupStartedAtBottom
+        ? Math.max(0, Math.min(currentBaseY, startBaseY))
+        : rawTargetViewportY;
+      let topArtifactAdjustment = getCodexResizeTopArtifactAdjustment(terminal, artifactCandidateViewportY);
+      let targetViewportY = topArtifactAdjustment.adjusted
+        ? Math.max(0, Math.min(currentBaseY, topArtifactAdjustment.viewportY))
+        : rawTargetViewportY;
+      const artifactPurgePlan = getCodexResizeTopArtifactPurgePlan(terminal, topArtifactAdjustment);
+      const artifactPurgeResult = applyCodexResizeTopArtifactPurge(terminal, artifactPurgePlan);
+
+      if (artifactPurgeResult.purged) {
+        currentState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+        currentBaseY = Number(currentState?.baseY || 0);
+        currentViewportY = Number(currentState?.viewportY || 0);
+        insertedRows = currentBaseY - startBaseY;
+        fallbackTargetViewportY = codexResizeGate.scrollbackCleanupStartedAtBottom
+          ? currentBaseY
+          : Math.max(0, Math.min(currentBaseY, startViewportY + Math.max(0, insertedRows)));
+        rawTargetViewportY = adjustTerminalRowAfterDeletion(
+          rawTargetViewportY,
+          artifactPurgeResult.deleteStart,
+          artifactPurgeResult.deleteCount,
+        );
+        targetViewportY = codexResizeGate.scrollbackCleanupStartedAtBottom
+          ? currentBaseY
+          : adjustTerminalRowAfterDeletion(
+            targetViewportY,
+            artifactPurgeResult.deleteStart,
+            artifactPurgeResult.deleteCount,
+          );
+        rawTargetViewportY = Math.max(0, Math.min(currentBaseY, rawTargetViewportY));
+        targetViewportY = Math.max(0, Math.min(currentBaseY, targetViewportY));
+        topArtifactAdjustment = {
+          ...topArtifactAdjustment,
+          purgeApplied: true,
+          purgedRows: artifactPurgeResult.deleteCount,
+          viewportY: targetViewportY,
+        };
+      }
+
+	      if (
+	        insertedRows <= 0
+	        && !anchorMatch.matched
+	        && !topArtifactAdjustment.adjusted
+	        && !artifactPurgeResult.purged
+	        && !shouldRestoreAfterTemporaryBottom
+	      ) {
+        return false;
+      }
+
+      const needsScroll = Math.abs(targetViewportY - currentViewportY) >= 1;
+      if (!needsScroll && !artifactPurgeResult.purged) {
+        return false;
+      }
+
+      if (
+        !artifactPurgeResult.purged
+        &&
+        codexResizeGate.scrollbackCleanupLastHandledBaseY >= currentBaseY
+        && codexResizeGate.scrollbackCleanupLastTargetY === targetViewportY
+      ) {
+        return false;
+      }
+
+      let scrolled = !needsScroll && artifactPurgeResult.purged;
+      let method = scrolled ? "purgeOnly" : "";
+      try {
+        if (!needsScroll) {
+          // The artifact purge already moved the live frame into the desired viewport.
+        } else if (
+          codexResizeGate.scrollbackCleanupStartedAtBottom
+          && typeof terminal.scrollToBottom === "function"
+        ) {
+          terminal.scrollToBottom();
+          method = "scrollToBottom";
+          scrolled = true;
+        } else if (typeof terminal.scrollToLine === "function") {
+          terminal.scrollToLine(targetViewportY);
+          method = "scrollToLine";
+          scrolled = true;
+        } else if (typeof terminal.scrollLines === "function") {
+          terminal.scrollLines(targetViewportY - currentViewportY);
+          method = "scrollLines";
+          scrolled = true;
+        }
+      } catch (_error) {
+        scrolled = false;
+      }
+
+      if (!scrolled) {
+        return false;
+      }
+
+      codexResizeGate.scrollbackCleanupLastHandledBaseY = Math.max(
+        codexResizeGate.scrollbackCleanupLastHandledBaseY,
+        currentBaseY,
+      );
+      codexResizeGate.scrollbackCleanupLastTargetY = targetViewportY;
+      const cleanupFields = {
+        anchorMatched: anchorMatch.matched,
+        anchorMatches: anchorMatch.matches,
+        artifactPurgeApplied: artifactPurgeResult.purged,
+        artifactPurgeDeleteCount: Number(artifactPurgeResult.deleteCount || 0),
+        artifactPurgeDeleteStart: Number(artifactPurgeResult.deleteStart || 0),
+        artifactPurgeReason: artifactPurgeResult.reason || artifactPurgePlan.reason || "",
+        fallbackTargetViewportY,
+        initialInsertedRows,
+	        insertedRows,
+	        method,
+	        reason,
+	        rawTargetViewportY,
+	        shouldRestoreAfterTemporaryBottom,
+	        topArtifactAdjusted: topArtifactAdjustment.adjusted,
+        topArtifactReason: topArtifactAdjustment.reason,
+        targetViewportY,
+      };
+      refreshTerminalRenderer("codex_resize_scrollback_cleanup", cleanupFields);
+
+      const timer = window.setTimeout(() => {
+        startupMetricTimers.delete(timer);
+        const afterState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_scrollback_cleanup", {
+          action: "apply",
+          afterBaseY: Number(afterState.baseY || 0),
+          afterViewportY: Number(afterState.viewportY || 0),
+	          beforeBaseY: cleanupBeforeBaseY,
+	          beforeViewportY: cleanupBeforeViewportY,
+          epoch: codexResizeGate.epoch,
+          anchorMatched: anchorMatch.matched,
+          anchorMatches: anchorMatch.matches,
+          anchorPreferredViewportY: anchorMatch.preferredViewportY,
+          anchorRequiredMatches: anchorMatch.requiredMatches || 0,
+          anchorTargetViewportY: anchorMatch.viewportY,
+          artifactPurgeApplied: artifactPurgeResult.purged,
+          artifactPurgeDeleteCount: Number(artifactPurgeResult.deleteCount || 0),
+          artifactPurgeDeleteStart: Number(artifactPurgeResult.deleteStart || 0),
+          artifactPurgeReason: artifactPurgeResult.reason || artifactPurgePlan.reason || "",
+          fallbackTargetViewportY,
+          initialInsertedRows,
+	          insertedRows,
+	          method,
+	          reason,
+	          shouldRestoreAfterTemporaryBottom,
+	          startBaseY,
+          startedAtBottom: codexResizeGate.scrollbackCleanupStartedAtBottom,
+          startViewportY,
+          rawTargetViewportY,
+          topArtifactAdjusted: topArtifactAdjustment.adjusted,
+          topArtifactDistanceToLiveTop: Number(topArtifactAdjustment.distanceToLiveTop || 0),
+          topArtifactPreLiveBlankRows: topArtifactAdjustment.preLiveBlankRows || [],
+          topArtifactPreLiveNonBlankRows: topArtifactAdjustment.preLiveNonBlankRows || [],
+          topArtifactLiveTitleRows: topArtifactAdjustment.liveTitleRows || [],
+          topArtifactPreLiveTitleRows: topArtifactAdjustment.preLiveTitleRows || [],
+          topArtifactPreLiveTopBorderRows: topArtifactAdjustment.preLiveTopBorderRows || [],
+          topArtifactReason: topArtifactAdjustment.reason,
+          topArtifactWasViewportY: Number(topArtifactAdjustment.wasViewportY ?? rawTargetViewportY),
+          targetViewportY,
+          ...extraFields,
+        });
+      }, 0);
+      startupMetricTimers.add(timer);
+      scheduleCodexResizePaintProbe("codex_resize_scrollback_cleanup", "after_scrollback_cleanup", {
+        anchorMatched: anchorMatch.matched,
+        anchorMatches: anchorMatch.matches,
+        fallbackTargetViewportY,
+        insertedRows,
+        method,
+        reason,
+        rawTargetViewportY,
+        topArtifactAdjusted: topArtifactAdjustment.adjusted,
+        topArtifactReason: topArtifactAdjustment.reason,
+        targetViewportY,
+      }, [0, 80]);
+      scheduleCodexResizeLiveTailCleanup("after_scrollback_cleanup", {
+        anchorMatched: anchorMatch.matched,
+        anchorMatches: anchorMatch.matches,
+        fallbackTargetViewportY,
+        insertedRows,
+        method,
+        reason,
+        rawTargetViewportY,
+        topArtifactAdjusted: topArtifactAdjustment.adjusted,
+        topArtifactReason: topArtifactAdjustment.reason,
+        targetViewportY,
+      }, [0, 80, 180]);
+      return true;
+    };
+    handleCodexResizeCursorHomeSettled = ({
+      afterState,
+      beforeState,
+      final,
+      params,
+      sequenceId,
+      variant,
+    } = {}) => {
+      if (!isCodexResizeScrollbackCleanupActive() || isDisposed) {
+        return;
+      }
+
+      const deltaBaseY = Number(afterState?.baseY || 0) - Number(beforeState?.baseY || 0);
+      if (!Number.isFinite(deltaBaseY) || deltaBaseY <= 0) {
+        return;
+      }
+
+      applyCodexResizeScrollbackCleanup("cursor_home_settled", afterState, {
+        deltaBaseY,
+        final,
+        params,
+        sequenceId,
+        variant,
+      });
+    };
+    scheduleCodexResizeGateFlush = (
+      reason,
+      delayMs = TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS,
+      options = {},
+    ) => {
+      if (!isCodexResizeGateEnabled() || !codexResizeGate.active || isDisposed) {
+        return;
+      }
+
+      const now = performance.now();
+      const maxDueAt = codexResizeGate.startedAt + TERMINAL_CODEX_RESIZE_GATE_MAX_MS;
+      const requestedDelayMs = Math.max(0, Number(delayMs || 0));
+      const dueAt = Math.min(now + requestedDelayMs, maxDueAt);
+
+      if (
+        codexResizeGate.flushTimer
+        && options.allowLater !== true
+        && codexResizeGate.flushDueAt
+        && codexResizeGate.flushDueAt <= dueAt + 1
+      ) {
+        return;
+      }
+
+      clearCodexResizeGateTimer();
+      codexResizeGate.flushTimer = window.setTimeout(() => {
+        codexResizeGate.flushTimer = 0;
+        codexResizeGate.flushDueAt = 0;
+        flushCodexResizeGate(reason);
+      }, Math.max(0, dueAt - now));
+      codexResizeGate.flushDueAt = dueAt;
+    };
+    const flushCodexResizeGate = (reason = "settled", force = false) => {
+      if (!codexResizeGate.active || isDisposed) {
+        return false;
+      }
+
+      const elapsedMs = performance.now() - codexResizeGate.startedAt;
+      const state = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const targetSize = codexResizeGate.targetSize || getCurrentCodexResizeGateSize();
+      const geometrySettled = isWindowsTerminalGeometrySettled(state, targetSize);
+      const hitMaxDeadline = elapsedMs >= TERMINAL_CODEX_RESIZE_GATE_MAX_MS - 1;
+
+      if (
+        !force
+        && !geometrySettled
+        && !hitMaxDeadline
+      ) {
+        scheduleCodexResizeGateFlush(reason, TERMINAL_CODEX_RESIZE_GATE_RETRY_MS, {
+          allowLater: true,
+        });
+        return false;
+      }
+
+      clearCodexResizeGateTimer();
+      const queuedWrites = codexResizeGate.queuedWrites.splice(0);
+      const queuedBytes = codexResizeGate.queuedBytes;
+      const epoch = codexResizeGate.epoch;
+      const previousSize = codexResizeGate.previousSize;
+      const startedAtBottom = codexResizeGate.startedAtBottom;
+      const startState = codexResizeGate.startState;
+      codexResizeGate.active = false;
+      codexResizeGate.scrollbackCleanupUntil = Math.max(
+        Number(codexResizeGate.scrollbackCleanupUntil || 0),
+        performance.now() + TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS,
+      );
+      codexResizeGate.liveTailCleanupUntil = Math.max(
+        Number(codexResizeGate.liveTailCleanupUntil || 0),
+        performance.now() + TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
+      );
+      codexResizeGate.queuedBytes = 0;
+      codexResizeGate.startedAt = 0;
+      codexResizeGate.startedAtBottom = false;
+      codexResizeGate.startState = null;
+      codexResizeGate.previousSize = null;
+      codexResizeGate.targetSize = null;
+
+      if (!queuedWrites.length) {
+        syncTerminalPaintBounds("codex_resize_gate_empty_flush");
+        const refreshed = refreshTerminalRenderer("codex_resize_gate_empty_flush", {
+          reason,
+        });
+        const cleaned = applyCodexResizeScrollbackCleanup("empty_flush", state, {
+          refreshed,
+        });
+        const liveTailCleanupScheduled = scheduleCodexResizeLiveTailCleanup("empty_flush", {
+          cleaned,
+          refreshed,
+        });
+        scheduleCodexResizePaintProbe("codex_resize_gate_empty_flush", "after_empty_flush", {
+          cleaned,
+          liveTailCleanupScheduled,
+          refreshed,
+        }, [0, 80, 180]);
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+          action: "flush_empty",
+          cleaned,
+          elapsedMs,
+          epoch,
+          force,
+          geometrySettled,
+          hitMaxDeadline,
+          liveTailCleanupScheduled,
+          previousCols: previousSize?.cols || 0,
+          previousRows: previousSize?.rows || 0,
+          reason,
+          refreshed,
+          targetCols: targetSize?.cols || 0,
+          targetRows: targetSize?.rows || 0,
+        });
+        return true;
+      }
+
+      const combinedData = concatTerminalByteArrays(queuedWrites.map((write) => write.data));
+      const coalesced = coalesceCodexResizeRepaintBytes(combinedData);
+      const queuedRawChunks = queuedWrites.filter((write) => write.rawCodexResizeGateData === true).length;
+      const resizeNormalizerBefore = terminalOutputNormalizer.enabled
+        ? {
+          droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
+          droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
+          droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
+          passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
+          pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
+          syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
+          syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
+        }
+        : null;
+	      const normalizedCoalescedData = terminalOutputNormalizer.enabled && coalesced.data?.byteLength
+	        ? normalizeTerminalOutputBytes(terminalOutputNormalizer, coalesced.data)
+	        : coalesced.data;
+      const resizeNormalizerStats = resizeNormalizerBefore
+        ? {
+          deltaDroppedEraseDisplay2OutsideSync:
+            terminalOutputNormalizer.droppedEraseDisplay2OutsideSync
+            - resizeNormalizerBefore.droppedEraseDisplay2OutsideSync,
+          deltaDroppedEraseScrollback3:
+            terminalOutputNormalizer.droppedEraseScrollback3 - resizeNormalizerBefore.droppedEraseScrollback3,
+          deltaDroppedSyncEraseDisplay2:
+            terminalOutputNormalizer.droppedSyncEraseDisplay2 - resizeNormalizerBefore.droppedSyncEraseDisplay2,
+          deltaPassedEraseDisplay2:
+            terminalOutputNormalizer.passedEraseDisplay2 - resizeNormalizerBefore.passedEraseDisplay2,
+          deltaPendingEscapeBytes:
+            terminalOutputNormalizer.pendingEscape.byteLength - resizeNormalizerBefore.pendingEscapeBytes,
+          deltaSyncBlocksEnded:
+            terminalOutputNormalizer.syncBlocksEnded - resizeNormalizerBefore.syncBlocksEnded,
+          deltaSyncBlocksSeen:
+            terminalOutputNormalizer.syncBlocksSeen - resizeNormalizerBefore.syncBlocksSeen,
+        }
+        : null;
+      scheduleCodexResizePaintProbe("codex_resize_gate_flush", "before_coalesced_write", {
+        coalescedBytes: Number(coalesced.data?.byteLength || 0),
+        droppedBytes: coalesced.droppedBytes,
+        framesDropped: coalesced.framesDropped,
+        framesSeen: coalesced.framesSeen,
+        normalizedCoalescedBytes: Number(normalizedCoalescedData?.byteLength || 0),
+        queuedBytes,
+        queuedChunks: queuedWrites.length,
+        queuedRawChunks,
+        resizeDeltaDroppedEraseDisplay2OutsideSync:
+          resizeNormalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
+        resizeDeltaDroppedEraseScrollback3: resizeNormalizerStats?.deltaDroppedEraseScrollback3 || 0,
+        resizeDeltaDroppedSyncEraseDisplay2: resizeNormalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
+        resizeDeltaPassedEraseDisplay2: resizeNormalizerStats?.deltaPassedEraseDisplay2 || 0,
+        resizeDeltaSyncBlocksEnded: resizeNormalizerStats?.deltaSyncBlocksEnded || 0,
+        resizeDeltaSyncBlocksSeen: resizeNormalizerStats?.deltaSyncBlocksSeen || 0,
+        scrollToBottomAfterWrite: startedAtBottom,
+      }, [0]);
+      scheduleCodexResizeLiveTailCleanup("before_coalesced_write", {
+        coalescedBytes: Number(coalesced.data?.byteLength || 0),
+        droppedBytes: coalesced.droppedBytes,
+        framesDropped: coalesced.framesDropped,
+        framesSeen: coalesced.framesSeen,
+        queuedBytes,
+        queuedChunks: queuedWrites.length,
+      }, [180, 360]);
+      if (normalizedCoalescedData?.byteLength) {
+        const isFirstOutputChunk = queuedWrites.some((write) => write.isFirstOutputChunk);
+        const isFirstVisibleOutputChunk = queuedWrites.some((write) => write.isFirstVisibleOutputChunk);
+        const visibleChars = getTerminalOutputVisibleCharCount(normalizedCoalescedData);
+        enqueueTerminalOutputWrite(normalizedCoalescedData, {
+          afterWriteRefreshReason: "codex_resize_gate_flush",
+	          isFirstOutputChunk,
+	          isFirstVisibleOutputChunk,
+	          outputDebug: { visibleChars },
+	          scrollToBottomBeforeWrite: true,
+	          scrollToBottomAfterWrite: startedAtBottom,
+	        });
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+        action: "flush",
+        coalescedBytes: Number(coalesced.data?.byteLength || 0),
+        droppedBytes: coalesced.droppedBytes,
+        elapsedMs,
+        epoch,
+        force,
+        framesDropped: coalesced.framesDropped,
+        framesSeen: coalesced.framesSeen,
+        geometrySettled,
+        hitMaxDeadline,
+        normalizedCoalescedBytes: Number(normalizedCoalescedData?.byteLength || 0),
+        previousBaseY: Number(startState?.baseY || 0),
+        previousCols: previousSize?.cols || 0,
+        previousRows: previousSize?.rows || 0,
+        previousViewportY: Number(startState?.viewportY || 0),
+        queuedBytes,
+        queuedChunks: queuedWrites.length,
+        queuedRawChunks,
+        reason,
+        resizeDeltaDroppedEraseDisplay2OutsideSync:
+          resizeNormalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
+        resizeDeltaDroppedEraseScrollback3: resizeNormalizerStats?.deltaDroppedEraseScrollback3 || 0,
+        resizeDeltaDroppedSyncEraseDisplay2: resizeNormalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
+        resizeDeltaPassedEraseDisplay2: resizeNormalizerStats?.deltaPassedEraseDisplay2 || 0,
+        resizeDeltaPendingEscapeBytes: resizeNormalizerStats?.deltaPendingEscapeBytes || 0,
+        resizeDeltaSyncBlocksEnded: resizeNormalizerStats?.deltaSyncBlocksEnded || 0,
+        resizeDeltaSyncBlocksSeen: resizeNormalizerStats?.deltaSyncBlocksSeen || 0,
+        scrollToBottomAfterWrite: startedAtBottom,
+        targetCols: targetSize?.cols || 0,
+        targetRows: targetSize?.rows || 0,
+      });
+      return true;
+    };
+    markCodexResizeGateActive = (reason = "resize", size = null) => {
+      if (!isCodexResizeGateEnabled() || isDisposed) {
+        return;
+      }
+
+      const targetSize = normalizeCodexResizeGateSize(size) || getCurrentCodexResizeGateSize();
+      if (!targetSize) {
+        return;
+      }
+
+      const previousObservedSize = codexResizeGate.lastObservedSize;
+      const sizeChanged = Boolean(previousObservedSize)
+        && !codexResizeGateSizesEqual(previousObservedSize, targetSize);
+      codexResizeGate.lastObservedSize = targetSize;
+
+      if (!previousObservedSize) {
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+          action: "prime",
+          reason,
+          targetCols: targetSize.cols,
+          targetRows: targetSize.rows,
+        });
+        return;
+      }
+
+      if (
+        !sizeChanged
+        && (
+          !codexResizeGate.active
+          || codexResizeGateSizesEqual(codexResizeGate.targetSize, targetSize)
+        )
+      ) {
+        return;
+      }
+
+      if (!sawFirstVisibleOutput && visibleOutputChunks <= 0) {
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+          action: "skip_before_visible_output",
+          previousCols: previousObservedSize.cols,
+          previousRows: previousObservedSize.rows,
+          reason,
+          targetCols: targetSize.cols,
+          targetRows: targetSize.rows,
+        });
+        return;
+      }
+
+      const now = performance.now();
+      const wasActive = codexResizeGate.active;
+      const startState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      codexResizeGate.active = true;
+      codexResizeGate.epoch += 1;
+      codexResizeGate.previousSize = previousObservedSize;
+      codexResizeGate.startedAt = now;
+      codexResizeGate.startedAtBottom = Number(startState.viewportY || 0) >= Math.max(0, Number(startState.baseY || 0) - 1);
+      codexResizeGate.startState = startState;
+      codexResizeGate.targetSize = targetSize;
+      codexResizeGate.scrollbackCleanupUntil = Math.max(
+        Number(codexResizeGate.scrollbackCleanupUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS,
+      );
+      codexResizeGate.liveTailCleanupUntil = Math.max(
+        Number(codexResizeGate.liveTailCleanupUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
+      );
+      if (!wasActive) {
+        codexResizeGate.liveTailLastCleanedSignature = "";
+        codexResizeGate.scrollbackCleanupLastHandledBaseY = 0;
+        codexResizeGate.scrollbackCleanupLastTargetY = -1;
+        codexResizeGate.scrollbackCleanupAnchor = getTerminalViewportAnchorDiagnostic(terminal);
+        codexResizeGate.scrollbackCleanupStartBaseY = Number(startState.baseY || 0);
+        codexResizeGate.scrollbackCleanupStartedAtBottom = codexResizeGate.startedAtBottom;
+        codexResizeGate.scrollbackCleanupStartViewportY = Number(startState.viewportY || 0);
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
+        action: wasActive ? "retarget" : "start",
+        epoch: codexResizeGate.epoch,
+        previousBaseY: Number(startState.baseY || 0),
+        previousCols: previousObservedSize.cols,
+        previousRows: previousObservedSize.rows,
+        previousViewportY: Number(startState.viewportY || 0),
+        reason,
+        liveTailCleanupUntil: Number(codexResizeGate.liveTailCleanupUntil || 0),
+        startedAtBottom: codexResizeGate.startedAtBottom,
+        scrollbackCleanupStartBaseY: codexResizeGate.scrollbackCleanupStartBaseY,
+        scrollbackCleanupAnchorRows: Number(codexResizeGate.scrollbackCleanupAnchor?.rowCount || 0),
+        scrollbackCleanupAnchorViewportY: Number(codexResizeGate.scrollbackCleanupAnchor?.viewportY || 0),
+        scrollbackCleanupStartViewportY: codexResizeGate.scrollbackCleanupStartViewportY,
+        scrollbackCleanupStartedAtBottom: codexResizeGate.scrollbackCleanupStartedAtBottom,
+        targetCols: targetSize.cols,
+        targetRows: targetSize.rows,
+      });
+      scheduleCodexResizePaintProbe(reason, wasActive ? "gate_retarget" : "gate_start", {
+        previousCols: previousObservedSize.cols,
+        previousRows: previousObservedSize.rows,
+        targetCols: targetSize.cols,
+        targetRows: targetSize.rows,
+      }, [0]);
+
+      scheduleCodexResizeGateFlush(reason, TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS, {
+        allowLater: true,
+      });
+    };
+    const writeTerminalOutput = (data, options = {}) => {
+      if (
+        isCodexResizeGateEnabled()
+        && codexResizeGate.active
+        && data?.byteLength
+      ) {
+        const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
+        if (codexResizeGate.queuedBytes + queuedData.byteLength > TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES) {
+          flushCodexResizeGate("max_bytes", true);
+        }
+
+        if (codexResizeGate.active) {
+          codexResizeGate.queuedWrites.push({
+            data: queuedData,
+            isFirstOutputChunk: options.isFirstOutputChunk === true,
+            isFirstVisibleOutputChunk: options.isFirstVisibleOutputChunk === true,
+            rawCodexResizeGateData: options.rawCodexResizeGateData === true,
+          });
+          codexResizeGate.queuedBytes += queuedData.byteLength;
+          scheduleCodexResizeGateFlush("output");
+          return;
+        }
+      }
+
+      enqueueTerminalOutputWrite(data, options);
+    };
+    disposables.push(() => {
+      clearCodexResizeGateTimer();
+      codexResizeGate.active = false;
+      codexResizeGate.flushDueAt = 0;
+      codexResizeGate.lastObservedSize = null;
+      codexResizeGate.lastOutputPaintProbeAt = 0;
+      codexResizeGate.liveTailCleanupSequence = 0;
+      codexResizeGate.liveTailCleanupUntil = 0;
+      codexResizeGate.liveTailLastCleanedSignature = "";
+      codexResizeGate.paintProbeUntil = 0;
+      codexResizeGate.previousSize = null;
+      codexResizeGate.queuedWrites.length = 0;
+      codexResizeGate.queuedBytes = 0;
+      codexResizeGate.scrollbackCleanupAnchor = null;
+      codexResizeGate.scrollbackCleanupLastHandledBaseY = 0;
+      codexResizeGate.scrollbackCleanupLastTargetY = -1;
+      codexResizeGate.scrollbackCleanupStartBaseY = 0;
+      codexResizeGate.scrollbackCleanupStartedAtBottom = false;
+      codexResizeGate.scrollbackCleanupStartViewportY = 0;
+      codexResizeGate.scrollbackCleanupUntil = 0;
+      codexResizeGate.startedAt = 0;
+      codexResizeGate.startedAtBottom = false;
+      codexResizeGate.startState = null;
+      codexResizeGate.targetSize = null;
+    });
 
     resizeController = createTerminalResizeController({
       canResize: () => hasOpenPty && !isDisposed,
@@ -3879,7 +5332,6 @@ function WorkspaceTerminal({
           return;
         }
 
-        rememberWindowsTerminalResizeDone(event);
         patchTerminalMetrics({
           gridMs: event.elapsedMs,
           resizeLagMs: event.elapsedMs,
@@ -3888,19 +5340,13 @@ function WorkspaceTerminal({
           resizeBatches: 1,
           resizePanes: 1,
         });
+        syncTerminalPaintBounds("resize_done");
+        scheduleTerminalPaintBoundsSync("resize_done_settled", [34, 120, 260]);
+        scheduleCodexResizeGateFlush(event.reason || "resize_done");
       },
-      onError: () => {
-        if (windowsTerminalResizeLiveClearTimer) {
-          window.clearTimeout(windowsTerminalResizeLiveClearTimer);
-          startupMetricTimers.delete(windowsTerminalResizeLiveClearTimer);
-          windowsTerminalResizeLiveClearTimer = 0;
-        }
-        windowsTerminalResizeLiveClearWritesInFlight = 0;
-        windowsTerminalResizeLiveClearPendingEvent = null;
-        windowsTerminalResizeStartState = null;
-      },
+      onError: () => {},
       onStart: (event) => {
-        rememberWindowsTerminalResizeStart(event);
+        markCodexResizeGateActive(event.reason || "resize_start", event);
       },
       paneId: () => paneId,
       term: terminal,
@@ -3943,28 +5389,121 @@ function WorkspaceTerminal({
             return;
           }
 
+          const deferCodexResizeNormalization = terminalOutputNormalizer.enabled
+            && isCodexResizeGateEnabled()
+            && codexResizeGate.active;
+          const normalizerBefore = terminalOutputNormalizer.enabled && !deferCodexResizeNormalization
+            ? {
+              droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
+              droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
+              droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
+              passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
+              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
+              syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
+              syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
+            }
+            : null;
+          const terminalData = deferCodexResizeNormalization
+            ? displayData
+            : (
+              terminalOutputNormalizer.enabled
+                ? normalizeTerminalOutputBytes(terminalOutputNormalizer, displayData)
+                : displayData
+            );
+          const normalizerChanged = normalizerBefore
+            ? (
+              terminalOutputNormalizer.droppedEraseDisplay2OutsideSync !== normalizerBefore.droppedEraseDisplay2OutsideSync
+              || terminalOutputNormalizer.droppedEraseScrollback3 !== normalizerBefore.droppedEraseScrollback3
+              || terminalOutputNormalizer.droppedSyncEraseDisplay2 !== normalizerBefore.droppedSyncEraseDisplay2
+              || terminalOutputNormalizer.passedEraseDisplay2 !== normalizerBefore.passedEraseDisplay2
+              || terminalOutputNormalizer.pendingEscape.byteLength !== normalizerBefore.pendingEscapeBytes
+              || terminalOutputNormalizer.syncBlocksEnded !== normalizerBefore.syncBlocksEnded
+              || terminalOutputNormalizer.syncBlocksSeen !== normalizerBefore.syncBlocksSeen
+            )
+            : false;
+          const normalizerStats = normalizerBefore
+            ? {
+              changed: normalizerChanged,
+              deltaDroppedEraseDisplay2OutsideSync:
+                terminalOutputNormalizer.droppedEraseDisplay2OutsideSync
+                - normalizerBefore.droppedEraseDisplay2OutsideSync,
+              deltaDroppedEraseScrollback3:
+                terminalOutputNormalizer.droppedEraseScrollback3 - normalizerBefore.droppedEraseScrollback3,
+              deltaDroppedSyncEraseDisplay2:
+                terminalOutputNormalizer.droppedSyncEraseDisplay2 - normalizerBefore.droppedSyncEraseDisplay2,
+              deltaPassedEraseDisplay2:
+                terminalOutputNormalizer.passedEraseDisplay2 - normalizerBefore.passedEraseDisplay2,
+              deltaPendingEscapeBytes:
+                terminalOutputNormalizer.pendingEscape.byteLength - normalizerBefore.pendingEscapeBytes,
+              deltaSyncBlocksEnded:
+                terminalOutputNormalizer.syncBlocksEnded - normalizerBefore.syncBlocksEnded,
+              deltaSyncBlocksSeen:
+                terminalOutputNormalizer.syncBlocksSeen - normalizerBefore.syncBlocksSeen,
+              displayBytes: displayData.byteLength,
+              outputBytes: terminalData.byteLength,
+            }
+            : null;
+
+          if (deferCodexResizeNormalization) {
+            logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.output_normalized", {
+              action: "defer_codex_resize_gate",
+              displayBytes: displayData.byteLength,
+              outputBytes: terminalData.byteLength,
+              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
+            });
+          }
+
+          if (normalizerChanged) {
+            logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.output_normalized", {
+              displayBytes: displayData.byteLength,
+              deltaDroppedEraseDisplay2OutsideSync:
+                normalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
+              deltaDroppedEraseScrollback3: normalizerStats?.deltaDroppedEraseScrollback3 || 0,
+              deltaDroppedSyncEraseDisplay2: normalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
+              deltaPassedEraseDisplay2: normalizerStats?.deltaPassedEraseDisplay2 || 0,
+              deltaPendingEscapeBytes: normalizerStats?.deltaPendingEscapeBytes || 0,
+              deltaSyncBlocksEnded: normalizerStats?.deltaSyncBlocksEnded || 0,
+              deltaSyncBlocksSeen: normalizerStats?.deltaSyncBlocksSeen || 0,
+              dropEraseDisplay2OutsideSync: terminalOutputNormalizer.dropEraseDisplay2OutsideSync,
+              droppedEraseDisplay2OutsideSync:
+                terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
+              droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
+              droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
+              inSyncOutput: terminalOutputNormalizer.inSyncOutput,
+              outputBytes: terminalData.byteLength,
+              passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
+              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
+              syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
+              syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
+            });
+          }
+
+          if (!terminalData.byteLength) {
+            return;
+          }
+
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
-          outputBytes += displayData.byteLength;
+          outputBytes += terminalData.byteLength;
           const outputByteStats = terminalDiagnosticsEnabled
-            ? getTerminalOutputByteStats(displayData)
+            ? getTerminalOutputByteStats(terminalData)
             : null;
           const visibleChars = outputByteStats
             ? outputByteStats.visibleChars
-            : getTerminalOutputVisibleCharCount(displayData, 1);
+            : getTerminalOutputVisibleCharCount(terminalData, 1);
           const hasVisibleOutput = visibleChars > 0;
           const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
           const shouldCollectOutputDebug = isFirstOutputChunk
             || isFirstVisibleOutputChunk;
           const debugStartedAt = shouldCollectOutputDebug ? performance.now() : 0;
           const outputDebug = shouldCollectOutputDebug
-            ? getTerminalOutputDebugFields(displayData)
+            ? getTerminalOutputDebugFields(terminalData)
             : { visibleChars };
           const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
           if (terminalDiagnosticsEnabled) {
             outputDiagnosticChunks += 1;
             outputDiagnosticInputBytes += data.byteLength;
-            outputDiagnosticDisplayBytes += displayData.byteLength;
+            outputDiagnosticDisplayBytes += terminalData.byteLength;
             outputDiagnosticVisibleChars += outputByteStats.visibleChars;
             outputDiagnosticEscapeBytes += outputByteStats.escapeBytes;
             outputDiagnosticControlBytes += outputByteStats.controlBytes;
@@ -3981,7 +5520,7 @@ function WorkspaceTerminal({
           }
 
           if (hasVisibleOutput) {
-            visibleOutputBytes += displayData.byteLength;
+            visibleOutputBytes += terminalData.byteLength;
             visibleOutputChunks += 1;
           }
 
@@ -4001,7 +5540,7 @@ function WorkspaceTerminal({
             "frontend.output_chunk.slow",
             {
               debugMs,
-              displayBytes: displayData.byteLength,
+              displayBytes: terminalData.byteLength,
               elapsedMs: performance.now() - chunkStartedAt,
               inputBytes: data.byteLength,
               isFirstOutputChunk,
@@ -4016,10 +5555,11 @@ function WorkspaceTerminal({
             { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
           );
 
-          writeTerminalOutput(displayData, {
+          writeTerminalOutput(terminalData, {
             isFirstOutputChunk,
             isFirstVisibleOutputChunk,
             outputDebug,
+            rawCodexResizeGateData: deferCodexResizeNormalization,
           });
         });
         disposables.push(await listen("forge-terminal-exit", (event) => {
@@ -4158,6 +5698,22 @@ function WorkspaceTerminal({
 
           if (!hasOpenPty && !startupControlReply) {
             return;
+          }
+
+          if (!startupControlReply && isCodexResizePaintProbeActive()) {
+            const inputDebug = getTerminalInputDebugFields(safeData);
+            logCodexResizePaintProbe("terminal_input", "before_input_write", {
+              hasNewline: safeData.includes("\n"),
+              hasReturn: safeData.includes("\r"),
+              inputDebug,
+              startsWithEscape: safeData.startsWith("\x1b"),
+            });
+            scheduleCodexResizePaintProbe("terminal_input", "after_input_write", {
+              hasNewline: safeData.includes("\n"),
+              hasReturn: safeData.includes("\r"),
+              inputBytes: inputDebug.bytes,
+              startsWithEscape: safeData.startsWith("\x1b"),
+            });
           }
 
           if (safeData.startsWith("\x1b")) {
@@ -4557,11 +6113,11 @@ function WorkspaceTerminal({
 
     startTerminal();
 
-    return () => {
-      isDisposed = true;
-      if (resizeControllerRef.current === resizeController) {
-        resizeControllerRef.current = null;
-      }
+	    return () => {
+	      isDisposed = true;
+	      if (resizeControllerRef.current === resizeController) {
+	        resizeControllerRef.current = null;
+	      }
       resizeController?.dispose();
       activeWebglAddon = null;
       if (webglAttachTimer) {
@@ -4610,7 +6166,7 @@ function WorkspaceTerminal({
       }).catch(() => {});
       terminal.dispose();
     };
-  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalClosed, terminalRoleId, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalAgentKind, terminalClosed, terminalRoleId, terminalScrollStabilityMode, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
 
@@ -4918,7 +6474,6 @@ function WorkspaceTerminal({
   const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
-
   if (!agent) {
     return (
       <TerminalWorkspaceSurface>
@@ -4963,6 +6518,19 @@ function WorkspaceTerminal({
       </TerminalWorkspaceSurface>
     );
   }
+
+  const xtermSurface = (
+    <XtermSurface
+      data-active={terminalFocused ? "true" : "false"}
+      data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
+      data-parked={parkedPrompt ? "true" : "false"}
+      onDragEnter={handleTerminalTodoDragEnter}
+      onDragLeave={handleTerminalTodoDragLeave}
+      onDragOver={handleTerminalTodoDragOver}
+      onDrop={handleTerminalTodoDrop}
+      ref={containerRef}
+    />
+  );
 
   return (
     <TerminalWorkspaceSurface
@@ -5080,16 +6648,7 @@ function WorkspaceTerminal({
           </TerminalClosedSurface>
         ) : (
           <>
-            <XtermSurface
-              data-active={terminalFocused ? "true" : "false"}
-              data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
-              data-parked={parkedPrompt ? "true" : "false"}
-              onDragEnter={handleTerminalTodoDragEnter}
-              onDragLeave={handleTerminalTodoDragLeave}
-              onDragOver={handleTerminalTodoDragOver}
-              onDrop={handleTerminalTodoDrop}
-              ref={containerRef}
-            />
+            {xtermSurface}
             {showTerminalStatusOverlay && (
               <TerminalStatusOverlay
                 aria-live={isTerminalStatusErrorOverlay ? "assertive" : "polite"}

@@ -619,6 +619,7 @@ fn terminal_args_with_codex_mcp_identity(
     if !provider_id.to_ascii_lowercase().contains("codex") {
         return next;
     }
+    apply_codex_terminal_display_args(&mut next);
     let Some(coordination) = coordination else {
         return next;
     };
@@ -686,6 +687,12 @@ fn terminal_args_with_codex_mcp_identity(
     next.push("-c".to_string());
     next.push("shell_environment_policy.inherit=all".to_string());
     next
+}
+
+fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
+    if !terminal_args_have_option(args, "--no-alt-screen", "") {
+        args.push("--no-alt-screen".to_string());
+    }
 }
 
 fn apply_codex_coordinated_auto_approval_args(args: &mut Vec<String>, write_root: Option<&str>) {

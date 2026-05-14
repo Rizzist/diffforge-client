@@ -4285,6 +4285,25 @@ mod terminal_tests {
         assert!(!args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--no-alt-screen")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_launch_args_disable_alt_screen_without_coordination() {
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &["--model".to_string(), "gpt-5.4".to_string()],
+            None,
+            "pane-auto",
+            42,
+        );
+
+        assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
     }
 
     #[cfg(windows)]

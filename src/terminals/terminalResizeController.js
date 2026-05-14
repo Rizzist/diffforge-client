@@ -88,6 +88,42 @@ function getPositiveNumber(value) {
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 0;
 }
 
+function getElementLayoutSize(element) {
+  const clientWidth = getPositiveNumber(element?.clientWidth);
+  const clientHeight = getPositiveNumber(element?.clientHeight);
+
+  if (clientWidth && clientHeight) {
+    return {
+      height: clientHeight,
+      source: "client",
+      width: clientWidth,
+    };
+  }
+
+  const offsetWidth = getPositiveNumber(element?.offsetWidth);
+  const offsetHeight = getPositiveNumber(element?.offsetHeight);
+
+  if (offsetWidth && offsetHeight) {
+    return {
+      height: offsetHeight,
+      source: "offset",
+      width: offsetWidth,
+    };
+  }
+
+  const bounds = typeof element?.getBoundingClientRect === "function"
+    ? element.getBoundingClientRect()
+    : null;
+  const rectWidth = getPositiveNumber(bounds?.width);
+  const rectHeight = getPositiveNumber(bounds?.height);
+
+  return {
+    height: rectHeight || Number(bounds?.height),
+    source: "rect",
+    width: rectWidth || Number(bounds?.width),
+  };
+}
+
 export function getTerminalActualCellSize(term) {
   const dimensions = term?._core?._renderService?.dimensions;
   const actualCellWidth = getPositiveNumber(dimensions?.actualCellWidth);
@@ -141,9 +177,14 @@ export function measureTerminalGrid({
     };
   }
 
-  const bounds = container.getBoundingClientRect();
-  const containerWidth = Number(bounds.width);
-  const containerHeight = Number(bounds.height);
+  const layoutSize = getElementLayoutSize(container);
+  const visualBounds = typeof container.getBoundingClientRect === "function"
+    ? container.getBoundingClientRect()
+    : null;
+  const containerWidth = Number(layoutSize.width);
+  const containerHeight = Number(layoutSize.height);
+  const visualContainerWidth = Number(visualBounds?.width);
+  const visualContainerHeight = Number(visualBounds?.height);
 
   if (!Number.isFinite(containerWidth) || !Number.isFinite(containerHeight)) {
     return {
@@ -152,7 +193,10 @@ export function measureTerminalGrid({
       cols: defaultCols,
       rows: defaultRows,
       containerHeight,
+      containerMeasureSource: layoutSize.source,
       containerWidth,
+      visualContainerHeight,
+      visualContainerWidth,
     };
   }
 
@@ -163,7 +207,10 @@ export function measureTerminalGrid({
       cols: defaultCols,
       rows: defaultRows,
       containerHeight,
+      containerMeasureSource: layoutSize.source,
       containerWidth,
+      visualContainerHeight,
+      visualContainerWidth,
     };
   }
 
@@ -183,8 +230,11 @@ export function measureTerminalGrid({
       actualCellHeight,
       actualCellWidth,
       containerHeight,
+      containerMeasureSource: layoutSize.source,
       containerWidth,
       metricSource,
+      visualContainerHeight,
+      visualContainerWidth,
     };
   }
 
@@ -199,11 +249,14 @@ export function measureTerminalGrid({
     actualCellWidth,
     cols,
     containerHeight,
+    containerMeasureSource: layoutSize.source,
     containerWidth,
     metricSource,
     rawCols,
     rawRows,
     rows,
+    visualContainerHeight,
+    visualContainerWidth,
   };
 }
 
