@@ -2017,7 +2017,8 @@ export const WorkspaceTerminalPanels = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND};
   }
 
-  &[data-terminal-dragging="true"] {
+  &[data-terminal-dragging="true"],
+  &[data-todo-dragging="true"] {
     overflow: visible;
     cursor: grabbing;
   }
@@ -2026,7 +2027,8 @@ export const WorkspaceTerminalPanels = styled.div`
     overflow: visible !important;
   }
 
-  &[data-terminal-dragging="true"] [data-panel] {
+  &[data-terminal-dragging="true"] [data-panel],
+  &[data-todo-dragging="true"] [data-panel] {
     overflow: visible !important;
   }
 
@@ -2086,6 +2088,7 @@ export const ResizeHandle = styled(Separator)`
   }
 
   ${WorkspaceTerminalPanels}[data-terminal-dragging="true"] &,
+  ${WorkspaceTerminalPanels}[data-todo-dragging="true"] &,
   ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
     opacity: 0;
     pointer-events: none;

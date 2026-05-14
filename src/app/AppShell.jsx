@@ -5546,7 +5546,7 @@ export default function App() {
                         <CrashRecoveryIntro>
                           <p>
                             Diff Forge found agent work that was still active when the desktop app stopped unexpectedly.
-                            Those sessions were marked <strong>interrupted</strong> so stale leases and worktrees do not block new work.
+                            Those sessions were marked <strong>interrupted</strong> so stale leases and protected sessions do not block new work.
                           </p>
                           <p>
                             Choose <strong>Resume agents</strong> to open the terminal workspace and continue manually.

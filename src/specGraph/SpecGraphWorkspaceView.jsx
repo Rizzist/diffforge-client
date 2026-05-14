@@ -163,7 +163,7 @@ export default function SpecGraphWorkspaceView({
         </LocalIgnoredToggle>
         <LocalIgnoredHint>
           {localIgnoredState === "loading"
-            ? "checking .agents cache"
+            ? "checking local cache"
             : showLocalIgnored
               ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
               : "local only, not synced"}
@@ -207,7 +207,7 @@ function SpecInspector({ node }) {
           {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}
           {isLocalOnlyNode(node) && <span data-state="local_only">local only</span>}
           {isLeasedFileNode(node) && <span data-state="leased">leased</span>}
-          {isWorktreeFileNode(node) && <span data-state="worktree">worktree</span>}
+          {isWorktreeFileNode(node) && <span data-state="worktree">isolated</span>}
           <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
           {(Number(node.out_of_spec_count || node.notification_count) || 0) > 0 && (
             <span data-state="out_of_spec">out of spec: {Number(node.out_of_spec_count || node.notification_count) || 0}</span>

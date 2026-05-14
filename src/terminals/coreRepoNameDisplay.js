@@ -22,6 +22,8 @@ import {
 const FUNCTIONAL_REPO_WORKTREE_MARKER = "/.agents/worktrees";
 const FUNCTIONAL_REPO_AGENTS_MARKER = "/.agents";
 const ANSI_CSI_PATTERN = String.raw`\u001b\[[0-?]*[ -/]*[@-~]`;
+const FUNCTIONAL_REPO_PATH_BOUNDARY = String.raw`(?=$|[\s"'` + "`" + String.raw`<>()\[\]{}|;,\u001b])`;
+const FUNCTIONAL_REPO_PATH_CHILD = String.raw`((?:[\/\\][^\s"'` + "`" + String.raw`<>()\[\]{}|;,\u001b]+)*)`;
 const FUNCTIONAL_REPO_PATH_TERMINATORS = new Set([
   "",
   " ",
@@ -176,6 +178,44 @@ function maskAnyAgentsInternalPath(text, coreRepoPath) {
   );
 }
 
+function maskPrivateRuntimeNamespaceLeaks(text, coreRepoPath) {
+  const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
+  if (!corePath) {
+    return text;
+  }
+
+  const coreDisplay = replacementForCoreRepo(corePath);
+  const coreDisplaySource = workspacePathRegExpSource(coreDisplay);
+  if (!coreDisplay || !coreDisplaySource) {
+    return text;
+  }
+
+  let next = String(text || "");
+  const normalizedChild = (childPath = "") => normalizeWorkspacePathSeparators(childPath).replace(/^\/+/, "");
+  const displayWithChild = (childPath = "") => replacementForCoreRepo(corePath, normalizedChild(childPath));
+
+  next = next.replace(
+    new RegExp(`${coreDisplaySource}[\\\\/]\\.agents[\\\\/]worktrees[\\\\/][^\\\\/\\s"'\\\`<>()\\[\\]{}|;,\\u001b]+${FUNCTIONAL_REPO_PATH_CHILD}${FUNCTIONAL_REPO_PATH_BOUNDARY}`, "g"),
+    (_match, childPath = "") => displayWithChild(childPath),
+  );
+  next = next.replace(
+    new RegExp(`${coreDisplaySource}[\\\\/]\\.agents[^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]*${FUNCTIONAL_REPO_PATH_BOUNDARY}`, "g"),
+    () => coreDisplay,
+  );
+
+  const leadingBoundary = String.raw`(^|[\s"'` + "`" + String.raw`<>()\[\]{}|;,\u001b])`;
+  next = next.replace(
+    new RegExp(`${leadingBoundary}[\\\\/]?\\.agents[\\\\/]worktrees[\\\\/][^\\\\/\\s"'\\\`<>()\\[\\]{}|;,\\u001b]+${FUNCTIONAL_REPO_PATH_CHILD}${FUNCTIONAL_REPO_PATH_BOUNDARY}`, "g"),
+    (_match, boundary = "", childPath = "") => `${boundary}${displayWithChild(childPath)}`,
+  );
+  next = next.replace(
+    new RegExp(`${leadingBoundary}[\\\\/]?\\.agents[^\\s"'\\\`<>()\\[\\]{}|;,\\u001b]*${FUNCTIONAL_REPO_PATH_BOUNDARY}`, "g"),
+    (_match, boundary = "") => `${boundary}${coreDisplay}`,
+  );
+
+  return next;
+}
+
 function maskTrailingKnownCoreRepoPath(text, coreRepoPath) {
   const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
   if (!corePath) {
@@ -317,8 +357,9 @@ export function maskFunctionalRepoPathsForDisplayText(value, options = {}) {
     options.coreRepoPath,
   );
   const worktreeMasked = maskFullWorktreePath(ellipsizedMasked);
+  const agentsMasked = maskAnyAgentsInternalPath(worktreeMasked, options.coreRepoPath);
 
-  return maskAnyAgentsInternalPath(worktreeMasked, options.coreRepoPath);
+  return maskPrivateRuntimeNamespaceLeaks(agentsMasked, options.coreRepoPath);
 }
 
 function rewindAnsiSequencesBeforeIndex(text, index) {

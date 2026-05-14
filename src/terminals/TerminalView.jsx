@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
@@ -110,7 +111,6 @@ const TerminalSurfaceSlot = styled.div`
   }
 `;
 
-const TODO_QUEUE_DRAG_MIME = "application/x-diffforge-todo";
 const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 1120;
 const TODO_QUEUE_MAX_ITEMS = 120;
@@ -273,6 +273,13 @@ const TodoQueueItemCard = styled.article`
   background: rgba(13, 17, 23, 0.72);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   cursor: grab;
+  touch-action: none;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    opacity 150ms ease,
+    transform 150ms ease;
+  user-select: none;
 
   &:hover {
     border-color: rgba(98, 160, 255, 0.26);
@@ -283,6 +290,11 @@ const TodoQueueItemCard = styled.article`
 
   &:active {
     cursor: grabbing;
+  }
+
+  &[data-todo-dragging="true"] {
+    opacity: 0.42;
+    transform: scale(0.985);
   }
 `;
 
@@ -337,6 +349,53 @@ const TodoQueueEmpty = styled.div`
   font-weight: 720;
   line-height: 1.45;
   text-align: center;
+`;
+
+const TodoQueueError = styled.div`
+  border: 1px solid rgba(248, 113, 113, 0.26);
+  border-radius: 8px;
+  padding: 8px 9px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.18);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.4;
+`;
+
+const TodoDragPreview = styled.div`
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 6000;
+  display: grid;
+  width: min(var(--todo-drag-width, 280px), calc(100vw - 24px));
+  max-height: min(260px, calc(100vh - 24px));
+  gap: 7px;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid rgba(138, 216, 255, 0.52);
+  border-radius: 8px;
+  color: #f5fbff;
+  background:
+    linear-gradient(90deg, rgba(47, 128, 255, 0.18), rgba(255, 122, 24, 0.08)),
+    rgba(5, 10, 18, 0.96);
+  box-shadow:
+    0 22px 54px rgba(0, 0, 0, 0.46),
+    0 0 0 1px rgba(255, 255, 255, 0.05);
+  opacity: 0.96;
+  pointer-events: none;
+  transform: translate3d(var(--todo-drag-x, 0px), var(--todo-drag-y, 0px), 0);
+  will-change: transform;
+`;
+
+const TodoDragPreviewText = styled.div`
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: #f4faff;
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1.45;
+  white-space: pre-wrap;
 `;
 
 const TERMINAL_PANEL_ANCHOR_SELECTOR = "[data-terminal-panel-anchor='true']";
@@ -478,6 +537,44 @@ function pointIsInRect(clientX, clientY, rect) {
     && clientX <= rect.right
     && clientY >= rect.top
     && clientY <= rect.bottom;
+}
+
+function getPlainDomRect(rect) {
+  if (!rect) {
+    return null;
+  }
+
+  return {
+    height: Number(rect.height || 0),
+    left: Number(rect.left || 0),
+    top: Number(rect.top || 0),
+    width: Number(rect.width || 0),
+  };
+}
+
+function getTodoDropTargetFromPoint({
+  clientX,
+  clientY,
+  containerRect,
+  fullscreenTerminalIndex,
+  rects,
+  terminalIndexes,
+}) {
+  if (
+    Number.isInteger(fullscreenTerminalIndex)
+    && pointIsInRect(clientX, clientY, containerRect)
+  ) {
+    return fullscreenTerminalIndex;
+  }
+
+  for (const terminalIndex of terminalIndexes || []) {
+    const rect = getAbsoluteRect(rects?.[terminalIndex], containerRect);
+    if (pointIsInRect(clientX, clientY, rect)) {
+      return terminalIndex;
+    }
+  }
+
+  return null;
 }
 
 function getRowsWithMetrics(rows, rects, containerRect, draggedTerminalIndex) {
@@ -639,6 +736,18 @@ function normalizeTodoQueueText(value) {
     .slice(0, TODO_QUEUE_MAX_TEXT_LENGTH);
 }
 
+function getTodoDropErrorMessage(error) {
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  if (error && typeof error.message === "string" && error.message.trim()) {
+    return error.message;
+  }
+
+  return "Unable to send todo to terminal.";
+}
+
 function createTodoQueueItem(text) {
   const createdAt = new Date().toISOString();
   const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -715,8 +824,11 @@ function formatTodoQueueCreatedAt(value) {
 }
 
 const TodoQueuePanel = memo(function TodoQueuePanel({
+  activeDragItemId = "",
   draft,
+  dropError = "",
   items,
+  onBeginTodoDrag,
   onDraftChange,
   onRemoveItem,
   onSubmitDraft,
@@ -736,22 +848,36 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     onSubmitDraft();
   }, [onSubmitDraft]);
 
-  const handleDragStart = useCallback((event, item) => {
+  const handlePointerDown = useCallback((event, item) => {
+    if (event.button !== 0 || event.target?.closest?.("[data-todo-control='true']")) {
+      return;
+    }
+
     const text = normalizeTodoQueueText(item?.text);
     if (!text) {
       event.preventDefault();
       return;
     }
 
-    event.dataTransfer.effectAllowed = "copy";
-    event.dataTransfer.setData("text/plain", text);
-    event.dataTransfer.setData(TODO_QUEUE_DRAG_MIME, JSON.stringify({
-      id: item.id,
-      source: "todo-queue",
-      text,
+    const sourceRect = getPlainDomRect(event.currentTarget?.getBoundingClientRect?.());
+    if (!sourceRect) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    onBeginTodoDrag?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      item: {
+        id: item.id,
+        text,
+      },
+      pointerId: event.pointerId,
+      sourceRect,
       workspaceId,
-    }));
-  }, [workspaceId]);
+    });
+  }, [onBeginTodoDrag, workspaceId]);
 
   return (
     <TodoQueueSurface aria-label="To Do Queue">
@@ -776,6 +902,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           </TodoQueueSubmitButton>
         </TodoQueueSubmitRow>
       </TodoQueueComposer>
+      {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
 
       <TodoQueueListWrap>
         <TodoQueueListTopline>
@@ -785,9 +912,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         <TodoQueueList role="list">
           {items.length ? items.map((item) => (
             <TodoQueueItemCard
-              draggable
+              data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
               key={item.id}
-              onDragStart={(event) => handleDragStart(event, item)}
+              onPointerDown={(event) => handlePointerDown(event, item)}
               role="listitem"
               title="Drag into an agent terminal"
             >
@@ -795,6 +922,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               <TodoQueueItemMeta>{formatTodoQueueCreatedAt(item.createdAt)}</TodoQueueItemMeta>
               <TodoQueueRemoveButton
                 aria-label="Remove todo"
+                data-todo-control="true"
                 onClick={() => onRemoveItem(item.id)}
                 title="Remove"
                 type="button"
@@ -860,6 +988,9 @@ function TerminalView({
   const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
   const terminalDragActive = Boolean(terminalDragState);
+  const [todoDragState, setTodoDragState] = useState(null);
+  const [todoDropError, setTodoDropError] = useState("");
+  const todoDragActive = Boolean(todoDragState);
   const [todoQueueDraft, setTodoQueueDraft] = useState("");
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
@@ -870,6 +1001,7 @@ function TerminalView({
   const terminalPanelRectRef = useRef(null);
   const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
+  const todoDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
   const todoQueueStorageKey = useMemo(
     () => getTodoQueueStorageKey(terminalWorkspace?.id),
@@ -1116,6 +1248,7 @@ function TerminalView({
       createTodoQueueItem(text),
       ...currentItems,
     ]);
+    setTodoDropError("");
     setTodoQueueDraft("");
   }, [todoQueueDraft, updateTodoQueueItems]);
 
@@ -1124,6 +1257,66 @@ function TerminalView({
       currentItems.filter((item) => item.id !== itemId)
     ));
   }, [updateTodoQueueItems]);
+
+  const updateTodoDragState = useCallback((updater) => {
+    setTodoDragState((currentState) => {
+      const nextState = typeof updater === "function" ? updater(currentState) : updater;
+      todoDragStateRef.current = nextState || null;
+      return nextState || null;
+    });
+  }, []);
+
+  const handleBeginTodoDrag = useCallback((event) => {
+    const text = normalizeTodoQueueText(event?.item?.text);
+    const sourceRect = event?.sourceRect;
+
+    if (
+      !text
+      || !terminalWorkspace?.id
+      || !sourceRect
+      || !terminalPanelsRef.current
+      || terminalDragActive
+    ) {
+      return;
+    }
+
+    measureTerminalLayout();
+
+    const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+    const targetTerminalIndex = getTodoDropTargetFromPoint({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      containerRect,
+      fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
+      rects: terminalLayoutRectsRef.current,
+      terminalIndexes: logicalTerminalIndexes,
+    });
+    const offsetX = Number(event.clientX || 0) - Number(sourceRect.left || 0);
+    const offsetY = Number(event.clientY || 0) - Number(sourceRect.top || 0);
+
+    setTodoDropError("");
+    updateTodoDragState({
+      height: Math.max(0, Number(sourceRect.height || 0)),
+      itemId: event.item?.id || "",
+      offsetX,
+      offsetY,
+      pointerId: event.pointerId,
+      targetTerminalIndex,
+      text,
+      width: Math.max(220, Number(sourceRect.width || 0)),
+      workspaceId: event.workspaceId || terminalWorkspace.id,
+      x: Number(event.clientX || 0) - offsetX,
+      y: Number(event.clientY || 0) - offsetY,
+    });
+  }, [
+    fullscreenActive,
+    fullscreenTerminalIndex,
+    logicalTerminalIndexes,
+    measureTerminalLayout,
+    terminalDragActive,
+    terminalWorkspace?.id,
+    updateTodoDragState,
+  ]);
 
   const updateTerminalDragState = useCallback((updater) => {
     setTerminalDragState((currentState) => {
@@ -1139,6 +1332,7 @@ function TerminalView({
       || logicalTerminalIndexes.length <= 1
       || !terminalWorkspace?.id
       || !event?.surfaceRect
+      || todoDragActive
     ) {
       return;
     }
@@ -1178,7 +1372,124 @@ function TerminalView({
     logicalTerminalIndexes.length,
     measureTerminalLayout,
     terminalWorkspace?.id,
+    todoDragActive,
     updateTerminalDragState,
+  ]);
+
+  useEffect(() => {
+    if (!todoDragActive) {
+      return undefined;
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousTouchAction = document.body.style.touchAction;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.touchAction = "none";
+    document.body.style.userSelect = "none";
+
+    const resolveDropTarget = (clientX, clientY) => {
+      const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+      if (!containerRect) {
+        return null;
+      }
+
+      return getTodoDropTargetFromPoint({
+        clientX,
+        clientY,
+        containerRect,
+        fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
+        rects: terminalLayoutRectsRef.current,
+        terminalIndexes: logicalTerminalIndexes,
+      });
+    };
+
+    const cancelDrag = () => {
+      updateTodoDragState(null);
+    };
+
+    const commitDrag = (targetTerminalIndex) => {
+      const currentDrag = todoDragStateRef.current;
+      if (!currentDrag) {
+        return;
+      }
+
+      const paneId = Number.isInteger(targetTerminalIndex)
+        ? getTerminalPaneId(targetTerminalIndex)
+        : "";
+
+      updateTodoDragState(null);
+
+      if (!paneId) {
+        return;
+      }
+
+      setActiveTerminalPaneId(paneId);
+      invoke("terminal_write", {
+        data: `${currentDrag.text}\r`,
+        paneId,
+      })
+        .then(() => setTodoDropError(""))
+        .catch((error) => {
+          setTodoDropError(getTodoDropErrorMessage(error));
+        });
+    };
+
+    const handlePointerMove = (event) => {
+      const currentDrag = todoDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+
+      const targetTerminalIndex = resolveDropTarget(event.clientX, event.clientY);
+      updateTodoDragState({
+        ...currentDrag,
+        targetTerminalIndex,
+        x: event.clientX - currentDrag.offsetX,
+        y: event.clientY - currentDrag.offsetY,
+      });
+    };
+
+    const handlePointerUp = (event) => {
+      const currentDrag = todoDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      commitDrag(resolveDropTarget(event.clientX, event.clientY));
+    };
+
+    const handlePointerCancel = (event) => {
+      const currentDrag = todoDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      cancelDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp, { passive: false });
+    window.addEventListener("pointercancel", handlePointerCancel);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.touchAction = previousTouchAction;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
+  }, [
+    fullscreenActive,
+    fullscreenTerminalIndex,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    todoDragActive,
+    updateTodoDragState,
   ]);
 
   useEffect(() => {
@@ -1383,6 +1694,7 @@ function TerminalView({
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
       data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
       data-terminal-fullscreen-state={fullscreenState}
+      data-todo-dragging={todoDragActive ? "true" : "false"}
       ref={terminalPanelsRef}
       style={fullscreenMotionStyle}
     >
@@ -1476,6 +1788,8 @@ function TerminalView({
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
+                todoDropActive={todoDragActive}
+                todoDropTarget={todoDragState?.targetTerminalIndex === terminalIndex}
                 workingDirectory={terminalWorkspaceWorkingDirectory}
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
@@ -1563,8 +1877,11 @@ function TerminalView({
                       minSize="18%"
                     >
                       <TodoQueuePanel
+                        activeDragItemId={todoDragState?.itemId || ""}
                         draft={todoQueueDraft}
+                        dropError={todoDropError}
                         items={todoQueueItems}
+                        onBeginTodoDrag={handleBeginTodoDrag}
                         onDraftChange={setTodoQueueDraft}
                         onRemoveItem={removeTodoQueueItem}
                         onSubmitDraft={submitTodoQueueDraft}
@@ -1575,6 +1892,18 @@ function TerminalView({
                 )}
               </ResizePanelGroup>
             ) : terminalWorkspaceContent}
+            {todoDragState && (
+              <TodoDragPreview
+                aria-hidden="true"
+                style={{
+                  "--todo-drag-width": `${Math.max(220, Number(todoDragState.width || 0))}px`,
+                  "--todo-drag-x": `${Math.round(Number(todoDragState.x || 0))}px`,
+                  "--todo-drag-y": `${Math.round(Number(todoDragState.y || 0))}px`,
+                }}
+              >
+                <TodoDragPreviewText>{todoDragState.text}</TodoDragPreviewText>
+              </TodoDragPreview>
+            )}
           </TerminalWorkspaceMain>
       )}
     </ForgeWorkspace>

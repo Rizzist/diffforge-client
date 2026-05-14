@@ -822,6 +822,9 @@ fn default_terminal_working_directory() -> PathBuf {
 const TERMINAL_EMULATION_TERM: &str = "xterm-256color";
 const TERMINAL_EMULATION_COLORTERM: &str = "truecolor";
 const TERMINAL_EMULATION_FORCE_COLOR: &str = "1";
+#[cfg(windows)]
+const TERMINAL_EMULATION_PROGRAM: &str = "vscode";
+#[cfg(not(windows))]
 const TERMINAL_EMULATION_PROGRAM: &str = "DiffForge";
 
 fn apply_terminal_emulation_env(command: &mut CommandBuilder) {

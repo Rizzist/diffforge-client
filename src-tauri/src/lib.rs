@@ -1853,6 +1853,7 @@ pub fn run() {
             set_terminal_audio_input_target,
             terminal_write_to_audio_input_target,
             terminal_write,
+            terminal_windows_pty_info,
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,
             windows_terminal_set_diagnostic_logging,

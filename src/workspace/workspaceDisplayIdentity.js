@@ -1,5 +1,7 @@
 const FUNCTIONAL_REPO_WORKTREE_MARKER = "/.agents/worktrees";
 const FUNCTIONAL_REPO_AGENTS_MARKER = "/.agents";
+const FUNCTIONAL_REPO_AGENTS_SEGMENT = ".agents";
+const FUNCTIONAL_REPO_WORKTREES_SEGMENT = "worktrees";
 
 export function normalizeWorkspacePathSeparators(value) {
   let text = String(value || "").trim().replace(/\\/g, "/");
@@ -178,6 +180,18 @@ function pathStartsWithRoot(path, root) {
   return left === right || left.startsWith(`${right}/`);
 }
 
+function pathMatchesKnownRoot(path, identity) {
+  const candidates = [
+    identity?.coreRoot,
+    identity?.displayRoot,
+    ...(identity?.aliases || []),
+  ].filter(Boolean);
+
+  return candidates.some((candidate) => (
+    pathStartsWithRoot(path, candidate) && pathStartsWithRoot(candidate, path)
+  ));
+}
+
 function relativePathForRoot(path, root) {
   const normalizedPath = trimWorkspacePathSeparators(path);
   const normalizedRoot = trimWorkspacePathSeparators(root);
@@ -202,6 +216,64 @@ function functionalWorktreeRelativePath(value, identity) {
   const parts = afterMarker.split("/").filter(Boolean);
   if (parts.length <= 1) return "";
   return parts.slice(1).join("/");
+}
+
+function privateNamespacePathParts(value, identity) {
+  const normalized = trimWorkspacePathSeparators(value);
+  const lower = normalized.toLowerCase();
+  const markerIndex = lower.indexOf(FUNCTIONAL_REPO_AGENTS_MARKER);
+  const startsWithPrivateNamespace = lower === FUNCTIONAL_REPO_AGENTS_SEGMENT
+    || lower.startsWith(`${FUNCTIONAL_REPO_AGENTS_SEGMENT}/`);
+
+  if (markerIndex < 0 && !startsWithPrivateNamespace) {
+    return null;
+  }
+
+  const beforeMarker = markerIndex >= 0 ? normalized.slice(0, markerIndex) : "";
+  const privatePath = markerIndex >= 0
+    ? normalized.slice(markerIndex + 1)
+    : normalized.replace(/^\/+/, "");
+  const parts = privatePath.split("/").filter(Boolean);
+
+  if (parts[0]?.toLowerCase() !== FUNCTIONAL_REPO_AGENTS_SEGMENT) {
+    return null;
+  }
+
+  let displayRoot = identity?.displayRoot || "";
+  if (beforeMarker) {
+    const beforeLeaf = workspacePathLeaf(beforeMarker);
+    if (!displayRoot || !pathMatchesKnownRoot(beforeMarker, identity || {})) {
+      displayRoot = beforeLeaf ? `/${beforeLeaf}` : displayRoot;
+    }
+  }
+  if (!displayRoot && identity?.repoName) {
+    displayRoot = `/${identity.repoName}`;
+  }
+
+  const worktreeIndex = parts[1]?.toLowerCase() === FUNCTIONAL_REPO_WORKTREES_SEGMENT ? 1 : -1;
+  const childPath = worktreeIndex === 1 && parts.length > 3
+    ? parts.slice(3).join("/")
+    : "";
+
+  return {
+    childPath,
+    displayRoot,
+    privatePath: parts.join("/"),
+  };
+}
+
+export function workspacePrivatePathDisplayLabel(value, identityOrRoot, options = {}) {
+  const identity = typeof identityOrRoot === "object" && identityOrRoot
+    ? identityOrRoot
+    : createWorkspaceDisplayIdentity(identityOrRoot || "");
+  const includeChildPath = options.includeChildPath !== false;
+  const parts = privateNamespacePathParts(value, identity);
+
+  if (!parts) return null;
+  if (!parts.displayRoot) return "";
+  return includeChildPath && parts.childPath
+    ? `${parts.displayRoot}/${parts.childPath}`
+    : parts.displayRoot;
 }
 
 export function workspaceRelativePath(value, identityOrRoot) {
@@ -238,6 +310,11 @@ export function getWorkspacePathDisplayLabel(value, options = {}) {
     options.fallback || "Project",
   );
   const includeChildPath = options.includeChildPath !== false;
+  const privateDisplay = workspacePrivatePathDisplayLabel(value, identity, { includeChildPath });
+  if (privateDisplay !== null) {
+    return privateDisplay || identity.displayRoot;
+  }
+
   const relative = workspaceRelativePath(value, identity);
   if (relative !== null) {
     return includeChildPath && relative ? `${identity.displayRoot}/${relative}` : identity.displayRoot;

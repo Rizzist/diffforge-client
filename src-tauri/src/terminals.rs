@@ -5,6 +5,39 @@ fn terminal_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(windows)]
+fn terminal_windows_build_number() -> Option<u32> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    let status = unsafe { RtlGetVersion(&mut info) };
+
+    if status >= 0 && info.dwBuildNumber > 0 {
+        Some(info.dwBuildNumber)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn terminal_windows_build_number() -> Option<u32> {
+    None
+}
+
+#[tauri::command]
+async fn terminal_windows_pty_info() -> Result<Value, String> {
+    Ok(json!({
+        "backend": if cfg!(windows) { "conpty" } else { "native" },
+        "buildNumber": terminal_windows_build_number(),
+        "term": TERMINAL_EMULATION_TERM,
+        "termProgram": TERMINAL_EMULATION_PROGRAM,
+    }))
+}
+
 fn clean_terminal_telemetry_text(value: &str) -> String {
     value
         .replace(|character: char| character.is_control(), " ")
@@ -1557,7 +1590,6 @@ async fn terminal_open(
             "agent_started": agent_started,
             "colorterm": TERMINAL_EMULATION_COLORTERM,
             "cols": size.cols,
-            "conpty_passthrough_requested": cfg!(windows),
             "force_color": TERMINAL_EMULATION_FORCE_COLOR,
             "instance_id": instance_id,
             "kind": clean_terminal_diagnostic_log_text(&kind),
@@ -1568,6 +1600,7 @@ async fn terminal_open(
             "shell_pty": shell_pty,
             "term": TERMINAL_EMULATION_TERM,
             "term_program": TERMINAL_EMULATION_PROGRAM,
+            "windows_build_number": terminal_windows_build_number(),
         }),
     );
 
