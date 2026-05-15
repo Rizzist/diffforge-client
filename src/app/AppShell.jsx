@@ -15,6 +15,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import { closeWorkspaceTerminalPane, getDefaultTerminalIndexes, getTerminalPanelRows, normalizeWorkspaceTerminalIndexes } from "../terminals/WorkspaceTerminal.jsx";
+import {
+  persistTerminalStabilityRuntimeEnabled,
+  readTerminalStabilityRuntimeEnabled,
+} from "../terminals/terminalStabilityRecovery.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
@@ -1741,6 +1745,8 @@ export default function App() {
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
+  const [terminalStabilityRuntimeEnabled, setTerminalStabilityRuntimeEnabled] =
+    useState(readTerminalStabilityRuntimeEnabled);
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState({});
   const [workspaceTerminalDisplayLayouts, setWorkspaceTerminalDisplayLayouts] = useState({});
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState("");
@@ -2051,6 +2057,12 @@ export default function App() {
 
     updateWorkspaceLifecycleSettings({ defaultWorkspaceId: nextDefaultWorkspaceId });
   }, [updateWorkspaceLifecycleSettings, workspaces]);
+
+  const toggleTerminalStabilityRuntime = useCallback(() => {
+    setTerminalStabilityRuntimeEnabled((currentEnabled) => (
+      persistTerminalStabilityRuntimeEnabled(!currentEnabled)
+    ));
+  }, []);
 
   const activateWorkspace = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
@@ -5173,6 +5185,43 @@ export default function App() {
                             <span>Activate selected</span>
                           </PrimaryButton>
                         )}
+                      </AccountCardFooter>
+                    </AccountCard>
+                  </AccountSettingsPanel>
+
+                  <AccountSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Terminal rendering</PanelKicker>
+                        <PanelHeading>Stability recovery</PanelHeading>
+                      </div>
+                    </PanelHeaderRow>
+
+                    <AccountCard data-tone={terminalStabilityRuntimeEnabled ? "blue" : "orange"}>
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Runtime mode</SettingsLabel>
+                          <SettingsValue>
+                            {terminalStabilityRuntimeEnabled ? "Recovery enabled" : "Native terminal mode"}
+                          </SettingsValue>
+                          <SettingsHint>Applies to active Codex and Claude terminal panes immediately.</SettingsHint>
+                        </div>
+                        <AgentReadyPill data-tone={terminalStabilityRuntimeEnabled ? "blue" : "orange"}>
+                          <ButtonTerminalIcon aria-hidden="true" />
+                          <span>{terminalStabilityRuntimeEnabled ? "Enabled" : "Disabled"}</span>
+                        </AgentReadyPill>
+                      </AccountCardHeader>
+
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          {terminalStabilityRuntimeEnabled
+                            ? "Scrollback recovery and resize cleanup are active."
+                            : "Terminal output passes through without recovery transforms."}
+                        </SettingsHint>
+                        <SecondaryButton onClick={toggleTerminalStabilityRuntime} type="button">
+                          <ButtonSettingsIcon aria-hidden="true" />
+                          <span>{terminalStabilityRuntimeEnabled ? "Disable" : "Enable"}</span>
+                        </SecondaryButton>
                       </AccountCardFooter>
                     </AccountCard>
                   </AccountSettingsPanel>

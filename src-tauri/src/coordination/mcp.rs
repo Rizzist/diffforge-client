@@ -40,6 +40,7 @@ pub struct McpContext {
     pub repo_path: Option<String>,
     pub db_path: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_kind: Option<String>,
     pub agent_slot_id: Option<String>,
     pub slot_key: Option<String>,
     pub session_id: Option<String>,
@@ -61,6 +62,7 @@ impl McpContext {
                 ("--repo-path", Some(value)) => context.repo_path = Some(value),
                 ("--db-path", Some(value)) => context.db_path = Some(value),
                 ("--agent-id", Some(value)) => context.agent_id = Some(value),
+                ("--agent-kind", Some(value)) => context.agent_kind = Some(value),
                 ("--agent-slot-id", Some(value)) => context.agent_slot_id = Some(value),
                 ("--slot-key", Some(value)) => context.slot_key = Some(value),
                 ("--session-id", Some(value)) => context.session_id = Some(value),
@@ -82,6 +84,7 @@ impl McpContext {
             repo_path: string_field(value, "repo_path"),
             db_path: string_field(value, "db_path"),
             agent_id: string_field(value, "agent_id"),
+            agent_kind: string_field(value, "agent_kind"),
             agent_slot_id: string_field(value, "agent_slot_id"),
             slot_key: string_field(value, "slot_key"),
             session_id: string_field(value, "session_id"),
@@ -100,6 +103,7 @@ impl McpContext {
             "repo_path": self.repo_path,
             "db_path": self.db_path,
             "agent_id": self.agent_id,
+            "agent_kind": self.agent_kind,
             "agent_slot_id": self.agent_slot_id,
             "slot_key": self.slot_key,
             "session_id": self.session_id,
@@ -123,6 +127,14 @@ impl McpContext {
                 "COORDINATION_AGENT_ID",
                 "DIFFFORGE_AGENT_ID",
                 "CLOUD_MCP_AGENT_ID",
+            ],
+        );
+        set_default_from_env(
+            &mut self.agent_kind,
+            &[
+                "COORDINATION_AGENT_KIND",
+                "DIFFFORGE_AGENT_KIND",
+                "CLOUD_MCP_AGENT_KIND",
             ],
         );
         set_default_from_env(&mut self.agent_slot_id, &["COORDINATION_AGENT_SLOT_ID"]);
@@ -982,7 +994,13 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
             json!({"allowed_tools": TOOL_NAMES}),
         );
     }
+    let explicit_task_id = value_has_nonempty_string(&input, "task_id");
     apply_context_defaults(context, &mut input);
+    if matches!(tool, "acquire_lease" | "checkpoint" | "submit_patch") && !explicit_task_id {
+        if let Some(object) = input.as_object_mut() {
+            object.insert("__explicit_task_id_missing".to_string(), json!(true));
+        }
+    }
     let result = match dispatch_tool_result(context, tool, input) {
         Ok(value) => value,
         Err(error) => api_error("tool_failed", error, json!({"tool": tool})),
@@ -1057,6 +1075,9 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let requested_lane = input["lane"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
+    let agent_kind = input["agent_kind"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
     let requested_title = input["title"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
@@ -1079,31 +1100,40 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         input["repo_path"].as_str(),
         input["db_path"].as_str().map(PathBuf::from).as_deref(),
         input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
         agent_id,
         session_id,
-        local_task_hint.as_deref(),
+        local_task_hint.as_deref().or_else(|| {
+            task_id.and_then(|task_id| (!input_task_id_is_session_id).then_some(task_id))
+        }),
         input["worktree_id"].as_str(),
         input["worktree_path"].as_str(),
+        agent_kind,
         lane.as_deref(),
         task_title.as_deref(),
         None,
         &start_plan,
     ) {
-        Ok(response) => json!({"ok": true, "response": response}),
-        Err(error) => json!({"ok": false, "error": error}),
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(api_error(
+                "cloud_start_task_failed",
+                "Cloud start_task must return a task_id before Rust creates local task state.",
+                json!({"error": error}),
+            ))
+        }
     };
-    let cloud_task_id = cloud["response"]
-        .as_object()
-        .and_then(|_| cloud_start_task_id(&cloud["response"]));
-    let local_start_task_id = cloud_task_id
-        .as_deref()
-        .or(local_task_hint.as_deref())
-        .or(task_id);
-
+    let Some(cloud_task_id) = cloud_start_task_id(&cloud) else {
+        return Ok(api_error(
+            "cloud_start_task_missing_task_id",
+            "Cloud start_task did not return a task_id; refusing to create a local task.",
+            json!({"cloud": cloud}),
+        ));
+    };
     let started = kernel.start_task(
         agent_id,
         session_id,
-        local_start_task_id,
+        Some(cloud_task_id.as_str()),
         None,
         Some(&start_plan),
         requested_title,
@@ -1114,18 +1144,37 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     }
 
     let mut data = started["data"].clone();
+    let Some(started_task_id) = data["task_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(api_error(
+            "start_task_requires_active_session",
+            "start_task must create or reuse a concrete task before leases, checkpoints, or spec sync.",
+            json!({}),
+        ));
+    };
+    if started_task_id != cloud_task_id {
+        return Ok(api_error(
+            "cloud_local_task_id_mismatch",
+            "Rust refused to continue because the local task id did not match Cloud start_task.",
+            json!({"cloud_task_id": cloud_task_id, "local_task_id": started_task_id}),
+        ));
+    }
 
     if let Some(object) = data.as_object_mut() {
         object.insert("start_plan".to_string(), json!(start_plan));
-        object.insert("cloud".to_string(), cloud);
+        object.insert("cloud".to_string(), json!({"ok": true, "response": cloud}));
+        object.insert("cloud_task_id".to_string(), json!(cloud_task_id));
         object.insert(
             "task_id_source".to_string(),
-            json!(if cloud_task_id.is_some() {
-                "cloud"
-            } else if local_task_hint.is_some() {
-                "local_existing"
+            json!(if local_task_hint.is_some() {
+                "cloud_confirmed_existing"
+            } else if task_id.is_some() {
+                "cloud_confirmed_explicit"
             } else {
-                "local_fallback"
+                "cloud"
             }),
         );
         if input_task_id_is_session_id {
@@ -1136,9 +1185,23 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
 }
 
 fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
+        return Ok(api_error(
+            "task_id_required_after_start_task",
+            "acquire_lease requires the task_id returned by start_task; implicit session task defaults are not allowed for write leases.",
+            json!({}),
+        ));
+    }
     let task_id = req(input, "task_id")?;
     let agent_id = req(input, "agent_id")?;
     let session_id = req(input, "session_id")?;
+    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
+        return Ok(api_error(
+            "start_task_required_before_lease",
+            "Call start_task for this session and pass its returned task_id before acquiring a write lease.",
+            json!({"task_id": task_id, "session_id": session_id}),
+        ));
+    }
     let resource_key = req(input, "resource_key")?;
     let mode = input["mode"].as_str().unwrap_or("write");
     let acquired = kernel.acquire_lease(
@@ -1275,6 +1338,13 @@ fn optional_start_task_text(input: &Value) -> Option<String> {
 }
 
 fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
+        return Ok(api_error(
+            "task_id_required_after_start_task",
+            "checkpoint requires the task_id returned by start_task; implicit session task defaults are not allowed for spec activity.",
+            json!({}),
+        ));
+    }
     let summary = req(input, "summary")?.trim();
     let agent_id = input["agent_id"]
         .as_str()
@@ -1285,17 +1355,90 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let task_id = input["task_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
-    let task = task_id
-        .and_then(|task_id| {
-            kernel
-                .query_json(
-                    "SELECT id, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
-                    &[&task_id],
-                )
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
-        })
-        .unwrap_or_else(|| json!({}));
+    let Some(task_id) = task_id else {
+        return Ok(api_error(
+            "checkpoint_requires_active_task",
+            "checkpoint is only available after start_task has created an active task. Read-only file inspection does not need tasks or checkpoints.",
+            json!({"policy": "read_only_exploration_is_free"}),
+        ));
+    };
+    let task = match kernel
+        .query_json(
+            "SELECT t.id,
+                    t.assigned_role,
+                    t.status,
+                    t.claimed_session_id,
+                    COALESCE(s.status, '') AS claimed_session_status
+             FROM tasks t
+             LEFT JOIN agent_sessions s ON s.id=t.claimed_session_id
+             WHERE t.id=?1
+             LIMIT 1",
+            &[&task_id],
+        )?
+        .into_iter()
+        .next()
+    {
+        Some(task) => task,
+        None => {
+            return Ok(api_error(
+                "checkpoint_task_not_found",
+                "checkpoint requires an existing active task.",
+                json!({"task_id": task_id}),
+            ))
+        }
+    };
+    let task_status = task["status"].as_str().unwrap_or_default();
+    if matches!(
+        task_status,
+        "done" | "completed" | "merged" | "cancelled" | "interrupted" | "skipped"
+    ) {
+        return Ok(api_error(
+            "checkpoint_task_not_active",
+            "checkpoint is only available while the task is active.",
+            json!({"task_id": task_id, "status": task_status}),
+        ));
+    }
+    let claimed_session_id = task["claimed_session_id"].as_str().unwrap_or_default();
+    if claimed_session_id.is_empty() {
+        return Ok(api_error(
+            "checkpoint_task_not_active",
+            "checkpoint is only available while the task is claimed by an active session.",
+            json!({"task_id": task_id, "status": task_status}),
+        ));
+    }
+    let claimed_session_status = task["claimed_session_status"].as_str().unwrap_or_default();
+    if claimed_session_status != "active" {
+        return Ok(api_error(
+            "checkpoint_task_not_active",
+            "checkpoint is only available while the task's claimed session is active.",
+            json!({
+                "task_id": task_id,
+                "status": task_status,
+                "claimed_session_id": claimed_session_id,
+                "claimed_session_status": claimed_session_status,
+            }),
+        ));
+    }
+    if let Some(session_id) = session_id {
+        if claimed_session_id != session_id {
+            return Ok(api_error(
+                "checkpoint_task_claimed_by_another_session",
+                "checkpoint cannot be recorded for a task claimed by another session.",
+                json!({
+                    "task_id": task_id,
+                    "claimed_session_id": claimed_session_id,
+                    "session_id": session_id,
+                }),
+            ));
+        }
+        if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
+            return Ok(api_error(
+                "start_task_required_before_checkpoint",
+                "Call start_task for this session and pass its returned task_id before checkpointing.",
+                json!({"task_id": task_id, "session_id": session_id}),
+            ));
+        }
+    }
     let lane = input["lane"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -1306,7 +1449,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         "agent_mcp_client",
         actor_id,
         EventRefs {
-            task_id: task_id.map(str::to_string),
+            task_id: Some(task_id.to_string()),
             agent_id: agent_id.map(str::to_string),
             session_id: session_id.map(str::to_string),
             ..EventRefs::default()
@@ -1324,7 +1467,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         input["workspace_id"].as_str(),
         agent_id,
         session_id,
-        task_id,
+        Some(task_id),
         input["worktree_id"].as_str(),
         input["worktree_path"].as_str(),
         lane,
@@ -1342,9 +1485,23 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
 }
 
 fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
+        return Ok(api_error(
+            "task_id_required_after_start_task",
+            "submit_patch requires the task_id returned by start_task; implicit session task defaults are not allowed.",
+            json!({}),
+        ));
+    }
     let task_id = req(input, "task_id")?;
     let agent_id = req(input, "agent_id")?;
     let session_id = req(input, "session_id")?;
+    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
+        return Ok(api_error(
+            "start_task_required_before_submit_patch",
+            "Call start_task for this session and pass its returned task_id before submitting a patch.",
+            json!({"task_id": task_id, "session_id": session_id}),
+        ));
+    }
     let task = kernel
         .query_json(
             "SELECT id, status, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
@@ -1404,6 +1561,7 @@ fn apply_context_defaults(context: &McpContext, input: &mut Value) {
         ("repo_path", &context.repo_path),
         ("db_path", &context.db_path),
         ("agent_id", &context.agent_id),
+        ("agent_kind", &context.agent_kind),
         ("agent_slot_id", &context.agent_slot_id),
         ("slot_key", &context.slot_key),
         ("session_id", &context.session_id),
@@ -1455,6 +1613,7 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
     };
     for (key, session_key) in [
         ("agent_id", "agent_id"),
+        ("agent_kind", "agent_kind"),
         ("agent_slot_id", "agent_slot_id"),
         ("session_id", "id"),
         ("task_id", "task_id"),
@@ -1512,7 +1671,12 @@ fn active_session_for_identity(
     if let Some(session_id) = clean_identity(session_id) {
         return kernel
             .query_json(
-                "SELECT * FROM agent_sessions WHERE id=?1 ORDER BY updated_at DESC LIMIT 1",
+                "SELECT s.*, COALESCE(sl.agent_kind, a.kind) AS agent_kind
+                 FROM agent_sessions s
+                 LEFT JOIN agents a ON a.id=s.agent_id
+                 LEFT JOIN agent_slots sl ON sl.id=s.agent_slot_id
+                 WHERE s.id=?1
+                 ORDER BY s.updated_at DESC LIMIT 1",
                 &[&session_id],
             )
             .ok()
@@ -1521,7 +1685,12 @@ fn active_session_for_identity(
     if let Some(agent_slot_id) = clean_identity(agent_slot_id) {
         return kernel
             .query_json(
-                "SELECT * FROM agent_sessions WHERE agent_slot_id=?1 AND status='active' ORDER BY updated_at DESC LIMIT 1",
+                "SELECT s.*, COALESCE(sl.agent_kind, a.kind) AS agent_kind
+                 FROM agent_sessions s
+                 LEFT JOIN agents a ON a.id=s.agent_id
+                 LEFT JOIN agent_slots sl ON sl.id=s.agent_slot_id
+                 WHERE s.agent_slot_id=?1 AND s.status='active'
+                 ORDER BY s.updated_at DESC LIMIT 1",
                 &[&agent_slot_id],
             )
             .ok()
@@ -1530,8 +1699,10 @@ fn active_session_for_identity(
     if let Some(slot_key) = clean_identity(slot_key) {
         return kernel
             .query_json(
-                "SELECT s.* FROM agent_sessions s
+                "SELECT s.*, COALESCE(sl.agent_kind, a.kind) AS agent_kind
+                 FROM agent_sessions s
                  JOIN agent_slots sl ON sl.id=s.agent_slot_id
+                 LEFT JOIN agents a ON a.id=s.agent_id
                  WHERE sl.slot_key=?1 AND s.status='active'
                  ORDER BY s.updated_at DESC LIMIT 1",
                 &[&slot_key],
@@ -1542,7 +1713,12 @@ fn active_session_for_identity(
     if let Some(agent_id) = clean_identity(agent_id) {
         return kernel
             .query_json(
-                "SELECT * FROM agent_sessions WHERE agent_id=?1 AND status='active' ORDER BY updated_at DESC LIMIT 1",
+                "SELECT s.*, COALESCE(sl.agent_kind, a.kind) AS agent_kind
+                 FROM agent_sessions s
+                 LEFT JOIN agents a ON a.id=s.agent_id
+                 LEFT JOIN agent_slots sl ON sl.id=s.agent_slot_id
+                 WHERE s.agent_id=?1 AND s.status='active'
+                 ORDER BY s.updated_at DESC LIMIT 1",
                 &[&agent_id],
             )
             .ok()
@@ -1558,12 +1734,39 @@ fn clean_identity(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn value_has_nonempty_string(input: &Value, key: &str) -> bool {
+    input[key]
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn mcp_start_task_seen_for_task(
+    kernel: &CoordinationKernel,
+    task_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let rows = kernel.query_json(
+        "SELECT payload_json
+         FROM events
+         WHERE event_type='mcp_agent_tool_called'
+           AND task_id=?1
+           AND session_id=?2
+         ORDER BY seq DESC
+         LIMIT 50",
+        &[&task_id, &session_id],
+    )?;
+    Ok(rows.into_iter().any(|event| {
+        event["payload_json"]["details"]["tool"].as_str() == Some("start_task")
+            && event["payload_json"]["details"]["ok"].as_bool() != Some(false)
+    }))
+}
+
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the Cloud-created coordination task for this session. Omit task_id on the first call; Rust mirrors the returned server task_id locally for leases, checkpoints, and patches.".to_string(),
-        "acquire_lease" => "Acquire a lease for an already-created task. Use resource_key such as file:index.html, glob:src/**, route:GET /api/users, or db:table:users.".to_string(),
-        "checkpoint" => "Send one short summary of what has been done so far. Rust attaches task/session/file context and forwards it to Cloud MCP.".to_string(),
-        "submit_patch" => "Submit the current task patch for validation and automatic safe integration when possible.".to_string(),
+        "start_task" => "Start the coordination task only after read-only inspection, immediately before editing. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, and patches.".to_string(),
+        "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
+        "checkpoint" => "Send one short summary only while an active started task exists. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "submit_patch" => "Submit the current task patch for validation and automatic safe integration when possible. You must pass the task_id returned by start_task.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
     }
 }
@@ -1573,8 +1776,8 @@ fn tool_input_schema(name: &str) -> Value {
         "start_task" => json!({
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "Optional existing server task_id returned by start_task. Omit this on the first call."},
-                "plan": {"type": "string", "description": "Required short explanation of what you are about to do before editing."}
+                "task_id": {"type": "string", "description": "Optional existing task_id when continuing a previously started task. Omit this on the first call."},
+                "plan": {"type": "string", "description": "Required short explanation of the edit you are about to make. Do not call start_task for read-only inspection."}
             },
             "required": ["plan"],
             "additionalProperties": true
@@ -1582,30 +1785,32 @@ fn tool_input_schema(name: &str) -> Value {
         "acquire_lease" => json!({
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "Existing local task id; defaults to the current session task when available."},
+                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
                 "resource_key": {"type": "string", "description": "Required normalized resource key, for example file:index.html or glob:src/**. Do not send paths[]."},
                 "mode": {"type": "string", "description": "Lease mode, usually write.", "default": "write"},
                 "ttl_seconds": {"type": "integer", "description": "Optional lease TTL."},
                 "reason": {"type": "string", "description": "Short public reason for the lease."}
             },
-            "required": ["resource_key"],
+            "required": ["task_id", "resource_key"],
             "additionalProperties": true
         }),
         "checkpoint" => json!({
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "One short public summary of what has been done so far."}
+                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
+                "summary": {"type": "string", "description": "One short public summary of active task progress. Do not call checkpoint before start_task."}
             },
-            "required": ["summary"],
+            "required": ["task_id", "summary"],
             "additionalProperties": true
         }),
         "submit_patch" => json!({
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "Existing local task id; defaults to the current session task when available."},
+                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
                 "worktree_id": {"type": "string", "description": "Optional; defaults to the current session worktree when available."},
                 "summary": {"type": "string", "description": "Short public summary of the completed changes."}
             },
+            "required": ["task_id"],
             "additionalProperties": true
         }),
         _ => json!({"type": "object", "additionalProperties": true}),
@@ -1629,6 +1834,75 @@ mod tests {
             cloud_start_task_id(&response).as_deref(),
             Some("server-task-123")
         );
+    }
+
+    #[test]
+    fn checkpoint_without_active_task_is_rejected_before_event() {
+        let root =
+            std::env::temp_dir().join(format!("diffforge_checkpoint_guard_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let kernel = CoordinationKernel::init(&root, None).unwrap();
+
+        let result = kernel_checkpoint(
+            &kernel,
+            &json!({
+                "summary": "Inspected files",
+                "agent_id": "agent-test",
+                "session_id": "session-test",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(
+            result["error"]["code"].as_str(),
+            Some("checkpoint_requires_active_task")
+        );
+        let checkpoint_events = kernel
+            .query_json(
+                "SELECT event_type FROM events WHERE event_type='agent_checkpoint'",
+                &[],
+            )
+            .unwrap();
+        assert!(checkpoint_events.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_for_unclaimed_task_is_rejected_before_event() {
+        let root =
+            std::env::temp_dir().join(format!("diffforge_checkpoint_unclaimed_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let kernel = CoordinationKernel::init(&root, None).unwrap();
+        let task = kernel
+            .create_task("Read-only exploration", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+
+        let result = kernel_checkpoint(
+            &kernel,
+            &json!({
+                "summary": "Inspected files",
+                "task_id": task_id,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(
+            result["error"]["code"].as_str(),
+            Some("checkpoint_task_not_active")
+        );
+        let checkpoint_events = kernel
+            .query_json(
+                "SELECT event_type FROM events WHERE event_type='agent_checkpoint'",
+                &[],
+            )
+            .unwrap();
+        assert!(checkpoint_events.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

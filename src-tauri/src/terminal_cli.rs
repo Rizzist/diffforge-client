@@ -616,10 +616,15 @@ fn terminal_args_with_codex_mcp_identity(
     _instance_id: u64,
 ) -> Vec<String> {
     let mut next = args.to_vec();
-    if !provider_id.to_ascii_lowercase().contains("codex") {
+    let provider_id = provider_id.to_ascii_lowercase();
+    let is_codex = provider_id.contains("codex");
+    let is_claude = provider_id.contains("claude");
+    if !is_codex && !is_claude {
         return next;
     }
-    apply_codex_terminal_display_args(&mut next);
+    if is_codex {
+        apply_codex_terminal_display_args(&mut next);
+    }
     let Some(coordination) = coordination else {
         return next;
     };
@@ -631,14 +636,6 @@ fn terminal_args_with_codex_mcp_identity(
     };
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
-
-    apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
-
-    next.push("-c".to_string());
-    next.push(format!(
-        "mcp_servers.coordination-kernel.command={}",
-        terminal_toml_string(&coordination.mcp_command)
-    ));
 
     let mut coordination_args =
         crate::coordination::mcp::proxy_args_for_repo(&coordination.repo_path);
@@ -667,25 +664,38 @@ fn terminal_args_with_codex_mcp_identity(
         }
     }
 
-    next.push("-c".to_string());
-    next.push(format!(
-        "mcp_servers.coordination-kernel.args={}",
-        terminal_toml_string_array(&coordination_args)
-    ));
-    next.push("-c".to_string());
-    next.push(format!(
-        "mcp_servers.coordination-kernel.default_tools_approval_mode={}",
-        terminal_toml_string("prompt")
-    ));
-    for tool in crate::coordination::mcp::TOOL_NAMES {
+    if is_codex {
+        apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
+
         next.push("-c".to_string());
         next.push(format!(
-            "mcp_servers.coordination-kernel.tools.{tool}.approval_mode={}",
-            terminal_toml_string("approve")
+            "mcp_servers.coordination-kernel.command={}",
+            terminal_toml_string(&coordination.mcp_command)
         ));
+
+        next.push("-c".to_string());
+        next.push(format!(
+            "mcp_servers.coordination-kernel.args={}",
+            terminal_toml_string_array(&coordination_args)
+        ));
+        next.push("-c".to_string());
+        next.push(format!(
+            "mcp_servers.coordination-kernel.default_tools_approval_mode={}",
+            terminal_toml_string("prompt")
+        ));
+        for tool in crate::coordination::mcp::TOOL_NAMES {
+            next.push("-c".to_string());
+            next.push(format!(
+                "mcp_servers.coordination-kernel.tools.{tool}.approval_mode={}",
+                terminal_toml_string("approve")
+            ));
+        }
+        next.push("-c".to_string());
+        next.push("shell_environment_policy.inherit=all".to_string());
     }
-    next.push("-c".to_string());
-    next.push("shell_environment_policy.inherit=all".to_string());
+    if is_claude {
+        apply_claude_coordinated_auto_approval_args(&mut next, coordination, &coordination_args);
+    }
     next
 }
 
@@ -714,12 +724,85 @@ fn apply_codex_coordinated_auto_approval_args(args: &mut Vec<String>, write_root
     }
 }
 
+fn apply_claude_coordinated_auto_approval_args(
+    args: &mut Vec<String>,
+    coordination: &TerminalCoordinationSession,
+    coordination_args: &[String],
+) {
+    if !terminal_args_have_any_option(args, &["--add-dir"])
+        && !coordination.repo_path.trim().is_empty()
+    {
+        args.push("--add-dir".to_string());
+        args.push(coordination.repo_path.clone());
+    }
+    if !terminal_args_have_any_option(args, &["--allowedTools", "--allowed-tools"]) {
+        args.push("--allowedTools".to_string());
+        args.push(claude_auto_approved_tools_arg());
+    }
+    if !terminal_args_have_any_option(args, &["--mcp-config"]) {
+        args.push("--mcp-config".to_string());
+        args.push(claude_coordination_mcp_config_arg(
+            coordination,
+            coordination_args,
+        ));
+    }
+}
+
+fn claude_auto_approved_tools_arg() -> String {
+    let mut tools = ["Read", "Glob", "Grep", "LS"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tools.extend(
+        crate::coordination::mcp::TOOL_NAMES
+            .iter()
+            .map(|tool| format!("mcp__coordination-kernel__{tool}")),
+    );
+    tools.join(",")
+}
+
+fn claude_coordination_mcp_config_arg(
+    coordination: &TerminalCoordinationSession,
+    coordination_args: &[String],
+) -> String {
+    json!({
+        "mcpServers": {
+            "coordination-kernel": {
+                "command": coordination.mcp_command.clone(),
+                "args": coordination_args,
+                "env": {
+                    "COORDINATION_ENABLED": "1",
+                    "COORDINATION_REPO_PATH": coordination.repo_path.clone(),
+                    "COORDINATION_DB_PATH": coordination.db_path.clone(),
+                    "COORDINATION_AGENT_ID": coordination.agent_id.clone(),
+                    "COORDINATION_SESSION_ID": coordination.session_id.clone(),
+                    "COORDINATION_MCP_ALWAYS_ON": "1"
+                },
+                "diffforge": {
+                    "scope": "terminal-session",
+                    "alwaysOn": true,
+                    "toggleable": false,
+                    "identitySource": "terminal_launch_args",
+                    "authority": "local_coordination_kernel"
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
 fn terminal_args_have_option(args: &[String], long: &str, short: &str) -> bool {
     args.iter().any(|arg| {
         arg == long
             || (!short.is_empty() && arg == short)
             || (!long.is_empty() && arg.starts_with(&format!("{long}=")))
     })
+}
+
+fn terminal_args_have_any_option(args: &[String], options: &[&str]) -> bool {
+    options
+        .iter()
+        .any(|option| terminal_args_have_option(args, option, ""))
 }
 
 fn terminal_toml_string_array(values: &[String]) -> String {

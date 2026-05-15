@@ -9,8 +9,10 @@ const DEFAULT_MAX_COLS = 400;
 const DEFAULT_MAX_ROWS = 160;
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
-const DEFAULT_DEBOUNCE_MS = 16;
-const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 100;
+const DEFAULT_DEBOUNCE_MS = 0;
+const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 260;
+const DEFAULT_NATIVE_RESIZE_COMMIT_MS = 260;
+const DEFAULT_WEBGL_ATLAS_CLEAR_AFTER_RESIZE_MS = 120;
 const MAX_INVALID_CELL_RETRIES = 30;
 const RESIZE_DIAGNOSTIC_SLOW_MS = 16;
 
@@ -273,6 +275,7 @@ export function createTerminalResizeController({
   maxRows = DEFAULT_MAX_ROWS,
   minCols = DEFAULT_MIN_COLS,
   minRows = DEFAULT_MIN_ROWS,
+  nativeResizeCommitMs = DEFAULT_NATIVE_RESIZE_COMMIT_MS,
   nativeResizeTrailingMs = DEFAULT_NATIVE_RESIZE_TRAILING_MS,
   onDone,
   onError,
@@ -281,6 +284,7 @@ export function createTerminalResizeController({
   onStart,
   paneId,
   term,
+  webglAtlasClearAfterResizeMs = DEFAULT_WEBGL_ATLAS_CLEAR_AFTER_RESIZE_MS,
 } = {}) {
   if (!container || !term || typeof ResizeObserver !== "function") {
     return null;
@@ -293,6 +297,10 @@ export function createTerminalResizeController({
   let lastNativeAppliedSize = null;
   let nativeInFlight = false;
   let nativePendingAfterFlight = false;
+  let nativeResizeBurstActive = false;
+  let nativeResizeBurstId = 0;
+  let nativeResizeBurstStartedAt = 0;
+  let nativeResizeBurstStartSize = null;
   let nativeResizeTimer = 0;
   let pendingNativeForce = false;
   let pendingNativeRequest = null;
@@ -300,6 +308,7 @@ export function createTerminalResizeController({
   let queuedForResizeFrame = false;
   let queuedResizeDeadlineMs = 0;
   let queuedResizeReason = "";
+  let webglAtlasClearTimer = 0;
 
   const getPaneId = () => getOptionValue(paneId, "");
   const getInstanceId = () => getOptionValue(instanceId, undefined);
@@ -314,10 +323,78 @@ export function createTerminalResizeController({
     nativeResizeTimer = 0;
   };
 
+  const clearWebglAtlasClearTimer = () => {
+    if (!webglAtlasClearTimer) {
+      return;
+    }
+
+    window.clearTimeout(webglAtlasClearTimer);
+    webglAtlasClearTimer = 0;
+  };
+
+  const clearWebglAtlasNow = (fields = {}) => {
+    const webglAddon = typeof getWebglAddon === "function" ? getWebglAddon() : null;
+    const clearTextureAtlas = webglAddon?.clearTextureAtlas;
+    if (typeof clearTextureAtlas !== "function") {
+      return false;
+    }
+
+    const atlasStartedAt = nowMs();
+    try {
+      clearTextureAtlas.call(webglAddon);
+    } catch {
+      return false;
+    }
+
+    logTerminalDiagnosticDuration(
+      "frontend.resize_webgl_atlas_clear.slow",
+      atlasStartedAt,
+      fields,
+      { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
+    );
+    return true;
+  };
+
+  const scheduleWebglAtlasClear = (fields = {}) => {
+    clearWebglAtlasClearTimer();
+
+    const delayMs = Math.max(0, Number(webglAtlasClearAfterResizeMs || 0));
+    webglAtlasClearTimer = window.setTimeout(() => {
+      webglAtlasClearTimer = 0;
+      clearWebglAtlasNow(fields);
+    }, delayMs);
+  };
+
+  const getNativeResizeDelayMs = (delayMs, force = false) => {
+    if (force) {
+      return Math.max(0, Number(delayMs || 0));
+    }
+
+    return Math.max(
+      0,
+      Number(delayMs ?? nativeResizeTrailingMs),
+      Number(nativeResizeCommitMs || 0),
+    );
+  };
+
+  const getNativeResizeSizeSignature = (request) => (
+    request
+      ? `${request.paneId || ""}:${request.instanceId || ""}:${request.cols || 0}x${request.rows || 0}`
+      : ""
+  );
+
+  const logNativeResizeCoalescing = (action, fields = {}) => {
+    logTerminalDiagnosticEvent("frontend.resize_native_coalesced", {
+      action,
+      ...fields,
+    });
+  };
+
   const flushNativeResize = async () => {
     nativeResizeTimer = 0;
 
     if (disposed || !pendingNativeRequest) {
+      nativeResizeBurstActive = false;
       return;
     }
 
@@ -329,9 +406,15 @@ export function createTerminalResizeController({
     const request = pendingNativeRequest;
     const reason = pendingNativeReason;
     const force = pendingNativeForce;
+    const burstId = nativeResizeBurstId;
+    const burstElapsedMs = nativeResizeBurstStartedAt ? nowMs() - nativeResizeBurstStartedAt : 0;
+    const burstStartSize = nativeResizeBurstStartSize;
     pendingNativeRequest = null;
     pendingNativeReason = "";
     pendingNativeForce = false;
+    nativeResizeBurstActive = false;
+    nativeResizeBurstStartedAt = 0;
+    nativeResizeBurstStartSize = null;
 
     if (
       !force
@@ -341,6 +424,14 @@ export function createTerminalResizeController({
       && lastNativeAppliedSize?.paneId === request.paneId
       && lastNativeAppliedSize?.instanceId === request.instanceId
     ) {
+      logNativeResizeCoalescing("skip_duplicate_commit", {
+        burstElapsedMs,
+        burstId,
+        cols: request.cols,
+        paneId: request.paneId || "",
+        reason,
+        rows: request.rows,
+      });
       return;
     }
 
@@ -359,6 +450,17 @@ export function createTerminalResizeController({
         },
         { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
       );
+      logNativeResizeCoalescing("commit", {
+        burstElapsedMs,
+        burstId,
+        cols: request.cols,
+        force,
+        paneId: request.paneId || "",
+        previousCols: burstStartSize?.cols ?? null,
+        previousRows: burstStartSize?.rows ?? null,
+        reason,
+        rows: request.rows,
+      });
       lastNativeAppliedSize = {
         cols: request.cols,
         instanceId: request.instanceId,
@@ -388,13 +490,53 @@ export function createTerminalResizeController({
       return;
     }
 
+    const normalizedDelayMs = getNativeResizeDelayMs(delayMs, force);
+    const previousPendingSignature = getNativeResizeSizeSignature(pendingNativeRequest);
+    const nextPendingSignature = getNativeResizeSizeSignature(request);
+    if (force) {
+      nativeResizeBurstActive = false;
+      nativeResizeBurstStartedAt = 0;
+      nativeResizeBurstStartSize = null;
+    } else if (!nativeResizeBurstActive) {
+      nativeResizeBurstActive = true;
+      nativeResizeBurstId += 1;
+      nativeResizeBurstStartedAt = nowMs();
+      nativeResizeBurstStartSize = lastNativeAppliedSize
+        ? {
+          cols: lastNativeAppliedSize.cols,
+          rows: lastNativeAppliedSize.rows,
+        }
+        : null;
+      logNativeResizeCoalescing("start", {
+        burstId: nativeResizeBurstId,
+        cols: request.cols,
+        delayMs: normalizedDelayMs,
+        paneId: request.paneId || "",
+        previousCols: nativeResizeBurstStartSize?.cols ?? null,
+        previousRows: nativeResizeBurstStartSize?.rows ?? null,
+        reason,
+        rows: request.rows,
+      });
+    } else if (previousPendingSignature !== nextPendingSignature) {
+      logNativeResizeCoalescing("retarget", {
+        burstElapsedMs: nowMs() - nativeResizeBurstStartedAt,
+        burstId: nativeResizeBurstId,
+        cols: request.cols,
+        delayMs: normalizedDelayMs,
+        paneId: request.paneId || "",
+        previousPending: previousPendingSignature,
+        reason,
+        rows: request.rows,
+      });
+    }
+
     pendingNativeRequest = request;
     pendingNativeReason = reason;
     pendingNativeForce = Boolean(force);
     clearNativeResizeTimer();
     nativeResizeTimer = window.setTimeout(
       flushNativeResize,
-      Math.max(0, delayMs),
+      normalizedDelayMs,
     );
   };
 
@@ -433,6 +575,15 @@ export function createTerminalResizeController({
   };
 
   const observer = new ResizeObserver(() => {
+    if (Math.max(0, Number(debounceMs || 0)) <= 0) {
+      resizeNow("resize_observer", {
+        deferWebglAtlasClear: true,
+        frontendFirst: true,
+        nativeDelayMs: nativeResizeTrailingMs,
+      });
+      return;
+    }
+
     schedule("resize_observer", debounceMs);
   });
 
@@ -530,39 +681,40 @@ export function createTerminalResizeController({
       request.instanceId = resolvedInstanceId;
     }
 
-    callSafely(onStart, {
-      ...measurement,
-      reason,
-      request,
-    });
+    const notifyStart = () => {
+      callSafely(onStart, {
+        ...measurement,
+        reason,
+        request,
+      });
+    };
+
+    if (!options.frontendFirst) {
+      notifyStart();
+    }
 
     try {
       const termResizeStartedAt = nowMs();
       term.resize(cols, rows);
       const termResizeMs = nowMs() - termResizeStartedAt;
 
-      const webglAddon = typeof getWebglAddon === "function" ? getWebglAddon() : null;
-      const clearTextureAtlas = webglAddon?.clearTextureAtlas;
-      const clearedTextureAtlas = typeof clearTextureAtlas === "function";
+      if (options.frontendFirst) {
+        notifyStart();
+      }
 
-      if (clearedTextureAtlas) {
-        const atlasStartedAt = nowMs();
-        try {
-          clearTextureAtlas.call(webglAddon);
-        } catch {
-          // WebGL atlas clearing is best-effort; xterm has already accepted the grid.
-        }
-        logTerminalDiagnosticDuration(
-          "frontend.resize_webgl_atlas_clear.slow",
-          atlasStartedAt,
-          {
-            cols,
-            paneId: request.paneId || "",
-            reason,
-            rows,
-          },
-          { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
-        );
+      const atlasFields = {
+        cols,
+        paneId: request.paneId || "",
+        reason,
+        rows,
+      };
+      const deferredTextureAtlasClear = options.deferWebglAtlasClear === true;
+      const clearedTextureAtlas = deferredTextureAtlasClear
+        ? false
+        : clearWebglAtlasNow(atlasFields);
+
+      if (deferredTextureAtlasClear) {
+        scheduleWebglAtlasClear(atlasFields);
       }
 
       const elapsedMs = nowMs() - resizeStartedAt;
@@ -570,6 +722,7 @@ export function createTerminalResizeController({
         "frontend.resize.slow",
         {
           clearedTextureAtlas,
+          deferredTextureAtlasClear,
           cols,
           elapsedMs,
           measureMs,
@@ -585,6 +738,7 @@ export function createTerminalResizeController({
       callSafely(onDone, {
         ...measurement,
         clearedTextureAtlas,
+        deferredTextureAtlasClear,
         elapsedMs: nowMs() - measuredAt,
         reason,
       });
@@ -612,6 +766,10 @@ export function createTerminalResizeController({
       queuedForResizeFrame = false;
       removeResizeController(controller);
       clearNativeResizeTimer();
+      clearWebglAtlasClearTimer();
+      nativeResizeBurstActive = false;
+      nativeResizeBurstStartedAt = 0;
+      nativeResizeBurstStartSize = null;
       observer.disconnect();
     },
     flushScheduledResize,

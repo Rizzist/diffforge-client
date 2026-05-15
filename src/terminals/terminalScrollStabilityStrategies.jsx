@@ -1,5 +1,5 @@
 const TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER = "normalizer";
-const TERMINAL_AGENT_STABILITY_KINDS = new Set(["claude", "codex"]);
+const TERMINAL_AGENT_STABILITY_KINDS = new Set(["codex", "claude"]);
 const TERMINAL_ESC = 0x1b;
 const TERMINAL_CSI = 0x5b;
 const TERMINAL_DEC_PRIVATE = 0x3f;

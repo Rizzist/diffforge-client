@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export const windowsterminaldiagnostics = true;
+export const windowsterminaldiagnostics = false;
 
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT = 512;
 

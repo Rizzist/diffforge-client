@@ -26,6 +26,7 @@ pub struct ApiErrorEnvelope {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCoordinationContext {
     pub agent_id: String,
+    pub agent_kind: String,
     pub agent_slot_id: Option<String>,
     pub slot_key: Option<String>,
     pub session_id: String,
@@ -53,6 +54,12 @@ impl TerminalCoordinationContext {
         let mut values = vec![
             ("COORDINATION_ENABLED".to_string(), "1".to_string()),
             ("COORDINATION_AGENT_ID".to_string(), self.agent_id.clone()),
+            (
+                "COORDINATION_AGENT_KIND".to_string(),
+                self.agent_kind.clone(),
+            ),
+            ("DIFFFORGE_AGENT_KIND".to_string(), self.agent_kind.clone()),
+            ("CLOUD_MCP_AGENT_KIND".to_string(), self.agent_kind.clone()),
             ("DIFFFORGE_AGENT_ID".to_string(), self.agent_id.clone()),
             ("CLOUD_MCP_AGENT_ID".to_string(), self.agent_id.clone()),
             (
@@ -183,7 +190,7 @@ impl TerminalCoordinationContext {
             .unwrap_or_else(|| "none".to_string());
         let mut banner = format!(
             "COORDINATION ENABLED\nProject root: {}\nAgent branch: {}\nAgent branch root: {}\nMerge target root: {}\n\
-Merge integration branch: diff-forge/integration\nShell cwd is this slot's isolated branch root. The shared project root remains read-only for coordinated agent work.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nThis slot reuses the same MCP config and branch root across sessions.\nCoordinator MCP: always on\nCloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called\nDo not edit the shared project root or another agent slot's worktree. Direct project-root or cross-worktree writes are policy violations and block patch/merge.\nBefore editing:\n1. call coordination-kernel.start_task with a short plan explaining what you are about to do. Rust sends that plan to Cloud MCP for spec classification, refreshes cloud context, then returns the current local task_id, branch root, and peer state.\n2. acquire_lease using resource_key values such as file:index.html or glob:src/**. Do not send paths[] to acquire_lease. If a lease says queued behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n3. edit only inside COORDINATION_AGENT_BRANCH_ROOT; never cd into .agents/worktrees for another slot to make changes.\n4. when Rust resumes a parked task, call start_task again with your continuation plan, inspect the refreshed target file/context first, then acquire the lease and continue.\n5. submit_patch when done. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\nFor autonomous intent-resolution tasks: treat current integration as source of truth, preserve every compatible task intent without asking the user, resolve only leased files, submit_patch, and never apply_merge.\nDo not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n",
+Merge integration branch: diff-forge/integration\nShell cwd is this slot's isolated branch root. The shared project root remains read-only for coordinated agent work.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nThis slot reuses the same MCP config and branch root across sessions.\nCoordinator MCP: always on\nCloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called\nDo not edit the shared project root or another agent slot's worktree. Direct project-root or cross-worktree writes are policy violations and block patch/merge.\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nBefore the first edit:\n1. call coordination-kernel.start_task only when you are ready to edit, with a short plan for the immediate change. Cloud MCP must return a task_id first; Rust then mirrors that exact id locally, refreshes cloud context, and returns the current task_id, branch root, and peer state.\n2. acquire_lease using the task_id returned by start_task and resource_key values such as file:index.html or glob:src/**. Do not send paths[] to acquire_lease. If a lease says queued behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n3. edit only inside COORDINATION_AGENT_BRANCH_ROOT; never cd into .agents/worktrees for another slot to make changes.\n4. when Rust resumes a parked task, inspect the refreshed target file/context first, then call start_task again with your continuation edit plan, acquire the lease with the returned task_id, and continue.\n5. call checkpoint with that task_id only while a task is active and after meaningful edit progress; do not checkpoint reconnaissance.\n6. submit_patch with that task_id when done. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\nFor autonomous intent-resolution tasks: treat current integration as source of truth, preserve every compatible task intent without asking the user, resolve only leased files, submit_patch, and never apply_merge.\nDo not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n",
             self.repo_path,
             branch,
             worktree,

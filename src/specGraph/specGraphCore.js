@@ -432,7 +432,79 @@ export function normalizeSnapshot(snapshot, options = {}) {
     edges,
     agentWork: snapshot?.agentWork || matrix?.agent_work || {},
     graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
+    taskHistory: normalizeTaskHistory(snapshot?.taskHistory || matrix?.task_history || matrix?.taskHistory || {}),
     workspaceDisplayIdentity: displayIdentity,
+  };
+}
+
+export function normalizeTaskHistory(rawHistory = {}) {
+  const tasks = Array.isArray(rawHistory?.tasks) ? rawHistory.tasks : [];
+  return {
+    ...rawHistory,
+    tasks: tasks.map((task, taskIndex) => normalizeHistoryTask(task, taskIndex)),
+  };
+}
+
+function normalizeHistoryTask(task, taskIndex) {
+  const taskId = text(field(task, "task_id", "taskId", "id"), `task-${taskIndex}`);
+  const nodes = Array.isArray(task?.nodes) ? task.nodes : [];
+  const mutations = Array.isArray(task?.mutations) ? task.mutations : [];
+  return {
+    ...task,
+    task_id: taskId,
+    taskId,
+    title: text(field(task, "title", "summary"), "Untitled task"),
+    original_prompt: text(field(task, "original_prompt", "originalPrompt", "prompt")),
+    prompt: text(field(task, "prompt", "original_prompt", "originalPrompt")),
+    start_task_plan: text(field(task, "start_task_plan", "startTaskPlan", "body")),
+    coding_agent: text(field(task, "coding_agent", "codingAgent", "agent_kind", "agentKind")),
+    agent_kind: text(field(task, "agent_kind", "agentKind", "coding_agent", "codingAgent")),
+    status: text(field(task, "status"), "unknown"),
+    agent_id: text(field(task, "agent_id", "agentId")),
+    first_mutation_at: text(field(task, "first_mutation_at", "firstMutationAt", "created_at", "createdAt")),
+    last_mutation_at: text(field(task, "last_mutation_at", "lastMutationAt", "updated_at", "updatedAt")),
+    mutation_count: Number(field(task, "mutation_count", "mutationCount")) || mutations.length,
+    rolled_back_count: Number(field(task, "rolled_back_count", "rolledBackCount")) || 0,
+    rollback_state: text(field(task, "rollback_state", "rollbackState"), "active"),
+    nodes: nodes.map((node, nodeIndex) => normalizeHistoryNode(node, nodeIndex)),
+    mutations: mutations.map((mutation, mutationIndex) => normalizeHistoryMutation(mutation, mutationIndex)),
+  };
+}
+
+function normalizeHistoryNode(node, nodeIndex) {
+  const nodeId = text(field(node, "node_id", "nodeId", "id"), `node-${nodeIndex}`);
+  const specChanges = Array.isArray(node?.spec_changes) ? node.spec_changes : [];
+  const structuralChanges = Array.isArray(node?.structural_changes) ? node.structural_changes : [];
+  return {
+    ...node,
+    id: nodeId,
+    node_id: nodeId,
+    title: text(field(node, "title", "path"), nodeId),
+    node_type: text(field(node, "node_type", "nodeType"), "node"),
+    path: text(field(node, "path")),
+    summary: text(field(node, "summary")),
+    mutation_count: Number(field(node, "mutation_count", "mutationCount")) || specChanges.length + structuralChanges.length,
+    spec_changes: specChanges.map((mutation, index) => normalizeHistoryMutation(mutation, index)),
+    structural_changes: structuralChanges.map((mutation, index) => normalizeHistoryMutation(mutation, index)),
+  };
+}
+
+function normalizeHistoryMutation(mutation, mutationIndex) {
+  return {
+    ...mutation,
+    id: text(field(mutation, "id"), `mutation-${mutationIndex}`),
+    mutation_kind: text(field(mutation, "mutation_kind", "mutationKind"), "changed"),
+    action: text(field(mutation, "action"), "changed"),
+    entity_type: text(field(mutation, "entity_type", "entityType")),
+    entity_id: text(field(mutation, "entity_id", "entityId")),
+    node_id: text(field(mutation, "node_id", "nodeId")),
+    spec_object_id: text(field(mutation, "spec_object_id", "specObjectId")),
+    before_statement: text(field(mutation, "before_statement", "beforeStatement")),
+    after_statement: text(field(mutation, "after_statement", "afterStatement")),
+    before_status: text(field(mutation, "before_status", "beforeStatus")),
+    after_status: text(field(mutation, "after_status", "afterStatus")),
+    rollback_state: text(field(mutation, "rollback_state", "rollbackState"), "active"),
+    created_at: text(field(mutation, "created_at", "createdAt")),
   };
 }
 

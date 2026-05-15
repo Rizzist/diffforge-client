@@ -3,7 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   collapseFunctionalRepoPathToCoreRepoPath,
@@ -320,7 +320,6 @@ import {
 } from "../app/appStyles";
 import {
   createTerminalResizeController,
-  getTerminalActualCellSize,
   measureTerminalGrid,
 } from "./terminalResizeController";
 import {
@@ -351,6 +350,76 @@ import {
   getTerminalAgentScrollStabilityMode,
   normalizeTerminalOutputBytes,
 } from "./terminalScrollStabilityStrategies.jsx";
+import {
+  TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES,
+  TERMINAL_CODEX_RESIZE_GATE_MAX_MS,
+  TERMINAL_CODEX_RESIZE_GATE_RETRY_MS,
+  TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS,
+  TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS,
+  TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
+  TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS,
+  TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS,
+  TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS,
+  TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS,
+  TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_DELAYS_MS,
+  TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS,
+  TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS,
+  TERMINAL_CLAUDE_RESIZE_BLANK_FRAME_GUARD_MS,
+  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_CHARS,
+  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_ROWS,
+  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_RATIO,
+  TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS,
+  TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_DELAYS_MS,
+  TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_THROTTLE_MS,
+  TERMINAL_SLASH_COMMAND_PROBE_DELAYS_MS,
+  TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS,
+  TERMINAL_STABILITY_RESIZE_PROBE_DELAYS_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_DELAYS_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_MAX_RETRIES,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS,
+  TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS,
+  adjustTerminalRowAfterDeletion,
+  applyCodexResizeTopArtifactPurge,
+  applyTerminalTransientHeaderArtifactCleanup,
+  coalesceCodexResizeRepaintBytes,
+  codexResizeGateSizesEqual,
+  concatTerminalByteArrays,
+  createCodexResizeGateState,
+  createCodexSlashMenuCloseCleanupState,
+  createSlashCommandDiagnosticState,
+  findTerminalViewportAnchorMatch,
+  getCodexResizeLiveTailCleanupPlan,
+  getCodexResizeTopArtifactAdjustment,
+  getCodexResizeTopArtifactPurgePlan,
+  getClaudeResizeDuplicateRepaintDecision,
+  getTerminalBufferRowsDiagnostic,
+  getTerminalBufferDiagnostics,
+  getTerminalCursorHomeDiagnostic,
+  getTerminalOutputByteStats,
+  getTerminalOutputControlProfile,
+  getTerminalOutputDebugFields,
+  getTerminalOutputVisibleCharCount,
+  getTerminalInputDebugFields,
+  getFirstCsiParam,
+  getCsiParamNumbers,
+  getTerminalRendererPaintDiagnostics,
+  getTerminalSlashCommandInputSummary,
+  getTerminalSlashCommandLineSnapshot,
+  getTerminalStabilityFeatureFlags,
+  getTerminalTransientHeaderArtifactCleanupPlan,
+  getTerminalViewportAnchorDiagnostic,
+  getWindowsTerminalCompactState,
+  hashTerminalDiagnosticText,
+  isWindowsTerminalGeometrySettled,
+  isTerminalSlashCommandDiagnosticAgentKind,
+  listenTerminalStabilityRuntimeEnabled,
+  normalizeCodexResizeGateSize,
+  readTerminalStabilityRuntimeEnabled,
+  sanitizeTerminalDiagnosticText,
+} from "./terminalStabilityRecovery.jsx";
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
@@ -371,7 +440,6 @@ const TERMINAL_START_METRIC_WAIT_MS = 900;
 const TERMINAL_START_METRIC_POLL_MS = 16;
 const TERMINAL_START_GEOMETRY_WAIT_MS = 1400;
 const TERMINAL_START_GEOMETRY_POLL_MS = 16;
-const TERMINAL_GEOMETRY_TOLERANCE_PX = 3;
 const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
 const TERMINAL_WEBGL_IDLE_DELAY_MS = 420;
 const TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS = 80;
@@ -709,24 +777,6 @@ const TERMINAL_ROLE_SWITCH_OPTIONS = [
 ];
 const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
 const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 80, 190, 280];
-const TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS = 140;
-const TERMINAL_CODEX_RESIZE_GATE_RETRY_MS = 48;
-const TERMINAL_CODEX_RESIZE_GATE_MAX_MS = 900;
-const TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES = 768 * 1024;
-const TERMINAL_CODEX_RESIZE_REPAINT_MIN_BYTES = 180;
-const TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS = 5000;
-const TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS = [0, 34, 120, 320];
-const TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS = 160;
-const TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS = 900;
-const TERMINAL_CODEX_RESIZE_TOP_ARTIFACT_LOOKAHEAD_ROWS = 24;
-const TERMINAL_CODEX_RESIZE_TOP_BLANK_PREFIX_MAX_ROWS = 4;
-const TERMINAL_CODEX_RESIZE_ARTIFACT_PURGE_MAX_ROWS = 64;
-const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS = 1200;
-const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS = [0, 16, 50, 140, 320, 700];
-const TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER = 2;
-const TERMINAL_RENDERER_DOM_ROW_SNAPSHOT_LIMIT = 10;
-const TERMINAL_DEC2026_SET_BYTES = new Uint8Array([0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x68]);
-const TERMINAL_DEC2026_RESET_BYTES = new Uint8Array([0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x6c]);
 
 function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -782,336 +832,11 @@ function isTerminalSessionMissingError(error) {
     || message.includes("terminal session not running");
 }
 
-function getTerminalInputDebugFields(data) {
-  const text = String(data || "");
-  const bytes = Array.from(new TextEncoder().encode(text));
-
-  return {
-    bytes: bytes.length,
-    chars: Array.from(text).length,
-    controlByteHex: bytes
-      .filter((byte) => byte < 32 || byte === 127)
-      .slice(0, 12)
-      .map((byte) => byte.toString(16).padStart(2, "0")),
-    escapeCount: bytes.filter((byte) => byte === 0x1b).length,
-    hasEscape: bytes.includes(0x1b),
-    isBareEscape: bytes.length === 1 && bytes[0] === 0x1b,
-    prefixHex: bytes.slice(0, 16).map((byte) => byte.toString(16).padStart(2, "0")),
-    startsWithEscape: bytes[0] === 0x1b,
-  };
-}
-
-function stripTerminalControlSequences(text) {
-  const value = String(text || "");
-  let output = "";
-  let index = 0;
-
-  while (index < value.length) {
-    const code = value.charCodeAt(index);
-
-    if (code === 0x1b) {
-      const next = value[index + 1] || "";
-
-      if (next === "[") {
-        index += 2;
-        while (index < value.length) {
-          const finalCode = value.charCodeAt(index);
-          index += 1;
-          if (finalCode >= 0x40 && finalCode <= 0x7e) {
-            break;
-          }
-        }
-        continue;
-      }
-
-      if (next === "]") {
-        index += 2;
-        while (index < value.length) {
-          const currentCode = value.charCodeAt(index);
-          if (currentCode === 0x07) {
-            index += 1;
-            break;
-          }
-          if (currentCode === 0x1b && value[index + 1] === "\\") {
-            index += 2;
-            break;
-          }
-          index += 1;
-        }
-        continue;
-      }
-
-      index += next ? 2 : 1;
-      continue;
-    }
-
-    if (code >= 0x20 && code !== 0x7f) {
-      output += value[index];
-    }
-    index += 1;
-  }
-
-  return output;
-}
-
 function isTerminalGeneratedReplyInput(data) {
   const text = String(data || "");
 
   return /^\x1b\[\d+;\d+R$/.test(text)
     || /^\x1b\[\??[0-9;]*c$/.test(text);
-}
-
-function getTerminalOutputDebugFields(data) {
-  const bytes = Array.from(data || []);
-  const text = new TextDecoder("utf-8", { fatal: false }).decode(data || new Uint8Array());
-  const displayText = stripTerminalControlSequences(text);
-  const displayChars = Array.from(displayText);
-
-  return {
-    bytes: bytes.length,
-    chars: displayChars.length,
-    controlByteHex: bytes
-      .filter((byte) => byte < 32 || byte === 127)
-      .slice(0, 16)
-      .map((byte) => byte.toString(16).padStart(2, "0")),
-    controlBytes: bytes.filter((byte) => byte < 32 || byte === 127).length,
-    escapeBytes: bytes.filter((byte) => byte === 0x1b).length,
-    hasEscape: bytes.includes(0x1b),
-    prefixHex: bytes.slice(0, 24).map((byte) => byte.toString(16).padStart(2, "0")),
-    printableChars: displayChars.length,
-    safePreview: displayChars
-      .slice(0, 120)
-      .join("")
-      .trim(),
-    startsWithEscape: bytes[0] === 0x1b,
-    visibleChars: displayChars.filter((character) => !/\s/.test(character)).length,
-  };
-}
-
-function getTerminalOutputVisibleCharCount(data, maxCount = Number.POSITIVE_INFINITY) {
-  if (!data?.length) {
-    return 0;
-  }
-
-  let visibleChars = 0;
-  let escapeMode = "";
-
-  for (let index = 0; index < data.length; index += 1) {
-    const byte = data[index];
-
-    if (escapeMode === "csi") {
-      if (byte >= 0x40 && byte <= 0x7e) {
-        escapeMode = "";
-      }
-      continue;
-    }
-
-    if (escapeMode === "osc") {
-      if (byte === 0x07) {
-        escapeMode = "";
-        continue;
-      }
-      if (byte === 0x1b && data[index + 1] === 0x5c) {
-        index += 1;
-        escapeMode = "";
-      }
-      continue;
-    }
-
-    if (byte === 0x1b) {
-      const nextByte = data[index + 1];
-      if (nextByte === 0x5b) {
-        escapeMode = "csi";
-        index += 1;
-      } else if (nextByte === 0x5d) {
-        escapeMode = "osc";
-        index += 1;
-      } else if (nextByte != null) {
-        index += 1;
-      }
-      continue;
-    }
-
-    if (byte > 0x20 && byte !== 0x7f) {
-      visibleChars += 1;
-      if (visibleChars >= maxCount) {
-        return visibleChars;
-      }
-    }
-  }
-
-  return visibleChars;
-}
-
-function findTerminalByteSequence(data, sequence, fromIndex = 0) {
-  if (!data?.length || !sequence?.length || sequence.length > data.length) {
-    return -1;
-  }
-
-  const maxStart = data.length - sequence.length;
-  for (let index = Math.max(0, fromIndex); index <= maxStart; index += 1) {
-    let matched = true;
-    for (let offset = 0; offset < sequence.length; offset += 1) {
-      if (data[index + offset] !== sequence[offset]) {
-        matched = false;
-        break;
-      }
-    }
-
-    if (matched) {
-      return index;
-    }
-  }
-
-  return -1;
-}
-
-function concatTerminalByteArrays(chunks) {
-  const totalBytes = chunks.reduce((total, chunk) => total + Number(chunk?.byteLength || 0), 0);
-  const combined = new Uint8Array(totalBytes);
-  let offset = 0;
-
-  chunks.forEach((chunk) => {
-    if (!chunk?.byteLength) {
-      return;
-    }
-
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  });
-
-  return combined;
-}
-
-function coalesceCodexResizeRepaintBytes(data) {
-  if (!data?.byteLength) {
-    return {
-      data,
-      droppedBytes: 0,
-      framesDropped: 0,
-      framesSeen: 0,
-    };
-  }
-
-  const frames = [];
-  let searchIndex = 0;
-
-  while (searchIndex < data.length) {
-    const start = findTerminalByteSequence(data, TERMINAL_DEC2026_SET_BYTES, searchIndex);
-    if (start < 0) {
-      break;
-    }
-
-    const reset = findTerminalByteSequence(
-      data,
-      TERMINAL_DEC2026_RESET_BYTES,
-      start + TERMINAL_DEC2026_SET_BYTES.length,
-    );
-    if (reset < 0) {
-      break;
-    }
-
-    const end = reset + TERMINAL_DEC2026_RESET_BYTES.length;
-    frames.push({ end, start });
-    searchIndex = end;
-  }
-
-  if (frames.length <= 1) {
-    return {
-      data,
-      droppedBytes: 0,
-      framesDropped: 0,
-      framesSeen: frames.length,
-    };
-  }
-
-  let selectedFrameIndex = frames.length - 1;
-  for (let index = frames.length - 1; index >= 0; index -= 1) {
-    const frame = frames[index];
-    if (frame.end - frame.start >= TERMINAL_CODEX_RESIZE_REPAINT_MIN_BYTES) {
-      selectedFrameIndex = index;
-      break;
-    }
-  }
-
-  const selectedFrame = frames[selectedFrameIndex];
-  const output = data.slice(selectedFrame.start);
-
-  return {
-    data: output,
-    droppedBytes: selectedFrame.start,
-    framesDropped: selectedFrameIndex,
-    framesSeen: frames.length,
-  };
-}
-
-function getTerminalOutputByteStats(data) {
-  if (!data?.length) {
-    return {
-      controlBytes: 0,
-      escapeBytes: 0,
-      visibleChars: 0,
-    };
-  }
-
-  let controlBytes = 0;
-  let escapeBytes = 0;
-  let visibleChars = 0;
-  let escapeMode = "";
-
-  for (let index = 0; index < data.length; index += 1) {
-    const byte = data[index];
-
-    if (byte < 0x20 || byte === 0x7f) {
-      controlBytes += 1;
-      if (byte === 0x1b) {
-        escapeBytes += 1;
-      }
-    }
-
-    if (escapeMode === "csi") {
-      if (byte >= 0x40 && byte <= 0x7e) {
-        escapeMode = "";
-      }
-      continue;
-    }
-
-    if (escapeMode === "osc") {
-      if (byte === 0x07) {
-        escapeMode = "";
-        continue;
-      }
-      if (byte === 0x1b && data[index + 1] === 0x5c) {
-        index += 1;
-        escapeMode = "";
-      }
-      continue;
-    }
-
-    if (byte === 0x1b) {
-      const nextByte = data[index + 1];
-      if (nextByte === 0x5b) {
-        escapeMode = "csi";
-        index += 1;
-      } else if (nextByte === 0x5d) {
-        escapeMode = "osc";
-        index += 1;
-      } else if (nextByte != null) {
-        index += 1;
-      }
-      continue;
-    }
-
-    if (byte > 0x20 && byte !== 0x7f) {
-      visibleChars += 1;
-    }
-  }
-
-  return {
-    controlBytes,
-    escapeBytes,
-    visibleChars,
-  };
 }
 
 function getTerminalKeyDebugFields(event, extraFields = {}) {
@@ -1366,1299 +1091,6 @@ export function getTerminalPaneMinSizePercent(panelCount) {
   return `${minimum.toFixed(2)}%`;
 }
 
-function getTerminalBufferDiagnostics(terminal) {
-  const buffer = terminal.buffer?.active;
-
-  if (!buffer) {
-    return null;
-  }
-
-  let nonEmptyViewportRows = 0;
-  let wrappedViewportRows = 0;
-  const viewportStart = Math.max(0, buffer.viewportY || 0);
-  const viewportEnd = Math.min(buffer.length || 0, viewportStart + (terminal.rows || 0));
-
-  for (let index = viewportStart; index < viewportEnd; index += 1) {
-    const line = buffer.getLine(index);
-
-    if (!line) {
-      continue;
-    }
-
-    if (line.isWrapped) {
-      wrappedViewportRows += 1;
-    }
-
-    if (line.translateToString(true).trim().length > 0) {
-      nonEmptyViewportRows += 1;
-    }
-  }
-
-  return {
-    baseY: buffer.baseY,
-    cursorX: buffer.cursorX,
-    cursorY: buffer.cursorY,
-    hasScrollback: Boolean(
-      buffer.type !== "alternate"
-      && (
-        Number(buffer.baseY || 0) > 0
-        || Number(buffer.length || 0) > Math.max(1, Number(terminal.rows) || TERMINAL_DEFAULT_ROWS)
-      ),
-    ),
-    length: buffer.length,
-    nonEmptyViewportRows,
-    type: buffer.type || "",
-    viewportY: buffer.viewportY,
-    wrappedViewportRows,
-  };
-}
-
-function getTerminalElementDiagnostics(element) {
-  if (!element) {
-    return null;
-  }
-
-  const bounds = typeof element.getBoundingClientRect === "function"
-    ? element.getBoundingClientRect()
-    : null;
-  const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
-    ? window.getComputedStyle(element)
-    : null;
-
-  return {
-    clientHeight: Math.round(Number(element.clientHeight || 0)),
-    clientWidth: Math.round(Number(element.clientWidth || 0)),
-    display: style?.display || "",
-    offsetHeight: Math.round(Number(element.offsetHeight || 0)),
-    offsetWidth: Math.round(Number(element.offsetWidth || 0)),
-    overflowY: style?.overflowY || "",
-    pointerEvents: style?.pointerEvents || "",
-    rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
-    rectWidth: bounds ? Math.round(Number(bounds.width || 0)) : 0,
-    scrollHeight: Math.round(Number(element.scrollHeight || 0)),
-    scrollTop: Math.round(Number(element.scrollTop || 0)),
-    visibility: style?.visibility || "",
-  };
-}
-
-function hashTerminalDiagnosticText(value) {
-  const text = String(value || "");
-  let hash = 2166136261;
-
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-function sanitizeTerminalDiagnosticText(value, maxLength = 140) {
-  return String(value || "")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .trimEnd()
-    .slice(0, maxLength);
-}
-
-function getTerminalRowTextDiagnostic(terminal, rowIndex) {
-  const line = terminal?.buffer?.active?.getLine?.(rowIndex);
-  const text = line?.translateToString?.(false) || "";
-  const trimmed = text.trimEnd();
-
-  return {
-    hash: hashTerminalDiagnosticText(trimmed),
-    isBlank: trimmed.trim().length <= 0,
-    isWrapped: Boolean(line?.isWrapped),
-    rowIndex: Math.max(0, Math.floor(Number(rowIndex || 0))),
-    text: sanitizeTerminalDiagnosticText(trimmed),
-    textLength: trimmed.length,
-  };
-}
-
-function getTerminalRowsTextDiagnostic(terminal, startIndex, rowCount) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      available: false,
-      rows: [],
-    };
-  }
-
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const start = Math.max(0, Math.min(bufferLength, Math.floor(Number(startIndex || 0))));
-  const count = Math.max(1, Math.floor(Number(rowCount || 1)));
-  const end = Math.max(start, Math.min(bufferLength, start + count));
-  const rows = [];
-  let blankRows = 0;
-  let nonEmptyRows = 0;
-
-  for (let rowIndex = start; rowIndex < end; rowIndex += 1) {
-    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
-    rows.push({
-      ...row,
-      offset: rowIndex - start,
-    });
-
-    if (row.isBlank) {
-      blankRows += 1;
-    } else {
-      nonEmptyRows += 1;
-    }
-  }
-
-  return {
-    available: true,
-    blankRows,
-    bufferLength,
-    end,
-    nonEmptyRows,
-    rowCount: rows.length,
-    rows,
-    start,
-  };
-}
-
-function getTerminalBufferRowsDiagnostic(terminal, startIndex, rowCount) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      available: false,
-      rowHashes: [],
-    };
-  }
-
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const start = Math.max(0, Math.min(bufferLength, Math.floor(Number(startIndex || 0))));
-  const count = Math.max(1, Math.floor(Number(rowCount || terminal?.rows || TERMINAL_DEFAULT_ROWS)));
-  const end = Math.max(start, Math.min(bufferLength, start + count));
-  const rowHashes = [];
-  let aggregateHash = "811c9dc5";
-  let blankPrefixRows = 0;
-  let blankSuffixRows = 0;
-  let firstNonEmptyRow = -1;
-  let lastNonEmptyRow = -1;
-  let nonEmptyRows = 0;
-  let wrappedRows = 0;
-
-  for (let index = start; index < end; index += 1) {
-    const line = buffer.getLine?.(index);
-    const text = line?.translateToString?.(false) || "";
-    const trimmed = text.trimEnd();
-    const rowHash = hashTerminalDiagnosticText(trimmed);
-    const isNonEmpty = trimmed.trim().length > 0;
-
-    rowHashes.push(rowHash);
-    aggregateHash = hashTerminalDiagnosticText(`${aggregateHash}:${rowHash}:${line?.isWrapped ? 1 : 0}`);
-
-    if (line?.isWrapped) {
-      wrappedRows += 1;
-    }
-
-    if (isNonEmpty) {
-      nonEmptyRows += 1;
-      if (firstNonEmptyRow < 0) {
-        firstNonEmptyRow = index - start;
-      }
-      lastNonEmptyRow = index - start;
-    } else if (nonEmptyRows === 0) {
-      blankPrefixRows += 1;
-    }
-  }
-
-  for (let offset = rowHashes.length - 1; offset >= 0; offset -= 1) {
-    const line = buffer.getLine?.(start + offset);
-    const trimmed = (line?.translateToString?.(false) || "").trimEnd();
-    if (trimmed.trim().length > 0) {
-      break;
-    }
-    blankSuffixRows += 1;
-  }
-
-  return {
-    aggregateHash,
-    available: true,
-    baseY: Number(buffer.baseY || 0),
-    blankPrefixRows,
-    blankSuffixRows,
-    bufferLength,
-    cursorX: Number(buffer.cursorX || 0),
-    cursorY: Number(buffer.cursorY || 0),
-    end,
-    firstNonEmptyRow,
-    lastNonEmptyRow,
-    nonEmptyRows,
-    rowCount: end - start,
-    rowHashes,
-    start,
-    viewportY: Number(buffer.viewportY || 0),
-    wrappedRows,
-  };
-}
-
-function getTerminalRowFingerprint(terminal, rowIndex) {
-  const line = terminal?.buffer?.active?.getLine?.(rowIndex);
-  const text = line?.translateToString?.(false) || "";
-  const trimmed = text.trimEnd();
-  const semanticHash = hashTerminalDiagnosticText(trimmed);
-
-  return {
-    hash: hashTerminalDiagnosticText(`${semanticHash}:${line?.isWrapped ? 1 : 0}`),
-    isNonEmpty: trimmed.trim().length > 0,
-    isWrapped: Boolean(line?.isWrapped),
-    semanticHash,
-    textLength: trimmed.length,
-  };
-}
-
-function getTerminalViewportAnchorDiagnostic(terminal, maxAnchorRows = 6) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      available: false,
-      rows: [],
-    };
-  }
-
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const viewportY = Math.max(0, Math.min(bufferLength, Number(buffer.viewportY || 0)));
-  const visibleEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + terminalRows));
-  const rows = [];
-
-  for (let index = viewportY; index < visibleEnd && rows.length < maxAnchorRows; index += 1) {
-    const fingerprint = getTerminalRowFingerprint(terminal, index);
-    if (!fingerprint.isNonEmpty) {
-      continue;
-    }
-
-    rows.push({
-      hash: fingerprint.hash,
-      isWrapped: fingerprint.isWrapped,
-      offset: index - viewportY,
-      semanticHash: fingerprint.semanticHash,
-      textLength: fingerprint.textLength,
-    });
-  }
-
-  return {
-    available: rows.length > 0,
-    baseY: Number(buffer.baseY || 0),
-    bufferLength,
-    firstOffset: rows[0]?.offset ?? 0,
-    maxOffset: rows.reduce((max, row) => Math.max(max, Number(row.offset || 0)), 0),
-    rowCount: rows.length,
-    rows,
-    terminalRows,
-    viewportY,
-  };
-}
-
-function scoreTerminalViewportAnchorAt(terminal, anchor, candidateViewportY) {
-  const anchorRows = Array.isArray(anchor?.rows) ? anchor.rows : [];
-  if (!anchorRows.length) {
-    return {
-      matches: 0,
-      requiredMatches: 1,
-    };
-  }
-
-  let matches = 0;
-  anchorRows.forEach((anchorRow) => {
-    const rowIndex = candidateViewportY + Number(anchorRow.offset || 0);
-    const fingerprint = getTerminalRowFingerprint(terminal, rowIndex);
-    if (
-      fingerprint.hash === anchorRow.hash
-      && fingerprint.isWrapped === anchorRow.isWrapped
-    ) {
-      matches += 1;
-    }
-  });
-
-  return {
-    matches,
-    requiredMatches: Math.min(3, Math.max(1, anchorRows.length)),
-  };
-}
-
-function findTerminalViewportAnchorMatch(terminal, anchor, preferredViewportY) {
-  const buffer = terminal?.buffer?.active;
-  const anchorRows = Array.isArray(anchor?.rows) ? anchor.rows : [];
-
-  if (!buffer || !anchor?.available || !anchorRows.length) {
-    return {
-      matched: false,
-      matches: 0,
-      preferredViewportY: 0,
-      viewportY: -1,
-    };
-  }
-
-  const baseY = Math.max(0, Number(buffer.baseY || 0));
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const maxOffset = Math.max(0, Number(anchor.maxOffset || 0));
-  const maxCandidate = Math.max(0, Math.min(baseY, bufferLength - maxOffset - 1));
-  const preferred = Math.max(0, Math.min(maxCandidate, Math.floor(Number(preferredViewportY || 0))));
-  const requiredMatches = Math.min(3, Math.max(1, anchorRows.length));
-  let best = null;
-
-  const consider = (candidateViewportY) => {
-    const candidate = Math.max(0, Math.min(maxCandidate, Math.floor(Number(candidateViewportY || 0))));
-    const score = scoreTerminalViewportAnchorAt(terminal, anchor, candidate);
-    if (score.matches < requiredMatches) {
-      return;
-    }
-
-    const distance = Math.abs(candidate - preferred);
-    if (
-      !best
-      || score.matches > best.matches
-      || (score.matches === best.matches && distance < best.distance)
-    ) {
-      best = {
-        distance,
-        matches: score.matches,
-        viewportY: candidate,
-      };
-    }
-  };
-
-  const nearStart = Math.max(0, preferred - 40);
-  const nearEnd = Math.min(maxCandidate, preferred + 40);
-  for (let candidate = nearStart; candidate <= nearEnd; candidate += 1) {
-    consider(candidate);
-  }
-
-  if (!best) {
-    for (let candidate = 0; candidate <= maxCandidate; candidate += 1) {
-      if (candidate >= nearStart && candidate <= nearEnd) {
-        continue;
-      }
-      consider(candidate);
-    }
-  }
-
-  if (!best) {
-    return {
-      matched: false,
-      matches: 0,
-      preferredViewportY: preferred,
-      requiredMatches,
-      viewportY: -1,
-    };
-  }
-
-  return {
-    distance: best.distance,
-    matched: true,
-    matches: best.matches,
-    preferredViewportY: preferred,
-    requiredMatches,
-    viewportY: best.viewportY,
-  };
-}
-
-function isCodexBannerTopBorderText(value) {
-  const text = sanitizeTerminalDiagnosticText(value).trim();
-
-  return /^╭[─\s]+╮?$/.test(text);
-}
-
-function isCodexBannerBottomBorderText(value) {
-  const text = sanitizeTerminalDiagnosticText(value).trim();
-
-  return /^╰[─\s]+╯?$/.test(text);
-}
-
-function isCodexBannerTitleText(value) {
-  return /OpenAI Codex/.test(sanitizeTerminalDiagnosticText(value));
-}
-
-function isCodexResizeBannerArtifactText(value) {
-  const text = sanitizeTerminalDiagnosticText(value).trim();
-
-  return text.length <= 0
-    || isCodexBannerTopBorderText(text)
-    || isCodexBannerBottomBorderText(text)
-    || isCodexBannerTitleText(text)
-    || /^│\s*│?$/.test(text)
-    || /^│\s*model:\s+/i.test(text)
-    || /^│\s*directory:\s+/i.test(text)
-    || /^│$/.test(text);
-}
-
-function getCodexResizeTopArtifactAdjustment(terminal, candidateViewportY) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      adjusted: false,
-      reason: "buffer_unavailable",
-      viewportY: Math.max(0, Math.floor(Number(candidateViewportY || 0))),
-    };
-  }
-
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const baseY = Math.max(0, Math.min(bufferLength, Number(buffer.baseY || 0)));
-  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const maxViewportY = Math.max(0, Math.min(baseY, bufferLength - 1));
-  const viewportY = Math.max(0, Math.min(maxViewportY, Math.floor(Number(candidateViewportY || 0))));
-  const distanceToLiveTop = baseY - viewportY;
-
-  if (distanceToLiveTop <= 0) {
-    return {
-      adjusted: false,
-      baseY,
-      distanceToLiveTop,
-      reason: "at_live_top",
-      viewportY,
-    };
-  }
-
-  if (distanceToLiveTop > terminalRows + 4) {
-    return {
-      adjusted: false,
-      baseY,
-      distanceToLiveTop,
-      reason: "too_far_from_live_top",
-      viewportY,
-    };
-  }
-
-  const scanRows = Math.min(
-    TERMINAL_CODEX_RESIZE_TOP_ARTIFACT_LOOKAHEAD_ROWS,
-    Math.max(terminalRows, distanceToLiveTop + 8),
-  );
-  const scanEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + scanRows));
-  const preLiveBlankRows = [];
-  const preLiveNonBlankRows = [];
-  const preLiveTopBorderRows = [];
-  const preLiveTitleRows = [];
-  const liveTitleRows = [];
-
-  for (let rowIndex = viewportY; rowIndex < scanEnd; rowIndex += 1) {
-    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
-
-    if (rowIndex < baseY) {
-      if (row.isBlank) {
-        preLiveBlankRows.push(rowIndex);
-      } else {
-        preLiveNonBlankRows.push(rowIndex);
-      }
-
-      if (isCodexBannerTopBorderText(row.text)) {
-        preLiveTopBorderRows.push(rowIndex);
-      }
-    }
-
-    if (!isCodexBannerTitleText(row.text)) {
-      continue;
-    }
-
-    if (rowIndex < baseY) {
-      preLiveTitleRows.push(rowIndex);
-    } else {
-      liveTitleRows.push(rowIndex);
-    }
-  }
-
-  const hasRepeatedTopBorders = preLiveTopBorderRows.length >= 2;
-  const hasStrayTopBorderBeforeLive = preLiveTopBorderRows.length > 0 && liveTitleRows.length > 0;
-  const hasBlankPrefixBeforeLive = preLiveBlankRows.length > 0
-    && preLiveBlankRows.length <= TERMINAL_CODEX_RESIZE_TOP_BLANK_PREFIX_MAX_ROWS
-    && preLiveNonBlankRows.length === 0
-    && liveTitleRows.length > 0;
-  const hasSplitBannerDuplicate = preLiveTitleRows.length > 0 && liveTitleRows.length > 0;
-
-  if (
-    !hasRepeatedTopBorders
-    && !hasStrayTopBorderBeforeLive
-    && !hasBlankPrefixBeforeLive
-    && !hasSplitBannerDuplicate
-  ) {
-    return {
-      adjusted: false,
-      baseY,
-      distanceToLiveTop,
-      liveTitleRows,
-      preLiveBlankRows,
-      preLiveNonBlankRows,
-      preLiveTitleRows,
-      preLiveTopBorderRows,
-      reason: "no_transient_banner_artifact",
-      viewportY,
-    };
-  }
-
-  return {
-    adjusted: true,
-    baseY,
-    distanceToLiveTop,
-    liveTitleRows,
-    preLiveBlankRows,
-    preLiveNonBlankRows,
-    preLiveTitleRows,
-    preLiveTopBorderRows,
-    reason: hasRepeatedTopBorders
-      ? "repeated_codex_banner_top_borders"
-      : hasStrayTopBorderBeforeLive
-        ? "stray_codex_banner_top_border_before_live"
-        : hasBlankPrefixBeforeLive
-          ? "blank_prefix_before_live_codex_banner"
-          : "split_codex_banner_duplicate",
-    viewportY: baseY,
-    wasViewportY: viewportY,
-  };
-}
-
-function getTerminalInternalActiveBuffer(terminal) {
-  return terminal?._core?._bufferService?.buffer
-    || terminal?._core?._bufferService?.buffers?.active
-    || null;
-}
-
-function adjustTerminalRowAfterDeletion(rowIndex, deleteStart, deleteCount) {
-  const row = Math.max(0, Math.floor(Number(rowIndex || 0)));
-  const start = Math.max(0, Math.floor(Number(deleteStart || 0)));
-  const count = Math.max(0, Math.floor(Number(deleteCount || 0)));
-  const end = start + count;
-
-  if (count <= 0 || row < start) {
-    return row;
-  }
-
-  if (row < end) {
-    return start;
-  }
-
-  return Math.max(0, row - count);
-}
-
-function getCodexResizeTopArtifactPurgePlan(terminal, topArtifactAdjustment) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer || !topArtifactAdjustment?.adjusted) {
-    return {
-      shouldPurge: false,
-      reason: "not_adjusted",
-    };
-  }
-
-  const baseY = Math.max(0, Math.floor(Number(topArtifactAdjustment.baseY || 0)));
-  const start = Math.max(0, Math.floor(Number(
-    topArtifactAdjustment.wasViewportY ?? topArtifactAdjustment.viewportY ?? 0,
-  )));
-  const rowCount = Math.max(0, baseY - start);
-
-  if (rowCount <= 0) {
-    return {
-      shouldPurge: false,
-      reason: "empty_range",
-    };
-  }
-
-  if (rowCount > TERMINAL_CODEX_RESIZE_ARTIFACT_PURGE_MAX_ROWS) {
-    return {
-      shouldPurge: false,
-      reason: "range_too_large",
-      rowCount,
-      start,
-    };
-  }
-
-  const rows = [];
-  const nonArtifactRows = [];
-  let artifactRows = 0;
-  let nonBlankRows = 0;
-
-  for (let rowIndex = start; rowIndex < baseY; rowIndex += 1) {
-    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
-    const isArtifact = isCodexResizeBannerArtifactText(row.text);
-    rows.push(row);
-    if (!row.isBlank) {
-      nonBlankRows += 1;
-    }
-    if (isArtifact) {
-      artifactRows += 1;
-    } else {
-      nonArtifactRows.push(row);
-    }
-  }
-
-  if (nonArtifactRows.length > 0) {
-    return {
-      nonArtifactRows,
-      reason: "range_contains_non_artifact_rows",
-      rowCount,
-      rows,
-      shouldPurge: false,
-      start,
-    };
-  }
-
-  if (nonBlankRows <= 0 && !topArtifactAdjustment.liveTitleRows?.length) {
-    return {
-      reason: "blank_range_without_live_banner",
-      rowCount,
-      rows,
-      shouldPurge: false,
-      start,
-    };
-  }
-
-  return {
-    artifactRows,
-    baseY,
-    nonBlankRows,
-    reason: topArtifactAdjustment.reason || "top_artifact",
-    rowCount,
-    rows,
-    shouldPurge: true,
-    start,
-  };
-}
-
-function applyCodexResizeTopArtifactPurge(terminal, purgePlan) {
-  if (!purgePlan?.shouldPurge) {
-    return {
-      purged: false,
-      reason: purgePlan?.reason || "no_plan",
-    };
-  }
-
-  const internalBuffer = getTerminalInternalActiveBuffer(terminal);
-  const lines = internalBuffer?.lines;
-
-  if (
-    !internalBuffer
-    || !lines
-    || typeof lines.splice !== "function"
-  ) {
-    return {
-      purged: false,
-      reason: "internal_buffer_unavailable",
-    };
-  }
-
-  const deleteStart = Math.max(0, Math.floor(Number(purgePlan.start || 0)));
-  const deleteCount = Math.max(0, Math.floor(Number(purgePlan.rowCount || 0)));
-
-  if (deleteCount <= 0 || deleteStart + deleteCount > Number(lines.length || 0)) {
-    return {
-      deleteCount,
-      deleteStart,
-      purged: false,
-      reason: "invalid_delete_range",
-    };
-  }
-
-  const beforeBaseY = Math.max(0, Number(internalBuffer.ybase || 0));
-  const beforeViewportY = Math.max(0, Number(internalBuffer.ydisp || 0));
-  const beforeSavedY = Math.max(0, Number(internalBuffer.savedY || 0));
-
-  try {
-    lines.splice(deleteStart, deleteCount);
-    internalBuffer.ybase = adjustTerminalRowAfterDeletion(beforeBaseY, deleteStart, deleteCount);
-    internalBuffer.ydisp = Math.min(
-      internalBuffer.ybase,
-      adjustTerminalRowAfterDeletion(beforeViewportY, deleteStart, deleteCount),
-    );
-    internalBuffer.savedY = adjustTerminalRowAfterDeletion(beforeSavedY, deleteStart, deleteCount);
-
-    const bufferService = terminal?._core?._bufferService;
-    try {
-      bufferService?._onScroll?.fire?.(internalBuffer.ydisp);
-    } catch (_error) {
-    }
-
-    return {
-      afterBaseY: Number(internalBuffer.ybase || 0),
-      afterViewportY: Number(internalBuffer.ydisp || 0),
-      beforeBaseY,
-      beforeViewportY,
-      deleteCount,
-      deleteStart,
-      purged: true,
-      reason: purgePlan.reason,
-    };
-  } catch (_error) {
-    return {
-      deleteCount,
-      deleteStart,
-      purged: false,
-      reason: "delete_failed",
-    };
-  }
-}
-
-function getTerminalBottomBandDiagnostic(terminal) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      available: false,
-    };
-  }
-
-  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const baseY = Math.max(0, Number(buffer.baseY || 0));
-  const viewportY = Math.max(0, Number(buffer.viewportY || 0));
-  const cursorX = Math.max(0, Number(buffer.cursorX || 0));
-  const cursorY = Math.max(0, Number(buffer.cursorY || 0));
-  const cursorAbsoluteRow = Math.max(0, Math.min(bufferLength - 1, baseY + cursorY));
-  const liveEnd = Math.max(baseY, Math.min(bufferLength, baseY + terminalRows));
-  const viewportEnd = Math.max(viewportY, Math.min(bufferLength, viewportY + terminalRows));
-  const cursorWindowStart = Math.max(baseY, cursorAbsoluteRow - 5);
-  const cursorWindowEnd = Math.min(liveEnd, cursorAbsoluteRow + 7);
-  const liveTailStart = Math.max(baseY, liveEnd - 10);
-  const viewportTailStart = Math.max(viewportY, viewportEnd - 10);
-  let blankRowsBelowCursor = 0;
-  let nonEmptyRowsBelowCursor = 0;
-  let firstNonEmptyBelowCursor = -1;
-  let lastNonEmptyBelowCursor = -1;
-
-  for (let rowIndex = cursorAbsoluteRow + 1; rowIndex < liveEnd; rowIndex += 1) {
-    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
-    if (row.isBlank) {
-      blankRowsBelowCursor += 1;
-    } else {
-      nonEmptyRowsBelowCursor += 1;
-      if (firstNonEmptyBelowCursor < 0) {
-        firstNonEmptyBelowCursor = rowIndex;
-      }
-      lastNonEmptyBelowCursor = rowIndex;
-    }
-  }
-
-  return {
-    available: true,
-    baseY,
-    blankRowsBelowCursor,
-    bufferLength,
-    cursorAbsoluteRow,
-    cursorLine: getTerminalRowTextDiagnostic(terminal, cursorAbsoluteRow),
-    cursorWindow: getTerminalRowsTextDiagnostic(terminal, cursorWindowStart, cursorWindowEnd - cursorWindowStart),
-    cursorX,
-    cursorY,
-    firstNonEmptyBelowCursor,
-    lastNonEmptyBelowCursor,
-    liveEnd,
-    liveTail: getTerminalRowsTextDiagnostic(terminal, liveTailStart, liveEnd - liveTailStart),
-    nonEmptyRowsBelowCursor,
-    terminalRows,
-    viewportEnd,
-    viewportTail: getTerminalRowsTextDiagnostic(terminal, viewportTailStart, viewportEnd - viewportTailStart),
-    viewportY,
-  };
-}
-
-function getTerminalTopBandDiagnostic(terminal) {
-  const buffer = terminal?.buffer?.active;
-
-  if (!buffer) {
-    return {
-      available: false,
-    };
-  }
-
-  const terminalRows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const bufferLength = Math.max(0, Number(buffer.length || 0));
-  const baseY = Math.max(0, Number(buffer.baseY || 0));
-  const viewportY = Math.max(0, Number(buffer.viewportY || 0));
-  const cursorX = Math.max(0, Number(buffer.cursorX || 0));
-  const cursorY = Math.max(0, Number(buffer.cursorY || 0));
-  const sampleRows = Math.min(12, terminalRows);
-  const viewportTop = getTerminalRowsTextDiagnostic(terminal, viewportY, sampleRows);
-  const liveTop = getTerminalRowsTextDiagnostic(terminal, baseY, sampleRows);
-  const viewportTexts = Array.isArray(viewportTop.rows)
-    ? viewportTop.rows.map((row) => row.text)
-    : [];
-  const liveTexts = Array.isArray(liveTop.rows)
-    ? liveTop.rows.map((row) => row.text)
-    : [];
-  const viewportCodexBannerRows = (viewportTop.rows || [])
-    .filter((row) => /OpenAI Codex/.test(row.text || ""))
-    .map((row) => row.rowIndex);
-  const liveCodexBannerRows = (liveTop.rows || [])
-    .filter((row) => /OpenAI Codex/.test(row.text || ""))
-    .map((row) => row.rowIndex);
-
-  return {
-    available: true,
-    baseMinusViewport: baseY - viewportY,
-    baseY,
-    bufferLength,
-    cursorX,
-    cursorY,
-    liveCodexBannerRows,
-    liveTop,
-    liveTopTextHash: hashTerminalDiagnosticText(liveTexts.join("\n")),
-    sampleRows,
-    terminalRows,
-    viewportCodexBannerRows,
-    viewportTop,
-    viewportTopTextHash: hashTerminalDiagnosticText(viewportTexts.join("\n")),
-    viewportY,
-  };
-}
-
-function isCodexComposerPromptText(value) {
-  return sanitizeTerminalDiagnosticText(value).trimStart().startsWith("›");
-}
-
-function isCodexExpectedComposerFooterText(value) {
-  const text = sanitizeTerminalDiagnosticText(value)
-    .replace(/^[│╭╰╮╯─\s]+/g, "")
-    .replace(/[│╭╰╮╯─\s]+$/g, "")
-    .trim();
-
-  return /^gpt-[\w.-]+(?:\s+[\w.-]+)?\s+·\s+\/.+/.test(text);
-}
-
-function isCodexExpectedComposerFooterBorderText(value) {
-  const text = sanitizeTerminalDiagnosticText(value).trim();
-
-  return /^[│╭╰╮╯─\s]+$/.test(text);
-}
-
-function areCodexExpectedComposerFooterRows(rows) {
-  const nonEmptyRows = Array.isArray(rows) ? rows : [];
-
-  if (
-    nonEmptyRows.length < 1
-    || nonEmptyRows.length > TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER + 1
-  ) {
-    return false;
-  }
-
-  let footerRows = 0;
-  for (const row of nonEmptyRows) {
-    const text = row?.text || "";
-    if (isCodexExpectedComposerFooterText(text)) {
-      footerRows += 1;
-      continue;
-    }
-
-    if (isCodexExpectedComposerFooterBorderText(text)) {
-      continue;
-    }
-
-    return false;
-  }
-
-  return footerRows >= 1;
-}
-
-function getCodexResizeLiveTailCleanupPlan(terminal) {
-  const bottomBand = getTerminalBottomBandDiagnostic(terminal);
-
-  if (!bottomBand.available) {
-    return {
-      bottomBand,
-      reason: "buffer_unavailable",
-      shouldClean: false,
-    };
-  }
-
-  const terminalRows = Math.max(1, Number(bottomBand.terminalRows || terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const cursorY = Math.max(0, Number(bottomBand.cursorY || 0));
-  const cursorAbsoluteRow = Math.max(0, Number(bottomBand.cursorAbsoluteRow || 0));
-  const liveEnd = Math.max(cursorAbsoluteRow, Number(bottomBand.liveEnd || 0));
-  const nonEmptyRowsBelow = [];
-
-  for (let rowIndex = cursorAbsoluteRow + 1; rowIndex < liveEnd; rowIndex += 1) {
-    const row = getTerminalRowTextDiagnostic(terminal, rowIndex);
-    if (!row.isBlank) {
-      nonEmptyRowsBelow.push(row);
-    }
-  }
-
-  const cursorText = bottomBand.cursorLine?.text || "";
-  const composerMatched = isCodexComposerPromptText(cursorText);
-  const hasOnlyExpectedFooter = areCodexExpectedComposerFooterRows(nonEmptyRowsBelow);
-
-  if (!composerMatched) {
-    return {
-      bottomBand,
-      composerMatched,
-      nonEmptyRowsBelow,
-      reason: "cursor_not_composer",
-      shouldClean: false,
-    };
-  }
-
-  if (cursorY >= terminalRows - 1) {
-    return {
-      bottomBand,
-      composerMatched,
-      nonEmptyRowsBelow,
-      reason: "cursor_on_last_row",
-      shouldClean: false,
-    };
-  }
-
-  if (!nonEmptyRowsBelow.length) {
-    return {
-      bottomBand,
-      composerMatched,
-      nonEmptyRowsBelow,
-      reason: "tail_already_blank",
-      shouldClean: false,
-    };
-  }
-
-  if (hasOnlyExpectedFooter) {
-    return {
-      bottomBand,
-      composerMatched,
-      nonEmptyRowsBelow,
-      reason: "expected_footer_only",
-      shouldClean: false,
-    };
-  }
-
-  const targetRow = Math.max(
-    1,
-    Math.min(
-      terminalRows,
-      cursorY + 2 + TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER,
-    ),
-  );
-  const nonEmptySignature = nonEmptyRowsBelow
-    .map((row) => `${row.rowIndex}:${row.hash}:${row.textLength}`)
-    .join("|");
-
-  return {
-    bottomBand,
-    composerMatched,
-    nonEmptyRowsBelow,
-    reason: "stale_live_tail",
-    preservedRowsBelowComposer: TERMINAL_CODEX_RESIZE_LIVE_TAIL_PRESERVE_ROWS_BELOW_COMPOSER,
-    sequence: `\x1b7\x1b[${targetRow};1H\x1b[0J\x1b8`,
-    shouldClean: true,
-    signature: [
-      terminal?.cols || 0,
-      terminalRows,
-      bottomBand.baseY,
-      cursorAbsoluteRow,
-      bottomBand.cursorLine?.hash || "",
-      nonEmptySignature,
-    ].join(":"),
-    targetRow,
-  };
-}
-
-function getTerminalCanvasDiagnostics(container) {
-  const canvases = Array.from(container?.querySelectorAll?.("canvas") || []);
-
-  return canvases.map((canvas, index) => {
-    const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
-      ? window.getComputedStyle(canvas)
-      : null;
-    const bounds = typeof canvas.getBoundingClientRect === "function"
-      ? canvas.getBoundingClientRect()
-      : null;
-
-    return {
-      className: String(canvas.className || ""),
-      clientHeight: Math.round(Number(canvas.clientHeight || 0)),
-      clientWidth: Math.round(Number(canvas.clientWidth || 0)),
-      height: Math.round(Number(canvas.height || 0)),
-      index,
-      opacity: style?.opacity || "",
-      rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
-      rectTop: bounds ? Math.round(Number(bounds.top || 0)) : 0,
-      rectWidth: bounds ? Math.round(Number(bounds.width || 0)) : 0,
-      styleHeight: style?.height || "",
-      styleTransform: style?.transform || "",
-      styleWidth: style?.width || "",
-      width: Math.round(Number(canvas.width || 0)),
-    };
-  });
-}
-
-function getTerminalRowsDomSnapshot(container, limit = TERMINAL_RENDERER_DOM_ROW_SNAPSHOT_LIMIT) {
-  const rowsElement = container?.querySelector?.(".xterm-rows") || null;
-  const screenElement = container?.querySelector?.(".xterm-screen") || null;
-  const textLayerElement = container?.querySelector?.(".xterm-text-layer") || null;
-  const containerBounds = typeof container?.getBoundingClientRect === "function"
-    ? container.getBoundingClientRect()
-    : null;
-  const rowsBounds = typeof rowsElement?.getBoundingClientRect === "function"
-    ? rowsElement.getBoundingClientRect()
-    : null;
-  const rowLimit = Math.max(0, Math.floor(Number(limit || 0)));
-  const rowElements = Array.from(rowsElement?.children || []).slice(0, rowLimit);
-
-  return {
-    childCount: Number(rowsElement?.children?.length || 0),
-    firstRows: rowElements.map((rowElement, index) => {
-      const bounds = typeof rowElement?.getBoundingClientRect === "function"
-        ? rowElement.getBoundingClientRect()
-        : null;
-      const style = typeof window !== "undefined" && typeof window.getComputedStyle === "function"
-        ? window.getComputedStyle(rowElement)
-        : null;
-
-      return {
-        childCount: Number(rowElement?.children?.length || 0),
-        className: String(rowElement?.className || ""),
-        index,
-        rectHeight: bounds ? Math.round(Number(bounds.height || 0)) : 0,
-        rectLeft: bounds && containerBounds
-          ? Math.round(Number(bounds.left || 0) - Number(containerBounds.left || 0))
-          : 0,
-        rectTop: bounds && containerBounds
-          ? Math.round(Number(bounds.top || 0) - Number(containerBounds.top || 0))
-          : 0,
-        styleHeight: style?.height || "",
-        styleTransform: style?.transform || "",
-        text: sanitizeTerminalDiagnosticText(rowElement?.textContent || "", 180),
-      };
-    }),
-    rowsElement: getTerminalElementDiagnostics(rowsElement),
-    rowsRectTop: rowsBounds && containerBounds
-      ? Math.round(Number(rowsBounds.top || 0) - Number(containerBounds.top || 0))
-      : 0,
-    screen: getTerminalElementDiagnostics(screenElement),
-    textLayer: getTerminalElementDiagnostics(textLayerElement),
-  };
-}
-
-function getTerminalRendererPaintDiagnostics(terminal, container, scrollableElement) {
-  const screenElement = container?.querySelector?.(".xterm-screen") || null;
-  const viewportElement = container?.querySelector?.(".xterm-viewport") || null;
-  const rowsElement = container?.querySelector?.(".xterm-rows") || null;
-  const textLayerElement = container?.querySelector?.(".xterm-text-layer") || null;
-  const cursorLayerElement = container?.querySelector?.(".xterm-cursor-layer") || null;
-  const containerBounds = typeof container?.getBoundingClientRect === "function"
-    ? container.getBoundingClientRect()
-    : null;
-  const screenBounds = typeof screenElement?.getBoundingClientRect === "function"
-    ? screenElement.getBoundingClientRect()
-    : null;
-  const dimensions = terminal?._core?._renderService?.dimensions || {};
-  const cssCanvas = dimensions?.css?.canvas || {};
-  const cssCell = dimensions?.css?.cell || {};
-  const deviceCanvas = dimensions?.device?.canvas || {};
-  const deviceCell = dimensions?.device?.cell || {};
-  const buffer = terminal?.buffer?.active;
-  const rows = Math.max(1, Number(terminal?.rows || TERMINAL_DEFAULT_ROWS));
-  const baseY = Number(buffer?.baseY || 0);
-  const viewportY = Number(buffer?.viewportY || 0);
-
-  return {
-    canvasCount: Number(container?.querySelectorAll?.("canvas")?.length || 0),
-    canvases: getTerminalCanvasDiagnostics(container),
-    cursorLayer: getTerminalElementDiagnostics(cursorLayerElement),
-    liveRows: getTerminalBufferRowsDiagnostic(terminal, baseY, rows),
-    paintBounds: {
-      containerHeight: containerBounds ? Math.round(Number(containerBounds.height || 0)) : 0,
-      cssPaintedBottom: container?.style?.getPropertyValue?.("--terminal-xterm-painted-bottom") || "",
-      screenBottom: screenBounds && containerBounds
-        ? Math.round(Number(screenBounds.bottom || 0) - Number(containerBounds.top || 0))
-        : 0,
-      unpaintedBottomPx: screenBounds && containerBounds
-        ? Math.max(0, Math.round(Number(containerBounds.bottom || 0) - Number(screenBounds.bottom || 0)))
-        : 0,
-    },
-    renderService: {
-      actualCellHeight: Number(dimensions.actualCellHeight || 0),
-      actualCellWidth: Number(dimensions.actualCellWidth || 0),
-      cssCanvasHeight: Number(cssCanvas.height || 0),
-      cssCanvasWidth: Number(cssCanvas.width || 0),
-      cssCellHeight: Number(cssCell.height || 0),
-      cssCellWidth: Number(cssCell.width || 0),
-      deviceCanvasHeight: Number(deviceCanvas.height || 0),
-      deviceCanvasWidth: Number(deviceCanvas.width || 0),
-      deviceCellHeight: Number(deviceCell.height || 0),
-      deviceCellWidth: Number(deviceCell.width || 0),
-    },
-    rowsDom: getTerminalRowsDomSnapshot(container),
-    rowsElement: getTerminalElementDiagnostics(rowsElement),
-    screen: getTerminalElementDiagnostics(screenElement),
-    scrollable: getTerminalElementDiagnostics(scrollableElement),
-    textLayer: getTerminalElementDiagnostics(textLayerElement),
-    topBand: getTerminalTopBandDiagnostic(terminal),
-    viewport: getTerminalElementDiagnostics(viewportElement),
-    viewportRows: getTerminalBufferRowsDiagnostic(terminal, viewportY, rows),
-  };
-}
-
-function getTerminalModesDiagnostics(terminal) {
-  try {
-    const modes = terminal?.modes;
-
-    return {
-      applicationCursorKeysMode: Boolean(modes?.applicationCursorKeysMode),
-      mouseTrackingMode: modes?.mouseTrackingMode || "unavailable",
-      originMode: Boolean(modes?.originMode),
-      sendFocusMode: Boolean(modes?.sendFocusMode),
-      wraparoundMode: Boolean(modes?.wraparoundMode),
-    };
-  } catch (_) {
-    return {
-      applicationCursorKeysMode: false,
-      mouseTrackingMode: "unavailable",
-      originMode: false,
-      sendFocusMode: false,
-      wraparoundMode: false,
-    };
-  }
-}
-
-function getCsiParamNumbers(params) {
-  if (!Array.isArray(params)) {
-    return [];
-  }
-
-  const numbers = [];
-  params.forEach((param) => {
-    const values = Array.isArray(param) ? param : [param];
-    values.forEach((value) => {
-      const number = Number(value);
-      if (Number.isFinite(number)) {
-        numbers.push(number);
-      }
-    });
-  });
-
-  return numbers;
-}
-
-function getFirstCsiParam(params, fallback = 0) {
-  const numbers = getCsiParamNumbers(params);
-  return numbers.length > 0 ? numbers[0] : fallback;
-}
-
-function getTerminalCursorHomeDiagnostic(params) {
-  const numbers = getCsiParamNumbers(params);
-
-  if (numbers.length === 0) {
-    return {
-      isHome: true,
-      variant: "bare",
-    };
-  }
-
-  if (numbers.length > 2) {
-    return {
-      isHome: false,
-      variant: "",
-    };
-  }
-
-  const row = numbers[0] ?? 1;
-  const column = numbers[1] ?? 1;
-  const rowIsHome = row === 0 || row === 1;
-  const columnIsHome = column === 0 || column === 1;
-
-  if (!rowIsHome || !columnIsHome) {
-    return {
-      isHome: false,
-      variant: "",
-    };
-  }
-
-  return {
-    isHome: true,
-    variant: numbers.length === 1 ? "omitted_column" : "explicit",
-  };
-}
-
-function getWindowsTerminalCompactState(terminal, container, scrollableElement) {
-  const buffer = getTerminalBufferDiagnostics(terminal) || {};
-  const viewportElement = container?.querySelector?.(".xterm-viewport") || null;
-  const screenElement = container?.querySelector?.(".xterm-screen") || null;
-  const containerState = getTerminalElementDiagnostics(container);
-  const viewportState = getTerminalElementDiagnostics(viewportElement);
-  const screenState = getTerminalElementDiagnostics(screenElement);
-  const scrollableState = getTerminalElementDiagnostics(scrollableElement);
-  const cellSize = getTerminalActualCellSize(terminal);
-  const cols = Number(terminal?.cols || 0);
-  const rows = Number(terminal?.rows || 0);
-  const cellWidth = Number(cellSize?.actualCellWidth || 0);
-  const cellHeight = Number(cellSize?.actualCellHeight || 0);
-  const validCellSize = Boolean(
-    cellSize?.valid
-    && Number.isFinite(cellWidth)
-    && Number.isFinite(cellHeight)
-    && cellWidth > 0
-    && cellHeight > 0,
-  );
-  const expectedScreenWidth = validCellSize ? Math.round(cols * cellWidth) : 0;
-  const expectedScreenHeight = validCellSize ? Math.round(rows * cellHeight) : 0;
-
-  return {
-    baseY: Number(buffer.baseY || 0),
-    bufferLength: Number(buffer.length || 0),
-    bufferType: buffer.type || "",
-    cellHeight,
-    cellWidth,
-    cols,
-    containerHeight: Number(containerState.clientHeight || 0),
-    containerWidth: Number(containerState.clientWidth || 0),
-    cursorX: Number(buffer.cursorX || 0),
-    cursorY: Number(buffer.cursorY || 0),
-    expectedScreenHeight,
-    expectedScreenWidth,
-    hasScrollback: Boolean(buffer.hasScrollback),
-    mouseTrackingMode: getTerminalModesDiagnostics(terminal).mouseTrackingMode,
-    rows,
-    screenHeight: Number(screenState.clientHeight || 0),
-    screenHeightDelta: Number(screenState.clientHeight || 0) - expectedScreenHeight,
-    screenWidth: Number(screenState.clientWidth || 0),
-    screenWidthDelta: Number(screenState.clientWidth || 0) - expectedScreenWidth,
-    scrollableHeight: Number(scrollableState.clientHeight || 0),
-    scrollableScrollHeight: Number(scrollableState.scrollHeight || 0),
-    scrollableScrollTop: Number(scrollableState.scrollTop || 0),
-    validCellSize,
-    viewportHeight: Number(viewportState.clientHeight || 0),
-    viewportScrollHeight: Number(viewportState.scrollHeight || 0),
-    viewportScrollTop: Number(viewportState.scrollTop || 0),
-    viewportWidth: Number(viewportState.clientWidth || 0),
-    viewportY: Number(buffer.viewportY || 0),
-  };
-}
-
-function isWindowsTerminalGeometrySettled(state, targetSize) {
-  if (!state || !targetSize) {
-    return false;
-  }
-
-  if (Number(state.cols || 0) !== Number(targetSize.cols || 0)) {
-    return false;
-  }
-
-  if (Number(state.rows || 0) !== Number(targetSize.rows || 0)) {
-    return false;
-  }
-
-  if (!state.validCellSize) {
-    return false;
-  }
-
-  if (
-    state.containerHeight <= 0
-    || state.containerWidth <= 0
-    || state.screenHeight <= 0
-    || state.screenWidth <= 0
-    || state.viewportHeight <= 0
-    || state.viewportWidth <= 0
-  ) {
-    return false;
-  }
-
-  const widthTolerance = Math.max(TERMINAL_GEOMETRY_TOLERANCE_PX, Math.ceil(Number(state.cellWidth || 0)));
-  const heightTolerance = Math.max(TERMINAL_GEOMETRY_TOLERANCE_PX, Math.ceil(Number(state.cellHeight || 0)));
-
-  return Math.abs(Number(state.screenWidthDelta || 0)) <= widthTolerance
-    && Math.abs(Number(state.screenHeightDelta || 0)) <= heightTolerance;
-}
-
 function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
@@ -2694,6 +1126,7 @@ function WorkspaceTerminal({
   const resizeControllerRef = useRef(null);
   const surfaceRef = useRef(null);
   const xtermRef = useRef(null);
+  const terminalStabilityRuntimeEnabledRef = useRef(readTerminalStabilityRuntimeEnabled());
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
@@ -2720,11 +1153,19 @@ function WorkspaceTerminal({
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
+  const isTerminalStabilityRuntimeEnabled = useCallback(
+    () => terminalStabilityRuntimeEnabledRef.current === true,
+    [],
+  );
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
+    agentKind: terminalAgentKind,
+    isGenericTerminal,
+  }), [isGenericTerminal, terminalAgentKind]);
   const terminalScrollStabilityMode = getTerminalAgentScrollStabilityMode({
     agentKind: terminalAgentKind,
     isMacHost: TERMINAL_IS_MACOS_HOST,
@@ -2732,6 +1173,7 @@ function WorkspaceTerminal({
   });
   const useNormalizerAgentScrollStability = terminalScrollStabilityMode
     === TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER
+    && terminalStabilityFeatures.normalizerPipeline
     && !isGenericTerminal;
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
@@ -2961,6 +1403,11 @@ function WorkspaceTerminal({
     patchTerminalMetrics({ terminalCount });
   }, [terminalCount]);
 
+  useEffect(() => listenTerminalStabilityRuntimeEnabled((enabled) => {
+    terminalStabilityRuntimeEnabledRef.current = enabled;
+    resizeControllerRef.current?.schedule?.("terminal_stability_runtime_toggle", 0);
+  }), []);
+
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
@@ -3187,9 +1634,14 @@ function WorkspaceTerminal({
     xtermRef.current = terminal;
 
     const terminalOutputNormalizer = createTerminalOutputNormalizer({
-      dropEraseDisplay2OutsideSync: terminalAgentKind === "codex",
-      enabled: useNormalizerAgentScrollStability,
+      dropEraseDisplay2OutsideSync: terminalStabilityFeatures.dropEraseDisplay2OutsideSync,
+      enabled: useNormalizerAgentScrollStability && terminalStabilityFeatures.outputNormalizer,
     });
+    const isTerminalStabilityRuntimeActive = () => isTerminalStabilityRuntimeEnabled();
+    const isTerminalOutputNormalizerActive = () => (
+      terminalOutputNormalizer.enabled
+      && isTerminalStabilityRuntimeActive()
+    );
     syncTerminalDiagnosticLogging();
     syncWindowsTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
@@ -3291,6 +1743,7 @@ function WorkspaceTerminal({
         scrollStabilityMode: terminalScrollStabilityMode || "off",
         scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
         scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
+        terminalStabilityFeatures,
         terminalIndex,
         useWebglRenderer,
         windowsPty: TERMINAL_IS_WINDOWS_HOST ? windowsPtyOptions?.backend || TERMINAL_WINDOWS_PTY_BACKEND : "",
@@ -3338,15 +1791,19 @@ function WorkspaceTerminal({
       throw new Error("Terminal container was not visible before renderer startup.");
     };
 
+    let getSlashCommandDiagnosticContext = () => null;
     const logWindowsTerminalCompactDiagnostic = (phase, fields = {}) => {
       if (!windowsTerminalDiagnosticsEnabled) {
         return;
       }
 
+      const slashCommand = getSlashCommandDiagnosticContext();
       logWindowsTerminalDiagnosticEvent(phase, {
         ...fields,
+        agentKind: terminalAgentKind,
         paneId,
         rendererMode,
+        ...(slashCommand ? { slashCommand } : {}),
         state: getWindowsTerminalCompactState(terminal, container, terminalScrollableElement),
         terminalIndex,
       });
@@ -3356,9 +1813,23 @@ function WorkspaceTerminal({
     let scheduleCodexResizePaintProbe = () => {};
     let logCodexResizePaintProbe = () => {};
     let isCodexResizePaintProbeActive = () => false;
+    let handleSlashCommandDiagnosticInput = () => {};
+    let isSlashCommandDiagnosticProbeActive = () => false;
+    let scheduleSlashCommandDiagnosticProbe = () => {};
+    let logSlashCommandDiagnosticProbe = () => {};
+    let markCodexSlashMenuCloseCleanup = () => {};
+    let markCodexSlashMenuOutputActivity = () => {};
     let applyCodexResizeScrollbackCleanup = () => false;
     let scheduleCodexResizeLiveTailCleanup = () => false;
     let handleCodexResizeCursorHomeSettled = () => {};
+    let scheduleTerminalStabilityResizeProbe = () => {};
+    let scheduleTransientHeaderArtifactCleanup = () => false;
+    let markTransientHeaderArtifactOutputActivity = () => {};
+    let markTransientHeaderArtifactRedrawActivity = () => {};
+    let markClaudeResizeBlankFrameGuardActive = () => {};
+    let shouldDropClaudeResizeBlankFrame = () => false;
+    let shouldDropClaudeResizeDuplicateRepaint = () => false;
+    let scheduleClaudeDuplicateRepaintVisualCleanup = () => false;
     let syncTerminalPaintBounds = () => false;
     let scheduleTerminalPaintBoundsSync = () => {};
 
@@ -3464,7 +1935,7 @@ function WorkspaceTerminal({
     };
 
     const registerWindowsTerminalControlDiagnostics = () => {
-      if (!windowsTerminalDiagnosticsEnabled) {
+      if (!windowsTerminalDiagnosticsEnabled && !terminalStabilityFeatures.transientHeaderArtifactCleanup) {
         return;
       }
 
@@ -3480,6 +1951,9 @@ function WorkspaceTerminal({
         const allParams = getCsiParamNumbers(params);
         const activeBufferType = getTerminalBufferDiagnostics(terminal)?.type || "";
         const control = actionParam === 3 ? "erase_saved_lines" : "erase_display";
+        markTransientHeaderArtifactRedrawActivity(control, {
+          params: allParams.length > 0 ? allParams : [actionParam],
+        });
 
         logWindowsTerminalControl(control, {
           action: "allow",
@@ -3514,6 +1988,17 @@ function WorkspaceTerminal({
               mode,
               params: interestingParams,
             });
+            if (
+              control === "alternate_buffer"
+              || control === "sync_output"
+              || mode === "reset"
+            ) {
+              markTransientHeaderArtifactRedrawActivity(control, {
+                mode,
+                params: interestingParams,
+              });
+            }
+
           }
 
           return false;
@@ -3533,8 +2018,10 @@ function WorkspaceTerminal({
           }
 
           const afterState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
-          logWindowsTerminalDiagnosticEvent("frontend.windows_terminal.cursor_home_settled", {
+          const includeRenderer = isSlashCommandDiagnosticProbeActive();
+          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.cursor_home_settled", {
             action: "allow",
+            afterState,
             beforeBaseY: Number(beforeState?.baseY || 0),
             beforeCursorX: Number(beforeState?.cursorX || 0),
             beforeCursorY: Number(beforeState?.cursorY || 0),
@@ -3545,13 +2032,11 @@ function WorkspaceTerminal({
             deltaCursorY: Number(afterState.cursorY || 0) - Number(beforeState?.cursorY || 0),
             deltaViewportY: Number(afterState.viewportY || 0) - Number(beforeState?.viewportY || 0),
             final,
-            paneId,
             params,
-            rendererMode,
+            ...(includeRenderer
+              ? { renderer: getTerminalRendererPaintDiagnostics(terminal, container, terminalScrollableElement) }
+              : {}),
             sequenceId,
-            source: "frontend",
-            state: afterState,
-            terminalIndex,
             variant,
           });
           handleCodexResizeCursorHomeSettled({
@@ -3572,6 +2057,11 @@ function WorkspaceTerminal({
           const homeDiagnostic = getTerminalCursorHomeDiagnostic(params);
           if (homeDiagnostic.isHome) {
             const beforeState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+            markTransientHeaderArtifactRedrawActivity("cursor_home", {
+              final,
+              params: allParams,
+              variant: homeDiagnostic.variant,
+            });
             const sequenceId = logWindowsTerminalControl("cursor_home", {
               action: "allow",
               final,
@@ -3665,7 +2155,21 @@ function WorkspaceTerminal({
 
     let windowsTerminalLastResizeLogAt = 0;
     disposables.push(terminal.onResize((event) => {
+      markTransientHeaderArtifactRedrawActivity("xterm_resize", {
+        cols: Number(event?.cols || 0),
+        rows: Number(event?.rows || 0),
+      });
+      markClaudeResizeBlankFrameGuardActive("xterm_resize", event);
       markCodexResizeGateActive("xterm_resize", event);
+      scheduleTerminalStabilityResizeProbe("xterm_resize", "xterm_resize", {
+        cols: Number(event?.cols || 0),
+        rows: Number(event?.rows || 0),
+      });
+      scheduleTransientHeaderArtifactCleanup("xterm_resize", {
+        cols: Number(event?.cols || 0),
+        rows: Number(event?.rows || 0),
+        source: "xterm_resize",
+      });
       syncTerminalPaintBounds("xterm_resize");
       scheduleTerminalPaintBoundsSync("xterm_resize_settled", [34, 120, 260]);
       const now = performance.now();
@@ -4222,6 +2726,26 @@ function WorkspaceTerminal({
         ? getTerminalOutputDebugFields(batchData)
         : { visibleChars: batchVisibleChars };
       const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
+      if (shouldDropClaudeResizeBlankFrame(batchData, {
+        outputDebug,
+        reason,
+        writes: writes.length,
+      })) {
+        if (pendingOutputWrites.length) {
+          scheduleTerminalOutputBatchFlush();
+        }
+        return;
+      }
+      if (shouldDropClaudeResizeDuplicateRepaint(batchData, {
+        outputDebug,
+        reason,
+        writes: writes.length,
+      })) {
+        if (pendingOutputWrites.length) {
+          scheduleTerminalOutputBatchFlush();
+        }
+        return;
+      }
       if (terminalDiagnosticsEnabled) {
         outputDiagnosticWriteBatches += 1;
         outputDiagnosticWriteBytes += batchBytes;
@@ -4237,6 +2761,15 @@ function WorkspaceTerminal({
       outputWriteInFlight = true;
       const handleTerminalWriteComplete = () => {
         outputWriteInFlight = false;
+        markTransientHeaderArtifactOutputActivity(batchBytes, {
+          reason,
+          writes: writes.length,
+        });
+        scheduleClaudeDuplicateRepaintVisualCleanup("after_output_write", {
+          batchBytes,
+          reason,
+          writes: writes.length,
+        });
         const writeCallbackMs = performance.now() - writeStartedAt;
         const elapsedMs = performance.now() - flushStartedAt;
         if (terminalDiagnosticsEnabled) {
@@ -4370,6 +2903,16 @@ function WorkspaceTerminal({
           }, [16, 80]);
         }
 
+        if (isSlashCommandDiagnosticProbeActive()) {
+          scheduleSlashCommandDiagnosticProbe("terminal_output_write", "after_output_write", {
+            batchBytes,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            reason,
+            writes: writes.length,
+          }, TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_DELAYS_MS);
+        }
+
         if (pendingOutputWrites.length) {
           scheduleTerminalOutputBatchFlush();
         }
@@ -4471,61 +3014,1286 @@ function WorkspaceTerminal({
       scheduleTerminalOutputBatchFlush();
     };
 
-    const codexResizeGate = {
-      active: false,
-      epoch: 0,
-      flushDueAt: 0,
-      flushTimer: 0,
-      lastObservedSize: null,
-      lastOutputPaintProbeAt: 0,
-      liveTailCleanupSequence: 0,
-      liveTailCleanupUntil: 0,
-      liveTailLastCleanedSignature: "",
-      paintProbeSequence: 0,
-      paintProbeUntil: 0,
-      previousSize: null,
-      queuedBytes: 0,
-      queuedWrites: [],
-      scrollbackCleanupAnchor: null,
-      scrollbackCleanupLastHandledBaseY: 0,
-      scrollbackCleanupLastTargetY: -1,
-      scrollbackCleanupStartBaseY: 0,
-      scrollbackCleanupStartedAtBottom: false,
-      scrollbackCleanupStartViewportY: 0,
-      scrollbackCleanupUntil: 0,
-      startedAtBottom: false,
-      startedAt: 0,
-      startState: null,
-      targetSize: null,
-    };
+    const codexResizeGate = createCodexResizeGateState();
     const isCodexResizeGateEnabled = () => (
-      terminalAgentKind === "codex"
+      isTerminalStabilityRuntimeActive()
+      && terminalStabilityFeatures.resizeGate
       && terminalOutputNormalizer.enabled
       && !isGenericTerminal
     );
-    const normalizeCodexResizeGateSize = (size) => {
-      const cols = Number(size?.cols || 0);
-      const rows = Number(size?.rows || 0);
+    const claudeResizeBlankFrameGuard = {
+      droppedDuplicateRepaints: 0,
+      droppedFrames: 0,
+      duplicateRepaintDecisions: 0,
+      epoch: 0,
+      lastDuplicateRepaintSignature: "",
+      lastDroppedSignature: "",
+      lastObservedSize: null,
+      pendingDuplicateRepaintVisualCleanup: null,
+      until: 0,
+    };
+    const isClaudeResizeBlankFrameGuardEnabled = () => (
+      isTerminalStabilityRuntimeActive()
+      && terminalStabilityFeatures.claudeResizeBlankFrameGuard === true
+      && terminalStabilityFeatures.normalizerPipeline
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const isClaudeResizeDuplicateRepaintGuardEnabled = () => (
+      isTerminalStabilityRuntimeActive()
+      && terminalStabilityFeatures.claudeResizeDuplicateRepaintGuard === true
+      && terminalStabilityFeatures.normalizerPipeline
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const isClaudeResizeRepaintGuardEnabled = () => (
+      isClaudeResizeBlankFrameGuardEnabled()
+      || isClaudeResizeDuplicateRepaintGuardEnabled()
+    );
+    const getCurrentTerminalResizeGateSize = () => normalizeCodexResizeGateSize({
+      cols: terminal.cols,
+      rows: terminal.rows,
+    });
+    markClaudeResizeBlankFrameGuardActive = (reason = "resize", size = null, options = {}) => {
+      if (!isClaudeResizeRepaintGuardEnabled()) {
+        return;
+      }
 
-      if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols <= 0 || rows <= 0) {
+      const targetSize = normalizeCodexResizeGateSize(size) || getCurrentTerminalResizeGateSize();
+      const now = performance.now();
+      const previousSize = claudeResizeBlankFrameGuard.lastObservedSize;
+      const sizeChanged = Boolean(previousSize)
+        && !codexResizeGateSizesEqual(previousSize, targetSize);
+
+      claudeResizeBlankFrameGuard.until = Math.max(
+        Number(claudeResizeBlankFrameGuard.until || 0),
+        now + TERMINAL_CLAUDE_RESIZE_BLANK_FRAME_GUARD_MS,
+      );
+      claudeResizeBlankFrameGuard.lastObservedSize = targetSize || previousSize;
+      if (sizeChanged || options.force === true) {
+        claudeResizeBlankFrameGuard.epoch += 1;
+      }
+
+      if (windowsTerminalDiagnosticsEnabled && (sizeChanged || options.force === true)) {
+        logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.claude_resize_blank_frame_guard", {
+          action: "activate",
+          epoch: claudeResizeBlankFrameGuard.epoch,
+          reason,
+          targetCols: targetSize?.cols || 0,
+          targetRows: targetSize?.rows || 0,
+          until: Number(claudeResizeBlankFrameGuard.until || 0),
+        });
+      }
+    };
+    scheduleClaudeDuplicateRepaintVisualCleanup = (reason = "after_output_write", extraFields = {}) => {
+      const pending = claudeResizeBlankFrameGuard.pendingDuplicateRepaintVisualCleanup;
+      if (!pending) {
+        return false;
+      }
+
+      claudeResizeBlankFrameGuard.pendingDuplicateRepaintVisualCleanup = null;
+      if (
+        !isTransientHeaderArtifactCleanupEnabled()
+        || performance.now() > Number(pending.until || 0)
+      ) {
+        return false;
+      }
+
+      return scheduleTransientHeaderArtifactCleanup("claude_duplicate_repaint_visual_fallback", {
+        ...pending.fields,
+        fallbackReason: reason,
+        source: "duplicate_repaint_guard_visual_fallback",
+        ...extraFields,
+      }, [0]);
+    };
+    shouldDropClaudeResizeBlankFrame = (data, options = {}) => {
+      if (
+        !isClaudeResizeBlankFrameGuardEnabled()
+        || !data?.byteLength
+        || performance.now() > Number(claudeResizeBlankFrameGuard.until || 0)
+      ) {
+        return false;
+      }
+
+      const outputDebug = options.outputDebug?.printableChars == null
+        ? getTerminalOutputDebugFields(data)
+        : options.outputDebug;
+      const controlProfile = getTerminalOutputControlProfile(data);
+      const visibleChars = Number(outputDebug.visibleChars || 0);
+      const printableChars = Number(outputDebug.printableChars || 0);
+      const terminalRows = Math.max(1, Math.floor(Number(terminal.rows || 1)));
+      const looksLikeBlankRepaint = controlProfile.hasCursorHome
+        && visibleChars <= 0
+        && (
+          printableChars >= Math.max(8, Math.min(terminalRows, 24))
+          || controlProfile.hasEraseDisplay
+          || controlProfile.eraseLineCount >= Math.max(1, Math.min(terminalRows, 4))
+        );
+
+      if (!looksLikeBlankRepaint) {
+        return false;
+      }
+
+      const buffer = terminal?.buffer?.active;
+      const baseY = Math.max(0, Number(buffer?.baseY || 0));
+      const viewportY = Math.max(0, Number(buffer?.viewportY || 0));
+      const liveRows = getTerminalBufferRowsDiagnostic(terminal, baseY, terminalRows);
+      const viewportRows = viewportY === baseY
+        ? liveRows
+        : getTerminalBufferRowsDiagnostic(terminal, viewportY, terminalRows);
+      const existingNonEmptyRows = Math.max(
+        Number(liveRows.nonEmptyRows || 0),
+        Number(viewportRows.nonEmptyRows || 0),
+      );
+
+      if (existingNonEmptyRows <= 0) {
+        return false;
+      }
+
+      const signature = [
+        claudeResizeBlankFrameGuard.epoch,
+        data.byteLength,
+        controlProfile.cursorHomeCount,
+        controlProfile.eraseDisplayCount,
+        controlProfile.eraseLineCount,
+        printableChars,
+        visibleChars,
+      ].join(":");
+      claudeResizeBlankFrameGuard.droppedFrames += 1;
+      claudeResizeBlankFrameGuard.lastDroppedSignature = signature;
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.claude_resize_blank_frame_guard", {
+        action: "drop_blank_repaint",
+        baseY,
+        bytes: Number(data.byteLength || 0),
+        cursorHomeCount: controlProfile.cursorHomeCount,
+        droppedFrames: claudeResizeBlankFrameGuard.droppedFrames,
+        epoch: claudeResizeBlankFrameGuard.epoch,
+        eraseDisplayCount: controlProfile.eraseDisplayCount,
+        eraseLineCount: controlProfile.eraseLineCount,
+        existingNonEmptyRows,
+        liveBlankPrefixRows: Number(liveRows.blankPrefixRows || 0),
+        liveBlankSuffixRows: Number(liveRows.blankSuffixRows || 0),
+        printableChars,
+        reason: options.reason || "",
+        signature,
+        visibleChars,
+        viewportBlankPrefixRows: Number(viewportRows.blankPrefixRows || 0),
+        viewportBlankSuffixRows: Number(viewportRows.blankSuffixRows || 0),
+        viewportY,
+        writes: Number(options.writes || 0),
+      });
+
+      return true;
+    };
+    shouldDropClaudeResizeDuplicateRepaint = (data, options = {}) => {
+      if (
+        !isClaudeResizeDuplicateRepaintGuardEnabled()
+        || !data?.byteLength
+        || performance.now() > Number(claudeResizeBlankFrameGuard.until || 0)
+      ) {
+        return false;
+      }
+
+      const outputDebug = options.outputDebug?.printableChars == null
+        ? getTerminalOutputDebugFields(data)
+        : options.outputDebug;
+      const visibleChars = Number(outputDebug.visibleChars || 0);
+      if (visibleChars <= 0) {
+        return false;
+      }
+
+      const controlProfile = getTerminalOutputControlProfile(data);
+      if (!controlProfile.hasCursorHome) {
+        return false;
+      }
+
+      claudeResizeBlankFrameGuard.duplicateRepaintDecisions += 1;
+      const decision = getClaudeResizeDuplicateRepaintDecision(terminal, data, {
+        controlProfile,
+      });
+
+      if (!decision.shouldDrop) {
+        if (decision.shouldMaskFallback) {
+          claudeResizeBlankFrameGuard.pendingDuplicateRepaintVisualCleanup = {
+            fields: {
+              blockingUniqueChars: Number(decision.blockingUniqueChars || 0),
+              blockingUniqueRows: Number(decision.blockingUniqueRows || 0),
+              bytes: Number(data.byteLength || 0),
+              comparableRows: Number(decision.comparableRows || 0),
+              matchedCharRatio: Number(decision.matchedCharRatio || 0),
+              matchedChars: Number(decision.matchedChars || 0),
+              matchedRatio: Number(decision.matchedRatio || 0),
+              matchedRows: Number(decision.matchedRows || 0),
+              reason: options.reason || "",
+              repaintKindCounts: decision.repaintKindCounts || {},
+              skipReason: decision.reason,
+              uniqueSubstantialRows: Number(decision.uniqueSubstantialRows || 0),
+            },
+            until: performance.now() + 600,
+          };
+        }
+        if (
+          windowsTerminalDiagnosticsEnabled
+          && claudeResizeBlankFrameGuard.duplicateRepaintDecisions <= 6
+        ) {
+          logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.claude_resize_duplicate_repaint_guard", {
+            action: "allow",
+            blockingUniqueChars: Number(decision.blockingUniqueChars || 0),
+            blockingUniqueRows: Number(decision.blockingUniqueRows || 0),
+            bytes: Number(data.byteLength || 0),
+            comparableRows: Number(decision.comparableRows || 0),
+            cursorHomeCount: controlProfile.cursorHomeCount,
+            epoch: claudeResizeBlankFrameGuard.epoch,
+            existingRows: Number(decision.existingRows || 0),
+            matchedCharRatio: Number(decision.matchedCharRatio || 0),
+            matchedChars: Number(decision.matchedChars || 0),
+            matchedRatio: Number(decision.matchedRatio || 0),
+            matchedRows: Number(decision.matchedRows || 0),
+            minMatchedChars: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_CHARS,
+            minMatchedRows: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_ROWS,
+            minRatio: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_RATIO,
+            outputRows: Number(decision.outputRows || 0),
+            printableChars: Number(outputDebug.printableChars || 0),
+            reason: options.reason || "",
+            repaintKindCounts: decision.repaintKindCounts || {},
+            sampleRows: decision.sampleRows || [],
+            shouldMaskFallback: Boolean(decision.shouldMaskFallback),
+            skipReason: decision.reason,
+            uniqueSampleRows: decision.uniqueSampleRows || [],
+            uniqueSubstantialRows: Number(decision.uniqueSubstantialRows || 0),
+            visibleChars,
+            writes: Number(options.writes || 0),
+          });
+        }
+        return false;
+      }
+
+      const signature = [
+        claudeResizeBlankFrameGuard.epoch,
+        data.byteLength,
+        controlProfile.cursorHomeCount,
+        decision.matchedRows,
+        decision.matchedChars,
+        decision.comparableRows,
+        visibleChars,
+      ].join(":");
+      claudeResizeBlankFrameGuard.droppedDuplicateRepaints += 1;
+      claudeResizeBlankFrameGuard.lastDuplicateRepaintSignature = signature;
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.claude_resize_duplicate_repaint_guard", {
+        action: "drop_duplicate_repaint",
+        blockingUniqueChars: Number(decision.blockingUniqueChars || 0),
+        blockingUniqueRows: Number(decision.blockingUniqueRows || 0),
+        bytes: Number(data.byteLength || 0),
+        comparableChars: Number(decision.comparableChars || 0),
+        comparableRows: Number(decision.comparableRows || 0),
+        cursorHomeCount: controlProfile.cursorHomeCount,
+        droppedDuplicateRepaints: claudeResizeBlankFrameGuard.droppedDuplicateRepaints,
+        epoch: claudeResizeBlankFrameGuard.epoch,
+        existingRows: Number(decision.existingRows || 0),
+        hasClaudeHeader: Boolean(decision.hasClaudeHeader),
+        matchedCharRatio: Number(decision.matchedCharRatio || 0),
+        matchedChars: Number(decision.matchedChars || 0),
+        matchedRatio: Number(decision.matchedRatio || 0),
+        matchedRows: Number(decision.matchedRows || 0),
+        minMatchedChars: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_CHARS,
+        minMatchedRows: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_ROWS,
+        minRatio: TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_RATIO,
+        outputRows: Number(decision.outputRows || 0),
+        printableChars: Number(outputDebug.printableChars || 0),
+        reason: options.reason || "",
+        repaintKindCounts: decision.repaintKindCounts || {},
+        sampleRows: decision.sampleRows || [],
+        scanStart: Number(decision.scanStart || 0),
+        shouldDropByShape: Boolean(decision.shouldDropByShape),
+        signature,
+        skipReason: decision.reason,
+        uniqueSampleRows: decision.uniqueSampleRows || [],
+        uniqueSubstantialRows: Number(decision.uniqueSubstantialRows || 0),
+        visibleChars,
+        writes: Number(options.writes || 0),
+      });
+
+      scheduleTransientHeaderArtifactCleanup("claude_duplicate_repaint_dropped", {
+        bytes: Number(data.byteLength || 0),
+        matchedRows: Number(decision.matchedRows || 0),
+        source: "duplicate_repaint_guard",
+      }, [120, 360]);
+
+      return true;
+    };
+    const slashCommandDiagnosticState = createSlashCommandDiagnosticState();
+    const codexSlashMenuCloseCleanupState = createCodexSlashMenuCloseCleanupState();
+    const isSlashCommandDiagnosticEnabled = () => (
+      windowsTerminalDiagnosticsEnabled
+      && isTerminalStabilityRuntimeActive()
+      && terminalStabilityFeatures.slashCommandDiagnostics
+      && isTerminalSlashCommandDiagnosticAgentKind(terminalAgentKind)
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const getSlashCommandDiagnosticSnapshot = () => {
+      const now = performance.now();
+      const lineSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.line);
+      const keydownSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.keydownLine);
+      const activeSnapshot = (
+        lineSnapshot.startsWithSlash
+        && lineSnapshot.commandPreview.length >= keydownSnapshot.commandPreview.length
+      )
+        ? lineSnapshot
+        : keydownSnapshot.startsWithSlash
+          ? keydownSnapshot
+          : lineSnapshot;
+      const hasActiveProbe = now <= Number(slashCommandDiagnosticState.probeUntil || 0);
+      if (!slashCommandDiagnosticState.active && !slashCommandDiagnosticState.keydownActive && !hasActiveProbe) {
         return null;
       }
 
       return {
-        cols: Math.floor(cols),
-        rows: Math.floor(rows),
+        active: slashCommandDiagnosticState.active || slashCommandDiagnosticState.keydownActive,
+        commandName: activeSnapshot.commandName || slashCommandDiagnosticState.lastSubmittedCommandName,
+        commandPreview: activeSnapshot.commandPreview || slashCommandDiagnosticState.lastSubmittedCommandPreview,
+        inputCommandName: lineSnapshot.commandName,
+        inputCommandPreview: lineSnapshot.commandPreview,
+        keydownCommandName: keydownSnapshot.commandName,
+        keydownCommandPreview: keydownSnapshot.commandPreview,
+        lastSubmittedCommandName: slashCommandDiagnosticState.lastSubmittedCommandName,
+        lastSubmittedCommandPreview: slashCommandDiagnosticState.lastSubmittedCommandPreview,
+        lineLength: activeSnapshot.lineLength,
+        probeActive: hasActiveProbe,
+        probeRemainingMs: Math.max(0, Math.round(Number(slashCommandDiagnosticState.probeUntil || 0) - now)),
+        sequence: slashCommandDiagnosticState.sequence,
+        source: lineSnapshot.startsWithSlash
+          ? "pty_input"
+          : keydownSnapshot.startsWithSlash
+            ? "keydown"
+            : "",
+        startsWithSlash: activeSnapshot.startsWithSlash,
       };
+    };
+    getSlashCommandDiagnosticContext = () => (
+      isSlashCommandDiagnosticEnabled() ? getSlashCommandDiagnosticSnapshot() : null
+    );
+    isSlashCommandDiagnosticProbeActive = () => (
+      isSlashCommandDiagnosticEnabled()
+      && performance.now() <= Number(slashCommandDiagnosticState.probeUntil || 0)
+    );
+    logSlashCommandDiagnosticProbe = (reason, action, extraFields = {}) => {
+      if (!isSlashCommandDiagnosticEnabled()) {
+        return;
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.slash_command", {
+        action,
+        command: getSlashCommandDiagnosticSnapshot(),
+        reason,
+        renderer: getTerminalRendererPaintDiagnostics(terminal, container, terminalScrollableElement),
+        ...extraFields,
+      });
+    };
+    scheduleSlashCommandDiagnosticProbe = (
+      reason,
+      action,
+      extraFields = {},
+      delaysMs = TERMINAL_SLASH_COMMAND_PROBE_DELAYS_MS,
+    ) => {
+      if (!isSlashCommandDiagnosticEnabled()) {
+        return;
+      }
+
+      const now = performance.now();
+      if (
+        action === "after_output_write"
+        && now - Number(slashCommandDiagnosticState.lastOutputProbeAt || 0)
+          < TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_THROTTLE_MS
+      ) {
+        return;
+      }
+
+      if (action === "after_output_write") {
+        slashCommandDiagnosticState.lastOutputProbeAt = now;
+      }
+
+      slashCommandDiagnosticState.probeUntil = Math.max(
+        Number(slashCommandDiagnosticState.probeUntil || 0),
+        now + TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS,
+      );
+      slashCommandDiagnosticState.probeSequence += 1;
+      const probeId = slashCommandDiagnosticState.probeSequence;
+
+      delaysMs.forEach((delayMs) => {
+        const normalizedDelayMs = Math.max(0, Number(delayMs || 0));
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          logSlashCommandDiagnosticProbe(reason, action, {
+            delayMs: normalizedDelayMs,
+            probeId,
+            ...extraFields,
+          });
+        }, normalizedDelayMs);
+        startupMetricTimers.add(timer);
+      });
+    };
+    let terminalStabilityResizeProbeSequence = 0;
+    const isTerminalStabilityResizeProbeEnabled = () => (
+      windowsTerminalDiagnosticsEnabled
+      && isTerminalStabilityRuntimeActive()
+      && useNormalizerAgentScrollStability
+      && terminalStabilityFeatures.resizeDiagnostics
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const logTerminalStabilityResizeProbe = (reason, action, extraFields = {}) => {
+      if (!isTerminalStabilityResizeProbeEnabled()) {
+        return;
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.stability_resize_probe", {
+        action,
+        agentKind: terminalAgentKind,
+        features: terminalStabilityFeatures,
+        reason,
+        renderer: getTerminalRendererPaintDiagnostics(terminal, container, terminalScrollableElement),
+        state: getWindowsTerminalCompactState(terminal, container, terminalScrollableElement),
+        ...extraFields,
+      });
+    };
+    scheduleTerminalStabilityResizeProbe = (
+      reason,
+      action,
+      extraFields = {},
+      delaysMs = TERMINAL_STABILITY_RESIZE_PROBE_DELAYS_MS,
+    ) => {
+      if (!isTerminalStabilityResizeProbeEnabled()) {
+        return;
+      }
+
+      terminalStabilityResizeProbeSequence += 1;
+      const probeId = terminalStabilityResizeProbeSequence;
+      delaysMs.forEach((delayMs) => {
+        const normalizedDelayMs = Math.max(0, Number(delayMs || 0));
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          logTerminalStabilityResizeProbe(reason, action, {
+            delayMs: normalizedDelayMs,
+            probeId,
+            ...extraFields,
+          });
+        }, normalizedDelayMs);
+        startupMetricTimers.add(timer);
+      });
+    };
+    let transientHeaderArtifactCleanupSequence = 0;
+    let transientHeaderArtifactCleanupUntil = 0;
+    let transientHeaderArtifactCleanupLastSignature = "";
+    let transientHeaderArtifactCleanupTimer = 0;
+    let transientHeaderArtifactCleanupDueAt = 0;
+    let transientHeaderArtifactCleanupRetryCount = 0;
+    let transientHeaderArtifactCleanupLastOutputAt = 0;
+    let transientHeaderArtifactCleanupLastRedrawAt = 0;
+    let transientHeaderArtifactCleanupLastRedrawControl = "";
+    let transientHeaderArtifactCleanupPendingReason = "";
+    let transientHeaderArtifactCleanupPendingFields = {};
+    let transientHeaderArtifactCleanupCandidateSignature = "";
+    let transientHeaderArtifactCleanupCandidateSeenAt = 0;
+    let transientHeaderArtifactVisualMask = null;
+    let transientHeaderArtifactVisualMaskSequence = 0;
+    const isTransientHeaderArtifactCleanupEnabled = () => (
+      isTerminalStabilityRuntimeActive()
+      && useNormalizerAgentScrollStability
+      && terminalStabilityFeatures.normalizerPipeline
+      && terminalStabilityFeatures.transientHeaderArtifactCleanup
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const clearTransientHeaderArtifactVisualMask = (reason = "clear", extraFields = {}) => {
+      const currentMask = transientHeaderArtifactVisualMask;
+      if (!currentMask) {
+        return false;
+      }
+
+      const maskedRows = Array.isArray(currentMask.rows) ? currentMask.rows : [];
+      maskedRows.forEach((maskedRow) => {
+        const rowElement = maskedRow?.element;
+        if (!rowElement || !rowElement.isConnected) {
+          return;
+        }
+
+        if (rowElement.getAttribute("data-terminal-transient-header-mask") === currentMask.maskId) {
+          rowElement.style.visibility = maskedRow.previousVisibility || "";
+          rowElement.style.pointerEvents = maskedRow.previousPointerEvents || "";
+          rowElement.style.opacity = maskedRow.previousOpacity || "";
+          rowElement.removeAttribute("data-terminal-transient-header-mask");
+        }
+      });
+
+      transientHeaderArtifactVisualMask = null;
+
+      if (windowsTerminalDiagnosticsEnabled) {
+        logTransientHeaderArtifactCleanup("mask_clear", {
+          maskId: currentMask.maskId,
+          maskedRows: maskedRows.length,
+          reason,
+          signature: currentMask.signature,
+          ...extraFields,
+        });
+      }
+
+      return true;
+    };
+    const resetTransientHeaderArtifactCandidate = (options = {}) => {
+      transientHeaderArtifactCleanupCandidateSignature = "";
+      transientHeaderArtifactCleanupCandidateSeenAt = 0;
+      if (options.clearMask !== false) {
+        clearTransientHeaderArtifactVisualMask(options.reason || "candidate_reset", options);
+      }
+    };
+    const clearTransientHeaderArtifactCleanupTimer = () => {
+      if (!transientHeaderArtifactCleanupTimer) {
+        return;
+      }
+
+      window.clearTimeout(transientHeaderArtifactCleanupTimer);
+      startupMetricTimers.delete(transientHeaderArtifactCleanupTimer);
+      transientHeaderArtifactCleanupTimer = 0;
+      transientHeaderArtifactCleanupDueAt = 0;
+    };
+    const logTransientHeaderArtifactCleanup = (action, fields = {}) => {
+      if (!windowsTerminalDiagnosticsEnabled || !terminalStabilityFeatures.resizeDiagnostics || isDisposed) {
+        return;
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.transient_header_artifact_cleanup", {
+        action,
+        cleanupUntil: Number(transientHeaderArtifactCleanupUntil || 0),
+        features: terminalStabilityFeatures,
+        profileId: terminalStabilityFeatures.transientHeaderArtifactProfile || "",
+        ...fields,
+      });
+    };
+    const applyTransientHeaderArtifactVisualMask = (plan, stableSignature, reason, extraFields = {}) => {
+      if (!plan?.shouldCleanup || !stableSignature || !container?.isConnected) {
+        clearTransientHeaderArtifactVisualMask("mask_unavailable", {
+          reason,
+          ...extraFields,
+        });
+        return false;
+      }
+
+      const rowsElement = container.querySelector(".xterm-rows");
+      const buffer = terminal?.buffer?.active;
+      const rowElements = Array.from(rowsElement?.children || []);
+
+      if (!rowsElement || !buffer || !rowElements.length) {
+        clearTransientHeaderArtifactVisualMask("mask_rows_unavailable", {
+          reason,
+          ...extraFields,
+        });
+        return false;
+      }
+
+      const viewportY = Math.max(0, Math.floor(Number(buffer.viewportY || 0)));
+      const terminalRows = Math.max(1, Math.floor(Number(terminal?.rows || rowElements.length || 1)));
+      const visibleEnd = viewportY + Math.min(terminalRows, rowElements.length);
+      const maskedRows = [];
+      const seenRowIndexes = new Set();
+
+      (plan.deleteBlocks || []).forEach((block) => {
+        const deleteStart = Math.max(0, Math.floor(Number(block.deleteStart ?? block.start ?? 0)));
+        const fallbackDeleteEnd = deleteStart + Math.max(0, Math.floor(Number(block.rowCount || 0)));
+        const deleteEnd = Math.max(
+          deleteStart,
+          Math.floor(Number(block.deleteEnd ?? fallbackDeleteEnd)),
+        );
+        const maskStart = Math.max(deleteStart, viewportY);
+        const maskEnd = Math.min(deleteEnd, visibleEnd);
+
+        for (let rowIndex = maskStart; rowIndex < maskEnd; rowIndex += 1) {
+          const childIndex = rowIndex - viewportY;
+          const rowElement = rowElements[childIndex];
+          if (!rowElement || seenRowIndexes.has(rowIndex)) {
+            continue;
+          }
+
+          seenRowIndexes.add(rowIndex);
+          maskedRows.push({
+            childIndex,
+            element: rowElement,
+            previousOpacity: rowElement.style.opacity || "",
+            previousPointerEvents: rowElement.style.pointerEvents || "",
+            previousVisibility: rowElement.style.visibility || "",
+            rowIndex,
+          });
+        }
+      });
+
+      if (!maskedRows.length) {
+        clearTransientHeaderArtifactVisualMask("mask_no_visible_rows", {
+          reason,
+          ...extraFields,
+        });
+        return false;
+      }
+
+      if (
+        transientHeaderArtifactVisualMask?.signature === stableSignature
+        && transientHeaderArtifactVisualMask.rows?.length === maskedRows.length
+        && maskedRows.every((maskedRow, index) => (
+          transientHeaderArtifactVisualMask.rows[index]?.element === maskedRow.element
+          && maskedRow.element?.getAttribute("data-terminal-transient-header-mask")
+            === transientHeaderArtifactVisualMask.maskId
+        ))
+      ) {
+        return true;
+      }
+
+      clearTransientHeaderArtifactVisualMask("mask_replace", {
+        nextSignature: stableSignature,
+        reason,
+      });
+
+      maskedRows.forEach((maskedRow) => {
+        const rowElement = maskedRow.element;
+        maskedRow.previousOpacity = rowElement.style.opacity || "";
+        maskedRow.previousPointerEvents = rowElement.style.pointerEvents || "";
+        maskedRow.previousVisibility = rowElement.style.visibility || "";
+      });
+
+      transientHeaderArtifactVisualMaskSequence += 1;
+      const maskId = `${terminalInstanceId || paneId || "terminal"}:${
+        transientHeaderArtifactVisualMaskSequence
+      }`;
+
+      maskedRows.forEach((maskedRow) => {
+        const rowElement = maskedRow.element;
+        rowElement.setAttribute("data-terminal-transient-header-mask", maskId);
+        rowElement.style.visibility = "hidden";
+        rowElement.style.pointerEvents = "none";
+        rowElement.style.opacity = "0";
+      });
+
+      transientHeaderArtifactVisualMask = {
+        appliedAt: performance.now(),
+        firstRowIndex: maskedRows[0]?.rowIndex ?? -1,
+        lastRowIndex: maskedRows[maskedRows.length - 1]?.rowIndex ?? -1,
+        maskId,
+        rows: maskedRows,
+        signature: stableSignature,
+      };
+
+      logTransientHeaderArtifactCleanup("mask_apply", {
+        firstRowIndex: transientHeaderArtifactVisualMask.firstRowIndex,
+        lastRowIndex: transientHeaderArtifactVisualMask.lastRowIndex,
+        maskId,
+        maskedRows: maskedRows.length,
+        reason,
+        signature: stableSignature,
+        viewportY,
+        ...extraFields,
+      });
+
+      return true;
+    };
+    markTransientHeaderArtifactOutputActivity = (byteLength = 0, extraFields = {}) => {
+      if (!isTransientHeaderArtifactCleanupEnabled()) {
+        return;
+      }
+
+      transientHeaderArtifactCleanupLastOutputAt = performance.now();
+      resetTransientHeaderArtifactCandidate();
+      if (performance.now() <= Number(transientHeaderArtifactCleanupUntil || 0)) {
+        scheduleTransientHeaderArtifactCleanup("output_activity", {
+          bytes: Number(byteLength || 0),
+          source: "terminal_output_write",
+          ...extraFields,
+        }, [TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS + 16]);
+      }
+    };
+    markTransientHeaderArtifactRedrawActivity = (control, extraFields = {}) => {
+      if (!isTransientHeaderArtifactCleanupEnabled()) {
+        return;
+      }
+
+      transientHeaderArtifactCleanupLastRedrawAt = performance.now();
+      transientHeaderArtifactCleanupLastRedrawControl = String(control || "");
+      resetTransientHeaderArtifactCandidate();
+      if (performance.now() <= Number(transientHeaderArtifactCleanupUntil || 0)) {
+        scheduleTransientHeaderArtifactCleanup("redraw_activity", {
+          control: transientHeaderArtifactCleanupLastRedrawControl,
+          source: "terminal_control",
+          ...extraFields,
+        }, [0]);
+      }
+    };
+    const getTransientHeaderArtifactQuietState = () => {
+      const now = performance.now();
+      const pendingWrites = pendingOutputWrites.length;
+      if (outputWriteInFlight || pendingWrites > 0) {
+        return {
+          pendingOutputBytes,
+          pendingOutputWrites: pendingWrites,
+          quiet: false,
+          reason: "pending_output",
+          waitMs: TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS,
+        };
+      }
+
+      const outputAgeMs = transientHeaderArtifactCleanupLastOutputAt
+        ? now - Number(transientHeaderArtifactCleanupLastOutputAt || 0)
+        : Number.POSITIVE_INFINITY;
+      const redrawAgeMs = transientHeaderArtifactCleanupLastRedrawAt
+        ? now - Number(transientHeaderArtifactCleanupLastRedrawAt || 0)
+        : Number.POSITIVE_INFINITY;
+      const outputWaitMs = outputAgeMs < TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS
+        ? TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS - outputAgeMs
+        : 0;
+      const redrawWaitMs = redrawAgeMs < TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS
+        ? TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS - redrawAgeMs
+        : 0;
+      const waitMs = Math.ceil(Math.max(outputWaitMs, redrawWaitMs, 0));
+
+      if (waitMs > 0) {
+        return {
+          lastRedrawControl: transientHeaderArtifactCleanupLastRedrawControl,
+          outputAgeMs,
+          quiet: false,
+          reason: redrawWaitMs >= outputWaitMs ? "redraw_quiet_window" : "output_quiet_window",
+          redrawAgeMs,
+          waitMs,
+        };
+      }
+
+      return {
+        outputAgeMs,
+        quiet: true,
+        redrawAgeMs,
+        waitMs: 0,
+      };
+    };
+    const applyTransientHeaderArtifactCleanup = (reason, extraFields = {}) => {
+      if (!isTransientHeaderArtifactCleanupEnabled()) {
+        return false;
+      }
+
+      const now = performance.now();
+      if (now > Number(transientHeaderArtifactCleanupUntil || 0)) {
+        clearTransientHeaderArtifactCleanupTimer();
+        resetTransientHeaderArtifactCandidate();
+        return false;
+      }
+
+      const plan = getTerminalTransientHeaderArtifactCleanupPlan(terminal, {
+        agentKind: terminalAgentKind,
+        profileId: terminalStabilityFeatures.transientHeaderArtifactProfile,
+      });
+      const signature = plan.shouldCleanup
+        ? `${plan.profileId}:${plan.keepBlock?.start || 0}:${
+          (plan.deleteBlocks || [])
+            .map((block) => `${block.start}-${block.deleteEnd ?? block.end}`)
+            .join(",")
+        }`
+        : "";
+
+      if (!plan.shouldCleanup) {
+        resetTransientHeaderArtifactCandidate();
+        if (windowsTerminalDiagnosticsEnabled && plan.blockCount > 1) {
+          logTransientHeaderArtifactCleanup("skip", {
+            blockCount: Number(plan.blockCount || 0),
+            deleteRows: Number(plan.deleteRows || 0),
+            reason,
+            scanStart: Number(plan.scanStart || 0),
+            skipReason: plan.reason,
+            ...extraFields,
+          });
+        }
+        return false;
+      }
+
+      if (signature && signature === transientHeaderArtifactCleanupLastSignature) {
+        resetTransientHeaderArtifactCandidate();
+        return false;
+      }
+
+      const stableSignature = [
+        signature,
+        plan.baseY,
+        plan.viewportY,
+        plan.bufferLength,
+      ].join(":");
+      applyTransientHeaderArtifactVisualMask(plan, stableSignature, reason, {
+        ...extraFields,
+      });
+      if (
+        !transientHeaderArtifactCleanupCandidateSignature
+        || transientHeaderArtifactCleanupCandidateSignature !== stableSignature
+      ) {
+        transientHeaderArtifactCleanupCandidateSignature = stableSignature;
+        transientHeaderArtifactCleanupCandidateSeenAt = now;
+        scheduleTransientHeaderArtifactCleanup(reason, {
+          candidateSignature: stableSignature,
+          retryReason: "waiting_for_stable_plan",
+          ...extraFields,
+        }, [TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS]);
+        return false;
+      }
+
+      const stableForMs = now - Number(transientHeaderArtifactCleanupCandidateSeenAt || 0);
+      if (stableForMs < TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS) {
+        scheduleTransientHeaderArtifactCleanup(reason, {
+          candidateSignature: stableSignature,
+          retryReason: "waiting_for_stable_plan",
+          stableForMs,
+          ...extraFields,
+        }, [TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS - stableForMs + 12]);
+        return false;
+      }
+
+      const quietState = getTransientHeaderArtifactQuietState();
+      if (!quietState.quiet) {
+        transientHeaderArtifactCleanupRetryCount += 1;
+        if (transientHeaderArtifactCleanupRetryCount > TERMINAL_TRANSIENT_HEADER_ARTIFACT_MAX_RETRIES) {
+          logTransientHeaderArtifactCleanup("abort", {
+            reason,
+            retryCount: transientHeaderArtifactCleanupRetryCount,
+            skipReason: quietState.reason,
+            ...quietState,
+            ...extraFields,
+          });
+          clearTransientHeaderArtifactCleanupTimer();
+          resetTransientHeaderArtifactCandidate();
+          return false;
+        }
+
+        scheduleTransientHeaderArtifactCleanup(reason, {
+          retryCount: transientHeaderArtifactCleanupRetryCount,
+          retryReason: quietState.reason,
+          ...quietState,
+          ...extraFields,
+        }, [Math.max(16, quietState.waitMs || TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS)]);
+        return false;
+      }
+
+      transientHeaderArtifactCleanupLastSignature = signature;
+      transientHeaderArtifactCleanupRetryCount = 0;
+      resetTransientHeaderArtifactCandidate({ clearMask: false });
+      const beforeState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      const result = applyTerminalTransientHeaderArtifactCleanup(terminal, plan);
+
+      if (!result.cleaned) {
+        clearTransientHeaderArtifactVisualMask("apply_failed", {
+          reason,
+          resultReason: result.reason,
+        });
+        logTransientHeaderArtifactCleanup("apply_failed", {
+          blockCount: Number(plan.blockCount || 0),
+          deleteRows: Number(plan.deleteRows || 0),
+          reason,
+          resultReason: result.reason,
+          ...extraFields,
+        });
+        return false;
+      }
+
+      const refreshed = refreshTerminalRenderer("transient_header_artifact_cleanup", {
+        blockCount: Number(plan.blockCount || 0),
+        deletedRows: Number(result.deletedRows || 0),
+        profileId: plan.profileId,
+        reason,
+      });
+      clearTransientHeaderArtifactVisualMask("cleanup_applied", {
+        deletedRows: Number(result.deletedRows || 0),
+        reason,
+      });
+      const afterState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      logTransientHeaderArtifactCleanup("apply", {
+        afterBaseY: Number(afterState.baseY || 0),
+        afterViewportY: Number(afterState.viewportY || 0),
+        beforeBaseY: Number(beforeState.baseY || 0),
+        beforeViewportY: Number(beforeState.viewportY || 0),
+        blockCount: Number(plan.blockCount || 0),
+        currentThreshold: Number(plan.currentThreshold || 0),
+        deletedBlocks: result.deletedBlocks || [],
+        deletedRows: Number(result.deletedRows || 0),
+        expandedGapRows: (result.deletedBlocks || [])
+          .reduce((total, block) => total + Number(block.expandedGapRows || 0), 0),
+        keepBlockStart: Number(plan.keepBlock?.start || 0),
+        reason,
+        refreshed,
+        resultReason: result.reason,
+        scanStart: Number(plan.scanStart || 0),
+        ...extraFields,
+      });
+      scheduleTerminalStabilityResizeProbe(reason, "after_transient_header_cleanup", {
+        deletedRows: Number(result.deletedRows || 0),
+        profileId: plan.profileId,
+      }, [0, 180]);
+      return true;
+    };
+    scheduleTransientHeaderArtifactCleanup = (
+      reason,
+      extraFields = {},
+      delaysMs = TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_DELAYS_MS,
+    ) => {
+      if (!isTransientHeaderArtifactCleanupEnabled()) {
+        return false;
+      }
+
+      const now = performance.now();
+      const normalizedDelaysMs = Array.isArray(delaysMs) && delaysMs.length
+        ? delaysMs
+          .map((delayMs) => Math.max(0, Number(delayMs || 0)))
+          .filter((delayMs) => Number.isFinite(delayMs))
+        : [0];
+      if (!normalizedDelaysMs.length) {
+        normalizedDelaysMs.push(0);
+      }
+      if (!extraFields.retryReason) {
+        transientHeaderArtifactCleanupRetryCount = 0;
+      }
+      const targetDelayMs = Math.min(...normalizedDelaysMs);
+      const targetDueAt = now + targetDelayMs;
+
+      transientHeaderArtifactCleanupUntil = Math.max(
+        Number(transientHeaderArtifactCleanupUntil || 0),
+        now + TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_MS,
+      );
+      transientHeaderArtifactCleanupPendingReason = reason;
+      transientHeaderArtifactCleanupPendingFields = {
+        ...extraFields,
+      };
+
+      if (
+        transientHeaderArtifactCleanupTimer
+        && transientHeaderArtifactCleanupDueAt > 0
+        && targetDueAt + 8 >= transientHeaderArtifactCleanupDueAt
+      ) {
+        return true;
+      }
+
+      clearTransientHeaderArtifactCleanupTimer();
+      transientHeaderArtifactCleanupSequence += 1;
+      const cleanupId = transientHeaderArtifactCleanupSequence;
+
+      transientHeaderArtifactCleanupDueAt = targetDueAt;
+      transientHeaderArtifactCleanupTimer = window.setTimeout(() => {
+        const timer = transientHeaderArtifactCleanupTimer;
+        startupMetricTimers.delete(timer);
+        transientHeaderArtifactCleanupTimer = 0;
+        transientHeaderArtifactCleanupDueAt = 0;
+        applyTransientHeaderArtifactCleanup(transientHeaderArtifactCleanupPendingReason || reason, {
+          cleanupId,
+          delayMs: targetDelayMs,
+          ...transientHeaderArtifactCleanupPendingFields,
+        });
+      }, targetDelayMs);
+      startupMetricTimers.add(transientHeaderArtifactCleanupTimer);
+
+      logTransientHeaderArtifactCleanup("schedule", {
+        cleanupId,
+        delaysMs: normalizedDelaysMs,
+        reason,
+        ...extraFields,
+      });
+
+      return true;
+    };
+    const activateSlashCommandDiagnosticProbe = (reason, action, extraFields = {}) => {
+      if (!isSlashCommandDiagnosticEnabled()) {
+        return;
+      }
+
+      slashCommandDiagnosticState.probeUntil = Math.max(
+        Number(slashCommandDiagnosticState.probeUntil || 0),
+        performance.now() + TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS,
+      );
+      logSlashCommandDiagnosticProbe(reason, action, extraFields);
+      scheduleSlashCommandDiagnosticProbe(reason, action, extraFields);
+    };
+    const resetSlashCommandDiagnosticLine = () => {
+      slashCommandDiagnosticState.active = false;
+      slashCommandDiagnosticState.commandName = "";
+      slashCommandDiagnosticState.commandPreview = "";
+      slashCommandDiagnosticState.keydownActive = false;
+      slashCommandDiagnosticState.keydownCommandName = "";
+      slashCommandDiagnosticState.keydownCommandPreview = "";
+      slashCommandDiagnosticState.keydownLine = "";
+      slashCommandDiagnosticState.lastLoggedPreview = "";
+      slashCommandDiagnosticState.lastKeydownLoggedPreview = "";
+      slashCommandDiagnosticState.line = "";
+    };
+    const applySlashCommandLineSnapshot = (snapshot) => {
+      slashCommandDiagnosticState.commandName = snapshot.commandName;
+      slashCommandDiagnosticState.commandPreview = snapshot.commandPreview;
+    };
+    const applySlashCommandKeydownSnapshot = (snapshot) => {
+      slashCommandDiagnosticState.keydownCommandName = snapshot.commandName;
+      slashCommandDiagnosticState.keydownCommandPreview = snapshot.commandPreview;
+    };
+    const appendSlashCommandDiagnosticPrintableInput = (inputData) => {
+      const text = String(inputData || "");
+
+      for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        const code = char.charCodeAt(0);
+
+        if (char === "\r" || char === "\n") {
+          continue;
+        }
+
+        if (char === "\x7f" || char === "\b") {
+          slashCommandDiagnosticState.line = slashCommandDiagnosticState.line.slice(0, -1);
+          continue;
+        }
+
+        if (code === 0x1b) {
+          const next = text[index + 1] || "";
+          if (next === "[") {
+            index += 2;
+            while (index < text.length) {
+              const finalCode = text.charCodeAt(index);
+              if (finalCode >= 0x40 && finalCode <= 0x7e) {
+                break;
+              }
+              index += 1;
+            }
+          } else if (next) {
+            index += 1;
+          }
+          continue;
+        }
+
+        if (code >= 0x20 && code !== 0x7f) {
+          slashCommandDiagnosticState.line = (
+            slashCommandDiagnosticState.line + char
+          ).slice(-TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS);
+        }
+      }
+    };
+    const getSlashCommandKeydownSummary = (event) => ({
+      altKey: Boolean(event?.altKey),
+      code: sanitizeTerminalDiagnosticText(event?.code || "", 40),
+      ctrlKey: Boolean(event?.ctrlKey),
+      isBackspace: event?.key === "Backspace",
+      isEnter: event?.key === "Enter",
+      isEscape: event?.key === "Escape",
+      isPrintable: String(event?.key || "").length === 1
+        && !event?.metaKey
+        && !event?.ctrlKey
+        && !event?.altKey,
+      key: sanitizeTerminalDiagnosticText(event?.key || "", 40),
+      metaKey: Boolean(event?.metaKey),
+      repeat: Boolean(event?.repeat),
+      shiftKey: Boolean(event?.shiftKey),
+    });
+    const appendSlashCommandDiagnosticKeydownInput = (event) => {
+      if (!event) {
+        return;
+      }
+
+      if (event.key === "Backspace") {
+        slashCommandDiagnosticState.keydownLine = slashCommandDiagnosticState.keydownLine.slice(0, -1);
+        return;
+      }
+
+      if (
+        String(event.key || "").length === 1
+        && !event.metaKey
+        && !event.ctrlKey
+        && !event.altKey
+      ) {
+        slashCommandDiagnosticState.keydownLine = (
+          slashCommandDiagnosticState.keydownLine + event.key
+        ).slice(-TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS);
+      }
+    };
+    const resetSlashCommandDiagnosticKeydownLine = () => {
+      slashCommandDiagnosticState.keydownActive = false;
+      slashCommandDiagnosticState.keydownCommandName = "";
+      slashCommandDiagnosticState.keydownCommandPreview = "";
+      slashCommandDiagnosticState.keydownLine = "";
+      slashCommandDiagnosticState.lastKeydownLoggedPreview = "";
+    };
+    const handleSlashCommandDiagnosticKeyDown = (event, reason = "keydown") => {
+      if (
+        !isSlashCommandDiagnosticEnabled()
+        || !event
+        || event.isComposing
+      ) {
+        return;
+      }
+
+      const keySummary = getSlashCommandKeydownSummary(event);
+      const wasActive = slashCommandDiagnosticState.keydownActive;
+      const wasProbeActive = isSlashCommandDiagnosticProbeActive();
+      const beforeSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.keydownLine);
+
+      if (keySummary.isEnter) {
+        if (wasActive || beforeSnapshot.startsWithSlash) {
+          slashCommandDiagnosticState.lastSubmittedCommandName = beforeSnapshot.commandName;
+          slashCommandDiagnosticState.lastSubmittedCommandPreview = beforeSnapshot.commandPreview;
+          activateSlashCommandDiagnosticProbe(reason, "keydown_submit", {
+            key: keySummary,
+            submittedCommand: beforeSnapshot,
+          });
+        } else if (wasProbeActive) {
+          activateSlashCommandDiagnosticProbe(reason, "keydown_picker_submit", {
+            key: keySummary,
+          });
+          markCodexSlashMenuCloseCleanup(reason, "keydown_picker_submit", {
+            key: keySummary,
+          });
+        }
+        resetSlashCommandDiagnosticKeydownLine();
+        return;
+      }
+
+      if (keySummary.isEscape) {
+        if (wasActive || beforeSnapshot.startsWithSlash) {
+          activateSlashCommandDiagnosticProbe(reason, "keydown_cancel", {
+            beforeCommand: beforeSnapshot,
+            key: keySummary,
+          });
+          markCodexSlashMenuCloseCleanup(reason, "keydown_cancel", {
+            beforeCommand: beforeSnapshot,
+            key: keySummary,
+          });
+          resetSlashCommandDiagnosticKeydownLine();
+        } else if (wasProbeActive) {
+          activateSlashCommandDiagnosticProbe(reason, "keydown_picker_escape", {
+            key: keySummary,
+          });
+          markCodexSlashMenuCloseCleanup(reason, "keydown_picker_escape", {
+            key: keySummary,
+          });
+        }
+        return;
+      }
+
+      appendSlashCommandDiagnosticKeydownInput(event);
+      const afterSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.keydownLine);
+
+      if (afterSnapshot.startsWithSlash && !wasActive) {
+        slashCommandDiagnosticState.keydownActive = true;
+        if (!slashCommandDiagnosticState.active) {
+          slashCommandDiagnosticState.sequence += 1;
+        }
+        applySlashCommandKeydownSnapshot(afterSnapshot);
+        slashCommandDiagnosticState.lastKeydownLoggedPreview = afterSnapshot.commandPreview;
+        activateSlashCommandDiagnosticProbe(reason, "keydown_start", {
+          key: keySummary,
+        });
+      } else if (
+        afterSnapshot.startsWithSlash
+        && afterSnapshot.commandPreview !== slashCommandDiagnosticState.lastKeydownLoggedPreview
+      ) {
+        applySlashCommandKeydownSnapshot(afterSnapshot);
+        slashCommandDiagnosticState.lastKeydownLoggedPreview = afterSnapshot.commandPreview;
+        activateSlashCommandDiagnosticProbe(reason, "keydown_update", {
+          key: keySummary,
+        });
+      } else if (wasActive && !afterSnapshot.startsWithSlash) {
+        activateSlashCommandDiagnosticProbe(reason, "keydown_abandon", {
+          beforeCommand: beforeSnapshot,
+          key: keySummary,
+        });
+        resetSlashCommandDiagnosticKeydownLine();
+      } else if (wasProbeActive && !keySummary.isPrintable) {
+        activateSlashCommandDiagnosticProbe(reason, "keydown_picker_control", {
+          key: keySummary,
+        });
+      }
+    };
+    handleSlashCommandDiagnosticInput = (inputData, reason = "xterm_on_data") => {
+      if (!isSlashCommandDiagnosticEnabled()) {
+        return;
+      }
+
+      const inputSummary = getTerminalSlashCommandInputSummary(inputData);
+      const wasActive = slashCommandDiagnosticState.active;
+      const wasProbeActive = isSlashCommandDiagnosticProbeActive();
+      const beforeSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.line);
+      appendSlashCommandDiagnosticPrintableInput(inputData);
+      const afterSnapshot = getTerminalSlashCommandLineSnapshot(slashCommandDiagnosticState.line);
+      const hasSubmit = inputSummary.hasReturn || inputSummary.hasNewline;
+      const hasCancel = String(inputData || "").includes("\x03");
+      const isControlOnly = inputSummary.chars > 0 && !inputSummary.printablePreview;
+
+      if (afterSnapshot.startsWithSlash && !wasActive) {
+        slashCommandDiagnosticState.active = true;
+        slashCommandDiagnosticState.sequence += 1;
+        applySlashCommandLineSnapshot(afterSnapshot);
+        slashCommandDiagnosticState.lastLoggedPreview = afterSnapshot.commandPreview;
+        activateSlashCommandDiagnosticProbe(reason, "start", {
+          input: inputSummary,
+        });
+      } else if (
+        afterSnapshot.startsWithSlash
+        && afterSnapshot.commandPreview !== slashCommandDiagnosticState.lastLoggedPreview
+      ) {
+        applySlashCommandLineSnapshot(afterSnapshot);
+        slashCommandDiagnosticState.lastLoggedPreview = afterSnapshot.commandPreview;
+        activateSlashCommandDiagnosticProbe(reason, "update", {
+          input: inputSummary,
+        });
+      } else if (wasActive && !afterSnapshot.startsWithSlash && !hasSubmit && !hasCancel) {
+        activateSlashCommandDiagnosticProbe(reason, "abandon", {
+          beforeCommand: beforeSnapshot,
+          input: inputSummary,
+        });
+        resetSlashCommandDiagnosticLine();
+      }
+
+      if (hasSubmit) {
+        const submittedSnapshot = afterSnapshot.startsWithSlash ? afterSnapshot : beforeSnapshot;
+        if (wasActive || submittedSnapshot.startsWithSlash) {
+          applySlashCommandLineSnapshot(submittedSnapshot);
+          slashCommandDiagnosticState.lastSubmittedCommandName = submittedSnapshot.commandName;
+          slashCommandDiagnosticState.lastSubmittedCommandPreview = submittedSnapshot.commandPreview;
+          activateSlashCommandDiagnosticProbe(reason, "submit", {
+            input: inputSummary,
+            submittedCommand: submittedSnapshot,
+          });
+        } else if (wasProbeActive) {
+          activateSlashCommandDiagnosticProbe(reason, "picker_submit_input", {
+            input: inputSummary,
+          });
+          markCodexSlashMenuCloseCleanup(reason, "picker_submit_input", {
+            input: inputSummary,
+          });
+        }
+        resetSlashCommandDiagnosticLine();
+        return;
+      }
+
+      if (hasCancel && wasActive) {
+        activateSlashCommandDiagnosticProbe(reason, "cancel", {
+          beforeCommand: beforeSnapshot,
+          input: inputSummary,
+        });
+        markCodexSlashMenuCloseCleanup(reason, "cancel", {
+          beforeCommand: beforeSnapshot,
+          input: inputSummary,
+        });
+        resetSlashCommandDiagnosticLine();
+        return;
+      }
+
+      if (wasProbeActive && (inputSummary.hasEscape || isControlOnly)) {
+        activateSlashCommandDiagnosticProbe(reason, "picker_control_input", {
+          input: inputSummary,
+        });
+        if (inputSummary.hasEscape) {
+          markCodexSlashMenuCloseCleanup(reason, "picker_escape_input", {
+            input: inputSummary,
+          });
+        }
+      }
     };
     const getCurrentCodexResizeGateSize = () => normalizeCodexResizeGateSize({
       cols: terminal.cols,
       rows: terminal.rows,
     });
-    const codexResizeGateSizesEqual = (left, right) => (
-      Boolean(left)
-      && Boolean(right)
-      && Number(left.cols || 0) === Number(right.cols || 0)
-      && Number(left.rows || 0) === Number(right.rows || 0)
-    );
     const clearCodexResizeGateTimer = () => {
       if (!codexResizeGate.flushTimer) {
         return;
@@ -5053,7 +4821,7 @@ function WorkspaceTerminal({
       const combinedData = concatTerminalByteArrays(queuedWrites.map((write) => write.data));
       const coalesced = coalesceCodexResizeRepaintBytes(combinedData);
       const queuedRawChunks = queuedWrites.filter((write) => write.rawCodexResizeGateData === true).length;
-      const resizeNormalizerBefore = terminalOutputNormalizer.enabled
+      const resizeNormalizerBefore = isTerminalOutputNormalizerActive()
         ? {
           droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
           droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
@@ -5064,7 +4832,7 @@ function WorkspaceTerminal({
           syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
         }
         : null;
-	      const normalizedCoalescedData = terminalOutputNormalizer.enabled && coalesced.data?.byteLength
+	      const normalizedCoalescedData = isTerminalOutputNormalizerActive() && coalesced.data?.byteLength
 	        ? normalizeTerminalOutputBytes(terminalOutputNormalizer, coalesced.data)
 	        : coalesced.data;
       const resizeNormalizerStats = resizeNormalizerBefore
@@ -5160,7 +4928,7 @@ function WorkspaceTerminal({
       });
       return true;
     };
-    markCodexResizeGateActive = (reason = "resize", size = null) => {
+    markCodexResizeGateActive = (reason = "resize", size = null, options = {}) => {
       if (!isCodexResizeGateEnabled() || isDisposed) {
         return;
       }
@@ -5170,6 +4938,8 @@ function WorkspaceTerminal({
         return;
       }
 
+      const force = options.force === true;
+      const synthetic = options.synthetic === true;
       const previousObservedSize = codexResizeGate.lastObservedSize;
       const sizeChanged = Boolean(previousObservedSize)
         && !codexResizeGateSizesEqual(previousObservedSize, targetSize);
@@ -5178,15 +4948,20 @@ function WorkspaceTerminal({
       if (!previousObservedSize) {
         logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
           action: "prime",
+          forced: force,
           reason,
+          synthetic,
           targetCols: targetSize.cols,
           targetRows: targetSize.rows,
         });
-        return;
+        if (!force) {
+          return;
+        }
       }
 
       if (
         !sizeChanged
+        && !force
         && (
           !codexResizeGate.active
           || codexResizeGateSizesEqual(codexResizeGate.targetSize, targetSize)
@@ -5212,7 +4987,7 @@ function WorkspaceTerminal({
       const startState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
       codexResizeGate.active = true;
       codexResizeGate.epoch += 1;
-      codexResizeGate.previousSize = previousObservedSize;
+      codexResizeGate.previousSize = previousObservedSize || targetSize;
       codexResizeGate.startedAt = now;
       codexResizeGate.startedAtBottom = Number(startState.viewportY || 0) >= Math.max(0, Number(startState.baseY || 0) - 1);
       codexResizeGate.startState = startState;
@@ -5225,7 +5000,7 @@ function WorkspaceTerminal({
         Number(codexResizeGate.liveTailCleanupUntil || 0),
         now + TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
       );
-      if (!wasActive) {
+      if (!wasActive || force) {
         codexResizeGate.liveTailLastCleanedSignature = "";
         codexResizeGate.scrollbackCleanupLastHandledBaseY = 0;
         codexResizeGate.scrollbackCleanupLastTargetY = -1;
@@ -5236,11 +5011,16 @@ function WorkspaceTerminal({
       }
 
       logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
-        action: wasActive ? "retarget" : "start",
+        action: force
+          ? (wasActive ? "synthetic_retarget" : "synthetic_start")
+          : wasActive
+            ? "retarget"
+            : "start",
         epoch: codexResizeGate.epoch,
+        forced: force,
         previousBaseY: Number(startState.baseY || 0),
-        previousCols: previousObservedSize.cols,
-        previousRows: previousObservedSize.rows,
+        previousCols: (previousObservedSize || targetSize).cols,
+        previousRows: (previousObservedSize || targetSize).rows,
         previousViewportY: Number(startState.viewportY || 0),
         reason,
         liveTailCleanupUntil: Number(codexResizeGate.liveTailCleanupUntil || 0),
@@ -5250,12 +5030,15 @@ function WorkspaceTerminal({
         scrollbackCleanupAnchorViewportY: Number(codexResizeGate.scrollbackCleanupAnchor?.viewportY || 0),
         scrollbackCleanupStartViewportY: codexResizeGate.scrollbackCleanupStartViewportY,
         scrollbackCleanupStartedAtBottom: codexResizeGate.scrollbackCleanupStartedAtBottom,
+        synthetic,
         targetCols: targetSize.cols,
         targetRows: targetSize.rows,
       });
       scheduleCodexResizePaintProbe(reason, wasActive ? "gate_retarget" : "gate_start", {
-        previousCols: previousObservedSize.cols,
-        previousRows: previousObservedSize.rows,
+        forced: force,
+        previousCols: (previousObservedSize || targetSize).cols,
+        previousRows: (previousObservedSize || targetSize).rows,
+        synthetic,
         targetCols: targetSize.cols,
         targetRows: targetSize.rows,
       }, [0]);
@@ -5263,6 +5046,266 @@ function WorkspaceTerminal({
       scheduleCodexResizeGateFlush(reason, TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS, {
         allowLater: true,
       });
+    };
+    const isCodexSlashMenuCloseCleanupEnabled = () => (
+      isTerminalStabilityRuntimeActive()
+      && terminalStabilityFeatures.slashMenuCloseResize
+      && terminalOutputNormalizer.enabled
+      && !isGenericTerminal
+      && !isDisposed
+    );
+    const isCodexSlashMenuCloseCleanupActive = () => (
+      isCodexSlashMenuCloseCleanupEnabled()
+      && codexSlashMenuCloseCleanupState.active
+      && performance.now() <= Number(codexSlashMenuCloseCleanupState.cleanupUntil || 0)
+    );
+    const clearCodexSlashMenuCloseCleanupTimer = () => {
+      if (!codexSlashMenuCloseCleanupState.quietTimer) {
+        return;
+      }
+
+      window.clearTimeout(codexSlashMenuCloseCleanupState.quietTimer);
+      codexSlashMenuCloseCleanupState.quietTimer = 0;
+    };
+    const logCodexSlashMenuCloseCleanup = (action, fields = {}) => {
+      if (!windowsTerminalDiagnosticsEnabled || !terminalStabilityFeatures.slashMenuCloseResize || isDisposed) {
+        return;
+      }
+
+      logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_slash_menu_close_cleanup", {
+        action,
+        cleanupActive: isCodexSlashMenuCloseCleanupActive(),
+        cleanupUntil: Number(codexSlashMenuCloseCleanupState.cleanupUntil || 0),
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        epoch: codexSlashMenuCloseCleanupState.epoch,
+        lastOutputAgeMs: codexSlashMenuCloseCleanupState.lastOutputAt
+          ? performance.now() - codexSlashMenuCloseCleanupState.lastOutputAt
+          : -1,
+        resizeEpoch: codexResizeGate.epoch,
+        resizeGateActive: codexResizeGate.active,
+        resizeRequested: codexSlashMenuCloseCleanupState.resizeRequested,
+        ...fields,
+      });
+    };
+    const applyCodexSlashMenuCloseCleanup = (reason, extraFields = {}) => {
+      if (!isCodexSlashMenuCloseCleanupActive()) {
+        return false;
+      }
+
+      const now = performance.now();
+      if (now > Number(codexSlashMenuCloseCleanupState.cleanupUntil || 0)) {
+        codexSlashMenuCloseCleanupState.active = false;
+        clearCodexSlashMenuCloseCleanupTimer();
+        return false;
+      }
+
+      if (outputWriteInFlight || pendingOutputWrites.length > 0) {
+        scheduleCodexSlashMenuCloseCleanup(reason, {
+          pendingOutputBytes,
+          pendingOutputWrites: pendingOutputWrites.length,
+          retryReason: "pending_output",
+          ...extraFields,
+        }, [TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS]);
+        return false;
+      }
+
+      const quietForMs = codexSlashMenuCloseCleanupState.lastOutputAt
+        ? now - Number(codexSlashMenuCloseCleanupState.lastOutputAt || 0)
+        : TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS;
+      if (quietForMs < TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS) {
+        scheduleCodexSlashMenuCloseCleanup(reason, {
+          quietForMs,
+          retryReason: "waiting_for_output_quiet",
+          ...extraFields,
+        }, [TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS - quietForMs + 12]);
+        return false;
+      }
+
+      codexResizeGate.scrollbackCleanupUntil = Math.max(
+        Number(codexResizeGate.scrollbackCleanupUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS,
+      );
+      codexResizeGate.liveTailCleanupUntil = Math.max(
+        Number(codexResizeGate.liveTailCleanupUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
+      );
+      codexResizeGate.paintProbeUntil = Math.max(
+        Number(codexResizeGate.paintProbeUntil || 0),
+        now + TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS,
+      );
+
+      const beforeState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      syncTerminalPaintBounds("codex_slash_menu_close_cleanup");
+      const refreshed = refreshTerminalRenderer("codex_slash_menu_close_cleanup", {
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        reason,
+      });
+      const scrollbackCleaned = applyCodexResizeScrollbackCleanup("codex_slash_menu_close_cleanup", beforeState, {
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        quietForMs,
+        syntheticSlashMenuClose: true,
+        ...extraFields,
+      });
+      const liveTailCleaned = applyCodexResizeLiveTailCleanup("codex_slash_menu_close_cleanup_immediate", {
+        allowWithPendingOutput: true,
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        quietForMs,
+        syntheticSlashMenuClose: true,
+      });
+      const liveTailScheduled = scheduleCodexResizeLiveTailCleanup("codex_slash_menu_close_cleanup", {
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        quietForMs,
+        syntheticSlashMenuClose: true,
+      }, [0, 80, 180, 360]);
+      scheduleCodexResizePaintProbe("codex_slash_menu_close_cleanup", "after_cleanup", {
+        closeAction: codexSlashMenuCloseCleanupState.closeAction,
+        closeReason: codexSlashMenuCloseCleanupState.closeReason,
+        liveTailCleaned,
+        liveTailScheduled,
+        quietForMs,
+        refreshed,
+        scrollbackCleaned,
+      }, [0, 80, 240]);
+
+      const afterState = getWindowsTerminalCompactState(terminal, container, terminalScrollableElement);
+      logCodexSlashMenuCloseCleanup("apply", {
+        afterBaseY: Number(afterState.baseY || 0),
+        afterViewportY: Number(afterState.viewportY || 0),
+        beforeBaseY: Number(beforeState.baseY || 0),
+        beforeViewportY: Number(beforeState.viewportY || 0),
+        liveTailCleaned,
+        liveTailScheduled,
+        quietForMs,
+        reason,
+        refreshed,
+        scrollbackCleaned,
+        ...extraFields,
+      });
+
+      if (scrollbackCleaned || liveTailCleaned) {
+        codexSlashMenuCloseCleanupState.active = false;
+      }
+
+      return scrollbackCleaned || liveTailCleaned || refreshed;
+    };
+    const scheduleCodexSlashMenuCloseCleanup = (
+      reason,
+      extraFields = {},
+      delaysMs = TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_DELAYS_MS,
+    ) => {
+      if (!isCodexSlashMenuCloseCleanupActive()) {
+        return false;
+      }
+
+      codexSlashMenuCloseCleanupState.cleanupUntil = Math.max(
+        Number(codexSlashMenuCloseCleanupState.cleanupUntil || 0),
+        performance.now() + TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS,
+      );
+      codexSlashMenuCloseCleanupState.cleanupSequence += 1;
+      const cleanupId = codexSlashMenuCloseCleanupState.cleanupSequence;
+
+      delaysMs.forEach((delayMs) => {
+        const normalizedDelayMs = Math.max(0, Number(delayMs || 0));
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          applyCodexSlashMenuCloseCleanup(reason, {
+            cleanupId,
+            delayMs: normalizedDelayMs,
+            ...extraFields,
+          });
+        }, normalizedDelayMs);
+        startupMetricTimers.add(timer);
+      });
+
+      return true;
+    };
+    markCodexSlashMenuCloseCleanup = (reason, action, extraFields = {}) => {
+      if (!isCodexSlashMenuCloseCleanupEnabled()) {
+        return false;
+      }
+
+      const targetSize = getCurrentCodexResizeGateSize();
+      if (!targetSize) {
+        return false;
+      }
+
+      const now = performance.now();
+      codexSlashMenuCloseCleanupState.active = true;
+      codexSlashMenuCloseCleanupState.cleanupUntil = Math.max(
+        Number(codexSlashMenuCloseCleanupState.cleanupUntil || 0),
+        now + TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS,
+      );
+      codexSlashMenuCloseCleanupState.closeAction = String(action || "");
+      codexSlashMenuCloseCleanupState.closeReason = String(reason || "");
+      codexSlashMenuCloseCleanupState.epoch += 1;
+      codexSlashMenuCloseCleanupState.startedAt = now;
+      codexSlashMenuCloseCleanupState.lastOutputAt = 0;
+      codexSlashMenuCloseCleanupState.resizeRequested = false;
+
+      markCodexResizeGateActive(`codex_slash_menu_close:${action}`, targetSize, {
+        force: true,
+        synthetic: true,
+      });
+
+      clearCodexSlashMenuCloseCleanupTimer();
+      const resizePulseTimer = window.setTimeout(() => {
+        startupMetricTimers.delete(resizePulseTimer);
+        codexSlashMenuCloseCleanupState.quietTimer = 0;
+        if (!isCodexSlashMenuCloseCleanupActive()) {
+          return;
+        }
+
+        try {
+          const resizeResult = resizeController?.resizeNow?.(`codex_slash_menu_close:${action}`, {
+            force: true,
+            forceNative: true,
+            nativeDelayMs: 0,
+          });
+          codexSlashMenuCloseCleanupState.resizeRequested = Boolean(resizeResult);
+          if (resizeResult && typeof resizeResult.catch === "function") {
+            resizeResult.catch(() => {});
+          }
+        } catch (_error) {
+          codexSlashMenuCloseCleanupState.resizeRequested = false;
+        }
+      }, 50);
+      codexSlashMenuCloseCleanupState.quietTimer = resizePulseTimer;
+      startupMetricTimers.add(resizePulseTimer);
+
+      scheduleCodexResizeGateFlush(`codex_slash_menu_close:${action}`, 260, {
+        allowLater: true,
+      });
+      scheduleCodexSlashMenuCloseCleanup(reason, {
+        closeAction: action,
+        targetCols: targetSize.cols,
+        targetRows: targetSize.rows,
+        ...extraFields,
+      });
+      logCodexSlashMenuCloseCleanup("start", {
+        closeAction: action,
+        reason,
+        targetCols: targetSize.cols,
+        targetRows: targetSize.rows,
+        ...extraFields,
+      });
+
+      return true;
+    };
+    markCodexSlashMenuOutputActivity = (byteLength = 0, extraFields = {}) => {
+      if (!isCodexSlashMenuCloseCleanupActive()) {
+        return;
+      }
+
+      codexSlashMenuCloseCleanupState.lastOutputAt = performance.now();
+      scheduleCodexSlashMenuCloseCleanup("output_activity", {
+        bytes: Number(byteLength || 0),
+        ...extraFields,
+      }, [TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS + 16]);
     };
     const writeTerminalOutput = (data, options = {}) => {
       if (
@@ -5292,6 +5335,12 @@ function WorkspaceTerminal({
     };
     disposables.push(() => {
       clearCodexResizeGateTimer();
+      clearTransientHeaderArtifactCleanupTimer();
+      clearTransientHeaderArtifactVisualMask("dispose");
+      clearCodexSlashMenuCloseCleanupTimer();
+      codexSlashMenuCloseCleanupState.active = false;
+      codexSlashMenuCloseCleanupState.cleanupUntil = 0;
+      codexSlashMenuCloseCleanupState.lastOutputAt = 0;
       codexResizeGate.active = false;
       codexResizeGate.flushDueAt = 0;
       codexResizeGate.lastObservedSize = null;
@@ -5314,6 +5363,15 @@ function WorkspaceTerminal({
       codexResizeGate.startedAtBottom = false;
       codexResizeGate.startState = null;
       codexResizeGate.targetSize = null;
+      claudeResizeBlankFrameGuard.droppedDuplicateRepaints = 0;
+      claudeResizeBlankFrameGuard.droppedFrames = 0;
+      claudeResizeBlankFrameGuard.duplicateRepaintDecisions = 0;
+      claudeResizeBlankFrameGuard.epoch = 0;
+      claudeResizeBlankFrameGuard.lastDuplicateRepaintSignature = "";
+      claudeResizeBlankFrameGuard.lastDroppedSignature = "";
+      claudeResizeBlankFrameGuard.lastObservedSize = null;
+      claudeResizeBlankFrameGuard.pendingDuplicateRepaintVisualCleanup = null;
+      claudeResizeBlankFrameGuard.until = 0;
     });
 
     resizeController = createTerminalResizeController({
@@ -5340,13 +5398,38 @@ function WorkspaceTerminal({
           resizeBatches: 1,
           resizePanes: 1,
         });
+        markTransientHeaderArtifactRedrawActivity("resize_done", {
+          elapsedMs: Number(event.elapsedMs || 0),
+          source: "resize_controller_done",
+        });
+        markClaudeResizeBlankFrameGuardActive(event.reason || "resize_done", event);
         syncTerminalPaintBounds("resize_done");
         scheduleTerminalPaintBoundsSync("resize_done_settled", [34, 120, 260]);
+        scheduleTerminalStabilityResizeProbe(event.reason || "resize_done", "resize_done", {
+          elapsedMs: Number(event.elapsedMs || 0),
+          source: "resize_controller",
+        });
+        scheduleTransientHeaderArtifactCleanup(event.reason || "resize_done", {
+          elapsedMs: Number(event.elapsedMs || 0),
+          source: "resize_controller_done",
+        });
         scheduleCodexResizeGateFlush(event.reason || "resize_done");
       },
       onError: () => {},
       onStart: (event) => {
+        markTransientHeaderArtifactRedrawActivity("resize_start", {
+          source: "resize_controller_start",
+        });
+        markClaudeResizeBlankFrameGuardActive(event.reason || "resize_start", event, {
+          force: true,
+        });
         markCodexResizeGateActive(event.reason || "resize_start", event);
+        scheduleTerminalStabilityResizeProbe(event.reason || "resize_start", "resize_start", {
+          source: "resize_controller",
+        }, [0, 120]);
+        scheduleTransientHeaderArtifactCleanup(event.reason || "resize_start", {
+          source: "resize_controller_start",
+        }, [320, 900]);
       },
       paneId: () => paneId,
       term: terminal,
@@ -5389,10 +5472,11 @@ function WorkspaceTerminal({
             return;
           }
 
-          const deferCodexResizeNormalization = terminalOutputNormalizer.enabled
+          const outputNormalizerActive = isTerminalOutputNormalizerActive();
+          const deferCodexResizeNormalization = outputNormalizerActive
             && isCodexResizeGateEnabled()
             && codexResizeGate.active;
-          const normalizerBefore = terminalOutputNormalizer.enabled && !deferCodexResizeNormalization
+          const normalizerBefore = outputNormalizerActive && !deferCodexResizeNormalization
             ? {
               droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
               droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
@@ -5406,7 +5490,7 @@ function WorkspaceTerminal({
           const terminalData = deferCodexResizeNormalization
             ? displayData
             : (
-              terminalOutputNormalizer.enabled
+              outputNormalizerActive
                 ? normalizeTerminalOutputBytes(terminalOutputNormalizer, displayData)
                 : displayData
             );
@@ -5536,6 +5620,13 @@ function WorkspaceTerminal({
             sawFirstVisibleOutput = true;
           }
 
+          markCodexSlashMenuOutputActivity(terminalData.byteLength, {
+            hasVisibleOutput,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            visibleChars,
+          });
+
           logTerminalDiagnosticEvent(
             "frontend.output_chunk.slow",
             {
@@ -5599,6 +5690,8 @@ function WorkspaceTerminal({
               ...getTerminalInputDebugFields(data),
             }
             : null;
+
+          handleSlashCommandDiagnosticInput(data, `pty_input_write:${reason}`);
 
           terminalInputWriteChain = terminalInputWriteChain
             .catch(() => {})
@@ -5793,6 +5886,13 @@ function WorkspaceTerminal({
         container.addEventListener("keydown", handleTerminalSelectionDelete, true);
         disposables.push(() => {
           container.removeEventListener("keydown", handleTerminalSelectionDelete, true);
+        });
+        const handleTerminalSlashCommandKeyDown = (event) => {
+          handleSlashCommandDiagnosticKeyDown(event, "container_capture_keydown");
+        };
+        container.addEventListener("keydown", handleTerminalSlashCommandKeyDown, true);
+        disposables.push(() => {
+          container.removeEventListener("keydown", handleTerminalSlashCommandKeyDown, true);
         });
         const handleTerminalEscapeKey = (event, source = "container_capture_keydown") => {
           const isPlainEscape = event.key === "Escape"

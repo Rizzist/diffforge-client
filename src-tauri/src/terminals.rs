@@ -453,6 +453,7 @@ fn terminal_coordination_session_from_context(
         db_path: context.db_path.clone(),
         mcp_command: context.mcp_command.clone(),
         agent_id: context.agent_id.clone(),
+        agent_kind: context.agent_kind.clone(),
         session_id: context.session_id.clone(),
         env_vars: context.env_vars(),
     }
@@ -2818,9 +2819,9 @@ Original task:\n{original_task}\n\n\
 Why you were parked:\n{parked_lines}\n\n\
 Dependency now resolved:\n{resolved_lines}{refresh_note}\n\n\
 Continue now:\n\
-1. Call coordination-kernel.start_task with a short continuation plan to refresh coordination state.\n\
-2. Inspect the current target file(s) before editing so you do not work from stale context.\n\
-3. Re-acquire the needed lease(s), continue the original task above, and submit the patch when finished."
+1. Inspect the current target file(s) before editing so you do not work from stale context.\n\
+2. Call coordination-kernel.start_task only when you are ready to edit, with a short continuation plan.\n\
+3. Re-acquire the needed lease(s) using the task_id returned by start_task, continue the original task above, and submit the patch with that task_id when finished."
     )
 }
 
@@ -4165,6 +4166,7 @@ mod terminal_tests {
             db_path,
             mcp_command: "coordination_mcp".to_string(),
             agent_id,
+            agent_kind: "codex".to_string(),
             session_id,
             env_vars: Vec::new(),
         }
@@ -4291,6 +4293,53 @@ mod terminal_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn coordinated_claude_launch_auto_approves_repo_views_and_coordination_tools() {
+        let coordination = terminal_test_coordination("claude_auto_approval_args");
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "claude",
+            &["--model".to_string(), "sonnet".to_string()],
+            Some(&coordination),
+            "pane-auto",
+            42,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
+        let allowed_tools = args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--allowedTools" || pair[0] == "--allowed-tools")
+                    .then(|| pair[1].as_str())
+            })
+            .unwrap();
+        for tool in [
+            "Read",
+            "Glob",
+            "Grep",
+            "LS",
+            "mcp__coordination-kernel__start_task",
+            "mcp__coordination-kernel__acquire_lease",
+            "mcp__coordination-kernel__checkpoint",
+            "mcp__coordination-kernel__submit_patch",
+        ] {
+            assert!(allowed_tools.split(',').any(|allowed| allowed == tool));
+        }
+        let mcp_config = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
+            .unwrap();
+        assert!(mcp_config.contains("\"coordination-kernel\""));
+        assert!(mcp_config.contains("--session-id"));
+        assert!(mcp_config.contains(&coordination.session_id));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|arg| arg == "--no-alt-screen"));
     }
 
     #[test]

@@ -435,6 +435,7 @@ struct TerminalCoordinationSession {
     db_path: String,
     mcp_command: String,
     agent_id: String,
+    agent_kind: String,
     session_id: String,
     env_vars: Vec<(String, String)>,
 }

@@ -46,6 +46,7 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
 ];
 const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] =
     &["start_task", "acquire_lease", "checkpoint", "submit_patch"];
+const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
 #[derive(Clone, Copy)]
 struct SessionSlotOptions {
@@ -2954,6 +2955,7 @@ impl CoordinationKernel {
 
         Ok(TerminalCoordinationContext {
             agent_id,
+            agent_kind: agent_kind.to_string(),
             agent_slot_id,
             slot_key,
             session_id,
@@ -3028,6 +3030,7 @@ impl CoordinationKernel {
             .as_str()
             .ok_or_else(|| "Unable to read created terminal agent id.".to_string())?
             .to_string();
+        let agent_kind = session["agentKind"].as_str().unwrap_or("agent").to_string();
         let session_id = session["id"]
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
@@ -3072,6 +3075,7 @@ impl CoordinationKernel {
 
         Ok(TerminalCoordinationContext {
             agent_id,
+            agent_kind,
             agent_slot_id,
             slot_key,
             session_id,
@@ -4294,6 +4298,9 @@ impl CoordinationKernel {
                 .join(".codex")
                 .join("config.toml")
                 .exists()
+            && claude_settings_file_has_required_policy(&claude_settings_path(
+                &self.paths.repo_path,
+            ))
     }
 
     fn slot_mcp_activation_files_match(
@@ -4329,6 +4336,7 @@ impl CoordinationKernel {
                 &worktree.join(".codex").join("config.toml"),
                 &codex_config_toml(command, args),
             )
+            && claude_settings_file_has_required_policy(&claude_settings_path(&worktree))
     }
 
     fn write_worktree_mcp_activation_files(
@@ -4364,6 +4372,7 @@ impl CoordinationKernel {
             &codex_dir.join("config.toml"),
             &codex_config_toml(command, args),
         )?;
+        write_claude_settings_file(&worktree)?;
         self.write_agent_contract_files(&worktree)?;
         Ok(())
     }
@@ -4418,6 +4427,7 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         let codex_path = codex_dir.join("config.toml");
         write_text_file_atomic(&codex_path, &codex_config_toml(command, args))?;
+        write_claude_settings_file(&self.paths.repo_path)?;
         self.write_agent_contract_files(&self.paths.repo_path)?;
 
         Ok((mcp_path, codex_path))
@@ -4477,6 +4487,12 @@ impl CoordinationKernel {
         {
             additions.push(".codex/config.toml");
         }
+        if !existing
+            .lines()
+            .any(|line| line.trim() == ".claude/settings.local.json")
+        {
+            additions.push(".claude/settings.local.json");
+        }
         if additions.is_empty() {
             return Ok(());
         }
@@ -4514,7 +4530,7 @@ impl CoordinationKernel {
                 .map_err(|error| format!("Unable to create git exclude directory: {error}"))?;
         }
         let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
-        let additions = [".mcp.json", ".codex/", "opencode.json"];
+        let additions = [".mcp.json", ".codex/", ".claude/", "opencode.json"];
         let mut next = existing.clone();
         for addition in additions {
             if !existing.lines().any(|line| line.trim() == addition) {
@@ -11118,14 +11134,15 @@ impl CoordinationKernel {
             "workflow": {
                 "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "submit_patch"],
                 "next": [
-                    "Acquire leases for the exact files/resources you will edit.",
-                    "Call checkpoint with one short summary after meaningful progress.",
+                    "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
+                    "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
+                    "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
                     "Use normal shell and edit tools inside COORDINATION_AGENT_BRANCH_ROOT.",
                     "Submit the patch when finished; submit_patch owns validation and safe integration."
                 ],
                 "cloud_mcp": {
                     "mode": "automatic_rust_lifecycle",
-                    "agent_action_required": "checkpoint_only",
+                    "agent_action_required": "use_cloud_returned_start_task_id_for_lease_checkpoint_and_submit",
                     "note": "Diff Forge publishes context packs, task lifecycle, checkpoint summaries, and lane state through the app/kernel cloud sync path."
                 }
             }
@@ -14182,6 +14199,7 @@ impl CoordinationKernel {
         json!({
             "id": session["id"].as_str().unwrap_or_default(),
             "agentId": session["agent_id"].as_str().unwrap_or_default(),
+            "agentKind": slot["agent_kind"].as_str().unwrap_or("agent"),
             "agentSlotId": slot["id"].as_str().unwrap_or_default(),
             "slotKey": slot["slot_key"].as_str().unwrap_or_default(),
             "taskId": session["task_id"].as_str(),
@@ -15104,6 +15122,110 @@ fn codex_config_toml(command: &str, args: &[String]) -> String {
     config
 }
 
+fn claude_settings_path(root: &Path) -> PathBuf {
+    root.join(".claude").join("settings.local.json")
+}
+
+fn claude_auto_approved_tools() -> Vec<String> {
+    let mut tools = CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect::<Vec<_>>();
+    tools.extend(
+        CODEX_AUTO_APPROVED_COORDINATION_TOOLS
+            .iter()
+            .map(|tool| format!("mcp__coordination-kernel__{tool}")),
+    );
+    tools
+}
+
+fn claude_settings_with_required_policy(existing: Value) -> Value {
+    let mut settings = existing.as_object().cloned().unwrap_or_default();
+
+    let mut enabled_servers = settings
+        .remove("enabledMcpjsonServers")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if !enabled_servers
+        .iter()
+        .any(|value| value.as_str() == Some("coordination-kernel"))
+    {
+        enabled_servers.push(json!("coordination-kernel"));
+    }
+    settings.insert(
+        "enabledMcpjsonServers".to_string(),
+        Value::Array(enabled_servers),
+    );
+    settings.insert("enableAllProjectMcpServers".to_string(), json!(true));
+
+    let mut permissions = settings
+        .remove("permissions")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut allow = permissions
+        .remove("allow")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut seen = allow
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<HashSet<_>>();
+    for tool in claude_auto_approved_tools() {
+        if seen.insert(tool.clone()) {
+            allow.push(json!(tool));
+        }
+    }
+    permissions.insert("allow".to_string(), Value::Array(allow));
+    settings.insert("permissions".to_string(), Value::Object(permissions));
+
+    Value::Object(settings)
+}
+
+fn claude_settings_file_has_required_policy(path: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<Value>(&body) else {
+        return false;
+    };
+    if settings["enableAllProjectMcpServers"].as_bool() != Some(true) {
+        return false;
+    }
+    let server_enabled = settings["enabledMcpjsonServers"]
+        .as_array()
+        .is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.as_str() == Some("coordination-kernel"))
+        });
+    if !server_enabled {
+        return false;
+    }
+    let allowed = settings["permissions"]["allow"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    claude_auto_approved_tools()
+        .iter()
+        .all(|tool| allowed.contains(tool.as_str()))
+}
+
+fn write_claude_settings_file(root: &Path) -> Result<PathBuf, String> {
+    let path = claude_settings_path(root);
+    let existing = fs::read_to_string(&path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .unwrap_or_else(|| json!({}));
+    let settings = claude_settings_with_required_policy(existing);
+    write_json_file_atomic(&path, &settings)?;
+    Ok(path)
+}
+
 fn opencode_config_json(command: &str, args: &[String]) -> Value {
     let mut command_args = Vec::with_capacity(args.len() + 1);
     command_args.push(json!(command));
@@ -15134,12 +15256,13 @@ fn diffforge_agent_contract_markdown() -> String {
 # Diff Forge agent coordination contract\n\n\
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, and patch submission.\n\n\
 ## Required flow for every user task\n\n\
-1. Call `coordination-kernel.start_task` once before editing, and again when a parked task resumes. Include a short `plan` explaining what you are about to do; Rust sends that plan to Cloud MCP for spec classification before work starts.\n\
-2. Use `coordination-kernel.acquire_lease` with normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-3. Use normal shell and edit tools inside `COORDINATION_AGENT_BRANCH_ROOT`; never edit the shared project root or another agent slot's worktree.\n\
-4. Call `coordination-kernel.checkpoint` occasionally with one short summary of what you have done so far.\n\
-5. When finished, call `coordination-kernel.submit_patch`. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\n\
-6. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
+2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
+3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
+4. Use normal shell and edit tools inside `COORDINATION_AGENT_BRANCH_ROOT`; never edit the shared project root or another agent slot's worktree.\n\
+5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
+6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\n\
+7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, lane claims, and merge context through the Rust cloud event path.\n\
@@ -15665,6 +15788,96 @@ mod tests {
         );
     }
 
+    fn fake_cloud_mcp_url(default_task_id: &str, omit_task_id: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let default_task_id = default_task_id.to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(32) {
+                handle_fake_cloud_mcp_stream(stream, default_task_id.clone(), omit_task_id);
+            }
+        });
+        url
+    }
+
+    fn handle_fake_cloud_mcp_stream(
+        mut stream: std::net::TcpStream,
+        default_task_id: String,
+        omit_task_id: bool,
+    ) {
+        use std::io::{Read, Write};
+
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(read) = stream.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_text = String::from_utf8_lossy(&buffer);
+        let path = request_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let body_text = request_text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        let request_json =
+            serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_else(|_| json!({}));
+        let requested_task_id = request_json["payload"]["task_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(default_task_id.as_str());
+
+        let body = if path == "/v1/events" {
+            if omit_task_id {
+                json!({
+                    "data": {
+                        "task": {},
+                        "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
+                    }
+                })
+            } else {
+                json!({
+                    "data": {
+                        "task_id": requested_task_id,
+                        "task": {"id": requested_task_id},
+                        "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
+                    }
+                })
+            }
+        } else if path == "/v1/spec/graph" {
+            json!({
+                "data": {
+                    "kind": "project_spec_graph",
+                    "version": 3,
+                    "repo_id": "repo-test",
+                    "workspace_id": "workspace-test",
+                    "graph_stats": {},
+                    "agent_work": {},
+                    "nodes": [],
+                    "edges": []
+                }
+            })
+        } else {
+            json!({"data": {"ok": true}})
+        }
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
     #[test]
     fn atomic_text_writes_use_isolated_temp_files_under_concurrency() {
         let repo = temp_repo("atomic_text_concurrency");
@@ -15970,6 +16183,9 @@ mod tests {
         ));
         assert!(worktree.join(".mcp.json").exists());
         assert!(worktree.join(".codex").join("config.toml").exists());
+        assert!(claude_settings_file_has_required_policy(
+            &worktree.join(".claude").join("settings.local.json")
+        ));
         let worktree_opencode_path = worktree.join("opencode.json");
         assert!(worktree_opencode_path.exists());
         let worktree_opencode: Value =
@@ -15992,6 +16208,9 @@ mod tests {
         assert!(!agent_config.contains("COORDINATION_SESSION_ID"));
         assert!(repo.join(".mcp.json").exists());
         assert!(repo.join(".codex").join("config.toml").exists());
+        assert!(claude_settings_file_has_required_policy(
+            &repo.join(".claude").join("settings.local.json")
+        ));
         let repo_codex = fs::read_to_string(repo.join(".codex").join("config.toml")).unwrap();
         let worktree_codex =
             fs::read_to_string(worktree.join(".codex").join("config.toml")).unwrap();
@@ -16117,12 +16336,36 @@ mod tests {
             .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
             .unwrap();
         let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
+        let claude_settings_path = repo.join(".claude").join("settings.local.json");
 
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
         for tool in ["start_task", "acquire_lease", "checkpoint", "submit_patch"] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
             )));
+        }
+        assert!(claude_settings_file_has_required_policy(
+            &claude_settings_path
+        ));
+        let claude_settings: Value =
+            serde_json::from_str(&fs::read_to_string(claude_settings_path).unwrap()).unwrap();
+        let claude_allow = claude_settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<HashSet<_>>();
+        for tool in [
+            "Read",
+            "Glob",
+            "Grep",
+            "LS",
+            "mcp__coordination-kernel__start_task",
+            "mcp__coordination-kernel__acquire_lease",
+            "mcp__coordination-kernel__checkpoint",
+            "mcp__coordination-kernel__submit_patch",
+        ] {
+            assert!(claude_allow.contains(tool));
         }
         assert!(!config.contains("[mcp_servers.cloud-diffforge]"));
         for prompt_gated_tool in [
@@ -16198,6 +16441,7 @@ mod tests {
 
         let initial = kernel.mcp_client_mount_summary().unwrap();
         assert_eq!(initial["status"].as_str(), Some("not_seen"));
+        let cloud_url = fake_cloud_mcp_url("cloud-mount-task", false);
 
         let response = crate::coordination::mcp::dispatch_tool(
             &crate::coordination::mcp::McpContext {
@@ -16208,11 +16452,14 @@ mod tests {
                 ..crate::coordination::mcp::McpContext::default()
             },
             "start_task",
-            json!({"plan": "Verify the coordination MCP mount proof path."}),
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Verify the coordination MCP mount proof path."
+            }),
         );
         assert_eq!(response["ok"].as_bool(), Some(true));
         let task_id = response["data"]["task_id"].as_str().unwrap();
-        assert!(!task_id.is_empty());
+        assert_eq!(task_id, "cloud-mount-task");
         assert_eq!(response["data"]["created_task"].as_bool(), Some(true));
 
         let summary = kernel.mcp_client_mount_summary().unwrap();
@@ -16257,21 +16504,28 @@ mod tests {
             session_id: Some(session_id.clone()),
             ..crate::coordination::mcp::McpContext::default()
         };
+        let cloud_url = fake_cloud_mcp_url("cloud-bootstrap-task", false);
 
         let started = crate::coordination::mcp::dispatch_tool(
             &context,
             "start_task",
-            json!({"plan": "Create a simple ice cream wish list page."}),
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Create a simple ice cream wish list page."
+            }),
         );
         assert_eq!(started["ok"].as_bool(), Some(true));
         let task_id = started["data"]["task_id"].as_str().unwrap();
-        assert!(!task_id.is_empty());
+        assert_eq!(task_id, "cloud-bootstrap-task");
         assert_eq!(started["data"]["created_task"].as_bool(), Some(true));
 
         let repeated = crate::coordination::mcp::dispatch_tool(
             &context,
             "start_task",
-            json!({"plan": "Continue the simple ice cream wish list page."}),
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Continue the simple ice cream wish list page."
+            }),
         );
         assert_eq!(repeated["ok"].as_bool(), Some(true));
         assert_eq!(repeated["data"]["task_id"].as_str(), Some(task_id));
@@ -16281,7 +16535,11 @@ mod tests {
         let lease = crate::coordination::mcp::dispatch_tool(
             &context,
             "acquire_lease",
-            json!({"resource_key": "file:index.html", "reason": "Create the wishlist page"}),
+            json!({
+                "task_id": task_id,
+                "resource_key": "file:index.html",
+                "reason": "Create the wishlist page"
+            }),
         );
         assert_eq!(lease["ok"].as_bool(), Some(true));
         assert_eq!(
@@ -16295,6 +16553,89 @@ mod tests {
     }
 
     #[test]
+    fn agent_mcp_start_task_refuses_local_task_without_cloud_task_id() {
+        let repo = init_git_repo("mcp_start_task_requires_cloud_id");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let cloud_url = fake_cloud_mcp_url("unused-task", true);
+
+        let response = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id),
+                session_id: Some(session_id.clone()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Try to start without a Cloud task id."
+            }),
+        );
+
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(
+            response["error"]["code"].as_str(),
+            Some("cloud_start_task_failed")
+        );
+        let session = kernel
+            .query_one(
+                "SELECT task_id FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert!(session["task_id"].as_str().unwrap_or_default().is_empty());
+        let tasks = kernel.query_json("SELECT id FROM tasks", &[]).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn agent_mcp_acquire_lease_rejects_implicit_task_id() {
+        let repo = init_git_repo("mcp_acquire_requires_explicit_task_id");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let context = crate::coordination::mcp::McpContext {
+            repo_path: Some(process_path_text(&repo)),
+            agent_id: Some(agent_id),
+            session_id: Some(session_id),
+            ..crate::coordination::mcp::McpContext::default()
+        };
+        let cloud_url = fake_cloud_mcp_url("cloud-implicit-task", false);
+
+        let started = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Create a simple ice cream wish list page."
+            }),
+        );
+        assert_eq!(started["ok"].as_bool(), Some(true));
+
+        let lease = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "acquire_lease",
+            json!({"resource_key": "file:index.html", "reason": "Create the wishlist page"}),
+        );
+        assert_eq!(lease["ok"].as_bool(), Some(false));
+        assert_eq!(
+            lease["error"]["code"].as_str(),
+            Some("task_id_required_after_start_task")
+        );
+    }
+
+    #[test]
     fn agent_mcp_start_task_treats_session_id_task_id_as_omitted() {
         let repo = init_git_repo("mcp_start_task_session_id");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -16304,6 +16645,7 @@ mod tests {
             .create_session(&agent_id, None, None, false, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap().to_string();
+        let cloud_url = fake_cloud_mcp_url("cloud-session-omitted-task", false);
 
         let started = crate::coordination::mcp::dispatch_tool(
             &crate::coordination::mcp::McpContext {
@@ -16314,13 +16656,14 @@ mod tests {
             },
             "start_task",
             json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
                 "task_id": session_id,
                 "plan": "Create a simple ice cream wish list page."
             }),
         );
         assert_eq!(started["ok"].as_bool(), Some(true));
         let task_id = started["data"]["task_id"].as_str().unwrap();
-        assert!(!task_id.is_empty());
+        assert_eq!(task_id, "cloud-session-omitted-task");
         assert_ne!(task_id, session_id);
         assert_eq!(
             started["data"]["ignored_session_id_task_id"].as_bool(),
@@ -16338,6 +16681,7 @@ mod tests {
             .create_session(&agent_id, None, None, false, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap().to_string();
+        let cloud_url = fake_cloud_mcp_url("ice-cream-wishlist-index", false);
 
         let started = crate::coordination::mcp::dispatch_tool(
             &crate::coordination::mcp::McpContext {
@@ -16348,6 +16692,7 @@ mod tests {
             },
             "start_task",
             json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
                 "task_id": "ice-cream-wishlist-index",
                 "plan": "Create a simple ice cream wish list page."
             }),
@@ -16366,7 +16711,11 @@ mod tests {
                 ..crate::coordination::mcp::McpContext::default()
             },
             "acquire_lease",
-            json!({"resource_key": "file:index.html", "reason": "Create the wishlist page"}),
+            json!({
+                "task_id": task_id.clone(),
+                "resource_key": "file:index.html",
+                "reason": "Create the wishlist page"
+            }),
         );
         assert_eq!(lease["ok"].as_bool(), Some(true));
         let rows = kernel
