@@ -49,6 +49,7 @@ const TerminalPanelAnchor = styled.div`
   height: 100%;
   min-width: 0;
   min-height: 0;
+  background: #020304;
   pointer-events: none;
 
   &[data-terminal-drag-placeholder="true"]::after {
@@ -67,6 +68,7 @@ const TerminalSurfaceLayer = styled.div`
   inset: 0;
   z-index: 20;
   overflow: visible;
+  background: #020304;
   pointer-events: none;
 `;
 
@@ -79,6 +81,7 @@ const TerminalSurfaceSlot = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: visible;
+  background: #020304;
   pointer-events: auto;
   transform: translate3d(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px), 0);
   transition:

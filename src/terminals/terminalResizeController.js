@@ -307,6 +307,7 @@ export function createTerminalResizeController({
   let pendingNativeReason = "";
   let queuedForResizeFrame = false;
   let queuedResizeDeadlineMs = 0;
+  let queuedResizeOptions = null;
   let queuedResizeReason = "";
   let webglAtlasClearTimer = 0;
 
@@ -540,7 +541,7 @@ export function createTerminalResizeController({
     );
   };
 
-  const schedule = (reason = "resize_observer", delayMs = debounceMs) => {
+  const schedule = (reason = "resize_observer", delayMs = debounceMs, options = {}) => {
     if (disposed) {
       return;
     }
@@ -560,6 +561,10 @@ export function createTerminalResizeController({
     });
 
     queuedResizeReason = reason;
+    queuedResizeOptions = {
+      ...(queuedResizeOptions || {}),
+      ...(options || {}),
+    };
 
     if (!queuedForResizeFrame) {
       queuedForResizeFrame = true;
@@ -575,21 +580,17 @@ export function createTerminalResizeController({
   };
 
   const observer = new ResizeObserver(() => {
-    if (Math.max(0, Number(debounceMs || 0)) <= 0) {
-      resizeNow("resize_observer", {
-        deferWebglAtlasClear: true,
-        frontendFirst: true,
-        nativeDelayMs: nativeResizeTrailingMs,
-      });
-      return;
-    }
-
-    schedule("resize_observer", debounceMs);
+    schedule("resize_observer", debounceMs, {
+      deferWebglAtlasClear: true,
+      frontendFirst: true,
+      nativeDelayMs: nativeResizeTrailingMs,
+    });
   });
 
   function flushScheduledResize() {
     if (disposed || !queuedForResizeFrame) {
       queuedForResizeFrame = false;
+      queuedResizeOptions = null;
       return;
     }
 
@@ -599,10 +600,15 @@ export function createTerminalResizeController({
     }
 
     const reason = queuedResizeReason || "resize_observer";
+    const options = queuedResizeOptions || {};
     queuedForResizeFrame = false;
     queuedResizeDeadlineMs = 0;
+    queuedResizeOptions = null;
     queuedResizeReason = "";
-    resizeNow(reason, { nativeDelayMs: nativeResizeTrailingMs });
+    resizeNow(reason, {
+      nativeDelayMs: nativeResizeTrailingMs,
+      ...options,
+    });
   }
 
   async function resizeNow(reason = "manual", options = {}) {
@@ -765,6 +771,7 @@ export function createTerminalResizeController({
       disposed = true;
       queuedForResizeFrame = false;
       removeResizeController(controller);
+      queuedResizeOptions = null;
       clearNativeResizeTimer();
       clearWebglAtlasClearTimer();
       nativeResizeBurstActive = false;

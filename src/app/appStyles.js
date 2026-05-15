@@ -18,6 +18,8 @@ import { Fullscreen } from "@styled-icons/material-rounded/Fullscreen";
 import { FullscreenExit } from "@styled-icons/material-rounded/FullscreenExit";
 import { Hub } from "@styled-icons/material-rounded/Hub";
 import { Key } from "@styled-icons/material-rounded/Key";
+import { KeyboardDoubleArrowLeft } from "@styled-icons/material-rounded/KeyboardDoubleArrowLeft";
+import { KeyboardDoubleArrowRight } from "@styled-icons/material-rounded/KeyboardDoubleArrowRight";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
 import { Mic } from "@styled-icons/material-rounded/Mic";
@@ -38,6 +40,23 @@ export const AUTH_TILE_SIZE = 40;
 const TERMINAL_THEME_BACKGROUND = "#020304";
 const TERMINAL_PANE_MIN_WIDTH_PX = 180;
 const TERMINAL_PANE_MIN_HEIGHT_PX = 96;
+const FILES_VSCODE_THEME_VARS = `
+  --files-vscode-activity: #05070b;
+  --files-vscode-sidebar: #080a0f;
+  --files-vscode-editor: #030405;
+  --files-vscode-editor-gutter: #06080c;
+  --files-vscode-tab: #090b10;
+  --files-vscode-tab-active: #030405;
+  --files-vscode-border: #1d222b;
+  --files-vscode-border-subtle: #141922;
+  --files-vscode-hover: #111722;
+  --files-vscode-selection: #0b3a5a;
+  --files-vscode-selection-inactive: #151c26;
+  --files-vscode-text: #d3d8df;
+  --files-vscode-text-muted: #7f8793;
+  --files-vscode-blue: #4fa3ff;
+  --files-vscode-focus: #3c8fdc;
+`;
 
 export const GlobalStyle = createGlobalStyle`
   :root {
@@ -126,6 +145,14 @@ export const GlobalStyle = createGlobalStyle`
       var(--forge-bg);
   }
 
+  html[data-window-platform="macos"],
+  html[data-window-platform="macos"] body,
+  html[data-window-platform="macos"] #app,
+  body[data-window-platform="macos"],
+  body[data-window-platform="macos"] #app {
+    background: transparent !important;
+  }
+
   html[data-audio-widget="true"],
   html[data-audio-widget="true"] body,
   html[data-audio-widget="true"] #app,
@@ -172,6 +199,14 @@ export const AppFrame = styled.div`
   min-height: 100vh;
   grid-template-rows: ${TITLE_BAR_HEIGHT} minmax(0, 1fr);
   background: var(--forge-bg);
+
+  &[data-platform="macos"][data-window-expanded="false"] {
+    min-height: 100vh;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.36);
+    overflow: hidden;
+  }
 `;
 
 export const WindowResizeEdges = styled.div`
@@ -264,12 +299,14 @@ export const WindowTitleBar = styled.header`
   height: ${TITLE_BAR_HEIGHT};
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 1px solid rgba(185, 191, 203, 0.16);
   color: #e8eef8;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.018)),
-    #060910;
+  background: #000000;
   user-select: none;
+
+  &[data-platform="macos"] {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
 `;
 
 export const WindowTitle = styled.div`
@@ -297,12 +334,33 @@ export const WindowTitle = styled.div`
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  ${WindowTitleBar}[data-platform="macos"] & {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: center;
+    padding-right: 86px;
+    padding-left: 0;
+  }
 `;
 
 export const WindowControls = styled.div`
   display: inline-flex;
   height: 100%;
   align-items: center;
+
+  &[data-platform="macos"] {
+    grid-column: 1;
+    grid-row: 1;
+    justify-self: start;
+    gap: 8px;
+    padding: 0 12px;
+  }
+
+  &[data-platform="linux"] {
+    gap: 4px;
+    padding: 0 8px;
+  }
 `;
 
 export const WindowControlButton = styled.button`
@@ -324,18 +382,75 @@ export const WindowControlButton = styled.button`
     color: #ffffff;
     background: #d83b32;
   }
+
+  &[data-platform="macos"] {
+    width: 12px;
+    height: 12px;
+    padding: 0;
+    border: 1px solid rgba(0, 0, 0, 0.22);
+    border-radius: 999px;
+    color: rgba(0, 0, 0, 0.62);
+    box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.12);
+  }
+
+  &[data-platform="macos"][data-action="close"] {
+    order: 1;
+    background: #ff5f57;
+  }
+
+  &[data-platform="macos"][data-action="minimize"] {
+    order: 2;
+    background: #ffbd2e;
+  }
+
+  &[data-platform="macos"][data-action="maximize"] {
+    order: 3;
+    background: #28c840;
+  }
+
+  &[data-platform="macos"] svg {
+    width: 8px;
+    height: 8px;
+    opacity: 0;
+    transform: scale(0.82);
+    transition:
+      opacity 120ms ease,
+      transform 120ms ease;
+  }
+
+  ${WindowControls}[data-platform="macos"]:hover &[data-platform="macos"] svg,
+  &[data-platform="macos"]:focus-visible svg {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  &[data-platform="macos"]:hover,
+  &[data-platform="macos"][data-variant="close"]:hover {
+    color: rgba(0, 0, 0, 0.7);
+    filter: brightness(0.96);
+  }
+
+  &[data-platform="linux"] {
+    width: 34px;
+    height: 26px;
+    border-radius: 7px;
+    color: #c9d2dc;
+  }
+
+  &[data-platform="linux"]:hover {
+    color: #ffffff;
+    background: rgba(230, 236, 245, 0.08);
+  }
+
+  &[data-platform="linux"][data-variant="close"]:hover {
+    background: rgba(216, 59, 50, 0.86);
+  }
 `;
 
 export const AppContent = styled.div`
   min-height: 0;
   overflow: auto;
-  background:
-    linear-gradient(180deg, rgba(47, 128, 255, 0.1) 0%, rgba(3, 5, 8, 0) 34rem),
-    linear-gradient(135deg, rgba(255, 122, 24, 0.08) 0%, rgba(3, 5, 8, 0) 28rem),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.026) 1px, transparent 1px),
-    #030508;
-  background-size: auto, auto, 96px 96px, 96px 96px, auto;
+  background: #000000;
 `;
 
 export const workspaceCloseSpin = keyframes`
@@ -927,24 +1042,53 @@ export const LoginLayout = styled.div`
 `;
 
 export const SquareField = styled.div`
+  --square-field-bg: #030508;
+  --square-grid-x: rgba(185, 191, 203, 0.24);
+  --square-grid-y: rgba(185, 191, 203, 0.22);
+  --square-overlay-left: rgba(3, 5, 8, 0.72);
+  --square-overlay-mid: rgba(3, 5, 8, 0.12);
+  --square-overlay-right: rgba(3, 5, 8, 0.6);
+  --square-overlay-top: rgba(3, 5, 8, 0.06);
+  --square-overlay-bottom: rgba(3, 5, 8, 0.48);
+  --square-pulse-bg: rgba(188, 194, 205, 0.96);
+  --square-pulse-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+
   position: absolute;
   inset: 0;
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
   background:
-    linear-gradient(90deg, rgba(185, 191, 203, 0.24) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(185, 191, 203, 0.22) 1px, transparent 1px),
-    #030508;
+    linear-gradient(90deg, var(--square-grid-x) 1px, transparent 1px),
+    linear-gradient(180deg, var(--square-grid-y) 1px, transparent 1px),
+    var(--square-field-bg);
   background-size: ${AUTH_TILE_SIZE}px ${AUTH_TILE_SIZE}px;
+
+  &[data-tone="quiet"] {
+    --square-field-bg: #000000;
+    --square-grid-x: rgba(104, 110, 120, 0.22);
+    --square-grid-y: rgba(104, 110, 120, 0.2);
+    --square-overlay-left: rgba(0, 0, 0, 0.74);
+    --square-overlay-mid: rgba(0, 0, 0, 0.16);
+    --square-overlay-right: rgba(0, 0, 0, 0.66);
+    --square-overlay-top: rgba(0, 0, 0, 0.08);
+    --square-overlay-bottom: rgba(0, 0, 0, 0.52);
+    --square-pulse-bg: rgba(104, 110, 120, 0.72);
+    --square-pulse-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+  }
 
   &::after {
     position: absolute;
     inset: 0;
     z-index: 2;
     background:
-      linear-gradient(90deg, rgba(3, 5, 8, 0.72), rgba(3, 5, 8, 0.12) 46%, rgba(3, 5, 8, 0.6)),
-      linear-gradient(180deg, rgba(3, 5, 8, 0.06), rgba(3, 5, 8, 0.48));
+      linear-gradient(
+        90deg,
+        var(--square-overlay-left),
+        var(--square-overlay-mid) 46%,
+        var(--square-overlay-right)
+      ),
+      linear-gradient(180deg, var(--square-overlay-top), var(--square-overlay-bottom));
     content: "";
   }
 `;
@@ -956,8 +1100,8 @@ export const SquarePulse = styled.span`
   z-index: 1;
   width: ${AUTH_TILE_SIZE}px;
   height: ${AUTH_TILE_SIZE}px;
-  background: rgba(188, 194, 205, 0.96);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  background: var(--square-pulse-bg);
+  box-shadow: var(--square-pulse-shadow);
   opacity: 0;
   animation: ${squareFade} var(--duration) ease-in-out var(--delay) infinite;
 `;
@@ -1398,12 +1542,16 @@ export const WorkspaceStartupOverlay = styled(SplashScreen).attrs({ as: "section
 `;
 
 export const DashboardShell = styled.main`
+  --workspace-rail-width: 192px;
+  --workspace-rail-collapsed-width: 56px;
+  --workspace-rail-target-width: var(--workspace-rail-width);
+
   position: relative;
   display: grid;
   min-width: 320px;
   height: calc(100vh - ${TITLE_BAR_HEIGHT});
   min-height: 0;
-  grid-template-columns: 192px minmax(280px, 1fr);
+  grid-template-columns: var(--workspace-rail-current-width, var(--workspace-rail-target-width)) minmax(280px, 1fr);
   color: var(--forge-text);
   overflow: hidden;
   background:
@@ -1417,8 +1565,14 @@ export const DashboardShell = styled.main`
     pointer-events: none;
   }
 
+  &[data-rail-collapsed="true"] {
+    --workspace-rail-target-width: var(--workspace-rail-collapsed-width);
+  }
+
   @media (max-width: 980px) {
-    grid-template-columns: 184px minmax(0, 1fr);
+    --workspace-rail-width: 184px;
+
+    grid-template-columns: var(--workspace-rail-current-width, var(--workspace-rail-target-width)) minmax(0, 1fr);
   }
 
   @media (max-width: 760px) {
@@ -1426,6 +1580,10 @@ export const DashboardShell = styled.main`
     min-height: calc(100vh - ${TITLE_BAR_HEIGHT});
     grid-template-columns: 1fr;
     overflow: auto;
+
+    &[data-rail-collapsed="true"] {
+      grid-template-columns: 1fr;
+    }
   }
 `;
 
@@ -1440,10 +1598,21 @@ export const WorkspaceRail = styled.aside`
     linear-gradient(180deg, rgba(47, 128, 255, 0.035), rgba(255, 122, 24, 0.018)),
     rgba(6, 9, 16, 0.94);
   animation: ${railReveal} 300ms cubic-bezier(0.2, 0.8, 0.2, 1) 40ms both;
+  overflow: hidden;
+  transition:
+    padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    gap 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &[data-collapsed="true"] {
+    gap: 7px;
+    padding: 8px 6px;
+  }
 
   @media (max-width: 760px) {
     min-height: auto;
     grid-template-rows: auto auto;
+    gap: 10px;
+    padding: 10px;
     border-right: 0;
     border-bottom: 1px solid var(--forge-border);
   }
@@ -1459,14 +1628,115 @@ export const RailTop = styled.div`
   padding-bottom: 4px;
 `;
 
+export const RailHeader = styled.div`
+  display: grid;
+  height: 28px;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 8px;
+  animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
+  transition:
+    gap 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    grid-template-columns: 0 28px;
+    gap: 0;
+    justify-content: center;
+    justify-items: center;
+  }
+
+  @media (max-width: 760px) {
+    height: 28px;
+    grid-template-columns: minmax(0, 1fr) 28px;
+    gap: 8px;
+    justify-content: stretch;
+    justify-items: stretch;
+  }
+`;
+
 export const RailSectionTitle = styled.p`
+  max-width: 120px;
   margin: 0;
   color: var(--forge-text-disabled);
   font-size: 10px;
   font-weight: 760;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
+  overflow: hidden;
+  white-space: nowrap;
+  transition:
+    max-width 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 150ms ease,
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+
+  @media (max-width: 760px) {
+    max-width: none;
+    opacity: 1;
+    transform: none;
+  }
+`;
+
+export const RailCollapseButton = styled.button`
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  justify-self: end;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 8px;
+  color: var(--forge-text-muted);
+  background:
+    linear-gradient(180deg, rgba(230, 236, 245, 0.05), rgba(230, 236, 245, 0.018)),
+    rgba(7, 9, 13, 0.74);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  svg {
+    width: 16px;
+    height: 16px;
+    transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  &:hover {
+    border-color: rgba(98, 160, 255, 0.3);
+    color: var(--forge-text);
+    background:
+      linear-gradient(90deg, rgba(47, 128, 255, 0.14), rgba(255, 122, 24, 0.04)),
+      rgba(13, 17, 23, 0.78);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.045),
+      0 0 18px rgba(47, 128, 255, 0.08);
+  }
+
+  &:active {
+    transform: scale(0.96);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    justify-self: center;
+    margin: 0 auto;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &:hover svg {
+    transform: translateX(1px);
+  }
+
+  @media (max-width: 760px) {
+    justify-self: end;
+  }
 `;
 
 export const WorkspaceList = styled.div`
@@ -1477,6 +1747,10 @@ export const WorkspaceList = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding-right: 2px;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    padding-right: 0;
+  }
 `;
 
 export const WorkspaceRow = styled.div`
@@ -1502,30 +1776,46 @@ export const WorkspaceRow = styled.div`
 `;
 
 export const WorkspaceButton = styled.button`
+  --workspace-card-bg: transparent;
+  --workspace-card-border: transparent;
+  --workspace-card-text: #c7d0dc;
+  --workspace-card-muted: #7e8998;
+  --workspace-card-status: rgba(144, 155, 170, 0.32);
+  --workspace-card-status-border: rgba(144, 155, 170, 0.24);
+  --workspace-card-hover-bg: rgba(230, 236, 245, 0.04);
+  --workspace-card-hover-border: rgba(230, 236, 245, 0.08);
+  --workspace-card-selected-bg: rgba(125, 160, 205, 0.09);
+  --workspace-card-selected-border: rgba(125, 160, 205, 0.22);
+
   position: relative;
   display: grid;
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 42px;
-  grid-template-columns: 4px minmax(0, 1fr);
+  min-height: 38px;
+  grid-template-columns: 18px minmax(0, 1fr);
   align-items: stretch;
-  gap: 8px;
-  padding: 5px 36px 5px 8px;
-  border: 1px solid rgba(230, 236, 245, 0.06);
+  gap: 7px;
+  padding: 4px 34px 4px 7px;
+  border: 1px solid var(--workspace-card-border);
   border-radius: 8px;
   box-sizing: border-box;
-  color: var(--forge-text-soft);
-  background: rgba(13, 17, 23, 0.48);
+  color: var(--workspace-card-text);
+  background: var(--workspace-card-bg);
   overflow: hidden;
   text-align: left;
   transition:
     background 160ms ease,
     border-color 160ms ease,
-    color 160ms ease;
+    color 160ms ease,
+    gap 190ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   strong {
     display: block;
+    max-height: 16px;
+    max-width: 100%;
     min-width: 0;
     overflow: hidden;
     font-size: 12px;
@@ -1533,42 +1823,201 @@ export const WorkspaceButton = styled.button`
     line-height: 1.1;
     text-overflow: ellipsis;
     white-space: nowrap;
+    transition:
+      max-height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 140ms ease,
+      transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
-  &[data-selected="true"],
-  &:hover,
-  ${WorkspaceRow}:hover &,
-  ${WorkspaceRow}:focus-within & {
-    border-color: rgba(98, 160, 255, 0.26);
-    background:
-      linear-gradient(90deg, rgba(47, 128, 255, 0.12), rgba(255, 122, 24, 0.035)),
-      rgba(13, 17, 23, 0.72);
+  &[data-runtime="closed"] {
+    --workspace-card-text: #aab4c1;
+    --workspace-card-muted: #687382;
+    --workspace-card-status: rgba(144, 155, 170, 0.22);
+    --workspace-card-status-border: rgba(144, 155, 170, 0.22);
+  }
+
+  &[data-runtime="activating"] {
+    --workspace-card-border: transparent;
+    --workspace-card-text: #ead7aa;
+    --workspace-card-muted: #a89261;
+    --workspace-card-status: #d8b36a;
+    --workspace-card-status-border: rgba(216, 179, 106, 0.44);
+    --workspace-card-hover-bg: rgba(216, 179, 106, 0.06);
+    --workspace-card-hover-border: rgba(216, 179, 106, 0.18);
   }
 
   &[data-runtime="activated"] {
-    color: var(--forge-text);
-    border-color: rgba(60, 203, 127, 0.22);
+    --workspace-card-border: transparent;
+    --workspace-card-text: #dbe7f6;
+    --workspace-card-muted: #8797aa;
+    --workspace-card-status: var(--forge-blue-soft);
+    --workspace-card-status-border: rgba(125, 176, 255, 0.42);
+    --workspace-card-hover-bg: rgba(125, 160, 205, 0.055);
+    --workspace-card-hover-border: rgba(125, 160, 205, 0.16);
+  }
+
+  &:hover,
+  ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}:focus-within & {
+    border-color: var(--workspace-card-hover-border);
+    background: var(--workspace-card-hover-bg);
+  }
+
+  &[data-selected="true"] {
+    border-color: var(--workspace-card-selected-border);
+    background: var(--workspace-card-selected-bg);
+    box-shadow: inset 0 0 0 1px rgba(125, 160, 205, 0.04);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    min-height: 38px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    justify-items: center;
+    padding: 4px;
+    text-align: center;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & strong {
+    max-height: 0;
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+
+  @media (max-width: 760px) {
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 7px;
+    justify-items: stretch;
+    padding: 4px 34px 4px 7px;
+    text-align: left;
+
+    strong {
+      max-height: 16px;
+      opacity: 1;
+      transform: none;
+    }
   }
 `;
 
 export const WorkspaceLabel = styled.div`
   display: grid;
+  position: relative;
   min-width: 0;
   max-width: 100%;
+  min-height: 28px;
   overflow: hidden;
   align-content: center;
   gap: 2px;
+  transition:
+    gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    place-items 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
-  > span {
+  > span:not([data-compact-glyph="true"]) {
     display: block;
+    max-height: 12px;
     min-width: 0;
     overflow: hidden;
-    color: var(--forge-text-muted);
+    color: var(--workspace-card-muted);
     font-size: 10px;
     font-weight: 650;
     line-height: 1.15;
     text-overflow: ellipsis;
     white-space: nowrap;
+    transition:
+      max-height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 140ms ease,
+      transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    place-items: center;
+    gap: 0;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & > span:not([data-compact-glyph="true"]) {
+    max-height: 0;
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+
+  @media (max-width: 760px) {
+    place-items: initial;
+    gap: 2px;
+
+    > span:not([data-compact-glyph="true"]) {
+      max-height: 12px;
+      opacity: 1;
+      transform: none;
+    }
+  }
+`;
+
+export const WorkspaceCompactGlyph = styled.span.attrs({ "data-compact-glyph": "true" })`
+  position: relative;
+  display: grid;
+  width: 0;
+  height: 0;
+  place-items: center;
+  border: 1px solid rgba(144, 155, 170, 0.24);
+  border-radius: 8px;
+  box-sizing: border-box;
+  color: var(--workspace-card-text);
+  background: rgba(230, 236, 245, 0.025);
+  box-shadow: none;
+  font-size: 10px;
+  font-weight: 780;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  opacity: 0;
+  overflow: hidden;
+  transform: scale(0.82);
+  transition:
+    width 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 150ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &::after {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    width: 5px;
+    height: 5px;
+    border-radius: 3px;
+    border: 1px solid rgba(3, 5, 8, 0.9);
+    box-sizing: border-box;
+    background: var(--workspace-card-status);
+    content: "";
+    opacity: 0;
+    transform: scale(0.8);
+    transition:
+      background 160ms ease,
+      box-shadow 160ms ease,
+      opacity 140ms ease,
+      transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    width: 28px;
+    height: 28px;
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceButton}[data-runtime="closed"] & {
+    color: var(--workspace-card-text);
+    background: rgba(230, 236, 245, 0.018);
+  }
+
+  @media (max-width: 760px) {
+    width: 0;
+    height: 0;
+    opacity: 0;
+    transform: scale(0.82);
   }
 `;
 
@@ -1577,13 +2026,14 @@ export const WorkspaceSettingsButton = styled.button`
   top: 50%;
   right: 4px;
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   place-items: center;
+  padding: 0;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(7, 9, 13, 0.74);
+  background: #050607;
   opacity: 0;
   pointer-events: none;
   transform: translate(4px, -50%);
@@ -1595,14 +2045,16 @@ export const WorkspaceSettingsButton = styled.button`
     transform 160ms ease;
 
   svg {
-    width: 15px;
-    height: 15px;
+    display: block;
+    width: 16px;
+    height: 16px;
+    margin: auto;
   }
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.34);
+    border-color: rgba(185, 191, 203, 0.2);
     color: var(--forge-text-soft);
-    background: var(--forge-surface-hover);
+    background: #090a0c;
   }
 
   ${WorkspaceRow}:hover &,
@@ -1611,32 +2063,82 @@ export const WorkspaceSettingsButton = styled.button`
     pointer-events: auto;
     transform: translateY(-50%);
   }
+
+  ${WorkspaceRail}[data-collapsed="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(8px, -50%) scale(0.86);
+  }
+
+  @media (max-width: 760px) {
+    ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}:focus-within & {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(-50%);
+    }
+  }
 `;
 
 export const WorkspaceAccent = styled.span`
-  width: 3px;
-  height: 16px;
-  border-radius: 999px;
-  background: rgba(230, 236, 245, 0.16);
+  align-self: center;
+  justify-self: center;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--workspace-card-status-border);
+  border-radius: 3px;
+  box-sizing: border-box;
+  background: rgba(230, 236, 245, 0.025);
+  box-shadow: none;
   transition:
     background 180ms ease,
+    border-color 180ms ease,
     box-shadow 180ms ease,
     transform 180ms ease;
 
   ${WorkspaceButton}[data-runtime="activating"] & {
-    background: var(--forge-amber);
-    box-shadow:
-      0 0 10px rgba(223, 165, 90, 0.28),
-      0 0 10px rgba(217, 121, 53, 0.14);
-    transform: scaleY(1.12);
+    border-color: var(--workspace-card-status-border);
+    background: var(--workspace-card-status);
+    box-shadow: 0 0 10px rgba(216, 179, 106, 0.18);
+    transform: scale(1.08);
   }
 
   ${WorkspaceButton}[data-runtime="activated"] & {
-    background: var(--forge-green);
-    box-shadow:
-      0 0 12px rgba(60, 203, 127, 0.32),
-      0 0 14px rgba(60, 203, 127, 0.14);
-    transform: scaleY(1.18);
+    border-color: var(--workspace-card-status-border);
+    background: var(--workspace-card-status);
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+    transform: scale(1.08);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    position: absolute;
+    top: 50%;
+    left: 5px;
+    width: 2px;
+    height: 18px;
+    border: 0;
+    border-radius: 999px;
+    opacity: 0;
+    transform: translate(-2px, -50%) scaleY(0.8);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceButton}[data-runtime="activating"] & {
+    opacity: 1;
+    transform: translate(0, -50%) scaleY(1);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceButton}[data-runtime="activated"] & {
+    opacity: 1;
+    transform: translate(0, -50%) scaleY(1);
+  }
+
+  @media (max-width: 760px) {
+    position: static;
+    height: 10px;
+    opacity: 1;
+    transform: none;
   }
 `;
 
@@ -1656,6 +2158,9 @@ export const RailFooter = styled.div`
   border-top: 1px solid var(--forge-border);
   background: rgba(7, 9, 13, 0.7);
   animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
+  transition:
+    gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 `;
 
 export const RailGlobalActions = styled.div`
@@ -1666,6 +2171,16 @@ export const RailGlobalActions = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
   background: rgba(230, 236, 245, 0.018);
+  transition:
+    padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 160ms ease,
+    background 160ms ease;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    margin-top: 6px;
+    padding: 3px;
+    border-color: rgba(230, 236, 245, 0.075);
+  }
 `;
 
 export const RailActionButton = styled.button`
@@ -1690,7 +2205,10 @@ export const RailActionButton = styled.button`
   transition:
     border-color 160ms ease,
     background 160ms ease,
-    color 160ms ease;
+    color 160ms ease,
+    gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    min-height 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   &::before {
     position: absolute;
@@ -1714,22 +2232,29 @@ export const RailActionButton = styled.button`
   }
 
   span {
+    max-width: 120px;
     min-width: 0;
     overflow: hidden;
+    opacity: 1;
     text-overflow: ellipsis;
+    transform: translateX(0);
+    transition:
+      max-width 190ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 140ms ease,
+      transform 190ms cubic-bezier(0.2, 0.8, 0.2, 1);
     white-space: nowrap;
   }
 
   &[data-active="true"],
   &:hover {
     color: var(--forge-text);
-    border-color: var(--forge-border);
-    background: var(--forge-surface-hover);
+    border-color: rgba(125, 160, 205, 0.16);
+    background: rgba(125, 160, 205, 0.055);
   }
 
   &[data-active="true"] {
     border-color: rgba(125, 160, 205, 0.28);
-    background: var(--forge-surface-selected);
+    background: rgba(125, 160, 205, 0.12);
   }
 
   &[data-active="true"]::before {
@@ -1760,9 +2285,9 @@ export const RailActionButton = styled.button`
 
   &[data-scope="global"]:hover,
   &[data-scope="global"][data-active="true"] {
-    border-color: rgba(230, 236, 245, 0.08);
+    border-color: rgba(185, 191, 203, 0.1);
     color: #d8dee7;
-    background: rgba(230, 236, 245, 0.045);
+    background: #070809;
   }
 
   &[data-scope="global"]:hover svg,
@@ -1787,6 +2312,61 @@ export const RailActionButton = styled.button`
 
   &[data-variant="signout"]:hover svg {
     color: #d7a4a4;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    min-height: 30px;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &::before {
+    left: 50%;
+    right: auto;
+    bottom: 3px;
+    top: auto;
+    width: 16px;
+    height: 2px;
+    transform: translateX(-50%);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & span {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &[data-scope="global"] {
+    min-height: 32px;
+    padding-left: 0;
+  }
+
+  @media (max-width: 760px) {
+    min-height: 32px;
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 0 9px 0 11px;
+
+    &::before {
+      top: 8px;
+      bottom: 8px;
+      left: 3px;
+      width: 2px;
+      height: auto;
+      transform: none;
+    }
+
+    span {
+      max-width: 120px;
+      opacity: 1;
+      transform: none;
+    }
+
+    &[data-scope="global"] {
+      min-height: 34px;
+      padding-left: 8px;
+    }
   }
 `;
 
@@ -1859,10 +2439,42 @@ export const WorkspaceViewPane = styled.div`
   }
 `;
 
+export const WorkspaceRuntimeLayer = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity ${VIEW_TRANSITION_MS}ms ease,
+    visibility ${VIEW_TRANSITION_MS}ms step-end;
+
+  &[data-visible="true"] {
+    z-index: 1;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition:
+      opacity ${VIEW_TRANSITION_MS}ms ease,
+      visibility 0ms step-start;
+  }
+`;
+
 export const WorkspaceIdleSurface = styled(BlankWorkspace)`
   display: grid;
+  isolation: isolate;
   place-items: center;
   padding: 24px;
+  background: #000000;
+
+  &::after {
+    display: none;
+  }
 `;
 
 export const WorkspaceIdlePanel = styled.div`
@@ -1878,12 +2490,10 @@ export const WorkspaceIdlePanel = styled.div`
 export const WorkspaceIdleLogo = styled.img`
   width: clamp(74px, 10vw, 118px);
   height: clamp(74px, 10vw, 118px);
-  border: 1px solid rgba(98, 160, 255, 0.24);
+  border: 1px solid rgba(185, 191, 203, 0.18);
   border-radius: 8px;
-  background: rgba(6, 9, 16, 0.72);
-  box-shadow:
-    0 18px 70px rgba(47, 128, 255, 0.16),
-    0 0 32px rgba(255, 122, 24, 0.08);
+  background: rgba(3, 5, 8, 0.72);
+  box-shadow: 0 18px 70px rgba(0, 0, 0, 0.34);
 `;
 
 export const WorkspaceIdleTitle = styled.h2`
@@ -1921,6 +2531,13 @@ export const ForgeWorkspace = styled.section`
     animation: ${panelExit} ${VIEW_TRANSITION_MS}ms ease both;
     pointer-events: none;
   }
+
+  &[data-surface="files"] {
+    ${FILES_VSCODE_THEME_VARS}
+
+    color: var(--files-vscode-text);
+    background: var(--files-vscode-editor);
+  }
 `;
 
 export const TerminalWorkspaceSurface = styled.section`
@@ -1935,11 +2552,7 @@ export const TerminalWorkspaceSurface = styled.section`
   height: 100%;
   padding: 0;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    rgba(3, 5, 8, 0.14);
-  background-size: 68px 68px, 68px 68px, auto;
+  background: ${TERMINAL_THEME_BACKGROUND};
   transition:
     filter 180ms ease,
     opacity 180ms ease,
@@ -2007,7 +2620,7 @@ export const WorkspaceTerminalPanels = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.08);
+  background: ${TERMINAL_THEME_BACKGROUND};
 
   ${TerminalWorkspaceSurface} {
     min-height: 0;
@@ -2044,12 +2657,22 @@ export const ResizePanelGroup = styled(Group)`
   height: 100%;
   min-width: 0;
   min-height: 0;
+  background: ${TERMINAL_THEME_BACKGROUND};
+
+  &[data-surface="files"] {
+    background: var(--files-vscode-editor, #030405);
+  }
 `;
 
 export const ResizePanel = styled(Panel)`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: ${TERMINAL_THEME_BACKGROUND};
+
+  &[data-surface="files"] {
+    background: var(--files-vscode-editor, #030405);
+  }
 
   &[data-terminal-row="true"],
   &[data-terminal-leaf="true"] {
@@ -2120,12 +2743,12 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-surface="files"] {
-    background: #3c3c3c;
+    background: transparent;
     box-shadow: none;
   }
 
   &[data-surface="files"][data-direction="horizontal"] {
-    width: 6px;
+    width: 7px;
     margin: 0 -3px;
   }
 
@@ -2134,20 +2757,21 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-surface="files"][data-direction="horizontal"]::after {
-    left: 2px;
-    right: 2px;
-    background: #3c3c3c;
+    left: 3px;
+    right: auto;
+    width: 1px;
+    background: var(--files-vscode-border, #1d222b);
   }
 
   &[data-surface="files"]:hover,
   &[data-surface="files"][data-resize-handle-state="drag"] {
-    background: #007fd4;
+    background: transparent;
     box-shadow: none;
   }
 
   &[data-surface="files"]:hover::after,
   &[data-surface="files"][data-resize-handle-state="drag"]::after {
-    background: #007fd4;
+    background: var(--files-vscode-focus, #007fd4);
   }
 `;
 
@@ -2997,32 +3621,39 @@ export const TerminalAgentRow = styled.div`
 `;
 
 export const FilesWorkspaceSurface = styled.section`
-  display: block;
+  ${FILES_VSCODE_THEME_VARS}
+
+  display: grid;
   width: 100%;
   height: 100%;
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #1e1e1e;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
 
   > [data-panel-group] {
     width: 100%;
     height: 100%;
+    background: var(--files-vscode-editor);
   }
 `;
 
 export const FileExplorerPane = styled.aside`
   display: grid;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 0;
-  border-right: 1px solid #3c3c3c;
-  background: #252526;
+  border-right: 1px solid var(--files-vscode-border);
+  background: var(--files-vscode-sidebar);
 
   @media (max-width: 860px) {
     border-right: 0;
-    border-bottom: 1px solid #3c3c3c;
+    border-bottom: 1px solid var(--files-vscode-border);
   }
 `;
 
@@ -3034,11 +3665,11 @@ export const FileExplorerHeader = styled.header`
   justify-content: space-between;
   gap: 8px;
   padding: 0 8px 0 20px;
-  color: #bbbbbb;
-  background: #252526;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-sidebar);
 
   p {
-    color: #bbbbbb;
+    color: var(--files-vscode-text-muted);
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0;
@@ -3059,7 +3690,7 @@ export const FileIconButton = styled.button`
   place-items: center;
   border: 0;
   border-radius: 4px;
-  color: #cccccc;
+  color: var(--files-vscode-text);
   background: transparent;
   transition:
     color 160ms ease,
@@ -3072,11 +3703,11 @@ export const FileIconButton = styled.button`
 
   &:hover:not(:disabled) {
     color: #ffffff;
-    background: #2a2d2e;
+    background: var(--files-vscode-hover);
   }
 
   &:focus-visible {
-    outline: 1px solid #007fd4;
+    outline: 1px solid var(--files-vscode-focus);
     outline-offset: -1px;
   }
 
@@ -3090,9 +3721,9 @@ export const FileRootPath = styled.p`
   min-width: 0;
   overflow: hidden;
   padding: 0 12px 6px 20px;
-  border-bottom: 1px solid #303031;
-  color: #858585;
-  background: #252526;
+  border-bottom: 1px solid var(--files-vscode-border-subtle);
+  color: var(--files-vscode-text-muted);
+  background: var(--files-vscode-sidebar);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3105,11 +3736,13 @@ export const FileRootPath = styled.p`
 `;
 
 export const FileTree = styled.div`
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: auto;
   padding: 4px 0 10px;
-  background: #252526;
+  background: var(--files-vscode-sidebar);
 
   &::-webkit-scrollbar {
     width: 10px;
@@ -3141,7 +3774,7 @@ export const FileTreeButton = styled.button`
   padding: 0 8px 0 ${({ $depth }) => 4 + ($depth || 0) * 12}px;
   border: 0;
   border-radius: 0;
-  color: #cccccc;
+  color: var(--files-vscode-text);
   background: transparent;
   text-align: left;
   transition:
@@ -3150,16 +3783,16 @@ export const FileTreeButton = styled.button`
 
   &:hover {
     color: #ffffff;
-    background: #2a2d2e;
+    background: var(--files-vscode-hover);
   }
 
   &[data-selected="true"] {
     color: #ffffff;
-    background: #37373d;
+    background: var(--files-vscode-selection);
   }
 
   &:focus-visible {
-    outline: 1px solid #007fd4;
+    outline: 1px solid var(--files-vscode-focus);
     outline-offset: -1px;
   }
 `;
@@ -3169,7 +3802,7 @@ export const FileDisclosure = styled.span`
   width: 16px;
   height: 22px;
   place-items: center;
-  color: #858585;
+  color: var(--files-vscode-text-muted);
 
   .codicon {
     font-size: 16px;
@@ -3181,7 +3814,7 @@ export const FileKindIcon = styled.span`
   width: 16px;
   height: 22px;
   place-items: center;
-  color: #cccccc;
+  color: var(--files-vscode-text);
 
   .codicon {
     font-size: 16px;
@@ -3323,7 +3956,7 @@ export const FileTreeMessage = styled.p`
   overflow: hidden;
   height: 22px;
   padding: 0 8px 0 ${({ $depth }) => 36 + ($depth || 0) * 12}px;
-  color: #858585;
+  color: var(--files-vscode-text-muted);
   font-size: 12px;
   font-weight: 400;
   line-height: 22px;
@@ -3338,18 +3971,20 @@ export const FileTreeMessage = styled.p`
 export const FileTreeEmpty = styled.p`
   margin: 0;
   padding: 8px 20px;
-  color: #858585;
+  color: var(--files-vscode-text-muted);
   font-size: 12px;
   font-weight: 400;
 `;
 
 export const FilePreviewPane = styled.section`
   display: grid;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
 `;
 
 export const FilePreviewHeader = styled.header`
@@ -3360,8 +3995,8 @@ export const FilePreviewHeader = styled.header`
   justify-content: space-between;
   gap: 10px;
   padding: 0 10px 0 0;
-  border-bottom: 1px solid #3c3c3c;
-  background: #252526;
+  border-bottom: 1px solid var(--files-vscode-border);
+  background: var(--files-vscode-tab);
 `;
 
 export const FilePreviewTitle = styled.div`
@@ -3373,9 +4008,9 @@ export const FilePreviewTitle = styled.div`
   align-items: center;
   gap: 7px;
   padding: 0 14px;
-  border-right: 1px solid #3c3c3c;
-  color: #cccccc;
-  background: #1e1e1e;
+  border-right: 1px solid var(--files-vscode-border);
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-tab-active);
   font-size: 13px;
   font-weight: 400;
 
@@ -3383,7 +4018,7 @@ export const FilePreviewTitle = styled.div`
     width: 16px;
     height: 16px;
     flex: 0 0 auto;
-    color: #cccccc;
+    color: var(--files-vscode-text);
     font-size: 16px;
   }
 
@@ -3492,9 +4127,9 @@ export const FilePreviewModeSwitch = styled.div`
   min-width: 0;
   overflow: hidden;
   padding: 1px;
-  border: 1px solid #3c3c3c;
+  border: 1px solid var(--files-vscode-border);
   border-radius: 4px;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
 `;
 
 export const FilePreviewModeButton = styled.button`
@@ -3503,7 +4138,7 @@ export const FilePreviewModeButton = styled.button`
   padding: 0 7px;
   border: 0;
   border-radius: 3px;
-  color: #8f8f8f;
+  color: var(--files-vscode-text-muted);
   background: transparent;
   font-size: 10px;
   font-weight: 600;
@@ -3512,13 +4147,13 @@ export const FilePreviewModeButton = styled.button`
   cursor: pointer;
 
   &:hover:not(:disabled) {
-    color: #cccccc;
-    background: #2d2d2d;
+    color: var(--files-vscode-text);
+    background: var(--files-vscode-tab);
   }
 
   &[data-active="true"] {
     color: #ffffff;
-    background: #094771;
+    background: var(--files-vscode-selection);
   }
 
   &:disabled {
@@ -3532,9 +4167,9 @@ export const FileGitStatusPill = styled.span`
   min-width: 0;
   overflow: hidden;
   padding: 2px 6px;
-  border: 1px solid #3c3c3c;
+  border: 1px solid var(--files-vscode-border);
   border-radius: 3px;
-  background: #2d2d2d;
+  background: var(--files-vscode-tab);
   font-size: 10px;
   font-weight: 600;
   line-height: 14px;
@@ -3567,10 +4202,10 @@ export const FileGitStatusPill = styled.span`
 export const FileMetaPill = styled.span`
   flex: 0 0 auto;
   padding: 2px 6px;
-  border: 1px solid #3c3c3c;
+  border: 1px solid var(--files-vscode-border);
   border-radius: 3px;
-  color: #cccccc;
-  background: #2d2d2d;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-tab);
   font-size: 10px;
   font-weight: 500;
   line-height: 14px;
@@ -3581,9 +4216,9 @@ export const FilePreviewPath = styled.p`
   min-width: 0;
   overflow: hidden;
   padding: 4px 14px;
-  border-bottom: 1px solid #2d2d2d;
-  color: #858585;
-  background: #1e1e1e;
+  border-bottom: 1px solid var(--files-vscode-border-subtle);
+  color: var(--files-vscode-text-muted);
+  background: var(--files-vscode-editor);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3612,10 +4247,12 @@ export const FilePreviewPath = styled.p`
 `;
 
 export const FileContentFrame = styled.section`
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
 `;
 
 export const FilePreviewScroll = styled.div`
@@ -3626,7 +4263,7 @@ export const FilePreviewScroll = styled.div`
   min-height: 0;
   margin: 0;
   overflow: auto;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
 
   &::-webkit-scrollbar {
     width: 10px;
@@ -3648,7 +4285,7 @@ export const HighlightedCodeBlock = styled.pre`
   margin: 0;
   padding: 14px 16px 28px;
   color: #d4d4d4;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3748,7 +4385,7 @@ export const InlineReviewSurface = styled.div`
   min-height: 100%;
   grid-template-columns: minmax(max-content, 1fr) 14px;
   align-items: start;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
 `;
 
 export const InlineReviewCodeBlock = styled.div`
@@ -3757,7 +4394,7 @@ export const InlineReviewCodeBlock = styled.div`
   margin: 0;
   padding: 8px 0 28px;
   color: #d4d4d4;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -3918,14 +4555,14 @@ export const ReviewChangeRuler = styled.div`
   width: 14px;
   min-height: 80px;
   max-height: 100%;
-  border-left: 1px solid #2d2d2d;
-  background: #181818;
+  border-left: 1px solid var(--files-vscode-border-subtle);
+  background: var(--files-vscode-editor-gutter);
   cursor: ns-resize;
   touch-action: none;
   user-select: none;
 
   &:hover {
-    background: #202020;
+    background: var(--files-vscode-hover);
   }
 `;
 
@@ -3948,8 +4585,8 @@ export const FileDiffPanel = styled.section`
   display: grid;
   min-width: 0;
   margin: 0;
-  border-bottom: 1px solid #2d2d2d;
-  background: #181818;
+  border-bottom: 1px solid var(--files-vscode-border-subtle);
+  background: var(--files-vscode-editor-gutter);
 
   &[data-mode="diff"] {
     min-height: 100%;
@@ -3964,9 +4601,9 @@ export const FileDiffHeader = styled.header`
   align-items: center;
   gap: 8px;
   padding: 0 14px;
-  border-bottom: 1px solid #2d2d2d;
-  color: #cccccc;
-  background: #252526;
+  border-bottom: 1px solid var(--files-vscode-border-subtle);
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-sidebar);
   font-size: 12px;
 
   .codicon {
@@ -3999,7 +4636,7 @@ export const FileDiffBadge = styled.span`
 export const FileDiffMessage = styled.p`
   margin: 0;
   padding: 10px 14px;
-  color: #858585;
+  color: var(--files-vscode-text-muted);
   font-size: 12px;
   line-height: 18px;
 
@@ -4014,7 +4651,7 @@ export const DiffCodeBlock = styled.pre`
   overflow: visible;
   padding: 6px 0 8px;
   color: #d4d4d4;
-  background: #1e1e1e;
+  background: var(--files-vscode-editor);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -4051,24 +4688,25 @@ export const DiffLine = styled.div`
 
   &[data-tone="header"],
   &[data-tone="meta"] {
-    color: #858585;
+    color: var(--files-vscode-text-muted);
   }
 `;
 
 export const FileEmptyState = styled.div`
   display: grid;
   width: min(420px, 100%);
+  height: 100%;
   min-height: 100%;
   align-content: center;
   justify-items: center;
   gap: 10px;
   margin: 0 auto;
   padding: 22px;
-  color: #858585;
+  color: var(--files-vscode-text-muted);
   text-align: center;
 
   h2 {
-    color: #cccccc;
+    color: var(--files-vscode-text);
     font-size: 15px;
     font-weight: 500;
   }
@@ -4079,10 +4717,10 @@ export const FileEmptyIcon = styled.span`
   width: 40px;
   height: 40px;
   place-items: center;
-  border: 1px solid #3c3c3c;
+  border: 1px solid var(--files-vscode-border);
   border-radius: 4px;
-  color: #cccccc;
-  background: #252526;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-sidebar);
 
   svg,
   .codicon {
@@ -8179,6 +8817,14 @@ export const ButtonHubIcon = styled(Hub)`
 `;
 
 export const ButtonCheckIcon = styled(CheckCircle)`
+  ${buttonIconSize}
+`;
+
+export const ButtonRailCollapseIcon = styled(KeyboardDoubleArrowLeft)`
+  ${buttonIconSize}
+`;
+
+export const ButtonRailExpandIcon = styled(KeyboardDoubleArrowRight)`
   ${buttonIconSize}
 `;
 

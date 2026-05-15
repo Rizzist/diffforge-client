@@ -570,14 +570,14 @@ function edgeChangeLabel(change) {
 
 function NodeGlyph({ $created, $existing, $removed }) {
   const stroke = $removed
-    ? "#fb923c"
+    ? "#b9876d"
     : $created
-      ? "#34d399"
-      : "rgba(148, 163, 184, 0.78)";
+      ? "#8aa892"
+      : "rgba(139, 151, 166, 0.76)";
   const fill = $created
-    ? "rgba(52, 211, 153, 0.22)"
+    ? "rgba(138, 168, 146, 0.12)"
     : $removed
-      ? "rgba(251, 146, 60, 0.18)"
+      ? "rgba(185, 135, 109, 0.12)"
       : "transparent";
   const dash = $existing ? "2 1.6" : undefined;
   return (
@@ -590,14 +590,14 @@ function NodeGlyph({ $created, $existing, $removed }) {
 
 function EdgeGlyph({ $created, $removed }) {
   const stroke = $removed
-    ? "#fb923c"
+    ? "#b9876d"
     : $created
-      ? "#34d399"
-      : "rgba(148, 163, 184, 0.78)";
+      ? "#8aa892"
+      : "rgba(139, 151, 166, 0.76)";
   const fill = $created
-    ? "rgba(52, 211, 153, 0.22)"
+    ? "rgba(138, 168, 146, 0.12)"
     : $removed
-      ? "rgba(251, 146, 60, 0.18)"
+      ? "rgba(185, 135, 109, 0.12)"
       : "transparent";
   const dash = $removed ? "1.8 1.8" : undefined;
   return (
@@ -612,9 +612,9 @@ function EdgeGlyph({ $created, $removed }) {
 function SpecGlyph() {
   return (
     <Glyph viewBox="0 0 14 14" width="13" height="13" aria-hidden="true">
-      <rect x="2.4" y="2.2" width="9.2" height="9.6" rx="1.6" fill="transparent" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.3" />
-      <line x1="4.2" y1="5.8" x2="9.8" y2="5.8" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.1" />
-      <line x1="4.2" y1="8.4" x2="7.8" y2="8.4" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.1" />
+      <rect x="2.4" y="2.2" width="9.2" height="9.6" rx="1.6" fill="transparent" stroke="rgba(136, 165, 200, 0.78)" strokeWidth="1.3" />
+      <line x1="4.2" y1="5.8" x2="9.8" y2="5.8" stroke="rgba(136, 165, 200, 0.78)" strokeWidth="1.1" />
+      <line x1="4.2" y1="8.4" x2="7.8" y2="8.4" stroke="rgba(136, 165, 200, 0.78)" strokeWidth="1.1" />
     </Glyph>
   );
 }
@@ -790,6 +790,21 @@ function SpecObjectList({ title, specs, empty, historical = false }) {
 }
 
 const SpecGraphSurface = styled.section`
+  --history-bg: #0b0f14;
+  --history-panel: #0f141b;
+  --history-panel-soft: #111821;
+  --history-panel-muted: #0d1218;
+  --history-border: rgba(139, 151, 166, 0.18);
+  --history-border-strong: rgba(139, 151, 166, 0.3);
+  --history-text: #d8dee8;
+  --history-muted: #8b95a4;
+  --history-subtle: #626d7a;
+  --history-blue: #88a5c8;
+  --history-green: #8aa892;
+  --history-amber: #b8a06a;
+  --history-orange: #b9876d;
+  --history-red: #c48787;
+
   width: 100%;
   height: 100%;
   min-height: 0;
@@ -822,30 +837,29 @@ const SpecGraphToolbar = styled.div`
 
 const ViewToggleGroup = styled.div`
   align-items: center;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 999px;
-  background: rgba(8, 13, 22, 0.82);
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  background: var(--history-panel-muted);
   display: inline-flex;
-  gap: 2px;
-  padding: 3px;
+  gap: 1px;
+  padding: 2px;
 `;
 
 const ViewToggleButton = styled.button`
   border: 0;
-  border-radius: 999px;
+  border-radius: 5px;
   background: transparent;
-  color: rgba(226, 232, 240, 0.58);
+  color: var(--history-muted);
   cursor: pointer;
   font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0.06em;
-  padding: 7px 12px;
-  text-transform: uppercase;
+  font-weight: 720;
+  letter-spacing: 0.01em;
+  padding: 6px 10px;
   transition: background 160ms ease, color 160ms ease;
 
   &[data-active="true"] {
-    background: rgba(56, 189, 248, 0.16);
-    color: #bae6fd;
+    background: rgba(139, 151, 166, 0.12);
+    color: var(--history-text);
   }
 `;
 
@@ -908,11 +922,9 @@ const SpecGraphMain = styled.main`
 `;
 
 const HistoryMain = styled.main`
-  border: 1px solid rgba(230, 236, 245, 0.07);
+  border: 1px solid var(--history-border);
   border-radius: 8px;
-  background:
-    radial-gradient(circle at 10% 0%, rgba(56, 189, 248, 0.12), transparent 28%),
-    rgba(7, 9, 13, 0.64);
+  background: var(--history-bg);
   height: 100%;
   min-width: 0;
   min-height: 0;
@@ -948,11 +960,7 @@ const TimelineRail = styled.div`
     top: 0;
     bottom: 0;
     width: 2px;
-    background: linear-gradient(
-      180deg,
-      rgba(148, 163, 184, 0.18),
-      rgba(148, 163, 184, 0.06)
-    );
+    background: rgba(139, 151, 166, 0.18);
     border-radius: 2px;
   }
 
@@ -963,14 +971,14 @@ const TimelineRail = styled.div`
 
 const TimelineDot = styled.span`
   position: absolute;
-  left: 7px;
+  left: 8px;
   top: 18px;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--dot-color);
   border-radius: 999px;
-  background: rgba(7, 9, 13, 0.96);
-  --dot-color: rgba(148, 163, 184, 0.78);
-  box-shadow: 0 0 0 1.5px var(--dot-color), 0 0 0 4px rgba(7, 9, 13, 0.95);
+  background: var(--history-bg);
+  --dot-color: rgba(139, 151, 166, 0.72);
 
   &::after {
     content: "";
@@ -978,47 +986,46 @@ const TimelineDot = styled.span`
     inset: 3px;
     border-radius: 999px;
     background: var(--dot-color);
-    opacity: 0.92;
+    opacity: 0.9;
   }
 
   &[data-state="done"],
   &[data-state="merged"],
   &[data-state="applied"],
   &[data-state="accepted"] {
-    --dot-color: #34d399;
+    --dot-color: var(--history-green);
   }
 
   &[data-state="rolled_back"],
   &[data-state="interrupted"],
   &[data-state="cancelled"],
   &[data-state="rejected"] {
-    --dot-color: #fb923c;
+    --dot-color: var(--history-orange);
   }
 
   &[data-state="pending"] {
-    --dot-color: #fbbf24;
+    --dot-color: var(--history-amber);
   }
 `;
 
 const HistoryTaskCard = styled.article`
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.34);
+  border: 1px solid var(--history-border);
+  border-radius: 8px;
+  background: var(--history-panel);
   overflow: hidden;
   margin-bottom: 10px;
   transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
 
   &[data-active="true"] {
-    border-color: rgba(56, 189, 248, 0.45);
-    background: rgba(14, 116, 144, 0.16);
-    box-shadow: 0 14px 36px rgba(8, 47, 73, 0.28);
+    border-color: var(--history-border-strong);
+    background: var(--history-panel-soft);
+    box-shadow: inset 2px 0 0 var(--history-blue);
   }
 
   &[data-rolled-back="true"]:not([data-active="true"]) {
-    border-color: rgba(100, 116, 139, 0.16);
-    background: rgba(15, 23, 42, 0.2);
-    filter: grayscale(0.45);
-    opacity: 0.7;
+    border-color: rgba(139, 151, 166, 0.12);
+    background: rgba(13, 18, 24, 0.82);
+    opacity: 0.76;
   }
 `;
 
@@ -1028,7 +1035,7 @@ const HistoryTaskButton = styled.button`
   color: inherit;
   cursor: pointer;
   display: grid;
-  gap: 8px;
+  gap: 9px;
   padding: 12px 13px;
   text-align: left;
   width: 100%;
@@ -1042,17 +1049,17 @@ const HistoryTaskTopRow = styled.div`
 `;
 
 const HistoryTaskIndex = styled.span`
-  color: rgba(148, 163, 184, 0.6);
+  color: var(--history-subtle);
   font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.04em;
+  font-weight: 760;
+  letter-spacing: 0.02em;
   flex-shrink: 0;
 `;
 
 const HistoryTaskTitle = styled.strong`
-  color: rgba(238, 245, 255, 0.94);
+  color: var(--history-text);
   font-size: 13px;
-  font-weight: 850;
+  font-weight: 720;
   line-height: 1.3;
   flex: 1;
   min-width: 0;
@@ -1063,46 +1070,46 @@ const HistoryTaskTitle = styled.strong`
 
 const HistoryStatusPill = styled.span`
   align-items: center;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 999px;
-  color: rgba(203, 213, 225, 0.78);
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  color: var(--history-muted);
   display: inline-flex;
   flex-shrink: 0;
   font-size: 9.5px;
-  font-weight: 900;
-  letter-spacing: 0.06em;
-  padding: 3.5px 8px;
+  font-weight: 740;
+  letter-spacing: 0.03em;
+  padding: 3px 6px;
   text-transform: uppercase;
 
   &[data-state="done"],
   &[data-state="merged"],
   &[data-state="applied"],
   &[data-state="accepted"] {
-    border-color: rgba(52, 211, 153, 0.36);
-    color: #86efac;
-    background: rgba(6, 78, 59, 0.18);
+    border-color: rgba(138, 168, 146, 0.34);
+    color: var(--history-green);
+    background: rgba(138, 168, 146, 0.08);
   }
 
   &[data-state="rolled_back"],
   &[data-state="interrupted"],
   &[data-state="cancelled"],
   &[data-state="rejected"] {
-    border-color: rgba(251, 146, 60, 0.4);
-    color: #fed7aa;
-    background: rgba(124, 45, 18, 0.18);
+    border-color: rgba(185, 135, 109, 0.36);
+    color: var(--history-orange);
+    background: rgba(185, 135, 109, 0.08);
   }
 
   &[data-state="pending"] {
-    border-color: rgba(251, 191, 36, 0.34);
-    color: #fde68a;
+    border-color: rgba(184, 160, 106, 0.34);
+    color: var(--history-amber);
   }
 `;
 
 const HistoryTaskPrompt = styled.p`
-  color: rgba(203, 213, 225, 0.74);
+  color: var(--history-muted);
   display: -webkit-box;
   font-size: 11.5px;
-  font-weight: 660;
+  font-weight: 500;
   line-height: 1.42;
   margin: 0;
   -webkit-box-orient: vertical;
@@ -1114,52 +1121,49 @@ const HistoryDeltaStrip = styled.div`
   align-items: center;
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
   padding: 6px 0 2px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.13);
+  border-top: 1px solid rgba(139, 151, 166, 0.12);
 `;
 
 const DeltaChip = styled.span`
   align-items: center;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 999px;
-  background: rgba(2, 6, 23, 0.42);
-  color: rgba(226, 232, 240, 0.86);
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  background: var(--history-panel-muted);
+  color: var(--history-text);
   display: inline-flex;
   font-size: 10.5px;
-  font-weight: 760;
-  gap: 6px;
+  font-weight: 640;
+  gap: 5px;
   letter-spacing: 0.01em;
-  padding: 4px 9px 4px 7px;
+  padding: 3px 7px 3px 6px;
 
   &[data-empty="true"] {
-    border-color: rgba(148, 163, 184, 0.12);
-    color: rgba(148, 163, 184, 0.6);
+    border-color: rgba(139, 151, 166, 0.12);
+    color: var(--history-subtle);
     background: transparent;
   }
 
   &[data-kind="node"]:not([data-empty="true"]) {
-    border-color: rgba(52, 211, 153, 0.32);
-    background: rgba(6, 78, 59, 0.18);
-    color: #bbf7d0;
+    border-color: rgba(138, 168, 146, 0.28);
+    color: var(--history-green);
   }
 
   &[data-kind="edge"]:not([data-empty="true"]) {
-    border-color: rgba(125, 211, 252, 0.32);
-    background: rgba(7, 89, 133, 0.18);
-    color: #bae6fd;
+    border-color: rgba(136, 165, 200, 0.3);
+    color: var(--history-blue);
   }
 
   &[data-kind="node-rm"],
   &[data-kind="edge-rm"] {
-    border-color: rgba(251, 146, 60, 0.34);
-    background: rgba(124, 45, 18, 0.18);
-    color: #fed7aa;
+    border-color: rgba(185, 135, 109, 0.32);
+    color: var(--history-orange);
   }
 
   &[data-kind="specs"] {
-    border-color: rgba(186, 230, 253, 0.24);
-    color: rgba(186, 230, 253, 0.86);
+    border-color: rgba(136, 165, 200, 0.22);
+    color: var(--history-blue);
   }
 `;
 
@@ -1171,36 +1175,36 @@ const HistoryTaskFoot = styled.div`
 `;
 
 const FootBadge = styled.span`
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 6px;
-  color: rgba(203, 213, 225, 0.74);
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  color: var(--history-muted);
   font-size: 9.5px;
-  font-weight: 820;
-  letter-spacing: 0.05em;
+  font-weight: 680;
+  letter-spacing: 0.03em;
   padding: 3px 6px;
   text-transform: uppercase;
 
   &[data-state="agent"] {
-    border-color: rgba(56, 189, 248, 0.28);
-    color: #bae6fd;
+    border-color: rgba(136, 165, 200, 0.28);
+    color: var(--history-blue);
   }
 
   &[data-state="accepted"],
   &[data-state="approved"],
   &[data-state="done"] {
-    border-color: rgba(52, 211, 153, 0.3);
-    color: #86efac;
+    border-color: rgba(138, 168, 146, 0.28);
+    color: var(--history-green);
   }
 
   &[data-state="rejected"],
   &[data-state="blocked"] {
-    border-color: rgba(251, 113, 133, 0.36);
-    color: #fda4af;
+    border-color: rgba(196, 135, 135, 0.34);
+    color: var(--history-red);
   }
 
   &[data-kind="muted"] {
-    border-color: rgba(148, 163, 184, 0.14);
-    color: rgba(148, 163, 184, 0.66);
+    border-color: rgba(139, 151, 166, 0.12);
+    color: var(--history-subtle);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     letter-spacing: 0;
     text-transform: none;
@@ -1208,25 +1212,25 @@ const FootBadge = styled.span`
 `;
 
 const FootTime = styled.span`
-  color: rgba(148, 163, 184, 0.66);
+  color: var(--history-subtle);
   font-size: 10px;
-  font-weight: 700;
+  font-weight: 620;
   margin-left: auto;
 `;
 
 const HistoryNodeList = styled.div`
-  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  border-top: 1px solid rgba(139, 151, 166, 0.14);
   display: grid;
-  gap: 6px;
+  gap: 5px;
   padding: 8px 12px 12px;
-  background: rgba(2, 6, 23, 0.28);
+  background: rgba(8, 12, 16, 0.48);
 `;
 
 const HistoryNodeButton = styled.button`
   align-items: center;
-  border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 9px;
-  background: rgba(2, 6, 23, 0.34);
+  border: 1px solid rgba(139, 151, 166, 0.13);
+  border-radius: 6px;
+  background: rgba(11, 15, 20, 0.72);
   color: inherit;
   cursor: pointer;
   display: grid;
@@ -1237,16 +1241,16 @@ const HistoryNodeButton = styled.button`
   transition: border-color 140ms ease, background 140ms ease;
 
   &:hover {
-    border-color: rgba(125, 211, 252, 0.26);
+    border-color: var(--history-border-strong);
   }
 
   &[data-active="true"] {
-    border-color: rgba(56, 189, 248, 0.4);
-    background: rgba(7, 89, 133, 0.22);
+    border-color: rgba(136, 165, 200, 0.38);
+    background: rgba(17, 24, 33, 0.82);
   }
 
   &[data-created="true"] {
-    border-left: 2px solid rgba(52, 211, 153, 0.5);
+    box-shadow: inset 2px 0 0 var(--history-green);
   }
 `;
 
@@ -1264,9 +1268,9 @@ const NodeButtonBody = styled.div`
   min-width: 0;
 
   strong {
-    color: rgba(238, 245, 255, 0.92);
+    color: var(--history-text);
     font-size: 12px;
-    font-weight: 820;
+    font-weight: 700;
     line-height: 1.3;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1274,9 +1278,9 @@ const NodeButtonBody = styled.div`
   }
 
   small {
-    color: rgba(148, 163, 184, 0.7);
+    color: var(--history-muted);
     font-size: 10px;
-    font-weight: 680;
+    font-weight: 560;
   }
 `;
 
@@ -1286,21 +1290,21 @@ const NodeButtonKicker = styled.div`
   gap: 6px;
 
   span {
-    color: rgba(125, 211, 252, 0.78);
+    color: var(--history-blue);
     font-size: 9px;
-    font-weight: 900;
+    font-weight: 760;
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
   span[data-kind="created"] {
-    color: #86efac;
+    color: var(--history-green);
   }
 
   small {
-    color: rgba(148, 163, 184, 0.55);
+    color: var(--history-subtle);
     font-size: 9px;
-    font-weight: 760;
+    font-weight: 640;
     letter-spacing: 0.04em;
     text-transform: uppercase;
   }
@@ -1317,9 +1321,9 @@ const GraphDeltaGrid = styled.div`
 `;
 
 const GraphDeltaColumn = styled.div`
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 10px;
-  background: rgba(7, 9, 13, 0.52);
+  border: 1px solid var(--history-border);
+  border-radius: 8px;
+  background: var(--history-panel-muted);
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -1331,13 +1335,13 @@ const GraphDeltaHeading = styled.div`
   display: flex;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(15, 23, 42, 0.45);
+  border-bottom: 1px solid rgba(139, 151, 166, 0.12);
+  background: rgba(17, 24, 33, 0.58);
 
   span {
-    color: rgba(226, 232, 240, 0.86);
+    color: var(--history-text);
     font-size: 10.5px;
-    font-weight: 900;
+    font-weight: 760;
     letter-spacing: 0.07em;
     text-transform: uppercase;
   }
@@ -1359,11 +1363,11 @@ const DeltaCount = styled.span`
   }
 
   em[data-tone="added"] {
-    color: #86efac;
+    color: var(--history-green);
   }
 
   em[data-tone="removed"] {
-    color: #fed7aa;
+    color: var(--history-orange);
   }
 `;
 
@@ -1376,10 +1380,10 @@ const GraphDeltaList = styled.div`
 
 const GraphDeltaPill = styled.span`
   align-items: center;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 999px;
-  background: rgba(2, 6, 23, 0.46);
-  color: rgba(226, 232, 240, 0.86);
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  background: var(--history-panel);
+  color: var(--history-text);
   display: inline-flex;
   font-size: 10.5px;
   font-weight: 720;
@@ -1395,43 +1399,41 @@ const GraphDeltaPill = styled.span`
   }
 
   &[data-action="added"] {
-    border-color: rgba(52, 211, 153, 0.3);
-    background: rgba(6, 78, 59, 0.2);
-    color: #bbf7d0;
+    border-color: rgba(138, 168, 146, 0.28);
+    color: var(--history-green);
   }
 
   &[data-action="removed"] {
-    border-color: rgba(251, 146, 60, 0.32);
-    background: rgba(124, 45, 18, 0.18);
-    color: #fed7aa;
+    border-color: rgba(185, 135, 109, 0.32);
+    color: var(--history-orange);
   }
 `;
 
 const GraphDeltaEmpty = styled.span`
-  color: rgba(148, 163, 184, 0.56);
+  color: var(--history-subtle);
   font-size: 10.5px;
   font-weight: 680;
   padding: 2px 0;
 `;
 
 const HistoryEmpty = styled.div`
-  color: rgba(219, 231, 247, 0.46);
+  color: var(--history-muted);
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 600;
   padding: 16px;
 `;
 
 const HistoryNodeEmpty = styled.div`
-  color: rgba(219, 231, 247, 0.4);
+  color: var(--history-subtle);
   font-size: 11px;
-  font-weight: 680;
+  font-weight: 560;
   padding: 10px 2px 0;
 `;
 
 const Inspector = styled.aside`
-  border: 1px solid rgba(230, 236, 245, 0.07);
+  border: 1px solid var(--history-border);
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.72);
+  background: var(--history-bg);
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1442,16 +1444,16 @@ const Inspector = styled.aside`
 
 const InspectorHeader = styled.header`
   align-items: flex-start;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.07);
+  border-bottom: 1px solid var(--history-border);
   display: flex;
   justify-content: space-between;
   gap: 10px;
   padding: 11px 12px;
 
   h2 {
-    color: var(--forge-text-soft, #eef5ff);
+    color: var(--history-text);
     font-size: 14px;
-    font-weight: 820;
+    font-weight: 720;
     line-height: 1.24;
     margin: 0;
     min-width: 0;
@@ -1466,44 +1468,44 @@ const InspectorFacts = styled.div`
   gap: 5px;
 
   span {
-    border: 1px solid rgba(230, 236, 245, 0.12);
-    border-radius: 999px;
-    color: rgba(238, 245, 255, 0.82);
+    border: 1px solid var(--history-border);
+    border-radius: 5px;
+    color: var(--history-muted);
     font-size: 10px;
-    font-weight: 820;
+    font-weight: 680;
     line-height: 1;
     padding: 5px 8px;
     text-transform: lowercase;
   }
 
   span[data-state="updated"] {
-    border-color: rgba(52, 211, 153, 0.3);
-    color: #86efac;
+    border-color: rgba(138, 168, 146, 0.3);
+    color: var(--history-green);
   }
 
   span[data-state="behind_code"] {
-    border-color: rgba(251, 113, 133, 0.3);
-    color: #fda4af;
+    border-color: rgba(196, 135, 135, 0.3);
+    color: var(--history-red);
   }
 
   span[data-state="ahead_of_code"] {
-    border-color: rgba(251, 191, 36, 0.3);
-    color: #fde68a;
+    border-color: rgba(184, 160, 106, 0.3);
+    color: var(--history-amber);
   }
 
   span[data-state="no_spec"] {
-    border-color: rgba(100, 116, 139, 0.38);
-    color: #cbd5e1;
+    border-color: rgba(139, 151, 166, 0.24);
+    color: var(--history-muted);
   }
 
   span[data-state="out_of_spec"] {
-    border-color: rgba(251, 146, 60, 0.38);
-    color: #fed7aa;
+    border-color: rgba(185, 135, 109, 0.34);
+    color: var(--history-orange);
   }
 
   span[data-state="worktree"] {
-    border-color: rgba(56, 189, 248, 0.42);
-    color: #bae6fd;
+    border-color: rgba(136, 165, 200, 0.36);
+    color: var(--history-blue);
   }
 `;
 
@@ -1514,14 +1516,14 @@ const MarkdownPane = styled.div`
 `;
 
 const SpecObjectsSection = styled.section`
-  border-top: 1px solid rgba(230, 236, 245, 0.07);
+  border-top: 1px solid var(--history-border);
   padding: 12px;
 
   h3 {
-    color: rgba(238, 245, 255, 0.72);
+    color: var(--history-muted);
     font-size: 10px;
-    font-weight: 860;
-    letter-spacing: 0.08em;
+    font-weight: 740;
+    letter-spacing: 0.06em;
     margin: 0 0 8px;
     text-transform: uppercase;
   }
@@ -1530,49 +1532,48 @@ const SpecObjectsSection = styled.section`
 const HistoryDetailsSection = styled(SpecObjectsSection)``;
 
 const HistoryDetailCard = styled.article`
-  border: 1px solid rgba(56, 189, 248, 0.18);
-  border-radius: 10px;
-  background: rgba(14, 116, 144, 0.12);
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  background: var(--history-panel);
   padding: 10px;
 
   &[data-rolled-back="true"] {
-    border-color: rgba(148, 163, 184, 0.16);
-    background: rgba(15, 23, 42, 0.3);
-    filter: grayscale(0.45);
+    border-color: rgba(139, 151, 166, 0.14);
+    background: rgba(13, 18, 24, 0.82);
     opacity: 0.74;
   }
 
   p {
-    color: rgba(238, 245, 255, 0.86);
+    color: var(--history-text);
     font-size: 11.5px;
-    font-weight: 720;
+    font-weight: 560;
     line-height: 1.45;
     margin: 0;
   }
 
   small {
-    color: rgba(186, 230, 253, 0.72);
+    color: var(--history-muted);
     display: block;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: 560;
     margin-top: 6px;
   }
 `;
 
 const HistoryTaskPlan = styled.div`
-  border-left: 2px solid rgba(125, 211, 252, 0.3);
-  color: rgba(186, 230, 253, 0.76);
+  border-left: 2px solid rgba(136, 165, 200, 0.34);
+  color: var(--history-blue);
   font-size: 10.5px;
-  font-weight: 680;
+  font-weight: 560;
   line-height: 1.45;
   margin-top: 8px;
   padding-left: 8px;
 `;
 
 const HistoryMutationCard = styled.article`
-  border: 1px solid rgba(148, 163, 184, 0.15);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.38);
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  background: var(--history-panel);
   padding: 10px;
 
   & + & {
@@ -1581,20 +1582,18 @@ const HistoryMutationCard = styled.article`
 
   &[data-action="added"],
   &[data-action="restored"] {
-    border-color: rgba(52, 211, 153, 0.22);
-    background: rgba(6, 78, 59, 0.12);
+    border-color: rgba(138, 168, 146, 0.24);
   }
 
   &[data-action="abrogated"],
   &[data-action="removed"] {
-    border-color: rgba(251, 146, 60, 0.22);
-    background: rgba(124, 45, 18, 0.12);
+    border-color: rgba(185, 135, 109, 0.26);
   }
 
   > p {
-    color: rgba(229, 236, 246, 0.76);
+    color: var(--history-muted);
     font-size: 11px;
-    font-weight: 650;
+    font-weight: 540;
     line-height: 1.45;
     margin: 8px 0 0;
   }
@@ -1607,39 +1606,39 @@ const HistoryMutationHeading = styled.div`
   gap: 8px;
 
   span {
-    color: #e0f2fe;
+    color: var(--history-text);
     font-size: 10px;
-    font-weight: 900;
-    letter-spacing: 0.07em;
+    font-weight: 760;
+    letter-spacing: 0.05em;
     text-transform: uppercase;
   }
 
   small {
-    color: rgba(148, 163, 184, 0.72);
+    color: var(--history-subtle);
     font-size: 9.5px;
-    font-weight: 780;
+    font-weight: 620;
   }
 `;
 
 const HistoryStatement = styled.div`
-  border-left: 2px solid ${({ $before }) => ($before ? "rgba(251, 146, 60, 0.45)" : "rgba(52, 211, 153, 0.45)")};
+  border-left: 2px solid ${({ $before }) => ($before ? "rgba(185, 135, 109, 0.44)" : "rgba(138, 168, 146, 0.42)")};
   margin-top: 8px;
   padding-left: 8px;
 
   span {
-    color: ${({ $before }) => ($before ? "#fed7aa" : "#bbf7d0")};
+    color: ${({ $before }) => ($before ? "var(--history-orange)" : "var(--history-green)")};
     display: block;
     font-size: 9px;
-    font-weight: 900;
-    letter-spacing: 0.07em;
+    font-weight: 760;
+    letter-spacing: 0.05em;
     margin-bottom: 3px;
     text-transform: uppercase;
   }
 
   p {
-    color: rgba(229, 236, 246, ${({ $before }) => ($before ? 0.58 : 0.86)});
+    color: ${({ $before }) => ($before ? "var(--history-muted)" : "var(--history-text)")};
     font-size: 11px;
-    font-weight: 650;
+    font-weight: 540;
     line-height: 1.45;
     margin: 0;
   }

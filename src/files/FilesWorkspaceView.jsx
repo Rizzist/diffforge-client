@@ -1392,12 +1392,14 @@ export default function FilesWorkspaceView({
   return (
     <FilesWorkspaceSurface aria-label="Workspace files">
       <ResizePanelGroup
+        data-surface="files"
         defaultLayout={fileExplorerDefaultLayout}
         id={fileExplorerGroupId}
         onLayoutChanged={queueExplorerLayout}
         orientation="horizontal"
       >
         <ResizePanel
+          data-surface="files"
           defaultSize={toPanelPercent(fileExplorerLayout[0])}
           id={fileExplorerPanelId}
           maxSize={toPanelPercent(FILE_EXPLORER_MAX_SIZE)}
@@ -1454,6 +1456,7 @@ export default function FilesWorkspaceView({
         <ResizeHandle data-direction="horizontal" data-surface="files" />
 
         <ResizePanel
+          data-surface="files"
           defaultSize={toPanelPercent(fileExplorerLayout[1])}
           id={filePreviewPanelId}
           maxSize={toPanelPercent(FILE_PREVIEW_MAX_SIZE)}

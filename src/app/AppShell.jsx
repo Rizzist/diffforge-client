@@ -107,12 +107,15 @@ import {
   WorkspaceStartupOverlay,
   DashboardShell,
   WorkspaceRail,
+  RailHeader,
   RailTop,
   RailSectionTitle,
+  RailCollapseButton,
   WorkspaceList,
   WorkspaceRow,
   WorkspaceButton,
   WorkspaceLabel,
+  WorkspaceCompactGlyph,
   WorkspaceSettingsButton,
   WorkspaceAccent,
   WorkspaceMuted,
@@ -121,6 +124,7 @@ import {
   RailActionButton,
   WorkspaceViewStack,
   WorkspaceViewPane,
+  WorkspaceRuntimeLayer,
   WorkspaceIdleSurface,
   WorkspaceIdlePanel,
   WorkspaceIdleLogo,
@@ -352,6 +356,8 @@ import {
   ButtonMicIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
+  ButtonRailCollapseIcon,
+  ButtonRailExpandIcon,
   FileChevronIcon,
   FileExpandIcon,
   FileFolderTreeIcon,
@@ -392,12 +398,15 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "mcps"]);
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
 const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
 const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
+const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
+const WORKSPACE_RAIL_ANIMATION_MS = 220;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -622,9 +631,9 @@ const AUTH_TILE_BURSTS = Array.from({ length: 156 }, (_, index) => {
   return [col, row, delay, duration, peak];
 });
 
-function AuthSquareBackdrop() {
+function AuthSquareBackdrop({ tone = "default" } = {}) {
   return (
-    <SquareField aria-hidden="true">
+    <SquareField aria-hidden="true" data-tone={tone}>
       {AUTH_TILE_BURSTS.map(([col, row, delay, duration, peak]) => (
         <SquarePulse
           key={`${col}-${row}-${delay}`}
@@ -644,6 +653,7 @@ function AuthSquareBackdrop() {
 function WorkspaceIdleState({ detail = "No workspace selected.", viewMotion }) {
   return (
     <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
+      <AuthSquareBackdrop tone="quiet" />
       <WorkspaceIdlePanel>
         <WorkspaceIdleLogo src="/logo.webp" alt="" />
         <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
@@ -768,6 +778,28 @@ function getSafeCurrentWindow() {
   } catch {
     return null;
   }
+}
+
+function getWindowControlPlatform() {
+  if (typeof navigator === "undefined") {
+    return "linux";
+  }
+
+  const platform = [
+    navigator.userAgentData?.platform,
+    navigator.platform,
+    navigator.userAgent,
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  if (/mac|darwin/.test(platform)) {
+    return "macos";
+  }
+
+  if (/win/.test(platform)) {
+    return "windows";
+  }
+
+  return "linux";
 }
 
 function runWindowAction(action) {
@@ -1485,8 +1517,51 @@ function persistWorkspaceLifecycleSettings(settings) {
   }
 }
 
+function readWorkspaceRailCollapsed() {
+  try {
+    const settings = JSON.parse(window.localStorage.getItem(WORKSPACE_RAIL_STORAGE_KEY) || "{}");
+    return Boolean(settings?.collapsed);
+  } catch {
+    return false;
+  }
+}
+
+function persistWorkspaceRailCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(
+      WORKSPACE_RAIL_STORAGE_KEY,
+      JSON.stringify({ collapsed: Boolean(collapsed) }),
+    );
+  } catch {
+    // Rail density is a visual preference; the expanded layout remains the safe default.
+  }
+}
+
 function findWorkspaceById(workspaces, workspaceId) {
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
+}
+
+function getWorkspaceRailInitials(name) {
+  const parts = String(name || "Workspace")
+    .trim()
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+
+  if (parts.length >= 2) {
+    return `${parts[0][0] || "W"}${parts[1][0] || ""}`.toUpperCase();
+  }
+
+  return (parts[0] || "W").slice(0, 2).toUpperCase();
+}
+
+function parseCssPixelValue(value) {
+  const numericValue = Number.parseFloat(String(value || "").trim());
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function easeWorkspaceRailProgress(progress) {
+  const clampedProgress = Math.max(0, Math.min(1, progress));
+  return 1 - ((1 - clampedProgress) ** 3);
 }
 
 function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
@@ -1745,6 +1820,7 @@ export default function App() {
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
+  const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [terminalStabilityRuntimeEnabled, setTerminalStabilityRuntimeEnabled] =
     useState(readTerminalStabilityRuntimeEnabled);
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState({});
@@ -1769,6 +1845,9 @@ export default function App() {
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
   const launchStartedAtRef = useRef(Date.now());
+  const dashboardShellRef = useRef(null);
+  const workspaceRailRef = useRef(null);
+  const workspaceRailAnimationFrameRef = useRef(0);
   const viewTransitionTimeoutRef = useRef(null);
   const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
   const agentInitialStatusUserRef = useRef("");
@@ -2016,6 +2095,98 @@ export default function App() {
   const showSettingsView = useCallback(() => {
     showView("settings");
   }, [showView]);
+
+  const animateWorkspaceRailWidth = useCallback((nextCollapsed) => {
+    const shell = dashboardShellRef.current;
+    const rail = workspaceRailRef.current;
+
+    if (!shell || !rail || typeof window === "undefined") {
+      return;
+    }
+
+    window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+      shell.style.removeProperty("--workspace-rail-current-width");
+      return;
+    }
+
+    const computedStyle = window.getComputedStyle(shell);
+    const targetWidth = parseCssPixelValue(
+      computedStyle.getPropertyValue(
+        nextCollapsed ? "--workspace-rail-collapsed-width" : "--workspace-rail-width",
+      ),
+    );
+    const currentWidth = rail.getBoundingClientRect?.().width;
+    const startWidth = Number.isFinite(currentWidth) ? currentWidth : null;
+
+    if (!Number.isFinite(startWidth) || !Number.isFinite(targetWidth)) {
+      shell.style.removeProperty("--workspace-rail-current-width");
+      return;
+    }
+
+    if (Math.abs(startWidth - targetWidth) < 0.5) {
+      shell.style.removeProperty("--workspace-rail-current-width");
+      return;
+    }
+
+    shell.style.setProperty("--workspace-rail-current-width", `${startWidth}px`);
+
+    const startedAt = performance.now();
+    const step = (now) => {
+      const progress = (now - startedAt) / WORKSPACE_RAIL_ANIMATION_MS;
+      const easedProgress = easeWorkspaceRailProgress(progress);
+      const nextWidth = startWidth + ((targetWidth - startWidth) * easedProgress);
+
+      shell.style.setProperty("--workspace-rail-current-width", `${nextWidth.toFixed(2)}px`);
+
+      if (progress < 1) {
+        workspaceRailAnimationFrameRef.current = window.requestAnimationFrame(step);
+        return;
+      }
+
+      shell.style.removeProperty("--workspace-rail-current-width");
+      workspaceRailAnimationFrameRef.current = 0;
+    };
+
+    workspaceRailAnimationFrameRef.current = window.requestAnimationFrame(step);
+  }, []);
+
+  const toggleWorkspaceRailCollapsed = useCallback(() => {
+    const nextCollapsed = !workspaceRailCollapsed;
+    animateWorkspaceRailWidth(nextCollapsed);
+    persistWorkspaceRailCollapsed(nextCollapsed);
+    setWorkspaceRailCollapsed(nextCollapsed);
+  }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
+
+  useEffect(() => {
+    const platform = getWindowControlPlatform();
+
+    document.documentElement.dataset.windowPlatform = platform;
+    document.body.dataset.windowPlatform = platform;
+
+    return () => {
+      delete document.documentElement.dataset.windowPlatform;
+      delete document.body.dataset.windowPlatform;
+    };
+  }, []);
+
+  const clearWorkspaceSelectionFromRail = useCallback((event) => {
+    const interactiveTarget = event.target.closest?.(
+      'a, button, input, select, textarea, [role="button"], [data-rail-interactive="true"]',
+    );
+
+    if (interactiveTarget) {
+      return;
+    }
+
+    setSelectedWorkspaceId("");
+    setWorkspaceSettingsModalId("");
+  }, []);
+
+  useEffect(() => () => {
+    window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+  }, []);
 
   const clearPreparedWorkspaceTerminals = useCallback((workspaceId) => {
     if (!workspaceId) {
@@ -4275,6 +4446,20 @@ export default function App() {
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
     : "";
   const hasSelectedWorkspace = Boolean(selectedWorkspace);
+  const shouldKeepWorkspaceTerminalMounted = Boolean(shouldShowWorkspaceSetup || activatedWorkspace);
+  const shouldRevealWorkspaceTerminal = Boolean(
+    shouldKeepWorkspaceTerminalMounted
+      && (shouldShowWorkspaceSetup || hasSelectedWorkspace),
+  );
+  const shouldShowDefaultWorkspaceIdle = Boolean(
+    !shouldShowWorkspaceSetup
+      && (!hasSelectedWorkspace || !activatedWorkspace),
+  );
+  const defaultWorkspaceIdleDetail = hasSelectedWorkspace
+    ? "No active workspace."
+    : "No workspace selected.";
+  const shouldShowTerminalNav = Boolean(hasSelectedWorkspace || shouldShowWorkspaceSetup);
+  const shouldShowWorkspaceDetailNav = hasSelectedWorkspace;
   const isSelectedWorkspaceActivated = Boolean(selectedWorkspace && activatedWorkspace?.id === selectedWorkspace.id);
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
@@ -4289,6 +4474,15 @@ export default function App() {
   const isWorkspaceSettingsBusy = workspaceSettingsState === "saving" || isWorkspaceSettingsDeactivating;
   const selectedWorkspaceIdForSpecSync = selectedWorkspace?.id || "";
   const selectedWorkspaceNameForSpecSync = selectedWorkspace?.name || "";
+
+  useEffect(() => {
+    if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        telemetrySource: "workspace_selection_cleared",
+        telemetryWorkspaceId: activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current,
+      });
+    }
+  }, [activeView, hasSelectedWorkspace, showView]);
 
   useEffect(() => {
     const repoPath = selectedWorkspaceFileRoot;
@@ -4544,8 +4738,9 @@ export default function App() {
       : !authInitialized
         ? "Validating this device before showing your workspace."
         : "Finishing the desktop handoff.";
+  const windowControlPlatform = getWindowControlPlatform();
   const isWindowExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
-  const windowResizeLabel = isWindowExpanded ? "Restore" : "Maximize";
+  const windowResizeLabel = isWindowExpanded ? "Restore" : windowControlPlatform === "macos" ? "Zoom" : "Maximize";
   const workspaceCloseReportedClosed = normalizeCloseCount(workspaceCloseState.closed);
   const workspaceCloseTotal = Math.max(normalizeCloseCount(workspaceCloseState.total), workspaceCloseReportedClosed);
   const workspaceCloseClosed = Math.min(workspaceCloseReportedClosed, workspaceCloseTotal);
@@ -4569,15 +4764,21 @@ export default function App() {
   return (
     <>
       <GlobalStyle />
-      <AppFrame>
-        <WindowTitleBar data-tauri-drag-region onMouseDown={handleTitleBarMouseDown}>
+      <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowExpanded}>
+        <WindowTitleBar
+          data-platform={windowControlPlatform}
+          data-tauri-drag-region
+          onMouseDown={handleTitleBarMouseDown}
+        >
           <WindowTitle data-tauri-drag-region>
             <img src="/logo.webp" alt="" />
             <span>{BRAND_NAME}</span>
           </WindowTitle>
-          <WindowControls aria-label="Window controls">
+          <WindowControls aria-label="Window controls" data-platform={windowControlPlatform}>
             <WindowControlButton
               aria-label="Minimize"
+              data-action="minimize"
+              data-platform={windowControlPlatform}
               data-window-control
               onClick={minimizeWindow}
               title="Minimize"
@@ -4587,6 +4788,8 @@ export default function App() {
             </WindowControlButton>
             <WindowControlButton
               aria-label={windowResizeLabel}
+              data-action="maximize"
+              data-platform={windowControlPlatform}
               data-window-control
               onClick={toggleMaximizeWindow}
               title={windowResizeLabel}
@@ -4600,6 +4803,8 @@ export default function App() {
             </WindowControlButton>
             <WindowControlButton
               aria-label="Close"
+              data-action="close"
+              data-platform={windowControlPlatform}
               data-window-control
               data-variant="close"
               onClick={closeWindow}
@@ -4730,11 +4935,33 @@ export default function App() {
             <AuthenticatedWorkspaceFrame>
               <DashboardShell
                 aria-hidden={isWorkspaceStartupOverlayVisible}
+                data-rail-collapsed={workspaceRailCollapsed}
                 data-startup={isWorkspaceStartupOverlayVisible}
+                ref={dashboardShellRef}
               >
-              <WorkspaceRail aria-label="Workspace navigation">
+              <WorkspaceRail
+                aria-label="Workspace navigation"
+                data-collapsed={workspaceRailCollapsed}
+                onClick={clearWorkspaceSelectionFromRail}
+                ref={workspaceRailRef}
+              >
                 <RailTop>
-                  <RailSectionTitle>Workspaces</RailSectionTitle>
+                  <RailHeader>
+                    <RailSectionTitle>Workspaces</RailSectionTitle>
+                    <RailCollapseButton
+                      aria-label={workspaceRailCollapsed ? "Expand workspace drawer" : "Collapse workspace drawer"}
+                      aria-pressed={workspaceRailCollapsed}
+                      onClick={toggleWorkspaceRailCollapsed}
+                      title={workspaceRailCollapsed ? "Expand drawer" : "Drawer smaller"}
+                      type="button"
+                    >
+                      {workspaceRailCollapsed ? (
+                        <ButtonRailExpandIcon aria-hidden="true" />
+                      ) : (
+                        <ButtonRailCollapseIcon aria-hidden="true" />
+                      )}
+                    </RailCollapseButton>
+                  </RailHeader>
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
@@ -4761,6 +4988,9 @@ export default function App() {
                           >
                             <WorkspaceAccent aria-hidden="true" />
                             <WorkspaceLabel>
+                              <WorkspaceCompactGlyph aria-hidden="true">
+                                {getWorkspaceRailInitials(workspace.name)}
+                              </WorkspaceCompactGlyph>
                               <strong>{workspace.name}</strong>
                               <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
                             </WorkspaceLabel>
@@ -4783,35 +5013,45 @@ export default function App() {
                 </RailTop>
 
                 <RailFooter>
-                  {hasSelectedWorkspace && (
+                  {shouldShowTerminalNav && (
+                    <RailActionButton
+                      aria-label="Terminals"
+                      data-active={activeView === DEFAULT_WORKSPACE_VIEW}
+                      onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                      title="Terminals"
+                      type="button"
+                    >
+                      <ButtonTerminalIcon aria-hidden="true" />
+                      <span>Terminals</span>
+                    </RailActionButton>
+                  )}
+                  {shouldShowWorkspaceDetailNav && (
                     <>
                       <RailActionButton
-                        data-active={activeView === DEFAULT_WORKSPACE_VIEW}
-                        onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
-                        type="button"
-                      >
-                        <ButtonTerminalIcon aria-hidden="true" />
-                        <span>Terminals</span>
-                      </RailActionButton>
-                      <RailActionButton
+                        aria-label="Files"
                         data-active={activeView === "files"}
                         onClick={() => showView("files")}
+                        title="Files"
                         type="button"
                       >
                         <ButtonFolderIcon aria-hidden="true" />
                         <span>Files</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="Spec Graph"
                         data-active={activeView === "specGraph"}
                         onClick={() => showView("specGraph")}
+                        title="Spec Graph"
                         type="button"
                       >
                         <ButtonForgeIcon aria-hidden="true" />
                         <span>Spec Graph</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="MCPs"
                         data-active={activeView === "mcps"}
                         onClick={() => showView("mcps")}
+                        title="MCPs"
                         type="button"
                       >
                         <ButtonHubIcon aria-hidden="true" />
@@ -4821,24 +5061,35 @@ export default function App() {
                   )}
                   <RailGlobalActions aria-label="Global controls">
                     <RailActionButton
+                      aria-label="Audio"
                       data-active={activeView === "audio"}
                       data-scope="global"
                       onClick={() => showView("audio")}
+                      title="Audio"
                       type="button"
                     >
                       <ButtonMicIcon aria-hidden="true" />
                       <span>Audio</span>
                     </RailActionButton>
                     <RailActionButton
+                      aria-label="Settings"
                       data-active={activeView === "settings"}
                       data-scope="global"
                       onClick={() => showView("settings")}
+                      title="Settings"
                       type="button"
                     >
                       <ButtonSettingsIcon aria-hidden="true" />
                       <span>Settings</span>
                     </RailActionButton>
-                    <RailActionButton data-scope="global" data-variant="signout" onClick={logout} type="button">
+                    <RailActionButton
+                      aria-label="Sign out"
+                      data-scope="global"
+                      data-variant="signout"
+                      onClick={logout}
+                      title="Sign out"
+                      type="button"
+                    >
                       <ButtonLogoutIcon aria-hidden="true" />
                       <span>Sign out</span>
                     </RailActionButton>
@@ -4851,39 +5102,50 @@ export default function App() {
                   aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                   data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                 >
-                  {shouldShowWorkspaceSetup || activatedWorkspace ? (
-                    <TerminalView
-                      terminalWorkspace={activatedWorkspace}
-                      terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
-                      terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
-                      terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
-                      terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
-                      terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
-                      agentStatusError={agentStatusError}
-                      agentStatuses={agentStatuses}
-                      agentStatusState={agentStatusState}
-                      closeWorkspaceTerminal={closeWorkspaceTerminal}
-                      changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
-                      createFirstWorkspace={createFirstWorkspace}
-                      handlePreparedTerminalChange={handlePreparedTerminalChange}
-                      refreshAgentStatuses={refreshAgentStatuses}
-                      reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
-                      setWorkspaceName={setWorkspaceName}
-                      shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
-                      shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
-                      showSettingsView={showSettingsView}
-                      splitWorkspaceTerminal={splitWorkspaceTerminal}
-                      terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
-                      viewMotion={viewMotion}
-                      workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
-                      workspaceError={workspaceError}
-                      workspaceName={workspaceName}
-                      workspaceSyncState={workspaceSyncState}
-                      workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
-                      workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
-                    />
-                  ) : (
-                    <WorkspaceIdleState detail="No active workspace." viewMotion={viewMotion} />
+                  {shouldKeepWorkspaceTerminalMounted && (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !shouldRevealWorkspaceTerminal}
+                      data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
+                    >
+                      <TerminalView
+                        terminalWorkspace={activatedWorkspace}
+                        terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
+                        terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
+                        terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
+                        terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
+                        terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
+                        agentStatusError={agentStatusError}
+                        agentStatuses={agentStatuses}
+                        agentStatusState={agentStatusState}
+                        closeWorkspaceTerminal={closeWorkspaceTerminal}
+                        changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
+                        createFirstWorkspace={createFirstWorkspace}
+                        handlePreparedTerminalChange={handlePreparedTerminalChange}
+                        refreshAgentStatuses={refreshAgentStatuses}
+                        reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
+                        setWorkspaceName={setWorkspaceName}
+                        shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
+                        shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
+                        showSettingsView={showSettingsView}
+                        splitWorkspaceTerminal={splitWorkspaceTerminal}
+                        terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
+                        viewMotion={viewMotion}
+                        workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
+                        workspaceError={workspaceError}
+                        workspaceName={workspaceName}
+                        workspaceSyncState={workspaceSyncState}
+                        workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
+                        workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
+                      />
+                    </WorkspaceRuntimeLayer>
+                  )}
+                  {shouldShowDefaultWorkspaceIdle && (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
+                      data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
+                    >
+                      <WorkspaceIdleState detail={defaultWorkspaceIdleDetail} viewMotion={viewMotion} />
+                    </WorkspaceRuntimeLayer>
                   )}
                 </WorkspaceViewPane>
 
@@ -5273,7 +5535,7 @@ export default function App() {
                   </AccountSettingsPanel>
                 </SettingsPage>
               ) : visibleView === "files" ? (
-                <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion}>
+                <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
                   {shouldShowWorkspaceSetup ? (
                     <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
                       <SetupHeader>

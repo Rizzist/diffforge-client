@@ -21,7 +21,7 @@
         "resizable": true,
         "decorations": false,
         "acceptFirstMouse": true,
-        "backgroundColor": "#030508",
+        "backgroundColor": "#000000",
         "shadow": true
       }
     ],
