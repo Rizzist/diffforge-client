@@ -2101,7 +2101,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
     let payload = json!({
         "source": "rust-diffforge-terminal-lifecycle",
         "spec_source": if has_claimed_paths { "rust_terminal_lease_scope" } else { "rust_terminal_lifecycle" },
-        "record_spec_activity": has_claimed_paths,
+        "record_spec_activity": false,
         "repo_id": repo_id,
         "agent_id": agent_id,
         "agent_label": agent_label,
@@ -6182,7 +6182,7 @@ fn cloud_mcp_proxy_insert_local_file_scope(
     }
     if matches!(
         tool_name,
-        "agent_heartbeat" | "checkpoint_recorded" | "agent_started_work" | "agent_work_started"
+        "checkpoint_recorded"
     ) {
         arguments
             .entry("record_spec_activity".to_string())

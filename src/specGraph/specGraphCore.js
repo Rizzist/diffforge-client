@@ -449,6 +449,11 @@ function normalizeHistoryTask(task, taskIndex) {
   const taskId = text(field(task, "task_id", "taskId", "id"), `task-${taskIndex}`);
   const nodes = Array.isArray(task?.nodes) ? task.nodes : [];
   const mutations = Array.isArray(task?.mutations) ? task.mutations : [];
+  const arbiterDecisions = Array.isArray(task?.arbiter_decisions)
+    ? task.arbiter_decisions
+    : Array.isArray(task?.arbiterDecisions)
+      ? task.arbiterDecisions
+      : [];
   return {
     ...task,
     task_id: taskId,
@@ -465,9 +470,12 @@ function normalizeHistoryTask(task, taskIndex) {
     last_mutation_at: text(field(task, "last_mutation_at", "lastMutationAt", "updated_at", "updatedAt")),
     mutation_count: Number(field(task, "mutation_count", "mutationCount")) || mutations.length,
     rolled_back_count: Number(field(task, "rolled_back_count", "rolledBackCount")) || 0,
+    arbiter_decision_count: Number(field(task, "arbiter_decision_count", "arbiterDecisionCount")) || arbiterDecisions.length,
+    arbiter_status: text(field(task, "arbiter_status", "arbiterStatus")),
     rollback_state: text(field(task, "rollback_state", "rollbackState"), "active"),
     nodes: nodes.map((node, nodeIndex) => normalizeHistoryNode(node, nodeIndex)),
     mutations: mutations.map((mutation, mutationIndex) => normalizeHistoryMutation(mutation, mutationIndex)),
+    arbiter_decisions: arbiterDecisions.map((decision, decisionIndex) => normalizeHistoryArbiterDecision(decision, decisionIndex)),
   };
 }
 
@@ -505,6 +513,22 @@ function normalizeHistoryMutation(mutation, mutationIndex) {
     after_status: text(field(mutation, "after_status", "afterStatus")),
     rollback_state: text(field(mutation, "rollback_state", "rollbackState"), "active"),
     created_at: text(field(mutation, "created_at", "createdAt")),
+  };
+}
+
+function normalizeHistoryArbiterDecision(decision, decisionIndex) {
+  return {
+    ...decision,
+    id: text(field(decision, "id"), `arbiter-${decisionIndex}`),
+    status: text(field(decision, "status"), "unknown"),
+    provider: text(field(decision, "provider"), "unknown"),
+    scope: text(field(decision, "scope")),
+    operation: text(field(decision, "operation")),
+    target_node_id: text(field(decision, "target_node_id", "targetNodeId")),
+    target_path: text(field(decision, "target_path", "targetPath")),
+    statement: text(field(decision, "statement")),
+    reason: text(field(decision, "reason")),
+    created_at: text(field(decision, "created_at", "createdAt")),
   };
 }
 

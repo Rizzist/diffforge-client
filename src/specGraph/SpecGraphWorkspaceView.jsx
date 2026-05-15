@@ -261,49 +261,105 @@ function TaskHistoryMain({ tasks, selectedTaskId, selectedNodeId, onSelectTask, 
 
   return (
     <HistoryMain>
-      <HistoryList>
+      <HistoryTimeline>
         {visibleTasks.map((task, index) => {
           const active = task.task_id === selectedTaskId;
           const nodes = Array.isArray(task.nodes) ? task.nodes : [];
           const rolledBack = task.rollback_state === "rolled_back";
+          const statusLabel = rolledBack ? "rolled back" : text(task.status, "unknown");
+          const statusState = rolledBack ? "rolled_back" : text(task.status, "unknown");
           const codingAgent = formatCodingAgent(task.coding_agent || task.agent_kind);
           const originalPrompt = text(task.original_prompt || task.prompt || task.start_task_plan, "No original prompt captured.");
+          const arbiterStatus = text(task.arbiter_status);
+          const delta = computeGraphDelta(task);
+          const isLast = index === visibleTasks.length - 1;
           return (
-            <HistoryTaskCard key={task.task_id || index} $active={active} $rolledBack={rolledBack}>
-              <HistoryTaskButton type="button" onClick={() => onSelectTask(task.task_id)}>
-                <HistoryTaskMeta>
-                  <span>#{index + 1}</span>
-                  <span data-state={task.rollback_state === "rolled_back" ? "rolled_back" : task.status}>
-                    {task.rollback_state === "rolled_back" ? "rolled back" : task.status}
-                  </span>
-                  {codingAgent && <span data-state="agent">{codingAgent}</span>}
-                </HistoryTaskMeta>
-                <strong>{text(task.title, "Untitled task")}</strong>
-                <HistoryTaskPrompt>{originalPrompt}</HistoryTaskPrompt>
-                <small>{shortTaskId(task.task_id)} · {task.mutation_count} changes · {formatHistoryTime(task.first_mutation_at)}</small>
-              </HistoryTaskButton>
-              {active && (
-                <HistoryNodeList>
-                  {nodes.length ? nodes.map((node) => (
-                    <HistoryNodeButton
-                      key={node.node_id}
-                      type="button"
-                      data-active={node.node_id === selectedNodeId ? "true" : "false"}
-                      onClick={() => onSelectNode(node.node_id)}
-                    >
-                      <span>{node.node_type || "node"}</span>
-                      <strong>{text(node.path || node.title, node.node_id)}</strong>
-                      <small>{node.spec_changes.length} spec changes · {node.structural_changes.length} structural</small>
-                    </HistoryNodeButton>
-                  )) : (
-                    <HistoryNodeEmpty>No node-level mutations captured.</HistoryNodeEmpty>
-                  )}
-                </HistoryNodeList>
-              )}
-            </HistoryTaskCard>
+            <HistoryTimelineRow key={task.task_id || index}>
+              <TimelineRail data-state={statusState} data-last={isLast ? "true" : "false"}>
+                <TimelineDot data-state={statusState} />
+              </TimelineRail>
+              <HistoryTaskCard
+                data-active={active ? "true" : "false"}
+                data-rolled-back={rolledBack ? "true" : "false"}
+              >
+                <HistoryTaskButton type="button" onClick={() => onSelectTask(task.task_id)}>
+                  <HistoryTaskTopRow>
+                    <HistoryTaskIndex>#{index + 1}</HistoryTaskIndex>
+                    <HistoryTaskTitle>{text(task.title, "Untitled task")}</HistoryTaskTitle>
+                    <HistoryStatusPill data-state={statusState}>{statusLabel}</HistoryStatusPill>
+                  </HistoryTaskTopRow>
+                  <HistoryTaskPrompt>{originalPrompt}</HistoryTaskPrompt>
+                  <HistoryDeltaStrip>
+                    <DeltaChip data-kind="node" data-empty={delta.createdNodes.length === 0 ? "true" : "false"}>
+                      <NodeGlyph $created={delta.createdNodes.length > 0} />
+                      <span>{delta.createdNodes.length} nodes</span>
+                    </DeltaChip>
+                    {delta.removedNodes.length > 0 && (
+                      <DeltaChip data-kind="node-rm">
+                        <NodeGlyph $removed />
+                        <span>{"−"}{delta.removedNodes.length}</span>
+                      </DeltaChip>
+                    )}
+                    <DeltaChip data-kind="edge" data-empty={delta.createdEdges.length === 0 ? "true" : "false"}>
+                      <EdgeGlyph $created={delta.createdEdges.length > 0} />
+                      <span>{delta.createdEdges.length} edges</span>
+                    </DeltaChip>
+                    {delta.removedEdges.length > 0 && (
+                      <DeltaChip data-kind="edge-rm">
+                        <EdgeGlyph $removed />
+                        <span>{"−"}{delta.removedEdges.length}</span>
+                      </DeltaChip>
+                    )}
+                    <DeltaChip data-kind="specs">
+                      <SpecGlyph />
+                      <span>{task.mutation_count || 0} specs</span>
+                    </DeltaChip>
+                  </HistoryDeltaStrip>
+                  <HistoryTaskFoot>
+                    {codingAgent && <FootBadge data-state="agent">{codingAgent}</FootBadge>}
+                    {arbiterStatus && <FootBadge data-state={arbiterStatus}>arbiter {arbiterStatus}</FootBadge>}
+                    {task.arbiter_decision_count ? (
+                      <FootBadge>{task.arbiter_decision_count} arbiter decisions</FootBadge>
+                    ) : null}
+                    <FootBadge data-kind="muted">{shortTaskId(task.task_id)}</FootBadge>
+                    <FootTime>{formatHistoryTime(task.first_mutation_at)}</FootTime>
+                  </HistoryTaskFoot>
+                </HistoryTaskButton>
+                {active && (
+                  <HistoryNodeList>
+                    {nodes.length ? nodes.map((node) => {
+                      const created = nodeWasCreated(node);
+                      return (
+                        <HistoryNodeButton
+                          key={node.node_id}
+                          type="button"
+                          data-active={node.node_id === selectedNodeId ? "true" : "false"}
+                          data-created={created ? "true" : "false"}
+                          onClick={() => onSelectNode(node.node_id)}
+                        >
+                          <NodeButtonGlyph>
+                            <NodeGlyph $created={created} $existing={!created} />
+                          </NodeButtonGlyph>
+                          <NodeButtonBody>
+                            <NodeButtonKicker>
+                              <span data-kind={created ? "created" : "touched"}>{created ? "created" : "touched"}</span>
+                              <small>{node.node_type || "node"}</small>
+                            </NodeButtonKicker>
+                            <strong>{text(node.path || node.title, node.node_id)}</strong>
+                            <small>{node.spec_changes.length} spec changes · {node.structural_changes.length} structural</small>
+                          </NodeButtonBody>
+                        </HistoryNodeButton>
+                      );
+                    }) : (
+                      <HistoryNodeEmpty>No node-level mutations captured.</HistoryNodeEmpty>
+                    )}
+                  </HistoryNodeList>
+                )}
+              </HistoryTaskCard>
+            </HistoryTimelineRow>
           );
         })}
-      </HistoryList>
+      </HistoryTimeline>
     </HistoryMain>
   );
 }
@@ -321,6 +377,8 @@ function TaskHistoryInspector({ task, node }) {
   const codingAgent = formatCodingAgent(task.coding_agent || task.agent_kind);
   const originalPrompt = text(task.original_prompt || task.prompt || task.start_task_plan, "No original prompt captured.");
   const startPlan = text(task.start_task_plan);
+  const arbiterDecisions = Array.isArray(task.arbiter_decisions) ? task.arbiter_decisions : [];
+  const delta = computeGraphDelta(task);
 
   return (
     <Inspector>
@@ -335,6 +393,7 @@ function TaskHistoryInspector({ task, node }) {
         </InspectorFacts>
       </InspectorHeader>
       <MarkdownPane>
+        <GraphDeltaPanel delta={delta} />
         <HistoryDetailsSection>
           <h3>Task</h3>
           <HistoryDetailCard data-rolled-back={task.rollback_state === "rolled_back" ? "true" : "false"}>
@@ -345,10 +404,43 @@ function TaskHistoryInspector({ task, node }) {
             <small>{text(codingAgent, "unknown agent")} · {text(task.agent_id, "unknown agent id")} · {formatHistoryTime(task.first_mutation_at)}</small>
           </HistoryDetailCard>
         </HistoryDetailsSection>
+        <HistoryArbiterList decisions={arbiterDecisions} />
         <HistoryMutationList title="Spec Object Changes" changes={specChanges} empty="No spec objects changed for this node." />
         <HistoryMutationList title="Node / Edge Changes" changes={structuralChanges} empty="No structural changes for this node." />
       </MarkdownPane>
     </Inspector>
+  );
+}
+
+function HistoryArbiterList({ decisions }) {
+  const visibleDecisions = Array.isArray(decisions) ? decisions : [];
+  return (
+    <HistoryDetailsSection>
+      <h3>Spec Arbiter</h3>
+      {visibleDecisions.length ? visibleDecisions.map((decision) => (
+        <HistoryMutationCard key={decision.id} data-action={decision.status}>
+          <HistoryMutationHeading>
+            <span>{text(decision.status, "unknown")}</span>
+            <small>{text(decision.provider, "unknown provider")}</small>
+          </HistoryMutationHeading>
+          {(decision.scope || decision.operation || decision.target_path) && (
+            <HistoryStatement>
+              <span>Decision</span>
+              <p>{[decision.operation, decision.scope, decision.target_path].filter(Boolean).join(" · ")}</p>
+            </HistoryStatement>
+          )}
+          {decision.statement && (
+            <HistoryStatement>
+              <span>Statement</span>
+              <p>{decision.statement}</p>
+            </HistoryStatement>
+          )}
+          {decision.reason && <p>{decision.reason}</p>}
+        </HistoryMutationCard>
+      )) : (
+        <SpecObjectsEmpty>No arbiter decisions captured for this task.</SpecObjectsEmpty>
+      )}
+    </HistoryDetailsSection>
   );
 }
 
@@ -412,6 +504,189 @@ function formatHistoryTime(value) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function isEdgeEntity(change) {
+  return /edge/i.test(text(change?.entity_type));
+}
+
+function isCreateAction(change) {
+  return /^(added|created|restored|inserted)$/i.test(text(change?.action));
+}
+
+function isRemoveAction(change) {
+  return /^(removed|abrogated|deleted)$/i.test(text(change?.action));
+}
+
+function computeGraphDelta(task) {
+  const empty = { createdNodes: [], removedNodes: [], createdEdges: [], removedEdges: [] };
+  if (!task) return empty;
+  const taskNodes = Array.isArray(task.nodes) ? task.nodes : [];
+  const createdNodes = [];
+  const removedNodes = [];
+  const createdEdges = [];
+  const removedEdges = [];
+  for (const taskNode of taskNodes) {
+    const structural = Array.isArray(taskNode.structural_changes) ? taskNode.structural_changes : [];
+    for (const change of structural) {
+      const enriched = { ...change, _node: taskNode };
+      if (isEdgeEntity(change)) {
+        if (isCreateAction(change)) createdEdges.push(enriched);
+        else if (isRemoveAction(change)) removedEdges.push(enriched);
+      } else {
+        if (isCreateAction(change)) createdNodes.push(enriched);
+        else if (isRemoveAction(change)) removedNodes.push(enriched);
+      }
+    }
+  }
+  return { createdNodes, removedNodes, createdEdges, removedEdges };
+}
+
+function nodeWasCreated(taskNode) {
+  const changes = Array.isArray(taskNode?.structural_changes) ? taskNode.structural_changes : [];
+  return changes.some((change) => !isEdgeEntity(change) && isCreateAction(change));
+}
+
+function nodeChangeLabel(change) {
+  return text(
+    change?._node?.path
+      || change?._node?.title
+      || change?.entity_id
+      || change?.after_statement
+      || change?.summary,
+    "node",
+  );
+}
+
+function edgeChangeLabel(change) {
+  return text(
+    change?.summary
+      || change?.after_statement
+      || change?.before_statement
+      || change?.entity_id,
+    "edge",
+  );
+}
+
+function NodeGlyph({ $created, $existing, $removed }) {
+  const stroke = $removed
+    ? "#fb923c"
+    : $created
+      ? "#34d399"
+      : "rgba(148, 163, 184, 0.78)";
+  const fill = $created
+    ? "rgba(52, 211, 153, 0.22)"
+    : $removed
+      ? "rgba(251, 146, 60, 0.18)"
+      : "transparent";
+  const dash = $existing ? "2 1.6" : undefined;
+  return (
+    <Glyph viewBox="0 0 14 14" width="13" height="13" aria-hidden="true">
+      <circle cx="7" cy="7" r="4.6" fill={fill} stroke={stroke} strokeWidth="1.4" strokeDasharray={dash} />
+      {$removed && <line x1="3.6" y1="3.6" x2="10.4" y2="10.4" stroke={stroke} strokeWidth="1.3" />}
+    </Glyph>
+  );
+}
+
+function EdgeGlyph({ $created, $removed }) {
+  const stroke = $removed
+    ? "#fb923c"
+    : $created
+      ? "#34d399"
+      : "rgba(148, 163, 184, 0.78)";
+  const fill = $created
+    ? "rgba(52, 211, 153, 0.22)"
+    : $removed
+      ? "rgba(251, 146, 60, 0.18)"
+      : "transparent";
+  const dash = $removed ? "1.8 1.8" : undefined;
+  return (
+    <Glyph viewBox="0 0 22 12" width="22" height="12" aria-hidden="true">
+      <circle cx="3.2" cy="6" r="2.4" fill={fill} stroke={stroke} strokeWidth="1.3" />
+      <circle cx="18.8" cy="6" r="2.4" fill={fill} stroke={stroke} strokeWidth="1.3" />
+      <line x1="5.7" y1="6" x2="16.3" y2="6" stroke={stroke} strokeWidth="1.4" strokeDasharray={dash} />
+    </Glyph>
+  );
+}
+
+function SpecGlyph() {
+  return (
+    <Glyph viewBox="0 0 14 14" width="13" height="13" aria-hidden="true">
+      <rect x="2.4" y="2.2" width="9.2" height="9.6" rx="1.6" fill="transparent" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.3" />
+      <line x1="4.2" y1="5.8" x2="9.8" y2="5.8" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.1" />
+      <line x1="4.2" y1="8.4" x2="7.8" y2="8.4" stroke="rgba(186, 230, 253, 0.78)" strokeWidth="1.1" />
+    </Glyph>
+  );
+}
+
+function GraphDeltaPanel({ delta }) {
+  const { createdNodes, removedNodes, createdEdges, removedEdges } = delta;
+  const total = createdNodes.length + removedNodes.length + createdEdges.length + removedEdges.length;
+  return (
+    <HistoryDetailsSection>
+      <h3>Graph Delta</h3>
+      {total === 0 ? (
+        <SpecObjectsEmpty>No nodes or edges were added or removed by this task.</SpecObjectsEmpty>
+      ) : (
+        <GraphDeltaGrid>
+          <GraphDeltaColumn>
+            <GraphDeltaHeading>
+              <NodeGlyph $created />
+              <span>Nodes</span>
+              <DeltaCount>
+                <em data-tone="added">+{createdNodes.length}</em>
+                {removedNodes.length > 0 && <em data-tone="removed">{"−"}{removedNodes.length}</em>}
+              </DeltaCount>
+            </GraphDeltaHeading>
+            <GraphDeltaList>
+              {createdNodes.map((change) => (
+                <GraphDeltaPill key={change.id} data-action="added">
+                  <NodeGlyph $created />
+                  <span>{nodeChangeLabel(change)}</span>
+                </GraphDeltaPill>
+              ))}
+              {removedNodes.map((change) => (
+                <GraphDeltaPill key={change.id} data-action="removed">
+                  <NodeGlyph $removed />
+                  <span>{nodeChangeLabel(change)}</span>
+                </GraphDeltaPill>
+              ))}
+              {!createdNodes.length && !removedNodes.length && (
+                <GraphDeltaEmpty>No nodes added or removed.</GraphDeltaEmpty>
+              )}
+            </GraphDeltaList>
+          </GraphDeltaColumn>
+          <GraphDeltaColumn>
+            <GraphDeltaHeading>
+              <EdgeGlyph $created />
+              <span>Edges</span>
+              <DeltaCount>
+                <em data-tone="added">+{createdEdges.length}</em>
+                {removedEdges.length > 0 && <em data-tone="removed">{"−"}{removedEdges.length}</em>}
+              </DeltaCount>
+            </GraphDeltaHeading>
+            <GraphDeltaList>
+              {createdEdges.map((change) => (
+                <GraphDeltaPill key={change.id} data-action="added">
+                  <EdgeGlyph $created />
+                  <span>{edgeChangeLabel(change)}</span>
+                </GraphDeltaPill>
+              ))}
+              {removedEdges.map((change) => (
+                <GraphDeltaPill key={change.id} data-action="removed">
+                  <EdgeGlyph $removed />
+                  <span>{edgeChangeLabel(change)}</span>
+                </GraphDeltaPill>
+              ))}
+              {!createdEdges.length && !removedEdges.length && (
+                <GraphDeltaEmpty>No edges added or removed.</GraphDeltaEmpty>
+              )}
+            </GraphDeltaList>
+          </GraphDeltaColumn>
+        </GraphDeltaGrid>
+      )}
+    </HistoryDetailsSection>
+  );
 }
 
 function SpecInspector({ node }) {
@@ -645,25 +920,106 @@ const HistoryMain = styled.main`
   padding: 12px;
 `;
 
-const HistoryList = styled.div`
+const Glyph = styled.svg`
+  flex-shrink: 0;
+  display: block;
+`;
+
+const HistoryTimeline = styled.div`
   display: grid;
-  gap: 10px;
+  gap: 0;
+`;
+
+const HistoryTimelineRow = styled.div`
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: stretch;
+  min-width: 0;
+`;
+
+const TimelineRail = styled.div`
+  position: relative;
+  width: 28px;
+
+  &::before {
+    content: "";
+    position: absolute;
+    left: 13px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: linear-gradient(
+      180deg,
+      rgba(148, 163, 184, 0.18),
+      rgba(148, 163, 184, 0.06)
+    );
+    border-radius: 2px;
+  }
+
+  &[data-last="true"]::before {
+    bottom: calc(100% - 26px);
+  }
+`;
+
+const TimelineDot = styled.span`
+  position: absolute;
+  left: 7px;
+  top: 18px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: rgba(7, 9, 13, 0.96);
+  --dot-color: rgba(148, 163, 184, 0.78);
+  box-shadow: 0 0 0 1.5px var(--dot-color), 0 0 0 4px rgba(7, 9, 13, 0.95);
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 3px;
+    border-radius: 999px;
+    background: var(--dot-color);
+    opacity: 0.92;
+  }
+
+  &[data-state="done"],
+  &[data-state="merged"],
+  &[data-state="applied"],
+  &[data-state="accepted"] {
+    --dot-color: #34d399;
+  }
+
+  &[data-state="rolled_back"],
+  &[data-state="interrupted"],
+  &[data-state="cancelled"],
+  &[data-state="rejected"] {
+    --dot-color: #fb923c;
+  }
+
+  &[data-state="pending"] {
+    --dot-color: #fbbf24;
+  }
 `;
 
 const HistoryTaskCard = styled.article`
-  border: 1px solid ${({ $active, $rolledBack }) => {
-    if ($rolledBack && !$active) return "rgba(100, 116, 139, 0.16)";
-    return $active ? "rgba(56, 189, 248, 0.42)" : "rgba(148, 163, 184, 0.14)";
-  }};
-  border-radius: 14px;
-  background: ${({ $active, $rolledBack }) => {
-    if ($rolledBack && !$active) return "rgba(15, 23, 42, 0.2)";
-    return $active ? "rgba(14, 116, 144, 0.15)" : "rgba(15, 23, 42, 0.34)";
-  }};
-  box-shadow: ${({ $active }) => ($active ? "0 18px 40px rgba(8, 47, 73, 0.22)" : "none")};
-  filter: ${({ $rolledBack }) => ($rolledBack ? "grayscale(0.45)" : "none")};
-  opacity: ${({ $rolledBack }) => ($rolledBack ? 0.68 : 1)};
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.34);
   overflow: hidden;
+  margin-bottom: 10px;
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+
+  &[data-active="true"] {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(14, 116, 144, 0.16);
+    box-shadow: 0 14px 36px rgba(8, 47, 73, 0.28);
+  }
+
+  &[data-rolled-back="true"]:not([data-active="true"]) {
+    border-color: rgba(100, 116, 139, 0.16);
+    background: rgba(15, 23, 42, 0.2);
+    filter: grayscale(0.45);
+    opacity: 0.7;
+  }
 `;
 
 const HistoryTaskButton = styled.button`
@@ -672,114 +1028,390 @@ const HistoryTaskButton = styled.button`
   color: inherit;
   cursor: pointer;
   display: grid;
-  gap: 6px;
-  padding: 12px;
+  gap: 8px;
+  padding: 12px 13px;
   text-align: left;
   width: 100%;
+`;
 
-  strong {
-    color: rgba(238, 245, 255, 0.9);
-    font-size: 13px;
-    font-weight: 850;
-    line-height: 1.32;
+const HistoryTaskTopRow = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const HistoryTaskIndex = styled.span`
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+`;
+
+const HistoryTaskTitle = styled.strong`
+  color: rgba(238, 245, 255, 0.94);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.3;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const HistoryStatusPill = styled.span`
+  align-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.78);
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  padding: 3.5px 8px;
+  text-transform: uppercase;
+
+  &[data-state="done"],
+  &[data-state="merged"],
+  &[data-state="applied"],
+  &[data-state="accepted"] {
+    border-color: rgba(52, 211, 153, 0.36);
+    color: #86efac;
+    background: rgba(6, 78, 59, 0.18);
   }
 
-  small {
-    color: rgba(148, 163, 184, 0.78);
-    font-size: 10.5px;
-    font-weight: 720;
+  &[data-state="rolled_back"],
+  &[data-state="interrupted"],
+  &[data-state="cancelled"],
+  &[data-state="rejected"] {
+    border-color: rgba(251, 146, 60, 0.4);
+    color: #fed7aa;
+    background: rgba(124, 45, 18, 0.18);
+  }
+
+  &[data-state="pending"] {
+    border-color: rgba(251, 191, 36, 0.34);
+    color: #fde68a;
   }
 `;
 
 const HistoryTaskPrompt = styled.p`
   color: rgba(203, 213, 225, 0.74);
   display: -webkit-box;
-  font-size: 11px;
-  font-weight: 680;
-  line-height: 1.38;
+  font-size: 11.5px;
+  font-weight: 660;
+  line-height: 1.42;
   margin: 0;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
 `;
 
-const HistoryTaskMeta = styled.div`
+const HistoryDeltaStrip = styled.div`
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  padding: 6px 0 2px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.13);
+`;
 
-  span {
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    border-radius: 999px;
-    color: rgba(203, 213, 225, 0.72);
-    font-size: 9px;
-    font-weight: 900;
-    letter-spacing: 0.05em;
-    padding: 4px 7px;
-    text-transform: uppercase;
+const DeltaChip = styled.span`
+  align-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  background: rgba(2, 6, 23, 0.42);
+  color: rgba(226, 232, 240, 0.86);
+  display: inline-flex;
+  font-size: 10.5px;
+  font-weight: 760;
+  gap: 6px;
+  letter-spacing: 0.01em;
+  padding: 4px 9px 4px 7px;
+
+  &[data-empty="true"] {
+    border-color: rgba(148, 163, 184, 0.12);
+    color: rgba(148, 163, 184, 0.6);
+    background: transparent;
   }
 
-  span[data-state="done"],
-  span[data-state="merged"] {
+  &[data-kind="node"]:not([data-empty="true"]) {
+    border-color: rgba(52, 211, 153, 0.32);
+    background: rgba(6, 78, 59, 0.18);
+    color: #bbf7d0;
+  }
+
+  &[data-kind="edge"]:not([data-empty="true"]) {
+    border-color: rgba(125, 211, 252, 0.32);
+    background: rgba(7, 89, 133, 0.18);
+    color: #bae6fd;
+  }
+
+  &[data-kind="node-rm"],
+  &[data-kind="edge-rm"] {
+    border-color: rgba(251, 146, 60, 0.34);
+    background: rgba(124, 45, 18, 0.18);
+    color: #fed7aa;
+  }
+
+  &[data-kind="specs"] {
+    border-color: rgba(186, 230, 253, 0.24);
+    color: rgba(186, 230, 253, 0.86);
+  }
+`;
+
+const HistoryTaskFoot = styled.div`
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+`;
+
+const FootBadge = styled.span`
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.74);
+  font-size: 9.5px;
+  font-weight: 820;
+  letter-spacing: 0.05em;
+  padding: 3px 6px;
+  text-transform: uppercase;
+
+  &[data-state="agent"] {
+    border-color: rgba(56, 189, 248, 0.28);
+    color: #bae6fd;
+  }
+
+  &[data-state="accepted"],
+  &[data-state="approved"],
+  &[data-state="done"] {
     border-color: rgba(52, 211, 153, 0.3);
     color: #86efac;
   }
 
-  span[data-state="interrupted"],
-  span[data-state="cancelled"],
-  span[data-state="rolled_back"] {
-    border-color: rgba(251, 146, 60, 0.34);
-    color: #fed7aa;
+  &[data-state="rejected"],
+  &[data-state="blocked"] {
+    border-color: rgba(251, 113, 133, 0.36);
+    color: #fda4af;
   }
 
-  span[data-state="agent"] {
-    border-color: rgba(56, 189, 248, 0.26);
-    color: #bae6fd;
+  &[data-kind="muted"] {
+    border-color: rgba(148, 163, 184, 0.14);
+    color: rgba(148, 163, 184, 0.66);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0;
+    text-transform: none;
   }
+`;
+
+const FootTime = styled.span`
+  color: rgba(148, 163, 184, 0.66);
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: auto;
 `;
 
 const HistoryNodeList = styled.div`
   border-top: 1px solid rgba(148, 163, 184, 0.12);
   display: grid;
-  gap: 7px;
-  padding: 0 10px 10px;
+  gap: 6px;
+  padding: 8px 12px 12px;
+  background: rgba(2, 6, 23, 0.28);
 `;
 
 const HistoryNodeButton = styled.button`
+  align-items: center;
   border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 10px;
-  background: rgba(2, 6, 23, 0.24);
+  border-radius: 9px;
+  background: rgba(2, 6, 23, 0.34);
   color: inherit;
   cursor: pointer;
   display: grid;
-  gap: 4px;
-  padding: 9px 10px;
+  gap: 10px;
+  grid-template-columns: 22px minmax(0, 1fr);
+  padding: 8px 10px;
   text-align: left;
+  transition: border-color 140ms ease, background 140ms ease;
 
-  &[data-active="true"] {
-    border-color: rgba(52, 211, 153, 0.34);
-    background: rgba(6, 78, 59, 0.16);
+  &:hover {
+    border-color: rgba(125, 211, 252, 0.26);
   }
 
+  &[data-active="true"] {
+    border-color: rgba(56, 189, 248, 0.4);
+    background: rgba(7, 89, 133, 0.22);
+  }
+
+  &[data-created="true"] {
+    border-left: 2px solid rgba(52, 211, 153, 0.5);
+  }
+`;
+
+const NodeButtonGlyph = styled.span`
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+`;
+
+const NodeButtonBody = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+
+  strong {
+    color: rgba(238, 245, 255, 0.92);
+    font-size: 12px;
+    font-weight: 820;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    color: rgba(148, 163, 184, 0.7);
+    font-size: 10px;
+    font-weight: 680;
+  }
+`;
+
+const NodeButtonKicker = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 6px;
+
   span {
-    color: rgba(125, 211, 252, 0.72);
+    color: rgba(125, 211, 252, 0.78);
     font-size: 9px;
     font-weight: 900;
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
-  strong {
-    color: rgba(238, 245, 255, 0.86);
-    font-size: 12px;
-    font-weight: 820;
+  span[data-kind="created"] {
+    color: #86efac;
   }
 
   small {
-    color: rgba(148, 163, 184, 0.72);
-    font-size: 10px;
-    font-weight: 680;
+    color: rgba(148, 163, 184, 0.55);
+    font-size: 9px;
+    font-weight: 760;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
+`;
+
+const GraphDeltaGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+
+  @media (max-width: 720px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const GraphDeltaColumn = styled.div`
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 10px;
+  background: rgba(7, 9, 13, 0.52);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+`;
+
+const GraphDeltaHeading = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(15, 23, 42, 0.45);
+
+  span {
+    color: rgba(226, 232, 240, 0.86);
+    font-size: 10.5px;
+    font-weight: 900;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+`;
+
+const DeltaCount = styled.span`
+  align-items: center;
+  display: inline-flex !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+  font-size: 10px !important;
+  font-weight: 800 !important;
+  gap: 6px;
+  letter-spacing: 0 !important;
+  margin-left: auto;
+  text-transform: none !important;
+
+  em {
+    font-style: normal;
+  }
+
+  em[data-tone="added"] {
+    color: #86efac;
+  }
+
+  em[data-tone="removed"] {
+    color: #fed7aa;
+  }
+`;
+
+const GraphDeltaList = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px;
+`;
+
+const GraphDeltaPill = styled.span`
+  align-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  background: rgba(2, 6, 23, 0.46);
+  color: rgba(226, 232, 240, 0.86);
+  display: inline-flex;
+  font-size: 10.5px;
+  font-weight: 720;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 9px 4px 7px;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 220px;
+  }
+
+  &[data-action="added"] {
+    border-color: rgba(52, 211, 153, 0.3);
+    background: rgba(6, 78, 59, 0.2);
+    color: #bbf7d0;
+  }
+
+  &[data-action="removed"] {
+    border-color: rgba(251, 146, 60, 0.32);
+    background: rgba(124, 45, 18, 0.18);
+    color: #fed7aa;
+  }
+`;
+
+const GraphDeltaEmpty = styled.span`
+  color: rgba(148, 163, 184, 0.56);
+  font-size: 10.5px;
+  font-weight: 680;
+  padding: 2px 0;
 `;
 
 const HistoryEmpty = styled.div`
