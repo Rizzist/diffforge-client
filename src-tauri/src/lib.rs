@@ -87,6 +87,7 @@ const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
+const APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS: u64 = 22_000;
 const APP_SHUTDOWN_PHASE_RUNNING: u8 = 0;
 const APP_SHUTDOWN_PHASE_QUIESCING: u8 = 1;
 const APP_SHUTDOWN_PHASE_STOPPING_WATCHERS: u8 = 2;
@@ -128,6 +129,7 @@ const WHISPER_MODEL_URL: &str =
 const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -1534,6 +1536,42 @@ fn schedule_app_exit_after_terminal_shutdown(
         .map_err(|error| format!("Failed to schedule app close: {error}"))
 }
 
+fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Result<(), String> {
+    if APP_CLOSE_FORCE_EXIT_SCHEDULED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    match thread::Builder::new()
+        .name("diffforge-app-close-watchdog".to_string())
+        .spawn(move || {
+            thread::sleep(Duration::from_millis(
+                APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS,
+            ));
+            advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
+            app_for_exit.exit(0);
+
+            thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
+
+            if let Some(window) = app_for_exit.get_webview_window(&window_label) {
+                let _ = window.destroy();
+            }
+
+            thread::sleep(Duration::from_millis(
+                APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
+            ));
+            std::process::exit(0);
+        }) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            APP_CLOSE_FORCE_EXIT_SCHEDULED.store(false, Ordering::Release);
+            Err(format!("Failed to schedule app close watchdog: {error}"))
+        }
+    }
+}
+
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
     let _ = coordination::watcher::stop_all_file_watchers("app_close");
@@ -1693,14 +1731,15 @@ async fn close_app_after_terminal_shutdown(
 ) -> Result<(), String> {
     let window_label = window.label().to_string();
     let _ = begin_app_shutdown();
+    let force_exit_result = schedule_app_force_exit(app.clone(), window_label.clone());
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return Ok(());
+        return force_exit_result;
     }
 
     run_backend_app_shutdown(app, window_label).await;
 
-    Ok(())
+    force_exit_result
 }
 
 fn restore_main_window(app: &AppHandle) -> bool {

@@ -114,6 +114,62 @@ const MessageText = styled.div`
   min-width: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  color: #d8dbd4;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: 0;
+  line-height: 1.55;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const MessageBody = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+`;
+
+const MessageInlineCode = styled.code`
+  display: inline;
+  border-radius: 4px;
+  padding: 1px 5px 2px;
+  color: #f2f2ed;
+  background: #1b1d19;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  font-weight: 650;
+`;
+
+const MessageFileLink = styled.button`
+  display: inline;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: #57a6ff;
+  background: transparent;
+  font: inherit;
+  font-weight: 650;
+  text-align: left;
+  text-decoration: none;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &:hover {
+    color: #88c2ff;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+`;
+
+const MessageTimestamp = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #3d423d;
+  font-size: 11px;
+  font-weight: 620;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -174,6 +230,82 @@ const TranscriptActivityBody = styled.pre`
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ToolCallsCell = styled.article`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0 10px;
+  color: #6f746d;
+  font-size: 11px;
+  line-height: 1.35;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ToolCallsBox = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 14px;
+  padding: 12px 16px 13px;
+  background: #11130f;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.018),
+    0 10px 34px rgba(0, 0, 0, 0.18);
+`;
+
+const ToolCallsHeading = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #5f645d;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.11em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ToolCallList = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+`;
+
+const ToolCallRow = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+`;
+
+const ToolCallDot = styled.span`
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: #4e554f;
+  opacity: 0.86;
+  user-select: none;
+`;
+
+const ToolCallText = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #777c75;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -509,7 +641,7 @@ const NewChatRoot = styled.main`
   overflow-x: hidden;
   overflow-y: auto;
   color: #e8e8e8;
-  background: #191919;
+  background: #000000;
 `;
 
 const NewChatCenter = styled.form`
@@ -662,7 +794,9 @@ const AGENT_LABELS = {
 };
 const IMAGE_ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 const IMAGE_ATTACHMENT_LIMIT = 4;
+const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
+const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za-z0-9_.@ -]+\.[A-Za-z0-9]+(?::\d+)?|[A-Za-z0-9_.@-]+\.(?:cjs|css|html|js|jsx|json|lock|md|mdx|mjs|ps1|py|rs|scss|sh|toml|ts|tsx|txt|yaml|yml)(?::\d+)?)/g;
 const MODEL_OPTIONS = {
   claude: [
     { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
@@ -1171,6 +1305,108 @@ function compactPath(value) {
   return parts.slice(-2).join("/");
 }
 
+function formatMessageTime(value) {
+  const timestamp = Date.parse(value || "");
+  if (!Number.isFinite(timestamp)) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function cleanFileReference(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^["'`(]+|["'`).,;:]+$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/:\d+$/, "");
+}
+
+function openWorkspaceFile(workspace, filePath) {
+  const relativePath = cleanFileReference(filePath);
+  if (!relativePath || typeof window === "undefined") {
+    return;
+  }
+
+  window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
+    detail: {
+      relativePath,
+      workspaceId: workspace?.id || "",
+    },
+  }));
+}
+
+function renderPlainMessageSegment(segment, keyPrefix, workspace) {
+  const parts = [];
+  let lastIndex = 0;
+
+  segment.replace(FILE_TOKEN_PATTERN, (match, _token, offset) => {
+    if (offset > lastIndex) {
+      parts.push(segment.slice(lastIndex, offset));
+    }
+
+    const filePath = cleanFileReference(match);
+    parts.push(
+      <MessageFileLink
+        key={`${keyPrefix}-file-${offset}`}
+        onClick={() => openWorkspaceFile(workspace, filePath)}
+        title={filePath}
+        type="button"
+      >
+        {match}
+      </MessageFileLink>,
+    );
+    lastIndex = offset + match.length;
+    return match;
+  });
+
+  if (lastIndex < segment.length) {
+    parts.push(segment.slice(lastIndex));
+  }
+
+  return parts.map((part, index) => (
+    typeof part === "string" ? <span key={`${keyPrefix}-text-${index}`}>{part}</span> : part
+  ));
+}
+
+function MessageTextContent({ message, workspace }) {
+  const text = String(message?.text || "");
+  const segments = text.split(/(`[^`]+`)/g);
+
+  return (
+    <>
+      {segments.map((segment, index) => {
+        if (!segment) {
+          return null;
+        }
+
+        if (segment.startsWith("`") && segment.endsWith("`") && segment.length > 1) {
+          return (
+            <MessageInlineCode key={`code-${index}`}>
+              {segment.slice(1, -1)}
+            </MessageInlineCode>
+          );
+        }
+
+        return renderPlainMessageSegment(segment, `segment-${index}`, workspace);
+      })}
+    </>
+  );
+}
+
+function MessageMeta({ message }) {
+  const timestamp = formatMessageTime(message?.createdAt);
+  if (!timestamp) {
+    return null;
+  }
+
+  return <MessageTimestamp>{timestamp}</MessageTimestamp>;
+}
+
 function buildActivityItems(thread) {
   if (!thread) {
     return [];
@@ -1201,7 +1437,116 @@ function buildActivityItems(thread) {
   return items;
 }
 
-function ThreadMessage({ message }) {
+function isToolCallMessage(message) {
+  if (message?.role !== "activity") {
+    return false;
+  }
+
+  const kind = String(message.kind || "").toLowerCase();
+  const title = String(message.title || "").toLowerCase();
+  if (kind === "reasoning") {
+    return false;
+  }
+
+  return [
+    "command",
+    "exec",
+    "file",
+    "mcp",
+    "patch",
+    "tool",
+    "tool_call",
+    "tool_output",
+    "web",
+  ].some((marker) => kind.includes(marker) || title.includes(marker));
+}
+
+function getToolCallLabel(message) {
+  const title = String(message?.title || "").trim();
+  const genericTitles = new Set(["activity", "tool call", "tool output"]);
+  if (title && !genericTitles.has(title.toLowerCase())) {
+    return title;
+  }
+
+  if (String(message?.kind || "").toLowerCase() === "tool_output") {
+    return "Command run complete";
+  }
+
+  if (String(message?.kind || "").toLowerCase() === "tool_call") {
+    return "Command run started";
+  }
+
+  const firstLine = String(message?.text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+
+  return firstLine || title || "Tool call";
+}
+
+function buildTranscriptItems(messages) {
+  const items = [];
+  let toolGroup = [];
+
+  const flushToolGroup = () => {
+    if (!toolGroup.length) {
+      return;
+    }
+
+    items.push({
+      id: `tool-group-${toolGroup[0].id || items.length}`,
+      messages: toolGroup,
+      type: "toolGroup",
+    });
+    toolGroup = [];
+  };
+
+  (Array.isArray(messages) ? messages : []).forEach((message) => {
+    if (isToolCallMessage(message)) {
+      toolGroup.push(message);
+      return;
+    }
+
+    flushToolGroup();
+    items.push({
+      id: message?.id || `message-${items.length}`,
+      message,
+      type: "message",
+    });
+  });
+
+  flushToolGroup();
+  return items;
+}
+
+function ToolCallsGroup({ messages }) {
+  const calls = Array.isArray(messages) ? messages : [];
+  if (!calls.length) {
+    return null;
+  }
+
+  return (
+    <ToolCallsCell>
+      <ActivityBullet aria-hidden="true" />
+      <ToolCallsBox>
+        <ToolCallsHeading>{`Tool Calls (${calls.length})`}</ToolCallsHeading>
+        <ToolCallList>
+          {calls.map((message, index) => {
+            const label = getToolCallLabel(message);
+            return (
+              <ToolCallRow key={message.id || `${label}-${index}`}>
+                <ToolCallDot aria-hidden="true" />
+                <ToolCallText title={label}>{label}</ToolCallText>
+              </ToolCallRow>
+            );
+          })}
+        </ToolCallList>
+      </ToolCallsBox>
+    </ToolCallsCell>
+  );
+}
+
+function ThreadMessage({ message, workspace }) {
   if (!message) {
     return null;
   }
@@ -1210,7 +1555,12 @@ function ThreadMessage({ message }) {
     return (
       <AssistantCell>
         <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
-        <MessageText>{message.text}</MessageText>
+        <MessageBody>
+          <MessageText>
+            <MessageTextContent message={message} workspace={workspace} />
+          </MessageText>
+          <MessageMeta message={message} />
+        </MessageBody>
       </AssistantCell>
     );
   }
@@ -1237,7 +1587,12 @@ function ThreadMessage({ message }) {
   return (
     <UserCell>
       <UserPrefix aria-hidden="true">{"\u203a"}</UserPrefix>
-      <MessageText>{message.text}</MessageText>
+      <MessageBody>
+        <MessageText>
+          <MessageTextContent message={message} workspace={workspace} />
+        </MessageText>
+        <MessageMeta message={message} />
+      </MessageBody>
     </UserCell>
   );
 }
@@ -1259,6 +1614,7 @@ function WorkspaceThreadDetail({
   const [error, setError] = useState("");
   const fileInputRef = useRef(null);
   const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
   const activityItems = useMemo(() => buildActivityItems(thread), [thread]);
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
   const activeAgentStatus = useMemo(
@@ -1392,8 +1748,12 @@ function WorkspaceThreadDetail({
             <EmptyThread>{getWorkspaceThreadLabel(thread)}</EmptyThread>
           ) : null}
 
-          {messages.map((message) => (
-            <ThreadMessage key={message.id} message={message} />
+          {transcriptItems.map((item) => (
+            item.type === "toolGroup" ? (
+              <ToolCallsGroup key={item.id} messages={item.messages} />
+            ) : (
+              <ThreadMessage key={item.id} message={item.message} workspace={workspace} />
+            )
           ))}
 
           {activityItems.map((item) => (

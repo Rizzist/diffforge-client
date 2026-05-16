@@ -330,6 +330,7 @@ const FILE_EXPLORER_MAX_SIZE = 76;
 const FILE_PREVIEW_DEFAULT_SIZE = 72;
 const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
+const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const FILE_PREVIEW_MODES = [
   { id: "file", label: "File" },
   { id: "review", label: "Review" },
@@ -1219,6 +1220,30 @@ export default function FilesWorkspaceView({
       setFileError(getErrorMessage(error, "Unable to open file."));
     }
   }, [workspaceRoot]);
+
+  useEffect(() => {
+    const handleWorkspaceFileOpen = (event) => {
+      const detail = event?.detail || {};
+      const targetWorkspaceId = String(detail.workspaceId || "").trim();
+      const relativePath = String(detail.relativePath || "")
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "");
+
+      if (!relativePath || (targetWorkspaceId && targetWorkspaceId !== workspaceId)) {
+        return;
+      }
+
+      openFile({
+        kind: "file",
+        name: getExplorerFileName(relativePath),
+        relativePath,
+      });
+    };
+
+    window.addEventListener(WORKSPACE_FILE_OPEN_EVENT, handleWorkspaceFileOpen);
+    return () => window.removeEventListener(WORKSPACE_FILE_OPEN_EVENT, handleWorkspaceFileOpen);
+  }, [openFile, workspaceId]);
 
   const toggleDirectory = useCallback((entry) => {
     const directoryPath = entry.relativePath || "";

@@ -2542,6 +2542,8 @@ export const ForgeWorkspace = styled.section`
 `;
 
 export const TerminalWorkspaceSurface = styled.section`
+  --terminal-focus-outline-inset: 0px;
+
   position: relative;
   isolation: isolate;
   display: flex;
@@ -2560,6 +2562,8 @@ export const TerminalWorkspaceSurface = styled.section`
     box-shadow 180ms ease;
 
   &[data-terminal-fullscreen="true"] {
+    --terminal-focus-outline-inset: 1px;
+
     position: absolute;
     inset: 0;
     z-index: 220;
@@ -2596,8 +2600,9 @@ export const TerminalWorkspaceSurface = styled.section`
 
   &::after {
     position: absolute;
-    inset: 0;
+    inset: var(--terminal-focus-outline-inset);
     z-index: 120;
+    box-sizing: border-box;
     border: 0 solid transparent;
     box-shadow: none;
     pointer-events: none;
@@ -2616,7 +2621,7 @@ export const TerminalWorkspaceSurface = styled.section`
       0 0 12px rgba(132, 157, 190, 0.14);
   }
 
-  &[data-threads-view="true"]::after {
+  &[data-threads-view="true"]:not([data-terminal-fullscreen="true"])::after {
     border-width: 0;
     border-color: transparent;
     box-shadow: none;

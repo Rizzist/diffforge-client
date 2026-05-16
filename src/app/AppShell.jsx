@@ -464,7 +464,7 @@ const TERMINAL_WEBGL_STAGGER_MS = 90;
 const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
-const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 18000;
+const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 30000;
 const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
@@ -884,26 +884,14 @@ function normalizeTerminalCloseProgress(payload) {
   };
 }
 
-async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
-  try {
-    await withTimeout(
-      invoke("close_app_after_terminal_shutdown"),
-      WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
-      "Native app exit timed out.",
-    );
-    return;
-  } catch {
-  }
-
-  let closeSucceeded = false;
-
+async function closeWorkspaceWindowDirectly(appWindow) {
   try {
     await withTimeout(
       appWindow.close(),
       WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
       "Window close timed out.",
     );
-    closeSucceeded = true;
+    return;
   } catch (closeError) {
 
     if (typeof appWindow.destroy !== "function") {
@@ -912,10 +900,6 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
   }
 
   if (typeof appWindow.destroy !== "function") {
-    if (closeSucceeded) {
-      return;
-    }
-
     throw new Error("Window destroy is unavailable.");
   }
 
@@ -929,6 +913,20 @@ async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
     throw destroyError;
   }
 
+}
+
+async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
+  try {
+    await withTimeout(
+      invoke("close_app_after_terminal_shutdown"),
+      WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
+      "Native app exit timed out.",
+    );
+    return;
+  } catch {
+  }
+
+  await closeWorkspaceWindowDirectly(appWindow);
 }
 
 async function readWindowFrameState(appWindow = getSafeCurrentWindow()) {
@@ -3865,13 +3863,21 @@ export default function App() {
       return;
     }
 
+    event.preventDefault();
+
     if (event.detail === 2) {
       toggleWindowSize();
       return;
     }
 
+    if (getWindowControlPlatform() === "windows" && (windowFrameState.isFullscreen || windowFrameState.isMaximized)) {
+      // Windows can lose a frameless maximized window if startDragging is invoked
+      // from a custom titlebar before the user has actually dragged it.
+      return;
+    }
+
     runWindowAction(() => getSafeCurrentWindow()?.startDragging());
-  }, [toggleWindowSize]);
+  }, [toggleWindowSize, windowFrameState.isFullscreen, windowFrameState.isMaximized]);
 
   const handleWindowResizeEdgeMouseDown = useCallback((event) => {
     if (event.button !== 0) {
@@ -3923,13 +3929,15 @@ export default function App() {
   const closeWindow = useCallback((event) => {
     event?.stopPropagation?.();
 
-    if (workspaceCloseInFlightRef.current) {
-      return;
-    }
-
     const appWindow = getSafeCurrentWindow();
 
     if (!appWindow) {
+      return;
+    }
+
+    if (workspaceCloseInFlightRef.current) {
+      workspaceCloseAllowNativeRef.current = true;
+      runWindowAction(() => closeWorkspaceWindowDirectly(appWindow));
       return;
     }
 
@@ -3940,24 +3948,32 @@ export default function App() {
 
     runWindowAction(async () => {
       let unlistenCloseProgress = null;
+      let releaseCloseProgressListener = false;
 
-      try {
-        unlistenCloseProgress = await listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
-          const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
+      listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
+        const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
 
-          setWorkspaceCloseState((currentCloseState) => {
-            const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
+        setWorkspaceCloseState((currentCloseState) => {
+          const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
 
-            return {
-              isActive: true,
-              closed: Math.max(currentProgress.closed, nextProgress.closed),
-              total: Math.max(currentProgress.total, nextProgress.total),
-            };
-          });
+          return {
+            isActive: true,
+            closed: Math.max(currentProgress.closed, nextProgress.closed),
+            total: Math.max(currentProgress.total, nextProgress.total),
+          };
         });
-      } catch {
-        // Missing progress events should not block the close sequence.
-      }
+      })
+        .then((unlisten) => {
+          if (releaseCloseProgressListener && typeof unlisten === "function") {
+            unlisten();
+            return;
+          }
+
+          unlistenCloseProgress = unlisten;
+        })
+        .catch(() => {
+          // Missing progress events should not block the close sequence.
+        });
 
       try {
         workspaceCloseAllowNativeRef.current = true;
@@ -3967,6 +3983,7 @@ export default function App() {
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
       } finally {
+        releaseCloseProgressListener = true;
         if (typeof unlistenCloseProgress === "function") {
           unlistenCloseProgress();
         }
@@ -5406,10 +5423,9 @@ export default function App() {
       <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowExpanded}>
         <WindowTitleBar
           data-platform={windowControlPlatform}
-          data-tauri-drag-region
           onMouseDown={handleTitleBarMouseDown}
         >
-          <WindowTitle data-tauri-drag-region>
+          <WindowTitle>
             <img src="/logo.webp" alt="" />
             <span>{BRAND_NAME}</span>
           </WindowTitle>

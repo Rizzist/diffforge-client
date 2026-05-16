@@ -39,7 +39,7 @@ const OverlayRoot = styled.div`
   min-width: 0;
   min-height: 0;
   color: #d8e2ef;
-  background: rgba(0, 0, 0, 0.94);
+  background: #000000;
   animation: ${overlayFadeIn} 140ms ease both;
   backdrop-filter: blur(7px);
   pointer-events: auto;
@@ -54,7 +54,7 @@ const OverlayPanel = styled.section`
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background: #030405;
+  background: #000000;
   box-shadow: none;
   animation: ${overlayPanelIn} 160ms cubic-bezier(0.16, 1, 0.3, 1) both;
   transition: grid-template-columns 180ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -79,8 +79,8 @@ const ThreadRail = styled.aside`
   min-width: 0;
   min-height: 0;
   overflow: visible;
-  border-right: 1px solid rgba(148, 163, 184, 0.16);
-  background: rgba(0, 0, 0, 0.92);
+  border-right: 1px solid rgba(255, 255, 255, 0.07);
+  background: #000000;
 `;
 
 const DrawerToggle = styled.button`
@@ -130,6 +130,7 @@ const WorkspaceList = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 40px 7px 8px;
+  background: #000000;
 `;
 
 const RailActionStack = styled.div`
@@ -149,10 +150,10 @@ const RailActionButton = styled.button`
   padding: 0 7px;
   border: 1px solid rgba(94, 111, 132, 0.18);
   border-radius: 5px;
-  color: #758296;
-  background: rgba(148, 163, 184, 0.035);
+  color: #f4f6f8;
+  background: rgba(255, 255, 255, 0.04);
   text-align: left;
-  opacity: 0.64;
+  opacity: 1;
   transition:
     background 130ms ease,
     color 130ms ease,
@@ -160,12 +161,14 @@ const RailActionButton = styled.button`
 
   &:hover:not(:disabled),
   &[data-active="true"] {
-    color: #dbe4f0;
+    color: #ffffff;
     background: rgba(148, 163, 184, 0.08);
     opacity: 1;
   }
 
   &:disabled {
+    color: #f4f6f8;
+    opacity: 1;
     cursor: not-allowed;
   }
 
@@ -225,6 +228,7 @@ const CollapsedRail = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 40px 6px 8px;
+  background: #000000;
 `;
 
 const CollapsedRailActionStack = styled.div`
@@ -243,9 +247,9 @@ const CollapsedRailActionButton = styled.button`
   padding: 0;
   border: 1px solid rgba(94, 111, 132, 0.18);
   border-radius: 5px;
-  color: #758296;
-  background: rgba(148, 163, 184, 0.035);
-  opacity: 0.64;
+  color: #f4f6f8;
+  background: rgba(255, 255, 255, 0.04);
+  opacity: 1;
   transition:
     background 130ms ease,
     color 130ms ease,
@@ -253,12 +257,14 @@ const CollapsedRailActionButton = styled.button`
 
   &:hover:not(:disabled),
   &[data-active="true"] {
-    color: #dbe4f0;
+    color: #ffffff;
     background: rgba(148, 163, 184, 0.08);
     opacity: 1;
   }
 
   &:disabled {
+    color: #f4f6f8;
+    opacity: 1;
     cursor: not-allowed;
   }
 
