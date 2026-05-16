@@ -3791,6 +3791,7 @@ fn emit_terminal_prompt_submitted(
     app: &AppHandle,
     instance: &TerminalInstance,
     prompt: &str,
+    prompt_event_id: Option<&str>,
     thread_id_override: Option<&str>,
 ) {
     let prompt = prompt.trim();
@@ -3814,6 +3815,10 @@ fn emit_terminal_prompt_submitted(
                 .unwrap_or(metadata.thread_id),
             agent_id: metadata.agent_id,
             agent_kind: metadata.agent_kind,
+            prompt_event_id: prompt_event_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             prompt: prompt.to_string(),
         },
     );
@@ -3849,6 +3854,7 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
                 payload.pane_id,
                 payload.instance_id,
                 payload.data,
+                payload.prompt_event_id,
                 payload.prompt_event_text,
                 payload.thread_id,
             )
@@ -3888,12 +3894,19 @@ async fn terminal_write_inner(
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_id: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
+        if prompt_event_text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err("Terminal session is not running.".to_string());
+        }
         return Ok(());
     };
     let _input_guard = instance.input_queue.lock().await;
@@ -3940,7 +3953,13 @@ async fn terminal_write_inner(
             .filter(|value| !value.is_empty())
             .unwrap_or(prompt.as_str())
             .to_string();
-        emit_terminal_prompt_submitted(&app, &instance, &event_prompt, thread_id.as_deref());
+        emit_terminal_prompt_submitted(
+            &app,
+            &instance,
+            &event_prompt,
+            prompt_event_id.as_deref(),
+            thread_id.as_deref(),
+        );
         if *instance.agent_started.lock().await {
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
@@ -3987,6 +4006,7 @@ async fn terminal_write(
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_id: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
@@ -3997,6 +4017,7 @@ async fn terminal_write(
         pane_id,
         instance_id,
         data,
+        prompt_event_id,
         prompt_event_text,
         thread_id,
     )

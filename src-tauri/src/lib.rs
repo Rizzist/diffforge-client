@@ -51,6 +51,7 @@ const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
 const AGENT_INSTALL_TIMEOUT_SECS: u64 = 240;
 const AGENT_RUN_TIMEOUT_SECS: u64 = 120;
+const AGENT_THREAD_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 const AGENT_LOGOUT_TIMEOUT_SECS: u64 = 30;
 const MAX_FORGE_PROMPT_LENGTH: usize = 12_000;
 const MAX_FORGE_MODEL_LENGTH: usize = 80;
@@ -823,6 +824,19 @@ struct ForgeRunResult {
     working_directory: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentThreadTurnResult {
+    agent_id: String,
+    label: String,
+    model: String,
+    output: String,
+    provider_session_id: String,
+    requested_provider_session_id: String,
+    stderr: String,
+    working_directory: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForgePromptRequest {
@@ -831,6 +845,16 @@ struct ForgePromptRequest {
     model: Option<String>,
     working_directory: Option<String>,
     images: Option<Vec<ForgePromptImage>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentThreadTurnRequest {
+    agent_id: String,
+    provider_session_id: Option<String>,
+    prompt: String,
+    model: Option<String>,
+    working_directory: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1003,6 +1027,7 @@ struct TerminalInputEventPayload {
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_id: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 }
@@ -1026,6 +1051,7 @@ struct TerminalPromptSubmittedPayload {
     thread_id: String,
     agent_id: String,
     agent_kind: String,
+    prompt_event_id: Option<String>,
     prompt: String,
 }
 
@@ -1964,6 +1990,7 @@ pub fn run() {
             workspace_web_reload,
             workspace_web_close_all,
             run_forge_prompt,
+            agent_thread_turn_start,
             save_todo_image_attachments,
             save_todo_text_attachment,
             whisper_model_status,

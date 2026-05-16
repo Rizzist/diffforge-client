@@ -1220,6 +1220,144 @@ function buildTerminalSubmittedInput(text, agentKind, isGenericTerminal = false)
   return `${text}${getTerminalSubmitSequence(agentKind, isGenericTerminal)}`;
 }
 
+function createThreadProjectionToken(prefix = "projection") {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function buildProviderTurnStartProjectionEvents({
+  agentId,
+  source = "provider-api",
+  startedAt,
+  text,
+  turnId,
+  userMessageId,
+}) {
+  const safeText = String(text || "").trim();
+  const safeStartedAt = startedAt || new Date().toISOString();
+  const safeTurnId = turnId || createThreadProjectionToken("turn");
+  const safeUserMessageId = userMessageId || createThreadProjectionToken("message-user");
+
+  return [
+    {
+      agentId,
+      createdAt: safeStartedAt,
+      id: `projection-provider-turn-started-${safeTurnId}`,
+      messageId: safeUserMessageId,
+      source,
+      status: "running",
+      turnId: safeTurnId,
+      type: "thread.turn.started",
+    },
+    {
+      agentId,
+      createdAt: safeStartedAt,
+      id: `projection-provider-user-${safeUserMessageId}`,
+      messageId: safeUserMessageId,
+      role: "user",
+      source,
+      status: "submitted",
+      text: safeText,
+      turnId: safeTurnId,
+      type: "thread.message.user",
+    },
+  ];
+}
+
+function buildProviderTurnProjectionEvents({
+  agentId,
+  assistantMessageId,
+  completedAt,
+  output,
+  source = "provider-api",
+  startedAt,
+  text,
+  turnId,
+  userMessageId,
+}) {
+  const safeText = String(text || "").trim();
+  const safeOutput = String(output || "").trim() || "(No output returned.)";
+  const safeStartedAt = startedAt || new Date().toISOString();
+  const safeCompletedAt = completedAt || safeStartedAt;
+  const safeTurnId = turnId || createThreadProjectionToken("turn");
+  const safeUserMessageId = userMessageId || createThreadProjectionToken("message-user");
+  const safeAssistantMessageId = assistantMessageId || createThreadProjectionToken("message-assistant");
+
+  return [
+    ...buildProviderTurnStartProjectionEvents({
+      agentId,
+      source,
+      startedAt: safeStartedAt,
+      text: safeText,
+      turnId: safeTurnId,
+      userMessageId: safeUserMessageId,
+    }),
+    {
+      agentId,
+      createdAt: safeCompletedAt,
+      delta: safeOutput,
+      id: `projection-provider-assistant-delta-${safeAssistantMessageId}`,
+      messageId: safeAssistantMessageId,
+      source,
+      status: "streaming",
+      text: safeOutput,
+      turnId: safeTurnId,
+      type: "thread.message.assistant.delta",
+    },
+    {
+      agentId,
+      createdAt: safeCompletedAt,
+      id: `projection-provider-assistant-complete-${safeAssistantMessageId}`,
+      messageId: safeAssistantMessageId,
+      source,
+      status: "complete",
+      text: safeOutput,
+      turnId: safeTurnId,
+      type: "thread.message.assistant.complete",
+    },
+    {
+      agentId,
+      assistantMessageId: safeAssistantMessageId,
+      completedAt: safeCompletedAt,
+      createdAt: safeCompletedAt,
+      id: `projection-provider-turn-completed-${safeTurnId}`,
+      messageId: safeUserMessageId,
+      source,
+      status: "completed",
+      turnId: safeTurnId,
+      type: "thread.turn.completed",
+    },
+  ];
+}
+
+function buildProviderTurnErrorProjectionEvents({
+  agentId,
+  completedAt,
+  error,
+  source = "provider-api",
+  turnId,
+  userMessageId,
+}) {
+  const safeCompletedAt = completedAt || new Date().toISOString();
+  const safeTurnId = turnId || createThreadProjectionToken("turn");
+  const safeUserMessageId = userMessageId || createThreadProjectionToken("message-user");
+  const safeError = String(error || "Unable to send message through the provider session.").trim();
+
+  return [
+    {
+      agentId,
+      completedAt: safeCompletedAt,
+      createdAt: safeCompletedAt,
+      id: `projection-provider-turn-error-${safeTurnId}`,
+      messageId: safeUserMessageId,
+      source,
+      status: "error",
+      text: safeError,
+      turnId: safeTurnId,
+      type: "thread.turn.error",
+    },
+  ];
+}
+
 function encodeTerminalComposerText(value) {
   return String(value || "").replace(/\n/g, TERMINAL_SHIFT_ENTER_SEQUENCE);
 }
@@ -1540,6 +1678,9 @@ function WorkspaceTerminal({
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
   const submittedPendingPromptIdsRef = useRef(new Set());
+  const pendingPromptSendTimersRef = useRef(new Map());
+  const terminalFirstVisibleOutputAtRef = useRef(0);
+  const terminalRunningSinceRef = useRef(0);
   const terminalActiveRef = useRef(Boolean(isActive));
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1548,6 +1689,7 @@ function WorkspaceTerminal({
   const preserveCoordinationOnNextCleanupRef = useRef(false);
   const preserveCoordinationOnNextOpenRef = useRef(false);
   const forceFreshSessionOnNextOpenRef = useRef(false);
+  const providerSessionOverrideOnNextOpenRef = useRef("");
   const parkedPromptRef = useRef(null);
   const cancellingParkedPromptKeysRef = useRef(new Set());
   const threadComposerDraftsRef = useRef(new Map());
@@ -1768,6 +1910,7 @@ function WorkspaceTerminal({
   const queueWorkspaceThreadComposerWrite = useCallback(({
     binding,
     data,
+    promptEventId,
     promptEventText,
     threadId,
   }) => {
@@ -1806,6 +1949,7 @@ function WorkspaceTerminal({
           data,
           instanceId: binding.instanceId,
           paneId: binding.paneId,
+          promptEventId,
           promptEventText,
           threadId,
         });
@@ -1881,6 +2025,262 @@ function WorkspaceTerminal({
     workspaceThreads,
   ]);
 
+  const reloadTerminalWithProviderSession = useCallback(({
+    agentId,
+    providerSessionId,
+    reason = "provider_turn_completed",
+    threadId,
+  }) => {
+    const nextProviderSessionId = String(providerSessionId || "").trim();
+    if (
+      !nextProviderSessionId
+      || isGenericTerminal
+      || terminalClosed
+      || terminalClosingRef.current
+    ) {
+      return;
+    }
+
+    providerSessionOverrideOnNextOpenRef.current = nextProviderSessionId;
+    preserveCoordinationOnNextCleanupRef.current = true;
+    preserveCoordinationOnNextOpenRef.current = true;
+    logThreadBridgeDiagnostic("frontend.provider_turn.reload_terminal_session", {
+      agentId: getTerminalAgentKind(agentId),
+      paneId,
+      providerSessionPresent: true,
+      reason,
+      terminalIndex,
+      threadId: threadId || terminalThreadIdRef.current || "",
+      workspaceId: workspace?.id || "",
+    });
+    setRestartKey((current) => current + 1);
+  }, [
+    isGenericTerminal,
+    paneId,
+    terminalClosed,
+    terminalIndex,
+    workspace?.id,
+  ]);
+
+  const runWorkspaceThreadProviderTurn = useCallback(async ({
+    agentId,
+    binding,
+    message,
+    model,
+    pendingPromptId = "",
+    providerSessionId = "",
+    repoPath = "",
+    syncTerminalAfterTurn = true,
+    terminalIndex: targetTerminalIndex,
+    threadId,
+    workspace: targetWorkspace,
+    workspaceId: targetWorkspaceId,
+  }) => {
+    const text = String(message || "").trim();
+    const safeAgentId = getTerminalAgentKind(agentId);
+    const safeThreadId = String(threadId || "").trim();
+    const safeWorkspaceId = String(targetWorkspaceId || targetWorkspace?.id || workspace?.id || "").trim();
+    const safeRepoPath = String(repoPath || workingDirectory || "").trim();
+    const modelId = String(model || "").trim();
+    const previousProviderSessionId = String(providerSessionId || "").trim();
+    const instanceId = binding?.instanceId || terminalInstanceIdRef.current || undefined;
+    const lifecyclePaneId = binding?.paneId || paneId;
+    const lifecycleTerminalIndex = targetTerminalIndex ?? binding?.terminalIndex ?? terminalIndex;
+    const startedAt = new Date().toISOString();
+    const userMessageId = pendingPromptId || createThreadProjectionToken("message-user");
+    const turnId = `turn-${userMessageId}`;
+    const assistantMessageId = createThreadProjectionToken("message-assistant");
+
+    if (!text || !safeThreadId || !safeWorkspaceId || !safeRepoPath) {
+      throw new Error("Unable to start the provider turn for this thread.");
+    }
+
+    logThreadBridgeDiagnostic("frontend.provider_turn.start", {
+      agentId: safeAgentId,
+      instanceId: instanceId || "",
+      modelIdPresent: Boolean(modelId),
+      paneId: lifecyclePaneId,
+      pendingPromptId,
+      providerSessionPresent: Boolean(previousProviderSessionId),
+      repoPathPresent: Boolean(safeRepoPath),
+      terminalIndex: lifecycleTerminalIndex,
+      threadId: safeThreadId,
+      userMessageLength: text.length,
+      workspaceId: safeWorkspaceId,
+    });
+    onThreadTerminalLifecycle?.({
+      activityStatus: "thinking",
+      agentId: safeAgentId,
+      instanceId,
+      paneId: lifecyclePaneId,
+      status: "active",
+      terminalIndex: lifecycleTerminalIndex,
+      threadId: safeThreadId,
+      type: "agent-output",
+      workspaceId: safeWorkspaceId,
+    });
+    onThreadTerminalLifecycle?.({
+      agentId: safeAgentId,
+      clearPendingPrompt: false,
+      instanceId,
+      model: modelId,
+      modelSource: modelId ? "provider-api" : "",
+      nativeSessionId: previousProviderSessionId,
+      nativeSessionKind: previousProviderSessionId ? "session" : "",
+      nativeSessionSource: previousProviderSessionId ? "provider-api" : "",
+      paneId: lifecyclePaneId,
+      pendingPromptId,
+      projectionEvents: buildProviderTurnStartProjectionEvents({
+        agentId: safeAgentId,
+        startedAt,
+        text,
+        turnId,
+        userMessageId,
+      }),
+      providerSessionId: previousProviderSessionId,
+      repoPath: safeRepoPath,
+      status: "active",
+      terminalIndex: lifecycleTerminalIndex,
+      threadId: safeThreadId,
+      type: "provider-turn-started",
+      workspaceId: safeWorkspaceId,
+      workspaceName: targetWorkspace?.name || workspace?.name || "",
+    });
+
+    try {
+      const result = await invoke("agent_thread_turn_start", {
+        request: {
+          agentId: safeAgentId,
+          model: modelId || null,
+          prompt: text,
+          providerSessionId: previousProviderSessionId || null,
+          workingDirectory: safeRepoPath,
+        },
+      });
+      const completedAt = new Date().toISOString();
+      const nextProviderSessionId = String(
+        result?.providerSessionId || previousProviderSessionId || "",
+      ).trim();
+      const output = String(result?.output || "").trim();
+
+      logThreadBridgeDiagnostic("frontend.provider_turn.completed", {
+        agentId: safeAgentId,
+        instanceId: instanceId || "",
+        outputLength: output.length,
+        paneId: lifecyclePaneId,
+        pendingPromptId,
+        providerSessionPresent: Boolean(nextProviderSessionId),
+        terminalIndex: lifecycleTerminalIndex,
+        threadId: safeThreadId,
+        workspaceId: safeWorkspaceId,
+      });
+      if (nextProviderSessionId) {
+        onThreadTerminalLifecycle?.({
+          agentId: safeAgentId,
+          instanceId,
+          nativeSessionId: nextProviderSessionId,
+          nativeSessionKind: "session",
+          nativeSessionSource: "provider-api",
+          paneId: lifecyclePaneId,
+          providerSessionId: nextProviderSessionId,
+          terminalIndex: lifecycleTerminalIndex,
+          threadId: safeThreadId,
+          type: "provider-session",
+          workspaceId: safeWorkspaceId,
+        });
+      }
+      onThreadTerminalLifecycle?.({
+        agentId: safeAgentId,
+        instanceId,
+        model: result?.model || modelId,
+        modelSource: modelId ? "provider-api" : "",
+        nativeSessionId: nextProviderSessionId,
+        nativeSessionKind: nextProviderSessionId ? "session" : "",
+        nativeSessionSource: nextProviderSessionId ? "provider-api" : "",
+        paneId: lifecyclePaneId,
+        pendingPromptId,
+        projectionEvents: buildProviderTurnProjectionEvents({
+          agentId: safeAgentId,
+          assistantMessageId,
+          completedAt,
+          output: output || result?.output || "",
+          startedAt,
+          text,
+          turnId,
+          userMessageId,
+        }),
+        providerSessionId: nextProviderSessionId,
+        repoPath: safeRepoPath,
+        status: "active",
+        terminalIndex: lifecycleTerminalIndex,
+        threadId: safeThreadId,
+        type: "provider-turn-completed",
+        workspaceId: safeWorkspaceId,
+        workspaceName: targetWorkspace?.name || workspace?.name || "",
+      });
+      if (syncTerminalAfterTurn && nextProviderSessionId) {
+        reloadTerminalWithProviderSession({
+          agentId: safeAgentId,
+          providerSessionId: nextProviderSessionId,
+          reason: previousProviderSessionId
+            ? "provider_turn_reload_existing_session"
+            : "provider_turn_reload_created_session",
+          threadId: safeThreadId,
+        });
+      }
+
+      return result;
+    } catch (error) {
+      const messageText = getErrorMessage(error, "Unable to send message through the provider session.");
+      logThreadBridgeDiagnostic("frontend.provider_turn.error", {
+        agentId: safeAgentId,
+        instanceId: instanceId || "",
+        message: messageText,
+        paneId: lifecyclePaneId,
+        pendingPromptId,
+        terminalIndex: lifecycleTerminalIndex,
+        threadId: safeThreadId,
+        workspaceId: safeWorkspaceId,
+      });
+      onThreadTerminalLifecycle?.({
+        agentId: safeAgentId,
+        instanceId,
+        paneId: lifecyclePaneId,
+        pendingPromptId,
+        projectionEvents: buildProviderTurnErrorProjectionEvents({
+          agentId: safeAgentId,
+          completedAt: new Date().toISOString(),
+          error: messageText,
+          turnId,
+          userMessageId,
+        }),
+        status: "error",
+        terminalIndex: lifecycleTerminalIndex,
+        threadId: safeThreadId,
+        type: "provider-turn-error",
+        workspaceId: safeWorkspaceId,
+      });
+      if (pendingPromptId) {
+        onThreadTerminalLifecycle?.({
+          error: messageText,
+          pendingPromptId,
+          threadId: safeThreadId,
+          type: "pending-prompt-error",
+          workspaceId: safeWorkspaceId,
+        });
+      }
+      throw error;
+    }
+  }, [
+    reloadTerminalWithProviderSession,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalIndex,
+    workingDirectory,
+    workspace?.id,
+    workspace?.name,
+  ]);
+
   const submitWorkspaceThreadMessage = useCallback(async ({ message, model, thread: targetThread, workspace: targetWorkspace }) => {
     const text = String(message || "").trim();
     const modelId = String(model || "").trim();
@@ -1913,28 +2313,29 @@ function WorkspaceTerminal({
       throw new Error("Write a message before sending.");
     }
 
+    const providerSessionId = String(
+      latestThread?.transcriptSessionId || providerBinding?.nativeSessionId || "",
+    ).trim();
+
     if (!binding?.paneId || !binding?.instanceId) {
-      const providerSessionId = String(
-        latestThread?.transcriptSessionId || providerBinding?.nativeSessionId || "",
-      ).trim();
       if (
         latestThread?.id
         && targetWorkspaceId
-        && providerSessionId
         && typeof onCreateWorkspaceThreadTerminal === "function"
       ) {
         logThreadBridgeDiagnostic("frontend.thread_submit.spawn_terminal", {
           agentId,
           currentTerminalThreadId: terminalThreadIdRef.current || "",
           latestThreadId: latestThread.id,
-          providerSessionPresent: true,
+          providerSessionPresent: Boolean(providerSessionId),
           sourceTerminalIndex: terminalIndex,
           targetTerminalIndex,
           targetWorkspaceId,
           textLength: text.length,
         });
-        await onCreateWorkspaceThreadTerminal({
+        const result = await onCreateWorkspaceThreadTerminal({
           agentId,
+          deliveryMode: "provider-api",
           message: text,
           model: modelId,
           providerSessionId,
@@ -1944,6 +2345,9 @@ function WorkspaceTerminal({
           threadId: latestThread.id,
           workspace: targetWorkspace || workspace,
         });
+        if (result?.promptDelivery && typeof result.promptDelivery.then === "function") {
+          await result.promptDelivery;
+        }
         return;
       }
 
@@ -1980,103 +2384,24 @@ function WorkspaceTerminal({
       terminalThreadActivityStatusRef.current = "thinking";
     }
 
-    const syncKey = getThreadComposerSyncKey(latestThread, binding);
-    let submitData = "";
     const messageId = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
-    const messageCreatedAt = new Date().toISOString();
-    const lifecycleEvent = {
+    await runWorkspaceThreadProviderTurn({
       agentId,
-      instanceId: binding.instanceId,
-      messageCreatedAt,
-      messageId,
+      binding,
+      message: text,
       model: modelId,
-      modelSource: modelId ? "composer" : "",
-      paneId: binding.paneId,
-      repoPath: targetWorkspace?.id === workspace?.id
-        ? workingDirectory || ""
-        : latestThread.coordination?.worktreePath || workingDirectory || "",
-      slotKey: latestThread.slotKey || String(Math.max(0, Number.parseInt(latestThread.terminalIndex, 10) || 0) + 1),
-      status: "active",
+      pendingPromptId: messageId,
+      providerSessionId,
+      repoPath: latestThread.coordination?.worktreePath || workingDirectory || "",
       terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
       threadId: latestThread.id,
-      type: "message-submitted",
-      userMessage: text,
-      workspaceId: targetWorkspaceId,
-      workspaceName: targetWorkspace?.name || workspace?.name || "",
-    };
-    onThreadTerminalLifecycle?.(lifecycleEvent);
-    logThreadBridgeDiagnostic("frontend.thread_submit.lifecycle_sent", {
-      agentId,
-      instanceId: binding.instanceId,
-      messageId,
-      paneId: binding.paneId,
-      sameAsTerminalThreadRef: latestThread.id === terminalThreadIdRef.current,
-      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-      threadId: latestThread.id,
-      userMessageLength: text.length,
+      workspace: targetWorkspace || workspace,
       workspaceId: targetWorkspaceId,
     });
-
-    try {
-      await threadComposerWriteChainRef.current.catch(() => {});
-      const syncedDraft = threadComposerDraftsRef.current.get(syncKey) || "";
-      const forceReplace = threadComposerDirtyKeysRef.current.has(syncKey);
-      const syncData = buildTerminalComposerDraftInput(syncedDraft, text, forceReplace);
-      submitData = `${syncData}${getTerminalSubmitSequence(agentId)}`;
-
-      logThreadBridgeDiagnostic("frontend.thread_submit.write_start", {
-        agentId,
-        forceReplace,
-        inputDebug: getTerminalInputDebugFields(submitData),
-        instanceId: binding.instanceId,
-        paneId: binding.paneId,
-        sameAsTerminalThreadRef: latestThread.id === terminalThreadIdRef.current,
-        syncedDraftLength: syncedDraft.length,
-        terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-        threadId: latestThread.id,
-        userMessageLength: text.length,
-        workspaceId: targetWorkspaceId,
-      });
-      if (syncData) {
-        setThreadComposerDraftValue(syncKey, text);
-      }
-      await queueWorkspaceThreadComposerWrite({
-        binding,
-        data: submitData,
-        promptEventText: text,
-        threadId: latestThread.id,
-      });
-      setThreadComposerDraftValue(syncKey, "");
-      threadComposerDirtyKeysRef.current.delete(syncKey);
-      logThreadBridgeDiagnostic("frontend.thread_submit.write_done", {
-        agentId,
-        instanceId: binding.instanceId,
-        paneId: binding.paneId,
-        sameAsTerminalThreadRef: latestThread.id === terminalThreadIdRef.current,
-        terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-        threadId: latestThread.id,
-        userMessageLength: text.length,
-        workspaceId: targetWorkspaceId,
-      });
-    } catch (error) {
-      threadComposerDirtyKeysRef.current.add(syncKey);
-      logThreadBridgeDiagnostic("frontend.thread_submit.write_error", {
-        agentId,
-        instanceId: binding.instanceId,
-        message: error?.message || String(error || ""),
-        paneId: binding.paneId,
-        sameAsTerminalThreadRef: latestThread.id === terminalThreadIdRef.current,
-        terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-        threadId: latestThread.id,
-        userMessageLength: text.length,
-        workspaceId: targetWorkspaceId,
-      });
-      throw error;
-    }
   }, [
     onThreadTerminalLifecycle,
     onCreateWorkspaceThreadTerminal,
-    queueWorkspaceThreadComposerWrite,
+    runWorkspaceThreadProviderTurn,
     setThreadComposerDraftValue,
     terminalAgentKind,
     workingDirectory,
@@ -2106,7 +2431,7 @@ function WorkspaceTerminal({
       throw new Error("Unable to create a workspace terminal for this chat.");
     }
 
-    return onCreateWorkspaceThreadTerminal({
+    const result = onCreateWorkspaceThreadTerminal({
       agentId: nextAgentId,
       message: text,
       model: requestedModel,
@@ -2114,6 +2439,10 @@ function WorkspaceTerminal({
       sourceTerminalIndex: terminalIndex,
       workspace: targetWorkspace || workspace,
     });
+    if (result?.promptDelivery && typeof result.promptDelivery.then === "function") {
+      await result.promptDelivery;
+    }
+    return result;
   }, [
     onCreateWorkspaceThreadTerminal,
     paneId,
@@ -2571,7 +2900,12 @@ function WorkspaceTerminal({
       forceFreshSessionOnNextOpenRef.current
       || Boolean(thread?.freshSessionStartedAt && !threadProviderSessionId)
     ) && !isGenericTerminal;
-    const startupThreadProviderSessionId = forceFreshSessionForThisStart ? "" : threadProviderSessionId;
+    const providerSessionOverrideForThisStart = forceFreshSessionForThisStart
+      ? ""
+      : String(providerSessionOverrideOnNextOpenRef.current || "").trim();
+    const startupThreadProviderSessionId = forceFreshSessionForThisStart
+      ? ""
+      : providerSessionOverrideForThisStart || threadProviderSessionId;
     const startupThreadProviderModel = forceFreshSessionForThisStart ? "" : threadProviderModel;
     const startupThreadId = terminalThreadIdRef.current;
     const startupSlotKey = forceFreshSessionForThisStart
@@ -2579,6 +2913,7 @@ function WorkspaceTerminal({
       : terminalThreadSlotKeyRef.current;
     preserveCoordinationOnNextOpenRef.current = false;
     forceFreshSessionOnNextOpenRef.current = false;
+    providerSessionOverrideOnNextOpenRef.current = "";
     if (forceFreshSessionForThisStart) {
       terminalThreadSlotKeyRef.current = startupSlotKey;
     }
@@ -2591,6 +2926,7 @@ function WorkspaceTerminal({
       isGenericTerminal,
       paneId,
       preserveCoordinationForThisStart,
+      providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
       startupSlotKey,
       startupThreadId: startupThreadId || "",
       startupThreadProviderModelPresent: Boolean(startupThreadProviderModel),
@@ -2641,6 +2977,8 @@ function WorkspaceTerminal({
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
     terminalInstanceIdRef.current = terminalInstanceId;
+    terminalFirstVisibleOutputAtRef.current = 0;
+    terminalRunningSinceRef.current = 0;
     const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
     const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
     if (terminalActiveRef.current) {
@@ -2653,6 +2991,11 @@ function WorkspaceTerminal({
       }
 
       runtimeTerminalState = state;
+      if (state === "running") {
+        terminalRunningSinceRef.current = terminalRunningSinceRef.current || performance.now();
+      } else if (state === "starting" || state === "blocked" || state === "closed" || state === "error") {
+        terminalRunningSinceRef.current = 0;
+      }
       setTerminalState(state);
       setTerminalStatus({
         detail,
@@ -6747,6 +7090,18 @@ function WorkspaceTerminal({
             ? outputByteStats.visibleChars
             : getTerminalOutputVisibleCharCount(terminalData, 1);
           const hasVisibleOutput = visibleChars > 0;
+          if (hasVisibleOutput && !terminalFirstVisibleOutputAtRef.current) {
+            terminalFirstVisibleOutputAtRef.current = performance.now();
+            logThreadBridgeDiagnostic("frontend.pending_prompt.terminal_visible_output_ready", {
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              visibleChars,
+              workspaceId: workspace?.id || "",
+            });
+          }
           if (
             hasVisibleOutput
             && !isGenericTerminal
@@ -7573,8 +7928,17 @@ function WorkspaceTerminal({
     const pendingPrompt = thread?.pendingPrompt;
     const promptId = String(pendingPrompt?.id || "").trim();
     const promptText = String(pendingPrompt?.text || "").trim();
+    const deliveryMode = String(pendingPrompt?.deliveryMode || "").trim().toLowerCase();
+    const useProviderDelivery = deliveryMode === "provider-api";
+    const useTerminalConfirmedDelivery = deliveryMode === "terminal-confirmed";
+    const effectiveDeliveryMode = useProviderDelivery
+      ? "provider-api"
+      : useTerminalConfirmedDelivery
+        ? "terminal-confirmed"
+        : "terminal";
     const threadId = terminalThreadIdRef.current || thread?.id || "";
     const instanceId = terminalInstanceIdRef.current || 0;
+    const hasSessionRestoreModel = Boolean(threadProviderSessionId && threadProviderModel);
 
     if (
       !promptId
@@ -7593,43 +7957,300 @@ function WorkspaceTerminal({
     if (submittedPendingPromptIdsRef.current.has(promptId)) {
       return;
     }
+    if (pendingPromptSendTimersRef.current.has(promptId)) {
+      return;
+    }
 
-    submittedPendingPromptIdsRef.current.add(promptId);
-    terminalThreadActivityStatusRef.current = "thinking";
+    const initialStartedAt = performance.now();
+    const maxWaitMs = 45_000;
+    const visibleOutputSettledMs = hasSessionRestoreModel ? 1400 : 900;
+    const runningFallbackMs = hasSessionRestoreModel ? 4200 : 2800;
 
-    invoke("terminal_write", {
-      data: buildTerminalSubmittedInput(promptText, terminalAgentKind, isGenericTerminal),
-      instanceId,
-      paneId,
-      promptEventText: promptText,
-      threadId,
-    })
-      .then(() => {
-        onThreadTerminalLifecycle?.({
-          pendingPromptId: promptId,
+    const getPromptReadyDelayMs = () => {
+      if (isGenericTerminal) {
+        return 0;
+      }
+
+      const now = performance.now();
+      const firstVisibleAt = terminalFirstVisibleOutputAtRef.current;
+      const runningSince = terminalRunningSinceRef.current;
+      if (firstVisibleAt > 0) {
+        return Math.max(0, visibleOutputSettledMs - (now - firstVisibleAt));
+      }
+
+      if (runningSince > 0) {
+        return Math.max(0, runningFallbackMs - (now - runningSince));
+      }
+
+      return 250;
+    };
+
+    const sendPendingPrompt = () => {
+      pendingPromptSendTimersRef.current.delete(promptId);
+      if (
+        submittedPendingPromptIdsRef.current.has(promptId)
+        || terminalClosingRef.current
+        || !xtermRef.current
+      ) {
+        return;
+      }
+
+      const elapsedMs = performance.now() - initialStartedAt;
+      const readyDelayMs = getPromptReadyDelayMs();
+      if (readyDelayMs > 0 && elapsedMs < maxWaitMs) {
+        const nextDelayMs = Math.min(Math.max(readyDelayMs, 120), 750);
+        logThreadBridgeDiagnostic("frontend.pending_prompt.wait_for_terminal_ready", {
+          agentId: terminalAgentKind,
+          elapsedMs: Math.round(elapsedMs),
+          firstVisibleOutputSeen: terminalFirstVisibleOutputAtRef.current > 0,
+          hasSessionRestoreModel,
+          instanceId: terminalInstanceIdRef.current || instanceId,
+          nextDelayMs,
+          paneId,
+          promptId,
+          runningSinceSeen: terminalRunningSinceRef.current > 0,
+          terminalIndex,
           threadId,
-          type: "pending-prompt-sent",
           workspaceId: workspace?.id || thread?.workspaceId || "",
         });
-      })
-      .catch((error) => {
-        submittedPendingPromptIdsRef.current.delete(promptId);
-        setTerminalError(getErrorMessage(error, "Unable to send initial chat message."));
+        const retryTimer = window.setTimeout(sendPendingPrompt, nextDelayMs);
+        pendingPromptSendTimersRef.current.set(promptId, retryTimer);
+        return;
+      }
+
+      const currentInstanceId = terminalInstanceIdRef.current || instanceId;
+      const currentThreadId = terminalThreadIdRef.current || threadId;
+      if (!currentInstanceId || !currentThreadId) {
+        if (elapsedMs >= maxWaitMs) {
+          const message = "Terminal did not become ready for the pending prompt.";
+          setTerminalError(message);
+          onThreadTerminalLifecycle?.({
+            error: message,
+            pendingPromptId: promptId,
+            threadId,
+            type: "pending-prompt-error",
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+          return;
+        }
+        const retryTimer = window.setTimeout(sendPendingPrompt, 250);
+        pendingPromptSendTimersRef.current.set(promptId, retryTimer);
+        return;
+      }
+
+      submittedPendingPromptIdsRef.current.add(promptId);
+      terminalThreadActivityStatusRef.current = "thinking";
+
+      logThreadBridgeDiagnostic("frontend.pending_prompt.write_start", {
+        agentId: terminalAgentKind,
+        deliveryMode: effectiveDeliveryMode,
+        elapsedMs: Math.round(elapsedMs),
+        firstVisibleOutputSeen: terminalFirstVisibleOutputAtRef.current > 0,
+        hasSessionRestoreModel,
+        instanceId: currentInstanceId,
+        paneId,
+        promptId,
+        terminalIndex,
+        threadId: currentThreadId,
+        workspaceId: workspace?.id || thread?.workspaceId || "",
       });
+
+      if (useProviderDelivery) {
+        runWorkspaceThreadProviderTurn({
+          agentId: terminalAgentKind,
+          binding: {
+            instanceId: currentInstanceId,
+            paneId,
+            terminalIndex,
+          },
+          message: promptText,
+          model: pendingPrompt?.model || threadProviderModel || "",
+          pendingPromptId: promptId,
+          providerSessionId: threadProviderSessionId || "",
+          repoPath: thread?.coordination?.worktreePath
+            || terminalLaunchInfo?.agentBranchRoot
+            || terminalLaunchInfo?.workingDirectory
+            || workingDirectory
+            || "",
+          syncTerminalAfterTurn: true,
+          terminalIndex,
+          threadId: currentThreadId,
+          workspace,
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        }).catch((error) => {
+          submittedPendingPromptIdsRef.current.delete(promptId);
+          setTerminalError(getErrorMessage(error, "Unable to send initial chat message."));
+        });
+        return;
+      }
+
+      const retryTerminalSubmit = () => {
+        const submitSequence = getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal);
+        if (!submitSequence) {
+          return;
+        }
+
+        window.setTimeout(() => {
+          const retryInstanceId = terminalInstanceIdRef.current || currentInstanceId;
+          if (
+            terminalClosingRef.current
+            || !retryInstanceId
+            || !paneId
+          ) {
+            return;
+          }
+
+          logThreadBridgeDiagnostic("frontend.pending_prompt.submit_retry_enter", {
+            agentId: terminalAgentKind,
+            deliveryMode: effectiveDeliveryMode,
+            instanceId: retryInstanceId,
+            paneId,
+            promptId,
+            terminalIndex,
+            threadId: currentThreadId,
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+
+          invoke("terminal_write", {
+            data: submitSequence,
+            instanceId: retryInstanceId,
+            paneId,
+            threadId: currentThreadId,
+          }).catch((error) => {
+            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_retry_failed", {
+              agentId: terminalAgentKind,
+              deliveryMode: effectiveDeliveryMode,
+              error: getErrorMessage(error, "Unable to retry terminal submit."),
+              instanceId: retryInstanceId,
+              paneId,
+              promptId,
+              terminalIndex,
+              threadId: currentThreadId,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
+            });
+          });
+        }, 260);
+      };
+
+      invoke("terminal_write", {
+        data: buildTerminalSubmittedInput(promptText, terminalAgentKind, isGenericTerminal),
+        instanceId: currentInstanceId,
+        paneId,
+        promptEventId: promptId,
+        promptEventText: promptText,
+        threadId: currentThreadId,
+      })
+        .then(() => {
+          if (useTerminalConfirmedDelivery) {
+            const startedAt = new Date().toISOString();
+            const userMessageId = promptId || createThreadProjectionToken("message-user");
+            const turnId = `turn-${userMessageId}`;
+            const workspaceId = workspace?.id || thread?.workspaceId || "";
+            const repoPath = thread?.coordination?.worktreePath
+              || terminalLaunchInfo?.agentBranchRoot
+              || terminalLaunchInfo?.workingDirectory
+              || workingDirectory
+              || "";
+            onThreadTerminalLifecycle?.({
+              activityStatus: "thinking",
+              agentId: terminalAgentKind,
+              instanceId: currentInstanceId,
+              paneId,
+              status: "active",
+              terminalIndex,
+              threadId: currentThreadId,
+              type: "agent-output",
+              workspaceId,
+            });
+            onThreadTerminalLifecycle?.({
+              agentId: terminalAgentKind,
+              clearPendingPrompt: false,
+              instanceId: currentInstanceId,
+              model: pendingPrompt?.model || threadProviderModel || "",
+              modelSource: pendingPrompt?.model || threadProviderModel ? "terminal-confirmed" : "",
+              nativeSessionId: threadProviderSessionId || "",
+              nativeSessionKind: threadProviderSessionId ? "session" : "",
+              nativeSessionSource: threadProviderSessionId ? "terminal-confirmed" : "",
+              paneId,
+              pendingPromptId: promptId,
+              projectionEvents: buildProviderTurnStartProjectionEvents({
+                agentId: terminalAgentKind,
+                source: "terminal-confirmed",
+                startedAt,
+                text: promptText,
+                turnId,
+                userMessageId,
+              }),
+              providerSessionId: threadProviderSessionId || "",
+              repoPath,
+              status: "active",
+              terminalIndex,
+              threadId: currentThreadId,
+              type: "provider-turn-started",
+              workspaceId,
+              workspaceName: workspace?.name || "",
+            });
+            retryTerminalSubmit();
+          }
+          onThreadTerminalLifecycle?.({
+            pendingPromptId: promptId,
+            threadId: currentThreadId,
+            type: "pending-prompt-sent",
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+        })
+        .catch((error) => {
+          submittedPendingPromptIdsRef.current.delete(promptId);
+          const message = getErrorMessage(error, "Unable to send initial chat message.");
+          setTerminalError(message);
+          onThreadTerminalLifecycle?.({
+            error: message,
+            pendingPromptId: promptId,
+            threadId: currentThreadId,
+            type: "pending-prompt-error",
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+        });
+    };
+
+    const timer = window.setTimeout(sendPendingPrompt, 120);
+    pendingPromptSendTimersRef.current.set(promptId, timer);
+    return () => {
+      const currentTimer = pendingPromptSendTimersRef.current.get(promptId);
+      if (currentTimer) {
+        pendingPromptSendTimersRef.current.delete(promptId);
+        window.clearTimeout(currentTimer);
+      }
+    };
   }, [
     isGenericTerminal,
     onThreadTerminalLifecycle,
     paneId,
+    runWorkspaceThreadProviderTurn,
+    terminalAgentKind,
     terminalClosed,
     terminalClosing,
+    terminalIndex,
+    terminalLaunchInfo?.agentBranchRoot,
+    terminalLaunchInfo?.workingDirectory,
     terminalState,
+    thread?.coordination?.worktreePath,
     thread?.id,
     thread?.pendingPrompt,
     thread?.workspaceId,
+    threadProviderModel,
+    threadProviderSessionId,
+    workingDirectory,
+    workspace,
     workspace?.id,
   ]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
+
+  useEffect(() => () => {
+    pendingPromptSendTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    pendingPromptSendTimersRef.current.clear();
+  }, []);
 
   const handleTerminalTodoDragEnter = useCallback((event) => {
     if (terminalClosed || terminalClosing) {
@@ -8184,7 +8805,6 @@ function WorkspaceTerminal({
               onActiveThreadChange={handleThreadsViewActiveThreadChange}
               onClose={toggleTerminalFullscreen}
               onCreateChat={createWorkspaceThreadChat}
-              onDraftInput={syncWorkspaceThreadComposerInput}
               onArchiveThread={onArchiveWorkspaceThread}
               onSelectModel={changeWorkspaceThreadModel}
               onSelectThread={onSelectWorkspaceThread}

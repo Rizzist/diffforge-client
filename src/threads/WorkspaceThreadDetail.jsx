@@ -1132,8 +1132,6 @@ function NewChatView({
     const previousAttachments = attachments;
     setSending(true);
     setError("");
-    setDraft("");
-    setAttachments([]);
     try {
       const imageBlock = await saveImageAttachments(previousAttachments);
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
@@ -1144,6 +1142,8 @@ function NewChatView({
         model: selectedModel,
         workspace,
       });
+      setDraft("");
+      setAttachments([]);
     } catch (submitError) {
       setDraft(previousDraft);
       setAttachments(previousAttachments);
@@ -1657,8 +1657,6 @@ function WorkspaceThreadDetail({
     const previousAttachments = attachments;
     setSending(true);
     setError("");
-    setDraft("");
-    setAttachments([]);
     try {
       const imageBlock = await saveImageAttachments(previousAttachments);
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
@@ -1669,6 +1667,8 @@ function WorkspaceThreadDetail({
         thread,
         workspace,
       });
+      setDraft("");
+      setAttachments([]);
     } catch (submitError) {
       setDraft(previousDraft);
       setAttachments(previousAttachments);

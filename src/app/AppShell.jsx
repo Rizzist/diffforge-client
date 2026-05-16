@@ -26,6 +26,7 @@ import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilitySt
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
   archiveWorkspaceThread,
+  appendWorkspaceThreadProjectionEvents,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
   createWorkspaceThreadId,
@@ -449,6 +450,7 @@ const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
 const WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS = 700;
 const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 120000;
+const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 
 function getThreadDiagnosticTextLength(value) {
   return String(value ?? "").length;
@@ -2064,6 +2066,7 @@ export default function App() {
   const workspaceSettingsRef = useRef(workspaceSettings);
   const workspaceThreadsRef = useRef(workspaceThreads);
   const workspaceThreadTranscriptRequestsRef = useRef(new Map());
+  const workspacePendingPromptDeliveriesRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
@@ -3766,6 +3769,91 @@ export default function App() {
     workspaceTerminalRoleOptions,
   ]);
 
+  const rejectWorkspacePromptDeliveriesForThread = useCallback((workspaceId, threadId, message = "") => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    const safeThreadId = String(threadId || "").trim();
+    if (!safeWorkspaceId || !safeThreadId) {
+      return;
+    }
+
+    workspacePendingPromptDeliveriesRef.current.forEach((entry, promptId) => {
+      if (entry.workspaceId !== safeWorkspaceId || entry.threadId !== safeThreadId) {
+        return;
+      }
+
+      window.clearTimeout(entry.timeoutId);
+      workspacePendingPromptDeliveriesRef.current.delete(promptId);
+      entry.reject(new Error(message || "Terminal closed before sending the pending prompt."));
+    });
+  }, []);
+
+  const settleWorkspacePromptDelivery = useCallback((promptId, errorMessage = "") => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return;
+    }
+
+    const entry = workspacePendingPromptDeliveriesRef.current.get(safePromptId);
+    if (!entry) {
+      return;
+    }
+
+    window.clearTimeout(entry.timeoutId);
+    workspacePendingPromptDeliveriesRef.current.delete(safePromptId);
+    if (errorMessage) {
+      entry.reject(new Error(errorMessage));
+      return;
+    }
+
+    entry.resolve({
+      pendingPromptId: safePromptId,
+      threadId: entry.threadId,
+      workspaceId: entry.workspaceId,
+    });
+  }, []);
+
+  const createWorkspacePromptDelivery = useCallback((pendingPromptId, meta = {}) => {
+    const safePromptId = String(pendingPromptId || "").trim();
+    if (!safePromptId) {
+      return Promise.resolve(null);
+    }
+
+    const existing = workspacePendingPromptDeliveriesRef.current.get(safePromptId);
+    if (existing?.promise) {
+      return existing.promise;
+    }
+
+    let resolveDelivery = null;
+    let rejectDelivery = null;
+    const promise = new Promise((resolve, reject) => {
+      resolveDelivery = resolve;
+      rejectDelivery = reject;
+    });
+    const timeoutId = window.setTimeout(() => {
+      workspacePendingPromptDeliveriesRef.current.delete(safePromptId);
+      rejectDelivery?.(new Error("Timed out waiting for the terminal to send the pending prompt."));
+    }, WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS);
+
+    promise.catch(() => {});
+    workspacePendingPromptDeliveriesRef.current.set(safePromptId, {
+      promise,
+      reject: rejectDelivery,
+      resolve: resolveDelivery,
+      threadId: String(meta.threadId || "").trim(),
+      timeoutId,
+      workspaceId: String(meta.workspaceId || "").trim(),
+    });
+    return promise;
+  }, []);
+
+  useEffect(() => () => {
+    workspacePendingPromptDeliveriesRef.current.forEach((entry) => {
+      window.clearTimeout(entry.timeoutId);
+      entry.reject(new Error("Application closed before sending the pending prompt."));
+    });
+    workspacePendingPromptDeliveriesRef.current.clear();
+  }, []);
+
   const createWorkspaceThreadTerminal = useCallback((request = {}) => {
     const text = String(request.message || "").trim();
     const requestedWorkspaceId = String(
@@ -3876,6 +3964,10 @@ export default function App() {
     ).trim();
     const pendingPromptId = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
     const messageCreatedAt = new Date().toISOString();
+    const promptDelivery = createWorkspacePromptDelivery(pendingPromptId, {
+      threadId,
+      workspaceId,
+    });
 
     workspaceSettingsRef.current = nextSettings;
     workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
@@ -3892,11 +3984,11 @@ export default function App() {
 
     setWorkspaceThreads((threads) => materializeWorkspaceThreadForTerminal(threads, {
       agentId,
-      messageId: pendingPromptId,
       messageCreatedAt,
       model,
       modelSource: model ? "new-chat" : "",
       nativeSessionId: providerSessionId,
+      pendingPromptDeliveryMode: "terminal-confirmed",
       pendingPromptId,
       pendingPromptText: text,
       providerSessionId,
@@ -3906,20 +3998,24 @@ export default function App() {
       terminalIndex: nextTerminalIndex,
       threadId,
       title: existingThread ? existingThread.title || existingThread.sessionName || "" : text,
-      type: "message-submitted",
-      userMessage: text,
+      type: "thread-starting",
       workspaceId,
       workspaceName: workspace?.name || "",
     }));
 
     return {
+      pendingPromptId,
+      promptDelivery,
+      providerSessionId,
       terminalIndex: nextTerminalIndex,
       threadId,
+      workingDirectory: getWorkspaceRootDirectory(currentSettings, workspaceId) || defaultWorkingDirectory || "",
       workspace,
       workspaceId,
     };
   }, [
     activatedWorkspace,
+    createWorkspacePromptDelivery,
     defaultWorkingDirectory,
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
@@ -5661,7 +5757,7 @@ export default function App() {
       lifecycleEvent = {
         ...event,
         messageCreatedAt: event.messageCreatedAt || new Date().toISOString(),
-        messageId: `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+        messageId: event.messageId || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
         threadId: event.threadId
           || existingThread?.id
           || createWorkspaceThreadId(event.workspaceId, event.terminalIndex),
@@ -5702,6 +5798,26 @@ export default function App() {
         lifecycleAgentId,
       ),
     });
+
+    if (lifecycleEvent.type === "pending-prompt-sent" || lifecycleEvent.type === "provider-turn-completed") {
+      settleWorkspacePromptDelivery(lifecycleEvent.pendingPromptId || lifecycleEvent.promptId);
+    } else if (lifecycleEvent.type === "pending-prompt-error") {
+      settleWorkspacePromptDelivery(
+        lifecycleEvent.pendingPromptId || lifecycleEvent.promptId,
+        lifecycleEvent.error || "Unable to send pending prompt.",
+      );
+    } else if (lifecycleEvent.type === "provider-turn-error") {
+      settleWorkspacePromptDelivery(
+        lifecycleEvent.pendingPromptId || lifecycleEvent.promptId,
+        lifecycleEvent.error || "Unable to send pending prompt.",
+      );
+    } else if (["closed", "exited", "error"].includes(lifecycleEvent.type)) {
+      rejectWorkspacePromptDeliveriesForThread(
+        lifecycleWorkspaceId,
+        lifecycleThreadId,
+        lifecycleEvent.error || "Terminal closed before sending the pending prompt.",
+      );
+    }
 
     if (
       lifecycleThreadId
@@ -5753,6 +5869,17 @@ export default function App() {
       } else if (lifecycleEvent.type === "pending-prompt-sent") {
         operation = "pending_prompt_sent";
         nextThreads = clearWorkspaceThreadPendingPrompt(threads, lifecycleEvent);
+      } else if (lifecycleEvent.type === "pending-prompt-error") {
+        operation = "pending_prompt_error";
+        nextThreads = threads;
+      } else if (lifecycleEvent.type === "provider-turn-started") {
+        operation = "provider_turn_started";
+        nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+      } else if (lifecycleEvent.type === "provider-turn-completed" || lifecycleEvent.type === "provider-turn-error") {
+        operation = lifecycleEvent.type === "provider-turn-error"
+          ? "provider_turn_error"
+          : "provider_turn_completed";
+        nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "agent-output") {
         operation = "mark_agent_activity";
         nextThreads = markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
@@ -5828,7 +5955,11 @@ export default function App() {
         pollUntilTurnComplete: lifecycleEvent.type === "message-submitted",
       });
     }
-  }, [requestWorkspaceThreadTranscript]);
+  }, [
+    rejectWorkspacePromptDeliveriesForThread,
+    requestWorkspaceThreadTranscript,
+    settleWorkspacePromptDelivery,
+  ]);
 
   useEffect(() => {
     let unlistenPromptSubmitted = null;
@@ -5859,19 +5990,20 @@ export default function App() {
         threadId: payload.threadId || "",
         workspaceId,
       });
-      handleThreadTerminalLifecycle({
+      requestWorkspaceThreadTranscript({
         agentId: payload.agentId || payload.agentKind || "",
+        delayMs: 700,
+        expectedMessageCreatedAt: new Date().toISOString(),
+        expectedUserMessage: userMessage,
         instanceId: payload.instanceId,
         paneId: payload.paneId || "",
-        repoPath: workspaceSettingsRef.current?.[workspaceId]?.rootDirectory || defaultWorkingDirectory || "",
+        pollStartedAt: Date.now(),
+        pollUntilTurnComplete: true,
         source: "terminal-prompt-submitted",
-        status: "active",
         terminalIndex: payload.terminalIndex,
         threadId: payload.threadId || "",
-        type: "message-submitted",
         userMessage,
         workspaceId,
-        workspaceName: payload.workspaceName || "",
       });
     }).then((unlisten) => {
       if (cancelled) {
@@ -5888,7 +6020,7 @@ export default function App() {
         unlistenPromptSubmitted();
       }
     };
-  }, [defaultWorkingDirectory, handleThreadTerminalLifecycle]);
+  }, [requestWorkspaceThreadTranscript]);
 
   useEffect(() => {
     Object.entries(workspaceThreads || {}).forEach(([workspaceId, entry]) => {

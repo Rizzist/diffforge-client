@@ -164,8 +164,14 @@ function normalizePendingPrompt(value) {
     return null;
   }
 
+  const rawDeliveryMode = cleanText(value.deliveryMode || value.mode).toLowerCase();
+  const deliveryMode = rawDeliveryMode === "provider-api" || rawDeliveryMode === "terminal-confirmed"
+    ? rawDeliveryMode
+    : "terminal";
+
   return {
     createdAt: cleanText(value.createdAt, nowIso()),
+    deliveryMode,
     id: cleanText(value.id, createRandomId("pending-prompt")),
     model: cleanModelId(value.model),
     text,
@@ -2327,6 +2333,7 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   );
   const pendingPrompt = normalizePendingPrompt(event.pendingPrompt || {
     createdAt: event.messageCreatedAt,
+    deliveryMode: event.pendingPromptDeliveryMode || event.deliveryMode,
     id: event.pendingPromptId,
     message: event.pendingPromptText,
     model: event.model,
@@ -2342,11 +2349,14 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     event.transcriptHydrationMode,
     event.freshSession ? "session-only" : previousThread?.transcriptHydrationMode || "",
   );
+  const shouldBindTerminal = event.bindTerminal !== false;
 
-  upsertActiveTerminal(entry, event, {
-    status: event.status || "active",
-    threadId,
-  });
+  if (shouldBindTerminal) {
+    upsertActiveTerminal(entry, event, {
+      status: event.status || "active",
+      threadId,
+    });
+  }
 
   if (!entry.threads[threadId]) {
     entry.threads[threadId] = {
@@ -2388,10 +2398,14 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     entry.threadOrder.push(threadId);
   }
 
-  bindExistingThreadToTerminal(entry, threadId, event, {
-    incrementMessageCount: hasSubmittedPrompt,
-    status: event.status || "active",
-  });
+  if (shouldBindTerminal) {
+    bindExistingThreadToTerminal(entry, threadId, event, {
+      incrementMessageCount: hasSubmittedPrompt,
+      status: event.status || "active",
+    });
+  } else {
+    entry.activeThreadId = threadId;
+  }
   if (entry.threads[threadId]) {
     const submittedEvents = createSubmittedUserProjectionEvents(entry.threads[threadId], event);
     const projectionEvents = appendThreadProjectionEvents(
@@ -3085,6 +3099,96 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
           transcriptSessionId: sessionId || existing.transcriptSessionId,
           transcriptSourcePath: cleanText(event.sourcePath || event.rolloutPath),
           transcriptStatus: "ready",
+          updatedAt: now,
+        },
+      },
+    },
+  };
+}
+
+export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const threadId = cleanText(event.threadId);
+  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
+    return state || {};
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[workspaceId];
+  const existing = entry?.threads?.[threadId];
+  if (!existing) {
+    return state || {};
+  }
+
+  const now = nowIso();
+  const projectionEvents = appendThreadProjectionEvents(
+    ensureThreadProjectionEvents(existing),
+    event.projectionEvents || event.events || [],
+  );
+  const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
+  const latestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
+  const activityStatus = latestTurnState === "running"
+    ? "thinking"
+    : ["completed", "error", "interrupted"].includes(latestTurnState)
+      ? "idle"
+      : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
+  const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
+  const providerBindings = normalizeProviderBindings(
+    existing.providerBindings,
+    existing.currentAgent,
+    {
+      activityStatus,
+      coordination: existing.coordination,
+      lastActiveAt: now,
+      lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : existing.lastMessageAt,
+      messageCount: messages.length,
+      status: existing.status,
+      terminalBinding: existing.terminalBinding,
+      updatedAt: now,
+    },
+  );
+  if (providerBindings[agentId]) {
+    providerBindings[agentId] = {
+      ...providerBindings[agentId],
+      activityStatus,
+      lastActiveAt: now,
+      lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : providerBindings[agentId].lastMessageAt,
+      messageCount: messages.length,
+      modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
+      modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "provider-turn") : providerBindings[agentId].modelSource,
+      modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBindings[agentId].modelUpdatedAt,
+      nativeSessionId: cleanText(event.nativeSessionId || event.providerSessionId, providerBindings[agentId].nativeSessionId),
+      nativeSessionKind: cleanText(event.nativeSessionKind, providerBindings[agentId].nativeSessionKind || "session"),
+      nativeSessionSource: cleanText(event.nativeSessionSource, providerBindings[agentId].nativeSessionSource || "provider-turn"),
+      nativeSessionUpdatedAt: cleanText(event.nativeSessionId || event.providerSessionId) ? now : providerBindings[agentId].nativeSessionUpdatedAt,
+      status: cleanText(event.status, existing.status || providerBindings[agentId].status || "active"),
+      updatedAt: now,
+    };
+  }
+
+  return {
+    ...currentState,
+    [workspaceId]: {
+      ...entry,
+      activeThreadId: threadId,
+      threads: {
+        ...entry.threads,
+        [threadId]: {
+          ...existing,
+          activityStatus,
+          lastActiveAt: now,
+          lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : existing.lastMessageAt,
+          latestTurn,
+          materialized: true,
+          messageCount: messages.length,
+          messages,
+          pendingPrompt: shouldClearPendingPrompt ? null : existing.pendingPrompt,
+          projectionEvents,
+          providerBindings,
+          status: cleanText(event.status, existing.status || "active"),
+          transcriptSessionId: cleanText(event.providerSessionId || event.nativeSessionId, existing.transcriptSessionId),
           updatedAt: now,
         },
       },

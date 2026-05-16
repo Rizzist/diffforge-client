@@ -2121,6 +2121,332 @@ fn save_todo_text_attachment_for(
     })
 }
 
+fn temporary_agent_output_path(prefix: &str) -> Result<PathBuf, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("Unable to prepare agent output file: {error}"))?
+        .as_millis();
+    let directory = env::temp_dir().join("diffforge-agent-turn-output");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Unable to prepare agent output directory: {error}"))?;
+    Ok(directory.join(format!(
+        "{}-{}-{timestamp}.txt",
+        std::process::id(),
+        prefix
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .take(24)
+            .collect::<String>()
+    )))
+}
+
+fn json_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_session_id_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let normalized_key = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if matches!(normalized_key.as_str(), "sessionid" | "sessionuuid") {
+                    if let Some(session_id) = json_string(Some(child)) {
+                        return Some(clean_codex_id(session_id));
+                    }
+                }
+                if normalized_key == "session" {
+                    if let Some(session_object) = child.as_object() {
+                        if let Some(session_id) = json_string(session_object.get("id")) {
+                            return Some(clean_codex_id(session_id));
+                        }
+                    }
+                }
+            }
+
+            object
+                .values()
+                .find_map(extract_session_id_from_json)
+        }
+        Value::Array(items) => items.iter().find_map(extract_session_id_from_json),
+        _ => None,
+    }
+}
+
+fn json_content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(json_content_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => {
+            if let Some(text) = json_string(object.get("text")) {
+                return text;
+            }
+            if let Some(text) = json_string(object.get("content")) {
+                return text;
+            }
+            if let Some(content) = object.get("content") {
+                return json_content_text(content);
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn collect_agent_turn_texts(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            let event_type = json_string(object.get("type")).unwrap_or_default().to_ascii_lowercase();
+            let role = json_string(object.get("role")).unwrap_or_default().to_ascii_lowercase();
+
+            if event_type == "result" {
+                if let Some(result) = json_string(object.get("result")) {
+                    texts.push(result);
+                }
+            }
+
+            if role == "assistant" || event_type.contains("assistant") || event_type.contains("message") {
+                for key in ["message", "content", "text", "delta", "output"] {
+                    if let Some(child) = object.get(key) {
+                        let text = json_content_text(child);
+                        if !text.is_empty() {
+                            texts.push(text);
+                        }
+                    }
+                }
+            }
+
+            object
+                .values()
+                .for_each(|child| collect_agent_turn_texts(child, texts));
+        }
+        Value::Array(items) => {
+            items.iter().for_each(|child| collect_agent_turn_texts(child, texts));
+        }
+        _ => {}
+    }
+}
+
+fn extract_agent_turn_metadata(stdout: &str, stderr: &str) -> (String, String) {
+    let mut session_id = String::new();
+    let mut texts = Vec::new();
+    let combined = command_output_text(stdout, stderr);
+    let combined_trimmed = combined.trim();
+    if (combined_trimmed.starts_with('{') || combined_trimmed.starts_with('['))
+        && serde_json::from_str::<Value>(combined_trimmed)
+            .map(|value| {
+                session_id = extract_session_id_from_json(&value).unwrap_or_default();
+                collect_agent_turn_texts(&value, &mut texts);
+            })
+            .is_ok()
+    {
+        let output = texts
+            .into_iter()
+            .map(|text| clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT))
+            .filter(|text| !text.is_empty())
+            .last()
+            .unwrap_or_default();
+        return (session_id, output);
+    }
+
+    for line in stdout.lines().chain(stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if session_id.is_empty() {
+            session_id = extract_session_id_from_json(&value).unwrap_or_default();
+        }
+        collect_agent_turn_texts(&value, &mut texts);
+    }
+
+    let output = texts
+        .into_iter()
+        .map(|text| clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT))
+        .filter(|text| !text.is_empty())
+        .last()
+        .unwrap_or_default();
+
+    (session_id, output)
+}
+
+fn build_codex_turn_args(
+    model: Option<&str>,
+    provider_session_id: &str,
+    output_path: &Path,
+) -> Vec<String> {
+    let mut args = vec!["exec".to_string()];
+    if !provider_session_id.is_empty() {
+        args.push("resume".to_string());
+    }
+
+    args.push("--skip-git-repo-check".to_string());
+    args.push("--output-last-message".to_string());
+    args.push(output_path.to_string_lossy().to_string());
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if !provider_session_id.is_empty() {
+        args.push(provider_session_id.to_string());
+    }
+    args.push("-".to_string());
+    args
+}
+
+fn build_claude_turn_args(model: Option<&str>, provider_session_id: &str, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if !provider_session_id.is_empty() {
+        args.push("--resume".to_string());
+        args.push(provider_session_id.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
+fn build_opencode_turn_args(model: Option<&str>, provider_session_id: &str, prompt: &str, cwd: &Path) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--dir".to_string(),
+        cwd.to_string_lossy().to_string(),
+    ];
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if !provider_session_id.is_empty() {
+        args.push("--session".to_string());
+        args.push(provider_session_id.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
+fn run_agent_thread_turn_for(request: AgentThreadTurnRequest) -> Result<AgentThreadTurnResult, String> {
+    let provider = parse_agent_provider(&request.agent_id)?;
+    let definition = agent_definition(provider);
+    let prompt = request.prompt.trim();
+    let model = normalize_forge_model(request.model)?;
+    let requested_provider_session_id = clean_codex_id(request.provider_session_id.unwrap_or_default());
+
+    if prompt.is_empty() {
+        return Err("Write a message before sending.".to_string());
+    }
+
+    if prompt.len() > MAX_FORGE_PROMPT_LENGTH {
+        return Err("Message is too long for a local agent turn.".to_string());
+    }
+
+    let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
+    let mut output_path = None;
+    let (args, stdin_text) = match provider {
+        AgentProvider::Codex => {
+            let path = temporary_agent_output_path("codex")?;
+            let args = build_codex_turn_args(
+                model.as_deref(),
+                &requested_provider_session_id,
+                &path,
+            );
+            output_path = Some(path);
+            (args, Some(prompt))
+        }
+        AgentProvider::Claude => (
+            build_claude_turn_args(model.as_deref(), &requested_provider_session_id, prompt),
+            None,
+        ),
+        AgentProvider::OpenCode => (
+            build_opencode_turn_args(
+                model.as_deref(),
+                &requested_provider_session_id,
+                prompt,
+                &working_directory,
+            ),
+            None,
+        ),
+    };
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let capture = run_agent_command_capture(
+        definition,
+        &arg_refs,
+        stdin_text,
+        Duration::from_secs(AGENT_THREAD_TURN_TIMEOUT_SECS),
+        Some(&working_directory),
+    );
+    let output_from_file = output_path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some(path) = &output_path {
+        let _ = fs::remove_file(path);
+    }
+
+    let capture = capture?;
+    let stderr = capture.stderr.trim().to_string();
+    let stdout = capture.stdout.trim().to_string();
+    if capture.exit_code != Some(0) {
+        let message = first_output_line(&command_output_text(&stdout, &stderr));
+        return Err(if message.is_empty() {
+            format!("{} returned a non-zero exit status.", definition.label)
+        } else {
+            message
+        });
+    }
+
+    let (parsed_session_id, parsed_output) = extract_agent_turn_metadata(&stdout, &stderr);
+    let output = if !output_from_file.is_empty() {
+        output_from_file
+    } else if !parsed_output.is_empty() {
+        parsed_output
+    } else {
+        clean_codex_transcript_text(command_output_text(&stdout, &stderr), CODEX_TRANSCRIPT_MAX_TEXT)
+    };
+
+    Ok(AgentThreadTurnResult {
+        agent_id: definition.id.to_string(),
+        label: definition.label.to_string(),
+        model: model.unwrap_or_default(),
+        output: if output.trim().is_empty() {
+            "(No output returned.)".to_string()
+        } else {
+            output
+        },
+        provider_session_id: if parsed_session_id.is_empty() {
+            requested_provider_session_id.clone()
+        } else {
+            parsed_session_id
+        },
+        requested_provider_session_id,
+        stderr,
+        working_directory: workspace_path_display(&working_directory),
+    })
+}
+
 #[tauri::command]
 async fn save_todo_image_attachments(
     images: Vec<ForgePromptImage>,

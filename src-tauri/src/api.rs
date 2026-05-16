@@ -418,3 +418,12 @@ async fn run_forge_prompt(request: ForgePromptRequest) -> Result<ForgeRunResult,
         .await
         .map_err(|error| format!("Unable to run Forge Console prompt: {error}"))?
 }
+
+#[tauri::command]
+async fn agent_thread_turn_start(
+    request: AgentThreadTurnRequest,
+) -> Result<AgentThreadTurnResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_agent_thread_turn_for(request))
+        .await
+        .map_err(|error| format!("Unable to send agent turn: {error}"))?
+}
