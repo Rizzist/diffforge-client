@@ -303,6 +303,43 @@ fn command_title(command: &str, fallback: &str) -> String {
     format!("Ran {}", clean_codex_title(first_line, fallback))
 }
 
+fn transcript_task_complete_message(
+    id: String,
+    source: &str,
+    timestamp: &str,
+    text: impl AsRef<str>,
+) -> CodexThreadTranscriptMessage {
+    let text = clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT);
+    CodexThreadTranscriptMessage {
+        id,
+        role: "assistant".to_string(),
+        kind: "task_complete".to_string(),
+        text,
+        title: "Task complete".to_string(),
+        call_id: String::new(),
+        created_at: timestamp.to_string(),
+        source: source.to_string(),
+    }
+}
+
+fn transcript_error_message(
+    id: String,
+    source: &str,
+    timestamp: &str,
+    text: impl AsRef<str>,
+) -> CodexThreadTranscriptMessage {
+    CodexThreadTranscriptMessage {
+        id,
+        role: "activity".to_string(),
+        kind: "error".to_string(),
+        text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+        title: "Error".to_string(),
+        call_id: String::new(),
+        created_at: timestamp.to_string(),
+        source: source.to_string(),
+    }
+}
+
 fn codex_function_call_message(
     line_index: usize,
     timestamp: &str,
@@ -498,7 +535,12 @@ fn push_codex_message(
         return;
     }
 
-    let key = if !message.call_id.is_empty() {
+    let key = if message.role == "user"
+        || message.kind == "task_complete"
+        || (message.role == "activity" && message.call_id.is_empty())
+    {
+        format!("id:{}", message.id)
+    } else if !message.call_id.is_empty() {
         format!(
             "{}:{}:{}:{}",
             message.role,
@@ -568,12 +610,19 @@ fn codex_messages_from_event(
         "task_complete" => vec![CodexThreadTranscriptMessage {
             id: format!("codex-{line_index}-task-complete"),
             role: "assistant".to_string(),
-            kind: "message".to_string(),
-            text: clean_codex_transcript_text(
-                value_string(payload.get("last_agent_message")),
-                CODEX_TRANSCRIPT_MAX_TEXT,
-            ),
-            title: String::new(),
+            kind: "task_complete".to_string(),
+            text: {
+                let text = clean_codex_transcript_text(
+                    value_string(payload.get("last_agent_message")),
+                    CODEX_TRANSCRIPT_MAX_TEXT,
+                );
+                if text.trim().is_empty() {
+                    "Task complete".to_string()
+                } else {
+                    text
+                }
+            },
+            title: "Task complete".to_string(),
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
@@ -898,10 +947,13 @@ fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
         if !next_cwd.is_empty() {
             cwd = next_cwd;
         }
-        if value.get("type").and_then(Value::as_str) == Some("ai-title") {
+        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        if entry_type == "ai-title" {
             title = clean_codex_title(value_string(value.get("aiTitle")), "");
+        } else if entry_type == "summary" {
+            title = clean_codex_title(value_string(value.get("summary")), "");
         }
-        if !session_id.is_empty() && !cwd.is_empty() {
+        if !session_id.is_empty() && !cwd.is_empty() && !title.is_empty() {
             break;
         }
     }
@@ -1022,6 +1074,28 @@ fn claude_content_text(value: &Value) -> String {
     }
 }
 
+fn claude_tool_title(name: &str, input: &Value) -> String {
+    let fallback = if name.trim().is_empty() {
+        "Called tool".to_string()
+    } else {
+        format!("Called {name}")
+    };
+    let normalized_name = name.trim().to_lowercase();
+    if normalized_name == "bash" || normalized_name == "shell" {
+        let command = value_string(input.get("command"));
+        if !command.trim().is_empty() {
+            return command_title(&command, &fallback);
+        }
+    }
+
+    fallback
+}
+
+fn claude_stop_reason_completes_turn(stop_reason: &str) -> bool {
+    let stop_reason = stop_reason.trim();
+    !stop_reason.is_empty() && stop_reason != "tool_use" && stop_reason != "max_tokens"
+}
+
 fn claude_activity_from_block(
     line_index: usize,
     block_index: usize,
@@ -1033,6 +1107,7 @@ fn claude_activity_from_block(
         "tool_use" => {
             let name = value_string(block.get("name"));
             let call_id = value_string(block.get("id"));
+            let input_value = block.get("input").unwrap_or(&Value::Null);
             let input = block
                 .get("input")
                 .map(pretty_json)
@@ -1042,11 +1117,7 @@ fn claude_activity_from_block(
                 role: "activity".to_string(),
                 kind: "tool_call".to_string(),
                 text: clean_codex_transcript_text(input, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: if name.is_empty() {
-                    "Tool call".to_string()
-                } else {
-                    format!("Called {name}")
-                },
+                title: clean_codex_title(claude_tool_title(&name, input_value), "Called tool"),
                 call_id,
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
@@ -1135,6 +1206,47 @@ fn parse_claude_session(
             meta.title = clean_codex_title(value_string(value.get("aiTitle")), "");
             continue;
         }
+        if entry_type == "summary" {
+            meta.title = clean_codex_title(value_string(value.get("summary")), "");
+            continue;
+        }
+        if entry_type == "result" {
+            let is_error = value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+                || value_string(value.get("subtype")).to_lowercase().contains("error");
+            let result_text = first_value_string(&[
+                value.get("result"),
+                value.get("message"),
+                value.get("error"),
+            ]);
+            if is_error {
+                push_codex_message(
+                    &mut messages,
+                    &mut seen,
+                    Some(transcript_error_message(
+                        format!("claude-{line_index}-result-error"),
+                        "claude",
+                        &timestamp,
+                        if result_text.trim().is_empty() {
+                            "Claude Code turn failed"
+                        } else {
+                            result_text.as_str()
+                        },
+                    )),
+                );
+            } else {
+                push_codex_message(
+                    &mut messages,
+                    &mut seen,
+                    Some(transcript_task_complete_message(
+                        format!("claude-{line_index}-task-complete"),
+                        "claude",
+                        &timestamp,
+                        result_text,
+                    )),
+                );
+            }
+            continue;
+        }
         let Some(message) = value.get("message") else {
             continue;
         };
@@ -1158,7 +1270,7 @@ fn parse_claude_session(
                         id: format!("claude-{line_index}-{role}"),
                         role: role.to_string(),
                         kind: "message".to_string(),
-                        text,
+                        text: text.clone(),
                         title: String::new(),
                         call_id: String::new(),
                         created_at: timestamp.clone(),
@@ -1175,6 +1287,23 @@ fn parse_claude_session(
                         claude_activity_from_block(line_index, block_index, &timestamp, block),
                     );
                 }
+            }
+
+            if role == "assistant"
+                && claude_stop_reason_completes_turn(
+                    &value_string(message.get("stop_reason").or_else(|| value.get("stop_reason"))),
+                )
+            {
+                push_codex_message(
+                    &mut messages,
+                    &mut seen,
+                    Some(transcript_task_complete_message(
+                        format!("claude-{line_index}-task-complete"),
+                        "claude",
+                        &timestamp,
+                        text,
+                    )),
+                );
             }
         }
     }
@@ -1232,52 +1361,92 @@ fn opencode_json_text(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
+fn opencode_tool_title(tool: &str, input_value: &Value) -> String {
+    let fallback = if tool.trim().is_empty() {
+        "Called tool".to_string()
+    } else {
+        format!("Called {tool}")
+    };
+    let normalized_tool = tool.trim().to_lowercase();
+    if normalized_tool == "bash" || normalized_tool == "shell" {
+        let command = value_string(input_value.get("command"))
+            .trim()
+            .to_string();
+        if !command.is_empty() {
+            return command_title(&command, &fallback);
+        }
+    }
+
+    fallback
+}
+
+fn opencode_part_created_at(timestamp: &str, data: &Value, end_time: bool) -> String {
+    let time = data.get("time").unwrap_or(&Value::Null);
+    let state_time = data
+        .get("state")
+        .and_then(|state| state.get("time"))
+        .unwrap_or(&Value::Null);
+    let key = if end_time { "end" } else { "start" };
+    let raw = time
+        .get(key)
+        .or_else(|| state_time.get(key))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let stamped = opencode_timestamp(raw);
+    if stamped.is_empty() {
+        timestamp.to_string()
+    } else {
+        stamped
+    }
+}
+
 fn opencode_part_message(
     message_id: &str,
     role: &str,
     part_id: &str,
     timestamp: &str,
     data: &Value,
-) -> Option<CodexThreadTranscriptMessage> {
+) -> Vec<CodexThreadTranscriptMessage> {
     let part_type = data.get("type").and_then(Value::as_str).unwrap_or_default();
     let message_role = if role == "assistant" { "assistant" } else { "user" };
     match part_type {
         "text" => {
             let text = first_value_string(&[data.get("text"), data.get("content")]);
             if text.trim().is_empty() {
-                return None;
+                return Vec::new();
             }
-            Some(CodexThreadTranscriptMessage {
+            vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-text"),
                 role: message_role.to_string(),
                 kind: "message".to_string(),
                 text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT),
                 title: String::new(),
                 call_id: String::new(),
-                created_at: timestamp.to_string(),
+                created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            })
+            }]
         }
         "reasoning" => {
             let text = first_value_string(&[data.get("text"), data.get("content")]);
             if text.trim().is_empty() {
-                return None;
+                return Vec::new();
             }
-            Some(CodexThreadTranscriptMessage {
+            vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-reasoning"),
                 role: "activity".to_string(),
                 kind: "reasoning".to_string(),
                 text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
                 title: "Reasoning".to_string(),
                 call_id: String::new(),
-                created_at: timestamp.to_string(),
+                created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            })
+            }]
         }
         "tool" => {
             let tool = first_value_string(&[data.get("tool"), data.get("name"), data.get("title")]);
             let call_id = first_value_string(&[data.get("callID"), data.get("callId"), data.get("id")]);
             let state = data.get("state").unwrap_or(&Value::Null);
+            let input_value = data.get("input").or_else(|| state.get("input")).unwrap_or(&Value::Null);
             let input = opencode_json_text(data.get("input").or_else(|| state.get("input")));
             let output = opencode_json_text(
                 data.get("output")
@@ -1285,39 +1454,48 @@ fn opencode_part_message(
                     .or_else(|| state.get("output"))
                     .or_else(|| state.get("result")),
             );
-            let mut sections = Vec::new();
-            if !input.trim().is_empty() {
-                sections.push(format!("input:\n{input}"));
-            }
-            if !output.trim().is_empty() {
-                sections.push(format!("output:\n{output}"));
-            }
-            if sections.is_empty() {
-                sections.push(pretty_json(data));
-            }
-            Some(CodexThreadTranscriptMessage {
-                id: format!("opencode-{message_id}-{part_id}-tool"),
+            let error = opencode_json_text(data.get("error").or_else(|| state.get("error")));
+            let mut messages = Vec::new();
+            let call_text = if input.trim().is_empty() {
+                pretty_json(data)
+            } else {
+                input
+            };
+            messages.push(CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-tool-call"),
                 role: "activity".to_string(),
-                kind: if output.trim().is_empty() {
-                    "tool_call".to_string()
-                } else {
-                    "tool_output".to_string()
-                },
-                text: clean_codex_transcript_text(
-                    sections.join("\n\n"),
-                    CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
-                ),
-                title: if tool.is_empty() {
-                    "Tool".to_string()
-                } else {
-                    format!("Tool {tool}")
-                },
-                call_id,
-                created_at: timestamp.to_string(),
+                kind: "tool_call".to_string(),
+                text: clean_codex_transcript_text(call_text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: clean_codex_title(opencode_tool_title(&tool, input_value), "Called tool"),
+                call_id: call_id.clone(),
+                created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            })
+            });
+            let has_error = !error.trim().is_empty();
+            let output_text = if has_error {
+                error
+            } else {
+                output
+            };
+            if !output_text.trim().is_empty() {
+                messages.push(CodexThreadTranscriptMessage {
+                    id: format!("opencode-{message_id}-{part_id}-tool-output"),
+                    role: "activity".to_string(),
+                    kind: "tool_output".to_string(),
+                    text: clean_codex_transcript_text(output_text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                    title: if has_error {
+                        "Tool error".to_string()
+                    } else {
+                        "Tool output".to_string()
+                    },
+                    call_id,
+                    created_at: opencode_part_created_at(timestamp, data, true),
+                    source: "opencode".to_string(),
+                });
+            }
+            messages
         }
-        "patch" => Some(CodexThreadTranscriptMessage {
+        "patch" => vec![CodexThreadTranscriptMessage {
             id: format!("opencode-{message_id}-{part_id}-patch"),
             role: "activity".to_string(),
             kind: "patch".to_string(),
@@ -1326,8 +1504,8 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
-        }),
-        "file" => Some(CodexThreadTranscriptMessage {
+        }],
+        "file" => vec![CodexThreadTranscriptMessage {
             id: format!("opencode-{message_id}-{part_id}-file"),
             role: "activity".to_string(),
             kind: "file".to_string(),
@@ -1336,18 +1514,60 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
-        }),
-        "step-start" | "step-finish" | "snapshot" => Some(CodexThreadTranscriptMessage {
-            id: format!("opencode-{message_id}-{part_id}-{part_type}"),
+        }],
+        "step-start" => {
+            let text = first_value_string(&[data.get("summary"), data.get("description")]);
+            let text = if text.trim().is_empty() {
+                "Working".to_string()
+            } else {
+                text
+            };
+            vec![CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-step-start"),
+                role: "activity".to_string(),
+                kind: "task_progress".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: "Working".to_string(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+            }]
+        }
+        "step-finish" => {
+            let reason = first_value_string(&[data.get("reason"), data.get("summary")]);
+            let reason_is_error = reason.to_lowercase().contains("error")
+                || reason.to_lowercase().contains("fail");
+            if reason_is_error {
+                vec![transcript_error_message(
+                    format!("opencode-{message_id}-{part_id}-step-error"),
+                    "opencode",
+                    timestamp,
+                    if reason.trim().is_empty() {
+                        "OpenCode turn failed"
+                    } else {
+                        reason.as_str()
+                    },
+                )]
+            } else {
+                vec![transcript_task_complete_message(
+                    format!("opencode-{message_id}-{part_id}-task-complete"),
+                    "opencode",
+                    timestamp,
+                    reason,
+                )]
+            }
+        }
+        "snapshot" => vec![CodexThreadTranscriptMessage {
+            id: format!("opencode-{message_id}-{part_id}-snapshot"),
             role: "activity".to_string(),
-            kind: part_type.replace('-', "_"),
-            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-            title: part_type.replace('-', " "),
+            kind: "activity".to_string(),
+            text: clean_codex_transcript_text("Snapshot captured", CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: "Snapshot".to_string(),
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
-        }),
-        _ => None,
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -1503,11 +1723,9 @@ fn parse_opencode_session(
 
         for (part_id, part_time, part_data) in parts_by_message.remove(&row.0).unwrap_or_default() {
             let part_timestamp = opencode_timestamp(part_time);
-            push_codex_message(
-                &mut messages,
-                &mut seen,
-                opencode_part_message(&row.0, &role, &part_id, &part_timestamp, &part_data),
-            );
+            for message in opencode_part_message(&row.0, &role, &part_id, &part_timestamp, &part_data) {
+                push_codex_message(&mut messages, &mut seen, Some(message));
+            }
         }
     }
 

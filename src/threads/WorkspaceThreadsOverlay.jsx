@@ -3,13 +3,16 @@ import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Edit } from "@styled-icons/fa-regular/Edit";
 import { Search } from "@styled-icons/material-rounded/Search";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect } from "react";
 import styled, { keyframes } from "styled-components";
 
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
+  getWorkspaceThreadCanArchive,
+  getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
+  getWorkspaceThreadTurnState,
 } from "./workspaceThreads";
 
 const overlayFadeIn = keyframes`
@@ -510,6 +513,31 @@ const TerminalStateDot = styled.span`
     background: #f87171;
     box-shadow: 0 0 10px rgba(248, 113, 113, 0.24);
   }
+
+  &[data-state="running"] {
+    background: #fcd34d;
+    box-shadow: 0 0 10px rgba(252, 211, 77, 0.26);
+  }
+
+  &[data-state="completed"] {
+    background: #34d399;
+    box-shadow: 0 0 10px rgba(52, 211, 153, 0.28);
+  }
+
+  &[data-state="interrupted"] {
+    background: #fbbf24;
+    box-shadow: 0 0 10px rgba(251, 191, 36, 0.24);
+  }
+
+  &[data-live="true"][data-nosession="false"]:not([data-state="error"]) {
+    background: #34d399;
+    box-shadow: 0 0 10px rgba(52, 211, 153, 0.28);
+  }
+
+  &[data-live="true"][data-nosession="true"] {
+    background: #fcd34d;
+    box-shadow: 0 0 10px rgba(252, 211, 77, 0.24);
+  }
 `;
 
 const EmptyThreads = styled.div`
@@ -530,19 +558,57 @@ function getThreadRows(workspaceThreads, workspaceId) {
     .filter((thread) => thread?.materialized);
 }
 
-function getThreadState(thread) {
+function terminalMatchesThreadBinding(terminal, terminalBinding) {
+  if (!terminal) {
+    return false;
+  }
+
+  if (!terminalBinding) {
+    return true;
+  }
+
+  const terminalIndexMatches = Number(terminal.terminalIndex) === Number(terminalBinding.terminalIndex);
+  const instanceMatches = !terminalBinding.instanceId
+    || Number(terminal.instanceId) === Number(terminalBinding.instanceId);
+  const paneMatches = !terminalBinding.paneId || terminal.paneId === terminalBinding.paneId;
+  return terminalIndexMatches && instanceMatches && paneMatches;
+}
+
+function getThreadState(thread, entry) {
   const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
   const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
-  const hasSession = Boolean(
-    thread?.transcriptSessionId
-      || providerBinding?.nativeSessionId,
+  const turnState = getWorkspaceThreadTurnState(thread);
+  const hasSession = getWorkspaceThreadHasSession(thread);
+  const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
+  const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
+  const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
+  const isTerminalMappedToThread = Boolean(
+    mappedTerminal?.threadId === thread?.id
+      && terminalMatchesThreadBinding(mappedTerminal, terminalBinding),
   );
-  const isActiveTerminal = Boolean(terminalBinding && ["active", "starting"].includes(thread?.status));
+  const isActiveTerminal = Boolean(
+    isTerminalMappedToThread
+      && ["active", "starting"].includes(String(mappedTerminal?.status || "").toLowerCase())
+      && ["active", "starting"].includes(String(thread?.status || "").toLowerCase()),
+  );
+  const dotState = turnState === "error"
+    ? "error"
+    : hasSession && isActiveTerminal
+      ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
+      : turnState === "running"
+        ? "running"
+        : turnState === "interrupted"
+          ? "interrupted"
+          : isActiveTerminal
+            ? thread?.status || "idle"
+            : "idle";
 
   return {
-    isLive: Boolean(terminalBinding && thread.status === "active"),
-    isNonSessionActive: isActiveTerminal && !hasSession,
+    canArchive: getWorkspaceThreadCanArchive(thread),
+    isLive: Boolean(hasSession && isActiveTerminal),
+    isNonSessionActive: !hasSession,
     label: getWorkspaceThreadLabel(thread),
+    state: dotState,
   };
 }
 
@@ -557,18 +623,38 @@ function WorkspaceThreadsOverlay({
   onSelectModel,
   onSelectThread,
   onSubmitMessage,
+  onViewStateChange,
   open,
   selectedThreadId,
   selectedWorkspaceId,
+  viewState,
   workspaceThreads,
   workspaces,
 }) {
-  const [railCollapsed, setRailCollapsed] = useState(false);
-  const [newChatActive, setNewChatActive] = useState(false);
-  const [localSelection, setLocalSelection] = useState(() => ({
-    threadId: selectedThreadId || "",
-    workspaceId: selectedWorkspaceId || "",
-  }));
+  const safeViewState = viewState && typeof viewState === "object" && !Array.isArray(viewState)
+    ? viewState
+    : {};
+  const railCollapsed = safeViewState.railCollapsed === true;
+  const newChatActive = safeViewState.newChatActive === true;
+  const localSelection = {
+    threadId: safeViewState.selectedThreadId || selectedThreadId || "",
+    workspaceId: safeViewState.selectedWorkspaceId || selectedWorkspaceId || "",
+  };
+  const commitViewState = (workspaceId, patch = {}) => {
+    const safeWorkspaceId = workspaceId
+      || patch.workspaceId
+      || patch.selectedWorkspaceId
+      || localSelection.workspaceId
+      || selectedWorkspaceId
+      || "";
+    if (!safeWorkspaceId) {
+      return;
+    }
+    onViewStateChange?.(safeWorkspaceId, {
+      ...patch,
+      workspaceId: safeWorkspaceId,
+    });
+  };
 
   useEffect(() => {
     if (!open) {
@@ -585,17 +671,6 @@ function WorkspaceThreadsOverlay({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose, open]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    setLocalSelection({
-      threadId: selectedThreadId || "",
-      workspaceId: selectedWorkspaceId || "",
-    });
-  }, [open, selectedThreadId, selectedWorkspaceId]);
 
   const collapsedThreadGroups = (workspaces || [])
     .map((workspace) => ({
@@ -633,8 +708,11 @@ function WorkspaceThreadsOverlay({
   const visibleActiveWorkspaceId = newChatActive ? "" : activeWorkspaceId;
   const visibleActiveThreadId = newChatActive ? "" : activeThreadId;
   const selectThread = (workspaceId, threadId) => {
-    setNewChatActive(false);
-    setLocalSelection({ threadId, workspaceId });
+    commitViewState(workspaceId, {
+      newChatActive: false,
+      selectedThreadId: threadId,
+      selectedWorkspaceId: workspaceId,
+    });
     onSelectThread?.(workspaceId, threadId);
   };
   const archiveThread = (event, workspaceId, threadId) => {
@@ -643,10 +721,12 @@ function WorkspaceThreadsOverlay({
     onArchiveThread?.(workspaceId, threadId);
   };
   const openNewChat = () => {
-    setNewChatActive(true);
-    if (railCollapsed) {
-      setRailCollapsed(false);
-    }
+    const workspaceId = newChatWorkspace?.id || selectedWorkspaceId || activeWorkspaceId || "";
+    commitViewState(workspaceId, {
+      newChatActive: true,
+      railCollapsed: false,
+      selectedWorkspaceId: workspaceId,
+    });
   };
   const createChat = async (request) => {
     const result = await onCreateChat?.({
@@ -656,9 +736,12 @@ function WorkspaceThreadsOverlay({
     const nextWorkspaceId = result?.workspaceId || result?.workspace?.id || newChatWorkspace?.id || "";
     const nextThreadId = result?.threadId || result?.thread?.id || "";
     if (nextWorkspaceId && nextThreadId) {
-      setLocalSelection({ threadId: nextThreadId, workspaceId: nextWorkspaceId });
+      commitViewState(nextWorkspaceId, {
+        newChatActive: false,
+        selectedThreadId: nextThreadId,
+        selectedWorkspaceId: nextWorkspaceId,
+      });
       onSelectThread?.(nextWorkspaceId, nextThreadId);
-      setNewChatActive(false);
     }
 
     return result;
@@ -666,7 +749,11 @@ function WorkspaceThreadsOverlay({
 
   useEffect(() => {
     if (open && !hasVisibleThreads) {
-      setNewChatActive(true);
+      const workspaceId = newChatWorkspace?.id || selectedWorkspaceId || activeWorkspaceId || "";
+      commitViewState(workspaceId, {
+        newChatActive: true,
+        selectedWorkspaceId: workspaceId,
+      });
     }
   }, [hasVisibleThreads, open]);
 
@@ -702,7 +789,9 @@ function WorkspaceThreadsOverlay({
         <ThreadRail>
           <DrawerToggle
             aria-label={railCollapsed ? "Expand threads sidebar" : "Collapse threads sidebar"}
-            onClick={() => setRailCollapsed((value) => !value)}
+            onClick={() => commitViewState(activeWorkspaceId || selectedWorkspaceId, {
+              railCollapsed: !railCollapsed,
+            })}
             title={railCollapsed ? "Expand threads" : "Collapse threads"}
             type="button"
           >
@@ -746,7 +835,10 @@ function WorkspaceThreadsOverlay({
                     {threads.map((thread) => {
                       const isSelected = visibleActiveWorkspaceId === workspace.id
                         && visibleActiveThreadId === thread.id;
-                      const { isLive, isNonSessionActive, label } = getThreadState(thread);
+                      const { isLive, isNonSessionActive, label, state } = getThreadState(
+                        thread,
+                        workspaceThreads?.[workspace.id],
+                      );
                       const title = `${workspace.name}: ${label}`;
 
                       return (
@@ -762,7 +854,7 @@ function WorkspaceThreadsOverlay({
                             aria-hidden="true"
                             data-live={isLive ? "true" : "false"}
                             data-nosession={isNonSessionActive ? "true" : "false"}
-                            data-state={thread.status}
+                            data-state={state}
                           />
                         </CollapsedThreadButton>
                       );
@@ -798,7 +890,13 @@ function WorkspaceThreadsOverlay({
                       {threads.length ? threads.map((thread) => {
                         const isSelected = visibleActiveWorkspaceId === workspace.id
                           && visibleActiveThreadId === thread.id;
-                        const { isLive, isNonSessionActive, label } = getThreadState(thread);
+                        const {
+                          canArchive,
+                          isLive,
+                          isNonSessionActive,
+                          label,
+                          state,
+                        } = getThreadState(thread, workspaceThreads?.[workspace.id]);
 
                         return (
                           <ThreadRow
@@ -817,17 +915,19 @@ function WorkspaceThreadsOverlay({
                                 aria-hidden="true"
                                 data-live={isLive ? "true" : "false"}
                                 data-nosession={isNonSessionActive ? "true" : "false"}
-                                data-state={thread.status}
+                                data-state={state}
                               />
                             </ThreadSelectButton>
-                            <ThreadArchiveButton
-                              aria-label={`Archive ${label}`}
-                              onClick={(event) => archiveThread(event, workspace.id, thread.id)}
-                              title="Archive thread"
-                              type="button"
-                            >
-                              <DeleteOutline aria-hidden="true" />
-                            </ThreadArchiveButton>
+                            {canArchive ? (
+                              <ThreadArchiveButton
+                                aria-label={`Archive ${label}`}
+                                onClick={(event) => archiveThread(event, workspace.id, thread.id)}
+                                title="Archive thread"
+                                type="button"
+                              >
+                                <DeleteOutline aria-hidden="true" />
+                              </ThreadArchiveButton>
+                            ) : null}
                           </ThreadRow>
                         );
                       }) : (
@@ -851,6 +951,7 @@ function WorkspaceThreadsOverlay({
           onSubmitMessage={onSubmitMessage}
           thread={newChatActive ? null : activeThread}
           workspace={newChatActive ? newChatWorkspace : activeWorkspace}
+          workspaceThreadEntry={workspaceThreads?.[newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId]}
         />
       </OverlayPanel>
     </OverlayRoot>

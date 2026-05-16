@@ -7,6 +7,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import styled, { keyframes } from "styled-components";
 
 import {
+  getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
 } from "./workspaceThreads";
@@ -212,6 +213,14 @@ const TranscriptActivityCell = styled.article`
   -webkit-user-select: text;
 `;
 
+const TranscriptActivityHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+`;
+
 const TranscriptActivityTitle = styled.div`
   min-width: 0;
   overflow: hidden;
@@ -219,6 +228,17 @@ const TranscriptActivityTitle = styled.div`
   font-weight: 520;
   text-overflow: ellipsis;
   white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const TranscriptActivityStatus = styled.span`
+  min-width: 0;
+  color: var(--thread-muted-soft);
+  font-size: 10px;
+  font-weight: 520;
+  line-height: 1;
+  text-transform: uppercase;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -239,79 +259,6 @@ const TranscriptActivityBody = styled.pre`
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  user-select: text;
-  -webkit-user-select: text;
-`;
-
-const ToolCallsCell = styled.article`
-  display: block;
-  min-width: 0;
-  padding: 0 0 14px;
-  color: var(--thread-muted);
-  font-size: 11px;
-  line-height: 1.35;
-  user-select: text;
-  -webkit-user-select: text;
-`;
-
-const ToolCallsBox = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.045);
-  border-radius: 12px;
-  padding: 8px 10px;
-  background: rgba(255, 255, 255, 0.025);
-  box-shadow: none;
-`;
-
-const ToolCallsHeading = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: var(--thread-muted-soft);
-  font-size: 9px;
-  font-weight: 560;
-  letter-spacing: 0.16em;
-  line-height: 1;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-  user-select: text;
-  -webkit-user-select: text;
-`;
-
-const ToolCallList = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 9px;
-`;
-
-const ToolCallRow = styled.div`
-  display: grid;
-  min-width: 0;
-  grid-template-columns: 10px minmax(0, 1fr);
-  align-items: center;
-  gap: 11px;
-`;
-
-const ToolCallDot = styled.span`
-  width: 6px;
-  height: 6px;
-  border-radius: 99px;
-  background: var(--thread-muted-soft);
-  opacity: 0.86;
-  user-select: none;
-`;
-
-const ToolCallText = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: var(--thread-muted);
-  font-size: 12px;
-  font-weight: 450;
-  line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -850,6 +797,37 @@ function normalizeAgentId(value) {
   }
 
   return THREAD_AGENT_IDS.has(agentId) ? agentId : "codex";
+}
+
+function getLiveTerminalBindingForThread(thread, providerBinding, workspaceThreadEntry) {
+  const storedBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
+  const terminalIndex = storedBinding?.terminalIndex ?? thread?.terminalIndex;
+  const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
+  const terminal = terminalKey ? workspaceThreadEntry?.terminals?.[terminalKey] : null;
+  if (
+    terminal?.threadId !== thread?.id
+    || !["active", "starting"].includes(String(terminal.status || "").toLowerCase())
+  ) {
+    return null;
+  }
+
+  if (storedBinding?.paneId && terminal.paneId && storedBinding.paneId !== terminal.paneId) {
+    return null;
+  }
+
+  if (
+    storedBinding?.instanceId
+    && terminal.instanceId
+    && Number(storedBinding.instanceId) !== Number(terminal.instanceId)
+  ) {
+    return null;
+  }
+
+  return {
+    instanceId: terminal.instanceId,
+    paneId: terminal.paneId,
+    terminalIndex: terminal.terminalIndex,
+  };
 }
 
 function findAgentStatus(agentStatuses, agentId) {
@@ -1393,15 +1371,36 @@ function MessageTextContent({ message, workspace }) {
   );
 }
 
-function buildActivityItems(thread) {
+function threadLatestTurnState(thread) {
+  return String(thread?.latestTurn?.state || "").trim().toLowerCase();
+}
+
+function messagesContainTurnWork(messages, turnId) {
+  const safeTurnId = String(turnId || "").trim();
+  return (Array.isArray(messages) ? messages : []).some((message) => (
+    (!safeTurnId || message?.turnId === safeTurnId)
+    && ["assistant", "activity"].includes(message?.role)
+    && String(message?.text || "").trim()
+  ));
+}
+
+function buildActivityItems(thread, messages = []) {
   if (!thread) {
     return [];
   }
 
   const items = [];
-  const isThinking = thread.activityStatus === "thinking";
+  const latestTurn = thread.latestTurn || null;
+  const turnState = threadLatestTurnState(thread);
+  const isThinking = turnState === "running" || thread.activityStatus === "thinking";
 
-  if (isThinking) {
+  if (turnState === "running") {
+    items.push({
+      id: `turn-${latestTurn?.turnId || "latest"}-running`,
+      live: true,
+      text: messagesContainTurnWork(messages, latestTurn?.turnId) ? "Working" : "Thinking",
+    });
+  } else if (isThinking) {
     items.push({ id: "thinking", live: true, text: "Thinking" });
   } else if (thread.status === "starting") {
     items.push({ id: "starting", live: true, text: "Starting agent" });
@@ -1412,30 +1411,6 @@ function buildActivityItems(thread) {
   }
 
   return items;
-}
-
-function isToolCallMessage(message) {
-  if (message?.role !== "activity") {
-    return false;
-  }
-
-  const kind = String(message.kind || "").toLowerCase();
-  const title = String(message.title || "").toLowerCase();
-  if (kind === "reasoning") {
-    return false;
-  }
-
-  return [
-    "command",
-    "exec",
-    "file",
-    "mcp",
-    "patch",
-    "tool",
-    "tool_call",
-    "tool_output",
-    "web",
-  ].some((marker) => kind.includes(marker) || title.includes(marker));
 }
 
 function getToolCallLabel(message) {
@@ -1462,63 +1437,40 @@ function getToolCallLabel(message) {
 }
 
 function buildTranscriptItems(messages) {
-  const items = [];
-  let toolGroup = [];
-
-  const flushToolGroup = () => {
-    if (!toolGroup.length) {
-      return;
-    }
-
-    items.push({
-      id: `tool-group-${toolGroup[0].id || items.length}`,
-      messages: toolGroup,
-      type: "toolGroup",
-    });
-    toolGroup = [];
-  };
-
-  (Array.isArray(messages) ? messages : []).forEach((message) => {
-    if (isToolCallMessage(message)) {
-      toolGroup.push(message);
-      return;
-    }
-
-    flushToolGroup();
-    items.push({
-      id: message?.id || `message-${items.length}`,
-      message,
-      type: "message",
-    });
-  });
-
-  flushToolGroup();
-  return items;
+  return (Array.isArray(messages) ? messages : []).map((message, index) => ({
+    id: message?.id || `message-${index}`,
+    message,
+    type: "message",
+  }));
 }
 
-function ToolCallsGroup({ messages }) {
-  const calls = Array.isArray(messages) ? messages : [];
-  if (!calls.length) {
+function isChatProjectionMessage(message) {
+  const kind = String(message?.kind || "").trim().toLowerCase();
+  const source = String(message?.source || "").trim().toLowerCase();
+  return kind !== "live_output" && source !== "terminal-live";
+}
+
+function ActivityMessage({ message }) {
+  if (!message) {
     return null;
   }
 
+  const label = getToolCallLabel(message);
+  const status = String(message.status || "").trim();
+  const body = String(message.text || "").trim();
+  const kind = String(message.kind || "activity").trim().toLowerCase();
+
   return (
-    <ToolCallsCell>
-      <ToolCallsBox>
-        <ToolCallsHeading>{`Tool Calls (${calls.length})`}</ToolCallsHeading>
-        <ToolCallList>
-          {calls.map((message, index) => {
-            const label = getToolCallLabel(message);
-            return (
-              <ToolCallRow key={message.id || `${label}-${index}`}>
-                <ToolCallDot aria-hidden="true" />
-                <ToolCallText title={label}>{label}</ToolCallText>
-              </ToolCallRow>
-            );
-          })}
-        </ToolCallList>
-      </ToolCallsBox>
-    </ToolCallsCell>
+    <TranscriptActivityCell data-kind={kind} data-message-role="activity" data-status={status || "complete"}>
+      <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
+      <div>
+        <TranscriptActivityHeader>
+          <TranscriptActivityTitle title={label}>{label}</TranscriptActivityTitle>
+          {status ? <TranscriptActivityStatus>{status}</TranscriptActivityStatus> : null}
+        </TranscriptActivityHeader>
+        {body ? <TranscriptActivityBody>{body}</TranscriptActivityBody> : null}
+      </div>
+    </TranscriptActivityCell>
   );
 }
 
@@ -1541,22 +1493,7 @@ function ThreadMessage({ message, workspace }) {
   }
 
   if (message.role === "activity") {
-    const title = message.title || (
-      message.kind === "tool_call"
-        ? "Tool call"
-        : message.kind === "tool_output"
-          ? "Tool output"
-          : "Activity"
-    );
-    return (
-      <TranscriptActivityCell data-message-role="activity">
-        <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
-        <div>
-          <TranscriptActivityTitle>{title}</TranscriptActivityTitle>
-          {message.text ? <TranscriptActivityBody>{message.text}</TranscriptActivityBody> : null}
-        </div>
-      </TranscriptActivityCell>
-    );
+    return <ActivityMessage message={message} />;
   }
 
   return (
@@ -1581,6 +1518,7 @@ function WorkspaceThreadDetail({
   onSubmitMessage,
   thread,
   workspace,
+  workspaceThreadEntry,
 }) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState([]);
@@ -1590,9 +1528,11 @@ function WorkspaceThreadDetail({
   const [error, setError] = useState("");
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
-  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  const messages = Array.isArray(thread?.messages)
+    ? thread.messages.filter(isChatProjectionMessage)
+    : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
-  const activityItems = useMemo(() => buildActivityItems(thread), [thread]);
+  const activityItems = useMemo(() => buildActivityItems(thread, messages), [messages, thread]);
   const latestMessage = messages[messages.length - 1] || null;
   const latestActivity = activityItems[activityItems.length - 1] || null;
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
@@ -1606,7 +1546,13 @@ function WorkspaceThreadDetail({
     () => getModelOptions(activeAgentId, activeAgentStatus, { modelId: activeProviderModelId }),
     [activeAgentId, activeAgentStatus, activeProviderModelId],
   );
-  const activeTerminalBinding = activeProviderBinding?.terminalBinding || thread?.terminalBinding;
+  const activeTerminalBinding = getLiveTerminalBindingForThread(
+    thread,
+    activeProviderBinding,
+    workspaceThreadEntry,
+  );
+  const hasActiveTerminalBinding = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
+  const hasProviderSession = getWorkspaceThreadHasSession(thread);
   const composerSyncKey = [
     thread?.workspaceId || workspace?.id || "",
     thread?.id || "",
@@ -1614,13 +1560,15 @@ function WorkspaceThreadDetail({
     activeTerminalBinding?.instanceId || "",
   ].join(":");
   const syncedComposerDraft = String(composerDrafts?.[composerSyncKey] || "");
-  const canSubmit = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
+  const canSubmit = Boolean(thread && (hasActiveTerminalBinding || hasProviderSession));
   const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
   const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
   const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
-  const placeholder = canSubmit
+  const placeholder = hasActiveTerminalBinding
     ? `Ask ${agentLabel} to work in this thread`
-    : `No active ${agentLabel} terminal is bound to this thread`;
+    : hasProviderSession
+      ? `Ask ${agentLabel} to resume this thread`
+      : `No ${agentLabel} session is available for this thread`;
   const submitDisabled = sending || !canSubmit || (!draft.trim() && attachments.length === 0);
 
   useEffect(() => {
@@ -1649,6 +1597,8 @@ function WorkspaceThreadDetail({
     messages.length,
     thread?.activityStatus,
     thread?.id,
+    thread?.latestTurn?.state,
+    thread?.latestTurn?.turnId,
     thread?.status,
   ]);
 
@@ -1681,7 +1631,7 @@ function WorkspaceThreadDetail({
     setModelMenuOpen(false);
     setError("");
 
-    if (!nextModel || !thread || !canSubmit) {
+    if (!nextModel || !thread || !hasActiveTerminalBinding) {
       return;
     }
 
@@ -1759,11 +1709,7 @@ function WorkspaceThreadDetail({
           ) : null}
 
           {transcriptItems.map((item) => (
-            item.type === "toolGroup" ? (
-              <ToolCallsGroup key={item.id} messages={item.messages} />
-            ) : (
-              <ThreadMessage key={item.id} message={item.message} workspace={workspace} />
-            )
+            <ThreadMessage key={item.id} message={item.message} workspace={workspace} />
           ))}
 
           {activityItems.map((item) => (

@@ -4,14 +4,31 @@ import {
 } from "../terminals/liveViewSanitizer.js";
 
 const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
+const MAX_THREAD_PROJECTION_EVENTS = 900;
 const MAX_THREAD_MESSAGES = 360;
 const MAX_THREADS_PER_WORKSPACE = 80;
 const THREAD_PROMPT_LABEL_MAX_WORDS = 6;
 const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
 const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
-const LIVE_OUTPUT_MAX_CHARS = 24000;
 const DEFAULT_AGENT_ID = "codex";
 const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
+const THREAD_PROJECTION_EVENT_TYPES = new Set([
+  "thread.activity",
+  "thread.file",
+  "thread.message.assistant.complete",
+  "thread.message.assistant.delta",
+  "thread.message.system",
+  "thread.message.user",
+  "thread.patch",
+  "thread.reasoning",
+  "thread.tool_call",
+  "thread.tool_output",
+  "thread.turn.completed",
+  "thread.turn.error",
+  "thread.turn.interrupted",
+  "thread.turn.started",
+]);
+const THREAD_TURN_STATES = new Set(["completed", "error", "interrupted", "running"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -242,6 +259,26 @@ function normalizeTerminalThreadIds(value, threads = {}) {
   return normalized;
 }
 
+function normalizeThreadsViewState(value, fallback = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    newChatActive: source.newChatActive === true,
+    railCollapsed: source.railCollapsed === true,
+    selectedThreadId: cleanText(
+      source.selectedThreadId
+        || source.threadId
+        || fallback.selectedThreadId
+        || fallback.threadId,
+    ),
+    selectedWorkspaceId: cleanText(
+      source.selectedWorkspaceId
+        || source.workspaceId
+        || fallback.selectedWorkspaceId
+        || fallback.workspaceId,
+    ),
+  };
+}
+
 function rememberTerminalThread(entry, terminalIndex, threadId) {
   const key = terminalSessionKey(terminalIndex);
   const safeThreadId = cleanText(threadId);
@@ -311,6 +348,58 @@ function normalizeThreadActivityStatus(value, fallback = "idle") {
   return ["idle", "thinking"].includes(status) ? status : "idle";
 }
 
+function normalizeThreadTurnState(value, fallback = "") {
+  const state = cleanText(value, fallback).toLowerCase();
+  return THREAD_TURN_STATES.has(state) ? state : "";
+}
+
+function normalizeThreadLatestTurn(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const turnId = cleanText(value.turnId || value.turn_id || value.id);
+  const state = normalizeThreadTurnState(value.state || value.status || value.turnState || value.turn_state);
+  if (!turnId || !state) {
+    return null;
+  }
+
+  const requestedAt = cleanText(value.requestedAt || value.requested_at || value.createdAt || value.created_at);
+  const startedAt = cleanText(value.startedAt || value.started_at || requestedAt);
+  const completedAt = cleanText(value.completedAt || value.completed_at);
+  const updatedAt = cleanText(value.updatedAt || value.updated_at || completedAt || startedAt || requestedAt, nowIso());
+
+  return {
+    agentId: cleanAgentId(value.agentId || value.agent_id, ""),
+    assistantMessageId: cleanText(value.assistantMessageId || value.assistant_message_id),
+    completedAt,
+    error: cleanText(value.error || value.message),
+    messageId: cleanText(value.messageId || value.message_id),
+    requestedAt,
+    startedAt,
+    state,
+    turnId,
+    updatedAt,
+  };
+}
+
+function createTurnIdForMessage(thread, messageId) {
+  return [
+    "turn",
+    safeKey(thread?.id || thread?.threadId || "thread"),
+    safeKey(messageId, "message"),
+  ].join("-");
+}
+
+function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
+  const normalizedTurn = normalizeThreadLatestTurn(latestTurn);
+  if (normalizedTurn?.state === "running") {
+    return "thinking";
+  }
+
+  return normalizeThreadActivityStatus(fallback);
+}
+
 function normalizeThreadMessage(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return null;
@@ -323,8 +412,22 @@ function normalizeThreadMessage(message) {
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "-")
     .slice(0, 48);
+  const source = cleanText(message.source);
   const text = cleanMessageText(message.text || message.message);
-  if (!id || !text || (safeRole === "user" && isTerminalArtifactMessage(message.text || message.message))) {
+  const status = cleanText(message.status, "submitted");
+  const isTurnCompleteMessage = safeRole === "assistant"
+    && (
+      kind === "task_complete"
+      || kind === "final_answer"
+      || status.toLowerCase() === "task_complete"
+    );
+  if (
+    !id
+    || (!text && !isTurnCompleteMessage)
+    || kind === "live_output"
+    || source === "terminal-live"
+    || (safeRole === "user" && isTerminalArtifactMessage(message.text || message.message))
+  ) {
     return null;
   }
 
@@ -335,10 +438,11 @@ function normalizeThreadMessage(message) {
     id,
     kind: kind || (safeRole === "activity" ? "activity" : "message"),
     role: safeRole,
-    source: cleanText(message.source),
-    status: cleanText(message.status, "submitted"),
+    source,
+    status,
     text,
     title: cleanText(message.title),
+    turnId: cleanText(message.turnId || message.turn_id),
   };
 }
 
@@ -359,25 +463,522 @@ function normalizeThreadMessages(messages) {
   return normalized.slice(-MAX_THREAD_MESSAGES);
 }
 
-function appendThreadUserMessage(thread, event = {}) {
-  const rawText = event.userMessage || event.message;
-  const text = cleanSubmittedUserMessage(rawText);
-  if (!text) {
-    return thread?.messages || [];
+function stableProjectionHash(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
   }
 
-  const messages = normalizeThreadMessages(thread?.messages);
-  const source = cleanText(event.source || event.messageSource).toLowerCase();
+  return (hash >>> 0).toString(36);
+}
+
+function normalizeProjectionEventType(value) {
+  const type = cleanText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]/g, "-");
+  return THREAD_PROJECTION_EVENT_TYPES.has(type) ? type : "";
+}
+
+function isActivityProjectionEventType(type) {
+  return [
+    "thread.activity",
+    "thread.file",
+    "thread.patch",
+    "thread.reasoning",
+    "thread.tool_call",
+    "thread.tool_output",
+  ].includes(type);
+}
+
+function isTurnProjectionEventType(type) {
+  return [
+    "thread.turn.completed",
+    "thread.turn.error",
+    "thread.turn.interrupted",
+    "thread.turn.started",
+  ].includes(type);
+}
+
+function projectionEventTypeForActivityKind(kind) {
+  const safeKind = cleanText(kind, "activity")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "_");
+  if (safeKind === "tool_call") {
+    return "thread.tool_call";
+  }
+  if (safeKind === "tool_output") {
+    return "thread.tool_output";
+  }
+  if (safeKind === "reasoning") {
+    return "thread.reasoning";
+  }
+  if (safeKind === "patch") {
+    return "thread.patch";
+  }
+  if (safeKind === "file") {
+    return "thread.file";
+  }
+
+  return "thread.activity";
+}
+
+function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return null;
+  }
+
+  const type = normalizeProjectionEventType(event.type);
+  if (!type) {
+    return null;
+  }
+
+  const turnId = cleanText(event.turnId || event.turn_id);
+  const messageId = cleanText(
+    event.messageId
+      || event.message_id
+      || (isTurnProjectionEventType(type) ? turnId : "")
+      || event.id,
+  );
+  const delta = cleanMessageText(event.delta);
+  const text = cleanMessageText(event.text || event.message);
+  const title = cleanText(event.title);
   if (
-    source === "terminal-prompt-submitted"
-    && messages.some((message) => message.role === "user" && cleanMessageText(message.text) === text)
+    (!messageId || (isTurnProjectionEventType(type) && !(turnId || messageId)))
+    || (
+      !text
+      && !delta
+      && type !== "thread.message.assistant.complete"
+      && !isTurnProjectionEventType(type)
+    )
   ) {
-    return messages;
+    return null;
   }
-  const id = cleanText(event.messageId, createRandomId(`message-${safeKey(thread?.id, "thread")}`));
-  if (messages.some((message) => message.id === id)) {
-    return messages;
+
+  const sequence = Number.parseInt(event.sequence, 10);
+  const role = cleanText(event.role, isActivityProjectionEventType(type) ? "activity" : "assistant").toLowerCase();
+  const kind = cleanText(
+    event.kind,
+    isActivityProjectionEventType(type) ? type.replace(/^thread\./, "") : "message",
+  )
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .slice(0, 48);
+  const id = cleanText(
+    event.id || event.eventId || event.event_id,
+    `projection-${messageId}-${type}-${Number.isInteger(sequence) ? sequence : fallbackSequence}`,
+  );
+
+  return {
+    agentId: cleanAgentId(event.agentId || event.agent_id, ""),
+    callId: cleanText(event.callId || event.call_id),
+    createdAt: cleanText(event.createdAt || event.created_at, nowIso()),
+    completedAt: cleanText(event.completedAt || event.completed_at),
+    delta,
+    id,
+    kind,
+    messageId,
+    assistantMessageId: cleanText(event.assistantMessageId || event.assistant_message_id),
+    replaceText: event.replaceText === true,
+    role: ["activity", "assistant", "system", "user"].includes(role) ? role : "assistant",
+    sequence: Number.isInteger(sequence) && sequence >= 0 ? sequence : fallbackSequence,
+    source: cleanText(event.source),
+    status: cleanText(
+      event.status,
+      type === "thread.turn.started"
+        ? "running"
+        : type === "thread.turn.completed"
+          ? "completed"
+          : type === "thread.turn.error"
+            ? "error"
+            : type === "thread.turn.interrupted"
+              ? "interrupted"
+              : type === "thread.message.assistant.complete"
+                ? "complete"
+                : "streaming",
+    ),
+    text,
+    title,
+    turnId: turnId || (isTurnProjectionEventType(type) ? messageId : ""),
+    type,
+  };
+}
+
+function normalizeThreadProjectionEvents(events) {
+  const normalized = [];
+  const seen = new Set();
+
+  (Array.isArray(events) ? events : []).forEach((event, index) => {
+    const normalizedEvent = normalizeThreadProjectionEvent(event, index);
+    if (!normalizedEvent || seen.has(normalizedEvent.id)) {
+      return;
+    }
+
+    seen.add(normalizedEvent.id);
+    normalized.push(normalizedEvent);
+  });
+
+  return normalized
+    .sort((left, right) => left.sequence - right.sequence)
+    .map((event, index) => ({ ...event, sequence: index }))
+    .slice(-MAX_THREAD_PROJECTION_EVENTS)
+    .map((event, index) => ({ ...event, sequence: index }));
+}
+
+function upsertProjectedMessage(messagesById, messageOrder, message) {
+  const normalizedMessage = normalizeThreadMessage(message);
+  if (!normalizedMessage) {
+    return;
   }
+
+  if (!messagesById.has(normalizedMessage.id)) {
+    messageOrder.push(normalizedMessage.id);
+    messagesById.set(normalizedMessage.id, normalizedMessage);
+    return;
+  }
+
+  messagesById.set(normalizedMessage.id, {
+    ...messagesById.get(normalizedMessage.id),
+    ...normalizedMessage,
+  });
+}
+
+function projectThreadProjectionMessages(events, fallbackMessages = []) {
+  const projectionEvents = normalizeThreadProjectionEvents(events);
+  if (!projectionEvents.length) {
+    return normalizeThreadMessages(fallbackMessages);
+  }
+
+  const messagesById = new Map();
+  const messageOrder = [];
+  projectionEvents.forEach((event) => {
+    if (event.type === "thread.message.user" || event.type === "thread.message.system") {
+      upsertProjectedMessage(messagesById, messageOrder, {
+        agentId: event.agentId,
+        createdAt: event.createdAt,
+        id: event.messageId,
+        kind: "message",
+        role: event.type === "thread.message.system" ? "system" : "user",
+        source: event.source || "projection",
+        status: event.status || "submitted",
+        text: event.text || event.delta,
+        turnId: event.turnId,
+      });
+      return;
+    }
+
+    if (event.type === "thread.message.assistant.delta") {
+      const existing = messagesById.get(event.messageId);
+      const eventText = event.replaceText
+        ? event.text || event.delta
+        : `${existing?.text || ""}${event.delta || event.text}`;
+      upsertProjectedMessage(messagesById, messageOrder, {
+        agentId: event.agentId,
+        createdAt: event.createdAt,
+        id: event.messageId,
+        kind: event.kind || "message",
+        role: "assistant",
+        source: event.source || "projection",
+        status: "streaming",
+        text: eventText,
+        turnId: event.turnId,
+      });
+      return;
+    }
+
+    if (event.type === "thread.message.assistant.complete") {
+      const existing = messagesById.get(event.messageId);
+      if (!existing && !(event.text || event.delta)) {
+        return;
+      }
+
+      upsertProjectedMessage(messagesById, messageOrder, {
+        ...(existing || {}),
+        agentId: event.agentId || existing?.agentId || "",
+        createdAt: event.createdAt || existing?.createdAt,
+        id: event.messageId,
+        kind: event.kind || existing?.kind || "message",
+        role: "assistant",
+        source: event.source || existing?.source || "projection",
+        status: "complete",
+        text: event.replaceText || !existing?.text
+          ? event.text || event.delta || existing?.text || ""
+          : existing.text,
+        turnId: event.turnId || existing?.turnId || "",
+      });
+      return;
+    }
+
+    if (isActivityProjectionEventType(event.type)) {
+      upsertProjectedMessage(messagesById, messageOrder, {
+        agentId: event.agentId,
+        callId: event.callId,
+        createdAt: event.createdAt,
+        id: event.messageId,
+        kind: event.kind || "activity",
+        role: "activity",
+        source: event.source || "projection",
+        status: event.status || "complete",
+        text: event.text || event.delta,
+        title: event.title,
+        turnId: event.turnId,
+      });
+    }
+  });
+
+  return messageOrder
+    .map((messageId) => messagesById.get(messageId))
+    .filter(Boolean)
+    .slice(-MAX_THREAD_MESSAGES);
+}
+
+function threadMessageProjectionEventId(prefix, message, suffix = "") {
+  const id = cleanText(message?.id, createRandomId("message"));
+  const text = cleanMessageText(message?.text);
+  const hash = stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}`);
+  return [
+    prefix,
+    safeKey(id, "message"),
+    hash,
+    suffix,
+  ].filter(Boolean).join("-");
+}
+
+function projectionEventsFromMessages(messages, options = {}) {
+  const agentId = cleanAgentId(options.agentId, "");
+  const source = cleanText(options.source, "projection-bootstrap");
+  const events = [];
+  normalizeThreadMessages(messages).forEach((message) => {
+    const messageId = cleanText(message.id, createRandomId("message"));
+    const base = {
+      agentId: message.agentId || agentId,
+      callId: message.callId,
+      createdAt: message.createdAt,
+      kind: message.kind,
+      messageId,
+      source: message.source || source,
+      text: message.text,
+      title: message.title,
+      turnId: message.turnId,
+    };
+    if (message.role === "assistant") {
+      events.push({
+        ...base,
+        delta: message.text,
+        id: threadMessageProjectionEventId("projection-assistant-delta", message),
+        type: "thread.message.assistant.delta",
+      });
+      events.push({
+        ...base,
+        id: threadMessageProjectionEventId("projection-assistant-complete", message),
+        type: "thread.message.assistant.complete",
+      });
+      return;
+    }
+    if (message.role === "activity") {
+      events.push({
+        ...base,
+        id: threadMessageProjectionEventId("projection-activity", message),
+        type: projectionEventTypeForActivityKind(message.kind),
+      });
+      return;
+    }
+
+    events.push({
+      ...base,
+      id: threadMessageProjectionEventId("projection-user", message),
+      role: message.role,
+      type: message.role === "system" ? "thread.message.system" : "thread.message.user",
+    });
+  });
+
+  return events;
+}
+
+function ensureThreadProjectionEvents(thread) {
+  const existingProjectionEvents = normalizeThreadProjectionEvents(thread?.projectionEvents);
+  if (existingProjectionEvents.length) {
+    return existingProjectionEvents;
+  }
+
+  return normalizeThreadProjectionEvents(
+    projectionEventsFromMessages(thread?.messages, {
+      agentId: thread?.currentAgent,
+    }),
+  );
+}
+
+function appendThreadProjectionEvents(existingEvents, nextEvents) {
+  const normalizedExisting = normalizeThreadProjectionEvents(existingEvents);
+  const events = normalizedExisting.slice();
+  const seen = new Set(events.map((event) => event.id));
+  let nextSequence = events.length;
+
+  (Array.isArray(nextEvents) ? nextEvents : [nextEvents]).forEach((event) => {
+    const normalizedEvent = normalizeThreadProjectionEvent(
+      { ...event, sequence: nextSequence },
+      nextSequence,
+    );
+    if (!normalizedEvent || seen.has(normalizedEvent.id)) {
+      return;
+    }
+
+    seen.add(normalizedEvent.id);
+    events.push(normalizedEvent);
+    nextSequence += 1;
+  });
+
+  return normalizeThreadProjectionEvents(events);
+}
+
+function projectionHasTurnEvent(events, type, turnId) {
+  const safeTurnId = cleanText(turnId);
+  if (!safeTurnId) {
+    return false;
+  }
+
+  return normalizeThreadProjectionEvents(events).some((event) => (
+    event.type === type && event.turnId === safeTurnId
+  ));
+}
+
+function isTranscriptTurnCompleteMessage(message) {
+  const id = cleanText(message?.id).toLowerCase();
+  const kind = cleanText(message?.kind).toLowerCase();
+  const title = cleanText(message?.title).toLowerCase();
+  const status = cleanText(message?.status).toLowerCase();
+  return kind === "task_complete"
+    || kind === "final_answer"
+    || status === "task_complete"
+    || id.includes("task-complete")
+    || title === "task complete";
+}
+
+function isTranscriptTurnErrorMessage(message) {
+  const kind = cleanText(message?.kind).toLowerCase();
+  const status = cleanText(message?.status).toLowerCase();
+  return kind === "error" || status === "error";
+}
+
+function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
+  let latestTurn = normalizeThreadLatestTurn(fallbackLatestTurn);
+
+  normalizeThreadProjectionEvents(events).forEach((event) => {
+    const turnId = cleanText(event.turnId);
+    if (!turnId) {
+      return;
+    }
+
+    if (event.type === "thread.turn.started") {
+      latestTurn = normalizeThreadLatestTurn({
+        agentId: event.agentId,
+        messageId: event.messageId,
+        requestedAt: event.createdAt,
+        startedAt: event.createdAt,
+        state: "running",
+        turnId,
+        updatedAt: event.createdAt,
+      });
+      return;
+    }
+
+    if (!latestTurn || latestTurn.turnId !== turnId) {
+      return;
+    }
+
+    if (event.type === "thread.message.assistant.delta" || event.type === "thread.message.assistant.complete") {
+      latestTurn = normalizeThreadLatestTurn({
+        ...latestTurn,
+        assistantMessageId: event.messageId || latestTurn.assistantMessageId,
+        updatedAt: event.createdAt,
+      });
+      return;
+    }
+
+    if (isActivityProjectionEventType(event.type)) {
+      latestTurn = normalizeThreadLatestTurn({
+        ...latestTurn,
+        updatedAt: event.createdAt,
+      });
+      return;
+    }
+
+    if (event.type === "thread.turn.completed") {
+      latestTurn = normalizeThreadLatestTurn({
+        ...latestTurn,
+        assistantMessageId: event.assistantMessageId || latestTurn.assistantMessageId,
+        completedAt: event.completedAt || event.createdAt,
+        state: "completed",
+        updatedAt: event.completedAt || event.createdAt,
+      });
+      return;
+    }
+
+    if (event.type === "thread.turn.error") {
+      latestTurn = normalizeThreadLatestTurn({
+        ...latestTurn,
+        completedAt: event.completedAt || event.createdAt,
+        error: event.text || latestTurn.error,
+        state: "error",
+        updatedAt: event.completedAt || event.createdAt,
+      });
+      return;
+    }
+
+    if (event.type === "thread.turn.interrupted") {
+      latestTurn = normalizeThreadLatestTurn({
+        ...latestTurn,
+        completedAt: event.completedAt || event.createdAt,
+        state: "interrupted",
+        updatedAt: event.completedAt || event.createdAt,
+      });
+    }
+  });
+
+  return latestTurn;
+}
+
+function findMatchingProjectedMessage(projectedMessages, message) {
+  const messageId = cleanText(message?.id);
+  const role = cleanText(message?.role);
+  const kind = cleanText(message?.kind, "message");
+  const text = cleanMessageText(message?.text);
+  const callId = cleanText(message?.callId);
+
+  if (messageId) {
+    const exactMatch = projectedMessages.find((candidate) => cleanText(candidate.id) === messageId);
+    if (exactMatch) {
+      return exactMatch;
+    }
+  }
+
+  if (callId) {
+    const callMatch = projectedMessages.find((candidate) => (
+      cleanText(candidate.callId) === callId
+      && cleanText(candidate.kind, "message") === kind
+    ));
+    if (callMatch) {
+      return callMatch;
+    }
+  }
+
+  return projectedMessages.find((candidate) => (
+    candidate.role === role
+    && cleanText(candidate.kind, "message") === kind
+    && cleanMessageText(candidate.text) === text
+    && areThreadMessagesSameTurn(candidate, message, role === "user" ? 12000 : 5000)
+  )) || null;
+}
+
+function createSubmittedUserProjectionEvents(thread, event = {}) {
+  const text = cleanSubmittedUserMessage(event.userMessage || event.message);
+  if (!text) {
+    return [];
+  }
+
+  const projectionEvents = ensureThreadProjectionEvents(thread);
+  const messages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
   const createdAt = cleanText(event.messageCreatedAt, nowIso());
   const createdMs = Date.parse(createdAt);
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
@@ -388,33 +989,259 @@ function appendThreadUserMessage(thread, event = {}) {
     && Number.isFinite(lastUserMs)
     && Math.abs(createdMs - lastUserMs) < 2500
   ) {
-    return messages;
+    return [];
   }
 
-  return [
-    ...messages,
-    {
+  const messageId = cleanText(event.messageId, createRandomId(`message-${safeKey(thread?.id, "thread")}`));
+  const turnId = cleanText(event.turnId || event.turn_id, createTurnIdForMessage(thread, messageId));
+  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const source = cleanText(event.source || event.messageSource, "local-submit");
+  return [{
+    agentId,
+    createdAt,
+    id: `projection-user-${safeKey(messageId, "message")}`,
+    messageId,
+    source,
+    status: "submitted",
+    text,
+    turnId,
+    type: "thread.message.user",
+  }, {
+    agentId: cleanAgentId(event.agentId || event.currentAgent, ""),
+    createdAt,
+    id: `projection-turn-started-${safeKey(turnId, "turn")}`,
+    messageId,
+    source,
+    status: "running",
+    turnId,
+    type: "thread.turn.started",
+  }];
+}
+
+function createProjectionEventsFromTranscript(thread, incomingMessages, event = {}) {
+  const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
+  const source = cleanText(event.source, `${agentId || "agent"}-session`);
+  let projectionEvents = ensureThreadProjectionEvents(thread);
+  let projectedMessages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
+  const events = [];
+  let currentTurnId = cleanText(normalizeThreadLatestTurn(thread?.latestTurn)?.turnId);
+
+  normalizeThreadMessages(incomingMessages).forEach((message) => {
+    const eventStartCount = events.length;
+    const projectedMessage = findMatchingProjectedMessage(projectedMessages, message);
+    const messageId = cleanText(message.id, createRandomId("message"));
+    const createdAt = cleanText(message.createdAt, nowIso());
+    const messageTurnId = cleanText(
+      message.turnId
+        || message.turn_id
+        || projectedMessage?.turnId
+        || currentTurnId
+        || createTurnIdForMessage(thread, messageId),
+    );
+    const eventBase = {
+      agentId: message.agentId || agentId,
+      callId: message.callId,
       createdAt,
-      id,
-      role: "user",
-      status: "submitted",
-      text,
-    },
-  ].slice(-MAX_THREAD_MESSAGES);
+      kind: message.kind,
+      messageId,
+      source: message.source || source,
+      title: message.title,
+      turnId: messageTurnId,
+    };
+
+    if (message.role === "user") {
+      currentTurnId = cleanText(
+        message.turnId
+          || message.turn_id
+          || projectedMessage?.turnId
+          || createTurnIdForMessage(thread, messageId),
+      );
+      eventBase.turnId = currentTurnId;
+      if (!projectionHasTurnEvent(projectionEvents, "thread.turn.started", currentTurnId)) {
+        events.push({
+          ...eventBase,
+          id: `projection-provider-turn-started-${safeKey(currentTurnId, "turn")}`,
+          status: "running",
+          type: "thread.turn.started",
+        });
+      }
+      if (projectedMessage) {
+        // Keep the provider turn lifecycle even when the local submit already projected the user.
+      } else {
+        events.push({
+          ...eventBase,
+          id: `projection-provider-user-${safeKey(messageId, "message")}`,
+          role: "user",
+          status: message.status || "submitted",
+          text: message.text,
+          type: "thread.message.user",
+        });
+      }
+    } else if (message.role === "assistant") {
+      const nextText = cleanMessageText(message.text);
+      const turnComplete = isTranscriptTurnCompleteMessage(message);
+      if (!nextText) {
+        if (turnComplete && messageTurnId && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", messageTurnId)) {
+          events.push({
+            ...eventBase,
+            completedAt: createdAt,
+            id: `projection-provider-turn-completed-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+            status: "completed",
+            type: "thread.turn.completed",
+          });
+        }
+        return;
+      }
+
+      const duplicateFinalAssistant = turnComplete
+        ? projectedMessages.find((candidate) => (
+          candidate.role === "assistant"
+          && (!messageTurnId || candidate.turnId === messageTurnId)
+          && cleanMessageText(candidate.text) === nextText
+        ))
+        : null;
+      const messageProjectionTarget = duplicateFinalAssistant || projectedMessage;
+      const shouldProjectAssistant = !duplicateFinalAssistant;
+      const effectivePreviousText = cleanMessageText(messageProjectionTarget?.text);
+      let delta = nextText;
+      let replaceText = false;
+      if (effectivePreviousText && nextText.startsWith(effectivePreviousText)) {
+        delta = nextText.slice(effectivePreviousText.length);
+      } else if (effectivePreviousText && effectivePreviousText !== nextText) {
+        replaceText = true;
+      } else if (effectivePreviousText === nextText) {
+        delta = "";
+      }
+
+      if (shouldProjectAssistant && (delta || replaceText || !messageProjectionTarget)) {
+        events.push({
+          ...eventBase,
+          delta: replaceText ? "" : delta || nextText,
+          id: [
+            "projection-assistant-delta",
+            safeKey(messageId, "message"),
+            nextText.length,
+            stableProjectionHash(nextText),
+          ].join("-"),
+          replaceText,
+          text: replaceText ? nextText : "",
+          type: "thread.message.assistant.delta",
+        });
+      }
+      if (
+        shouldProjectAssistant
+        && (!messageProjectionTarget || messageProjectionTarget.status !== "complete" || messageProjectionTarget.text !== nextText)
+      ) {
+        events.push({
+          ...eventBase,
+          id: [
+            "projection-assistant-complete",
+            safeKey(messageId, "message"),
+            nextText.length,
+            stableProjectionHash(nextText),
+          ].join("-"),
+          text: nextText,
+          type: "thread.message.assistant.complete",
+        });
+      }
+      if (turnComplete && messageTurnId && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", messageTurnId)) {
+        events.push({
+          ...eventBase,
+          assistantMessageId: duplicateFinalAssistant?.id || messageId,
+          completedAt: createdAt,
+          id: `projection-provider-turn-completed-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+          status: "completed",
+          type: "thread.turn.completed",
+        });
+      }
+    } else if (message.role === "activity") {
+      if (projectedMessage && projectedMessage.text === message.text && projectedMessage.title === message.title) {
+        return;
+      }
+      events.push({
+        ...eventBase,
+        id: [
+          "projection-activity",
+          safeKey(messageId, "message"),
+          stableProjectionHash(`${message.kind}:${message.title}:${message.text}`),
+        ].join("-"),
+        status: message.status || "complete",
+        text: message.text,
+        type: projectionEventTypeForActivityKind(message.kind),
+      });
+      if (
+        isTranscriptTurnErrorMessage(message)
+        && messageTurnId
+        && !projectionHasTurnEvent(projectionEvents, "thread.turn.error", messageTurnId)
+      ) {
+        events.push({
+          ...eventBase,
+          completedAt: createdAt,
+          id: `projection-provider-turn-error-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+          status: "error",
+          text: message.text,
+          type: "thread.turn.error",
+        });
+      }
+    }
+
+    if (events.length > eventStartCount) {
+      projectionEvents = appendThreadProjectionEvents(projectionEvents, events.slice(eventStartCount));
+      projectedMessages = projectThreadProjectionMessages(projectionEvents, projectedMessages);
+    }
+  });
+
+  if (event.turnCompleteSeen === true && currentTurnId && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", currentTurnId)) {
+    const completedAt = cleanText(event.latestTimestamp || event.completedAt, nowIso());
+    const assistantMessage = [...projectedMessages].reverse().find((message) => (
+      message?.role === "assistant"
+      && (!message.turnId || message.turnId === currentTurnId)
+    ));
+    events.push({
+      agentId,
+      assistantMessageId: assistantMessage?.id || "",
+      completedAt,
+      createdAt: completedAt,
+      id: [
+        "projection-provider-turn-completed",
+        safeKey(currentTurnId, "turn"),
+        "fallback",
+        stableProjectionHash(completedAt),
+      ].join("-"),
+      messageId: assistantMessage?.id || currentTurnId,
+      source,
+      status: "completed",
+      turnId: currentTurnId,
+      type: "thread.turn.completed",
+    });
+  }
+
+  return events;
 }
 
 function defaultThreadTitle(terminalIndex, agentId) {
   const slot = Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1;
   const agent = cleanAgentId(agentId, DEFAULT_AGENT_ID);
-  const agentLabel = agent === "opencode"
-    ? "OpenCode"
-    : agent === "claude"
-      ? "Claude"
-      : agent === "generic"
-        ? "Shell"
-        : "Codex";
+  const agentLabel = getWorkspaceThreadAgentLabel(agent);
 
   return `${agentLabel} ${slot}`;
+}
+
+export function getWorkspaceThreadAgentLabel(threadOrAgentId) {
+  const agent = typeof threadOrAgentId === "string"
+    ? cleanAgentId(threadOrAgentId, DEFAULT_AGENT_ID)
+    : cleanAgentId(threadOrAgentId?.currentAgent || threadOrAgentId?.preferredAgent, DEFAULT_AGENT_ID);
+  if (agent === "opencode") {
+    return "OpenCode";
+  }
+  if (agent === "claude") {
+    return "Claude Code";
+  }
+  if (agent === "generic") {
+    return "Terminal";
+  }
+
+  return "Codex";
 }
 
 function isDefaultThreadTitleCandidate(value, thread) {
@@ -425,6 +1252,7 @@ function isDefaultThreadTitleCandidate(value, thread) {
 
   return THREAD_AGENT_IDS.some((agentId) => (
     title === defaultThreadTitle(getThreadTerminalIndex(thread) || 0, agentId).toLowerCase()
+    || title === `Claude ${Math.max(0, Number.parseInt(getThreadTerminalIndex(thread), 10) || 0) + 1}`.toLowerCase()
   ));
 }
 
@@ -619,7 +1447,19 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const currentAgent = cleanAgentId(thread.currentAgent || preferredAgent);
   const createdAt = cleanText(thread.createdAt, nowIso());
   const updatedAt = cleanText(thread.updatedAt, createdAt);
-  const messages = options.stripMessages ? [] : normalizeThreadMessages(thread.messages);
+  const projectionEvents = options.stripMessages
+    ? []
+    : normalizeThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents);
+  const messages = options.stripMessages
+    ? []
+    : (
+      projectionEvents.length
+        ? projectThreadProjectionMessages(projectionEvents, thread.messages)
+        : normalizeThreadMessages(thread.messages)
+    );
+  const projectedLatestTurn = options.stripMessages
+    ? normalizeThreadLatestTurn(thread.latestTurn)
+    : projectLatestTurnFromEvents(projectionEvents, thread.latestTurn);
   const messageCount = Math.max(normalizeMessageCount(thread.messageCount), messages.length);
   const materialized = thread.materialized === true || messageCount > 0;
   const status = cleanText(thread.status, "idle").toLowerCase();
@@ -647,11 +1487,18 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const storedSessionName = cleanThreadLabelCandidate(thread.sessionName);
   const storedTitle = cleanThreadLabelCandidate(thread.title);
 
+  const latestTurn = projectedLatestTurn;
+  const activityStatus = options.stripLiveBindings
+    ? "idle"
+    : activityStatusForLatestTurn(
+      latestTurn,
+      normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
+    );
+
   return {
     coordination,
-    activityStatus: options.stripLiveBindings
-      ? "idle"
-      : normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
+    activityStatus,
+    archivedAt: cleanText(thread.archivedAt),
     createdAt,
     currentAgent,
     id,
@@ -660,7 +1507,9 @@ function normalizeThread(thread, workspaceId, options = {}) {
     materialized,
     messageCount,
     messages,
+    latestTurn,
     pendingPrompt,
+    projectionEvents,
     preferredAgent,
     freshSessionStartedAt: options.stripLiveBindings ? "" : cleanText(thread.freshSessionStartedAt),
     sessionName: storedSessionName || storedTitle || fallbackTitle,
@@ -684,15 +1533,74 @@ function normalizeThread(thread, workspaceId, options = {}) {
   };
 }
 
+function archiveThreadRecord(thread, archivedAt = nowIso()) {
+  if (!thread) {
+    return null;
+  }
+
+  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const archivedLatestTurn = latestTurn?.state === "running"
+    ? normalizeThreadLatestTurn({
+      ...latestTurn,
+      completedAt: archivedAt,
+      state: "interrupted",
+      updatedAt: archivedAt,
+    })
+    : latestTurn;
+  const providerBindings = normalizeProviderBindings(
+    thread.providerBindings,
+    thread.currentAgent,
+    {
+      activityStatus: "idle",
+      coordination: thread.coordination,
+      lastActiveAt: thread.lastActiveAt,
+      lastMessageAt: thread.lastMessageAt,
+      messageCount: thread.messageCount,
+      status: "closed",
+      terminalBinding: null,
+      updatedAt: archivedAt,
+    },
+    { stripLiveBindings: true },
+  );
+
+  Object.keys(providerBindings).forEach((agentId) => {
+    providerBindings[agentId] = {
+      ...providerBindings[agentId],
+      activityStatus: "idle",
+      status: "closed",
+      terminalBinding: null,
+      updatedAt: archivedAt,
+    };
+  });
+
+  return {
+    ...thread,
+    activityStatus: "idle",
+    archivedAt: cleanText(thread.archivedAt, archivedAt),
+    latestTurn: archivedLatestTurn,
+    providerBindings,
+    status: "closed",
+    terminalBinding: null,
+    updatedAt: archivedAt,
+  };
+}
+
 function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
   const threadsSource = entry?.threads && typeof entry.threads === "object" && !Array.isArray(entry.threads)
     ? entry.threads
+    : {};
+  const archivedThreadsSource = entry?.archivedThreads
+    && typeof entry.archivedThreads === "object"
+    && !Array.isArray(entry.archivedThreads)
+    ? entry.archivedThreads
     : {};
   const hasTerminalThreadIdsSource = entry?.terminalThreadIds
     && typeof entry.terminalThreadIds === "object"
     && !Array.isArray(entry.terminalThreadIds);
   const normalizedThreads = {};
   const normalizedOrder = [];
+  const normalizedArchivedThreads = {};
+  const normalizedArchivedOrder = [];
   const terminalSource = !options.stripLiveBindings
     && entry?.terminals
     && typeof entry.terminals === "object"
@@ -702,9 +1610,42 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
   const normalizedTerminals = {};
   const normalizedTerminalOrder = [];
 
+  Object.values(archivedThreadsSource).forEach((thread) => {
+    const archivedAt = cleanText(thread?.archivedAt, nowIso());
+    const normalizedThread = normalizeThread(
+      {
+        ...thread,
+        archivedAt,
+      },
+      workspaceId,
+      {
+        ...options,
+        stripLiveBindings: true,
+      },
+    );
+    const archivedThread = archiveThreadRecord(normalizedThread, archivedAt);
+    if (!archivedThread || !archivedThread.materialized || normalizedArchivedThreads[archivedThread.id]) {
+      return;
+    }
+
+    normalizedArchivedThreads[archivedThread.id] = archivedThread;
+  });
+
   Object.values(threadsSource).forEach((thread) => {
     const normalizedThread = normalizeThread(thread, workspaceId, options);
-    if (!normalizedThread || !normalizedThread.materialized || normalizedThreads[normalizedThread.id]) {
+    if (!normalizedThread || !normalizedThread.materialized) {
+      return;
+    }
+
+    if (normalizedThread.archivedAt) {
+      const archivedThread = archiveThreadRecord(normalizedThread, normalizedThread.archivedAt);
+      if (archivedThread && !normalizedArchivedThreads[archivedThread.id]) {
+        normalizedArchivedThreads[archivedThread.id] = archivedThread;
+      }
+      return;
+    }
+
+    if (normalizedThreads[normalizedThread.id]) {
       return;
     }
 
@@ -722,6 +1663,20 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
   Object.keys(normalizedThreads).forEach((threadId) => {
     if (!normalizedOrder.includes(threadId)) {
       normalizedOrder.push(threadId);
+    }
+  });
+
+  const sourceArchivedOrder = Array.isArray(entry?.archivedThreadOrder) ? entry.archivedThreadOrder : [];
+  sourceArchivedOrder.forEach((threadId) => {
+    const safeThreadId = cleanText(threadId);
+    if (safeThreadId && normalizedArchivedThreads[safeThreadId] && !normalizedArchivedOrder.includes(safeThreadId)) {
+      normalizedArchivedOrder.push(safeThreadId);
+    }
+  });
+
+  Object.keys(normalizedArchivedThreads).forEach((threadId) => {
+    if (!normalizedArchivedOrder.includes(threadId)) {
+      normalizedArchivedOrder.push(threadId);
     }
   });
 
@@ -772,16 +1727,30 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
   }
 
   const activeThreadId = cleanText(entry?.activeThreadId);
+  const safeActiveThreadId = normalizedThreads[activeThreadId]
+    ? activeThreadId
+    : normalizedOrder[0] || "";
+  const threadsView = normalizeThreadsViewState(entry?.threadsView, {
+    selectedThreadId: safeActiveThreadId,
+    selectedWorkspaceId: workspaceId,
+  });
+  if (threadsView.selectedThreadId && !normalizedThreads[threadsView.selectedThreadId]) {
+    threadsView.selectedThreadId = safeActiveThreadId;
+  }
+  if (!threadsView.selectedWorkspaceId) {
+    threadsView.selectedWorkspaceId = workspaceId;
+  }
 
   return {
-    activeThreadId: normalizedThreads[activeThreadId]
-      ? activeThreadId
-      : normalizedOrder[0] || "",
+    activeThreadId: safeActiveThreadId,
+    archivedThreadOrder: normalizedArchivedOrder,
+    archivedThreads: normalizedArchivedThreads,
     terminalOrder: normalizedTerminalOrder,
     terminalThreadIds: normalizedTerminalThreadIds,
     terminals: normalizedTerminals,
     threadOrder: normalizedOrder.slice(0, MAX_THREADS_PER_WORKSPACE),
     threads: normalizedThreads,
+    threadsView,
   };
 }
 
@@ -838,11 +1807,14 @@ function ensureWorkspaceEntry(state, workspaceId) {
   const existing = normalizeWorkspaceEntry(state?.[workspaceId], workspaceId);
   return {
     activeThreadId: existing.activeThreadId,
+    archivedThreadOrder: existing.archivedThreadOrder.slice(),
+    archivedThreads: { ...existing.archivedThreads },
     terminalOrder: existing.terminalOrder.slice(),
     terminalThreadIds: { ...existing.terminalThreadIds },
     terminals: { ...existing.terminals },
     threadOrder: existing.threadOrder.slice(),
     threads: { ...existing.threads },
+    threadsView: { ...existing.threadsView },
   };
 }
 
@@ -879,10 +1851,12 @@ export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
         id: threadId,
         lastActiveAt: now,
         lastMessageAt: "",
+        latestTurn: null,
         materialized: true,
         messageCount: 0,
         messages: [],
         pendingPrompt: null,
+        projectionEvents: [],
         preferredAgent: agentId,
         providerBindings: {
           [agentId]: normalizeProviderBinding(null, agentId, {
@@ -980,12 +1954,71 @@ export function selectWorkspaceThread(state, workspaceId, threadId) {
 
   const thread = entry.threads[safeThreadId];
   const restoreChanged = rememberTerminalThread(entry, getThreadTerminalIndex(thread), safeThreadId);
-  if (entry.activeThreadId === safeThreadId && !restoreChanged) {
+  const nextThreadsView = {
+    ...normalizeThreadsViewState(entry.threadsView, {
+      selectedThreadId: entry.activeThreadId,
+      selectedWorkspaceId: safeWorkspaceId,
+    }),
+    newChatActive: false,
+    selectedThreadId: safeThreadId,
+    selectedWorkspaceId: safeWorkspaceId,
+  };
+  const viewChanged = JSON.stringify(entry.threadsView || {}) !== JSON.stringify(nextThreadsView);
+
+  if (entry.activeThreadId === safeThreadId && !restoreChanged && !viewChanged) {
     return state || {};
   }
 
   entry.activeThreadId = safeThreadId;
+  entry.threadsView = nextThreadsView;
 
+  return {
+    ...currentState,
+    [safeWorkspaceId]: entry,
+  };
+}
+
+export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) {
+  const safeWorkspaceId = cleanText(workspaceId || patch.workspaceId || patch.selectedWorkspaceId);
+  if (!safeWorkspaceId) {
+    return state || {};
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[safeWorkspaceId]
+    ? ensureWorkspaceEntry(currentState, safeWorkspaceId)
+    : null;
+  if (!entry) {
+    return state || {};
+  }
+
+  const existingView = normalizeThreadsViewState(entry.threadsView, {
+    selectedThreadId: entry.activeThreadId,
+    selectedWorkspaceId: safeWorkspaceId,
+  });
+  const requestedThreadId = cleanText(patch.selectedThreadId || patch.threadId);
+  const selectedThreadId = requestedThreadId && entry.threads[requestedThreadId]
+    ? requestedThreadId
+    : requestedThreadId
+      ? existingView.selectedThreadId
+      : existingView.selectedThreadId;
+  const nextView = {
+    ...existingView,
+    newChatActive: typeof patch.newChatActive === "boolean"
+      ? patch.newChatActive
+      : existingView.newChatActive,
+    railCollapsed: typeof patch.railCollapsed === "boolean"
+      ? patch.railCollapsed
+      : existingView.railCollapsed,
+    selectedThreadId: selectedThreadId || entry.activeThreadId || "",
+    selectedWorkspaceId: cleanText(patch.selectedWorkspaceId || safeWorkspaceId, existingView.selectedWorkspaceId || safeWorkspaceId),
+  };
+
+  if (JSON.stringify(existingView) === JSON.stringify(nextView)) {
+    return state || {};
+  }
+
+  entry.threadsView = nextView;
   return {
     ...currentState,
     [safeWorkspaceId]: entry,
@@ -1183,6 +2216,11 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
 
   const currentState = normalizeWorkspaceThreads(state);
   const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const eventAgentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const eventNativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
+  if (eventNativeSessionId && workspaceEntryHasArchivedSession(entry, eventAgentId, eventNativeSessionId)) {
+    return state || {};
+  }
   const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
   const terminalKey = terminalSessionKey(terminalIndex);
   const eventThreadId = cleanText(event.threadId);
@@ -1202,6 +2240,9 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
   } else if (terminal && !threadId && isThreadAgentId(terminal.agentId)) {
     const now = nowIso();
     const nextThreadId = createThreadIdForTerminal(workspaceId, terminal.terminalIndex);
+    const freshSessionStartedAt = event.freshSession
+      ? cleanText(event.freshSessionStartedAt, now)
+      : "";
     entry.threads[nextThreadId] = {
       coordination: normalizeCoordination({
         worktreePath: terminal.worktreePath,
@@ -1211,10 +2252,13 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
       id: nextThreadId,
       lastActiveAt: now,
       lastMessageAt: "",
+      latestTurn: null,
+      freshSessionStartedAt,
       materialized: true,
       messageCount: 0,
       messages: [],
       pendingPrompt: null,
+      projectionEvents: [],
       preferredAgent: terminal.agentId,
       providerBindings: {
         [terminal.agentId]: normalizeProviderBinding(null, terminal.agentId, {
@@ -1240,6 +2284,7 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
       }),
       terminalIndex: terminal.terminalIndex,
       title: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
+      transcriptHydrationMode: event.freshSession ? "session-only" : "",
       updatedAt: now,
       workspaceId,
     };
@@ -1265,8 +2310,15 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   const terminalKey = terminalSessionKey(terminalIndex);
   const existingTerminal = terminalKey ? entry.terminals[terminalKey] : null;
   const existingThreadId = cleanText(event.threadId || existingTerminal?.threadId);
+  if (workspaceEntryHasArchivedThreadId(entry, existingThreadId)) {
+    return state || {};
+  }
   const now = nowIso();
   const agentId = cleanAgentId(event.agentId || existingTerminal?.agentId || DEFAULT_AGENT_ID);
+  const eventNativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
+  if (eventNativeSessionId && workspaceEntryHasArchivedSession(entry, agentId, eventNativeSessionId)) {
+    return state || {};
+  }
   const threadId = existingThreadId || createThreadIdForTerminal(workspaceId, terminalIndex);
   const submittedUserMessage = cleanSubmittedUserMessage(event.userMessage || event.message);
   const promptLabel = getWorkspaceThreadPromptLabel(
@@ -1304,10 +2356,12 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       id: threadId,
       lastActiveAt: now,
       lastMessageAt: now,
+      latestTurn: null,
       materialized: true,
       messageCount: 0,
       messages: [],
       pendingPrompt: null,
+      projectionEvents: [],
       preferredAgent: agentId,
       freshSessionStartedAt,
       providerBindings: isThreadAgentId(agentId)
@@ -1339,11 +2393,23 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     status: event.status || "active",
   });
   if (entry.threads[threadId]) {
-    const messages = appendThreadUserMessage(entry.threads[threadId], event);
-    const messageAdded = messages.length > previousMessages.length;
-    const activityStatus = messageAdded || pendingPrompt
-      ? entry.threads[threadId].activityStatus
-      : previousActivityStatus;
+    const submittedEvents = createSubmittedUserProjectionEvents(entry.threads[threadId], event);
+    const projectionEvents = appendThreadProjectionEvents(
+      ensureThreadProjectionEvents(entry.threads[threadId]),
+      submittedEvents,
+    );
+    const messages = projectThreadProjectionMessages(projectionEvents, entry.threads[threadId].messages);
+    const messageAdded = submittedEvents.length > 0 && messages.length > previousMessages.length;
+    const latestTurn = projectLatestTurnFromEvents(
+      projectionEvents,
+      entry.threads[threadId].latestTurn,
+    );
+    const activityStatus = activityStatusForLatestTurn(
+      latestTurn,
+      messageAdded || pendingPrompt
+        ? entry.threads[threadId].activityStatus
+        : previousActivityStatus,
+    );
     const providerBindings = normalizeProviderBindings(
       entry.threads[threadId].providerBindings,
       entry.threads[threadId].currentAgent,
@@ -1368,9 +2434,11 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       ...entry.threads[threadId],
       activityStatus,
       lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : entry.threads[threadId].lastMessageAt,
+      latestTurn,
       messageCount: messages.length,
       messages,
       pendingPrompt: pendingPrompt || entry.threads[threadId].pendingPrompt,
+      projectionEvents,
       freshSessionStartedAt,
       providerBindings,
       transcriptHydrationMode,
@@ -1450,6 +2518,16 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
 
   if (existing) {
     const agentId = cleanAgentId(event.agentId || terminal?.agentId || existing.currentAgent, "");
+    const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+    const latestTurn = existingLatestTurn?.state === "running"
+      ? normalizeThreadLatestTurn({
+        ...existingLatestTurn,
+        completedAt: now,
+        error: safeStatus === "error" ? "Terminal error" : existingLatestTurn.error,
+        state: safeStatus === "error" ? "error" : "interrupted",
+        updatedAt: now,
+      })
+      : existingLatestTurn;
     const providerBindings = normalizeProviderBindings(
       existing.providerBindings,
       existing.currentAgent,
@@ -1485,6 +2563,7 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
     entry.threads[threadId] = {
       ...existing,
       activityStatus: "idle",
+      latestTurn,
       providerBindings,
       status: safeStatus,
       terminalBinding: null,
@@ -1598,6 +2677,74 @@ function workspaceThreadHasProviderSession(thread, agentId, sessionId) {
     || cleanText(providerBinding?.nativeSessionId) === safeSessionId;
 }
 
+function collectWorkspaceThreadSessionIds(thread, agentId = "") {
+  if (!thread) {
+    return [];
+  }
+
+  const sessionIds = new Set();
+  [
+    thread.transcriptSessionId,
+    thread.coordination?.sessionId,
+  ].forEach((sessionId) => {
+    const safeSessionId = cleanText(sessionId);
+    if (safeSessionId) {
+      sessionIds.add(safeSessionId);
+    }
+  });
+
+  const safeAgentId = cleanAgentId(agentId, "");
+  const bindings = safeAgentId
+    ? [getWorkspaceThreadProviderBinding(thread, safeAgentId)]
+    : Object.values(thread.providerBindings || {});
+  bindings.forEach((binding) => {
+    const safeSessionId = cleanText(binding?.nativeSessionId);
+    if (safeSessionId) {
+      sessionIds.add(safeSessionId);
+    }
+  });
+
+  return [...sessionIds];
+}
+
+function workspaceEntryHasArchivedThreadId(entry, threadId) {
+  const safeThreadId = cleanText(threadId);
+  return Boolean(safeThreadId && entry?.archivedThreads?.[safeThreadId]);
+}
+
+function workspaceEntryHasArchivedSession(entry, agentId, sessionId) {
+  const safeSessionId = cleanText(sessionId);
+  if (!entry?.archivedThreads || !safeSessionId) {
+    return false;
+  }
+
+  return Object.values(entry.archivedThreads).some((thread) => (
+    collectWorkspaceThreadSessionIds(thread, agentId).includes(safeSessionId)
+  ));
+}
+
+export function workspaceThreadSessionIsArchived(state, workspaceId, agentId, sessionId) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  const safeSessionId = cleanText(sessionId);
+  if (!safeWorkspaceId || !safeSessionId) {
+    return false;
+  }
+
+  const entry = normalizeWorkspaceThreads(state)[safeWorkspaceId];
+  return workspaceEntryHasArchivedSession(entry, agentId, safeSessionId);
+}
+
+export function workspaceThreadIdIsArchived(state, workspaceId, threadId) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  const safeThreadId = cleanText(threadId);
+  if (!safeWorkspaceId || !safeThreadId) {
+    return false;
+  }
+
+  const entry = normalizeWorkspaceThreads(state)[safeWorkspaceId];
+  return workspaceEntryHasArchivedThreadId(entry, safeThreadId);
+}
+
 function findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, ignoreThreadId = "") {
   const safeSessionId = cleanText(sessionId);
   if (!entry?.threads || !safeSessionId) {
@@ -1624,7 +2771,10 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
   const currentState = normalizeWorkspaceThreads(state);
   const entry = currentState[workspaceId];
   const existing = entry?.threads?.[threadId];
-  if (!existing) {
+  if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId)) {
+    return state || {};
+  }
+  if (workspaceEntryHasArchivedSession(entry, agentId, nativeSessionId)) {
     return state || {};
   }
   const duplicateThreadId = findWorkspaceThreadIdForProviderSession(
@@ -1796,154 +2946,25 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
   };
 }
 
-function threadMessageSortTime(message, fallbackIndex) {
+function threadMessageTimestampMs(message) {
   const createdAt = String(message?.createdAt || "").trim();
   const numericTimestamp = Number.parseFloat(createdAt);
   if (Number.isFinite(numericTimestamp) && numericTimestamp > 1_000_000_000) {
-    return numericTimestamp;
+    return numericTimestamp < 10_000_000_000 ? numericTimestamp * 1000 : numericTimestamp;
   }
+
   const timestamp = Date.parse(createdAt);
-  return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER - fallbackIndex;
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
-function threadMessageMergeKey(message) {
-  const role = cleanText(message?.role);
-  const kind = cleanText(message?.kind, "message");
-  const callId = cleanText(message?.callId);
-  const text = cleanMessageText(message?.text);
-  if (callId) {
-    return `${role}:${kind}:${callId}:${text}`;
-  }
-  return `${role}:${kind}:${text}`;
-}
-
-function mergeThreadSessionMessages(existingMessages, incomingMessages) {
-  const incoming = normalizeThreadMessages(incomingMessages);
-  const incomingHasAgentOutput = incoming.some((message) => (
-    message.role === "assistant" || message.role === "activity"
-  ));
-  const existing = normalizeThreadMessages(existingMessages)
-    .filter((message) => !incomingHasAgentOutput || message.kind !== "live_output");
-  const byKey = new Map();
-
-  incoming.forEach((message, index) => {
-    const key = threadMessageMergeKey(message);
-    if (!key || byKey.has(key)) {
-      return;
-    }
-    byKey.set(key, { ...message, __mergeIndex: index });
-  });
-
-  existing.forEach((message, index) => {
-    const key = threadMessageMergeKey(message);
-    if (!key || byKey.has(key)) {
-      return;
-    }
-    byKey.set(key, { ...message, __mergeIndex: incoming.length + index });
-  });
-
-  return Array.from(byKey.values())
-    .sort((left, right) => (
-      threadMessageSortTime(left, left.__mergeIndex) - threadMessageSortTime(right, right.__mergeIndex)
-      || left.__mergeIndex - right.__mergeIndex
-    ))
-    .map(({ __mergeIndex, ...message }) => message)
-    .slice(-MAX_THREAD_MESSAGES);
-}
-
-export function appendWorkspaceThreadAgentOutput(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
-  const sanitizedOutputText = cleanLiveViewText(event.outputText || event.text, { agentKind: agentId });
-  const text = cleanMessageText(
-    sanitizedOutputText,
-  );
-  if (!workspaceId || !threadId || !isThreadAgentId(agentId) || !text) {
-    return markWorkspaceThreadAgentActivity(state, event);
+function areThreadMessagesSameTurn(left, right, maxDeltaMs = 5000) {
+  const leftTimestamp = threadMessageTimestampMs(left);
+  const rightTimestamp = threadMessageTimestampMs(right);
+  if (!leftTimestamp || !rightTimestamp) {
+    return false;
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
-    return state || {};
-  }
-
-  const now = nowIso();
-  const messages = normalizeThreadMessages(existing.messages);
-  const lastIndex = messages.length - 1;
-  const lastMessage = messages[lastIndex];
-  const canAppend = lastMessage
-    && lastMessage.role === "assistant"
-    && lastMessage.kind === "live_output"
-    && lastMessage.agentId === agentId;
-  const nextMessages = messages.slice();
-  if (canAppend) {
-    const nextText = cleanMessageText(`${lastMessage.text}${text}`).slice(-LIVE_OUTPUT_MAX_CHARS);
-    nextMessages[lastIndex] = {
-      ...lastMessage,
-      createdAt: now,
-      status: "streaming",
-      text: nextText,
-    };
-  } else {
-    nextMessages.push({
-      agentId,
-      createdAt: now,
-      id: createRandomId(`live-${safeKey(threadId, "thread")}`),
-      kind: "live_output",
-      role: "assistant",
-      source: "terminal-live",
-      status: "streaming",
-      text: text.slice(-LIVE_OUTPUT_MAX_CHARS),
-      title: "",
-    });
-  }
-
-  const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
-    {
-      activityStatus: "idle",
-      coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: now,
-      messageCount: nextMessages.length,
-      status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: now,
-    },
-  );
-  if (providerBindings[agentId]) {
-    providerBindings[agentId] = {
-      ...providerBindings[agentId],
-      activityStatus: "idle",
-      lastMessageAt: now,
-      messageCount: nextMessages.length,
-      updatedAt: now,
-    };
-  }
-
-  return {
-    ...currentState,
-    [workspaceId]: {
-      ...entry,
-      threads: {
-        ...entry.threads,
-        [threadId]: {
-          ...existing,
-          activityStatus: existing.currentAgent === agentId ? "idle" : existing.activityStatus,
-          lastMessageAt: now,
-          materialized: true,
-          messageCount: nextMessages.length,
-          messages: nextMessages.slice(-MAX_THREAD_MESSAGES),
-          providerBindings,
-          updatedAt: now,
-        },
-      },
-    },
-  };
+  return Math.abs(leftTimestamp - rightTimestamp) <= maxDeltaMs;
 }
 
 export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
@@ -1957,7 +2978,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const currentState = normalizeWorkspaceThreads(state);
   const entry = currentState[workspaceId];
   const existing = entry?.threads?.[threadId];
-  if (!existing) {
+  if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId) || existing.archivedAt) {
     return state || {};
   }
 
@@ -1973,6 +2994,9 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     return state || {};
   }
   if (sessionId) {
+    if (workspaceEntryHasArchivedSession(entry, agentId, sessionId)) {
+      return state || {};
+    }
     const duplicateThreadId = findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, threadId);
     if (duplicateThreadId) {
       return state || {};
@@ -1982,7 +3006,19 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
   const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
   const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
-  const messages = mergeThreadSessionMessages(existing.messages, event.messages);
+  const projectionEvents = appendThreadProjectionEvents(
+    ensureThreadProjectionEvents(existing),
+    createProjectionEventsFromTranscript(existing, event.messages, {
+      agentId,
+      completedAt: event.completedAt,
+      latestTimestamp: event.latestTimestamp,
+      source: cleanText(event.source, `${agentId}-session`),
+      turnCompleteSeen: event.turnCompleteSeen,
+    }),
+  );
+  const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
+  const latestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const activityStatus = activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
     : existing.lastMessageAt;
@@ -1990,7 +3026,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     existing.providerBindings,
     existing.currentAgent,
     {
-      activityStatus: "idle",
+      activityStatus,
       coordination: existing.coordination,
       lastActiveAt: existing.lastActiveAt,
       lastMessageAt,
@@ -2004,6 +3040,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   if (sessionId && providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
+      activityStatus,
       nativeSessionId: sessionId,
       nativeSessionKind: "session",
       nativeSessionSource: cleanText(event.source, "codex-rollout"),
@@ -2017,6 +3054,12 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       nativeSessionUpdatedAt: now,
       updatedAt: now,
     };
+  } else if (providerBindings[agentId]) {
+    providerBindings[agentId] = {
+      ...providerBindings[agentId],
+      activityStatus,
+      updatedAt: now,
+    };
   }
 
   return {
@@ -2027,11 +3070,13 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus: "idle",
+          activityStatus,
           lastMessageAt,
+          latestTurn,
           materialized: true,
           messageCount: messages.length,
           messages,
+          projectionEvents,
           providerBindings,
           sessionName: sessionTitle || existingSessionName || existingTitle || title,
           title,
@@ -2063,7 +3108,10 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   }
 
   const now = nowIso();
-  const activityStatus = normalizeThreadActivityStatus(event.activityStatus);
+  const hasExplicitActivityStatus = cleanText(event.activityStatus) !== "";
+  const activityStatus = hasExplicitActivityStatus
+    ? normalizeThreadActivityStatus(event.activityStatus)
+    : activityStatusForLatestTurn(existing.latestTurn, existing.activityStatus);
   const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
@@ -2161,7 +3209,7 @@ export function getWorkspaceThreadsByTerminalIndex(state, workspaceId, terminalI
   return byIndex;
 }
 
-export function deleteWorkspaceThread(state, workspaceId, threadId) {
+export function archiveWorkspaceThread(state, workspaceId, threadId) {
   const safeWorkspaceId = cleanText(workspaceId);
   const safeThreadId = cleanText(threadId);
   if (!safeWorkspaceId || !safeThreadId) {
@@ -2170,10 +3218,20 @@ export function deleteWorkspaceThread(state, workspaceId, threadId) {
 
   const currentState = normalizeWorkspaceThreads(state);
   const entry = ensureWorkspaceEntry(currentState, safeWorkspaceId);
-  if (!entry.threads[safeThreadId]) {
+  const existing = entry.threads[safeThreadId];
+  if (!existing) {
+    return state || {};
+  }
+  if (!getWorkspaceThreadCanArchive(existing)) {
     return state || {};
   }
 
+  const archivedAt = nowIso();
+  entry.archivedThreads[safeThreadId] = archiveThreadRecord(existing, archivedAt);
+  entry.archivedThreadOrder = [
+    safeThreadId,
+    ...entry.archivedThreadOrder.filter((candidateId) => candidateId !== safeThreadId),
+  ];
   delete entry.threads[safeThreadId];
   forgetThreadEverywhere(entry, safeThreadId);
   entry.threadOrder = entry.threadOrder.filter((candidateId) => candidateId !== safeThreadId);
@@ -2189,11 +3247,26 @@ export function deleteWorkspaceThread(state, workspaceId, threadId) {
   if (entry.activeThreadId === safeThreadId) {
     entry.activeThreadId = entry.threadOrder[0] || "";
   }
+  if (entry.threadsView?.selectedThreadId === safeThreadId) {
+    entry.threadsView = {
+      ...normalizeThreadsViewState(entry.threadsView, {
+        selectedThreadId: entry.activeThreadId,
+        selectedWorkspaceId: safeWorkspaceId,
+      }),
+      newChatActive: false,
+      selectedThreadId: entry.activeThreadId || "",
+      selectedWorkspaceId: safeWorkspaceId,
+    };
+  }
 
   return {
     ...currentState,
     [safeWorkspaceId]: entry,
   };
+}
+
+export function deleteWorkspaceThread(state, workspaceId, threadId) {
+  return archiveWorkspaceThread(state, workspaceId, threadId);
 }
 
 function getThreadSessionLabel(thread) {
@@ -2212,6 +3285,24 @@ function getThreadSessionLabel(thread) {
   ]
     .map(cleanThreadLabelCandidate)
     .find(Boolean) || "";
+}
+
+export function getWorkspaceThreadHasSession(thread) {
+  if (!thread) {
+    return false;
+  }
+
+  if (cleanText(thread.transcriptSessionId)) {
+    return true;
+  }
+
+  return Object.values(thread.providerBindings || {}).some((binding) => (
+    Boolean(cleanText(binding?.nativeSessionId))
+  ));
+}
+
+export function getWorkspaceThreadCanArchive(thread) {
+  return getWorkspaceThreadHasSession(thread);
 }
 
 function getThreadNativeTitleLabel(thread) {
@@ -2257,6 +3348,10 @@ function getThreadPromptFallbackLabel(thread) {
 }
 
 export function getWorkspaceThreadLabel(thread) {
+  if (!getWorkspaceThreadHasSession(thread)) {
+    return getWorkspaceThreadAgentLabel(thread);
+  }
+
   const nativeTitleLabel = getThreadNativeTitleLabel(thread);
   if (nativeTitleLabel) {
     return nativeTitleLabel;
@@ -2277,7 +3372,7 @@ export function getWorkspaceThreadLabel(thread) {
     return sessionLabel;
   }
 
-  return cleanThreadLabelCandidate(thread?.sessionName || thread?.title)
+  return cleanRealThreadTitleCandidate(thread?.sessionName || thread?.title, thread)
     || defaultThreadTitle(getThreadTerminalIndex(thread) || 0, thread?.currentAgent || DEFAULT_AGENT_ID);
 }
 
@@ -2296,6 +3391,14 @@ export function getWorkspaceThreadProviderBinding(thread, agentId) {
     terminalBinding: thread.currentAgent === safeAgentId ? thread.terminalBinding : null,
     updatedAt: thread.updatedAt,
   });
+}
+
+export function getWorkspaceThreadLatestTurn(thread) {
+  return normalizeThreadLatestTurn(thread?.latestTurn);
+}
+
+export function getWorkspaceThreadTurnState(thread) {
+  return normalizeThreadLatestTurn(thread?.latestTurn)?.state || "";
 }
 
 export { THREAD_AGENT_IDS, WORKSPACE_THREADS_STORAGE_KEY };

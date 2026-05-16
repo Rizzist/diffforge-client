@@ -2003,6 +2003,7 @@ function TerminalView({
   onOpenWorkspaceSettings,
   onArchiveWorkspaceThread,
   onSelectWorkspaceThread,
+  onWorkspaceThreadsViewStateChange,
   onThreadTerminalLifecycle,
   refreshAgentStatuses,
   reorderWorkspaceTerminalDisplayLayout,
@@ -2093,9 +2094,26 @@ function TerminalView({
   ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
-  const selectedWorkspaceThreadId = terminalWorkspace
-    ? workspaceThreads?.[terminalWorkspace.id]?.activeThreadId || ""
-    : "";
+  const workspaceThreadEntry = terminalWorkspace
+    ? workspaceThreads?.[terminalWorkspace.id] || null
+    : null;
+  const selectedWorkspaceThreadId = workspaceThreadEntry?.threadsView?.selectedThreadId
+    || workspaceThreadEntry?.activeThreadId
+    || "";
+  const getLiveTerminalPaneIdForThread = useCallback((threadId) => {
+    const safeThreadId = String(threadId || "").trim();
+    if (!safeThreadId || !workspaceThreadEntry?.terminals) {
+      return "";
+    }
+
+    const terminal = Object.values(workspaceThreadEntry.terminals).find((candidate) => (
+      candidate?.threadId === safeThreadId
+      && ["active", "starting"].includes(String(candidate.status || "").toLowerCase())
+      && Number.isInteger(Number.parseInt(candidate.terminalIndex, 10))
+    ));
+
+    return terminal ? getTerminalPaneId(Number.parseInt(terminal.terminalIndex, 10)) : "";
+  }, [getTerminalPaneId, workspaceThreadEntry]);
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
     && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
   const fullscreenState = fullscreenActive
@@ -2761,6 +2779,10 @@ function TerminalView({
     clearFullscreenTransitionTimer();
 
     if (fullscreenActive && fullscreenTerminalIndex === terminalIndex) {
+      const selectedLivePaneId = getLiveTerminalPaneIdForThread(selectedWorkspaceThreadId);
+      if (selectedLivePaneId) {
+        setActiveTerminalPaneId(selectedLivePaneId);
+      }
       setFullscreenMotion({
         ...motion,
         phase: "closing",
@@ -2798,8 +2820,10 @@ function TerminalView({
     fullscreenActive,
     fullscreenTerminalIndex,
     getFullscreenMotionFromRect,
+    getLiveTerminalPaneIdForThread,
     getTerminalThread,
     onSelectWorkspaceThread,
+    selectedWorkspaceThreadId,
     terminalWorkspace?.id,
   ]);
 
@@ -2953,6 +2977,7 @@ function TerminalView({
                 onRecheckAgents={refreshAgentStatuses}
                 onSplitTerminal={handleSplitTerminal}
                 onSelectWorkspaceThread={onSelectWorkspaceThread}
+                onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
                 onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
@@ -2997,6 +3022,7 @@ function TerminalView({
       onRecheckAgents={refreshAgentStatuses}
       onSplitTerminal={handleSplitTerminal}
       onSelectWorkspaceThread={onSelectWorkspaceThread}
+      onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
       onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
