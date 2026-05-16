@@ -1997,9 +1997,11 @@ function TerminalView({
   agentStatusState,
   changeWorkspaceTerminalRole,
   closeWorkspaceTerminal,
+  createWorkspaceThreadTerminal,
   createFirstWorkspace,
   handlePreparedTerminalChange,
   onOpenWorkspaceSettings,
+  onArchiveWorkspaceThread,
   onSelectWorkspaceThread,
   onThreadTerminalLifecycle,
   refreshAgentStatuses,
@@ -2944,7 +2946,9 @@ function TerminalView({
                 onBeginTerminalDrag={handleBeginTerminalDrag}
                 onChangeTerminalRole={changeWorkspaceTerminalRole}
                 onCloseTerminal={closeWorkspaceTerminal}
+                onCreateWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                 onOpenSettings={showSettingsView}
+                onArchiveWorkspaceThread={onArchiveWorkspaceThread}
                 onPreparedTerminalChange={handlePreparedTerminalChange}
                 onRecheckAgents={refreshAgentStatuses}
                 onSplitTerminal={handleSplitTerminal}
@@ -2986,7 +2990,9 @@ function TerminalView({
       onActivateTerminal={handleActivateTerminalPane}
       onChangeTerminalRole={changeWorkspaceTerminalRole}
       onCloseTerminal={closeWorkspaceTerminal}
+      onCreateWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
       onOpenSettings={showSettingsView}
+      onArchiveWorkspaceThread={onArchiveWorkspaceThread}
       onPreparedTerminalChange={handlePreparedTerminalChange}
       onRecheckAgents={refreshAgentStatuses}
       onSplitTerminal={handleSplitTerminal}

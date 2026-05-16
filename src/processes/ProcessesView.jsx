@@ -1102,7 +1102,7 @@ const ProcessBucketsGrid = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: repeat(auto-fit, minmax(236px, 292px));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 324px));
   gap: 8px;
   align-items: start;
   align-content: start;
@@ -1142,7 +1142,7 @@ const ProcessBucketRow = styled.div`
   display: grid;
   height: 28px;
   min-width: 0;
-  grid-template-columns: 18px minmax(34px, 1fr) minmax(0, auto) 58px auto;
+  grid-template-columns: 18px minmax(0, 1fr) auto max-content max-content;
   align-items: center;
   gap: 5px;
   overflow: hidden;
@@ -1213,17 +1213,19 @@ const ProcessRowMain = styled.div`
 
 const ProcessRowUsage = styled.div`
   display: inline-flex;
-  min-width: 0;
+  min-width: max-content;
   align-items: baseline;
+  flex: 0 0 auto;
   justify-content: flex-end;
   gap: 5px;
-  overflow: hidden;
+  overflow: visible;
   color: var(--forge-text-muted);
+  white-space: nowrap;
 
   strong,
   span {
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex: 0 0 auto;
+    overflow: visible;
     white-space: nowrap;
   }
 
@@ -1269,8 +1271,9 @@ const ProcessRowPorts = styled.span`
 
 const ProcessRowActions = styled.div`
   display: inline-flex;
-  min-width: 0;
+  min-width: max-content;
   align-items: center;
+  flex: 0 0 auto;
   justify-content: flex-end;
   gap: 3px;
 `;
@@ -1280,18 +1283,23 @@ const ProcessDockerActionButton = styled.button`
   width: 20px;
   height: 20px;
   place-items: center;
+  padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 6px;
+  appearance: none;
   color: rgba(255, 255, 255, 0.76);
   background: rgba(255, 255, 255, 0.035);
+  line-height: 0;
   transition:
     border-color 140ms ease,
     color 140ms ease,
     background 140ms ease;
 
   svg {
+    display: block;
     width: 12px;
     height: 12px;
+    flex: 0 0 auto;
   }
 
   &:hover:not(:disabled) {
@@ -1317,18 +1325,23 @@ const ProcessRowStopButton = styled.button`
   width: 20px;
   height: 20px;
   place-items: center;
+  padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 6px;
+  appearance: none;
   color: rgba(255, 255, 255, 0.82);
   background: rgba(255, 255, 255, 0.045);
+  line-height: 0;
   transition:
     border-color 140ms ease,
     color 140ms ease,
     background 140ms ease;
 
   svg {
+    display: block;
     width: 12px;
     height: 12px;
+    flex: 0 0 auto;
   }
 
   &:hover:not(:disabled) {

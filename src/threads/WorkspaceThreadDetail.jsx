@@ -3,7 +3,7 @@ import { AddPhotoAlternate } from "@styled-icons/material-rounded/AddPhotoAltern
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import {
@@ -26,8 +26,17 @@ const DetailRoot = styled.main`
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
-  color: #d9d9d9;
-  background: #000000;
+  --thread-bg: #09090b;
+  --thread-card: #0d0d10;
+  --thread-fg: #f4f4f5;
+  --thread-muted: #a1a1aa;
+  --thread-muted-soft: rgba(161, 161, 170, 0.48);
+  --thread-border: rgba(255, 255, 255, 0.065);
+  --thread-accent: rgba(255, 255, 255, 0.055);
+  --thread-secondary: rgba(255, 255, 255, 0.045);
+  --thread-ring: rgba(98, 132, 255, 0.46);
+  color: var(--thread-fg);
+  background: var(--thread-bg);
   font-family:
     Inter,
     ui-sans-serif,
@@ -50,12 +59,12 @@ const TranscriptScroll = styled.div`
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  background: #000000;
+  background: var(--thread-bg);
   user-select: text;
   -webkit-user-select: text;
 
   &::-webkit-scrollbar {
-    width: 10px;
+    width: 6px;
   }
 
   &::-webkit-scrollbar-track {
@@ -63,20 +72,19 @@ const TranscriptScroll = styled.div`
   }
 
   &::-webkit-scrollbar-thumb {
-    border: 3px solid #000000;
     border-radius: 999px;
-    background: #53657b;
+    background: rgba(255, 255, 255, 0.1);
   }
 `;
 
 const TranscriptInner = styled.div`
   display: grid;
-  width: min(100%, 880px);
+  width: min(100%, 768px);
   min-height: 100%;
   align-content: end;
-  gap: 6px;
+  gap: 0;
   margin: 0 auto;
-  padding: 58px 24px 26px;
+  padding: 28px 24px 20px;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -85,28 +93,26 @@ const EmptyThread = styled.div`
   align-self: center;
   justify-self: center;
   max-width: 360px;
-  color: #6f7d8f;
-  font-size: 12px;
+  color: var(--thread-muted-soft);
+  font-size: 13px;
   line-height: 1.45;
   text-align: center;
 `;
 
 const UserCell = styled.article`
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 8px;
-  padding: 10px 0 8px;
-  color: #ededed;
-  font-size: 13px;
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  padding: 0 0 16px;
+  color: var(--thread-fg);
+  font-size: 14px;
   line-height: 1.58;
   user-select: text;
   -webkit-user-select: text;
 `;
 
 const UserPrefix = styled.span`
-  color: #9ca3af;
-  font-weight: 740;
-  line-height: 1.58;
+  display: none;
   user-select: none;
 `;
 
@@ -114,11 +120,11 @@ const MessageText = styled.div`
   min-width: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: #d8dbd4;
-  font-size: 13px;
-  font-weight: 520;
+  color: var(--thread-fg);
+  font-size: 14px;
+  font-weight: 430;
   letter-spacing: 0;
-  line-height: 1.55;
+  line-height: 1.65;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -126,18 +132,35 @@ const MessageText = styled.div`
 const MessageBody = styled.div`
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: 7px;
+
+  article[data-message-role="user"] & {
+    max-width: min(80%, 620px);
+    border: 1px solid var(--thread-border);
+    border-radius: 18px 18px 4px;
+    padding: 12px 15px;
+    background: var(--thread-secondary);
+  }
+
+  article[data-message-role="assistant"] & {
+    width: 100%;
+    padding: 1px 4px;
+  }
+
+  article[data-message-role="activity"] & {
+    width: 100%;
+  }
 `;
 
 const MessageInlineCode = styled.code`
   display: inline;
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 1px 5px 2px;
-  color: #f2f2ed;
-  background: #1b1d19;
+  color: #f8fafc;
+  background: rgba(255, 255, 255, 0.08);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.92em;
-  font-weight: 650;
+  font-weight: 560;
 `;
 
 const MessageFileLink = styled.button`
@@ -145,49 +168,35 @@ const MessageFileLink = styled.button`
   min-width: 0;
   padding: 0;
   border: 0;
-  color: #57a6ff;
+  color: #93c5fd;
   background: transparent;
   font: inherit;
-  font-weight: 650;
+  font-weight: 560;
   text-align: left;
   text-decoration: none;
   user-select: text;
   -webkit-user-select: text;
 
   &:hover {
-    color: #88c2ff;
+    color: #bfdbfe;
     text-decoration: underline;
     text-underline-offset: 2px;
   }
 `;
 
-const MessageTimestamp = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: #3d423d;
-  font-size: 11px;
-  font-weight: 620;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  user-select: text;
-  -webkit-user-select: text;
-`;
-
 const AssistantCell = styled.article`
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 8px;
-  padding: 0 0 10px;
-  color: #d6d6d6;
-  font-size: 13px;
+  display: block;
+  min-width: 0;
+  padding: 0 0 16px;
+  color: var(--thread-fg);
+  font-size: 14px;
   line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
 `;
 
 const AssistantPrefix = styled.span`
-  color: transparent;
+  display: none;
   user-select: none;
 `;
 
@@ -195,8 +204,8 @@ const TranscriptActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
   gap: 8px;
-  padding: 2px 0 8px;
-  color: #8f97a3;
+  padding: 2px 4px 12px;
+  color: var(--thread-muted);
   font-size: 12px;
   line-height: 1.5;
   user-select: text;
@@ -206,8 +215,8 @@ const TranscriptActivityCell = styled.article`
 const TranscriptActivityTitle = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: #a6afbd;
-  font-weight: 640;
+  color: var(--thread-muted);
+  font-weight: 520;
   text-overflow: ellipsis;
   white-space: nowrap;
   user-select: text;
@@ -220,9 +229,9 @@ const TranscriptActivityBody = styled.pre`
   margin: 6px 0 0;
   overflow-x: hidden;
   overflow-y: auto;
-  border-left: 1px solid rgba(116, 129, 148, 0.22);
+  border-left: 1px solid var(--thread-border);
   padding: 2px 0 2px 11px;
-  color: #8793a3;
+  color: var(--thread-muted);
   background: transparent;
   font: inherit;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -235,11 +244,10 @@ const TranscriptActivityBody = styled.pre`
 `;
 
 const ToolCallsCell = styled.article`
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 8px;
-  padding: 3px 0 10px;
-  color: #6f746d;
+  display: block;
+  min-width: 0;
+  padding: 0 0 14px;
+  color: var(--thread-muted);
   font-size: 11px;
   line-height: 1.35;
   user-select: text;
@@ -249,23 +257,21 @@ const ToolCallsCell = styled.article`
 const ToolCallsBox = styled.div`
   display: grid;
   min-width: 0;
-  gap: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.055);
-  border-radius: 14px;
-  padding: 12px 16px 13px;
-  background: #11130f;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.018),
-    0 10px 34px rgba(0, 0, 0, 0.18);
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.025);
+  box-shadow: none;
 `;
 
 const ToolCallsHeading = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: #5f645d;
-  font-size: 11px;
-  font-weight: 760;
-  letter-spacing: 0.11em;
+  color: var(--thread-muted-soft);
+  font-size: 9px;
+  font-weight: 560;
+  letter-spacing: 0.16em;
   line-height: 1;
   text-overflow: ellipsis;
   text-transform: uppercase;
@@ -292,7 +298,7 @@ const ToolCallDot = styled.span`
   width: 6px;
   height: 6px;
   border-radius: 99px;
-  background: #4e554f;
+  background: var(--thread-muted-soft);
   opacity: 0.86;
   user-select: none;
 `;
@@ -300,9 +306,9 @@ const ToolCallDot = styled.span`
 const ToolCallText = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: #777c75;
-  font-size: 11px;
-  font-weight: 650;
+  color: var(--thread-muted);
+  font-size: 12px;
+  font-weight: 450;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -314,7 +320,8 @@ const ActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
   gap: 8px;
-  color: #858b98;
+  padding: 0 4px 12px;
+  color: var(--thread-muted);
   font-size: 12px;
   line-height: 1.5;
   user-select: text;
@@ -322,7 +329,7 @@ const ActivityCell = styled.article`
 `;
 
 const ActivityBullet = styled.span`
-  color: #68707d;
+  color: var(--thread-muted-soft);
   user-select: none;
 `;
 
@@ -345,51 +352,54 @@ const ActivityText = styled.div`
 
 const ComposerShell = styled.form`
   display: grid;
-  width: min(100%, 880px);
+  width: min(100%, 832px);
   gap: 8px;
   margin: 0 auto;
-  padding: 0 24px 22px;
-  background: #000000;
+  padding: 0 24px 18px;
+  background: var(--thread-bg);
   user-select: none;
 `;
 
 const ComposerBox = styled.div`
   display: grid;
-  min-height: 82px;
-  grid-template-rows: auto minmax(38px, auto) 30px;
-  border: 1px solid #2d333b;
-  border-radius: 8px;
-  background: #111111;
-  box-shadow: none;
+  min-height: 118px;
+  grid-template-rows: auto minmax(70px, auto) auto;
   overflow: hidden;
+  border: 1px solid var(--thread-border);
+  border-radius: 20px;
+  background: var(--thread-card);
+  box-shadow: none;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease;
 
   &:focus-within {
-    border-color: #475569;
+    border-color: var(--thread-ring);
   }
 `;
 
 const ComposerInput = styled.textarea`
   width: 100%;
-  min-height: 46px;
-  max-height: 170px;
+  min-height: 70px;
+  max-height: 200px;
   resize: none;
-  padding: 12px 13px 6px;
+  padding: 15px 16px 8px;
   border: 0;
   outline: none;
-  color: #eeeeee;
+  color: var(--thread-fg);
   background: transparent;
   font: inherit;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 14px;
+  line-height: 1.65;
   user-select: text;
   -webkit-user-select: text;
 
   &::placeholder {
-    color: #7c8490;
+    color: var(--thread-muted-soft);
   }
 
   &:disabled {
-    color: #748196;
+    color: var(--thread-muted-soft);
     cursor: not-allowed;
   }
 `;
@@ -400,14 +410,14 @@ const ComposerFooter = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 7px 7px 11px;
+  padding: 0 12px 12px;
   user-select: none;
 `;
 
 const ComposerHint = styled.span`
   min-width: 0;
   overflow: hidden;
-  color: #8a929e;
+  color: var(--thread-muted-soft);
   font-size: 11px;
   line-height: 1;
   text-overflow: ellipsis;
@@ -430,8 +440,8 @@ const ComposerToolButton = styled.button`
   gap: 5px;
   padding: 0 7px;
   border: 0;
-  border-radius: 6px;
-  color: #aeb5bf;
+  border-radius: 8px;
+  color: var(--thread-muted);
   background: transparent;
   font: inherit;
   font-size: 11px;
@@ -443,8 +453,8 @@ const ComposerToolButton = styled.button`
     opacity 120ms ease;
 
   &:hover:not(:disabled) {
-    color: #eeeeee;
-    background: #232323;
+    color: var(--thread-fg);
+    background: var(--thread-accent);
   }
 
   &:disabled {
@@ -465,7 +475,7 @@ const ModelMenuWrap = styled.div`
 
 const ModelButton = styled(ComposerToolButton)`
   max-width: min(260px, 38vw);
-  color: #d0d5dd;
+  color: var(--thread-fg);
 
   span {
     min-width: 0;
@@ -477,7 +487,7 @@ const ModelButton = styled(ComposerToolButton)`
   svg {
     width: 15px;
     height: 15px;
-    color: #7f8794;
+    color: var(--thread-muted-soft);
   }
 `;
 
@@ -489,9 +499,9 @@ const ModelDropdown = styled.div`
   display: none;
   width: min(280px, 70vw);
   overflow: hidden;
-  border: 1px solid #30363d;
-  border-radius: 8px;
-  background: #181818;
+  border: 1px solid var(--thread-border);
+  border-radius: 12px;
+  background: var(--thread-card);
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
 
   &[data-open="true"] {
@@ -505,7 +515,7 @@ const ModelOption = styled.button`
   gap: 3px;
   padding: 9px 10px;
   border: 0;
-  color: #d5d9df;
+  color: var(--thread-fg);
   background: transparent;
   text-align: left;
   font: inherit;
@@ -513,7 +523,7 @@ const ModelOption = styled.button`
 
   &:hover,
   &[data-selected="true"] {
-    background: #262626;
+    background: var(--thread-accent);
   }
 
   strong {
@@ -527,7 +537,7 @@ const ModelOption = styled.button`
 
   span {
     overflow: hidden;
-    color: #8c94a0;
+    color: var(--thread-muted);
     font-size: 11px;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -553,11 +563,11 @@ const AttachmentChip = styled.span`
   height: 24px;
   align-items: center;
   gap: 6px;
-  border: 1px solid #2b3138;
-  border-radius: 6px;
-  padding: 0 5px 0 7px;
-  color: #c3c9d2;
-  background: #191919;
+  border: 1px solid var(--thread-border);
+  border-radius: 8px;
+  padding: 0 6px 0 8px;
+  color: var(--thread-fg);
+  background: rgba(255, 255, 255, 0.035);
   font-size: 11px;
   line-height: 1;
   user-select: none;
@@ -576,11 +586,11 @@ const AttachmentChip = styled.span`
     place-items: center;
     padding: 0;
     border: 0;
-    color: #8c94a0;
+    color: var(--thread-muted);
     background: transparent;
 
     &:hover {
-      color: #f3f4f6;
+      color: var(--thread-fg);
     }
   }
 
@@ -602,9 +612,9 @@ const SendButton = styled.button`
   place-items: center;
   padding: 0;
   border: 0;
-  border-radius: 7px;
-  color: #0b0c0d;
-  background: #aeb7c4;
+  border-radius: 999px;
+  color: #09090b;
+  background: #f4f4f5;
   user-select: none;
   transition:
     background 130ms ease,
@@ -612,7 +622,7 @@ const SendButton = styled.button`
     opacity 130ms ease;
 
   &:hover:not(:disabled) {
-    background: #d8dee8;
+    background: #ffffff;
   }
 
   &:disabled {
@@ -627,7 +637,7 @@ const SendButton = styled.button`
 `;
 
 const ComposerError = styled.div`
-  color: #f28a8a;
+  color: #fca5a5;
   font-size: 11px;
   line-height: 1.35;
 `;
@@ -640,21 +650,29 @@ const NewChatRoot = styled.main`
   padding: 36px 24px;
   overflow-x: hidden;
   overflow-y: auto;
-  color: #e8e8e8;
-  background: #000000;
+  --thread-bg: #09090b;
+  --thread-card: #0d0d10;
+  --thread-fg: #f4f4f5;
+  --thread-muted: #a1a1aa;
+  --thread-muted-soft: rgba(161, 161, 170, 0.48);
+  --thread-border: rgba(255, 255, 255, 0.065);
+  --thread-accent: rgba(255, 255, 255, 0.055);
+  --thread-ring: rgba(98, 132, 255, 0.46);
+  color: var(--thread-fg);
+  background: var(--thread-bg);
 `;
 
 const NewChatCenter = styled.form`
   display: grid;
-  width: min(100%, 760px);
+  width: min(100%, 832px);
   gap: 28px;
 `;
 
 const NewChatTitle = styled.h1`
   margin: 0;
-  color: #f4f4f5;
-  font-size: clamp(27px, 4vw, 43px);
-  font-weight: 420;
+  color: var(--thread-fg);
+  font-size: clamp(25px, 4vw, 40px);
+  font-weight: 430;
   letter-spacing: 0;
   line-height: 1.12;
   text-align: center;
@@ -662,16 +680,16 @@ const NewChatTitle = styled.h1`
 
 const NewChatBox = styled.div`
   display: grid;
-  min-height: 144px;
+  min-height: 132px;
   grid-template-rows: minmax(76px, auto) auto;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.04);
-  border-radius: 24px;
-  background: #2f2f2f;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--thread-border);
+  border-radius: 20px;
+  background: var(--thread-card);
+  box-shadow: none;
 
   &:focus-within {
-    border-color: rgba(255, 255, 255, 0.13);
+    border-color: var(--thread-ring);
   }
 `;
 
@@ -680,23 +698,23 @@ const NewChatInput = styled.textarea`
   min-height: 76px;
   max-height: 220px;
   resize: none;
-  padding: 21px 20px 10px;
+  padding: 15px 16px 8px;
   border: 0;
   outline: 0;
-  color: #f2f2f2;
+  color: var(--thread-fg);
   background: transparent;
   font: inherit;
-  font-size: 17px;
-  line-height: 1.45;
+  font-size: 16px;
+  line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
 
   &::placeholder {
-    color: #8f8f8f;
+    color: var(--thread-muted-soft);
   }
 
   &:disabled {
-    color: #a3a3a3;
+    color: var(--thread-muted-soft);
     cursor: not-allowed;
   }
 `;
@@ -707,7 +725,7 @@ const NewChatToolbar = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 12px 12px 14px;
+  padding: 0 12px 12px;
 `;
 
 const NewChatControls = styled.div`
@@ -722,11 +740,11 @@ const NewChatSelect = styled.select`
   max-width: 190px;
   height: 32px;
   min-width: 112px;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 999px;
   padding: 0 28px 0 12px;
-  color: #d7d7d7;
-  background: #2a2a2a;
+  color: var(--thread-fg);
+  background: rgba(255, 255, 255, 0.045);
   font: inherit;
   font-size: 12px;
   font-weight: 650;
@@ -742,7 +760,7 @@ const NewChatProject = styled.div`
   min-width: 0;
   max-width: 260px;
   overflow: hidden;
-  color: #a5a5a5;
+  color: var(--thread-muted);
   font-size: 12px;
   font-weight: 640;
   line-height: 1;
@@ -754,11 +772,11 @@ const NewChatAttachButton = styled(ComposerToolButton)`
   width: 32px;
   height: 32px;
   border-radius: 999px;
-  color: #b8b8b8;
+  color: var(--thread-muted);
   background: transparent;
 
   &:hover:not(:disabled) {
-    background: #3a3a3a;
+    background: var(--thread-accent);
   }
 `;
 
@@ -766,7 +784,7 @@ const NewChatSendButton = styled(SendButton)`
   width: 40px;
   height: 40px;
   border-radius: 999px;
-  background: #a6a6a6;
+  background: #f4f4f5;
 
   svg {
     width: 22px;
@@ -1295,29 +1313,6 @@ function NewChatView({
   );
 }
 
-function compactPath(value) {
-  const text = String(value || "").replace(/\\/g, "/").trim();
-  if (!text) {
-    return "";
-  }
-
-  const parts = text.split("/").filter(Boolean);
-  return parts.slice(-2).join("/");
-}
-
-function formatMessageTime(value) {
-  const timestamp = Date.parse(value || "");
-  if (!Number.isFinite(timestamp)) {
-    return "";
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(timestamp));
-}
-
 function cleanFileReference(value) {
   return String(value || "")
     .trim()
@@ -1398,15 +1393,6 @@ function MessageTextContent({ message, workspace }) {
   );
 }
 
-function MessageMeta({ message }) {
-  const timestamp = formatMessageTime(message?.createdAt);
-  if (!timestamp) {
-    return null;
-  }
-
-  return <MessageTimestamp>{timestamp}</MessageTimestamp>;
-}
-
 function buildActivityItems(thread) {
   if (!thread) {
     return [];
@@ -1414,10 +1400,6 @@ function buildActivityItems(thread) {
 
   const items = [];
   const isThinking = thread.activityStatus === "thinking";
-
-  if (thread.titleStatus === "pending") {
-    items.push({ id: "title", live: true, text: "Naming thread" });
-  }
 
   if (isThinking) {
     items.push({ id: "thinking", live: true, text: "Thinking" });
@@ -1427,11 +1409,6 @@ function buildActivityItems(thread) {
     items.push({ id: "closed", live: false, text: "Terminal exited" });
   } else if (thread.status === "error") {
     items.push({ id: "error", live: false, text: "Terminal error" });
-  }
-
-  const worktree = compactPath(thread.coordination?.worktreePath);
-  if (worktree) {
-    items.push({ id: "worktree", live: false, text: `Working in ${worktree}` });
   }
 
   return items;
@@ -1527,7 +1504,6 @@ function ToolCallsGroup({ messages }) {
 
   return (
     <ToolCallsCell>
-      <ActivityBullet aria-hidden="true" />
       <ToolCallsBox>
         <ToolCallsHeading>{`Tool Calls (${calls.length})`}</ToolCallsHeading>
         <ToolCallList>
@@ -1553,13 +1529,12 @@ function ThreadMessage({ message, workspace }) {
 
   if (message.role === "assistant") {
     return (
-      <AssistantCell>
+      <AssistantCell data-message-role="assistant">
         <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
         <MessageBody>
           <MessageText>
             <MessageTextContent message={message} workspace={workspace} />
           </MessageText>
-          <MessageMeta message={message} />
         </MessageBody>
       </AssistantCell>
     );
@@ -1574,7 +1549,7 @@ function ThreadMessage({ message, workspace }) {
           : "Activity"
     );
     return (
-      <TranscriptActivityCell>
+      <TranscriptActivityCell data-message-role="activity">
         <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
         <div>
           <TranscriptActivityTitle>{title}</TranscriptActivityTitle>
@@ -1585,13 +1560,12 @@ function ThreadMessage({ message, workspace }) {
   }
 
   return (
-    <UserCell>
+    <UserCell data-message-role="user">
       <UserPrefix aria-hidden="true">{"\u203a"}</UserPrefix>
       <MessageBody>
         <MessageText>
           <MessageTextContent message={message} workspace={workspace} />
         </MessageText>
-        <MessageMeta message={message} />
       </MessageBody>
     </UserCell>
   );
@@ -1599,8 +1573,10 @@ function ThreadMessage({ message, workspace }) {
 
 function WorkspaceThreadDetail({
   agentStatuses,
+  composerDrafts,
   newChatActive = false,
   onCreateChat,
+  onDraftInput,
   onSelectModel,
   onSubmitMessage,
   thread,
@@ -1613,9 +1589,12 @@ function WorkspaceThreadDetail({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const fileInputRef = useRef(null);
+  const transcriptScrollRef = useRef(null);
   const messages = Array.isArray(thread?.messages) ? thread.messages : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
   const activityItems = useMemo(() => buildActivityItems(thread), [thread]);
+  const latestMessage = messages[messages.length - 1] || null;
+  const latestActivity = activityItems[activityItems.length - 1] || null;
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
   const activeAgentStatus = useMemo(
     () => findAgentStatus(agentStatuses, activeAgentId),
@@ -1628,6 +1607,13 @@ function WorkspaceThreadDetail({
     [activeAgentId, activeAgentStatus, activeProviderModelId],
   );
   const activeTerminalBinding = activeProviderBinding?.terminalBinding || thread?.terminalBinding;
+  const composerSyncKey = [
+    thread?.workspaceId || workspace?.id || "",
+    thread?.id || "",
+    activeTerminalBinding?.paneId || "",
+    activeTerminalBinding?.instanceId || "",
+  ].join(":");
+  const syncedComposerDraft = String(composerDrafts?.[composerSyncKey] || "");
   const canSubmit = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
   const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
   const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
@@ -1641,6 +1627,30 @@ function WorkspaceThreadDetail({
     setSelectedModel(modelOptions[0]?.value || "");
     setModelMenuOpen(false);
   }, [activeAgentId, modelOptions, thread?.id]);
+
+  useEffect(() => {
+    setDraft(syncedComposerDraft);
+  }, [composerSyncKey, syncedComposerDraft]);
+
+  useLayoutEffect(() => {
+    const node = transcriptScrollRef.current;
+    if (!node) {
+      return;
+    }
+
+    node.scrollTop = node.scrollHeight;
+  }, [
+    latestActivity?.id,
+    latestActivity?.live,
+    latestActivity?.text,
+    latestMessage?.id,
+    latestMessage?.status,
+    latestMessage?.text,
+    messages.length,
+    thread?.activityStatus,
+    thread?.id,
+    thread?.status,
+  ]);
 
   const addImageFiles = async (fileList) => {
     const files = Array.from(fileList || []).slice(0, IMAGE_ATTACHMENT_LIMIT - attachments.length);
@@ -1742,7 +1752,7 @@ function WorkspaceThreadDetail({
 
   return (
     <DetailRoot aria-label={getWorkspaceThreadLabel(thread)}>
-      <TranscriptScroll>
+      <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
           {messages.length === 0 && activityItems.length === 0 ? (
             <EmptyThread>{getWorkspaceThreadLabel(thread)}</EmptyThread>
@@ -1800,7 +1810,17 @@ function WorkspaceThreadDetail({
           </AttachmentStrip>
           <ComposerInput
             disabled={!canSubmit || sending}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              const previousDraft = draft;
+              const nextDraft = event.target.value;
+              setDraft(nextDraft);
+              onDraftInput?.({
+                nextValue: nextDraft,
+                previousValue: previousDraft,
+                thread,
+                workspace,
+              });
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();

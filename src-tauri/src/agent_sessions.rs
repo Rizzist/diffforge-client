@@ -403,26 +403,87 @@ fn codex_function_output_message(
 fn codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
     let file = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
+    let mut meta = CodexRolloutMeta {
+        session_id: String::new(),
+        cwd: String::new(),
+        latest_timestamp: String::new(),
+        title: String::new(),
+    };
 
     for line in std::io::BufRead::lines(reader).take(120).flatten() {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let latest_timestamp = value_string(value.get("timestamp"));
-        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        if !latest_timestamp.is_empty() {
+            meta.latest_timestamp = latest_timestamp;
+        }
+
+        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        match record_type {
+            "session_meta" => {
+                meta.session_id = clean_codex_id(value_string(payload.get("id")));
+                meta.cwd = value_string(payload.get("cwd"));
+            }
+            "event_msg" => {
+                if payload.get("type").and_then(Value::as_str) == Some("thread_name_updated") {
+                    meta.title = clean_codex_title(value_string(payload.get("thread_name")), "");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if meta.session_id.is_empty() {
+        None
+    } else {
+        Some(meta)
+    }
+}
+
+fn codex_session_index_title(session_id: &str) -> String {
+    let session_id = clean_codex_id(session_id);
+    if session_id.is_empty() {
+        return String::new();
+    }
+
+    let Some(codex_home) = codex_home_dir() else {
+        return String::new();
+    };
+    let index_path = codex_home.join("session_index.jsonl");
+    let Ok(file) = fs::File::open(&index_path) else {
+        return String::new();
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut title = String::new();
+
+    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if clean_codex_id(value_string(value.get("id"))) != session_id {
             continue;
         }
 
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-        return Some(CodexRolloutMeta {
-            session_id: clean_codex_id(value_string(payload.get("id"))),
-            cwd: value_string(payload.get("cwd")),
-            latest_timestamp,
-            title: String::new(),
-        });
+        let next_title = clean_codex_title(
+            first_value_string(&[value.get("thread_name"), value.get("title")]),
+            "",
+        );
+        if !next_title.is_empty() {
+            title = next_title;
+        }
     }
 
-    None
+    title
+}
+
+fn first_non_empty_title(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| clean_codex_title(value, ""))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
 fn push_codex_message(
@@ -690,6 +751,9 @@ fn parse_codex_rollout(
                 meta.cwd = value_string(payload.get("cwd"));
             }
             "event_msg" => {
+                if payload.get("type").and_then(Value::as_str) == Some("thread_name_updated") {
+                    meta.title = clean_codex_title(value_string(payload.get("thread_name")), "");
+                }
                 for message in codex_messages_from_event(line_index, &timestamp, payload) {
                     push_codex_message(&mut messages, &mut seen, Some(message));
                 }
@@ -1544,14 +1608,15 @@ async fn agent_thread_transcript(
     } else {
         parsed_meta.latest_timestamp
     };
+    let session_title = first_non_empty_title(&[
+        parsed_meta.title,
+        initial_meta.title,
+        codex_session_index_title(&session_id),
+    ]);
 
     Ok(CodexThreadTranscriptResult {
         session_id,
-        session_title: if parsed_meta.title.is_empty() {
-            initial_meta.title
-        } else {
-            parsed_meta.title
-        },
+        session_title,
         rollout_path: path.to_string_lossy().to_string(),
         cwd,
         matched_by,

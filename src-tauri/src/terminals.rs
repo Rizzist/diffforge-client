@@ -797,7 +797,7 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
 }
 
 async fn prepare_terminal_coordination_launch(
-    pane_id: String,
+    pty_id: String,
     working_directory: PathBuf,
     kind: String,
     provider_for_coordination: Option<String>,
@@ -813,7 +813,7 @@ async fn prepare_terminal_coordination_launch(
     ),
     String,
 > {
-    let log_pane_id = pane_id.clone();
+    let launch_pty_id = pty_id.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
         let (coordination_kernel, _) =
             match crate::coordination::CoordinationKernel::open_for_terminal_launch(
@@ -851,7 +851,7 @@ async fn prepare_terminal_coordination_launch(
             &agent_name,
             agent_kind,
             &terminal_slot_key,
-            Some(&log_pane_id),
+            Some(&launch_pty_id),
             workspace_id.as_deref(),
             workspace_name.as_deref(),
             None,
@@ -1436,6 +1436,7 @@ async fn terminal_open(
     let model = request.model;
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
+    let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
     let working_directory_request = request.working_directory;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
@@ -1446,14 +1447,14 @@ async fn terminal_open(
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
 
     let preserve_coordination_session =
-        request.preserve_coordination_session.unwrap_or(false) && !plain_shell;
+        request.preserve_coordination_session.unwrap_or(false) && !plain_shell && !fresh_session;
     let _ = close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
         None,
         preserve_coordination_session,
-        false,
+        fresh_session,
     )
     .await
     .unwrap_or(false);
@@ -1476,12 +1477,22 @@ async fn terminal_open(
     } else {
         terminal_launch(&kind, provider, model, provider_session_id)?
     };
+    let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
+        state
+            .next_terminal_instance_id
+            .fetch_add(1, Ordering::Relaxed)
+    });
     if plain_shell {
     } else if !is_prewarm_pty {
         ensure_workspace_git_bootstrap_for_terminal(&working_directory).await?;
 
+        let coordination_pty_id = if fresh_session {
+            format!("{pane_id}-fresh-{instance_id}")
+        } else {
+            pane_id.clone()
+        };
         let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
-            pane_id.clone(),
+            coordination_pty_id,
             working_directory.clone(),
             kind.clone(),
             provider_for_coordination.clone(),
@@ -1497,11 +1508,6 @@ async fn terminal_open(
     }
 
     let size = terminal_size_from_request(requested_cols, requested_rows)?;
-    let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
-        state
-            .next_terminal_instance_id
-            .fetch_add(1, Ordering::Relaxed)
-    });
 
     let mut command = "prepared-shell".to_string();
     let mut agent_started = false;
@@ -2217,6 +2223,20 @@ fn terminal_observe_input_gate_submitted_prompt(
         return None;
     }
 
+    let normalized_data;
+    let data = if data.contains(TERMINAL_ENTER_SEQUENCE)
+        || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
+    {
+        normalized_data = data
+            .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
+            .replace(TERMINAL_ENTER_SEQUENCE, "\r");
+        normalized_data.as_str()
+    } else {
+        data
+    };
+    let stripped_color_reply_data = strip_bare_terminal_color_reply_input(data);
+    let data = stripped_color_reply_data.as_deref().unwrap_or(data);
+
     for character in data.chars() {
         if gate.ansi_osc_active {
             if gate.ansi_osc_escape_pending {
@@ -2278,7 +2298,7 @@ fn terminal_observe_input_gate_submitted_prompt(
                 let prompt = gate.current_line.trim().to_string();
                 gate.current_line.clear();
                 gate.current_line_user_touched = false;
-                if !prompt.is_empty() {
+                if !prompt.is_empty() && !is_terminal_color_reply_prompt(&prompt) {
                     submitted = Some(prompt);
                 }
             }
@@ -2310,6 +2330,75 @@ fn terminal_observe_input_gate_submitted_prompt(
     }
 
     submitted
+}
+
+fn find_bare_terminal_color_reply_start(data: &str) -> Option<usize> {
+    let lower = data.to_ascii_lowercase();
+    ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
+        .iter()
+        .filter_map(|pattern| lower.find(pattern))
+        .filter(|index| {
+            *index == 0 || data.as_bytes().get(index.saturating_sub(1)) != Some(&0x1b)
+        })
+        .min()
+}
+
+fn strip_bare_terminal_color_reply_input(data: &str) -> Option<String> {
+    let mut cursor = 0;
+    let mut output = String::new();
+    let mut changed = false;
+
+    while cursor < data.len() {
+        let Some(mut start) = find_bare_terminal_color_reply_start(&data[cursor..])
+            .map(|index| cursor + index)
+        else {
+            output.push_str(&data[cursor..]);
+            break;
+        };
+
+        if start > cursor && data.as_bytes().get(start - 1) == Some(&b'\\') {
+            start -= 1;
+        }
+
+        output.push_str(&data[cursor..start]);
+        let mut end = data.len();
+        for (offset, character) in data[start..].char_indices() {
+            if character == '\\' || character == '\u{7}' {
+                end = start + offset + character.len_utf8();
+                break;
+            }
+            if character == '\r' || character == '\n' {
+                end = start + offset;
+                break;
+            }
+        }
+        cursor = end;
+        changed = true;
+    }
+
+    changed.then_some(output)
+}
+
+fn is_terminal_color_reply_prompt(prompt: &str) -> bool {
+    let text = prompt
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
+        .iter()
+        .any(|pattern| text.contains(pattern))
+}
+
+fn normalize_terminal_enter_sequences_for_pty(data: String) -> String {
+    if data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
+        return data
+            .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
+            .replace(TERMINAL_ENTER_SEQUENCE, "\r");
+    }
+
+    data
 }
 
 async fn terminal_observe_submitted_prompt(
@@ -3702,6 +3791,7 @@ fn emit_terminal_prompt_submitted(
     app: &AppHandle,
     instance: &TerminalInstance,
     prompt: &str,
+    thread_id_override: Option<&str>,
 ) {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -3717,7 +3807,11 @@ fn emit_terminal_prompt_submitted(
             workspace_id: metadata.workspace_id,
             workspace_name: metadata.workspace_name,
             terminal_index: metadata.terminal_index,
-            thread_id: metadata.thread_id,
+            thread_id: thread_id_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or(metadata.thread_id),
             agent_id: metadata.agent_id,
             agent_kind: metadata.agent_kind,
             prompt: prompt.to_string(),
@@ -3756,6 +3850,7 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
                 payload.instance_id,
                 payload.data,
                 payload.prompt_event_text,
+                payload.thread_id,
             )
             .await
             {
@@ -3794,6 +3889,7 @@ async fn terminal_write_inner(
     instance_id: Option<u64>,
     data: String,
     prompt_event_text: Option<String>,
+    thread_id: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
@@ -3801,6 +3897,7 @@ async fn terminal_write_inner(
         return Ok(());
     };
     let _input_guard = instance.input_queue.lock().await;
+    let data = normalize_terminal_enter_sequences_for_pty(data);
 
     let escape_interrupt_task_id = if data == "\x1b" && instance.coordination.is_some() {
         instance
@@ -3835,14 +3932,15 @@ async fn terminal_write_inner(
         return Ok(());
     }
 
-    if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
+    let observed_prompt = terminal_observe_submitted_prompt(&instance, &data).await;
+    if let Some(prompt) = observed_prompt {
         let event_prompt = prompt_event_text
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(prompt.as_str())
             .to_string();
-        emit_terminal_prompt_submitted(&app, &instance, &event_prompt);
+        emit_terminal_prompt_submitted(&app, &instance, &event_prompt, thread_id.as_deref());
         if *instance.agent_started.lock().await {
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
@@ -3890,6 +3988,7 @@ async fn terminal_write(
     instance_id: Option<u64>,
     data: String,
     prompt_event_text: Option<String>,
+    thread_id: Option<String>,
 ) -> Result<(), String> {
     terminal_write_inner(
         app,
@@ -3899,6 +3998,7 @@ async fn terminal_write(
         instance_id,
         data,
         prompt_event_text,
+        thread_id,
     )
     .await
 }
@@ -4430,6 +4530,65 @@ mod terminal_tests {
         assert_eq!(
             terminal_observe_input_gate_submitted_prompt(&mut gate, "second line\r"),
             Some("first line\nsecond line".to_string())
+        );
+    }
+
+    #[test]
+    fn enhanced_enter_sequence_submits_prompt() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                &format!("send from overlay{TERMINAL_ENTER_SEQUENCE}"),
+            ),
+            Some("send from overlay".to_string())
+        );
+    }
+
+    #[test]
+    fn enhanced_enter_sequence_is_normalized_before_pty_write() {
+        assert_eq!(
+            normalize_terminal_enter_sequences_for_pty(format!(
+                "send from overlay{TERMINAL_ENTER_SEQUENCE}"
+            )),
+            "send from overlay\r"
+        );
+        assert_eq!(
+            normalize_terminal_enter_sequences_for_pty(format!(
+                "first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line"
+            )),
+            format!("first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line")
+        );
+    }
+
+    #[test]
+    fn bare_osc_color_reply_is_not_submitted_as_prompt() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                "]10;rgb:e8e8/eeee/f8f8\\]11;rgb:0202/0303/0404\\\r",
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "idk\r"),
+            Some("idk".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_osc_color_reply_is_stripped_around_real_prompt_text() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                "]10;rgb:e8e8/eeee/f8f8\\idk\r",
+            ),
+            Some("idk".to_string())
         );
     }
 

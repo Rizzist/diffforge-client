@@ -1,6 +1,15 @@
+import {
+  cleanLiveViewText,
+  stripLiveViewControlSequences,
+} from "../terminals/liveViewSanitizer.js";
+
 const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
 const MAX_THREAD_MESSAGES = 360;
 const MAX_THREADS_PER_WORKSPACE = 80;
+const THREAD_PROMPT_LABEL_MAX_WORDS = 6;
+const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
+const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
+const LIVE_OUTPUT_MAX_CHARS = 24000;
 const DEFAULT_AGENT_ID = "codex";
 const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
 
@@ -35,6 +44,86 @@ function cleanMessageText(value, fallback = "") {
   return text || fallback;
 }
 
+function cleanTerminalUiText(value, fallback = "") {
+  const stripped = stripLiveViewControlSequences(value);
+  const text = cleanLiveViewText(stripped)
+    .replace(/\\?\]?(?:10|11);rgb:[0-9a-fA-F/]+/g, " ")
+    .replace(/\brgb:[0-9a-fA-F/]+\b/g, " ");
+
+  return cleanText(text, fallback);
+}
+
+function isTerminalArtifactLabel(value) {
+  const text = cleanText(value).toLowerCase();
+  return !text
+    || /\\?\]?(?:10|11);rgb:[0-9a-f/]+/.test(text)
+    || /\brgb:[0-9a-f/]+\b/.test(text)
+    || text === "openai codex";
+}
+
+function isTerminalArtifactMessage(value) {
+  const text = cleanMessageText(value);
+  return !text
+    || isTerminalArtifactLabel(text);
+}
+
+function cleanSubmittedUserMessage(value) {
+  const text = cleanMessageText(value);
+  if (!text) {
+    return "";
+  }
+
+  const stripped = cleanMessageText(stripLiveViewControlSequences(value));
+  const promptText = stripped
+    .replace(/^(?:[›>❯]\s*)+/, "")
+    .replace(/^•\s+.*?[›❯]\s*/, "")
+    .trim();
+  if (promptText && promptText !== stripped && !isTerminalArtifactMessage(promptText)) {
+    return promptText;
+  }
+
+  if (!isTerminalArtifactMessage(value)) {
+    return text;
+  }
+
+  return promptText && !isTerminalArtifactMessage(promptText) ? promptText : "";
+}
+
+function cleanThreadLabelCandidate(value) {
+  const text = cleanTerminalUiText(value);
+  return isTerminalArtifactLabel(text) ? "" : limitThreadPromptLabel(text, "");
+}
+
+function isLikelyNativeSessionIdLabel(value) {
+  const text = cleanText(value);
+  if (!text) {
+    return false;
+  }
+
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text)
+    || /^ses_[A-Za-z0-9_-]{12,}$/.test(text)
+    || /^[0-9a-f]{24,}$/i.test(text)
+    || (/^[A-Za-z0-9_-]{24,}$/.test(text) && !/\s/.test(text));
+}
+
+function limitThreadPromptLabel(value, fallback = "New thread") {
+  const text = cleanText(value, fallback);
+  const chars = Array.from(text);
+  if (chars.length <= THREAD_PROMPT_LABEL_MAX_CHARS) {
+    return text;
+  }
+
+  const sliceLength = Math.max(0, THREAD_PROMPT_LABEL_MAX_CHARS - THREAD_PROMPT_LABEL_ELLIPSIS.length);
+  const truncated = chars
+    .slice(0, sliceLength)
+    .join("")
+    .trim()
+    .replace(/[.,!?;:]+$/g, "")
+    .trim();
+
+  return `${truncated || chars.slice(0, sliceLength).join("")}${THREAD_PROMPT_LABEL_ELLIPSIS}`;
+}
+
 function cleanModelId(value, fallback = "") {
   const modelId = cleanText(value);
   if (
@@ -46,6 +135,24 @@ function cleanModelId(value, fallback = "") {
   }
 
   return modelId;
+}
+
+function normalizePendingPrompt(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const text = cleanMessageText(value.text || value.message);
+  if (!text) {
+    return null;
+  }
+
+  return {
+    createdAt: cleanText(value.createdAt, nowIso()),
+    id: cleanText(value.id, createRandomId("pending-prompt")),
+    model: cleanModelId(value.model),
+    text,
+  };
 }
 
 function cleanAgentId(value, fallback = DEFAULT_AGENT_ID) {
@@ -217,7 +324,7 @@ function normalizeThreadMessage(message) {
     .replace(/[^a-z0-9_-]/g, "-")
     .slice(0, 48);
   const text = cleanMessageText(message.text || message.message);
-  if (!id || !text) {
+  if (!id || !text || (safeRole === "user" && isTerminalArtifactMessage(message.text || message.message))) {
     return null;
   }
 
@@ -253,12 +360,20 @@ function normalizeThreadMessages(messages) {
 }
 
 function appendThreadUserMessage(thread, event = {}) {
-  const text = cleanMessageText(event.userMessage || event.message);
+  const rawText = event.userMessage || event.message;
+  const text = cleanSubmittedUserMessage(rawText);
   if (!text) {
     return thread?.messages || [];
   }
 
   const messages = normalizeThreadMessages(thread?.messages);
+  const source = cleanText(event.source || event.messageSource).toLowerCase();
+  if (
+    source === "terminal-prompt-submitted"
+    && messages.some((message) => message.role === "user" && cleanMessageText(message.text) === text)
+  ) {
+    return messages;
+  }
   const id = cleanText(event.messageId, createRandomId(`message-${safeKey(thread?.id, "thread")}`));
   if (messages.some((message) => message.id === id)) {
     return messages;
@@ -302,13 +417,37 @@ function defaultThreadTitle(terminalIndex, agentId) {
   return `${agentLabel} ${slot}`;
 }
 
-export function getWorkspaceThreadTitlePlaceholder(message, fallback = "New thread") {
-  const text = cleanText(message, fallback);
-  if (text.length <= 160) {
-    return text;
+function isDefaultThreadTitleCandidate(value, thread) {
+  const title = cleanText(value).toLowerCase();
+  if (!title) {
+    return false;
   }
 
-  return `${text.slice(0, 157).trim()}...`;
+  return THREAD_AGENT_IDS.some((agentId) => (
+    title === defaultThreadTitle(getThreadTerminalIndex(thread) || 0, agentId).toLowerCase()
+  ));
+}
+
+function cleanRealThreadTitleCandidate(value, thread) {
+  const title = cleanThreadLabelCandidate(value);
+  if (!title || isLikelyNativeSessionIdLabel(title) || isDefaultThreadTitleCandidate(title, thread)) {
+    return "";
+  }
+
+  return title;
+}
+
+function getWorkspaceThreadPromptLabel(message, fallback = "New thread") {
+  const cleaned = cleanTerminalUiText(message, fallback)
+    .replace(/^["'`]+|["'`.,!?;:]+$/g, "")
+    .trim();
+  if (isTerminalArtifactLabel(cleaned)) {
+    return limitThreadPromptLabel(fallback, fallback);
+  }
+  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, THREAD_PROMPT_LABEL_MAX_WORDS);
+  const title = words.join(" ");
+
+  return limitThreadPromptLabel(title || fallback, fallback);
 }
 
 function normalizeCoordination(value) {
@@ -418,6 +557,16 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     nativeSessionId: cleanText(binding.nativeSessionId, fallback.nativeSessionId),
     nativeSessionKind: cleanText(binding.nativeSessionKind, fallback.nativeSessionKind || "session"),
     nativeSessionSource: cleanText(binding.nativeSessionSource, fallback.nativeSessionSource),
+    nativeSessionTitle: cleanThreadLabelCandidate(
+      binding.nativeSessionTitle
+        || binding.sessionTitle
+        || binding.title
+        || fallback.nativeSessionTitle
+        || fallback.sessionTitle
+        || fallback.title,
+    ),
+    nativeSessionTitleSource: cleanText(binding.nativeSessionTitleSource, fallback.nativeSessionTitleSource),
+    nativeSessionTitleUpdatedAt: cleanText(binding.nativeSessionTitleUpdatedAt, fallback.nativeSessionTitleUpdatedAt),
     nativeSessionUpdatedAt: cleanText(binding.nativeSessionUpdatedAt, fallback.nativeSessionUpdatedAt),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
     terminalBinding,
@@ -477,10 +626,6 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
     ? status
     : "idle";
-  const titleStatus = cleanText(thread.titleStatus, "ready").toLowerCase();
-  const safeTitleStatus = ["error", "pending", "ready"].includes(titleStatus)
-    ? titleStatus
-    : "ready";
   const coordination = normalizeCoordination(thread.coordination);
   const terminalBinding = options.stripLiveBindings ? null : normalizeTerminalBinding(thread.terminalBinding);
   const providerBindings = normalizeProviderBindings(
@@ -497,6 +642,10 @@ function normalizeThread(thread, workspaceId, options = {}) {
     },
     options,
   );
+  const pendingPrompt = options.stripLiveBindings ? null : normalizePendingPrompt(thread.pendingPrompt);
+  const fallbackTitle = defaultThreadTitle(terminalIndex || 0, currentAgent);
+  const storedSessionName = cleanThreadLabelCandidate(thread.sessionName);
+  const storedTitle = cleanThreadLabelCandidate(thread.title);
 
   return {
     coordination,
@@ -511,8 +660,10 @@ function normalizeThread(thread, workspaceId, options = {}) {
     materialized,
     messageCount,
     messages,
+    pendingPrompt,
     preferredAgent,
-    sessionName: cleanText(thread.sessionName, thread.title || defaultThreadTitle(terminalIndex || 0, currentAgent)),
+    freshSessionStartedAt: options.stripLiveBindings ? "" : cleanText(thread.freshSessionStartedAt),
+    sessionName: storedSessionName || storedTitle || fallbackTitle,
     slotKey: cleanText(
       thread.slotKey,
       terminalIndex == null ? `thread-${safeKey(id, "detached")}` : defaultSlotKey(terminalIndex),
@@ -521,10 +672,9 @@ function normalizeThread(thread, workspaceId, options = {}) {
     providerBindings,
     terminalBinding,
     terminalIndex,
-    title: cleanText(thread.title, defaultThreadTitle(terminalIndex || 0, currentAgent)),
-    titleRequestId: cleanText(thread.titleRequestId),
-    titleStatus: safeTitleStatus,
+    title: storedTitle || storedSessionName || fallbackTitle,
     transcriptHydratedAt: options.stripMessages ? "" : cleanText(thread.transcriptHydratedAt),
+    transcriptHydrationMode: options.stripMessages ? "" : cleanText(thread.transcriptHydrationMode),
     transcriptLatestTimestamp: options.stripMessages ? "" : cleanText(thread.transcriptLatestTimestamp),
     transcriptSessionId: cleanText(thread.transcriptSessionId),
     transcriptSourcePath: options.stripMessages ? "" : cleanText(thread.transcriptSourcePath),
@@ -717,6 +867,65 @@ export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
     const role = cleanAgentId(rolesByIndex[terminalIndex], fallbackAgent);
     const now = nowIso();
 
+    if (existingTerminal && !existingTerminal.threadId && isThreadAgentId(existingTerminal.agentId || role)) {
+      const agentId = cleanAgentId(existingTerminal.agentId || role);
+      const threadId = createThreadIdForTerminal(workspaceId, terminalIndex);
+      entry.threads[threadId] = {
+        coordination: normalizeCoordination({
+          worktreePath: existingTerminal.worktreePath,
+        }),
+        createdAt: now,
+        currentAgent: agentId,
+        id: threadId,
+        lastActiveAt: now,
+        lastMessageAt: "",
+        materialized: true,
+        messageCount: 0,
+        messages: [],
+        pendingPrompt: null,
+        preferredAgent: agentId,
+        providerBindings: {
+          [agentId]: normalizeProviderBinding(null, agentId, {
+            activityStatus: "idle",
+            lastActiveAt: now,
+            messageCount: 0,
+            status: existingTerminal.status || "active",
+            terminalBinding: normalizeTerminalBinding({
+              instanceId: existingTerminal.instanceId,
+              paneId: existingTerminal.paneId,
+              terminalIndex,
+            }),
+            updatedAt: now,
+          }),
+        },
+        sessionName: defaultThreadTitle(terminalIndex, agentId),
+        slotKey: existingTerminal.slotKey || defaultSlotKey(terminalIndex),
+        status: existingTerminal.status || "active",
+        terminalBinding: normalizeTerminalBinding({
+          instanceId: existingTerminal.instanceId,
+          paneId: existingTerminal.paneId,
+          terminalIndex,
+        }),
+        terminalIndex,
+        title: defaultThreadTitle(terminalIndex, agentId),
+        updatedAt: now,
+        workspaceId,
+      };
+      entry.threadOrder.push(threadId);
+      bindExistingThreadToTerminal(entry, threadId, {
+        agentId,
+        instanceId: existingTerminal.instanceId,
+        paneId: existingTerminal.paneId,
+        slotKey: existingTerminal.slotKey,
+        status: existingTerminal.status || "active",
+        terminalIndex,
+        workspaceId,
+        worktreePath: existingTerminal.worktreePath,
+      }, { status: existingTerminal.status || "active" });
+      changed = true;
+      return;
+    }
+
     if (existingTerminal && existingTerminal.agentId !== role && existingTerminal.status !== "active") {
       entry.terminals[terminalKey] = {
         ...existingTerminal,
@@ -902,6 +1111,11 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
   const activityStatus = options.incrementMessageCount
     ? "thinking"
     : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
+  const eventSessionName = cleanThreadLabelCandidate(event.sessionName);
+  const eventTitle = eventSessionName
+    || getWorkspaceThreadPromptLabel(event.title || event.userMessage, "");
+  const existingSessionName = cleanThreadLabelCandidate(existing.sessionName);
+  const existingTitle = cleanThreadLabelCandidate(existing.title);
   const providerBindings = {
     ...existingProviderBindings,
     [agentId]: {
@@ -936,14 +1150,12 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     messages: existing.messages,
     preferredAgent: cleanAgentId(event.preferredAgent || existing.preferredAgent || agentId),
     providerBindings,
-    sessionName: cleanText(event.sessionName || event.title, existing.sessionName || existing.title),
+    sessionName: eventSessionName || existingSessionName || eventTitle || existingTitle,
     slotKey: cleanText(event.slotKey || activeTerminal?.slotKey, existing.slotKey),
     status: safeStatus,
     terminalBinding,
     terminalIndex,
-    title: cleanText(event.title, existing.title),
-    titleRequestId: cleanText(event.titleRequestId, existing.titleRequestId),
-    titleStatus: event.titleRequestId ? "pending" : existing.titleStatus,
+    title: eventTitle || existingTitle || existingSessionName || defaultThreadTitle(terminalIndex, agentId),
     updatedAt: now,
   };
 
@@ -971,14 +1183,68 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
 
   const currentState = normalizeWorkspaceThreads(state);
   const entry = ensureWorkspaceEntry(currentState, workspaceId);
-  const threadId = cleanText(event.threadId);
+  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const terminalKey = terminalSessionKey(terminalIndex);
+  const eventThreadId = cleanText(event.threadId);
+  const restoredThreadId = terminalKey ? cleanText(entry.terminalThreadIds?.[terminalKey]) : "";
+  const threadId = entry.threads[eventThreadId]
+    ? eventThreadId
+    : entry.threads[restoredThreadId]
+      ? restoredThreadId
+      : "";
   const terminal = upsertActiveTerminal(entry, event, {
     status: event.status || "active",
-    threadId: entry.threads[threadId] ? threadId : "",
+    threadId,
   });
 
   if (terminal && threadId && entry.threads[threadId]) {
     bindExistingThreadToTerminal(entry, threadId, event, { status: event.status || "active" });
+  } else if (terminal && !threadId && isThreadAgentId(terminal.agentId)) {
+    const now = nowIso();
+    const nextThreadId = createThreadIdForTerminal(workspaceId, terminal.terminalIndex);
+    entry.threads[nextThreadId] = {
+      coordination: normalizeCoordination({
+        worktreePath: terminal.worktreePath,
+      }),
+      createdAt: now,
+      currentAgent: terminal.agentId,
+      id: nextThreadId,
+      lastActiveAt: now,
+      lastMessageAt: "",
+      materialized: true,
+      messageCount: 0,
+      messages: [],
+      pendingPrompt: null,
+      preferredAgent: terminal.agentId,
+      providerBindings: {
+        [terminal.agentId]: normalizeProviderBinding(null, terminal.agentId, {
+          activityStatus: "idle",
+          lastActiveAt: now,
+          messageCount: 0,
+          status: terminal.status || event.status || "active",
+          terminalBinding: normalizeTerminalBinding({
+            instanceId: terminal.instanceId,
+            paneId: terminal.paneId,
+            terminalIndex: terminal.terminalIndex,
+          }),
+          updatedAt: now,
+        }),
+      },
+      sessionName: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
+      slotKey: terminal.slotKey || defaultSlotKey(terminal.terminalIndex),
+      status: terminal.status || event.status || "active",
+      terminalBinding: normalizeTerminalBinding({
+        instanceId: terminal.instanceId,
+        paneId: terminal.paneId,
+        terminalIndex: terminal.terminalIndex,
+      }),
+      terminalIndex: terminal.terminalIndex,
+      title: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
+      updatedAt: now,
+      workspaceId,
+    };
+    entry.threadOrder.push(nextThreadId);
+    bindExistingThreadToTerminal(entry, nextThreadId, event, { status: event.status || "active" });
   }
 
   return {
@@ -1002,13 +1268,28 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   const now = nowIso();
   const agentId = cleanAgentId(event.agentId || existingTerminal?.agentId || DEFAULT_AGENT_ID);
   const threadId = existingThreadId || createThreadIdForTerminal(workspaceId, terminalIndex);
-  const titlePlaceholder = getWorkspaceThreadTitlePlaceholder(
-    event.title || event.userMessage,
+  const submittedUserMessage = cleanSubmittedUserMessage(event.userMessage || event.message);
+  const promptLabel = getWorkspaceThreadPromptLabel(
+    event.title || submittedUserMessage,
     defaultThreadTitle(terminalIndex, agentId),
   );
+  const pendingPrompt = normalizePendingPrompt(event.pendingPrompt || {
+    createdAt: event.messageCreatedAt,
+    id: event.pendingPromptId,
+    message: event.pendingPromptText,
+    model: event.model,
+  });
+  const hasSubmittedPrompt = Boolean(submittedUserMessage || pendingPrompt);
   const previousThread = entry.threads[threadId] || null;
   const previousMessages = normalizeThreadMessages(previousThread?.messages);
   const previousActivityStatus = normalizeThreadActivityStatus(previousThread?.activityStatus);
+  const freshSessionStartedAt = event.freshSession
+    ? cleanText(event.freshSessionStartedAt, previousThread?.freshSessionStartedAt || now)
+    : previousThread?.freshSessionStartedAt || "";
+  const transcriptHydrationMode = cleanText(
+    event.transcriptHydrationMode,
+    event.freshSession ? "session-only" : previousThread?.transcriptHydrationMode || "",
+  );
 
   upsertActiveTerminal(entry, event, {
     status: event.status || "active",
@@ -1026,7 +1307,9 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       materialized: true,
       messageCount: 0,
       messages: [],
+      pendingPrompt: null,
       preferredAgent: agentId,
+      freshSessionStartedAt,
       providerBindings: isThreadAgentId(agentId)
         ? {
           [agentId]: normalizeProviderBinding(null, agentId, {
@@ -1038,14 +1321,13 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
           }),
         }
         : {},
-      sessionName: titlePlaceholder,
+      sessionName: promptLabel,
       slotKey: cleanText(event.slotKey || existingTerminal?.slotKey, defaultSlotKey(terminalIndex)),
       status: "active",
       terminalBinding: null,
       terminalIndex,
-      title: titlePlaceholder,
-      titleRequestId: cleanText(event.titleRequestId),
-      titleStatus: event.titleRequestId ? "pending" : "ready",
+      title: promptLabel,
+      transcriptHydrationMode,
       updatedAt: now,
       workspaceId,
     };
@@ -1053,13 +1335,13 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   }
 
   bindExistingThreadToTerminal(entry, threadId, event, {
-    incrementMessageCount: true,
+    incrementMessageCount: hasSubmittedPrompt,
     status: event.status || "active",
   });
   if (entry.threads[threadId]) {
     const messages = appendThreadUserMessage(entry.threads[threadId], event);
     const messageAdded = messages.length > previousMessages.length;
-    const activityStatus = messageAdded
+    const activityStatus = messageAdded || pendingPrompt
       ? entry.threads[threadId].activityStatus
       : previousActivityStatus;
     const providerBindings = normalizeProviderBindings(
@@ -1088,7 +1370,10 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : entry.threads[threadId].lastMessageAt,
       messageCount: messages.length,
       messages,
+      pendingPrompt: pendingPrompt || entry.threads[threadId].pendingPrompt,
+      freshSessionStartedAt,
       providerBindings,
+      transcriptHydrationMode,
     };
   }
   entry.threadOrder = entry.threadOrder.filter((candidateId, index, order) => (
@@ -1302,47 +1587,29 @@ export function updateWorkspaceThreadAgent(state, event = {}) {
   };
 }
 
-export function updateWorkspaceThreadTitle(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const title = cleanText(event.title);
-  if (!workspaceId || !threadId || !title) {
-    return state || {};
+function workspaceThreadHasProviderSession(thread, agentId, sessionId) {
+  const safeSessionId = cleanText(sessionId);
+  if (!thread || !safeSessionId) {
+    return false;
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
-    return state || {};
+  const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+  return cleanText(thread.transcriptSessionId) === safeSessionId
+    || cleanText(providerBinding?.nativeSessionId) === safeSessionId;
+}
+
+function findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, ignoreThreadId = "") {
+  const safeSessionId = cleanText(sessionId);
+  if (!entry?.threads || !safeSessionId) {
+    return "";
   }
 
-  const titleRequestId = cleanText(event.titleRequestId);
-  if (
-    titleRequestId
-    && existing.titleRequestId
-    && existing.titleRequestId !== titleRequestId
-  ) {
-    return state || {};
-  }
-
-  return {
-    ...currentState,
-    [workspaceId]: {
-      ...entry,
-      threads: {
-        ...entry.threads,
-        [threadId]: {
-          ...existing,
-          sessionName: title,
-          title,
-          titleRequestId: titleRequestId || existing.titleRequestId,
-          titleStatus: event.status === "error" ? "error" : "ready",
-          updatedAt: nowIso(),
-        },
-      },
-    },
-  };
+  const ignored = cleanText(ignoreThreadId);
+  return Object.values(entry.threads).find((thread) => (
+    thread?.id
+    && thread.id !== ignored
+    && workspaceThreadHasProviderSession(thread, agentId, safeSessionId)
+  ))?.id || "";
 }
 
 export function updateWorkspaceThreadProviderSession(state, event = {}) {
@@ -1360,8 +1627,18 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
   if (!existing) {
     return state || {};
   }
+  const duplicateThreadId = findWorkspaceThreadIdForProviderSession(
+    entry,
+    agentId,
+    nativeSessionId,
+    threadId,
+  );
+  if (duplicateThreadId) {
+    return state || {};
+  }
 
   const now = nowIso();
+  const nativeSessionTitle = cleanRealThreadTitleCandidate(event.nativeSessionTitle || event.sessionTitle, existing);
   const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
@@ -1392,6 +1669,13 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
     nativeSessionId,
     nativeSessionKind: cleanText(event.nativeSessionKind, "session"),
     nativeSessionSource: cleanText(event.nativeSessionSource, "terminal-output"),
+    nativeSessionTitle: nativeSessionTitle || providerBindings[agentId]?.nativeSessionTitle || "",
+    nativeSessionTitleSource: nativeSessionTitle
+      ? cleanText(event.nativeSessionTitleSource || event.source, "provider")
+      : providerBindings[agentId]?.nativeSessionTitleSource || "",
+    nativeSessionTitleUpdatedAt: nativeSessionTitle
+      ? now
+      : providerBindings[agentId]?.nativeSessionTitleUpdatedAt || "",
     nativeSessionUpdatedAt: now,
     updatedAt: now,
   };
@@ -1405,6 +1689,8 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
         [threadId]: {
           ...existing,
           providerBindings,
+          sessionName: nativeSessionTitle || existing.sessionName,
+          title: nativeSessionTitle || existing.title,
           transcriptSessionId: nativeSessionId || existing.transcriptSessionId,
           updatedAt: now,
         },
@@ -1475,6 +1761,41 @@ export function updateWorkspaceThreadProviderModel(state, event = {}) {
   };
 }
 
+export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const threadId = cleanText(event.threadId);
+  if (!workspaceId || !threadId) {
+    return state || {};
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[workspaceId];
+  const existing = entry?.threads?.[threadId];
+  if (!existing?.pendingPrompt) {
+    return state || {};
+  }
+
+  const promptId = cleanText(event.pendingPromptId || event.promptId);
+  if (promptId && existing.pendingPrompt.id !== promptId) {
+    return state || {};
+  }
+
+  return {
+    ...currentState,
+    [workspaceId]: {
+      ...entry,
+      threads: {
+        ...entry.threads,
+        [threadId]: {
+          ...existing,
+          pendingPrompt: null,
+          updatedAt: nowIso(),
+        },
+      },
+    },
+  };
+}
+
 function threadMessageSortTime(message, fallbackIndex) {
   const createdAt = String(message?.createdAt || "").trim();
   const numericTimestamp = Number.parseFloat(createdAt);
@@ -1498,7 +1819,11 @@ function threadMessageMergeKey(message) {
 
 function mergeThreadSessionMessages(existingMessages, incomingMessages) {
   const incoming = normalizeThreadMessages(incomingMessages);
-  const existing = normalizeThreadMessages(existingMessages);
+  const incomingHasAgentOutput = incoming.some((message) => (
+    message.role === "assistant" || message.role === "activity"
+  ));
+  const existing = normalizeThreadMessages(existingMessages)
+    .filter((message) => !incomingHasAgentOutput || message.kind !== "live_output");
   const byKey = new Map();
 
   incoming.forEach((message, index) => {
@@ -1526,6 +1851,101 @@ function mergeThreadSessionMessages(existingMessages, incomingMessages) {
     .slice(-MAX_THREAD_MESSAGES);
 }
 
+export function appendWorkspaceThreadAgentOutput(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const threadId = cleanText(event.threadId);
+  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const sanitizedOutputText = cleanLiveViewText(event.outputText || event.text, { agentKind: agentId });
+  const text = cleanMessageText(
+    sanitizedOutputText,
+  );
+  if (!workspaceId || !threadId || !isThreadAgentId(agentId) || !text) {
+    return markWorkspaceThreadAgentActivity(state, event);
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[workspaceId];
+  const existing = entry?.threads?.[threadId];
+  if (!existing) {
+    return state || {};
+  }
+
+  const now = nowIso();
+  const messages = normalizeThreadMessages(existing.messages);
+  const lastIndex = messages.length - 1;
+  const lastMessage = messages[lastIndex];
+  const canAppend = lastMessage
+    && lastMessage.role === "assistant"
+    && lastMessage.kind === "live_output"
+    && lastMessage.agentId === agentId;
+  const nextMessages = messages.slice();
+  if (canAppend) {
+    const nextText = cleanMessageText(`${lastMessage.text}${text}`).slice(-LIVE_OUTPUT_MAX_CHARS);
+    nextMessages[lastIndex] = {
+      ...lastMessage,
+      createdAt: now,
+      status: "streaming",
+      text: nextText,
+    };
+  } else {
+    nextMessages.push({
+      agentId,
+      createdAt: now,
+      id: createRandomId(`live-${safeKey(threadId, "thread")}`),
+      kind: "live_output",
+      role: "assistant",
+      source: "terminal-live",
+      status: "streaming",
+      text: text.slice(-LIVE_OUTPUT_MAX_CHARS),
+      title: "",
+    });
+  }
+
+  const providerBindings = normalizeProviderBindings(
+    existing.providerBindings,
+    existing.currentAgent,
+    {
+      activityStatus: "idle",
+      coordination: existing.coordination,
+      lastActiveAt: existing.lastActiveAt,
+      lastMessageAt: now,
+      messageCount: nextMessages.length,
+      status: existing.status,
+      terminalBinding: existing.terminalBinding,
+      updatedAt: now,
+    },
+  );
+  if (providerBindings[agentId]) {
+    providerBindings[agentId] = {
+      ...providerBindings[agentId],
+      activityStatus: "idle",
+      lastMessageAt: now,
+      messageCount: nextMessages.length,
+      updatedAt: now,
+    };
+  }
+
+  return {
+    ...currentState,
+    [workspaceId]: {
+      ...entry,
+      threads: {
+        ...entry.threads,
+        [threadId]: {
+          ...existing,
+          activityStatus: existing.currentAgent === agentId ? "idle" : existing.activityStatus,
+          lastMessageAt: now,
+          materialized: true,
+          messageCount: nextMessages.length,
+          messages: nextMessages.slice(-MAX_THREAD_MESSAGES),
+          providerBindings,
+          updatedAt: now,
+        },
+      },
+    },
+  };
+}
+
 export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const workspaceId = cleanText(event.workspaceId);
   const threadId = cleanText(event.threadId);
@@ -1543,7 +1963,25 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
 
   const now = nowIso();
   const sessionId = cleanText(event.sessionId || event.providerSessionId || event.nativeSessionId);
-  const sessionTitle = cleanText(event.sessionTitle);
+  const requestedProviderSessionId = cleanText(event.requestedProviderSessionId || event.requestedNativeSessionId);
+  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  if (
+    existing.transcriptHydrationMode === "session-only"
+    && !requestedProviderSessionId
+    && matchedBy !== "sessionid"
+  ) {
+    return state || {};
+  }
+  if (sessionId) {
+    const duplicateThreadId = findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, threadId);
+    if (duplicateThreadId) {
+      return state || {};
+    }
+  }
+  const sessionTitle = cleanRealThreadTitleCandidate(event.sessionTitle, existing);
+  const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
+  const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
+  const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
   const messages = mergeThreadSessionMessages(existing.messages, event.messages);
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
@@ -1569,6 +2007,13 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       nativeSessionId: sessionId,
       nativeSessionKind: "session",
       nativeSessionSource: cleanText(event.source, "codex-rollout"),
+      nativeSessionTitle: sessionTitle || providerBindings[agentId].nativeSessionTitle || "",
+      nativeSessionTitleSource: sessionTitle
+        ? cleanText(event.source, `${agentId}-session`)
+        : providerBindings[agentId].nativeSessionTitleSource || "",
+      nativeSessionTitleUpdatedAt: sessionTitle
+        ? now
+        : providerBindings[agentId].nativeSessionTitleUpdatedAt || now,
       nativeSessionUpdatedAt: now,
       updatedAt: now,
     };
@@ -1588,7 +2033,8 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
           messageCount: messages.length,
           messages,
           providerBindings,
-          sessionName: sessionTitle || existing.sessionName || existing.title,
+          sessionName: sessionTitle || existingSessionName || existingTitle || title,
+          title,
           transcriptHydratedAt: now,
           transcriptLatestTimestamp: cleanText(event.latestTimestamp),
           transcriptSessionId: sessionId || existing.transcriptSessionId,
@@ -1750,8 +2196,89 @@ export function deleteWorkspaceThread(state, workspaceId, threadId) {
   };
 }
 
+function getThreadSessionLabel(thread) {
+  if (!thread) {
+    return "";
+  }
+
+  const agentId = cleanAgentId(thread.currentAgent, "");
+  const providerBinding = agentId
+    ? getWorkspaceThreadProviderBinding(thread, agentId)
+    : null;
+  return [
+    providerBinding?.nativeSessionId,
+    thread.transcriptSessionId,
+    thread.coordination?.sessionId,
+  ]
+    .map(cleanThreadLabelCandidate)
+    .find(Boolean) || "";
+}
+
+function getThreadNativeTitleLabel(thread) {
+  if (!thread) {
+    return "";
+  }
+
+  const currentAgent = cleanAgentId(thread.currentAgent, "");
+  const agents = [
+    currentAgent,
+    ...THREAD_AGENT_IDS.filter((agentId) => agentId !== currentAgent),
+  ].filter(Boolean);
+
+  for (const agentId of agents) {
+    const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+    const title = cleanRealThreadTitleCandidate(providerBinding?.nativeSessionTitle, thread);
+    if (title) {
+      return title;
+    }
+  }
+
+  return "";
+}
+
+function getThreadStoredTitleLabel(thread) {
+  return [
+    thread?.title,
+    thread?.sessionName,
+  ]
+    .map((candidate) => cleanRealThreadTitleCandidate(candidate, thread))
+    .find(Boolean) || "";
+}
+
+function getThreadPromptFallbackLabel(thread) {
+  const pendingLabel = getWorkspaceThreadPromptLabel(thread?.pendingPrompt?.text, "");
+  if (pendingLabel) {
+    return pendingLabel;
+  }
+
+  const firstUserMessage = (Array.isArray(thread?.messages) ? thread.messages : [])
+    .find((message) => message?.role === "user" && cleanMessageText(message.text));
+  return getWorkspaceThreadPromptLabel(firstUserMessage?.text, "");
+}
+
 export function getWorkspaceThreadLabel(thread) {
-  return cleanText(thread?.title, "Thread");
+  const nativeTitleLabel = getThreadNativeTitleLabel(thread);
+  if (nativeTitleLabel) {
+    return nativeTitleLabel;
+  }
+
+  const storedTitleLabel = getThreadStoredTitleLabel(thread);
+  if (storedTitleLabel) {
+    return storedTitleLabel;
+  }
+
+  const promptLabel = getThreadPromptFallbackLabel(thread);
+  if (promptLabel) {
+    return promptLabel;
+  }
+
+  const sessionLabel = getThreadSessionLabel(thread);
+  if (sessionLabel) {
+    return sessionLabel;
+  }
+
+  return cleanThreadLabelCandidate(thread?.sessionName || thread?.title)
+    || defaultThreadTitle(getThreadTerminalIndex(thread) || 0, thread?.currentAgent || DEFAULT_AGENT_ID);
 }
 
 export function getWorkspaceThreadProviderBinding(thread, agentId) {

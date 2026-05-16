@@ -351,75 +351,11 @@ import {
   normalizeTerminalOutputBytes,
 } from "./terminalScrollStabilityStrategies.jsx";
 import {
-  TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES,
-  TERMINAL_CODEX_RESIZE_GATE_MAX_MS,
-  TERMINAL_CODEX_RESIZE_GATE_RETRY_MS,
-  TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS,
-  TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS,
-  TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS,
-  TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS,
-  TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS,
-  TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS,
-  TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS,
-  TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_DELAYS_MS,
-  TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS,
-  TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS,
-  TERMINAL_CLAUDE_RESIZE_BLANK_FRAME_GUARD_MS,
-  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_CHARS,
-  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_ROWS,
-  TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_RATIO,
-  TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS,
-  TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_DELAYS_MS,
-  TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_THROTTLE_MS,
-  TERMINAL_SLASH_COMMAND_PROBE_DELAYS_MS,
-  TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS,
-  TERMINAL_STABILITY_RESIZE_PROBE_DELAYS_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_DELAYS_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_MAX_RETRIES,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS,
-  TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS,
-  adjustTerminalRowAfterDeletion,
-  applyCodexResizeTopArtifactPurge,
-  applyTerminalTransientHeaderArtifactCleanup,
-  coalesceCodexResizeRepaintBytes,
-  codexResizeGateSizesEqual,
-  concatTerminalByteArrays,
-  createCodexResizeGateState,
-  createCodexSlashMenuCloseCleanupState,
-  createSlashCommandDiagnosticState,
-  findTerminalViewportAnchorMatch,
-  getCodexResizeLiveTailCleanupPlan,
-  getCodexResizeTopArtifactAdjustment,
-  getCodexResizeTopArtifactPurgePlan,
-  getClaudeResizeDuplicateRepaintDecision,
-  getTerminalBufferRowsDiagnostic,
-  getTerminalBufferDiagnostics,
-  getTerminalCursorHomeDiagnostic,
-  getTerminalOutputByteStats,
-  getTerminalOutputControlProfile,
-  getTerminalOutputDebugFields,
-  getTerminalOutputVisibleCharCount,
-  getTerminalInputDebugFields,
-  getFirstCsiParam,
-  getCsiParamNumbers,
-  getTerminalRendererPaintDiagnostics,
-  getTerminalSlashCommandInputSummary,
-  getTerminalSlashCommandLineSnapshot,
-  getTerminalStabilityFeatureFlags,
-  getTerminalTransientHeaderArtifactCleanupPlan,
-  getTerminalViewportAnchorDiagnostic,
-  getWindowsTerminalCompactState,
-  hashTerminalDiagnosticText,
-  isWindowsTerminalGeometrySettled,
-  isTerminalSlashCommandDiagnosticAgentKind,
-  listenTerminalStabilityRuntimeEnabled,
-  normalizeCodexResizeGateSize,
-  readTerminalStabilityRuntimeEnabled,
-  sanitizeTerminalDiagnosticText,
-} from "./terminalStabilityRecovery.jsx";
+  createLiveViewSanitizer,
+  flushLiveViewOutput,
+  sanitizeLiveViewOutput,
+  stripLiveViewControlSequences,
+} from "./liveViewSanitizer.js";
 import WorkspaceThreadsOverlay from "../threads/WorkspaceThreadsOverlay.jsx";
 import {
   createWorkspaceThreadId,
@@ -458,9 +394,13 @@ const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
+export const WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-archive-terminal-reset";
+export const WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-new-session-terminal-reset";
 const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
 const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
+const TERMINAL_THREAD_LIVE_OUTPUT_FLUSH_MS = 120;
+const TERMINAL_THREAD_LIVE_OUTPUT_MAX_BUFFER = 8000;
 const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_OUTPUT_BATCH_MAX_MS;
 const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 75;
 const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 2;
@@ -473,17 +413,299 @@ const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
 const TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const TODO_DRAG_MIME = "application/x-diffforge-todo";
+const TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES = 0;
+const TERMINAL_CODEX_RESIZE_GATE_MAX_MS = 0;
+const TERMINAL_CODEX_RESIZE_GATE_RETRY_MS = 0;
+const TERMINAL_CODEX_RESIZE_GATE_SETTLE_MS = 0;
+const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_DELAYS_MS = [];
+const TERMINAL_CODEX_RESIZE_LIVE_TAIL_CLEANUP_MS = 0;
+const TERMINAL_CODEX_RESIZE_OUTPUT_PROBE_THROTTLE_MS = 0;
+const TERMINAL_CODEX_RESIZE_PAINT_PROBE_DELAYS_MS = [];
+const TERMINAL_CODEX_RESIZE_PAINT_PROBE_WINDOW_MS = 0;
+const TERMINAL_CODEX_RESIZE_SCROLLBACK_CLEANUP_MS = 0;
+const TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_DELAYS_MS = [];
+const TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS = 0;
+const TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS = 0;
+const TERMINAL_CLAUDE_RESIZE_BLANK_FRAME_GUARD_MS = 0;
+const TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_CHARS = 0;
+const TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_MATCHED_ROWS = 0;
+const TERMINAL_CLAUDE_RESIZE_DUPLICATE_REPAINT_MIN_RATIO = 1;
+const TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS = 240;
+const TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_DELAYS_MS = [];
+const TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_THROTTLE_MS = 0;
+const TERMINAL_SLASH_COMMAND_PROBE_DELAYS_MS = [];
+const TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS = 0;
+const TERMINAL_STABILITY_RESIZE_PROBE_DELAYS_MS = [];
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_DELAYS_MS = [];
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_CLEANUP_MS = 0;
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_MAX_RETRIES = 0;
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_OUTPUT_QUIET_MS = 0;
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS = 0;
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS = 0;
+const TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS = 0;
+const TERMINAL_STABILITY_DISABLED_FEATURES = Object.freeze({
+  claudeResizeBlankFrameGuard: false,
+  claudeResizeDuplicateRepaintGuard: false,
+  codexResizeGate: false,
+  codexResizeLiveTailCleanup: false,
+  codexResizePaintProbe: false,
+  codexResizeScrollbackCleanup: false,
+  dropEraseDisplay2OutsideSync: false,
+  normalizerPipeline: false,
+  outputNormalizer: false,
+  resizeDiagnostics: false,
+  slashCommandDiagnostics: false,
+  slashMenuCloseResize: false,
+  transientHeaderArtifactCleanup: false,
+});
 let activeTerminalKeyboardTarget = null;
 
-function stripAnsiForSessionCapture(value) {
-  return String(value || "")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b[()][A-Za-z0-9]/g, "");
+function decodeTerminalDiagnosticBytes(data) {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(data));
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new TextDecoder("utf-8", { fatal: false }).decode(
+      new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+    );
+  }
+  return String(data || "");
+}
+
+function sanitizeTerminalDiagnosticText(value, maxLength = 140) {
+  const text = stripLiveViewControlSequences(value)
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
+}
+
+function getTerminalOutputVisibleCharCount(data, fallback = 0) {
+  const text = stripLiveViewControlSequences(decodeTerminalDiagnosticBytes(data));
+  return text.length || fallback;
+}
+
+function getTerminalOutputByteStats(data) {
+  const text = decodeTerminalDiagnosticBytes(data);
+  let escapeBytes = 0;
+  let controlBytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 0x1b) {
+      escapeBytes += 1;
+    } else if (code < 0x20 || code === 0x7f) {
+      controlBytes += 1;
+    }
+  }
+  return {
+    bytes: Number(data?.byteLength || text.length || 0),
+    controlBytes,
+    escapeBytes,
+    visibleChars: getTerminalOutputVisibleCharCount(text, 0),
+  };
+}
+
+function getTerminalOutputDebugFields(data) {
+  const stats = getTerminalOutputByteStats(data);
+  return {
+    ...stats,
+    preview: sanitizeTerminalDiagnosticText(decodeTerminalDiagnosticBytes(data), 120),
+  };
+}
+
+function getTerminalInputDebugFields(data) {
+  const text = decodeTerminalDiagnosticBytes(data);
+  return {
+    bytes: text.length,
+    controlBytes: getTerminalOutputByteStats(text).controlBytes,
+    preview: sanitizeTerminalDiagnosticText(text, 80),
+    visibleChars: getTerminalOutputVisibleCharCount(text, 0),
+  };
+}
+
+function getTerminalOutputControlProfile(data) {
+  return getTerminalOutputByteStats(data);
+}
+
+function getFirstCsiParam() {
+  return null;
+}
+
+function getCsiParamNumbers() {
+  return [];
+}
+
+function createSlashCommandDiagnosticState() {
+  return {
+    keydownLine: "",
+    line: "",
+  };
+}
+
+function getTerminalSlashCommandLineSnapshot(value) {
+  const text = sanitizeTerminalDiagnosticText(value, TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS);
+  const commandPreview = text.trimStart();
+  return {
+    commandPreview,
+    startsWithSlash: commandPreview.startsWith("/"),
+    text,
+  };
+}
+
+function getTerminalSlashCommandInputSummary(value) {
+  return getTerminalSlashCommandLineSnapshot(value);
+}
+
+function isTerminalSlashCommandDiagnosticAgentKind() {
+  return false;
+}
+
+function createCodexSlashMenuCloseCleanupState() {
+  return {
+    active: false,
+  };
+}
+
+function createCodexResizeGateState() {
+  return {
+    active: false,
+    epoch: 0,
+    flushDueAt: 0,
+    flushTimer: 0,
+    lastObservedSize: null,
+    lastOutputPaintProbeAt: 0,
+    liveTailCleanupSequence: 0,
+    liveTailCleanupUntil: 0,
+    liveTailLastCleanedSignature: "",
+    paintProbeSequence: 0,
+    paintProbeUntil: 0,
+    previousSize: null,
+    queuedBytes: 0,
+    queuedWrites: [],
+    scrollbackCleanupAnchor: null,
+    scrollbackCleanupLastHandledBaseY: 0,
+    scrollbackCleanupLastTargetY: -1,
+    scrollbackCleanupStartBaseY: 0,
+    scrollbackCleanupStartViewportY: 0,
+    scrollbackCleanupStartedAtBottom: false,
+    scrollbackCleanupUntil: 0,
+    startedAt: 0,
+    startedAtBottom: false,
+    startState: null,
+    targetSize: null,
+  };
+}
+
+function normalizeCodexResizeGateSize(value = {}) {
+  return {
+    cols: Math.max(0, Number(value.cols || 0)),
+    rows: Math.max(0, Number(value.rows || 0)),
+  };
+}
+
+function codexResizeGateSizesEqual(left, right) {
+  return Number(left?.cols || 0) === Number(right?.cols || 0)
+    && Number(left?.rows || 0) === Number(right?.rows || 0);
+}
+
+function concatTerminalByteArrays(...arrays) {
+  const chunks = arrays.filter((array) => array?.byteLength);
+  const total = chunks.reduce((sum, array) => sum + array.byteLength, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach((array) => {
+    output.set(array, offset);
+    offset += array.byteLength;
+  });
+  return output;
+}
+
+function coalesceCodexResizeRepaintBytes(data) {
+  return data;
+}
+
+function getTerminalStabilityFeatureFlags() {
+  return TERMINAL_STABILITY_DISABLED_FEATURES;
+}
+
+function getWindowsTerminalCompactState() {
+  return {};
+}
+
+function getTerminalRendererPaintDiagnostics() {
+  return {};
+}
+
+function getTerminalBufferDiagnostics() {
+  return {};
+}
+
+function getTerminalBufferRowsDiagnostic() {
+  return [];
+}
+
+function getTerminalCursorHomeDiagnostic() {
+  return {};
+}
+
+function getTerminalViewportAnchorDiagnostic() {
+  return {};
+}
+
+function findTerminalViewportAnchorMatch() {
+  return null;
+}
+
+function isWindowsTerminalGeometrySettled() {
+  return true;
+}
+
+function getTerminalTransientHeaderArtifactCleanupPlan() {
+  return null;
+}
+
+function applyTerminalTransientHeaderArtifactCleanup() {
+  return {
+    deletedBlocks: [],
+    deletedRows: 0,
+    reason: "disabled",
+    refreshed: false,
+  };
+}
+
+function adjustTerminalRowAfterDeletion(row) {
+  return row;
+}
+
+function getCodexResizeTopArtifactPurgePlan() {
+  return null;
+}
+
+function applyCodexResizeTopArtifactPurge() {
+  return false;
+}
+
+function getCodexResizeTopArtifactAdjustment() {
+  return null;
+}
+
+function getCodexResizeLiveTailCleanupPlan() {
+  return null;
+}
+
+function getClaudeResizeDuplicateRepaintDecision() {
+  return {
+    action: "pass",
+    matchedRows: 0,
+    ratio: 0,
+  };
 }
 
 function extractNativeSessionIdFromOutput(agentId, text) {
-  const output = stripAnsiForSessionCapture(text);
+  const output = stripLiveViewControlSequences(text);
   const patterns = agentId === "codex"
     ? [
       /\bcodex(?:\.cmd|\.exe)?\s+resume\s+([0-9a-fA-F-]{8,}|[^\s"'`]+)/i,
@@ -878,7 +1100,22 @@ function isTerminalGeneratedReplyInput(data) {
   const text = String(data || "");
 
   return /^\x1b\[\d+;\d+R$/.test(text)
-    || /^\x1b\[\??[0-9;]*c$/.test(text);
+    || /^\x1b\[\??[0-9;]*c$/.test(text)
+    || /^(?:(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c))+$/.test(text);
+}
+
+function stripTerminalGeneratedReplyText(value) {
+  return String(value || "")
+    .replace(/(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c)/g, "")
+    .replace(/\\?\]?(?:10|11|12);rgb:[0-9a-fA-F/]+\\?/g, " ")
+    .replace(/\brgb:[0-9a-fA-F/]+\b/g, " ");
+}
+
+function isTerminalGeneratedReplyVisibleText(value) {
+  const text = String(value || "").trim();
+  return !text
+    || /\\?\]?(?:10|11|12);rgb:[0-9a-fA-F/]+/i.test(text)
+    || /\brgb:[0-9a-fA-F/]+\b/i.test(text);
 }
 
 function terminalInputChunkHasVisibleText(data) {
@@ -886,13 +1123,19 @@ function terminalInputChunkHasVisibleText(data) {
 }
 
 function terminalInputChunkVisibleText(data) {
-  return String(data || "")
+  const strippedText = stripTerminalGeneratedReplyText(stripLiveViewControlSequences(data));
+  const visibleText = strippedText
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
     .replace(/[\u0000-\u001F\u007F]/g, "");
+
+  return isTerminalGeneratedReplyVisibleText(visibleText) ? "" : visibleText;
 }
 
 function applyTerminalInputChunkToDraft(draft, data) {
   const text = String(data || "");
+  if (text.includes("\x15")) {
+    return "";
+  }
   if (text === "\x7f" || text === "\b") {
     return draft.slice(0, -1);
   }
@@ -944,36 +1187,6 @@ export function getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId =
   return `${WORKSPACE_TERMINAL_PANE_PREFIX}-${getSafePaneToken(workspaceId)}-${terminalIndex}-${agentId || "agent"}`;
 }
 
-function getNextThreadTerminalIndex(workspaceThreads, workspaceId) {
-  const usedIndexes = new Set();
-  const entry = workspaceThreads?.[workspaceId];
-
-  Object.values(entry?.threads || {}).forEach((thread) => {
-    const terminalIndex = Number.parseInt(
-      thread?.terminalIndex ?? thread?.terminalBinding?.terminalIndex,
-      10,
-    );
-    if (Number.isInteger(terminalIndex) && terminalIndex >= 0) {
-      usedIndexes.add(terminalIndex);
-    }
-  });
-
-  Object.values(entry?.terminals || {}).forEach((terminal) => {
-    const terminalIndex = Number.parseInt(terminal?.terminalIndex, 10);
-    if (Number.isInteger(terminalIndex) && terminalIndex >= 0) {
-      usedIndexes.add(terminalIndex);
-    }
-  });
-
-  for (let index = MAX_WORKSPACE_TERMINAL_COUNT; index < 60000; index += 1) {
-    if (!usedIndexes.has(index)) {
-      return index;
-    }
-  }
-
-  return MAX_WORKSPACE_TERMINAL_COUNT;
-}
-
 function getTerminalAgentKind(agentId) {
   const normalizedAgentId = String(agentId || "").toLowerCase();
 
@@ -994,6 +1207,97 @@ function getTerminalAgentKind(agentId) {
   }
 
   return "agent";
+}
+
+function getTerminalSubmitSequence(_agentKind, isGenericTerminal = false) {
+  if (isGenericTerminal) {
+    return "";
+  }
+
+  return "\r";
+}
+
+function buildTerminalSubmittedInput(text, agentKind, isGenericTerminal = false) {
+  return `${text}${getTerminalSubmitSequence(agentKind, isGenericTerminal)}`;
+}
+
+function encodeTerminalComposerText(value) {
+  return String(value || "").replace(/\n/g, TERMINAL_SHIFT_ENTER_SEQUENCE);
+}
+
+function buildTerminalComposerDraftInput(previousValue, nextValue, forceReplace = false) {
+  const previous = String(previousValue || "");
+  const next = String(nextValue || "");
+  if (previous === next && !forceReplace) {
+    return "";
+  }
+
+  if (forceReplace) {
+    return `\x15${encodeTerminalComposerText(next)}`;
+  }
+
+  if (next.startsWith(previous)) {
+    return encodeTerminalComposerText(next.slice(previous.length));
+  }
+
+  if (previous.startsWith(next)) {
+    return "\x7f".repeat(previous.length - next.length);
+  }
+
+  return `\x15${encodeTerminalComposerText(next)}`;
+}
+
+function getWorkspaceThreadTerminalTarget({
+  fallbackWorkspace,
+  terminalAgentKind,
+  targetThread,
+  targetWorkspace,
+  workspaceThreads,
+}) {
+  const targetWorkspaceId = targetThread?.workspaceId || targetWorkspace?.id || fallbackWorkspace?.id || "";
+  const workspaceThreadEntry = workspaceThreads?.[targetWorkspaceId];
+  const latestThread = workspaceThreadEntry?.threads?.[targetThread?.id] || targetThread;
+  const agentId = getTerminalAgentKind(latestThread?.currentAgent || targetThread?.currentAgent || terminalAgentKind);
+  const providerBinding = getWorkspaceThreadProviderBinding(latestThread, agentId);
+  const targetTerminalIndex = Number.parseInt(
+    latestThread?.terminalIndex
+      ?? latestThread?.terminalBinding?.terminalIndex
+      ?? providerBinding?.terminalBinding?.terminalIndex
+      ?? targetThread?.terminalIndex
+      ?? targetThread?.terminalBinding?.terminalIndex,
+    10,
+  );
+  const liveTerminal = Number.isInteger(targetTerminalIndex)
+    ? workspaceThreadEntry?.terminals?.[String(targetTerminalIndex)]
+    : null;
+  const liveTerminalBinding = liveTerminal?.paneId
+    && liveTerminal?.instanceId
+    && (!liveTerminal.threadId || liveTerminal.threadId === latestThread?.id)
+    ? {
+      instanceId: liveTerminal.instanceId,
+      paneId: liveTerminal.paneId,
+      terminalIndex: liveTerminal.terminalIndex,
+    }
+    : null;
+  const binding = liveTerminalBinding || providerBinding?.terminalBinding || latestThread?.terminalBinding;
+
+  return {
+    agentId,
+    binding,
+    latestThread,
+    targetTerminalIndex,
+    targetWorkspaceId,
+    workspaceThreadEntry,
+  };
+}
+
+function getThreadComposerSyncKey(thread, binding) {
+  return [
+    thread?.workspaceId || "",
+    thread?.id || "",
+    binding?.paneId || "",
+    binding?.instanceId || "",
+  ].join(":");
 }
 
 function getAgentTone(agent) {
@@ -1200,10 +1504,12 @@ function WorkspaceTerminal({
   onActivateTerminal,
   onChangeTerminalRole,
   onCloseTerminal,
+  onArchiveWorkspaceThread,
   onOpenSettings,
   onPreparedTerminalChange,
   onRecheckAgents,
   onBeginTerminalDrag,
+  onCreateWorkspaceThreadTerminal,
   onSplitTerminal,
   onSelectWorkspaceThread,
   onThreadTerminalLifecycle,
@@ -1229,11 +1535,10 @@ function WorkspaceTerminal({
   const resizeControllerRef = useRef(null);
   const surfaceRef = useRef(null);
   const xtermRef = useRef(null);
-  const terminalStabilityRuntimeEnabledRef = useRef(readTerminalStabilityRuntimeEnabled());
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
-  const hiddenThreadTerminalsRef = useRef(new Map());
+  const submittedPendingPromptIdsRef = useRef(new Set());
   const terminalActiveRef = useRef(Boolean(isActive));
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1241,8 +1546,13 @@ function WorkspaceTerminal({
   const terminalClosingRef = useRef(false);
   const preserveCoordinationOnNextCleanupRef = useRef(false);
   const preserveCoordinationOnNextOpenRef = useRef(false);
+  const forceFreshSessionOnNextOpenRef = useRef(false);
   const parkedPromptRef = useRef(null);
   const cancellingParkedPromptKeysRef = useRef(new Set());
+  const threadComposerDraftsRef = useRef(new Map());
+  const threadComposerDirtyKeysRef = useRef(new Set());
+  const threadComposerWriteChainRef = useRef(Promise.resolve());
+  const [threadComposerDrafts, setThreadComposerDrafts] = useState({});
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
   const [terminalError, setTerminalError] = useState("");
   const [terminalStatus, setTerminalStatus] = useState(() => ({
@@ -1258,7 +1568,7 @@ function WorkspaceTerminal({
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
   const isTerminalStabilityRuntimeEnabled = useCallback(
-    () => terminalStabilityRuntimeEnabledRef.current === true,
+    () => false,
     [],
   );
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
@@ -1300,16 +1610,6 @@ function WorkspaceTerminal({
   useEffect(() => {
     terminalThreadActivityStatusRef.current = terminalThreadActivityStatus;
   }, [terminalThreadActivityStatus]);
-  useEffect(() => () => {
-    hiddenThreadTerminalsRef.current.forEach((session) => {
-      invoke("terminal_close", {
-        instanceId: session.instanceId || undefined,
-        paneId: session.paneId,
-        preserveCoordinationSession: true,
-      }).catch(() => {});
-    });
-    hiddenThreadTerminalsRef.current.clear();
-  }, []);
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
     const terminal = xtermRef.current;
     if (!terminal) {
@@ -1361,6 +1661,11 @@ function WorkspaceTerminal({
       return;
     }
 
+    const safeUserMessage = terminalInputChunkVisibleText(userMessage).trim();
+    if (!safeUserMessage) {
+      return;
+    }
+
     terminalThreadActivityStatusRef.current = "thinking";
     onThreadTerminalLifecycle?.({
       agentId: agent?.id || terminalAgentKind,
@@ -1372,7 +1677,7 @@ function WorkspaceTerminal({
       terminalIndex,
       threadId: terminalThreadIdRef.current,
       type: "message-submitted",
-      userMessage,
+      userMessage: safeUserMessage,
       workspaceId: workspace?.id || "",
       workspaceName: workspace?.name || "",
     });
@@ -1387,59 +1692,213 @@ function WorkspaceTerminal({
     workspace?.id,
     workspace?.name,
   ]);
+
+  const setThreadComposerDraftValue = useCallback((syncKey, value) => {
+    const key = String(syncKey || "");
+    if (!key) {
+      return;
+    }
+
+    const nextValue = String(value || "");
+    if (nextValue) {
+      threadComposerDraftsRef.current.set(key, nextValue);
+    } else {
+      threadComposerDraftsRef.current.delete(key);
+    }
+
+    setThreadComposerDrafts((currentDrafts) => {
+      if ((currentDrafts[key] || "") === nextValue) {
+        return currentDrafts;
+      }
+
+      const nextDrafts = { ...currentDrafts };
+      if (nextValue) {
+        nextDrafts[key] = nextValue;
+      } else {
+        delete nextDrafts[key];
+      }
+      return nextDrafts;
+    });
+  }, []);
+
+  const getCurrentThreadComposerSyncKey = useCallback((instanceId = terminalInstanceIdRef.current) => {
+    if (!workspace?.id || !terminalThreadIdRef.current || !paneId || !instanceId) {
+      return "";
+    }
+
+    return getThreadComposerSyncKey(
+      {
+        id: terminalThreadIdRef.current,
+        workspaceId: workspace.id,
+      },
+      {
+        instanceId,
+        paneId,
+      },
+    );
+  }, [paneId, workspace?.id]);
+
+  const queueWorkspaceThreadComposerWrite = useCallback(({
+    binding,
+    data,
+    promptEventText,
+    threadId,
+  }) => {
+    if (!data || !binding?.paneId || !binding?.instanceId) {
+      return threadComposerWriteChainRef.current;
+    }
+
+    threadComposerWriteChainRef.current = threadComposerWriteChainRef.current
+      .catch(() => {})
+      .then(async () => {
+        await invoke("terminal_write", {
+          data,
+          instanceId: binding.instanceId,
+          paneId: binding.paneId,
+          promptEventText,
+          threadId,
+        });
+        return true;
+      })
+      .catch((error) => {
+        throw error;
+      });
+
+    return threadComposerWriteChainRef.current;
+  }, []);
+
+  const syncWorkspaceThreadComposerInput = useCallback(({ nextValue, previousValue, thread: targetThread, workspace: targetWorkspace }) => {
+    const {
+      binding,
+      latestThread,
+    } = getWorkspaceThreadTerminalTarget({
+      fallbackWorkspace: workspace,
+      targetThread,
+      targetWorkspace,
+      terminalAgentKind,
+      workspaceThreads,
+    });
+    const syncKey = getThreadComposerSyncKey(latestThread, binding);
+
+    if (!binding?.paneId || !binding?.instanceId || !latestThread?.id) {
+      return;
+    }
+
+    const previousDraft = threadComposerDraftsRef.current.has(syncKey)
+      ? threadComposerDraftsRef.current.get(syncKey)
+      : String(previousValue || "");
+    const nextDraft = String(nextValue || "");
+    const forceReplace = threadComposerDirtyKeysRef.current.has(syncKey);
+    const data = buildTerminalComposerDraftInput(previousDraft, nextDraft, forceReplace);
+    setThreadComposerDraftValue(syncKey, nextDraft);
+
+    if (!data) {
+      return;
+    }
+
+    queueWorkspaceThreadComposerWrite({
+      binding,
+      data,
+      threadId: latestThread.id,
+    }).then(() => {
+      threadComposerDirtyKeysRef.current.delete(syncKey);
+    }).catch(() => {
+      threadComposerDirtyKeysRef.current.add(syncKey);
+    });
+  }, [
+    queueWorkspaceThreadComposerWrite,
+    setThreadComposerDraftValue,
+    terminalAgentKind,
+    workspace,
+    workspaceThreads,
+  ]);
+
   const submitWorkspaceThreadMessage = useCallback(async ({ message, model, thread: targetThread, workspace: targetWorkspace }) => {
     const text = String(message || "").trim();
     const modelId = String(model || "").trim();
-    const agentId = getTerminalAgentKind(targetThread?.currentAgent || terminalAgentKind);
-    const providerBinding = getWorkspaceThreadProviderBinding(targetThread, agentId);
-    const binding = providerBinding?.terminalBinding || targetThread?.terminalBinding;
+    const {
+      agentId,
+      binding,
+      latestThread,
+      targetWorkspaceId,
+    } = getWorkspaceThreadTerminalTarget({
+      fallbackWorkspace: workspace,
+      targetThread,
+      targetWorkspace,
+      terminalAgentKind,
+      workspaceThreads,
+    });
     if (!text || !binding?.paneId || !binding?.instanceId) {
       throw new Error("No active terminal is bound to this thread.");
     }
 
-    if (targetThread.id === terminalThreadIdRef.current) {
+    if (latestThread.id === terminalThreadIdRef.current) {
       terminalThreadActivityStatusRef.current = "thinking";
     }
 
+    const syncKey = getThreadComposerSyncKey(latestThread, binding);
+    let submitData = "";
+    const messageId = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+    const messageCreatedAt = new Date().toISOString();
     const lifecycleEvent = {
       agentId,
       instanceId: binding.instanceId,
+      messageCreatedAt,
+      messageId,
       model: modelId,
       modelSource: modelId ? "composer" : "",
       paneId: binding.paneId,
       repoPath: targetWorkspace?.id === workspace?.id
         ? workingDirectory || ""
-        : targetThread.coordination?.worktreePath || workingDirectory || "",
-      slotKey: targetThread.slotKey || String(Math.max(0, Number.parseInt(targetThread.terminalIndex, 10) || 0) + 1),
+        : latestThread.coordination?.worktreePath || workingDirectory || "",
+      slotKey: latestThread.slotKey || String(Math.max(0, Number.parseInt(latestThread.terminalIndex, 10) || 0) + 1),
       status: "active",
-      terminalIndex: targetThread.terminalIndex ?? binding.terminalIndex,
-      threadId: targetThread.id,
+      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      threadId: latestThread.id,
       type: "message-submitted",
       userMessage: text,
-      workspaceId: targetThread.workspaceId || targetWorkspace?.id || workspace?.id || "",
+      workspaceId: targetWorkspaceId,
       workspaceName: targetWorkspace?.name || workspace?.name || "",
     };
-
     onThreadTerminalLifecycle?.(lifecycleEvent);
 
-    await invoke("terminal_write", {
-      data: `${text}\r`,
-      instanceId: binding.instanceId,
-      paneId: binding.paneId,
-      promptEventText: text,
-    });
+    try {
+      await threadComposerWriteChainRef.current.catch(() => {});
+      const syncedDraft = threadComposerDraftsRef.current.get(syncKey) || "";
+      const forceReplace = threadComposerDirtyKeysRef.current.has(syncKey);
+      const syncData = buildTerminalComposerDraftInput(syncedDraft, text, forceReplace);
+      submitData = `${syncData}${getTerminalSubmitSequence(agentId)}`;
+
+      if (syncData) {
+        setThreadComposerDraftValue(syncKey, text);
+      }
+      await queueWorkspaceThreadComposerWrite({
+        binding,
+        data: submitData,
+        promptEventText: text,
+        threadId: latestThread.id,
+      });
+      setThreadComposerDraftValue(syncKey, "");
+      threadComposerDirtyKeysRef.current.delete(syncKey);
+    } catch (error) {
+      threadComposerDirtyKeysRef.current.add(syncKey);
+      throw error;
+    }
   }, [
     onThreadTerminalLifecycle,
+    queueWorkspaceThreadComposerWrite,
+    setThreadComposerDraftValue,
     terminalAgentKind,
     workingDirectory,
     workspace?.id,
     workspace?.name,
+    workspaceThreads,
   ]);
   const createWorkspaceThreadChat = useCallback(async ({ agentId, message, model, workspace: targetWorkspace }) => {
     const text = String(message || "").trim();
     const nextAgentId = getTerminalAgentKind(agentId);
     const targetWorkspaceId = targetWorkspace?.id || workspace?.id || "";
-    const targetWorkspaceName = targetWorkspace?.name || workspace?.name || "";
+    const requestedModel = String(model || "").trim();
 
     if (!text) {
       throw new Error("Write a message before starting a chat.");
@@ -1453,173 +1912,23 @@ function WorkspaceTerminal({
       throw new Error("Open the workspace before starting a chat there.");
     }
 
-    const terminalIndex = getNextThreadTerminalIndex(workspaceThreads, targetWorkspaceId);
-    const threadId = createWorkspaceThreadId(targetWorkspaceId, terminalIndex);
-    const paneId = getWorkspaceTerminalPaneId(targetWorkspaceId, terminalIndex, nextAgentId);
-    const instanceId = getNextWorkspaceTerminalInstanceId();
-    const slotKey = String(terminalIndex + 1);
-    const requestedModel = String(model || "").trim();
-    const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
-    let providerSessionCaptureBuffer = "";
-    let capturedProviderSessionId = "";
-    let providerSessionPublished = false;
-    let threadMaterialized = false;
-    let activitySettled = false;
-
-    const publishProviderSession = (nativeSessionId) => {
-      if (!threadMaterialized || providerSessionPublished || !nativeSessionId) {
-        return;
-      }
-
-      providerSessionPublished = true;
-      onThreadTerminalLifecycle?.({
-        agentId: nextAgentId,
-        instanceId,
-        model: requestedModel,
-        modelSource: requestedModel ? "new-chat" : "",
-        nativeSessionId,
-        nativeSessionKind: "session",
-        nativeSessionSource: "terminal-output",
-        paneId,
-        terminalIndex,
-        threadId,
-        type: "provider-session",
-        workspaceId: targetWorkspaceId,
-      });
-    };
-
-    const outputChannel = new Channel((messageChunk) => {
-      const data = messageChunk instanceof ArrayBuffer
-        ? new Uint8Array(messageChunk)
-        : ArrayBuffer.isView(messageChunk)
-          ? new Uint8Array(messageChunk.buffer, messageChunk.byteOffset, messageChunk.byteLength)
-          : null;
-
-      if (!data?.byteLength) {
-        return;
-      }
-
-      const outputText = outputTextDecoder.decode(data, { stream: true });
-      const cleanOutputText = stripAnsiForSessionCapture(outputText);
-      if (!capturedProviderSessionId) {
-        providerSessionCaptureBuffer = stripAnsiForSessionCapture(
-          `${providerSessionCaptureBuffer}${cleanOutputText}`,
-        ).slice(-2400);
-        const nativeSessionId = extractNativeSessionIdFromOutput(
-          nextAgentId,
-          providerSessionCaptureBuffer,
-        );
-        if (nativeSessionId) {
-          capturedProviderSessionId = nativeSessionId;
-          publishProviderSession(nativeSessionId);
-        }
-      }
-
-      if (threadMaterialized && !activitySettled && cleanOutputText.trim()) {
-        activitySettled = true;
-        onThreadTerminalLifecycle?.({
-          activityStatus: "idle",
-          agentId: nextAgentId,
-          instanceId,
-          paneId,
-          terminalIndex,
-          threadId,
-          type: "agent-output",
-          workspaceId: targetWorkspaceId,
-        });
-      }
-    });
-
-    hiddenThreadTerminalsRef.current.set(paneId, {
-      instanceId,
-      outputChannel,
-      paneId,
-      threadId,
-    });
-
-    try {
-      const openResult = await invoke("terminal_open", {
-        request: {
-          paneId,
-          instanceId,
-          kind: nextAgentId,
-          provider: nextAgentId,
-          providerSessionId: "",
-          model: requestedModel,
-          plainShell: false,
-          preserveCoordinationSession: false,
-          slotKey,
-          terminalIndex,
-          threadId,
-          workingDirectory: workingDirectory || "",
-          workspaceId: targetWorkspaceId,
-          workspaceName: targetWorkspaceName,
-          cols: 100,
-          rows: 32,
-        },
-        outputChannel,
-      });
-
-      hiddenThreadTerminalsRef.current.set(paneId, {
-        instanceId: openResult?.instanceId || instanceId,
-        outputChannel,
-        paneId,
-        threadId,
-      });
-
-      onThreadTerminalLifecycle?.({
-        agentBranch: openResult?.agentBranch || "",
-        agentId: nextAgentId,
-        coordinationAgentId: openResult?.agentId || "",
-        coordinationMode: openResult?.coordinationMode || "",
-        instanceId: openResult?.instanceId || instanceId,
-        model: requestedModel,
-        modelSource: requestedModel ? "new-chat" : "",
-        paneId,
-        repoPath: workingDirectory || "",
-        sessionId: openResult?.sessionId || "",
-        slotKey: openResult?.slotKey || slotKey,
-        status: "active",
-        terminalIndex,
-        threadId,
-        title: text,
-        type: "message-submitted",
-        userMessage: text,
-        workspaceId: targetWorkspaceId,
-        workspaceName: targetWorkspaceName,
-        worktreePath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
-      });
-      threadMaterialized = true;
-      if (capturedProviderSessionId) {
-        publishProviderSession(capturedProviderSessionId);
-      }
-
-      await invoke("terminal_write", {
-        data: `${text}\r`,
-        instanceId: openResult?.instanceId || instanceId,
-        paneId,
-        promptEventText: text,
-      });
-
-      return {
-        threadId,
-        workspace: targetWorkspace || workspace,
-        workspaceId: targetWorkspaceId,
-      };
-    } catch (error) {
-      hiddenThreadTerminalsRef.current.delete(paneId);
-      invoke("terminal_close", {
-        instanceId,
-        paneId,
-        preserveCoordinationSession: false,
-      }).catch(() => {});
-      throw error;
+    if (typeof onCreateWorkspaceThreadTerminal !== "function") {
+      throw new Error("Unable to create a workspace terminal for this chat.");
     }
+
+    return onCreateWorkspaceThreadTerminal({
+      agentId: nextAgentId,
+      message: text,
+      model: requestedModel,
+      sourcePaneId: paneId,
+      sourceTerminalIndex: terminalIndex,
+      workspace: targetWorkspace || workspace,
+    });
   }, [
-    onThreadTerminalLifecycle,
-    workingDirectory,
+    onCreateWorkspaceThreadTerminal,
+    paneId,
+    terminalIndex,
     workspace,
-    workspaceThreads,
   ]);
   const changeWorkspaceThreadModel = useCallback(async ({ model, thread: targetThread }) => {
     const nextModel = String(model || "").trim();
@@ -1639,9 +1948,10 @@ function WorkspaceTerminal({
 
     const command = `/model ${nextModel}`;
     await invoke("terminal_write", {
-      data: `${command}\r`,
+      data: buildTerminalSubmittedInput(command, agentId),
       instanceId: binding.instanceId,
       paneId: binding.paneId,
+      threadId: targetThread.id,
     });
     onThreadTerminalLifecycle?.({
       agentId,
@@ -1824,6 +2134,103 @@ function WorkspaceTerminal({
     };
   }, [restartRoleMenuOpen]);
 
+  const materializeFreshThreadForTerminalSession = useCallback((target = {}) => {
+    const targetWorkspaceId = String(target.workspaceId || workspace?.id || "").trim();
+    const targetTerminalIndex = Number.parseInt(target.terminalIndex ?? terminalIndex, 10);
+    const nextAgentId = getTerminalAgentKind(target.agentId || terminalAgentKind);
+    if (
+      !targetWorkspaceId
+      || !Number.isInteger(targetTerminalIndex)
+      || !["codex", "claude", "opencode"].includes(nextAgentId)
+    ) {
+      return "";
+    }
+
+    const nextThreadId = String(target.threadId || createWorkspaceThreadId(targetWorkspaceId, targetTerminalIndex)).trim();
+    onThreadTerminalLifecycle?.({
+      agentId: nextAgentId,
+      freshSession: true,
+      instanceId: target.instanceId || undefined,
+      paneId: target.paneId || "",
+      repoPath: target.repoPath || workingDirectory || "",
+      slotKey: String(targetTerminalIndex + 1),
+      status: "starting",
+      terminalIndex: targetTerminalIndex,
+      threadId: nextThreadId,
+      transcriptHydrationMode: "session-only",
+      type: "thread-starting",
+      workspaceId: targetWorkspaceId,
+      workspaceName: target.workspaceName || workspace?.name || "",
+    });
+    return nextThreadId;
+  }, [
+    onThreadTerminalLifecycle,
+    terminalAgentKind,
+    terminalIndex,
+    workingDirectory,
+    workspace?.id,
+    workspace?.name,
+  ]);
+
+  const restartWithEmptyTerminalSession = useCallback((detail = {}) => {
+    const nextSlotKey = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
+    const nextThreadId = String(detail.nextThreadId || "").trim();
+
+    setRestartRoleMenuOpen(false);
+    setTerminalClosed(false);
+    terminalClosingRef.current = false;
+    preserveCoordinationOnNextCleanupRef.current = false;
+    preserveCoordinationOnNextOpenRef.current = false;
+    forceFreshSessionOnNextOpenRef.current = true;
+    terminalThreadIdRef.current = nextThreadId;
+    terminalThreadSlotKeyRef.current = nextSlotKey;
+    terminalThreadActivityStatusRef.current = "idle";
+    setTerminalClosing(false);
+    setTerminalState("starting");
+    setTerminalError("");
+    setTerminalLaunchInfo(null);
+    setParkedPrompt(null);
+    parkedPromptRef.current = null;
+    setTerminalStatus({
+      detail: detail.statusDetail || "Starting an empty terminal session.",
+      title: "Preparing Terminal",
+      visible: true,
+    });
+    setRestartKey((key) => key + 1);
+  }, [terminalIndex]);
+
+  useEffect(() => {
+    const handleEmptyThreadReset = (event) => {
+      const detail = event?.detail || {};
+      const targetWorkspaceId = String(detail.workspaceId || "").trim();
+      const targetThreadId = String(detail.threadId || "").trim();
+      const targetPaneId = String(detail.paneId || "").trim();
+      const targetTerminalIndex = Number.parseInt(detail.terminalIndex, 10);
+
+      if (
+        !targetWorkspaceId
+        || targetWorkspaceId !== String(workspace?.id || "")
+        || !Number.isInteger(targetTerminalIndex)
+        || targetTerminalIndex !== terminalIndex
+        || (targetPaneId && targetPaneId !== paneId)
+        || (!targetPaneId && targetThreadId && targetThreadId !== terminalThreadIdRef.current && targetThreadId !== thread?.id)
+        || terminalClosed
+        || terminalClosingRef.current
+      ) {
+        return;
+      }
+
+      restartWithEmptyTerminalSession(detail);
+    };
+
+    window.addEventListener(WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
+    window.addEventListener(WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
+    return () => {
+      window.removeEventListener(WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
+      window.removeEventListener(WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
+    };
+  }, [paneId, restartWithEmptyTerminalSession, terminalClosed, terminalIndex, thread?.id, workspace?.id]);
+
   useEffect(() => {
     parkedPromptRef.current = parkedPrompt;
     updateTerminalInteractiveState(terminalActiveRef.current, Boolean(parkedPrompt));
@@ -1857,11 +2264,6 @@ function WorkspaceTerminal({
   useEffect(() => {
     patchTerminalMetrics({ terminalCount });
   }, [terminalCount]);
-
-  useEffect(() => listenTerminalStabilityRuntimeEnabled((enabled) => {
-    terminalStabilityRuntimeEnabledRef.current = enabled;
-    resizeControllerRef.current?.schedule?.("terminal_stability_runtime_toggle", 0);
-  }), []);
 
   useEffect(() => {
     let disposed = false;
@@ -1909,6 +2311,7 @@ function WorkspaceTerminal({
       startAgentInPrewarmedTerminalRef.current = null;
       preserveCoordinationOnNextCleanupRef.current = false;
       preserveCoordinationOnNextOpenRef.current = false;
+      forceFreshSessionOnNextOpenRef.current = false;
       setTerminalState("blocked");
       setTerminalError("");
       setTerminalStatus({
@@ -1926,6 +2329,7 @@ function WorkspaceTerminal({
     if (terminalClosed) {
       preserveCoordinationOnNextCleanupRef.current = false;
       preserveCoordinationOnNextOpenRef.current = false;
+      forceFreshSessionOnNextOpenRef.current = false;
       setTerminalState("closed");
       setTerminalError("");
       setTerminalStatus({
@@ -1955,8 +2359,22 @@ function WorkspaceTerminal({
     let rendererMode = useWebglRenderer ? "webgl_pending" : "canvas";
     let runtimeTerminalState = "starting";
     const preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
+    const forceFreshSessionForThisStart = (
+      forceFreshSessionOnNextOpenRef.current
+      || Boolean(thread?.freshSessionStartedAt && !threadProviderSessionId)
+    ) && !isGenericTerminal;
+    const startupThreadProviderSessionId = forceFreshSessionForThisStart ? "" : threadProviderSessionId;
+    const startupThreadProviderModel = forceFreshSessionForThisStart ? "" : threadProviderModel;
+    const startupThreadId = terminalThreadIdRef.current;
+    const startupSlotKey = forceFreshSessionForThisStart
+      ? String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1)
+      : terminalThreadSlotKeyRef.current;
     preserveCoordinationOnNextOpenRef.current = false;
-    if (!preserveCoordinationForThisStart) {
+    forceFreshSessionOnNextOpenRef.current = false;
+    if (forceFreshSessionForThisStart) {
+      terminalThreadSlotKeyRef.current = startupSlotKey;
+    }
+    if (!preserveCoordinationForThisStart || forceFreshSessionForThisStart) {
       setTerminalLaunchInfo(null);
     }
     let startAgentInCurrentPty = null;
@@ -1969,6 +2387,7 @@ function WorkspaceTerminal({
     let pendingOutputBytes = 0;
     let outputBatchQueuedAt = 0;
     let outputWriteInFlight = false;
+    let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
     let outputBytes = 0;
@@ -2987,6 +3406,17 @@ function WorkspaceTerminal({
       return false;
     };
 
+    const scheduleVisibleOutputRefresh = (reason, extraFields = {}, delayMs = 34) => {
+      if (isDisposed || visibleOutputRefreshTimer) {
+        return;
+      }
+
+      visibleOutputRefreshTimer = window.setTimeout(() => {
+        visibleOutputRefreshTimer = 0;
+        refreshTerminalRenderer(reason, extraFields);
+      }, delayMs);
+    };
+
     const scheduleBlankStartupWatch = (reason, delayMs = TERMINAL_BLANK_STARTUP_PROBE_MS, previousProbe = null) => {
       if (isDisposed) {
         return;
@@ -3358,6 +3788,21 @@ function WorkspaceTerminal({
           }, [16, 80]);
         }
 
+        if (batchVisibleChars > 0) {
+          refreshTerminalRenderer("visible_output_written", {
+            bytes: batchData.byteLength,
+            reason,
+            transport: "binary_channel",
+            visibleChars: batchVisibleChars,
+          });
+          scheduleVisibleOutputRefresh("visible_output_written_settled", {
+            bytes: batchData.byteLength,
+            reason,
+            transport: "binary_channel",
+            visibleChars: batchVisibleChars,
+          });
+        }
+
         if (isSlashCommandDiagnosticProbeActive()) {
           scheduleSlashCommandDiagnosticProbe("terminal_output_write", "after_output_write", {
             batchBytes,
@@ -3471,8 +3916,7 @@ function WorkspaceTerminal({
 
     const codexResizeGate = createCodexResizeGateState();
     const isCodexResizeGateEnabled = () => (
-      isTerminalStabilityRuntimeActive()
-      && terminalStabilityFeatures.resizeGate
+      terminalStabilityFeatures.resizeGate
       && terminalOutputNormalizer.enabled
       && !isGenericTerminal
     );
@@ -5899,8 +6343,61 @@ function WorkspaceTerminal({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
         const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+        const liveOutputSanitizer = createLiveViewSanitizer();
         let providerSessionCaptureBuffer = "";
-        let capturedProviderSessionId = threadProviderSessionId || "";
+        let capturedProviderSessionId = startupThreadProviderSessionId || "";
+        let liveOutputBuffer = "";
+        let liveOutputFlushTimer = 0;
+        const flushLiveOutput = () => {
+          if (liveOutputFlushTimer) {
+            window.clearTimeout(liveOutputFlushTimer);
+            liveOutputFlushTimer = 0;
+          }
+          const outputText = `${liveOutputBuffer}${flushLiveViewOutput(liveOutputSanitizer, {
+            agentKind: terminalAgentKind,
+          })}`;
+          liveOutputBuffer = "";
+          if (isDisposed || isGenericTerminal || !terminalThreadIdRef.current || !outputText.trim()) {
+            return;
+          }
+
+          onThreadTerminalLifecycle?.({
+            activityStatus: "idle",
+            agentId: terminalAgentKind,
+            instanceId: terminalInstanceId,
+            outputText,
+            paneId,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current,
+            type: "agent-output",
+            workspaceId: workspace?.id || "",
+          });
+        };
+        const queueLiveOutput = (outputText) => {
+          if (isGenericTerminal || !terminalThreadIdRef.current) {
+            return;
+          }
+          const text = sanitizeLiveViewOutput(liveOutputSanitizer, outputText, {
+            agentKind: terminalAgentKind,
+          }).text;
+          if (!text.trim()) {
+            if (liveOutputSanitizer.currentLine?.trim() && !liveOutputFlushTimer) {
+              liveOutputFlushTimer = window.setTimeout(flushLiveOutput, TERMINAL_THREAD_LIVE_OUTPUT_FLUSH_MS);
+            }
+            return;
+          }
+          liveOutputBuffer = `${liveOutputBuffer}${text}`.slice(-TERMINAL_THREAD_LIVE_OUTPUT_MAX_BUFFER);
+          if (!liveOutputFlushTimer) {
+            liveOutputFlushTimer = window.setTimeout(flushLiveOutput, TERMINAL_THREAD_LIVE_OUTPUT_FLUSH_MS);
+          }
+        };
+        disposables.push(() => {
+          if (liveOutputFlushTimer) {
+            window.clearTimeout(liveOutputFlushTimer);
+            liveOutputFlushTimer = 0;
+          }
+          liveOutputBuffer = "";
+        });
         const outputChannel = new Channel((message) => {
           if (isDisposed) {
             return;
@@ -6024,10 +6521,10 @@ function WorkspaceTerminal({
             return;
           }
 
+          const decodedTerminalText = outputTextDecoder.decode(terminalData, { stream: true });
           if (!capturedProviderSessionId && !isGenericTerminal && terminalThreadIdRef.current) {
-            providerSessionCaptureBuffer = stripAnsiForSessionCapture(
-              `${providerSessionCaptureBuffer}${outputTextDecoder.decode(terminalData, { stream: true })}`,
-            ).slice(-2400);
+            const captureText = stripLiveViewControlSequences(decodedTerminalText);
+            providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${captureText}`.slice(-2400);
             const nativeSessionId = extractNativeSessionIdFromOutput(
               terminalAgentKind,
               providerSessionCaptureBuffer,
@@ -6059,6 +6556,9 @@ function WorkspaceTerminal({
             ? outputByteStats.visibleChars
             : getTerminalOutputVisibleCharCount(terminalData, 1);
           const hasVisibleOutput = visibleChars > 0;
+          if (hasVisibleOutput && decodedTerminalText) {
+            queueLiveOutput(decodedTerminalText);
+          }
           if (
             hasVisibleOutput
             && !isGenericTerminal
@@ -6172,7 +6672,7 @@ function WorkspaceTerminal({
               instanceId: terminalInstanceId,
               paneId,
               terminalIndex,
-              threadId: terminalThreadIdRef.current,
+              threadId: startupThreadId,
               type: "exited",
               workspaceId: workspace?.id || "",
             });
@@ -6192,6 +6692,19 @@ function WorkspaceTerminal({
         let terminalInputWriteChain = Promise.resolve();
         let terminalSubmittedInputHasText = false;
         let terminalSubmittedInputText = "";
+        const syncCurrentTerminalComposerDraft = (value) => {
+          setThreadComposerDraftValue(
+            getCurrentThreadComposerSyncKey(terminalInstanceId),
+            value,
+          );
+        };
+        const refreshTerminalComposerDraftFromStore = () => {
+          const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
+          if (syncKey && threadComposerDraftsRef.current.has(syncKey)) {
+            terminalSubmittedInputText = threadComposerDraftsRef.current.get(syncKey) || "";
+            terminalSubmittedInputHasText = terminalSubmittedInputText.trim().length > 0;
+          }
+        };
         const writeTerminalInputChunk = (data, reason) => {
           const isEscapeInput = String(data || "").includes("\x1b");
           const escapeDebugFields = isEscapeInput
@@ -6214,6 +6727,7 @@ function WorkspaceTerminal({
                 paneId,
                 instanceId: terminalInstanceId,
                 data,
+                threadId: terminalThreadIdRef.current,
               }).then((result) => {
                 if (escapeDebugFields) {
                 }
@@ -6281,7 +6795,11 @@ function WorkspaceTerminal({
           event.stopPropagation?.();
           event.stopImmediatePropagation?.();
 
+          refreshTerminalComposerDraftFromStore();
           flushTerminalInput("shift_enter_flush_before");
+          terminalSubmittedInputText = `${terminalSubmittedInputText}\n`;
+          terminalSubmittedInputHasText = true;
+          syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
           writeTerminalInputChunk(TERMINAL_SHIFT_ENTER_SEQUENCE, "shift_enter");
           return true;
         };
@@ -6296,9 +6814,10 @@ function WorkspaceTerminal({
             return;
           }
 
+          const terminalGeneratedReply = isTerminalGeneratedReplyInput(safeData);
           const startupControlReply = !hasOpenPty
             && startupControlReplyBridgeOpen
-            && isTerminalGeneratedReplyInput(safeData);
+            && terminalGeneratedReply;
 
           if (!hasOpenPty && !startupControlReply) {
             return;
@@ -6320,17 +6839,20 @@ function WorkspaceTerminal({
             });
           }
 
-          if (!startupControlReply && terminalInputChunkHasVisibleText(safeData)) {
+          if (!startupControlReply && !terminalGeneratedReply && terminalInputChunkHasVisibleText(safeData)) {
+            refreshTerminalComposerDraftFromStore();
             terminalSubmittedInputHasText = true;
           }
-          if (!startupControlReply) {
+          if (!startupControlReply && !terminalGeneratedReply) {
+            refreshTerminalComposerDraftFromStore();
             terminalSubmittedInputText = applyTerminalInputChunkToDraft(
               terminalSubmittedInputText,
               safeData,
             );
+            syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
           }
           const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
-          if (!startupControlReply && isSubmitInput) {
+          if (!startupControlReply && !terminalGeneratedReply && isSubmitInput) {
             if (terminalSubmittedInputHasText) {
               recordSubmittedAgentMessage(
                 terminalInstanceId,
@@ -6339,6 +6861,7 @@ function WorkspaceTerminal({
             }
             terminalSubmittedInputHasText = false;
             terminalSubmittedInputText = "";
+            syncCurrentTerminalComposerDraft("");
           }
 
           if (safeData.startsWith("\x1b")) {
@@ -6347,6 +6870,8 @@ function WorkspaceTerminal({
               safeData,
               startupControlReply
                 ? "startup_terminal_control_reply"
+                : terminalGeneratedReply
+                  ? "terminal_control_reply"
                 : safeData === "\x1b"
                   ? "escape"
                   : "escape_sequence",
@@ -6632,13 +7157,14 @@ function WorkspaceTerminal({
               instanceId: terminalInstanceId,
               kind: openKind,
               provider: openProvider,
-              providerSessionId: threadProviderSessionId,
-              model: threadProviderModel,
+              freshSession: forceFreshSessionForThisStart,
+              providerSessionId: startupThreadProviderSessionId,
+              model: startupThreadProviderModel,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
-              slotKey: terminalThreadSlotKeyRef.current,
+              slotKey: startupSlotKey,
               terminalIndex,
-              threadId: terminalThreadIdRef.current,
+              threadId: startupThreadId,
               workingDirectory: workingDirectory || "",
               workspaceId: workspace?.id || "",
               workspaceName: workspace?.name || "",
@@ -6687,14 +7213,14 @@ function WorkspaceTerminal({
           coordinationAgentId: openResult?.agentId || "",
           coordinationMode: openResult?.coordinationMode || "",
           instanceId: terminalInstanceId,
-          model: threadProviderModel,
-          modelSource: threadProviderModel ? "session-restore" : "",
+          model: startupThreadProviderModel,
+          modelSource: startupThreadProviderModel ? "session-restore" : "",
           paneId,
           sessionId: openResult?.sessionId || "",
           slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
           status: shouldPrewarmShell ? "starting" : "active",
           terminalIndex,
-          threadId: terminalThreadIdRef.current,
+          threadId: startupThreadId,
           type: "opened",
           workspaceId: workspace?.id || "",
           worktreePath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
@@ -6731,19 +7257,19 @@ function WorkspaceTerminal({
         focusTerminalKeyboardInput();
 
         if (
-          threadProviderModel
-          && threadProviderSessionId
+          startupThreadProviderModel
+          && startupThreadProviderSessionId
           && !isGenericTerminal
           && !shouldPrewarmShell
         ) {
-          const restoreModelCommand = `/model ${threadProviderModel}`;
+          const restoreModelCommand = `/model ${startupThreadProviderModel}`;
           window.setTimeout(() => {
             if (isDisposed) {
               return;
             }
 
             invoke("terminal_write", {
-              data: `${restoreModelCommand}\r`,
+              data: buildTerminalSubmittedInput(restoreModelCommand, terminalAgentKind, isGenericTerminal),
               instanceId: terminalInstanceId,
               paneId,
             }).catch(() => {});
@@ -6757,7 +7283,7 @@ function WorkspaceTerminal({
             paneId,
             ready: true,
             terminalIndex,
-            threadId: terminalThreadIdRef.current,
+            threadId: startupThreadId,
             workspaceId: workspace?.id || "",
           });
 
@@ -6784,7 +7310,7 @@ function WorkspaceTerminal({
             agentId: agent?.id || terminalAgentKind,
             paneId,
             terminalIndex,
-            threadId: terminalThreadIdRef.current,
+            threadId: startupThreadId,
             type: "error",
             workspaceId: workspace?.id || "",
           });
@@ -6806,6 +7332,10 @@ function WorkspaceTerminal({
       }
       if (backendPrepDetailTimer) {
         window.clearTimeout(backendPrepDetailTimer);
+      }
+      if (visibleOutputRefreshTimer) {
+        window.clearTimeout(visibleOutputRefreshTimer);
+        visibleOutputRefreshTimer = 0;
       }
       startupMetricTimers.forEach((timer) => window.clearTimeout(timer));
       startupMetricTimers.clear();
@@ -6835,7 +7365,7 @@ function WorkspaceTerminal({
         paneId,
         ready: false,
         terminalIndex,
-        threadId: terminalThreadIdRef.current,
+        threadId: startupThreadId,
         workspaceId: workspace?.id || "",
       });
       clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceId);
@@ -6848,7 +7378,67 @@ function WorkspaceTerminal({
       }).catch(() => {});
       terminal.dispose();
     };
-  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, onThreadTerminalLifecycle, paneId, recordSubmittedAgentMessage, requestTerminalAudioInputTarget, restartKey, terminalAgentKind, terminalClosed, terminalRoleId, terminalScrollStabilityMode, threadProviderModel, threadProviderSessionId, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, getCurrentThreadComposerSyncKey, isGenericTerminal, onPreparedTerminalChange, onThreadTerminalLifecycle, paneId, recordSubmittedAgentMessage, requestTerminalAudioInputTarget, restartKey, setThreadComposerDraftValue, terminalAgentKind, terminalClosed, terminalIndex, terminalRoleId, terminalScrollStabilityMode, thread?.freshSessionStartedAt, threadProviderModel, threadProviderSessionId, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
+
+  useEffect(() => {
+    const pendingPrompt = thread?.pendingPrompt;
+    const promptId = String(pendingPrompt?.id || "").trim();
+    const promptText = String(pendingPrompt?.text || "").trim();
+    const threadId = terminalThreadIdRef.current || thread?.id || "";
+    const instanceId = terminalInstanceIdRef.current || 0;
+
+    if (
+      !promptId
+      || !promptText
+      || !threadId
+      || !instanceId
+      || !paneId
+      || isGenericTerminal
+      || terminalClosed
+      || terminalClosing
+      || terminalState !== "running"
+    ) {
+      return;
+    }
+
+    if (submittedPendingPromptIdsRef.current.has(promptId)) {
+      return;
+    }
+
+    submittedPendingPromptIdsRef.current.add(promptId);
+    terminalThreadActivityStatusRef.current = "thinking";
+
+    invoke("terminal_write", {
+      data: buildTerminalSubmittedInput(promptText, terminalAgentKind, isGenericTerminal),
+      instanceId,
+      paneId,
+      promptEventText: promptText,
+      threadId,
+    })
+      .then(() => {
+        onThreadTerminalLifecycle?.({
+          pendingPromptId: promptId,
+          threadId,
+          type: "pending-prompt-sent",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        });
+      })
+      .catch((error) => {
+        submittedPendingPromptIdsRef.current.delete(promptId);
+        setTerminalError(getErrorMessage(error, "Unable to send initial chat message."));
+      });
+  }, [
+    isGenericTerminal,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalClosed,
+    terminalClosing,
+    terminalState,
+    thread?.id,
+    thread?.pendingPrompt,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
 
@@ -6923,8 +7513,9 @@ function WorkspaceTerminal({
       await invoke("terminal_write", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
-        data: `${prompt}${isGenericTerminal ? "" : "\r"}`,
+        data: buildTerminalSubmittedInput(prompt, terminalAgentKind, isGenericTerminal),
         promptEventText: prompt,
+        threadId: terminalThreadIdRef.current,
       });
     } catch (error) {
       setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
@@ -7021,6 +7612,28 @@ function WorkspaceTerminal({
     }
   }, [focusTerminalKeyboardInput, paneId, parkedPrompt, updateTerminalInteractiveState]);
 
+  const detachThreadForNewTerminalSession = useCallback((target = {}) => {
+    const targetWorkspaceId = String(target.workspaceId || workspace?.id || "").trim();
+    const targetTerminalIndex = Number.parseInt(target.terminalIndex ?? terminalIndex, 10);
+    if (!targetWorkspaceId || !Number.isInteger(targetTerminalIndex)) {
+      return false;
+    }
+
+    onThreadTerminalLifecycle?.({
+      agentId: getTerminalAgentKind(target.agentId || terminalAgentKind),
+      forgetTerminalThread: true,
+      instanceId: target.instanceId || undefined,
+      paneId: target.paneId || "",
+      rememberTerminalThread: false,
+      status: "closed",
+      terminalIndex: targetTerminalIndex,
+      threadId: String(target.threadId || "").trim(),
+      type: "closed",
+      workspaceId: targetWorkspaceId,
+    });
+    return true;
+  }, [onThreadTerminalLifecycle, terminalAgentKind, terminalIndex, workspace?.id]);
+
   const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
     if (terminalClosing) {
       return;
@@ -7029,61 +7642,47 @@ function WorkspaceTerminal({
     const nextRoleId = String(roleId || terminalAgentKind).toLowerCase();
     setRestartRoleMenuOpen(false);
 
-    if (threadsViewActive) {
-      const selectedThread = threadsViewSelectedThreadRef.current?.thread || thread;
-      const selectedWorkspaceId = selectedThread?.workspaceId
-        || threadsViewSelectedThreadRef.current?.workspaceId
-        || workspace?.id
-        || "";
-      const selectedTerminalIndex = Number.parseInt(
-        selectedThread?.terminalIndex ?? selectedThread?.terminalBinding?.terminalIndex,
-        10,
-      );
-
-      if (!selectedThread?.id || !selectedWorkspaceId || !Number.isInteger(selectedTerminalIndex)) {
-        return;
-      }
-
-      onChangeTerminalRole?.({
-        role: nextRoleId,
-        source: "thread_restart_menu",
-        terminalIndex: selectedTerminalIndex,
-        threadId: selectedThread.id,
-        workspaceId: selectedWorkspaceId,
-      });
-      return;
-    }
+    detachThreadForNewTerminalSession({
+      agentId: terminalAgentKind,
+      instanceId: terminalInstanceIdRef.current || undefined,
+      paneId,
+      terminalIndex,
+      threadId: terminalThreadIdRef.current || thread?.id || "",
+      workspaceId: workspace?.id || "",
+    });
+    const nextThreadId = materializeFreshThreadForTerminalSession({
+      agentId: nextRoleId || terminalAgentKind,
+      instanceId: terminalInstanceIdRef.current || undefined,
+      paneId,
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
 
     if (nextRoleId && nextRoleId !== terminalAgentKind) {
       onChangeTerminalRole?.({
         role: nextRoleId,
+        source: "terminal_restart_menu_new_session",
+        startNewSession: true,
         terminalIndex,
         workspaceId: workspace?.id || "",
       });
       return;
     }
 
-    setTerminalClosed(false);
-    terminalClosingRef.current = false;
-    preserveCoordinationOnNextCleanupRef.current = !isGenericTerminal;
-    preserveCoordinationOnNextOpenRef.current = !isGenericTerminal;
-    setTerminalClosing(false);
-    setTerminalState("starting");
-    setTerminalError("");
-    setTerminalStatus({
-      detail: "Restarting terminal session.",
-      title: "Preparing Terminal",
-      visible: true,
+    restartWithEmptyTerminalSession({
+      nextThreadId,
+      statusDetail: "Starting a new terminal session.",
     });
-    setRestartKey((key) => key + 1);
   }, [
-    isGenericTerminal,
+    detachThreadForNewTerminalSession,
+    materializeFreshThreadForTerminalSession,
     onChangeTerminalRole,
+    paneId,
+    restartWithEmptyTerminalSession,
     terminalAgentKind,
     terminalClosing,
     terminalIndex,
     thread,
-    threadsViewActive,
     workspace?.id,
   ]);
 
@@ -7262,10 +7861,7 @@ function WorkspaceTerminal({
       ref={containerRef}
     />
   );
-  const restartMenuThread = threadsViewSelectedThreadRef.current?.thread || thread;
-  const restartMenuAgentKind = threadsViewActive
-    ? getTerminalAgentKind(restartMenuThread?.currentAgent || terminalAgentKind)
-    : terminalAgentKind;
+  const restartMenuAgentKind = terminalAgentKind;
 
   return (
     <TerminalWorkspaceSurface
@@ -7334,10 +7930,10 @@ function WorkspaceTerminal({
           <TerminalRestartButton
             aria-expanded={restartRoleMenuOpen ? "true" : "false"}
             aria-haspopup="menu"
-            aria-label={threadsViewActive ? "Switch thread agent" : "Restart terminal"}
+            aria-label={threadsViewActive ? "Start new session" : "Restart terminal"}
             disabled={terminalClosed || terminalClosing}
             onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
-            title={threadsViewActive ? "Switch selected thread agent" : "Restart terminal or choose runtime"}
+            title={threadsViewActive ? "Start a new session in this terminal" : "Restart terminal or choose runtime"}
             type="button"
           >
             <ButtonRefreshIcon aria-hidden="true" />
@@ -7350,14 +7946,14 @@ function WorkspaceTerminal({
                 key={option.id}
                 onClick={() => restartTerminalAs(option.id)}
                 role="menuitem"
-                title={threadsViewActive ? `Switch selected thread to ${option.label}` : `Restart as ${option.label}`}
+                title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
                 type="button"
               >
                 <strong>
                   {threadsViewActive
                     ? option.id === restartMenuAgentKind
-                      ? `${option.label} selected`
-                      : `Switch to ${option.label}`
+                      ? `Restart ${option.label}`
+                      : `New ${option.label} session`
                     : option.id === terminalAgentKind
                       ? `Restart ${option.label}`
                       : option.label}
@@ -7395,9 +7991,12 @@ function WorkspaceTerminal({
             {xtermSurface}
             <WorkspaceThreadsOverlay
               agentStatuses={agentStatuses}
+              composerDrafts={threadComposerDrafts}
               onActiveThreadChange={handleThreadsViewActiveThreadChange}
               onClose={toggleTerminalFullscreen}
               onCreateChat={createWorkspaceThreadChat}
+              onDraftInput={syncWorkspaceThreadComposerInput}
+              onArchiveThread={onArchiveWorkspaceThread}
               onSelectModel={changeWorkspaceThreadModel}
               onSelectThread={onSelectWorkspaceThread}
               onSubmitMessage={submitWorkspaceThreadMessage}

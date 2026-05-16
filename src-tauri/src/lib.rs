@@ -70,6 +70,8 @@ const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
+const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
+const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
@@ -929,6 +931,7 @@ struct TerminalOpenRequest {
     provider_session_id: Option<String>,
     model: Option<String>,
     plain_shell: Option<bool>,
+    fresh_session: Option<bool>,
     preserve_coordination_session: Option<bool>,
     slot_key: Option<String>,
     terminal_index: Option<u16>,
@@ -1001,6 +1004,7 @@ struct TerminalInputEventPayload {
     instance_id: Option<u64>,
     data: String,
     prompt_event_text: Option<String>,
+    thread_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1519,6 +1523,7 @@ fn schedule_app_exit_after_terminal_shutdown(
         .name("diffforge-app-close".to_string())
         .spawn(move || {
             thread::sleep(Duration::from_millis(APP_CLOSE_EXIT_REQUEST_DELAY_MS));
+            let _ = close_workspace_webviews(&app_for_exit);
             app_for_exit.exit(0);
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
@@ -1550,6 +1555,7 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
             thread::sleep(Duration::from_millis(
                 APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS,
             ));
+            let _ = close_workspace_webviews(&app_for_exit);
             advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
             app_for_exit.exit(0);
 
@@ -1573,6 +1579,8 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
 }
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
+    let _ = close_workspace_webviews(&app_for_shutdown);
+
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
     let _ = coordination::watcher::stop_all_file_watchers("app_close");
 
@@ -1954,6 +1962,7 @@ pub fn run() {
             workspace_web_normalize_url,
             workspace_web_navigate,
             workspace_web_reload,
+            workspace_web_close_all,
             run_forge_prompt,
             save_todo_image_attachments,
             save_todo_text_attachment,
@@ -1990,7 +1999,6 @@ pub fn run() {
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,
             cloud_mcp_get_local_ignored_spec_graph_overlay,
-            cloud_mcp_generate_thread_title,
             cloud_mcp_start_spec_graph_sync,
             cloud_mcp_stop_spec_graph_sync,
             cloud_mcp_get_spec_graph,
@@ -2065,6 +2073,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let _ = begin_app_shutdown();
+                let _ = close_workspace_webviews(app);
                 advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
                 let _ = coordination::watcher::stop_all_file_watchers("run_exit_requested");
                 advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_DAEMONS);

@@ -16,6 +16,7 @@ const WEB_SESSION_STORAGE_KEY = "diffforge.workspaceWebSessions.v1";
 const DEFAULT_WEB_URL = "http://127.0.0.1:5173";
 const PROCESS_REFRESH_MS = 7000;
 const WEBVIEW_MIN_SIZE_PX = 12;
+export const WORKSPACE_WEB_CLOSE_REQUESTED_EVENT = "diffforge-workspace-web-close-requested";
 
 function getErrorMessage(error, fallback = "Unable to update web view.") {
   if (typeof error === "string" && error.trim()) {
@@ -150,6 +151,7 @@ export default function WebWorkspaceView({
   const webviewRef = useRef(null);
   const boundsFrameRef = useRef(0);
   const hiddenRef = useRef(false);
+  const webviewCloseRequestedRef = useRef(false);
   const navigationSerialRef = useRef(0);
   const currentUrlRef = useRef(currentUrl);
 
@@ -192,6 +194,31 @@ export default function WebWorkspaceView({
     }
   }, []);
 
+  const closeCurrentWebview = useCallback(async () => {
+    hiddenRef.current = true;
+    webviewCloseRequestedRef.current = true;
+    navigationSerialRef.current += 1;
+    window.cancelAnimationFrame(boundsFrameRef.current);
+
+    const webview = webviewRef.current;
+    webviewRef.current = null;
+    if (!webview) {
+      return;
+    }
+
+    try {
+      await webview.hide();
+    } catch {
+      // The backend close command also runs during shutdown; this path is best-effort.
+    }
+
+    try {
+      await webview.close();
+    } catch {
+      // A stale or already-closed native webview should not block app shutdown.
+    }
+  }, []);
+
   const updateBounds = useCallback(async () => {
     const webview = webviewRef.current;
     const viewport = viewportRef.current;
@@ -231,6 +258,10 @@ export default function WebWorkspaceView({
   }, [updateBounds]);
 
   const getOrCreateWebview = useCallback(async (url) => {
+    if (webviewCloseRequestedRef.current) {
+      throw new Error("Workspace web view is closing.");
+    }
+
     hiddenRef.current = false;
 
     if (webviewRef.current?.label === webviewLabel) {
@@ -289,6 +320,7 @@ export default function WebWorkspaceView({
       return;
     }
 
+    webviewCloseRequestedRef.current = false;
     const serial = navigationSerialRef.current + 1;
     navigationSerialRef.current = serial;
     setStatus("loading");
@@ -296,6 +328,9 @@ export default function WebWorkspaceView({
 
     try {
       const normalizedUrl = await invoke("workspace_web_normalize_url", { url: rawUrl });
+      if (navigationSerialRef.current !== serial || webviewCloseRequestedRef.current) {
+        return;
+      }
       const { created } = await getOrCreateWebview(normalizedUrl);
 
       if (navigationSerialRef.current !== serial) {
@@ -341,6 +376,7 @@ export default function WebWorkspaceView({
       return;
     }
 
+    webviewCloseRequestedRef.current = false;
     setStatus("loading");
     setError("");
 
@@ -376,6 +412,18 @@ export default function WebWorkspaceView({
   }, [processRootsKey, rootDirectory, workspaceId]);
 
   useEffect(() => {
+    const handleCloseRequested = () => {
+      closeCurrentWebview();
+    };
+
+    window.addEventListener(WORKSPACE_WEB_CLOSE_REQUESTED_EVENT, handleCloseRequested);
+
+    return () => {
+      window.removeEventListener(WORKSPACE_WEB_CLOSE_REQUESTED_EVENT, handleCloseRequested);
+    };
+  }, [closeCurrentWebview]);
+
+  useEffect(() => {
     let cancelled = false;
     const sync = async () => {
       await loadProcesses();
@@ -399,20 +447,23 @@ export default function WebWorkspaceView({
     }
 
     let cancelled = false;
+    webviewCloseRequestedRef.current = false;
+    const serial = navigationSerialRef.current + 1;
+    navigationSerialRef.current = serial;
     const show = async () => {
       try {
         const normalizedUrl = await invoke("workspace_web_normalize_url", { url: currentUrlRef.current });
-        if (cancelled) {
+        if (cancelled || navigationSerialRef.current !== serial || webviewCloseRequestedRef.current) {
           return;
         }
         setCurrentUrl(normalizedUrl);
         setDraftUrl((draft) => (draft ? draft : normalizedUrl));
         await getOrCreateWebview(normalizedUrl);
-        if (!cancelled) {
+        if (!cancelled && navigationSerialRef.current === serial && !webviewCloseRequestedRef.current) {
           scheduleBoundsUpdate();
         }
       } catch (showError) {
-        if (!cancelled) {
+        if (!cancelled && !webviewCloseRequestedRef.current) {
           setError(getErrorMessage(showError));
           setStatus("error");
         }

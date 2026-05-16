@@ -1221,7 +1221,6 @@ fn cloud_mcp_post_log_context(
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
-        "/v1/threads/title" => "cloud_generate_thread_title",
         "/v1/spec/graph" => "cloud_get_spec_graph",
         "/v1/spec/graph/delta" => "cloud_get_spec_graph_delta",
         "/v1/spec/nodes" => "cloud_get_spec_node",
@@ -1245,33 +1244,6 @@ fn cloud_mcp_post_log_context(
     }
 
     Some((root, workspace_id, workspace_name, fields))
-}
-
-#[tauri::command]
-async fn cloud_mcp_generate_thread_title(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-    thread_id: String,
-    user_message: String,
-    agent_id: Option<String>,
-) -> Result<Value, String> {
-    let root = resolve_workspace_root_directory(Some(&repo_path))
-        .unwrap_or_else(|_| PathBuf::from(&repo_path));
-    let root_display = workspace_path_display(&root);
-    let repo_id = cloud_mcp_repo_id_for_root(&root);
-    let payload = json!({
-        "agent_id": agent_id.unwrap_or_default(),
-        "message": user_message,
-        "repo_id": repo_id,
-        "repo_path": root_display,
-        "thread_id": thread_id,
-        "workspace_id": workspace_id.unwrap_or_default(),
-        "workspace_name": workspace_name.unwrap_or_default(),
-    });
-    let response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/threads/title", &payload).await?;
-    Ok(response.get("data").cloned().unwrap_or(response))
 }
 
 fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {

@@ -95,3 +95,38 @@ fn workspace_web_reload(app: AppHandle, label: String) -> Result<(), String> {
         .reload()
         .map_err(|error| format!("Unable to reload web view: {error}"))
 }
+
+fn close_workspace_webviews(app: &AppHandle) -> Result<usize, String> {
+    let mut closed = 0;
+    let mut errors = Vec::new();
+
+    for (label, webview) in app.webviews() {
+        if validate_workspace_webview_label(&label).is_err() {
+            continue;
+        }
+
+        let _ = webview.hide();
+        match webview.close() {
+            Ok(()) => {
+                closed += 1;
+            }
+            Err(error) => {
+                errors.push(format!("{label}: {error}"));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(closed)
+    } else {
+        Err(format!(
+            "Unable to close workspace web views: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+#[tauri::command]
+fn workspace_web_close_all(app: AppHandle) -> Result<usize, String> {
+    close_workspace_webviews(&app)
+}
