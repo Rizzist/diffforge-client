@@ -57,6 +57,7 @@ const MAX_FORGE_MODEL_LENGTH: usize = 80;
 const MAX_FORGE_IMAGES: usize = 4;
 const MAX_FORGE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TODO_TEXT_ATTACHMENT_BYTES: usize = 256 * 1024;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
 const TERMINAL_DEFAULT_ROWS: u16 = 24;
 const TERMINAL_MIN_COLS: u16 = 20;
@@ -107,6 +108,7 @@ const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progre
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
+const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -410,6 +412,32 @@ struct TerminalInstance {
     input_queue: Arc<Mutex<()>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
+    metadata: TerminalInstanceMetadata,
+}
+
+#[derive(Clone)]
+struct TerminalInstanceMetadata {
+    pane_id: String,
+    workspace_id: String,
+    workspace_name: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+}
+
+impl Default for TerminalInstanceMetadata {
+    fn default() -> Self {
+        Self {
+            pane_id: String::new(),
+            workspace_id: String::new(),
+            workspace_name: String::new(),
+            terminal_index: None,
+            thread_id: String::new(),
+            agent_id: String::new(),
+            agent_kind: String::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -498,6 +526,7 @@ impl TerminalInstance {
         working_directory: PathBuf,
         agent_started: bool,
         coordination: Option<TerminalCoordinationSession>,
+        metadata: TerminalInstanceMetadata,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
             child,
@@ -520,6 +549,7 @@ impl TerminalInstance {
                 input_queue: Arc::new(Mutex::new(())),
                 active_task: Arc::new(Mutex::new(None)),
                 coordination,
+                metadata,
             },
             reader,
         )
@@ -733,6 +763,11 @@ struct AgentStatus {
     npm_update_available: bool,
     recommend_native_install: bool,
     connect_command: &'static str,
+    image_input_supported: bool,
+    image_input_support: &'static str,
+    image_input_reason: String,
+    active_model: String,
+    active_model_supports_images: bool,
 }
 
 struct AgentRuntimeStatus {
@@ -802,6 +837,39 @@ struct ForgePromptImage {
     data_url: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentImageInputStatus {
+    supported: bool,
+    support: &'static str,
+    reason: String,
+    active_model: String,
+    active_model_supports_images: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TodoTextAttachmentRequest {
+    title: Option<String>,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedTodoImageAttachment {
+    name: String,
+    mime_type: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedTodoTextAttachment {
+    line_count: usize,
+    path: String,
+    title: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ForgeWorkingDirectory {
@@ -856,11 +924,13 @@ struct TerminalOpenRequest {
     instance_id: Option<u64>,
     kind: String,
     provider: Option<String>,
+    provider_session_id: Option<String>,
     model: Option<String>,
     plain_shell: Option<bool>,
     preserve_coordination_session: Option<bool>,
     slot_key: Option<String>,
     terminal_index: Option<u16>,
+    thread_id: Option<String>,
     working_directory: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
@@ -874,6 +944,7 @@ struct TerminalStartAgentRequest {
     pane_id: String,
     instance_id: Option<u64>,
     provider: String,
+    provider_session_id: Option<String>,
     model: Option<String>,
 }
 
@@ -908,6 +979,7 @@ struct TerminalOpenResult {
     agent_branch_root: Option<String>,
     agent_branch: Option<String>,
     slot_key: Option<String>,
+    thread_id: Option<String>,
     coordination_mode: Option<String>,
 }
 
@@ -926,6 +998,7 @@ struct TerminalInputEventPayload {
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_text: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -934,6 +1007,20 @@ struct TerminalInputErrorPayload {
     pane_id: String,
     instance_id: Option<u64>,
     message: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalPromptSubmittedPayload {
+    pane_id: String,
+    instance_id: u64,
+    workspace_id: String,
+    workspace_name: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+    prompt: String,
 }
 
 #[derive(Serialize)]
@@ -1158,8 +1245,11 @@ include!("validation.rs");
 include!("platform.rs");
 include!("process.rs");
 include!("workspace_files.rs");
+include!("workspace_web.rs");
+include!("developer_processes.rs");
 include!("terminal_cli.rs");
 include!("cloud_mcp.rs");
+include!("agent_sessions.rs");
 include!("terminals.rs");
 include!("api.rs");
 include!("audio.rs");
@@ -1754,6 +1844,7 @@ pub fn run() {
         .manage(TerminalDiagnosticState::new())
         .manage(WindowsTerminalDiagnosticState::new())
         .manage(CloudMcpState::new())
+        .manage(DeveloperProcessMonitorState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
             deepgram_stream: Arc::new(Mutex::new(None)),
@@ -1813,12 +1904,20 @@ pub fn run() {
             disconnect_agent,
             install_agent,
             update_agent,
+            list_developer_processes,
+            kill_developer_process,
+            docker_developer_action,
             forge_working_directory,
             validate_workspace_root_directory,
             list_workspace_directory,
             read_workspace_file,
             read_workspace_file_diff,
+            workspace_web_normalize_url,
+            workspace_web_navigate,
+            workspace_web_reload,
             run_forge_prompt,
+            save_todo_image_attachments,
+            save_todo_text_attachment,
             whisper_model_status,
             download_whisper_model,
             uninstall_whisper_model,
@@ -1852,9 +1951,11 @@ pub fn run() {
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,
             cloud_mcp_get_local_ignored_spec_graph_overlay,
+            cloud_mcp_generate_thread_title,
             cloud_mcp_start_spec_graph_sync,
             cloud_mcp_stop_spec_graph_sync,
             cloud_mcp_get_spec_graph,
+            agent_thread_transcript,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,

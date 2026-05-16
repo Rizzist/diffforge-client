@@ -11,6 +11,8 @@ pub const MIGRATION_VERSION: i64 = 5;
 pub const MIGRATION_NAME: &str = "coordination_kernel_ui_cleanup_alignment";
 pub const DEPENDENCY_GRAPH_MIGRATION_VERSION: i64 = 6;
 pub const DEPENDENCY_GRAPH_MIGRATION_NAME: &str = "coordination_kernel_dependency_graph_v2";
+pub const TASK_LIFECYCLE_MIGRATION_VERSION: i64 = 7;
+pub const TASK_LIFECYCLE_MIGRATION_NAME: &str = "coordination_kernel_task_lifecycle_boundaries";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -92,6 +94,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   source_plan_item_id TEXT,
   assigned_role TEXT,
   expected_output TEXT,
+  started_at TEXT,
+  finished_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

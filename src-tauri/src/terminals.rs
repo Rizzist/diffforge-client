@@ -79,6 +79,7 @@ fn terminal_launch(
     kind: &str,
     provider: Option<String>,
     model: Option<String>,
+    provider_session_id: Option<String>,
 ) -> Result<(Vec<String>, Vec<String>, String), String> {
     let provider = match kind {
         "console" => provider
@@ -99,6 +100,26 @@ fn terminal_launch(
     };
     let definition = agent_definition(provider);
     let mut args = Vec::new();
+    if let Some(session_id) = provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match provider {
+            AgentProvider::Codex => {
+                args.push("resume".to_string());
+                args.push(session_id.to_string());
+            }
+            AgentProvider::Claude => {
+                args.push("--resume".to_string());
+                args.push(session_id.to_string());
+            }
+            AgentProvider::OpenCode => {
+                args.push("--session".to_string());
+                args.push(session_id.to_string());
+            }
+        }
+    }
 
     if let Some(model) = normalize_forge_model(model)? {
         args.push("--model".to_string());
@@ -570,6 +591,7 @@ fn cleanup_terminal_instance_with_context(
         input_queue,
         active_task,
         coordination,
+        metadata,
     } = instance;
 
     let maybe_child = {
@@ -585,6 +607,7 @@ fn cleanup_terminal_instance_with_context(
         drop(input_gate);
         drop(input_queue);
         drop(active_task);
+        drop(metadata);
         interrupt_terminal_coordination_after_process_cleanup(
             coordination.as_ref(),
             reason,
@@ -613,6 +636,7 @@ fn cleanup_terminal_instance_with_context(
     drop(input_gate);
     drop(input_queue);
     drop(active_task);
+    drop(metadata);
     interrupt_terminal_coordination_after_process_cleanup(
         coordination.as_ref(),
         reason,
@@ -1408,6 +1432,7 @@ async fn terminal_open(
     let kind = request.kind;
     let provider = request.provider;
     let provider_for_coordination = provider.clone();
+    let provider_session_id = request.provider_session_id;
     let model = request.model;
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
@@ -1415,6 +1440,7 @@ async fn terminal_open(
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
     let terminal_index = request.terminal_index;
+    let thread_id = request.thread_id;
     let requested_slot_key = request.slot_key;
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
@@ -1448,7 +1474,7 @@ async fn terminal_open(
     let (command_candidates, args, label) = if is_prewarm_pty || plain_shell {
         (Vec::new(), Vec::new(), "Prepared PTY".to_string())
     } else {
-        terminal_launch(&kind, provider, model)?
+        terminal_launch(&kind, provider, model, provider_session_id)?
     };
     if plain_shell {
     } else if !is_prewarm_pty {
@@ -1513,6 +1539,19 @@ async fn terminal_open(
             &pane_id,
             instance_id,
         );
+        validate_terminal_agent_launch_args_for_platform(
+            provider_for_coordination
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if kind == "console" {
+                        "codex"
+                    } else {
+                        kind.as_str()
+                    }
+                }),
+            &launch_args,
+        )?;
         let coordination_env_vars = terminal_coordination
             .as_ref()
             .map(|coordination| coordination.env_vars.as_slice())
@@ -1537,12 +1576,39 @@ async fn terminal_open(
         warm_pty
     };
 
+    let terminal_metadata = TerminalInstanceMetadata {
+        pane_id: pane_id.clone(),
+        workspace_id: workspace_id.clone().unwrap_or_default(),
+        workspace_name: workspace_name.clone().unwrap_or_default(),
+        terminal_index,
+        thread_id: thread_id.clone().unwrap_or_default(),
+        agent_id: provider_for_coordination.clone().unwrap_or_else(|| {
+            if plain_shell {
+                "generic".to_string()
+            } else if kind == "console" {
+                "codex".to_string()
+            } else {
+                kind.clone()
+            }
+        }),
+        agent_kind: if plain_shell {
+            "generic".to_string()
+        } else if kind == "console" {
+            provider_for_coordination
+                .clone()
+                .unwrap_or_else(|| "codex".to_string())
+        } else {
+            kind.clone()
+        },
+    };
+
     let (instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
         warm_pty,
         process_working_directory.clone(),
         agent_started,
         terminal_coordination.clone(),
+        terminal_metadata,
     );
 
     let displaced_instance = state
@@ -1645,6 +1711,7 @@ async fn terminal_open(
                     .and_then(|worktree| worktree["slotKey"].as_str())
                     .map(str::to_string)
             }),
+        thread_id,
         coordination_mode: coordination_context
             .as_ref()
             .map(|context| context.enforcement_mode.clone())
@@ -1802,6 +1869,7 @@ async fn terminal_start_agent(
         &pane_id,
         instance.id,
     );
+    validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)?;
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
         &launch_args,
@@ -1875,6 +1943,27 @@ async fn start_terminal_agent_in_prepared_pty(
     };
     let definition = agent_definition(provider);
     let mut args = Vec::new();
+    if let Some(session_id) = request
+        .provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match provider {
+            AgentProvider::Codex => {
+                args.push("resume".to_string());
+                args.push(session_id.to_string());
+            }
+            AgentProvider::Claude => {
+                args.push("--resume".to_string());
+                args.push(session_id.to_string());
+            }
+            AgentProvider::OpenCode => {
+                args.push("--session".to_string());
+                args.push(session_id.to_string());
+            }
+        }
+    }
 
     match normalize_forge_model(request.model) {
         Ok(Some(model)) => {
@@ -1963,6 +2052,17 @@ async fn start_terminal_agent_in_prepared_pty(
             &pane_id,
             instance.id,
         );
+        if let Err(error) =
+            validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)
+        {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id: Some(instance.id),
+                started: false,
+                skipped: false,
+                message: error,
+            };
+        }
         let input = terminal_agent_start_input_with_env_in_directory(
             &command_path,
             &launch_args,
@@ -2545,7 +2645,7 @@ fn terminal_parking_snapshot_from_kernel(
                 LIMIT 1
               )
          WHERE i.task_id=?1
-           AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+           AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
          ORDER BY i.updated_at ASC",
         &[&task_id],
     )?;
@@ -2864,6 +2964,12 @@ pub(crate) fn observe_terminal_coordination_event(
             | "mcp_agent_tool_called"
             | "task_parked_for_resource_queue"
             | "active_file_lease_queue_waiter_released"
+            | "patch_submitted"
+            | "task_noop_submitted"
+            | "task_cancelled"
+            | "task_interrupted"
+            | "terminal_crash_recovery_interrupted_task"
+            | "merge_succeeded"
     ) {
         return;
     }
@@ -2932,6 +3038,15 @@ async fn terminal_handle_coordination_event(
                 refs,
             )
             .await;
+        }
+        "patch_submitted"
+        | "task_noop_submitted"
+        | "task_cancelled"
+        | "task_interrupted"
+        | "terminal_crash_recovery_interrupted_task"
+        | "merge_succeeded" => {
+            terminal_handle_task_lifecycle_end_event(app, terminals, refs, payload, &event_type)
+                .await;
         }
         _ => {}
     }
@@ -3011,6 +3126,114 @@ async fn terminal_handle_task_started_event(
     );
 }
 
+async fn terminal_handle_task_lifecycle_end_event(
+    app: AppHandle,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    refs: crate::coordination::kernel::EventRefs,
+    payload: Value,
+    event_type: &str,
+) {
+    let Some(task_id) = refs
+        .task_id
+        .as_deref()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+
+    let Some((pane_id, instance)) = terminal_find_instance_for_coordination_event(
+        &terminals,
+        refs.session_id.as_deref(),
+        Some(&task_id),
+    )
+    .await
+    else {
+        return;
+    };
+
+    let keep_active_for_resume = terminal_task_remains_active_for_resume(&instance, &task_id);
+    if keep_active_for_resume {
+        log_terminal_diagnostic_event(
+            &app,
+            "backend.terminal_active_task.kept_for_resume",
+            json!({
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "session_id": refs.session_id.as_deref().unwrap_or_default(),
+                "task_id": task_id,
+                "event_type": event_type,
+            }),
+        );
+        return;
+    }
+
+    let mut active_task = instance.active_task.lock().await;
+    let cleared = active_task
+        .as_ref()
+        .is_some_and(|active| active.task_id == task_id);
+    if cleared {
+        *active_task = None;
+    }
+    drop(active_task);
+
+    if cleared {
+        log_terminal_diagnostic_event(
+            &app,
+            "backend.terminal_active_task.ended",
+            json!({
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "session_id": refs.session_id.as_deref().unwrap_or_default(),
+                "task_id": task_id,
+                "event_type": event_type,
+                "task_status": payload["task_status"]
+                    .as_str()
+                    .or_else(|| payload["status"].as_str())
+                    .unwrap_or_default(),
+            }),
+        );
+    }
+}
+
+fn terminal_task_remains_active_for_resume(instance: &TerminalInstance, task_id: &str) -> bool {
+    let Some(coordination) = instance.coordination.as_ref() else {
+        return false;
+    };
+    let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    ) else {
+        return false;
+    };
+    let task = kernel
+        .query_json("SELECT status FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])
+        .ok()
+        .and_then(|rows| rows.into_iter().next());
+    let status = task
+        .as_ref()
+        .and_then(|task| task["status"].as_str())
+        .unwrap_or_default();
+    if status == "claimed" {
+        return true;
+    }
+    if !matches!(status, "ready" | "blocked" | "patch_submitted") {
+        return false;
+    }
+    let parked_intent_count = kernel
+        .query_json(
+            "SELECT COUNT(1)
+                    AS parked_intent_count
+             FROM task_resource_intents
+             WHERE task_id=?1
+               AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+            &[&task_id],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row["parked_intent_count"].as_i64())
+        .unwrap_or(0);
+    parked_intent_count > 0
+}
+
 async fn terminal_find_instance_for_coordination_event(
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
     session_id: Option<&str>,
@@ -3072,9 +3295,12 @@ async fn terminal_handle_task_parked_for_resource_event(
     refs: crate::coordination::kernel::EventRefs,
 ) {
     let task_id = refs.task_id.as_deref();
-    let Some((pane_id, instance)) =
-        terminal_find_instance_for_coordination_event(&terminals, refs.session_id.as_deref(), task_id)
-            .await
+    let Some((pane_id, instance)) = terminal_find_instance_for_coordination_event(
+        &terminals,
+        refs.session_id.as_deref(),
+        task_id,
+    )
+    .await
     else {
         return;
     };
@@ -3119,14 +3345,8 @@ async fn terminal_handle_resume_ready_event(
     };
 
     if let Some(parked) = terminal_find_parked_prompt_for_task(&parked_prompts, &task_id).await {
-        terminal_resume_parked_prompt_once(
-            app,
-            cloud_mcp_state,
-            terminals,
-            parked_prompts,
-            parked,
-        )
-        .await;
+        terminal_resume_parked_prompt_once(app, cloud_mcp_state, terminals, parked_prompts, parked)
+            .await;
         return;
     }
 
@@ -3275,14 +3495,8 @@ async fn terminal_register_parked_prompt_from_snapshot(
     }
 
     if let Some(parked) = prompt_to_resume {
-        terminal_resume_parked_prompt_once(
-            app,
-            cloud_mcp_state,
-            terminals,
-            parked_prompts,
-            parked,
-        )
-        .await;
+        terminal_resume_parked_prompt_once(app, cloud_mcp_state, terminals, parked_prompts, parked)
+            .await;
     }
 }
 
@@ -3395,8 +3609,7 @@ async fn terminal_resume_parked_prompt_once(
         &parked.prompt,
         resume_state.as_ref(),
     );
-    let resume_input_bytes =
-        resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
+    let resume_input_bytes = resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
     if resume_input_bytes > MAX_TERMINAL_WRITE_BYTES {
         terminal_emit_parked_prompt_interrupted(
             &app,
@@ -3485,6 +3698,33 @@ fn emit_terminal_input_error(
     );
 }
 
+fn emit_terminal_prompt_submitted(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    prompt: &str,
+) {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return;
+    }
+
+    let metadata = instance.metadata.clone();
+    let _ = app.emit(
+        TERMINAL_PROMPT_SUBMITTED_EVENT,
+        TerminalPromptSubmittedPayload {
+            pane_id: metadata.pane_id,
+            instance_id: instance.id,
+            workspace_id: metadata.workspace_id,
+            workspace_name: metadata.workspace_name,
+            terminal_index: metadata.terminal_index,
+            thread_id: metadata.thread_id,
+            agent_id: metadata.agent_id,
+            agent_kind: metadata.agent_kind,
+            prompt: prompt.to_string(),
+        },
+    );
+}
+
 fn register_terminal_input_event_listener(app: &tauri::App) {
     let app_handle = app.handle().clone();
 
@@ -3515,6 +3755,7 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
                 payload.pane_id,
                 payload.instance_id,
                 payload.data,
+                payload.prompt_event_text,
             )
             .await
             {
@@ -3552,6 +3793,7 @@ async fn terminal_write_inner(
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_text: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
@@ -3594,6 +3836,13 @@ async fn terminal_write_inner(
     }
 
     if let Some(prompt) = terminal_observe_submitted_prompt(&instance, &data).await {
+        let event_prompt = prompt_event_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(prompt.as_str())
+            .to_string();
+        emit_terminal_prompt_submitted(&app, &instance, &event_prompt);
         if *instance.agent_started.lock().await {
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
@@ -3601,12 +3850,8 @@ async fn terminal_write_inner(
             let coordination = instance.coordination.clone();
             let terminal_instance_id = instance.id;
             let active_task = instance.active_task.lock().await.clone();
-            let local_task_id = active_task
-                .as_ref()
-                .map(|task| task.task_id.clone());
-            let local_task_title = active_task
-                .as_ref()
-                .map(|task| task.title.clone());
+            let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
+            let local_task_title = active_task.as_ref().map(|task| task.title.clone());
             let prompt_for_cloud = prompt.clone();
             tauri::async_runtime::spawn(async move {
                 cloud_mcp_terminal_context_pack_for_prompt(
@@ -3644,6 +3889,7 @@ async fn terminal_write(
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    prompt_event_text: Option<String>,
 ) -> Result<(), String> {
     terminal_write_inner(
         app,
@@ -3652,6 +3898,7 @@ async fn terminal_write(
         pane_id,
         instance_id,
         data,
+        prompt_event_text,
     )
     .await
 }
@@ -3841,11 +4088,7 @@ async fn mark_terminal_active_task_interrupted(
     Ok(true)
 }
 
-fn mark_terminal_parked_prompt_stopped(
-    parked: &TerminalParkedPrompt,
-    status: &str,
-    reason: &str,
-) {
+fn mark_terminal_parked_prompt_stopped(parked: &TerminalParkedPrompt, status: &str, reason: &str) {
     if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
         &parked.coordination.repo_path,
         Some(PathBuf::from(&parked.coordination.db_path)),
@@ -4297,7 +4540,17 @@ mod terminal_tests {
 
     #[test]
     fn coordinated_claude_launch_auto_approves_repo_views_and_coordination_tools() {
-        let coordination = terminal_test_coordination("claude_auto_approval_args");
+        let mut coordination = terminal_test_coordination("claude_auto_approval_args");
+        let claude_config_path = PathBuf::from(&coordination.repo_path)
+            .join(".agents")
+            .join("mcp")
+            .join("agents")
+            .join("1.claude.json")
+            .display()
+            .to_string();
+        coordination
+            .env_vars
+            .push(("CLAUDE_MCP_CONFIG".to_string(), claude_config_path.clone()));
 
         let args = terminal_args_with_codex_mcp_identity(
             "claude",
@@ -4333,13 +4586,25 @@ mod terminal_tests {
             .windows(2)
             .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
             .unwrap();
-        assert!(mcp_config.contains("\"coordination-kernel\""));
-        assert!(mcp_config.contains("--session-id"));
-        assert!(mcp_config.contains(&coordination.session_id));
+        assert_eq!(mcp_config, claude_config_path);
+        assert!(!mcp_config.contains("\"coordination-kernel\""));
+        assert!(!mcp_config.contains("terminal_launch_args"));
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|arg| arg == "--no-alt-screen"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_launch_rejects_inline_mcp_json() {
+        let inline_config =
+            r#"{"mcpServers":{"coordination-kernel":{"command":"coordination_mcp"}}}"#;
+        let args = vec!["--mcp-config".to_string(), inline_config.to_string()];
+
+        let error = validate_terminal_agent_launch_args_for_platform("claude", &args).unwrap_err();
+
+        assert!(error.contains("file-backed MCP config"));
     }
 
     #[test]
@@ -4417,5 +4682,4 @@ mod terminal_tests {
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
     }
-
 }

@@ -8,10 +8,10 @@ import {
 } from "../workspace/workspaceDisplayIdentity.js";
 
 export const NODE_DIMENSIONS = {
-  workspace: { width: 172, height: 172 },
-  folder: { width: 150, height: 92 },
-  file: { width: 136, height: 78 },
-  abstract: { width: 166, height: 104 },
+  workspace: { width: 176, height: 176 },
+  folder: { width: 92, height: 54 },
+  file: { width: 142, height: 82 },
+  abstract: { width: 158, height: 96 },
 };
 
 function cleanText(value) {
@@ -215,16 +215,12 @@ function freshnessTone(value) {
 
 export function isWorktreeFileNode(node) {
   if (!isFileNodeType(node?.node_type)) return false;
-  if (isLeasedFileNode(node)) return false;
-  return node.file_source === "worktree" || node.provisional || node.pending_main_sync;
+  return nodeSourceState(node) === "worktree";
 }
 
 export function isLeasedFileNode(node) {
   if (!isFileNodeType(node?.node_type)) return false;
-  return node.file_source === "lease"
-    || node.file_origin === "lease"
-    || node.file_state === "lease"
-    || node.lease_state === "active";
+  return nodeSourceState(node) === "lease";
 }
 
 export function isLocalOnlyNode(node) {
@@ -233,20 +229,93 @@ export function isLocalOnlyNode(node) {
     || node?.file_source === "local_ignored";
 }
 
-function hasActiveSpecs(node) {
+export function nodeSourceState(node) {
+  const meta = node?.metadata || {};
+  const source = text(
+    field(node, "file_source", "fileSource", "source")
+      || field(meta, "source", "file_source", "fileSource"),
+  ).toLowerCase();
+  const origin = text(
+    field(node, "file_origin", "fileOrigin", "origin")
+      || field(meta, "origin", "file_origin", "fileOrigin"),
+  ).toLowerCase();
+  const fileState = text(
+    field(node, "file_state", "fileState")
+      || field(meta, "file_state", "fileState"),
+  ).toLowerCase();
+  const leaseState = text(
+    field(node, "lease_state", "leaseState")
+      || field(meta, "lease_state", "leaseState"),
+  ).toLowerCase();
+  const provisional = node?.provisional === true || meta?.provisional === true;
+  const pendingMainSync = node?.pending_main_sync === true
+    || node?.pendingMainSync === true
+    || meta?.pending_main_sync === true
+    || meta?.pendingMainSync === true;
+
+  if (isLocalOnlyNode(node) || source === "local_ignored") return "local";
+  if (
+    source === "lease"
+    || origin === "lease"
+    || fileState === "lease"
+    || leaseState === "active"
+  ) {
+    return "lease";
+  }
+  if (
+    source === "worktree"
+    || origin === "worktree"
+    || fileState === "worktree"
+    || provisional
+    || pendingMainSync
+  ) {
+    return "worktree";
+  }
+  if (
+    source === "filetree"
+    || source === "main"
+    || source === "committed"
+    || origin === "main"
+    || origin === "committed"
+  ) {
+    return "main";
+  }
+  return "unknown";
+}
+
+export function nodeSourceTone(node) {
+  switch (nodeSourceState(node)) {
+    case "lease":
+      return "#f59e0b";
+    case "worktree":
+      return "#38bdf8";
+    case "main":
+      return "#22c55e";
+    case "local":
+      return "#94a3b8";
+    case "unknown":
+    default:
+      return "#64748b";
+  }
+}
+
+export function hasActiveSpecs(node) {
+  if (typeof node?.has_active_specs === "boolean") return node.has_active_specs;
+  if (typeof node?.hasActiveSpecs === "boolean") return node.hasActiveSpecs;
   return Array.isArray(node?.active_specs) && node.active_specs.length > 0;
 }
 
+export function isNoSpecNode(node) {
+  return normalizeFreshnessState(node?.freshness_state || node?.spec_state) === "no_spec"
+    || !hasActiveSpecs(node);
+}
+
 export function isUnspecifiedStructuralNode(node) {
-  return ["workspace", "folder", "file"].includes(nodeKind(node)) && !hasActiveSpecs(node);
+  return ["workspace", "folder", "file"].includes(nodeKind(node)) && isNoSpecNode(node);
 }
 
 export function nodeTone(node) {
-  if (isUnspecifiedStructuralNode(node)) return "#64748b";
-  if (isLeasedFileNode(node)) return "#f59e0b";
-  if (isWorktreeFileNode(node)) return "#38bdf8";
-  if (isWorkspaceNodeType(node?.node_type)) return "#2dd4bf";
-  if (isFolderNodeType(node?.node_type)) return "#a78bfa";
+  if (isNoSpecNode(node)) return "#64748b";
   return freshnessTone(node?.freshness_state);
 }
 

@@ -15,17 +15,23 @@ import {
   dimensionsForNode,
   field,
   isContainmentEdge,
-  isLeasedFileNode,
-  isUnspecifiedStructuralNode,
-  isWorktreeFileNode,
+  isNoSpecNode,
   liveAgentsFor,
   nodeKind,
+  nodeSourceState,
+  nodeSourceTone,
   nodeTone,
   text,
 } from "../specGraphCore.js";
 
 const MAX_VISIBLE_AGENT_ORBITS = 6;
 const EMPTY_LAYOUT = new Map();
+const KIND_TONES = {
+  workspace: "#2dd4bf",
+  folder: "#a78bfa",
+  file: "#60a5fa",
+  abstract: "#c084fc",
+};
 
 const EDGE_ANCHORS = [
   { id: "top-left", position: Position.Top, x: 0.24, y: 0 },
@@ -42,16 +48,45 @@ const EDGE_ANCHORS = [
   { id: "left-top", position: Position.Left, x: 0, y: 0.24 },
 ];
 
-function flowEdgeStyle(edge) {
-  if (isContainmentEdge(edge)) {
-    return {
-      stroke: "rgba(148, 163, 184, 0.72)",
-      strokeWidth: 3,
-    };
+function colorWithAlpha(color, alpha) {
+  return color?.startsWith("#") ? `${color}${alpha}` : color;
+}
+
+function kindTone(kind) {
+  return KIND_TONES[kind] || KIND_TONES.abstract;
+}
+
+function sourceLabel(sourceState) {
+  switch (sourceState) {
+    case "lease":
+      return "lease";
+    case "worktree":
+      return "worktree";
+    case "main":
+      return "main";
+    case "local":
+      return "local";
+    default:
+      return "";
   }
+}
+
+function flowEdgeColor(edge, sourceNode, targetNode) {
+  if (isContainmentEdge(edge)) {
+    return "rgba(148, 163, 184, 0.58)";
+  }
+  const abstractNode = [sourceNode, targetNode].find((node) => nodeKind(node) === "abstract");
+  if (abstractNode) return colorWithAlpha(nodeTone(abstractNode), "cc");
+  return colorWithAlpha(nodeSourceTone(targetNode || sourceNode), "cc");
+}
+
+function flowEdgeStyle(edge, sourceNode, targetNode) {
+  const abstractLink = !isContainmentEdge(edge)
+    && [sourceNode, targetNode].some((node) => nodeKind(node) === "abstract");
   return {
-    stroke: "rgba(56, 189, 248, 0.82)",
-    strokeWidth: 3.2,
+    stroke: flowEdgeColor(edge, sourceNode, targetNode),
+    strokeWidth: isContainmentEdge(edge) ? 2.1 : 2.7,
+    strokeDasharray: abstractLink ? "6 7" : undefined,
   };
 }
 
@@ -149,24 +184,29 @@ function closestEdgeHandles(edge, nodeById, layout) {
 
 function toFlowEdges(edges, nodes, layout) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  return edges.map((edge) => ({
-    id: edge.id,
-    source: edge.from,
-    target: edge.to,
-    ...closestEdgeHandles(edge, nodeById, layout),
-    type: isContainmentEdge(edge) ? "straight" : "bezier",
-    animated: !isContainmentEdge(edge),
-    zIndex: 0,
-    interactionWidth: 18,
-    markerEnd: {
-      type: MarkerType.ArrowClosed,
-      color: isContainmentEdge(edge) ? "rgba(148, 163, 184, 0.92)" : "rgba(56, 189, 248, 0.9)",
-      width: 16,
-      height: 16,
-    },
-    style: flowEdgeStyle(edge),
-    data: edge,
-  }));
+  return edges.map((edge) => {
+    const sourceNode = nodeById.get(edge.from);
+    const targetNode = nodeById.get(edge.to);
+    const color = flowEdgeColor(edge, sourceNode, targetNode);
+    return {
+      id: edge.id,
+      source: edge.from,
+      target: edge.to,
+      ...closestEdgeHandles(edge, nodeById, layout),
+      type: isContainmentEdge(edge) ? "straight" : "bezier",
+      animated: !isContainmentEdge(edge),
+      zIndex: 0,
+      interactionWidth: 18,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color,
+        width: 14,
+        height: 14,
+      },
+      style: flowEdgeStyle(edge, sourceNode, targetNode),
+      data: edge,
+    };
+  });
 }
 
 const INVISIBLE_HANDLE_STYLE = {
@@ -291,15 +331,18 @@ export default function XyflowGraphRenderer({
 function SpecGraphNode({ data, selected }) {
   const node = data.node;
   const kind = nodeKind(node);
-  const tone = nodeTone(node);
+  const statusTone = nodeTone(node);
+  const sourceState = nodeSourceState(node);
+  const sourceTone = nodeSourceTone(node);
+  const nodeKindTone = kindTone(kind);
   const liveAgents = liveAgentsFor(node);
   const liveAgentCount = liveAgents.length;
   const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
   const active = Boolean(selected || data.selected);
   const title = text(node.display_title || node.displayTitle || node.title);
   const path = text(node.display_path || node.displayPath || node.path);
-  const leased = isLeasedFileNode(node);
-  const worktree = isWorktreeFileNode(node);
+  const noSpec = isNoSpecNode(node);
+  const source = sourceLabel(sourceState);
 
   return (
     <FlowNodeCard
@@ -307,16 +350,23 @@ function SpecGraphNode({ data, selected }) {
       type="button"
       $active={active}
       $kind={kind}
-      $tone={tone}
+      $kindTone={nodeKindTone}
+      $statusTone={statusTone}
+      $sourceState={sourceState}
+      $sourceTone={sourceTone}
       $live={liveAgentCount > 0}
-      $provisional={worktree}
-      $leased={leased}
-      $unspecified={isUnspecifiedStructuralNode(node)}
+      $noSpec={noSpec}
       onClick={(event) => {
         event.stopPropagation();
         data.onSelect(node.id);
       }}
     >
+      <SourceAccent
+        aria-hidden="true"
+        $kind={kind}
+        $sourceState={sourceState}
+        $sourceTone={sourceTone}
+      />
       {EDGE_ANCHORS.map((anchor) => (
         <Handle
           key={`target-${anchor.id}`}
@@ -341,16 +391,23 @@ function SpecGraphNode({ data, selected }) {
         <ActiveAgentOrbit
           key={`${node.id}-orbit-${field(agent, "agent_id", "agentId", "id") || index}`}
           aria-hidden="true"
-          $tone={tone}
+          $tone={sourceTone}
           $index={index}
           $total={liveAgentCount}
         />
       ))}
       {liveAgentCount > 0 && <AgentCountBadge>{liveAgentCount}</AgentCountBadge>}
       {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
-      <NodeKindLabel $kind={kind}>{isUnspecifiedStructuralNode(node) ? "no spec" : leased ? "leased" : kind}</NodeKindLabel>
-      <NodeTitle $kind={kind} title={title}>{title}</NodeTitle>
-      {path && kind !== "workspace" && <NodePath>{path}</NodePath>}
+      <NodeMetaRow $kind={kind}>
+        <NodeKindLabel $kind={kind} $noSpec={noSpec} $statusTone={statusTone}>
+          {noSpec ? "no spec" : kind}
+        </NodeKindLabel>
+        {source && kind !== "folder" && (
+          <NodeSourceChip $sourceTone={sourceTone}>{source}</NodeSourceChip>
+        )}
+      </NodeMetaRow>
+      <NodeTitle $kind={kind} $noSpec={noSpec} title={title}>{title}</NodeTitle>
+      {path && kind === "file" && <NodePath>{path}</NodePath>}
     </FlowNodeCard>
   );
 }
@@ -402,87 +459,258 @@ const FlowFrame = styled.div`
 
 const FlowNodeCard = styled.button`
   align-items: center;
-  border: 1px solid ${({ $active, $leased, $provisional, $tone }) => ($active || $leased || $provisional ? $tone : "rgba(230, 236, 245, 0.14)")};
+  border: ${({ $active, $kind, $kindTone, $sourceState, $sourceTone, $statusTone }) => {
+    if ($active) return `1.5px solid ${$statusTone || "#38bdf8"}`;
+    if ($sourceState === "lease") return `1.5px dashed ${$sourceTone || "#f59e0b"}`;
+    if ($sourceState === "local") return `1.2px dotted ${$sourceTone || "#94a3b8"}`;
+    if ($sourceState === "worktree") return `1.2px solid ${colorWithAlpha($sourceTone || "#38bdf8", "cc")}`;
+    if ($sourceState === "main") return `1px solid ${colorWithAlpha($sourceTone || "#22c55e", "8f")}`;
+    if ($kind === "abstract") return `1px dashed ${colorWithAlpha($kindTone || "#c084fc", "99")}`;
+    return "1px solid rgba(230, 236, 245, 0.14)";
+  }};
   border-radius: ${({ $kind }) => {
-    if ($kind === "folder") return "12px";
-    if ($kind === "file") return "9px";
+    if ($kind === "folder") return "8px";
+    if ($kind === "file") return "7px";
+    if ($kind === "abstract") return "22px 9px 22px 9px";
     return "999px";
   }};
-  background:
-    radial-gradient(circle at 48% 38%, ${({ $tone }) => `${$tone || "#38bdf8"}26`}, rgba(13, 17, 23, 0.88) 62%),
-    rgba(13, 17, 23, 0.94);
-  box-shadow: ${({ $active, $leased, $live, $provisional, $tone }) => {
-    if ($active) return `0 0 0 2px ${$tone}55, 0 18px 44px rgba(0, 0, 0, 0.34)`;
-    if ($leased) return `0 0 0 1px ${$tone}55, 0 0 26px ${$tone}22, 0 12px 30px rgba(0, 0, 0, 0.24)`;
-    if ($provisional) return `0 0 0 1px ${$tone}44, 0 0 24px ${$tone}22, 0 12px 30px rgba(0, 0, 0, 0.24)`;
-    if ($live) return `0 0 0 1px ${$tone}33, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+  background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+    if ($noSpec) {
+      return "linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.98))";
+    }
+    if ($kind === "abstract") {
+      return `
+        linear-gradient(135deg, ${colorWithAlpha($kindTone || "#c084fc", "24")}, rgba(13, 17, 23, 0.94) 56%),
+        radial-gradient(circle at 52% 46%, ${colorWithAlpha($statusTone || "#fbbf24", "24")}, transparent 68%),
+        rgba(13, 17, 23, 0.96)
+      `;
+    }
+    return `
+      radial-gradient(circle at 48% 36%, ${colorWithAlpha($statusTone || "#38bdf8", "24")}, rgba(13, 17, 23, 0.88) 62%),
+      rgba(13, 17, 23, 0.94)
+    `;
+  }};
+  box-shadow: ${({ $active, $live, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+    if ($active) {
+      return `0 0 0 2px ${colorWithAlpha($statusTone || "#38bdf8", "55")}, 0 0 0 5px ${colorWithAlpha($sourceTone || "#38bdf8", "22")}, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    }
+    if ($sourceState === "lease") {
+      return `0 0 0 1px ${colorWithAlpha($sourceTone || "#f59e0b", "44")}, 0 0 24px ${colorWithAlpha($sourceTone || "#f59e0b", "22")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    }
+    if ($sourceState === "worktree") {
+      return `0 0 0 1px ${colorWithAlpha($sourceTone || "#38bdf8", "33")}, 0 0 24px ${colorWithAlpha($sourceTone || "#38bdf8", "1f")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    }
+    if ($live) return `0 0 0 1px ${colorWithAlpha($sourceTone || "#34d399", "33")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    if ($noSpec) return "0 9px 22px rgba(0, 0, 0, 0.2)";
     return "0 12px 30px rgba(0, 0, 0, 0.2)";
   }};
   color: inherit;
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: ${({ $kind }) => ($kind === "folder" ? "3px" : "4px")};
   height: 100%;
   justify-content: center;
-  opacity: ${({ $unspecified }) => ($unspecified ? 0.68 : 1)};
-  outline: ${({ $leased, $provisional, $tone }) => ($leased || $provisional ? `1px dashed ${$tone}66` : "none")};
-  outline-offset: 4px;
+  min-width: 0;
+  opacity: ${({ $sourceState }) => ($sourceState === "local" ? 0.76 : 1)};
+  outline: none;
   overflow: visible;
-  padding: ${({ $kind }) => ($kind === "workspace" ? "20px" : "10px 12px")};
+  padding: ${({ $kind }) => {
+    if ($kind === "workspace") return "20px";
+    if ($kind === "folder") return "7px 8px 6px";
+    if ($kind === "file") return "9px 12px 9px 16px";
+    return "12px 14px";
+  }};
   position: relative;
   text-align: center;
   width: 100%;
 
   &::before {
-    background: ${({ $kind, $tone }) => ($kind === "folder" ? `${$tone || "#a78bfa"}66` : "transparent")};
+    background: ${({ $kind, $kindTone, $noSpec }) => {
+      if ($kind !== "folder") return "transparent";
+      return $noSpec ? "rgba(100, 116, 139, 0.92)" : colorWithAlpha($kindTone || "#a78bfa", "88");
+    }};
+    border: ${({ $kind, $sourceTone }) => ($kind === "folder" ? `1px solid ${colorWithAlpha($sourceTone || "#22c55e", "aa")}` : "0")};
+    border-bottom: 0;
     border-radius: 8px 8px 3px 3px;
     content: "";
     display: ${({ $kind }) => ($kind === "folder" ? "block" : "none")};
-    height: 9px;
-    left: 14px;
+    height: 8px;
+    left: 10px;
     position: absolute;
-    top: -7px;
-    width: 38px;
+    top: -6px;
+    width: 30px;
+    z-index: 1;
+  }
+
+  &::after {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    z-index: 1;
+    ${({ $kind, $kindTone, $sourceTone }) => {
+      if ($kind === "file") {
+        return `
+          background: ${colorWithAlpha($sourceTone || "#22c55e", "cc")};
+          clip-path: polygon(100% 0, 0 0, 100% 100%);
+          height: 14px;
+          right: 0;
+          top: 0;
+          width: 14px;
+        `;
+      }
+      if ($kind === "abstract") {
+        return `
+          background: rgba(13, 17, 23, 0.96);
+          border: 1px solid ${colorWithAlpha($kindTone || "#c084fc", "bb")};
+          height: 14px;
+          right: 16px;
+          top: -6px;
+          transform: rotate(45deg);
+          width: 14px;
+        `;
+      }
+      return "display: none;";
+    }}
   }
 
   &:hover {
-    border-color: ${({ $tone }) => $tone || "#38bdf8"};
+    border-color: ${({ $sourceTone, $statusTone }) => $sourceTone || $statusTone || "#38bdf8"};
     transform: scale(1.025);
   }
 `;
 
+const SourceAccent = styled.span`
+  pointer-events: none;
+  position: absolute;
+  z-index: 1;
+  ${({ $kind, $sourceState, $sourceTone }) => {
+    if ($sourceState === "unknown") return "display: none;";
+    if ($kind === "workspace") {
+      return `
+        background: transparent;
+        border: 1.5px solid ${colorWithAlpha($sourceTone || "#22c55e", "88")};
+        border-radius: 999px;
+        inset: 8px;
+      `;
+    }
+    if ($kind === "folder") {
+      return `
+        background: ${colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        border-radius: 999px;
+        bottom: 6px;
+        height: 3px;
+        left: 10px;
+        right: 10px;
+      `;
+    }
+    if ($kind === "file") {
+      return `
+        background: ${colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        border-radius: 0 999px 999px 0;
+        bottom: 13px;
+        left: 0;
+        top: 13px;
+        width: 5px;
+      `;
+    }
+    return `
+      background: ${colorWithAlpha($sourceTone || "#94a3b8", "b8")};
+      border-radius: 999px;
+      bottom: 10px;
+      height: 2px;
+      right: 10px;
+      transform: rotate(-28deg);
+      width: 24px;
+    `;
+  }}
+`;
+
+const NodeMetaRow = styled.div`
+  align-items: center;
+  display: flex;
+  gap: ${({ $kind }) => ($kind === "workspace" ? "6px" : "4px")};
+  justify-content: center;
+  max-width: 100%;
+  min-width: 0;
+  position: relative;
+  z-index: 2;
+`;
+
 const NodeKindLabel = styled.span`
-  color: ${({ $kind }) => ($kind === "workspace" ? "rgba(167, 243, 208, 0.84)" : "rgba(219, 231, 247, 0.45)")};
-  font-size: ${({ $kind }) => ($kind === "workspace" ? "10px" : "8.5px")};
+  color: ${({ $kind, $noSpec, $statusTone }) => {
+    if ($noSpec) return "rgba(226, 232, 240, 0.62)";
+    if ($kind === "workspace") return "rgba(167, 243, 208, 0.84)";
+    return colorWithAlpha($statusTone || "#e2e8f0", "cc");
+  }};
+  font-size: ${({ $kind }) => {
+    if ($kind === "workspace") return "10px";
+    if ($kind === "folder") return "7.5px";
+    return "8.5px";
+  }};
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+const NodeSourceChip = styled.span`
+  background: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#22c55e", "1f")};
+  border: 1px solid ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#22c55e", "66")};
+  border-radius: 999px;
+  color: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#22c55e", "f2")};
+  display: inline-flex;
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1;
+  max-width: 58px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 1px 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const NodeTitle = styled.div`
-  color: var(--forge-text-soft, #eef5ff);
+  color: ${({ $noSpec }) => ($noSpec ? "rgba(238, 245, 255, 0.78)" : "var(--forge-text-soft, #eef5ff)")};
   display: -webkit-box;
-  font-size: ${({ $kind }) => ($kind === "workspace" ? "14px" : $kind === "abstract" ? "12px" : "11px")};
+  font-size: ${({ $kind }) => {
+    if ($kind === "workspace") return "14px";
+    if ($kind === "folder") return "10.5px";
+    if ($kind === "abstract") return "11.5px";
+    return "11px";
+  }};
   font-weight: 840;
-  line-height: 1.18;
+  line-height: ${({ $kind }) => ($kind === "folder" ? 1.12 : 1.18)};
+  max-width: 100%;
   overflow: hidden;
+  position: relative;
   text-overflow: ellipsis;
+  z-index: 2;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: ${({ $kind }) => ($kind === "workspace" ? 5 : 3)};
+  -webkit-line-clamp: ${({ $kind }) => {
+    if ($kind === "workspace") return 5;
+    if ($kind === "folder") return 2;
+    if ($kind === "file") return 2;
+    return 3;
+  }};
   word-break: break-word;
 `;
 
 const NodePath = styled.div`
   color: rgba(219, 231, 247, 0.45);
-  font-size: 8.5px;
+  font-size: 8.2px;
   font-weight: 680;
   line-height: 1.15;
   max-width: 100%;
   overflow: hidden;
+  position: relative;
   text-overflow: ellipsis;
   white-space: nowrap;
+  z-index: 2;
 `;
 
 const AgentCountBadge = styled.span`

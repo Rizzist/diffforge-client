@@ -216,6 +216,26 @@ function maskPrivateRuntimeNamespaceLeaks(text, coreRepoPath) {
   return next;
 }
 
+function maskTodoAttachmentDisplayText(text) {
+  return String(text || "")
+    .replace(
+      /\[image-attached(?:\s+\d+)?\][^\r\n]*?\s+->\s+(?:[A-Za-z]:[\\/]|\\\\|\/|~)[^\r\n]*/g,
+      "[image-attached]",
+    )
+    .replace(
+      /(\[pasted-lines\s+\d+\])[^\r\n]*?\s+->\s+(?:[A-Za-z]:[\\/]|\\\\|\/|~)[^\r\n]*/g,
+      "$1",
+    )
+    .replace(
+      /(?:[A-Za-z]:[\\/]|\\\\|\/|~)[^\r\n\s"'`<>()\[\]{}|;,\u001b]*diffforge-todo-attachments[\\/][^\r\n\s"'`<>()\[\]{}|;,\u001b]*-images-[^\r\n\s"'`<>()\[\]{}|;,\u001b]*/gi,
+      "[image-attached]",
+    )
+    .replace(
+      /(?:[A-Za-z]:[\\/]|\\\\|\/|~)[^\r\n\s"'`<>()\[\]{}|;,\u001b]*diffforge-todo-attachments[\\/][^\r\n\s"'`<>()\[\]{}|;,\u001b]*-text-[^\r\n\s"'`<>()\[\]{}|;,\u001b]*pasted-lines-?(\d+)?[^\r\n\s"'`<>()\[\]{}|;,\u001b]*/gi,
+      (_match, lineCount = "") => (lineCount ? `[pasted-lines ${lineCount}]` : "[pasted-lines]"),
+    );
+}
+
 function maskTrailingKnownCoreRepoPath(text, coreRepoPath) {
   const corePath = normalizeWorkspacePathSeparators(coreRepoPath).replace(/\/+$/g, "");
   if (!corePath) {
@@ -332,7 +352,7 @@ function stripLeadingAgentsContinuationAfterCoreRepo(text) {
 export function maskFunctionalRepoPathsForDisplayText(value, options = {}) {
   const text = String(value || "");
   const knownMasked = maskKnownFunctionalPath(
-    text,
+    maskTodoAttachmentDisplayText(text),
     options.functionalRepoPath,
     options.coreRepoPath,
   );

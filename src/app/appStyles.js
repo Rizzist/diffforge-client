@@ -22,6 +22,7 @@ import { KeyboardDoubleArrowLeft } from "@styled-icons/material-rounded/Keyboard
 import { KeyboardDoubleArrowRight } from "@styled-icons/material-rounded/KeyboardDoubleArrowRight";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
+import { Memory } from "@styled-icons/material-rounded/Memory";
 import { Mic } from "@styled-icons/material-rounded/Mic";
 import { Remove } from "@styled-icons/material-rounded/Remove";
 import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
@@ -2580,6 +2581,10 @@ export const TerminalWorkspaceSurface = styled.section`
     will-change: transform, opacity;
   }
 
+  &[data-threads-view="true"][data-terminal-fullscreen="true"] {
+    box-shadow: none;
+  }
+
   &[data-terminal-fullscreen-state="opening"] {
     animation: ${terminalFullscreenEnter} var(--terminal-fullscreen-duration, 190ms) cubic-bezier(0.16, 1, 0.3, 1) both;
   }
@@ -2609,6 +2614,12 @@ export const TerminalWorkspaceSurface = styled.section`
       inset 0 0 0 1px rgba(226, 232, 240, 0.18),
       inset 0 0 14px rgba(132, 157, 190, 0.06),
       0 0 12px rgba(132, 157, 190, 0.14);
+  }
+
+  &[data-threads-view="true"]::after {
+    border-width: 0;
+    border-color: transparent;
+    box-shadow: none;
   }
 `;
 
@@ -8809,6 +8820,10 @@ export const ButtonKeyIcon = styled(Key)`
 `;
 
 export const ButtonMicIcon = styled(Mic)`
+  ${buttonIconSize}
+`;
+
+export const ButtonProcessIcon = styled(Memory)`
   ${buttonIconSize}
 `;
 

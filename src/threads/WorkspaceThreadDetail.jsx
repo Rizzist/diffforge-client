@@ -1,0 +1,1526 @@
+import { invoke } from "@tauri-apps/api/core";
+import { AddPhotoAlternate } from "@styled-icons/material-rounded/AddPhotoAlternate";
+import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
+import { Close } from "@styled-icons/material-rounded/Close";
+import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import styled, { keyframes } from "styled-components";
+
+import {
+  getWorkspaceThreadLabel,
+  getWorkspaceThreadProviderBinding,
+} from "./workspaceThreads";
+
+const thinkingPulse = keyframes`
+  0%, 100% {
+    opacity: 0.42;
+  }
+
+  50% {
+    opacity: 1;
+  }
+`;
+
+const DetailRoot = styled.main`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto;
+  color: #d9d9d9;
+  background: #000000;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  user-select: text;
+  -webkit-user-select: text;
+
+  *::selection {
+    color: #ffffff;
+    background: rgba(85, 132, 199, 0.42);
+  }
+`;
+
+const TranscriptScroll = styled.div`
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: #000000;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border: 3px solid #000000;
+    border-radius: 999px;
+    background: #53657b;
+  }
+`;
+
+const TranscriptInner = styled.div`
+  display: grid;
+  width: min(100%, 880px);
+  min-height: 100%;
+  align-content: end;
+  gap: 6px;
+  margin: 0 auto;
+  padding: 58px 24px 26px;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const EmptyThread = styled.div`
+  align-self: center;
+  justify-self: center;
+  max-width: 360px;
+  color: #6f7d8f;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+`;
+
+const UserCell = styled.article`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px 0 8px;
+  color: #ededed;
+  font-size: 13px;
+  line-height: 1.58;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const UserPrefix = styled.span`
+  color: #9ca3af;
+  font-weight: 740;
+  line-height: 1.58;
+  user-select: none;
+`;
+
+const MessageText = styled.div`
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const AssistantCell = styled.article`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  padding: 0 0 10px;
+  color: #d6d6d6;
+  font-size: 13px;
+  line-height: 1.6;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const AssistantPrefix = styled.span`
+  color: transparent;
+  user-select: none;
+`;
+
+const TranscriptActivityCell = styled.article`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  padding: 2px 0 8px;
+  color: #8f97a3;
+  font-size: 12px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const TranscriptActivityTitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #a6afbd;
+  font-weight: 640;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const TranscriptActivityBody = styled.pre`
+  max-height: 290px;
+  min-width: 0;
+  margin: 6px 0 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-left: 1px solid rgba(116, 129, 148, 0.22);
+  padding: 2px 0 2px 11px;
+  color: #8793a3;
+  background: transparent;
+  font: inherit;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ActivityCell = styled.article`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  color: #858b98;
+  font-size: 12px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ActivityBullet = styled.span`
+  color: #68707d;
+  user-select: none;
+`;
+
+const ActivityText = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &[data-live="true"]::after {
+    display: inline-block;
+    width: 18px;
+    margin-left: 2px;
+    animation: ${thinkingPulse} 1.1s ease-in-out infinite;
+    content: "...";
+  }
+`;
+
+const ComposerShell = styled.form`
+  display: grid;
+  width: min(100%, 880px);
+  gap: 8px;
+  margin: 0 auto;
+  padding: 0 24px 22px;
+  background: #000000;
+  user-select: none;
+`;
+
+const ComposerBox = styled.div`
+  display: grid;
+  min-height: 82px;
+  grid-template-rows: auto minmax(38px, auto) 30px;
+  border: 1px solid #2d333b;
+  border-radius: 8px;
+  background: #111111;
+  box-shadow: none;
+  overflow: hidden;
+
+  &:focus-within {
+    border-color: #475569;
+  }
+`;
+
+const ComposerInput = styled.textarea`
+  width: 100%;
+  min-height: 46px;
+  max-height: 170px;
+  resize: none;
+  padding: 12px 13px 6px;
+  border: 0;
+  outline: none;
+  color: #eeeeee;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &::placeholder {
+    color: #7c8490;
+  }
+
+  &:disabled {
+    color: #748196;
+    cursor: not-allowed;
+  }
+`;
+
+const ComposerFooter = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 7px 7px 11px;
+  user-select: none;
+`;
+
+const ComposerHint = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: #8a929e;
+  font-size: 11px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ComposerControls = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+`;
+
+const ComposerToolButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  color: #aeb5bf;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  user-select: none;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+
+  &:hover:not(:disabled) {
+    color: #eeeeee;
+    background: #232323;
+  }
+
+  &:disabled {
+    opacity: 0.44;
+    cursor: not-allowed;
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+`;
+
+const ModelMenuWrap = styled.div`
+  position: relative;
+  min-width: 0;
+`;
+
+const ModelButton = styled(ComposerToolButton)`
+  max-width: min(260px, 38vw);
+  color: #d0d5dd;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+    color: #7f8794;
+  }
+`;
+
+const ModelDropdown = styled.div`
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 4;
+  display: none;
+  width: min(280px, 70vw);
+  overflow: hidden;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #181818;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+
+  &[data-open="true"] {
+    display: grid;
+  }
+`;
+
+const ModelOption = styled.button`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 0;
+  color: #d5d9df;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  user-select: none;
+
+  &:hover,
+  &[data-selected="true"] {
+    background: #262626;
+  }
+
+  strong {
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: #8c94a0;
+    font-size: 11px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const AttachmentStrip = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 9px 0;
+
+  &:empty {
+    display: none;
+  }
+`;
+
+const AttachmentChip = styled.span`
+  display: inline-flex;
+  max-width: 220px;
+  height: 24px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #2b3138;
+  border-radius: 6px;
+  padding: 0 5px 0 7px;
+  color: #c3c9d2;
+  background: #191919;
+  font-size: 11px;
+  line-height: 1;
+  user-select: none;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    display: grid;
+    width: 16px;
+    height: 16px;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    color: #8c94a0;
+    background: transparent;
+
+    &:hover {
+      color: #f3f4f6;
+    }
+  }
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+`;
+
+const HiddenFileInput = styled.input`
+  display: none;
+`;
+
+const SendButton = styled.button`
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #0b0c0d;
+  background: #aeb7c4;
+  user-select: none;
+  transition:
+    background 130ms ease,
+    border-color 130ms ease,
+    opacity 130ms ease;
+
+  &:hover:not(:disabled) {
+    background: #d8dee8;
+  }
+
+  &:disabled {
+    opacity: 0.46;
+    cursor: not-allowed;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+`;
+
+const ComposerError = styled.div`
+  color: #f28a8a;
+  font-size: 11px;
+  line-height: 1.35;
+`;
+
+const NewChatRoot = styled.main`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  padding: 36px 24px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  color: #e8e8e8;
+  background: #191919;
+`;
+
+const NewChatCenter = styled.form`
+  display: grid;
+  width: min(100%, 760px);
+  gap: 28px;
+`;
+
+const NewChatTitle = styled.h1`
+  margin: 0;
+  color: #f4f4f5;
+  font-size: clamp(27px, 4vw, 43px);
+  font-weight: 420;
+  letter-spacing: 0;
+  line-height: 1.12;
+  text-align: center;
+`;
+
+const NewChatBox = styled.div`
+  display: grid;
+  min-height: 144px;
+  grid-template-rows: minmax(76px, auto) auto;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 24px;
+  background: #2f2f2f;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+
+  &:focus-within {
+    border-color: rgba(255, 255, 255, 0.13);
+  }
+`;
+
+const NewChatInput = styled.textarea`
+  width: 100%;
+  min-height: 76px;
+  max-height: 220px;
+  resize: none;
+  padding: 21px 20px 10px;
+  border: 0;
+  outline: 0;
+  color: #f2f2f2;
+  background: transparent;
+  font: inherit;
+  font-size: 17px;
+  line-height: 1.45;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &::placeholder {
+    color: #8f8f8f;
+  }
+
+  &:disabled {
+    color: #a3a3a3;
+    cursor: not-allowed;
+  }
+`;
+
+const NewChatToolbar = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px 12px 14px;
+`;
+
+const NewChatControls = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+`;
+
+const NewChatSelect = styled.select`
+  max-width: 190px;
+  height: 32px;
+  min-width: 112px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 28px 0 12px;
+  color: #d7d7d7;
+  background: #2a2a2a;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  outline: none;
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+`;
+
+const NewChatProject = styled.div`
+  min-width: 0;
+  max-width: 260px;
+  overflow: hidden;
+  color: #a5a5a5;
+  font-size: 12px;
+  font-weight: 640;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const NewChatAttachButton = styled(ComposerToolButton)`
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  color: #b8b8b8;
+  background: transparent;
+
+  &:hover:not(:disabled) {
+    background: #3a3a3a;
+  }
+`;
+
+const NewChatSendButton = styled(SendButton)`
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  background: #a6a6a6;
+
+  svg {
+    width: 22px;
+    height: 22px;
+  }
+`;
+
+const NewChatAttachmentStrip = styled(AttachmentStrip)`
+  padding: 0;
+`;
+
+const NewChatFooter = styled.div`
+  display: grid;
+  gap: 8px;
+`;
+
+const NewChatError = styled(ComposerError)`
+  text-align: center;
+`;
+
+const AGENT_LABELS = {
+  claude: "Claude",
+  codex: "Codex",
+  opencode: "OpenCode",
+};
+const IMAGE_ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
+const IMAGE_ATTACHMENT_LIMIT = 4;
+const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
+const MODEL_OPTIONS = {
+  claude: [
+    { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
+    { detail: "Higher capability", label: "Opus", value: "opus" },
+    { detail: "Fastest Claude option", label: "Haiku", value: "haiku" },
+  ],
+  codex: [
+    { detail: "Codex default", label: "5.5 Extra High", value: "gpt-5.5" },
+    { detail: "Balanced coding model", label: "5.4", value: "gpt-5.4" },
+    { detail: "Fast coding model", label: "5.3 Codex Spark", value: "gpt-5.3-codex-spark" },
+    { detail: "Reasoning model", label: "o3", value: "o3" },
+  ],
+  opencode: [
+    { detail: "Vision capable when configured in OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
+    { detail: "Vision capable when configured in OpenCode", label: "Claude Sonnet", value: "anthropic/claude-sonnet-4-5" },
+    { detail: "Vision capable when configured in OpenCode", label: "Gemini 2.5 Pro", value: "google/gemini-2.5-pro" },
+  ],
+};
+
+function normalizeAgentId(value) {
+  const agentId = String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
+
+  if (agentId.includes("claude")) {
+    return "claude";
+  }
+
+  if (agentId.includes("opencode") || agentId.includes("open-code")) {
+    return "opencode";
+  }
+
+  if (agentId.includes("codex")) {
+    return "codex";
+  }
+
+  return THREAD_AGENT_IDS.has(agentId) ? agentId : "codex";
+}
+
+function findAgentStatus(agentStatuses, agentId) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  return (Array.isArray(agentStatuses) ? agentStatuses : []).find((status) => (
+    normalizeAgentId(status?.id) === normalizedAgentId
+  )) || null;
+}
+
+function getStatusModel(status) {
+  return String(
+    status?.activeModel
+      || status?.model
+      || status?.selectedModel
+      || status?.configuredModel
+      || "",
+  ).trim();
+}
+
+function modelLooksImageCapable(model) {
+  const normalized = String(model || "").trim().toLowerCase();
+
+  if (!normalized) {
+    return null;
+  }
+
+  if ([
+    "gpt-3.5",
+    "o1-mini",
+    "o3-mini",
+    "deepseek",
+    "codestral",
+    "devstral",
+    "llama",
+    "qwen-coder",
+    "kimi",
+  ].some((marker) => normalized.includes(marker))) {
+    return false;
+  }
+
+  if ([
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "claude-3",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-haiku-4",
+    "sonnet-4",
+    "opus-4",
+    "gemini",
+    "pixtral",
+    "llava",
+    "minicpm-v",
+    "vision",
+    "multimodal",
+    "omni",
+    "qwen-vl",
+    "qwen2-vl",
+    "qwen2.5-vl",
+  ].some((marker) => normalized.includes(marker))
+    || normalized.includes("-vl")
+    || normalized.includes("/vl")
+    || normalized.endsWith(":vl")) {
+    return true;
+  }
+
+  return null;
+}
+
+function getModelOptions(agentId, status, binding = null) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const sessionModel = String(binding?.modelId || binding?.model || "").trim();
+  const activeModel = sessionModel || getStatusModel(status);
+  const options = [];
+
+  if (activeModel) {
+    options.push({
+      detail: sessionModel ? "Session model" : "Active terminal model",
+      label: activeModel,
+      value: activeModel,
+    });
+  } else {
+    options.push({
+      detail: "Use the agent default",
+      label: "Default",
+      value: "",
+    });
+  }
+
+  (MODEL_OPTIONS[normalizedAgentId] || []).forEach((option) => {
+    if (!options.some((existing) => existing.value === option.value)) {
+      options.push(option);
+    }
+  });
+
+  return options;
+}
+
+function getImageInputSupport(agentId, status, selectedModel) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const statusSupport = String(status?.imageInputSupport || "").trim().toLowerCase();
+  const activeModel = String(selectedModel || getStatusModel(status)).trim();
+
+  if (normalizedAgentId === "codex" || normalizedAgentId === "claude") {
+    return {
+      activeModel,
+      reason: status?.imageInputReason || `${AGENT_LABELS[normalizedAgentId]} supports image input.`,
+      supported: true,
+    };
+  }
+
+  if (normalizedAgentId === "opencode") {
+    if (status?.imageInputSupported === true || statusSupport === "supported") {
+      return {
+        activeModel,
+        reason: status?.imageInputReason || "OpenCode is using an image-capable model.",
+        supported: true,
+      };
+    }
+
+    const modelSupport = modelLooksImageCapable(activeModel);
+    if (modelSupport === true) {
+      return {
+        activeModel,
+        reason: `OpenCode is using an image-capable model (${activeModel}).`,
+        supported: true,
+      };
+    }
+
+    return {
+      activeModel,
+      reason: activeModel
+        ? `OpenCode image support is not available for ${activeModel}.`
+        : "OpenCode image input depends on the selected model.",
+      supported: false,
+    };
+  }
+
+  return {
+    activeModel,
+    reason: "This terminal does not accept image input.",
+    supported: false,
+  };
+}
+
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !String(file.type || "").startsWith("image/")) {
+      reject(new Error("Choose an image file."));
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to read image."));
+    reader.onload = () => resolve({
+      dataUrl: String(reader.result || ""),
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      mimeType: file.type,
+      name: file.name || "image",
+      size: file.size || 0,
+    });
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatSavedImageAttachments(images) {
+  return (Array.isArray(images) ? images : [])
+    .map((image, index) => {
+      const name = String(image?.name || `image-${index + 1}`).trim();
+      const path = String(image?.path || "").trim();
+      return path ? `[image-attached ${index + 1}] ${name} -> ${path}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function saveImageAttachments(attachments) {
+  const images = (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => ({
+      dataUrl: attachment.dataUrl,
+      mimeType: attachment.mimeType,
+      name: attachment.name,
+    }))
+    .filter((attachment) => attachment.dataUrl && attachment.mimeType);
+
+  if (!images.length) {
+    return "";
+  }
+
+  const savedImages = await invoke("save_todo_image_attachments", { images });
+  const imageBlock = formatSavedImageAttachments(savedImages);
+
+  if (!imageBlock) {
+    throw new Error("Unable to prepare image attachment.");
+  }
+
+  return imageBlock;
+}
+
+function isAgentStatusReady(status) {
+  if (!status) {
+    return true;
+  }
+
+  return status.installed === true && status.authenticated === true;
+}
+
+function getNewChatAgentOptions(agentStatuses) {
+  return ["codex", "claude", "opencode"].map((agentId) => {
+    const status = findAgentStatus(agentStatuses, agentId);
+    const ready = isAgentStatusReady(status);
+
+    return {
+      disabled: !ready,
+      id: agentId,
+      label: AGENT_LABELS[agentId] || agentId,
+      status,
+    };
+  });
+}
+
+function getDefaultNewChatAgentId(agentStatuses) {
+  return getNewChatAgentOptions(agentStatuses).find((option) => !option.disabled)?.id || "codex";
+}
+
+function NewChatView({
+  agentStatuses,
+  onCreateChat,
+  workspace,
+}) {
+  const [draft, setDraft] = useState("");
+  const [agentId, setAgentId] = useState(() => getDefaultNewChatAgentId(agentStatuses));
+  const [attachments, setAttachments] = useState([]);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+  const agentOptions = useMemo(() => getNewChatAgentOptions(agentStatuses), [agentStatuses]);
+  const selectedAgentOption = agentOptions.find((option) => option.id === agentId) || agentOptions[0];
+  const activeAgentId = normalizeAgentId(selectedAgentOption?.id || agentId);
+  const activeAgentStatus = useMemo(
+    () => findAgentStatus(agentStatuses, activeAgentId),
+    [activeAgentId, agentStatuses],
+  );
+  const modelOptions = useMemo(
+    () => getModelOptions(activeAgentId, activeAgentStatus),
+    [activeAgentId, activeAgentStatus],
+  );
+  const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
+  const workspaceName = workspace?.name || "Current workspace";
+  const submitDisabled = sending
+    || selectedAgentOption?.disabled
+    || !workspace?.id
+    || (!draft.trim() && attachments.length === 0);
+
+  useEffect(() => {
+    const defaultAgentId = getDefaultNewChatAgentId(agentStatuses);
+    setAgentId((currentAgentId) => {
+      const currentOption = getNewChatAgentOptions(agentStatuses).find((option) => option.id === currentAgentId);
+      return currentOption && !currentOption.disabled ? currentAgentId : defaultAgentId;
+    });
+  }, [agentStatuses]);
+
+  useEffect(() => {
+    setSelectedModel(modelOptions[0]?.value || "");
+    setModelMenuOpen(false);
+  }, [activeAgentId, modelOptions]);
+
+  const addImageFiles = async (fileList) => {
+    const files = Array.from(fileList || []).slice(0, IMAGE_ATTACHMENT_LIMIT - attachments.length);
+    if (!files.length) {
+      return;
+    }
+
+    setError("");
+    try {
+      const nextAttachments = await Promise.all(files.map(readImageFile));
+      setAttachments((currentAttachments) => (
+        currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
+      ));
+    } catch (readError) {
+      setError(readError?.message || "Unable to attach image.");
+    }
+  };
+
+  const removeAttachment = (attachmentId) => {
+    setAttachments((currentAttachments) => (
+      currentAttachments.filter((attachment) => attachment.id !== attachmentId)
+    ));
+  };
+
+  const submitNewChat = async () => {
+    const text = draft.trim();
+    if (submitDisabled) {
+      return;
+    }
+
+    const previousDraft = draft;
+    const previousAttachments = attachments;
+    setSending(true);
+    setError("");
+    setDraft("");
+    setAttachments([]);
+    try {
+      const imageBlock = await saveImageAttachments(previousAttachments);
+      const message = [text, imageBlock].filter(Boolean).join("\n\n");
+
+      await onCreateChat?.({
+        agentId: activeAgentId,
+        message,
+        model: selectedModel,
+        workspace,
+      });
+    } catch (submitError) {
+      setDraft(previousDraft);
+      setAttachments(previousAttachments);
+      setError(submitError?.message || "Unable to start chat.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <NewChatRoot aria-label="New chat">
+      <NewChatCenter
+        onSubmit={(event) => {
+          event.preventDefault();
+          submitNewChat();
+        }}
+      >
+        <NewChatTitle>What should we work on?</NewChatTitle>
+        <HiddenFileInput
+          accept={IMAGE_ATTACHMENT_ACCEPT}
+          multiple
+          onChange={(event) => {
+            addImageFiles(event.target.files);
+            event.target.value = "";
+          }}
+          ref={fileInputRef}
+          type="file"
+        />
+        <NewChatBox>
+          <NewChatInput
+            disabled={sending}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                submitNewChat();
+              }
+            }}
+            placeholder={`Ask ${AGENT_LABELS[activeAgentId] || "an agent"} anything`}
+            rows={3}
+            spellCheck="true"
+            value={draft}
+          />
+          <NewChatToolbar>
+            <NewChatControls>
+              <NewChatAttachButton
+                aria-label="Upload image"
+                disabled={
+                  sending
+                    || !imageInputSupport.supported
+                    || attachments.length >= IMAGE_ATTACHMENT_LIMIT
+                }
+                onClick={() => fileInputRef.current?.click()}
+                title={
+                  imageInputSupport.supported
+                    ? "Upload image"
+                    : imageInputSupport.reason
+                }
+                type="button"
+              >
+                <AddPhotoAlternate aria-hidden="true" />
+              </NewChatAttachButton>
+              <NewChatSelect
+                aria-label="Coding agent"
+                disabled={sending}
+                onChange={(event) => setAgentId(event.target.value)}
+                value={activeAgentId}
+              >
+                {agentOptions.map((option) => (
+                  <option disabled={option.disabled} key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </NewChatSelect>
+              <ModelMenuWrap
+                onBlur={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) {
+                    setModelMenuOpen(false);
+                  }
+                }}
+              >
+                <ModelButton
+                  aria-expanded={modelMenuOpen ? "true" : "false"}
+                  aria-haspopup="menu"
+                  disabled={sending}
+                  onClick={() => setModelMenuOpen((isOpen) => !isOpen)}
+                  title={selectedModelOption?.detail || "Model"}
+                  type="button"
+                >
+                  <span>{selectedModelOption?.label || "Default"}</span>
+                  <ExpandMore aria-hidden="true" />
+                </ModelButton>
+                <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
+                  {modelOptions.map((option) => (
+                    <ModelOption
+                      data-selected={option.value === selectedModel ? "true" : "false"}
+                      key={option.value || option.label}
+                      onClick={() => {
+                        setSelectedModel(option.value);
+                        setModelMenuOpen(false);
+                      }}
+                      role="menuitem"
+                      title={option.detail}
+                      type="button"
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.detail}</span>
+                    </ModelOption>
+                  ))}
+                </ModelDropdown>
+              </ModelMenuWrap>
+              <NewChatProject title={workspaceName}>{workspaceName}</NewChatProject>
+            </NewChatControls>
+            <NewChatSendButton
+              aria-label="Start chat"
+              disabled={submitDisabled}
+              title="Start chat"
+              type="submit"
+            >
+              <ArrowUpward aria-hidden="true" />
+            </NewChatSendButton>
+          </NewChatToolbar>
+        </NewChatBox>
+        <NewChatFooter>
+          <NewChatAttachmentStrip>
+            {attachments.map((attachment) => (
+              <AttachmentChip key={attachment.id} title={attachment.name}>
+                <span>{attachment.name}</span>
+                <button
+                  aria-label={`Remove ${attachment.name}`}
+                  disabled={sending}
+                  onClick={() => removeAttachment(attachment.id)}
+                  title="Remove image"
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </button>
+              </AttachmentChip>
+            ))}
+          </NewChatAttachmentStrip>
+          {error ? <NewChatError>{error}</NewChatError> : null}
+        </NewChatFooter>
+      </NewChatCenter>
+    </NewChatRoot>
+  );
+}
+
+function compactPath(value) {
+  const text = String(value || "").replace(/\\/g, "/").trim();
+  if (!text) {
+    return "";
+  }
+
+  const parts = text.split("/").filter(Boolean);
+  return parts.slice(-2).join("/");
+}
+
+function buildActivityItems(thread) {
+  if (!thread) {
+    return [];
+  }
+
+  const items = [];
+  const isThinking = thread.activityStatus === "thinking";
+
+  if (thread.titleStatus === "pending") {
+    items.push({ id: "title", live: true, text: "Naming thread" });
+  }
+
+  if (isThinking) {
+    items.push({ id: "thinking", live: true, text: "Thinking" });
+  } else if (thread.status === "starting") {
+    items.push({ id: "starting", live: true, text: "Starting agent" });
+  } else if (thread.status === "closed" || thread.status === "exited") {
+    items.push({ id: "closed", live: false, text: "Terminal exited" });
+  } else if (thread.status === "error") {
+    items.push({ id: "error", live: false, text: "Terminal error" });
+  }
+
+  const worktree = compactPath(thread.coordination?.worktreePath);
+  if (worktree) {
+    items.push({ id: "worktree", live: false, text: `Working in ${worktree}` });
+  }
+
+  return items;
+}
+
+function ThreadMessage({ message }) {
+  if (!message) {
+    return null;
+  }
+
+  if (message.role === "assistant") {
+    return (
+      <AssistantCell>
+        <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
+        <MessageText>{message.text}</MessageText>
+      </AssistantCell>
+    );
+  }
+
+  if (message.role === "activity") {
+    const title = message.title || (
+      message.kind === "tool_call"
+        ? "Tool call"
+        : message.kind === "tool_output"
+          ? "Tool output"
+          : "Activity"
+    );
+    return (
+      <TranscriptActivityCell>
+        <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
+        <div>
+          <TranscriptActivityTitle>{title}</TranscriptActivityTitle>
+          {message.text ? <TranscriptActivityBody>{message.text}</TranscriptActivityBody> : null}
+        </div>
+      </TranscriptActivityCell>
+    );
+  }
+
+  return (
+    <UserCell>
+      <UserPrefix aria-hidden="true">{"\u203a"}</UserPrefix>
+      <MessageText>{message.text}</MessageText>
+    </UserCell>
+  );
+}
+
+function WorkspaceThreadDetail({
+  agentStatuses,
+  newChatActive = false,
+  onCreateChat,
+  onSelectModel,
+  onSubmitMessage,
+  thread,
+  workspace,
+}) {
+  const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  const activityItems = useMemo(() => buildActivityItems(thread), [thread]);
+  const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
+  const activeAgentStatus = useMemo(
+    () => findAgentStatus(agentStatuses, activeAgentId),
+    [activeAgentId, agentStatuses],
+  );
+  const activeProviderBinding = getWorkspaceThreadProviderBinding(thread, activeAgentId);
+  const activeProviderModelId = activeProviderBinding?.modelId || "";
+  const modelOptions = useMemo(
+    () => getModelOptions(activeAgentId, activeAgentStatus, { modelId: activeProviderModelId }),
+    [activeAgentId, activeAgentStatus, activeProviderModelId],
+  );
+  const activeTerminalBinding = activeProviderBinding?.terminalBinding || thread?.terminalBinding;
+  const canSubmit = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
+  const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
+  const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
+  const placeholder = canSubmit
+    ? `Ask ${agentLabel} to work in this thread`
+    : `No active ${agentLabel} terminal is bound to this thread`;
+  const submitDisabled = sending || !canSubmit || (!draft.trim() && attachments.length === 0);
+
+  useEffect(() => {
+    setSelectedModel(modelOptions[0]?.value || "");
+    setModelMenuOpen(false);
+  }, [activeAgentId, modelOptions, thread?.id]);
+
+  const addImageFiles = async (fileList) => {
+    const files = Array.from(fileList || []).slice(0, IMAGE_ATTACHMENT_LIMIT - attachments.length);
+    if (!files.length) {
+      return;
+    }
+
+    setError("");
+    try {
+      const nextAttachments = await Promise.all(files.map(readImageFile));
+      setAttachments((currentAttachments) => (
+        currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
+      ));
+    } catch (readError) {
+      setError(readError?.message || "Unable to attach image.");
+    }
+  };
+
+  const removeAttachment = (attachmentId) => {
+    setAttachments((currentAttachments) => (
+      currentAttachments.filter((attachment) => attachment.id !== attachmentId)
+    ));
+  };
+
+  const selectModel = async (option) => {
+    const nextModel = String(option?.value || "").trim();
+    setSelectedModel(nextModel);
+    setModelMenuOpen(false);
+    setError("");
+
+    if (!nextModel || !thread || !canSubmit) {
+      return;
+    }
+
+    try {
+      await onSelectModel?.({
+        agentId: activeAgentId,
+        model: nextModel,
+        thread,
+        workspace,
+      });
+    } catch (modelError) {
+      setError(modelError?.message || "Unable to change model.");
+    }
+  };
+
+  const submitDraft = async () => {
+    const text = draft.trim();
+    if ((!text && attachments.length === 0) || !thread || !canSubmit) {
+      return;
+    }
+
+    const previousDraft = draft;
+    const previousAttachments = attachments;
+    setSending(true);
+    setError("");
+    setDraft("");
+    setAttachments([]);
+    try {
+      const imageBlock = await saveImageAttachments(previousAttachments);
+      const message = [text, imageBlock].filter(Boolean).join("\n\n");
+
+      await onSubmitMessage?.({
+        message,
+        model: selectedModel,
+        thread,
+        workspace,
+      });
+    } catch (submitError) {
+      setDraft(previousDraft);
+      setAttachments(previousAttachments);
+      setError(submitError?.message || "Unable to send message.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (newChatActive) {
+    return (
+      <NewChatView
+        agentStatuses={agentStatuses}
+        onCreateChat={onCreateChat}
+        workspace={workspace}
+      />
+    );
+  }
+
+  if (!thread) {
+    return (
+      <DetailRoot>
+        <TranscriptScroll>
+          <TranscriptInner>
+            <EmptyThread>Select a thread</EmptyThread>
+          </TranscriptInner>
+        </TranscriptScroll>
+      </DetailRoot>
+    );
+  }
+
+  return (
+    <DetailRoot aria-label={getWorkspaceThreadLabel(thread)}>
+      <TranscriptScroll>
+        <TranscriptInner>
+          {messages.length === 0 && activityItems.length === 0 ? (
+            <EmptyThread>{getWorkspaceThreadLabel(thread)}</EmptyThread>
+          ) : null}
+
+          {messages.map((message) => (
+            <ThreadMessage key={message.id} message={message} />
+          ))}
+
+          {activityItems.map((item) => (
+            <ActivityCell key={item.id}>
+              <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
+              <ActivityText data-live={item.live ? "true" : "false"}>{item.text}</ActivityText>
+            </ActivityCell>
+          ))}
+        </TranscriptInner>
+      </TranscriptScroll>
+
+      <ComposerShell
+        onSubmit={(event) => {
+          event.preventDefault();
+          submitDraft();
+        }}
+      >
+        <HiddenFileInput
+          accept={IMAGE_ATTACHMENT_ACCEPT}
+          multiple
+          onChange={(event) => {
+            addImageFiles(event.target.files);
+            event.target.value = "";
+          }}
+          ref={fileInputRef}
+          type="file"
+        />
+        <ComposerBox>
+          <AttachmentStrip>
+            {attachments.map((attachment) => (
+              <AttachmentChip key={attachment.id} title={attachment.name}>
+                <span>{attachment.name}</span>
+                <button
+                  aria-label={`Remove ${attachment.name}`}
+                  disabled={sending}
+                  onClick={() => removeAttachment(attachment.id)}
+                  title="Remove image"
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </button>
+              </AttachmentChip>
+            ))}
+          </AttachmentStrip>
+          <ComposerInput
+            disabled={!canSubmit || sending}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                submitDraft();
+              }
+            }}
+            placeholder={placeholder}
+            rows={2}
+            spellCheck="true"
+            value={draft}
+          />
+          <ComposerFooter>
+            <ComposerControls>
+              <ComposerToolButton
+                aria-label="Upload image"
+                disabled={
+                  !canSubmit
+                    || sending
+                    || !imageInputSupport.supported
+                    || attachments.length >= IMAGE_ATTACHMENT_LIMIT
+                }
+                onClick={() => fileInputRef.current?.click()}
+                title={
+                  imageInputSupport.supported
+                    ? "Upload image"
+                    : imageInputSupport.reason
+                }
+                type="button"
+              >
+                <AddPhotoAlternate aria-hidden="true" />
+              </ComposerToolButton>
+              <ModelMenuWrap
+                onBlur={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) {
+                    setModelMenuOpen(false);
+                  }
+                }}
+              >
+                <ModelButton
+                  aria-expanded={modelMenuOpen ? "true" : "false"}
+                  aria-haspopup="menu"
+                  onClick={() => setModelMenuOpen((isOpen) => !isOpen)}
+                  title={selectedModelOption?.detail || "Model"}
+                  type="button"
+                >
+                  <span>{selectedModelOption?.label || "Default"}</span>
+                  <ExpandMore aria-hidden="true" />
+                </ModelButton>
+                <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
+                  {modelOptions.map((option) => (
+                    <ModelOption
+                      data-selected={option.value === selectedModel ? "true" : "false"}
+                      key={option.value || option.label}
+                      onClick={() => selectModel(option)}
+                      role="menuitem"
+                      title={option.detail}
+                      type="button"
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.detail}</span>
+                    </ModelOption>
+                  ))}
+                </ModelDropdown>
+              </ModelMenuWrap>
+            </ComposerControls>
+            <ComposerHint>{workspace?.name || thread.workspaceId || "Workspace"}</ComposerHint>
+            <SendButton
+              aria-label="Send message"
+              disabled={submitDisabled}
+              title="Send message"
+              type="submit"
+            >
+              <ArrowUpward aria-hidden="true" />
+            </SendButton>
+          </ComposerFooter>
+        </ComposerBox>
+        {error ? <ComposerError>{error}</ComposerError> : null}
+      </ComposerShell>
+    </DetailRoot>
+  );
+}
+
+export default memo(WorkspaceThreadDetail);

@@ -20,6 +20,8 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
+import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
+import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
@@ -118,6 +120,16 @@ const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 1120;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 4000;
+const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
+const TODO_QUEUE_NOTE_LINE_THRESHOLD = 6;
+const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
+const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
+const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude", "opencode"]);
+const WORKSPACE_TOOL_TABS = [
+  { id: "orchestrator", label: "Orchestrator" },
+  { id: "files", label: "Files" },
+  { id: "web", label: "Web" },
+];
 
 const TodoQueueSurface = styled.aside`
   display: grid;
@@ -126,8 +138,7 @@ const TodoQueueSurface = styled.aside`
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 10px;
-  padding: 10px;
+  padding: 0;
   border-left: 1px solid rgba(230, 236, 245, 0.08);
   color: #e8eef8;
   background:
@@ -136,46 +147,226 @@ const TodoQueueSurface = styled.aside`
   overflow: hidden;
 `;
 
-const TodoQueueComposer = styled.form`
+const OrchestratorTopNav = styled.div`
   display: grid;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  min-height: 40px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  background: rgba(2, 4, 8, 0.44);
 `;
 
-const TodoQueueHeader = styled.div`
-  display: grid;
-  gap: 3px;
+const OrchestratorTopButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-right: 1px solid rgba(230, 236, 245, 0.07);
+  color: #9eabbc;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 780;
+  line-height: 1;
+  outline: none;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
 
-  strong {
+  &:last-child {
+    border-right: 0;
+  }
+
+  &[data-active="true"] {
     color: #f7fafc;
-    font-size: 13px;
-    font-weight: 850;
-    letter-spacing: 0.01em;
+    background: rgba(47, 128, 255, 0.13);
   }
 
-  span {
-    color: #8996a8;
-    font-size: 11px;
-    font-weight: 680;
-    line-height: 1.4;
+  &:disabled {
+    cursor: default;
+    opacity: 0.4;
+  }
+
+  &:not(:disabled):hover {
+    color: #f7fafc;
+    background: rgba(47, 128, 255, 0.16);
   }
 `;
 
-const TodoQueueTextArea = styled.textarea`
-  width: 100%;
-  min-height: 118px;
-  max-height: 220px;
-  resize: vertical;
-  padding: 11px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
-  border-radius: 8px;
-  color: #f7fafc;
-  background: rgba(2, 4, 8, 0.76);
-  font: 12px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+const OrchestratorView = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto auto minmax(0, 1fr);
+`;
+
+const OrchestratorVoiceArea = styled.div`
+  display: grid;
+  min-height: 116px;
+  place-items: center;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  background:
+    radial-gradient(circle at center, rgba(98, 160, 255, 0.14), transparent 62%),
+    rgba(2, 4, 8, 0.26);
+`;
+
+const OrchestratorVoiceButton = styled.button`
+  display: grid;
+  width: 74px;
+  height: 74px;
+  place-items: center;
+  border: 1px solid rgba(138, 216, 255, 0.28);
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.015)),
+    rgba(5, 10, 18, 0.92);
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
   outline: none;
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease,
-    background 150ms ease;
+    transform 150ms ease;
+
+  &:hover {
+    border-color: rgba(138, 216, 255, 0.46);
+    box-shadow:
+      0 16px 38px rgba(0, 0, 0, 0.36),
+      0 0 22px rgba(47, 128, 255, 0.12),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  &:active {
+    transform: scale(0.98);
+  }
+`;
+
+const OrchestratorVoiceLogo = styled.img.attrs({
+  alt: "",
+  draggable: false,
+  src: "/logo.webp",
+})`
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+  user-select: none;
+`;
+
+const OrchestratorSectionTabs = styled.div`
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 38px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+`;
+
+const OrchestratorSectionButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-right: 1px solid rgba(230, 236, 245, 0.07);
+  color: #8996a8;
+  background: rgba(2, 4, 8, 0.3);
+  font-size: 11px;
+  font-weight: 780;
+  outline: none;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+
+  &:last-child {
+    border-right: 0;
+  }
+
+  &[data-active="true"] {
+    color: #f7fafc;
+    background: rgba(47, 128, 255, 0.12);
+  }
+
+  &:hover {
+    color: #f7fafc;
+    background: rgba(47, 128, 255, 0.16);
+  }
+`;
+
+const OrchestratorContent = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const OrchestratorHistoryView = styled.div`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  padding: 18px;
+  color: #7f8da1;
+  background: rgba(2, 4, 8, 0.76);
+  font-size: 12px;
+  font-weight: 720;
+`;
+
+const WorkspaceToolSurface = styled.div`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #05070a;
+
+  > * {
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  &[data-tool="files"] {
+    background: var(--files-vscode-editor, #030405);
+  }
+`;
+
+const TodoQueueComposer = styled.form`
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+`;
+
+const TodoQueueBoard = styled.div`
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+`;
+
+const TodoQueueTextArea = styled.textarea`
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  resize: none;
+  padding: calc(8px + var(--todo-list-offset, 0px)) 36px 8px 32px;
+  border: 0;
+  border-radius: 0;
+  color: #f7fafc;
+  background: rgba(2, 4, 8, 0.76);
+  font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  outline: none;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    background 150ms ease,
+    padding 150ms ease;
 
   &::placeholder {
     color: rgba(166, 178, 194, 0.58);
@@ -190,105 +381,49 @@ const TodoQueueTextArea = styled.textarea`
   }
 `;
 
-const TodoQueueSubmitRow = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-`;
-
-const TodoQueueHint = styled.span`
-  min-width: 0;
-  color: #778397;
-  font-size: 10px;
-  font-weight: 720;
-  line-height: 1.35;
-`;
-
-const TodoQueueSubmitButton = styled.button`
-  display: inline-flex;
-  min-height: 30px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  padding: 0 11px;
-  border: 1px solid rgba(98, 160, 255, 0.28);
-  border-radius: 7px;
-  color: #f7fafc;
-  background: rgba(47, 128, 255, 0.14);
-  font-size: 11px;
-  font-weight: 820;
-  transition:
-    background 150ms ease,
-    border-color 150ms ease,
-    opacity 150ms ease;
-
-  &:hover:not(:disabled) {
-    border-color: rgba(98, 160, 255, 0.5);
-    background: rgba(47, 128, 255, 0.22);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.48;
-  }
-`;
-
-const TodoQueueListWrap = styled.div`
-  display: grid;
-  min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(230, 236, 245, 0.08);
-`;
-
-const TodoQueueListTopline = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  color: #8996a8;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-`;
-
 const TodoQueueList = styled.div`
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 2;
   display: grid;
-  min-height: 0;
   align-content: start;
-  gap: 7px;
+  max-height: calc(100% - 42px);
+  gap: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding-right: 2px;
 `;
 
 const TodoQueueItemCard = styled.article`
   position: relative;
   display: grid;
-  gap: 8px;
-  padding: 10px 34px 10px 10px;
-  border: 1px solid rgba(230, 236, 245, 0.1);
-  border-radius: 8px;
+  min-height: 35px;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  padding: 8px 36px 8px 12px;
+  border: 0;
+  border-radius: 0;
   color: #eef4fb;
-  background: rgba(13, 17, 23, 0.72);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  background: transparent;
   cursor: grab;
   touch-action: none;
   transition:
-    border-color 150ms ease,
     background 150ms ease,
     opacity 150ms ease,
     transform 150ms ease;
   user-select: none;
 
+  &::before {
+    content: "\\2022";
+    color: #8bb8ff;
+    font-size: 13px;
+    font-weight: 900;
+    line-height: 1.45;
+  }
+
   &:hover {
-    border-color: rgba(98, 160, 255, 0.26);
-    background:
-      linear-gradient(90deg, rgba(47, 128, 255, 0.09), rgba(255, 122, 24, 0.035)),
-      rgba(13, 17, 23, 0.86);
+    background: rgba(47, 128, 255, 0.1);
   }
 
   &:active {
@@ -298,6 +433,119 @@ const TodoQueueItemCard = styled.article`
   &[data-todo-dragging="true"] {
     opacity: 0.42;
     transform: scale(0.985);
+  }
+
+  &[data-todo-editing="true"] {
+    padding-right: 12px;
+    cursor: text;
+    user-select: text;
+  }
+
+  &[data-todo-reordering="true"] {
+    background: rgba(47, 128, 255, 0.14);
+  }
+
+  &:hover [data-todo-delete="true"],
+  &:focus-within [data-todo-delete="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+`;
+
+const TodoQueueItemContent = styled.div`
+  display: grid;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
+
+  &[data-has-preview="true"] {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+`;
+
+const TodoQueueItemImageFrame = styled.div`
+  display: grid;
+  width: 128px;
+  height: 128px;
+  place-items: center;
+  align-self: center;
+  overflow: hidden;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 8px;
+  background: rgba(2, 4, 8, 0.34);
+`;
+
+const TodoQueueItemImage = styled.img.attrs({ draggable: false })`
+  display: block;
+  max-width: 128px;
+  max-height: 128px;
+  object-fit: contain;
+  user-select: none;
+`;
+
+const TodoQueueItemNoteFrame = styled.div`
+  display: grid;
+  width: 128px;
+  height: 128px;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-self: center;
+  gap: 10px;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(98, 160, 255, 0.12), rgba(255, 255, 255, 0.025)),
+    rgba(2, 4, 8, 0.34);
+`;
+
+const TodoQueueItemNoteTitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #edf5ff;
+  font-size: 10px;
+  font-weight: 820;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const TodoQueueItemNoteIcon = styled.div`
+  position: relative;
+  width: 42px;
+  height: 52px;
+  align-self: center;
+  justify-self: center;
+  border: 1px solid rgba(138, 216, 255, 0.42);
+  border-radius: 5px;
+  background: rgba(13, 17, 23, 0.7);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+
+  &::before {
+    position: absolute;
+    top: -1px;
+    right: -1px;
+    width: 14px;
+    height: 14px;
+    border-bottom: 1px solid rgba(138, 216, 255, 0.32);
+    border-left: 1px solid rgba(138, 216, 255, 0.32);
+    border-bottom-left-radius: 4px;
+    background: rgba(98, 160, 255, 0.18);
+    content: "";
+  }
+
+  &::after {
+    position: absolute;
+    right: 9px;
+    bottom: 11px;
+    left: 9px;
+    height: 16px;
+    border-top: 1px solid rgba(237, 245, 255, 0.44);
+    border-bottom: 1px solid rgba(237, 245, 255, 0.28);
+    box-shadow: 0 7px 0 rgba(237, 245, 255, 0.22);
+    content: "";
   }
 `;
 
@@ -311,50 +559,75 @@ const TodoQueueItemText = styled.p`
   line-height: 1.45;
 `;
 
-const TodoQueueItemMeta = styled.span`
-  color: #748198;
-  font-size: 10px;
-  font-weight: 760;
+const TodoQueueItemEditor = styled.textarea`
+  width: 100%;
+  min-height: 86px;
+  max-height: 240px;
+  resize: vertical;
+  padding: 0;
+  border: 0;
+  color: #f7fafc;
+  background: transparent;
+  outline: none;
+  font-size: 12px;
+  font-weight: 690;
+  line-height: 1.45;
+  font-family: inherit;
 `;
 
-const TodoQueueRemoveButton = styled.button`
+const TodoQueueDraftBullet = styled.span`
   position: absolute;
-  top: 7px;
+  top: calc(8px + var(--todo-list-offset, 0px));
+  left: 12px;
+  z-index: 1;
+  color: #8bb8ff;
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.45;
+  pointer-events: none;
+  transition: top 150ms ease;
+
+  &::before {
+    content: "\\2022";
+  }
+`;
+
+const TodoQueueDeleteButton = styled.button`
+  position: absolute;
+  top: 6px;
   right: 7px;
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
-  border: 1px solid transparent;
+  border: 1px solid rgba(239, 107, 107, 0.14);
   border-radius: 6px;
-  color: #8996a8;
-  background: transparent;
+  color: #ffd0d0;
+  background: rgba(127, 29, 29, 0.18);
   font-size: 12px;
   font-weight: 900;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
 
   &:hover {
-    border-color: rgba(239, 107, 107, 0.24);
-    color: #ffd0d0;
-    background: rgba(239, 107, 107, 0.08);
+    border-color: rgba(239, 107, 107, 0.34);
+    background: rgba(239, 107, 107, 0.16);
   }
 `;
 
-const TodoQueueEmpty = styled.div`
-  display: grid;
-  min-height: 120px;
-  place-items: center;
-  padding: 18px;
-  border: 1px dashed rgba(230, 236, 245, 0.12);
-  border-radius: 8px;
-  color: #778397;
-  background: rgba(2, 4, 8, 0.3);
-  font-size: 12px;
-  font-weight: 720;
-  line-height: 1.45;
-  text-align: center;
-`;
-
 const TodoQueueError = styled.div`
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 3;
   border: 1px solid rgba(248, 113, 113, 0.26);
   border-radius: 8px;
   padding: 8px 9px;
@@ -739,6 +1012,425 @@ function normalizeTodoQueueText(value) {
     .slice(0, TODO_QUEUE_MAX_TEXT_LENGTH);
 }
 
+function normalizeTodoQueueMultilineText(value, maxLength = TODO_QUEUE_MAX_NOTE_TEXT_LENGTH) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function getTodoQueueLineCount(value) {
+  const text = normalizeTodoQueueMultilineText(value);
+  return text ? text.split("\n").length : 0;
+}
+
+function getTodoQueuePastedLinesLabel(lineCount) {
+  return `[pasted-lines ${Math.max(1, Number(lineCount || 0))}]`;
+}
+
+function getTodoQueueNoteTitle(value) {
+  const normalizedTitle = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalizedTitle) {
+    return "Pasted note";
+  }
+
+  return normalizedTitle.length > TODO_QUEUE_NOTE_TITLE_LENGTH
+    ? `${normalizedTitle.slice(0, TODO_QUEUE_NOTE_TITLE_LENGTH - 3)}...`
+    : normalizedTitle;
+}
+
+function normalizeTodoQueueNote(value) {
+  const note = typeof value === "string"
+    ? { text: value }
+    : value && typeof value === "object"
+      ? value
+      : null;
+  const text = normalizeTodoQueueMultilineText(note?.text || note?.content);
+
+  if (!text) {
+    return null;
+  }
+
+  const lineCount = getTodoQueueLineCount(text);
+
+  return {
+    lineCount,
+    text,
+    title: getTodoQueuePastedLinesLabel(lineCount),
+    preview: getTodoQueueNoteTitle(note?.preview || note?.title || text),
+  };
+}
+
+function getTodoQueueItemNote(item) {
+  return normalizeTodoQueueNote(item?.note || item?.noteText || item?.longText);
+}
+
+function getTodoQueueNoteFromPastedText(value) {
+  return getTodoQueueLineCount(value) > TODO_QUEUE_NOTE_LINE_THRESHOLD
+    ? normalizeTodoQueueNote(value)
+    : null;
+}
+
+function normalizeTodoQueueImage(value) {
+  const image = typeof value === "string"
+    ? { src: value }
+    : value && typeof value === "object"
+      ? value
+      : null;
+  const src = typeof image?.src === "string" ? image.src.trim() : "";
+
+  if (!src || !src.startsWith("data:image/")) {
+    return null;
+  }
+
+  return {
+    name: typeof image.name === "string" ? image.name.slice(0, 160) : "",
+    src,
+    type: typeof image.type === "string" ? image.type.slice(0, 80) : "",
+  };
+}
+
+function getTodoQueueItemImage(item) {
+  return normalizeTodoQueueImage(item?.image || item?.imageDataUrl || item?.imageSrc);
+}
+
+function dedupeTodoQueueImages(images) {
+  const seenSources = new Set();
+
+  return (Array.isArray(images) ? images : [])
+    .map(normalizeTodoQueueImage)
+    .filter((image) => {
+      if (!image || seenSources.has(image.src)) {
+        return false;
+      }
+
+      seenSources.add(image.src);
+      return true;
+    });
+}
+
+function getTodoQueueItemTerminalText(item) {
+  const text = normalizeTodoQueueText(item?.text);
+  const note = getTodoQueueItemNote(item);
+
+  if (text && note?.text) {
+    return `${text}\n\n${note.text}`;
+  }
+
+  return text || note?.text || "";
+}
+
+function normalizeTodoTerminalAgentId(value) {
+  return String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
+}
+
+function findTodoAgentStatus(agentStatuses, agentId) {
+  const normalizedAgentId = normalizeTodoTerminalAgentId(agentId);
+  return (Array.isArray(agentStatuses) ? agentStatuses : []).find((status) => (
+    normalizeTodoTerminalAgentId(status?.id) === normalizedAgentId
+  )) || null;
+}
+
+function todoModelLooksImageCapable(model) {
+  const normalized = String(model || "").trim().toLowerCase();
+
+  if (!normalized) {
+    return null;
+  }
+
+  if ([
+    "gpt-3.5",
+    "o1-mini",
+    "o3-mini",
+    "deepseek",
+    "codestral",
+    "devstral",
+    "llama",
+    "qwen-coder",
+    "kimi",
+  ].some((marker) => normalized.includes(marker))) {
+    return false;
+  }
+
+  if ([
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "claude-3",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-haiku-4",
+    "sonnet-4",
+    "opus-4",
+    "gemini",
+    "pixtral",
+    "llava",
+    "minicpm-v",
+    "vision",
+    "multimodal",
+    "omni",
+    "qwen-vl",
+    "qwen2-vl",
+    "qwen2.5-vl",
+  ].some((marker) => normalized.includes(marker))
+    || normalized.includes("-vl")
+    || normalized.includes("/vl")
+    || normalized.endsWith(":vl")) {
+    return true;
+  }
+
+  return null;
+}
+
+function resolveTodoImageInputSupport({ agent, agentStatuses, role }) {
+  const roleId = normalizeTodoTerminalAgentId(role || agent?.id);
+  const agentId = roleId === "generic" || roleId === "terminal" || roleId === "shell"
+    ? roleId
+    : normalizeTodoTerminalAgentId(agent?.id || roleId);
+  const status = findTodoAgentStatus(agentStatuses, agentId);
+  const statusSupport = String(status?.imageInputSupport || "").trim().toLowerCase();
+  const activeModel = String(
+    status?.activeModel
+    || status?.model
+    || status?.selectedModel
+    || status?.configuredModel
+    || "",
+  ).trim();
+
+  if (!TODO_QUEUE_IMAGE_TERMINALS.has(agentId)) {
+    return {
+      activeModel,
+      reason: "This terminal does not accept image todos.",
+      state: "unsupported",
+      supported: false,
+    };
+  }
+
+  if (agentId === "codex" || agentId === "claude") {
+    return {
+      activeModel,
+      reason: status?.imageInputReason || `${agent?.label || agentId} supports image input.`,
+      state: "supported",
+      supported: true,
+    };
+  }
+
+  if (agentId === "opencode") {
+    if (status?.imageInputSupported === true || statusSupport === "supported") {
+      return {
+        activeModel,
+        reason: status?.imageInputReason || "OpenCode is using an image-capable model.",
+        state: "supported",
+        supported: true,
+      };
+    }
+
+    if (status?.imageInputSupported === false && statusSupport === "unsupported") {
+      return {
+        activeModel,
+        reason: status?.imageInputReason || "OpenCode is using a text-only model.",
+        state: "unsupported",
+        supported: false,
+      };
+    }
+
+    const modelSupport = todoModelLooksImageCapable(activeModel);
+    if (modelSupport === true) {
+      return {
+        activeModel,
+        reason: `OpenCode is using an image-capable model (${activeModel}).`,
+        state: "supported",
+        supported: true,
+      };
+    }
+    if (modelSupport === false) {
+      return {
+        activeModel,
+        reason: `OpenCode is using a text-only model (${activeModel}).`,
+        state: "unsupported",
+        supported: false,
+      };
+    }
+
+    return {
+      activeModel,
+      reason: activeModel
+        ? `OpenCode image support is unknown for ${activeModel}.`
+        : "OpenCode image input depends on the selected model; no image-capable model was detected.",
+      state: activeModel ? "unknown" : "conditional",
+      supported: false,
+    };
+  }
+
+  return {
+    activeModel,
+    reason: "This terminal does not accept image todos.",
+    state: "unsupported",
+    supported: false,
+  };
+}
+
+function getTodoImageUnsupportedDropMessage(capability) {
+  const reason = typeof capability?.reason === "string" ? capability.reason.trim() : "";
+  return reason || "Drop image todos on Codex, Claude, or OpenCode with a vision model.";
+}
+
+function getTodoImageMimeType(image) {
+  const normalized = normalizeTodoQueueImage(image);
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized.type
+    || normalized.src.match(/^data:(image\/[^;]+);base64,/i)?.[1]
+    || "";
+}
+
+function todoImageToAttachmentPayload(image, index = 0) {
+  const normalized = normalizeTodoQueueImage(image);
+  const mimeType = getTodoImageMimeType(normalized);
+
+  if (!normalized || !mimeType) {
+    return null;
+  }
+
+  return {
+    dataUrl: normalized.src,
+    mimeType,
+    name: normalized.name || `todo-image-${index + 1}`,
+  };
+}
+
+function formatSavedTodoImageAttachments(images) {
+  return (Array.isArray(images) ? images : [])
+    .map((image, index) => {
+      const name = String(image?.name || `image-${index + 1}`).trim();
+      const path = String(image?.path || "").trim();
+      return path ? `[image-attached ${index + 1}] ${name} -> ${path}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function saveTodoQueueImageAttachments(images) {
+  const payload = (Array.isArray(images) ? images : [images])
+    .map(todoImageToAttachmentPayload)
+    .filter(Boolean);
+
+  if (!payload.length) {
+    return [];
+  }
+
+  return invoke("save_todo_image_attachments", { images: payload });
+}
+
+async function saveTodoQueueTextAttachment(note) {
+  const normalizedNote = normalizeTodoQueueNote(note);
+
+  if (!normalizedNote?.text) {
+    return null;
+  }
+
+  return invoke("save_todo_text_attachment", {
+    request: {
+      text: normalizedNote.text,
+      title: normalizedNote.title,
+    },
+  });
+}
+
+async function prepareTodoTerminalText(item) {
+  const text = normalizeTodoQueueText(item?.text);
+  const image = getTodoQueueItemImage(item);
+  const note = getTodoQueueItemNote(item);
+  const parts = [];
+
+  if (text) {
+    parts.push(text);
+  }
+
+  if (image) {
+    const savedImages = await saveTodoQueueImageAttachments([image]);
+    const imageBlock = formatSavedTodoImageAttachments(savedImages);
+
+    if (!imageBlock) {
+      throw new Error("Unable to prepare pasted image for terminal.");
+    }
+
+    parts.push(imageBlock);
+  }
+
+  if (note?.text) {
+    try {
+      const savedNote = await saveTodoQueueTextAttachment(note);
+      const savedPath = String(savedNote?.path || "").trim();
+      const lineCount = Number(savedNote?.lineCount || note.lineCount || getTodoQueueLineCount(note.text));
+      const label = getTodoQueuePastedLinesLabel(lineCount);
+
+      parts.push(savedPath ? `${label} -> ${savedPath}` : `${label}\n${note.text}`);
+    } catch {
+      parts.push(`${getTodoQueuePastedLinesLabel(note.lineCount || getTodoQueueLineCount(note.text))}\n${note.text}`);
+    }
+  }
+
+  return parts.filter(Boolean).join("\n\n");
+}
+
+function getTodoClipboardFileSignature(file) {
+  if (!file) {
+    return "";
+  }
+
+  return [
+    String(file.name || "clipboard-image"),
+    String(file.type || ""),
+    String(file.size || 0),
+    String(file.lastModified || 0),
+  ].join("|");
+}
+
+function getTodoClipboardImageFiles(clipboardData) {
+  const itemFiles = Array.from(clipboardData?.items || [])
+    .filter((item) => item?.kind === "file" && String(item.type || "").startsWith("image/"))
+    .map((item) => item.getAsFile?.())
+    .filter(Boolean);
+  const clipboardFiles = Array.from(clipboardData?.files || [])
+    .filter((file) => String(file?.type || "").startsWith("image/"));
+  const seenFiles = new Set();
+
+  return itemFiles.concat(clipboardFiles)
+    .filter((file) => {
+      const signature = getTodoClipboardFileSignature(file);
+      if (!signature || seenFiles.has(signature)) {
+        return false;
+      }
+
+      seenFiles.add(signature);
+      return true;
+    })
+    .slice(0, TODO_QUEUE_MAX_PASTE_IMAGES);
+}
+
+function readTodoImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.addEventListener("load", () => {
+      resolve(normalizeTodoQueueImage({
+        name: file?.name || "",
+        src: String(reader.result || ""),
+        type: file?.type || "",
+      }));
+    });
+    reader.addEventListener("error", () => reject(reader.error || new Error("Unable to read image.")));
+    reader.readAsDataURL(file);
+  });
+}
+
 function getTodoDropErrorMessage(error) {
   if (typeof error === "string" && error.trim()) {
     return error;
@@ -751,15 +1443,19 @@ function getTodoDropErrorMessage(error) {
   return "Unable to send todo to terminal.";
 }
 
-function createTodoQueueItem(text) {
+function createTodoQueueItem(text, options = {}) {
   const createdAt = new Date().toISOString();
   const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const image = normalizeTodoQueueImage(options.image);
+  const note = normalizeTodoQueueNote(options.note);
 
   return {
     createdAt,
     id,
+    ...(image ? { image } : {}),
+    ...(note ? { note } : {}),
     text,
   };
 }
@@ -770,7 +1466,9 @@ function normalizeTodoQueueItem(item) {
   }
 
   const text = normalizeTodoQueueText(item.text);
-  if (!text) {
+  const image = getTodoQueueItemImage(item);
+  const note = getTodoQueueItemNote(item);
+  if (!text && !image && !note) {
     return null;
   }
 
@@ -779,6 +1477,8 @@ function normalizeTodoQueueItem(item) {
     id: typeof item.id === "string" && item.id.trim()
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    ...(image ? { image } : {}),
+    ...(note ? { note } : {}),
     text,
   };
 }
@@ -814,29 +1514,38 @@ function writeTodoQueueItems(storageKey, items) {
   }
 }
 
-function formatTodoQueueCreatedAt(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "queued";
-  }
-
-  return date.toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
 const TodoQueuePanel = memo(function TodoQueuePanel({
   activeDragItemId = "",
+  defaultWorkingDirectory = "",
   draft,
   dropError = "",
   items,
   onBeginTodoDrag,
   onDraftChange,
+  onOpenWorkspaceSettings,
   onRemoveItem,
+  onReorderItem,
   onSubmitDraft,
+  onUpdateItem,
+  rootDirectory = "",
+  workspace,
+  workspaceError = "",
   workspaceId,
 }) {
+  const [activeWorkspaceTool, setActiveWorkspaceTool] = useState("orchestrator");
+  const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
+  const [editingItemId, setEditingItemId] = useState("");
+  const [editingDraft, setEditingDraft] = useState("");
+  const [reorderingItemId, setReorderingItemId] = useState("");
+  const [todoListOffset, setTodoListOffset] = useState(0);
+  const todoBoardRef = useRef(null);
+  const todoItemElementsRef = useRef(new Map());
+  const todoReorderDragRef = useRef(null);
+  const draftTextAreaRef = useRef(null);
+  const editingTextAreaRef = useRef(null);
+  const todoListRef = useRef(null);
+  const skipEditBlurCommitRef = useRef(false);
+
   const handleDraftKeyDown = useCallback((event) => {
     if (event.key !== "Enter" || event.shiftKey) {
       return;
@@ -846,18 +1555,133 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     onSubmitDraft();
   }, [onSubmitDraft]);
 
+  const handleDraftPaste = useCallback((event) => {
+    const imageFiles = getTodoClipboardImageFiles(event.clipboardData);
+    const note = getTodoQueueNoteFromPastedText(event.clipboardData?.getData?.("text/plain") || "");
+
+    if (!imageFiles.length) {
+      if (note) {
+        event.preventDefault();
+        onSubmitDraft({ note });
+      }
+      return;
+    }
+
+    event.preventDefault();
+    Promise.all(imageFiles.map(readTodoImageFile))
+      .then((images) => {
+        const normalizedImages = dedupeTodoQueueImages(images);
+        if (normalizedImages.length) {
+          const createdItems = onSubmitDraft({ images: normalizedImages, note }) || [];
+          const firstImageItem = createdItems.find((item) => getTodoQueueItemImage(item)) || createdItems[0];
+
+          if (firstImageItem?.id) {
+            setEditingItemId(firstImageItem.id);
+            setEditingDraft(normalizeTodoQueueText(firstImageItem.text));
+            skipEditBlurCommitRef.current = false;
+          }
+        }
+      })
+      .catch(() => {});
+  }, [onSubmitDraft]);
+
   const handleSubmit = useCallback((event) => {
     event.preventDefault();
     onSubmitDraft();
   }, [onSubmitDraft]);
 
+  const beginItemEdit = useCallback((item) => {
+    const text = normalizeTodoQueueText(item?.text);
+    if (!item?.id) {
+      return;
+    }
+
+    setEditingItemId(item.id);
+    setEditingDraft(text);
+    skipEditBlurCommitRef.current = false;
+  }, []);
+
+  const clearItemEdit = useCallback(() => {
+    setEditingItemId("");
+    setEditingDraft("");
+  }, []);
+
+  const commitItemEdit = useCallback(() => {
+    if (!editingItemId) {
+      return;
+    }
+
+    onUpdateItem?.(editingItemId, editingDraft);
+    skipEditBlurCommitRef.current = true;
+    clearItemEdit();
+  }, [clearItemEdit, editingDraft, editingItemId, onUpdateItem]);
+
+  const handleItemEditBlur = useCallback(() => {
+    if (skipEditBlurCommitRef.current) {
+      skipEditBlurCommitRef.current = false;
+      return;
+    }
+
+    commitItemEdit();
+  }, [commitItemEdit]);
+
+  const handleItemEditKeyDown = useCallback((event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      skipEditBlurCommitRef.current = true;
+      clearItemEdit();
+      return;
+    }
+
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+
+    event.preventDefault();
+    commitItemEdit();
+  }, [clearItemEdit, commitItemEdit]);
+
+  const focusDraftTextArea = useCallback(() => {
+    draftTextAreaRef.current?.focus?.();
+  }, []);
+
+  const handleBoardPointerDown = useCallback((event) => {
+    if (
+      event.target === draftTextAreaRef.current
+      || event.target?.closest?.("[data-todo-card='true']")
+      || event.target?.closest?.("[data-todo-control='true']")
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    focusDraftTextArea();
+  }, [focusDraftTextArea]);
+
+  const setTodoItemElement = useCallback((itemId, element) => {
+    if (element) {
+      todoItemElementsRef.current.set(itemId, element);
+      return;
+    }
+
+    todoItemElementsRef.current.delete(itemId);
+  }, []);
+
   const handlePointerDown = useCallback((event, item) => {
-    if (event.button !== 0 || event.target?.closest?.("[data-todo-control='true']")) {
+    if (
+      event.button !== 0
+      || event.detail > 1
+      || editingItemId === item?.id
+      || event.target?.closest?.("[data-todo-control='true']")
+    ) {
       return;
     }
 
     const text = normalizeTodoQueueText(item?.text);
-    if (!text) {
+    const terminalText = getTodoQueueItemTerminalText(item);
+    const image = getTodoQueueItemImage(item);
+    const note = getTodoQueueItemNote(item);
+    if (!terminalText && !image && !note) {
       event.preventDefault();
       return;
     }
@@ -869,85 +1693,302 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
     event.preventDefault();
     event.stopPropagation();
+    todoReorderDragRef.current = {
+      itemId: item.id,
+      pointerId: event.pointerId,
+    };
+    setReorderingItemId(item.id);
     onBeginTodoDrag?.({
       clientX: event.clientX,
       clientY: event.clientY,
       item: {
         id: item.id,
+        ...(image ? { image } : {}),
+        ...(note ? { note } : {}),
         text,
       },
       pointerId: event.pointerId,
       sourceRect,
       workspaceId,
     });
-  }, [onBeginTodoDrag, workspaceId]);
+  }, [editingItemId, onBeginTodoDrag, workspaceId]);
+
+  useEffect(() => {
+    if (!editingItemId) {
+      return;
+    }
+
+    const element = editingTextAreaRef.current;
+    element?.focus?.();
+    element?.setSelectionRange?.(editingDraft.length, editingDraft.length);
+  }, [editingItemId]);
+
+  useEffect(() => {
+    if (editingItemId && !items.some((item) => item.id === editingItemId)) {
+      clearItemEdit();
+    }
+  }, [clearItemEdit, editingItemId, items]);
+
+  useLayoutEffect(() => {
+    const listElement = todoListRef.current;
+
+    if (!listElement || !items.length) {
+      setTodoListOffset(0);
+      return undefined;
+    }
+
+    const updateOffset = () => {
+      const nextOffset = Math.ceil(listElement.getBoundingClientRect().height || 0);
+      setTodoListOffset((currentOffset) => (
+        currentOffset === nextOffset ? currentOffset : nextOffset
+      ));
+    };
+
+    updateOffset();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateOffset);
+      return () => window.removeEventListener("resize", updateOffset);
+    }
+
+    const observer = new ResizeObserver(updateOffset);
+    observer.observe(listElement);
+
+    return () => observer.disconnect();
+  }, [activeOrchestratorSection, items.length]);
+
+  useEffect(() => {
+    const drag = todoReorderDragRef.current;
+    if (!reorderingItemId || !drag) {
+      return undefined;
+    }
+
+    const getTargetIndex = (clientY) => {
+      const entries = items
+        .map((item, index) => ({
+          id: item.id,
+          index,
+          rect: todoItemElementsRef.current.get(item.id)?.getBoundingClientRect?.(),
+        }))
+        .filter((entry) => entry.rect);
+
+      for (const entry of entries) {
+        if (clientY < entry.rect.top + entry.rect.height / 2) {
+          return entry.index;
+        }
+      }
+
+      return entries.length;
+    };
+
+    const handlePointerMove = (event) => {
+      const currentDrag = todoReorderDragRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      const boardRect = todoBoardRef.current?.getBoundingClientRect?.();
+      if (!pointIsInRect(event.clientX, event.clientY, boardRect)) {
+        return;
+      }
+
+      onReorderItem?.(currentDrag.itemId, getTargetIndex(event.clientY));
+    };
+
+    const endDrag = (event) => {
+      const currentDrag = todoReorderDragRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      todoReorderDragRef.current = null;
+      setReorderingItemId("");
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: true });
+    window.addEventListener("pointerup", endDrag);
+    window.addEventListener("pointercancel", endDrag);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", endDrag);
+      window.removeEventListener("pointercancel", endDrag);
+    };
+  }, [items, onReorderItem, reorderingItemId]);
 
   return (
-    <TodoQueueSurface aria-label="To Do Queue">
-      <TodoQueueComposer onSubmit={handleSubmit}>
-        <TodoQueueHeader>
-          <strong>To Do Queue</strong>
-          <span>Type like a note. Enter queues it. Shift+Enter adds a line.</span>
-        </TodoQueueHeader>
-        <TodoQueueTextArea
-          aria-label="New todo"
-          maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
-          onChange={(event) => onDraftChange(event.target.value)}
-          onKeyDown={handleDraftKeyDown}
-          placeholder="Ask an agent to do something..."
-          spellCheck="true"
-          value={draft}
-        />
-        <TodoQueueSubmitRow>
-          <TodoQueueHint>Click here first, then use your audio widget if you want dictation.</TodoQueueHint>
-          <TodoQueueSubmitButton disabled={!normalizeTodoQueueText(draft)} type="submit">
-            Add
-          </TodoQueueSubmitButton>
-        </TodoQueueSubmitRow>
-      </TodoQueueComposer>
-      {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
-
-      <TodoQueueListWrap>
-        <TodoQueueListTopline>
-          <span>Queue</span>
-          <span>{items.length}</span>
-        </TodoQueueListTopline>
-        <TodoQueueList role="list">
-          {items.length ? items.map((item) => (
-            <TodoQueueItemCard
-              data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
-              key={item.id}
-              onPointerDown={(event) => handlePointerDown(event, item)}
-              role="listitem"
-              title="Drag into an agent terminal"
+    <TodoQueueSurface aria-label="Orchestrator">
+      <OrchestratorTopNav aria-label="Workspace tool">
+        {WORKSPACE_TOOL_TABS.map((tool) => (
+          <OrchestratorTopButton
+            data-active={activeWorkspaceTool === tool.id ? "true" : "false"}
+            key={tool.id}
+            onClick={() => setActiveWorkspaceTool(tool.id)}
+            type="button"
+          >
+            {tool.label}
+          </OrchestratorTopButton>
+        ))}
+      </OrchestratorTopNav>
+      {activeWorkspaceTool === "files" ? (
+        <WorkspaceToolSurface data-tool="files">
+          <FilesWorkspaceView
+            defaultWorkingDirectory={defaultWorkingDirectory}
+            onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+            rootDirectory={rootDirectory}
+            workspace={workspace}
+            workspaceError={workspaceError}
+          />
+        </WorkspaceToolSurface>
+      ) : activeWorkspaceTool === "web" ? (
+        <WorkspaceToolSurface data-tool="web">
+          <WebWorkspaceView
+            defaultWorkingDirectory={defaultWorkingDirectory}
+            rootDirectory={rootDirectory}
+            workspace={workspace}
+          />
+        </WorkspaceToolSurface>
+      ) : (
+        <OrchestratorView>
+          <OrchestratorVoiceArea>
+            <OrchestratorVoiceButton aria-label="Voice agent" type="button">
+              <OrchestratorVoiceLogo />
+            </OrchestratorVoiceButton>
+          </OrchestratorVoiceArea>
+          <OrchestratorSectionTabs aria-label="Orchestrator section">
+            <OrchestratorSectionButton
+              data-active={activeOrchestratorSection === "todo" ? "true" : "false"}
+              onClick={() => setActiveOrchestratorSection("todo")}
+              type="button"
             >
-              <TodoQueueItemText>{item.text}</TodoQueueItemText>
-              <TodoQueueItemMeta>{formatTodoQueueCreatedAt(item.createdAt)}</TodoQueueItemMeta>
-              <TodoQueueRemoveButton
-                aria-label="Remove todo"
-                data-todo-control="true"
-                onClick={() => onRemoveItem(item.id)}
-                title="Remove"
-                type="button"
-              >
-                x
-              </TodoQueueRemoveButton>
-            </TodoQueueItemCard>
-          )) : (
-            <TodoQueueEmpty>
-              Queued todos will live here. Drag one into an agent terminal when you are ready.
-            </TodoQueueEmpty>
-          )}
-        </TodoQueueList>
-      </TodoQueueListWrap>
+              Todo
+            </OrchestratorSectionButton>
+            <OrchestratorSectionButton
+              data-active={activeOrchestratorSection === "history" ? "true" : "false"}
+              onClick={() => setActiveOrchestratorSection("history")}
+              type="button"
+            >
+              Voice History
+            </OrchestratorSectionButton>
+          </OrchestratorSectionTabs>
+          <OrchestratorContent>
+            {activeOrchestratorSection === "todo" ? (
+              <TodoQueueComposer onSubmit={handleSubmit}>
+                <TodoQueueBoard
+                  onPointerDown={handleBoardPointerDown}
+                  ref={todoBoardRef}
+                  style={{ "--todo-list-offset": `${todoListOffset}px` }}
+                >
+                  <TodoQueueTextArea
+                    aria-label="New todo"
+                    maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+                    onChange={(event) => onDraftChange(event.target.value)}
+                    onKeyDown={handleDraftKeyDown}
+                    onPaste={handleDraftPaste}
+                    placeholder="Type a todo..."
+                    ref={draftTextAreaRef}
+                    spellCheck="true"
+                    value={draft}
+                  />
+                  <TodoQueueDraftBullet aria-hidden="true" />
+
+                  {items.length > 0 && (
+                    <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
+                      {items.map((item) => {
+                        const isEditing = editingItemId === item.id;
+                        const image = getTodoQueueItemImage(item);
+                        const note = getTodoQueueItemNote(item);
+                        const hasPreview = Boolean(image || note);
+
+                        return (
+                          <TodoQueueItemCard
+                            data-todo-card="true"
+                            data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
+                            data-todo-editing={isEditing ? "true" : undefined}
+                            data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
+                            key={item.id}
+                            onDoubleClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              beginItemEdit(item);
+                            }}
+                            onPointerDown={(event) => handlePointerDown(event, item)}
+                            ref={(element) => setTodoItemElement(item.id, element)}
+                            role="listitem"
+                            title="Drag into an agent terminal. Double-click to edit."
+                          >
+                            <TodoQueueItemContent data-has-preview={hasPreview ? "true" : "false"}>
+                              {image && (
+                                <TodoQueueItemImageFrame>
+                                  <TodoQueueItemImage alt="" src={image.src} />
+                                </TodoQueueItemImageFrame>
+                              )}
+                              {!image && note && (
+                                <TodoQueueItemNoteFrame>
+                                  <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
+                                  <TodoQueueItemNoteIcon aria-hidden="true" />
+                                </TodoQueueItemNoteFrame>
+                              )}
+                              {isEditing ? (
+                                <TodoQueueItemEditor
+                                  aria-label="Edit todo"
+                                  data-todo-control="true"
+                                  maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+                                  onBlur={handleItemEditBlur}
+                                  onChange={(event) => setEditingDraft(event.target.value)}
+                                  onKeyDown={handleItemEditKeyDown}
+                                  ref={editingTextAreaRef}
+                                  spellCheck="true"
+                                  value={editingDraft}
+                                />
+                              ) : (
+                                <TodoQueueItemText>{item.text}</TodoQueueItemText>
+                              )}
+                            </TodoQueueItemContent>
+                            {!isEditing && (
+                              <TodoQueueDeleteButton
+                                aria-label="Delete todo"
+                                data-todo-control="true"
+                                data-todo-delete="true"
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  onRemoveItem?.(item.id);
+                                }}
+                                onPointerDown={(event) => {
+                                  event.stopPropagation();
+                                }}
+                                title="Delete"
+                                type="button"
+                              >
+                                x
+                              </TodoQueueDeleteButton>
+                            )}
+                          </TodoQueueItemCard>
+                        );
+                      })}
+                    </TodoQueueList>
+                  )}
+
+                  {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
+                </TodoQueueBoard>
+              </TodoQueueComposer>
+            ) : (
+              <OrchestratorHistoryView>Voice history</OrchestratorHistoryView>
+            )}
+          </OrchestratorContent>
+        </OrchestratorView>
+      )}
     </TodoQueueSurface>
   );
 });
 
 function TerminalView({
+  defaultWorkingDirectory = "",
   terminalWorkspace,
   terminalAgentsByIndex = {},
   terminalRolesByIndex = {},
+  terminalThreadsByIndex = {},
   terminalWorkspaceWorkingDirectory,
   terminalWorkspaceLogicalIndexes,
   terminalWorkspaceLogicalTerminalCount,
@@ -958,6 +1999,9 @@ function TerminalView({
   closeWorkspaceTerminal,
   createFirstWorkspace,
   handlePreparedTerminalChange,
+  onOpenWorkspaceSettings,
+  onSelectWorkspaceThread,
+  onThreadTerminalLifecycle,
   refreshAgentStatuses,
   reorderWorkspaceTerminalDisplayLayout,
   setWorkspaceName,
@@ -973,6 +2017,8 @@ function TerminalView({
   workspaceSyncState,
   workspaceTerminalAgentLaunchReady,
   workspaceTerminalRenderAgent,
+  workspaceThreads = {},
+  workspaces = [],
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
   const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
@@ -1019,6 +2065,9 @@ function TerminalView({
   const getTerminalRole = useCallback((terminalIndex) => (
     terminalRolesByIndex[terminalIndex] || getTerminalAgent(terminalIndex)?.id || ""
   ), [getTerminalAgent, terminalRolesByIndex]);
+  const getTerminalThread = useCallback((terminalIndex) => (
+    terminalThreadsByIndex[terminalIndex] || null
+  ), [terminalThreadsByIndex]);
   const getTerminalPaneId = useCallback((terminalIndex) => {
     const role = getTerminalRole(terminalIndex);
     const agent = getTerminalAgent(terminalIndex);
@@ -1028,6 +2077,13 @@ function TerminalView({
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+  const getTerminalImageInputSupport = useCallback((terminalIndex) => (
+    resolveTodoImageInputSupport({
+      agent: getTerminalAgent(terminalIndex),
+      agentStatuses,
+      role: getTerminalRole(terminalIndex),
+    })
+  ), [agentStatuses, getTerminalAgent, getTerminalRole]);
   const visibleTerminalPaneIds = useMemo(() => (
     terminalWorkspace
       ? logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
@@ -1035,6 +2091,9 @@ function TerminalView({
   ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
+  const selectedWorkspaceThreadId = terminalWorkspace
+    ? workspaceThreads?.[terminalWorkspace.id]?.activeThreadId || ""
+    : "";
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
     && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
   const fullscreenState = fullscreenActive
@@ -1241,23 +2300,78 @@ function TerminalView({
     });
   }, []);
 
-  const submitTodoQueueDraft = useCallback(() => {
+  const submitTodoQueueDraft = useCallback((options = {}) => {
     const text = normalizeTodoQueueText(todoQueueDraft);
-    if (!text) {
-      return;
+    const images = dedupeTodoQueueImages(Array.isArray(options.images) ? options.images : [options.image]);
+    const note = normalizeTodoQueueNote(options.note);
+
+    if (!text && !images.length && !note) {
+      return [];
     }
 
-    updateTodoQueueItems((currentItems) => [
-      createTodoQueueItem(text),
-      ...currentItems,
-    ]);
+    const nextItems = images.length
+      ? images.map((image, imageIndex) => (
+        createTodoQueueItem(imageIndex === 0 ? text : "", {
+          image,
+          ...(imageIndex === 0 && note ? { note } : {}),
+        })
+      ))
+      : [createTodoQueueItem(text, note ? { note } : {})];
+
+    updateTodoQueueItems((currentItems) => currentItems.concat(nextItems));
     setTodoDropError("");
     setTodoQueueDraft("");
+    return nextItems;
   }, [todoQueueDraft, updateTodoQueueItems]);
 
   const removeTodoQueueItem = useCallback((itemId) => {
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
+    ));
+  }, [updateTodoQueueItems]);
+
+  const reorderTodoQueueItem = useCallback((itemId, targetIndex) => {
+    updateTodoQueueItems((currentItems) => {
+      const currentIndex = currentItems.findIndex((item) => item.id === itemId);
+      if (currentIndex < 0) {
+        return currentItems;
+      }
+
+      const movingItem = currentItems[currentIndex];
+      const withoutItem = currentItems.filter((item) => item.id !== itemId);
+      const rawTargetIndex = Math.max(
+        0,
+        Math.min(Number.parseInt(targetIndex, 10) || 0, currentItems.length),
+      );
+      const adjustedTargetIndex = currentIndex < rawTargetIndex
+        ? rawTargetIndex - 1
+        : rawTargetIndex;
+      const nextTargetIndex = Math.max(0, Math.min(adjustedTargetIndex, withoutItem.length));
+
+      if (nextTargetIndex === currentIndex) {
+        return currentItems;
+      }
+
+      withoutItem.splice(nextTargetIndex, 0, movingItem);
+      return withoutItem;
+    });
+  }, [updateTodoQueueItems]);
+
+  const updateTodoQueueItemText = useCallback((itemId, nextText) => {
+    const text = normalizeTodoQueueText(nextText);
+
+    updateTodoQueueItems((currentItems) => (
+      currentItems
+        .map((item) => (
+          item.id === itemId
+            ? { ...item, text }
+            : item
+        ))
+        .filter((item) => (
+          normalizeTodoQueueText(item.text)
+          || getTodoQueueItemImage(item)
+          || getTodoQueueItemNote(item)
+        ))
     ));
   }, [updateTodoQueueItems]);
 
@@ -1271,10 +2385,12 @@ function TerminalView({
 
   const handleBeginTodoDrag = useCallback((event) => {
     const text = normalizeTodoQueueText(event?.item?.text);
+    const image = getTodoQueueItemImage(event?.item);
+    const note = getTodoQueueItemNote(event?.item);
     const sourceRect = event?.sourceRect;
 
     if (
-      !text
+      (!text && !image && !note)
       || !terminalWorkspace?.id
       || !sourceRect
       || !terminalPanelsRef.current
@@ -1294,19 +2410,23 @@ function TerminalView({
       rects: terminalLayoutRectsRef.current,
       terminalIndexes: logicalTerminalIndexes,
     });
-    const offsetX = Number(event.clientX || 0) - Number(sourceRect.left || 0);
-    const offsetY = Number(event.clientY || 0) - Number(sourceRect.top || 0);
+    const dragWidth = Math.max(220, Number(sourceRect.width || 0));
+    const dragHeight = Math.max(0, Number(sourceRect.height || 0));
+    const offsetX = dragWidth / 2;
+    const offsetY = Math.max(0, Math.min(dragHeight - 4, dragHeight * 0.68));
 
     setTodoDropError("");
     updateTodoDragState({
-      height: Math.max(0, Number(sourceRect.height || 0)),
+      height: dragHeight,
       itemId: event.item?.id || "",
       offsetX,
       offsetY,
       pointerId: event.pointerId,
       targetTerminalIndex,
       text,
-      width: Math.max(220, Number(sourceRect.width || 0)),
+      ...(image ? { image } : {}),
+      ...(note ? { note } : {}),
+      width: dragWidth,
       workspaceId: event.workspaceId || terminalWorkspace.id,
       x: Number(event.clientX || 0) - offsetX,
       y: Number(event.clientY || 0) - offsetY,
@@ -1431,11 +2551,28 @@ function TerminalView({
         return;
       }
 
+      const image = getTodoQueueItemImage(currentDrag);
+      const imageInputSupport = Number.isInteger(targetTerminalIndex)
+        ? getTerminalImageInputSupport(targetTerminalIndex)
+        : { supported: false };
+
+      if (image && !imageInputSupport.supported) {
+        setTodoDropError(getTodoImageUnsupportedDropMessage(imageInputSupport));
+        return;
+      }
+
       setActiveTerminalPaneId(paneId);
-      invoke("terminal_write", {
-        data: `${currentDrag.text}${shouldAutoSubmit ? "\r" : ""}`,
-        paneId,
-      })
+      prepareTodoTerminalText(currentDrag)
+        .then((terminalText) => {
+          if (!terminalText) {
+            throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
+          }
+
+          return invoke("terminal_write", {
+            data: `${terminalText}${shouldAutoSubmit ? "\r" : ""}`,
+            paneId,
+          });
+        })
         .then(() => {
           setTodoDropError("");
           if (currentDrag.itemId) {
@@ -1500,6 +2637,7 @@ function TerminalView({
   }, [
     fullscreenActive,
     fullscreenTerminalIndex,
+    getTerminalImageInputSupport,
     getTerminalRole,
     getTerminalPaneId,
     logicalTerminalIndexes,
@@ -1635,6 +2773,11 @@ function TerminalView({
       return;
     }
 
+    const threadId = getTerminalThread(terminalIndex)?.id || "";
+    if (terminalWorkspace?.id && threadId) {
+      onSelectWorkspaceThread?.(terminalWorkspace.id, threadId);
+    }
+
     setFullscreenTerminalIndex(terminalIndex);
     setFullscreenMotion({
       ...motion,
@@ -1653,6 +2796,9 @@ function TerminalView({
     fullscreenActive,
     fullscreenTerminalIndex,
     getFullscreenMotionFromRect,
+    getTerminalThread,
+    onSelectWorkspaceThread,
+    terminalWorkspace?.id,
   ]);
 
   const getTerminalSlotStyle = useCallback((terminalIndex) => {
@@ -1705,6 +2851,9 @@ function TerminalView({
     hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
   );
+  const todoDragImage = getTodoQueueItemImage(todoDragState);
+  const todoDragNote = getTodoQueueItemNote(todoDragState);
+  const todoDragHasPreview = Boolean(todoDragImage || todoDragNote);
   const terminalWorkspaceContent = hasVisibleWorkspaceTerminalPanes ? (
     <WorkspaceTerminalPanels
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
@@ -1799,16 +2948,23 @@ function TerminalView({
                 onPreparedTerminalChange={handlePreparedTerminalChange}
                 onRecheckAgents={refreshAgentStatuses}
                 onSplitTerminal={handleSplitTerminal}
+                onSelectWorkspaceThread={onSelectWorkspaceThread}
+                onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
+                thread={getTerminalThread(terminalIndex)}
+                threadsViewActive={fullscreenThisTerminal}
                 todoDropActive={todoDragActive}
                 todoDropTarget={todoDragState?.targetTerminalIndex === terminalIndex}
                 workingDirectory={terminalWorkspaceWorkingDirectory}
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
+                workspaceThreads={workspaceThreads}
+                workspaces={workspaces}
+                selectedWorkspaceThreadId={selectedWorkspaceThreadId}
               />
             </TerminalSurfaceSlot>
           );
@@ -1834,14 +2990,21 @@ function TerminalView({
       onPreparedTerminalChange={handlePreparedTerminalChange}
       onRecheckAgents={refreshAgentStatuses}
       onSplitTerminal={handleSplitTerminal}
+      onSelectWorkspaceThread={onSelectWorkspaceThread}
+      onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
       terminalIndex={logicalTerminalIndexes[0] || 0}
       terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
+      thread={getTerminalThread(logicalTerminalIndexes[0] || 0)}
+      threadsViewActive={false}
       workingDirectory={terminalWorkspaceWorkingDirectory}
       workspace={terminalWorkspace}
       workspaceError={workspaceError}
+      workspaceThreads={workspaceThreads}
+      workspaces={workspaces}
+      selectedWorkspaceThreadId={selectedWorkspaceThreadId}
     />
   ) : null;
 
@@ -1894,13 +3057,20 @@ function TerminalView({
                     >
                       <TodoQueuePanel
                         activeDragItemId={todoDragState?.itemId || ""}
+                        defaultWorkingDirectory={defaultWorkingDirectory}
                         draft={todoQueueDraft}
                         dropError={todoDropError}
                         items={todoQueueItems}
                         onBeginTodoDrag={handleBeginTodoDrag}
                         onDraftChange={setTodoQueueDraft}
+                        onOpenWorkspaceSettings={onOpenWorkspaceSettings}
                         onRemoveItem={removeTodoQueueItem}
+                        onReorderItem={reorderTodoQueueItem}
                         onSubmitDraft={submitTodoQueueDraft}
+                        onUpdateItem={updateTodoQueueItemText}
+                        rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+                        workspace={terminalWorkspace}
+                        workspaceError={workspaceError}
                         workspaceId={terminalWorkspace.id}
                       />
                     </ResizePanel>
@@ -1917,7 +3087,22 @@ function TerminalView({
                   "--todo-drag-y": `${Math.round(Number(todoDragState.y || 0))}px`,
                 }}
               >
-                <TodoDragPreviewText>{todoDragState.text}</TodoDragPreviewText>
+                <TodoQueueItemContent data-has-preview={todoDragHasPreview ? "true" : "false"}>
+                  {todoDragImage && (
+                    <TodoQueueItemImageFrame>
+                      <TodoQueueItemImage alt="" src={todoDragImage.src} />
+                    </TodoQueueItemImageFrame>
+                  )}
+                  {!todoDragImage && todoDragNote && (
+                    <TodoQueueItemNoteFrame>
+                      <TodoQueueItemNoteTitle>{todoDragNote.title}</TodoQueueItemNoteTitle>
+                      <TodoQueueItemNoteIcon aria-hidden="true" />
+                    </TodoQueueItemNoteFrame>
+                  )}
+                  {normalizeTodoQueueText(todoDragState.text) && (
+                    <TodoDragPreviewText>{todoDragState.text}</TodoDragPreviewText>
+                  )}
+                </TodoQueueItemContent>
               </TodoDragPreview>
             )}
           </TerminalWorkspaceMain>

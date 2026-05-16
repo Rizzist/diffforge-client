@@ -19,7 +19,29 @@ import {
   persistTerminalStabilityRuntimeEnabled,
   readTerminalStabilityRuntimeEnabled,
 } from "../terminals/terminalStabilityRecovery.jsx";
+import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
+import {
+  bindWorkspaceThreadTerminal,
+  createWorkspaceThreadId,
+  ensureWorkspaceThreadsForTerminalIndexes,
+  getWorkspaceThreadForTerminalIndex,
+  getWorkspaceThreadProviderBinding,
+  getWorkspaceThreadTitlePlaceholder,
+  getWorkspaceThreadsByTerminalIndex,
+  hydrateWorkspaceThreadSessionTranscript,
+  markWorkspaceThreadAgentActivity,
+  markWorkspaceThreadTerminalDetached,
+  materializeWorkspaceThreadForTerminal,
+  persistWorkspaceThreads,
+  readWorkspaceThreads,
+  selectWorkspaceThread,
+  updateWorkspaceActiveTerminal,
+  updateWorkspaceThreadAgent,
+  updateWorkspaceThreadProviderModel,
+  updateWorkspaceThreadProviderSession,
+  updateWorkspaceThreadTitle,
+} from "../threads/workspaceThreads";
 import {
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
   readAudioTranscriptionProvider,
@@ -354,6 +376,7 @@ import {
   ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonMicIcon,
+  ButtonProcessIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
@@ -368,6 +391,8 @@ import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
+import ProcessesView from "../processes/ProcessesView.jsx";
+import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -398,9 +423,10 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "mcps"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
+const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
 const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
@@ -441,6 +467,7 @@ const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 18000;
 const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
+const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS = 1200;
 const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
@@ -518,6 +545,13 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
     : provider.id === "opencode"
       ? "opencode auth login"
       : "claude",
+  imageInputSupported: provider.id === "codex" || provider.id === "claude",
+  imageInputSupport: provider.id === "opencode" ? "conditional" : "supported",
+  imageInputReason: provider.id === "opencode"
+    ? "OpenCode image input depends on the selected model."
+    : `${provider.label} supports image input.`,
+  activeModel: "",
+  activeModelSupportsImages: provider.id === "codex" || provider.id === "claude",
 }));
 
 function getDefaultAgentStatus(providerId) {
@@ -545,6 +579,17 @@ function normalizeCachedAgentStatus(status) {
       : "Cached terminal CLI state. Rechecking...",
     cached: true,
     installed: Boolean(status.installed),
+    imageInputReason: typeof status.imageInputReason === "string"
+      ? status.imageInputReason.slice(0, 240)
+      : defaults.imageInputReason,
+    imageInputSupported: Boolean(status.imageInputSupported),
+    imageInputSupport: typeof status.imageInputSupport === "string"
+      ? status.imageInputSupport.slice(0, 40)
+      : defaults.imageInputSupport,
+    activeModel: typeof status.activeModel === "string"
+      ? status.activeModel.slice(0, 120)
+      : defaults.activeModel,
+    activeModelSupportsImages: Boolean(status.activeModelSupportsImages),
     npmAvailable: Boolean(status.npmAvailable),
     npmInstalled: Boolean(status.npmInstalled),
     npmLatestVersion: typeof status.npmLatestVersion === "string"
@@ -596,6 +641,11 @@ function persistAgentStatusCache(statuses) {
       authenticated: Boolean(status.authenticated),
       id: status.id,
       installed: Boolean(status.installed),
+      imageInputReason: typeof status.imageInputReason === "string" ? status.imageInputReason.slice(0, 240) : "",
+      imageInputSupported: Boolean(status.imageInputSupported),
+      imageInputSupport: typeof status.imageInputSupport === "string" ? status.imageInputSupport.slice(0, 40) : "",
+      activeModel: typeof status.activeModel === "string" ? status.activeModel.slice(0, 120) : "",
+      activeModelSupportsImages: Boolean(status.activeModelSupportsImages),
       npmAvailable: Boolean(status.npmAvailable),
       npmInstalled: Boolean(status.npmInstalled),
       npmLatestVersion: typeof status.npmLatestVersion === "string" ? status.npmLatestVersion.slice(0, 120) : "",
@@ -1819,6 +1869,7 @@ export default function App() {
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
+  const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [terminalStabilityRuntimeEnabled, setTerminalStabilityRuntimeEnabled] =
@@ -1857,6 +1908,9 @@ export default function App() {
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
   const workspaceSettingsRef = useRef(workspaceSettings);
+  const workspaceThreadsRef = useRef(workspaceThreads);
+  const workspaceThreadTitleRequestsRef = useRef(new Set());
+  const workspaceThreadTranscriptRequestsRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
@@ -1880,6 +1934,55 @@ export default function App() {
   const workspaceCloseAllowNativeRef = useRef(false);
 
   useEffect(() => {
+    if (!workspaces.length) {
+      return;
+    }
+
+    setWorkspaceThreads((currentThreads) => {
+      let nextThreads = currentThreads;
+
+      workspaces.forEach((workspace) => {
+        const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
+        const terminalIndexes = getWorkspaceLogicalTerminalIndexes(
+          workspaceTerminalLogicalIndexes,
+          workspace.id,
+          terminalCount,
+        );
+        const terminalRoles = getWorkspaceTerminalRoles(
+          workspaceSettings,
+          workspace.id,
+          terminalCount,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        );
+        const rolesByIndex = Object.fromEntries(terminalIndexes.map((terminalIndex, index) => ([
+          terminalIndex,
+          normalizeWorkspaceTerminalRole(
+            terminalRoles[index] || terminalRoles[terminalIndex],
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          ),
+        ])));
+
+        nextThreads = ensureWorkspaceThreadsForTerminalIndexes(nextThreads, {
+          fallbackAgent: workspaceTerminalFallbackRole,
+          rolesByIndex,
+          terminalIndexes,
+          workspaceId: workspace.id,
+        });
+      });
+
+      return nextThreads;
+    });
+  }, [
+    workspaceSettings,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalLogicalIndexes,
+    workspaceTerminalRoleOptions,
+    workspaces,
+  ]);
+
+  useEffect(() => {
     selectedWorkspaceIdRef.current = selectedWorkspaceId;
   }, [selectedWorkspaceId]);
 
@@ -1890,6 +1993,11 @@ export default function App() {
   useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
   }, [workspaceSettings]);
+
+  useEffect(() => {
+    workspaceThreadsRef.current = workspaceThreads;
+    persistWorkspaceThreads(workspaceThreads);
+  }, [workspaceThreads]);
 
   useEffect(() => {
     workspaceTerminalLogicalIndexesRef.current = workspaceTerminalLogicalIndexes;
@@ -3184,7 +3292,9 @@ export default function App() {
               previousTerminalCount: currentTerminalCount,
               reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
               terminalIndex,
-              waitForCleanup: true,
+              // Windows ConPTY teardown can outlive the settings transaction. The backend
+              // removes the pane immediately, then finishes process cleanup in the background.
+              waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
               workspaceId: selectedWorkspace.id,
             });
           })),
@@ -3292,7 +3402,7 @@ export default function App() {
     closeWorkspaceSettings,
   ]);
 
-  const closeWorkspaceTerminal = useCallback(({ workspaceId, terminalIndex }) => {
+  const closeWorkspaceTerminal = useCallback(({ threadId, workspaceId, terminalIndex }) => {
     if (!workspaceId) {
       return;
     }
@@ -3318,13 +3428,29 @@ export default function App() {
       return;
     }
 
-    let removedTerminalIndex = terminalIndex;
-    let nextIndexes = currentIndexes.filter((index) => index !== terminalIndex);
-
-    if (nextIndexes.length === currentIndexes.length) {
-      removedTerminalIndex = currentIndexes[currentIndexes.length - 1];
-      nextIndexes = currentIndexes.slice(0, -1);
+    const requestedTerminalIndex = Number.parseInt(terminalIndex, 10);
+    const closingTerminalIndex = currentIndexes.includes(requestedTerminalIndex)
+      ? requestedTerminalIndex
+      : currentIndexes[currentIndexes.length - 1];
+    const closingThread = threadId
+      ? { id: threadId }
+      : getWorkspaceThreadForTerminalIndex(
+        workspaceThreadsRef.current,
+        workspaceId,
+        closingTerminalIndex,
+      );
+    if (closingThread?.id) {
+      setWorkspaceThreads((threads) => markWorkspaceThreadTerminalDetached(threads, {
+        rememberTerminalThread: false,
+        status: "closed",
+        terminalIndex: closingTerminalIndex,
+        threadId: closingThread.id,
+        workspaceId,
+      }));
     }
+
+    const removedTerminalIndex = closingTerminalIndex;
+    const nextIndexes = currentIndexes.filter((index) => index !== closingTerminalIndex);
 
     const nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => {
@@ -3376,6 +3502,31 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
+
+  const closeTrackedProcessTerminal = useCallback(async (target = {}) => {
+    const paneId = String(target.paneId || "").trim();
+    if (!paneId) {
+      throw new Error("Missing terminal pane for tracked process.");
+    }
+
+    await invoke("terminal_close", {
+      paneId,
+      instanceId: target.instanceId || undefined,
+      waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP || undefined,
+    });
+
+    const workspaceId = String(target.workspaceId || "").trim();
+    const terminalIndex = Number.parseInt(target.terminalIndex, 10);
+    if (workspaceId && Number.isInteger(terminalIndex)) {
+      closeWorkspaceTerminal({
+        threadId: target.threadId || "",
+        terminalIndex,
+        workspaceId,
+      });
+    }
+
+    return { closedProcesses: 1, paneId };
+  }, [closeWorkspaceTerminal]);
 
   const splitWorkspaceTerminal = useCallback(({ direction = "vertical", terminalIndex, workspaceId }) => {
     if (!workspaceId) {
@@ -3511,7 +3662,7 @@ export default function App() {
     setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
   }, []);
 
-  const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, workspaceId }) => {
+  const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, threadId, workspaceId }) => {
     if (!workspaceId) {
       return;
     }
@@ -3521,61 +3672,126 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
     const currentIndexes = getWorkspaceLogicalTerminalIndexes(
-      workspaceTerminalLogicalIndexes,
+      currentLogicalIndexesByWorkspace,
       workspaceId,
       terminalCount,
     );
-    const roleIndex = currentIndexes.indexOf(terminalIndex);
-
-    if (roleIndex < 0) {
+    let targetTerminalIndex = Number.parseInt(terminalIndex, 10);
+    targetTerminalIndex = Number.isInteger(targetTerminalIndex) && targetTerminalIndex >= 0
+      ? targetTerminalIndex
+      : -1;
+    if (targetTerminalIndex < 0) {
       return;
     }
 
     const currentRoles = getWorkspaceTerminalRoles(
-      workspaceSettings,
+      currentSettings,
       workspaceId,
       terminalCount,
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const previousRole = currentRoles[roleIndex] || workspaceTerminalFallbackRole;
+    let nextIndexes = currentIndexes.slice();
+    let roleIndex = nextIndexes.indexOf(targetTerminalIndex);
+    let nextTerminalCount = terminalCount;
+    let nextDisplayLayouts = currentDisplayLayouts;
 
-    if (previousRole === nextRole) {
+    if (roleIndex < 0) {
+      if (nextIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+        return;
+      }
+
+      nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...nextIndexes, targetTerminalIndex]);
+      roleIndex = nextIndexes.indexOf(targetTerminalIndex);
+      nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+      const currentRows = getWorkspaceDisplayTerminalRows(
+        currentDisplayLayouts,
+        workspaceId,
+        currentIndexes,
+      );
+      nextDisplayLayouts = {
+        ...currentDisplayLayouts,
+        [workspaceId]: currentRows.length
+          ? [...currentRows.map((row) => row.terminalIndexes.slice()), [targetTerminalIndex]]
+          : [[targetTerminalIndex]],
+      };
+    }
+
+    if (roleIndex < 0) {
       return;
     }
 
-    const nextRoles = currentRoles.slice();
-    nextRoles[roleIndex] = nextRole;
+    const roleByIndex = Object.fromEntries(currentIndexes.map((index, indexOrder) => ([
+      index,
+      currentRoles[indexOrder] || workspaceTerminalFallbackRole,
+    ])));
+    const previousRole = roleByIndex[targetTerminalIndex] || workspaceTerminalFallbackRole;
+    const roleThread = threadId
+      ? workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId]
+      : getWorkspaceThreadForTerminalIndex(
+        workspaceThreadsRef.current,
+        workspaceId,
+        targetTerminalIndex,
+      );
 
-    setWorkspaceSettings((settings) => {
-      const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
-        terminalRoles: nextRoles,
-      });
+    if (previousRole === nextRole && (!roleThread?.id || roleThread.currentAgent === nextRole)) {
+      return;
+    }
 
-      persistWorkspaceSettings(nextSettings);
-      return nextSettings;
+    const nextRoles = nextIndexes.map((index) => (
+      index === targetTerminalIndex ? nextRole : roleByIndex[index] || workspaceTerminalFallbackRole
+    ));
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
+      [workspaceId]: nextIndexes,
+    };
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      terminalCount: nextTerminalCount,
+      terminalRoles: nextRoles,
     });
 
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+
     if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
       setWorkspaceTerminalRolesDraft(nextRoles);
     }
 
-    closeWorkspaceTerminalPane({
-      agentId: getWorkspaceTerminalPaneAgentId(previousRole),
-      nextTerminalCount: terminalCount,
-      previousTerminalCount: terminalCount,
-      reason: "terminal_role_switch",
-      terminalIndex,
-      workspaceId,
-    });
+    if (roleThread?.id) {
+      setWorkspaceThreads((threads) => updateWorkspaceThreadAgent(threads, {
+        agentId: nextRole,
+        status: "starting",
+        terminalIndex: targetTerminalIndex,
+        threadId: roleThread.id,
+        workspaceId,
+      }));
+    }
+
+    if (currentIndexes.includes(targetTerminalIndex)) {
+      closeWorkspaceTerminalPane({
+        agentId: getWorkspaceTerminalPaneAgentId(previousRole),
+        nextTerminalCount,
+        previousTerminalCount: terminalCount,
+        reason: "terminal_role_switch",
+        terminalIndex: targetTerminalIndex,
+        workspaceId,
+      });
+    }
   }, [
-    workspaceSettings,
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
-    workspaceTerminalLogicalIndexes,
   ]);
 
   const useDefaultWorkspaceRoot = useCallback(() => {
@@ -4320,6 +4536,19 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
+  const activatedWorkspaceThreadsByIndex = useMemo(() => (
+    activatedWorkspace
+      ? getWorkspaceThreadsByTerminalIndex(
+        workspaceThreads,
+        activatedWorkspace.id,
+        activatedWorkspaceLogicalTerminalIndexes,
+      )
+      : {}
+  ), [
+    activatedWorkspace?.id,
+    activatedWorkspaceLogicalTerminalIndexes,
+    workspaceThreads,
+  ]);
   const activatedWorkspaceAgentTerminalEntries = useMemo(() => (
     activatedWorkspaceTerminalRoleEntries.filter(({ role, terminalIndex }) => (
       normalizeWorkspaceTerminalRole(
@@ -4445,6 +4674,35 @@ export default function App() {
   const selectedWorkspaceFileRoot = selectedWorkspace
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
     : "";
+  const processKnownRoots = useMemo(() => {
+    const roots = [];
+    const seen = new Set();
+
+    const addRoot = (root) => {
+      const value = String(root || "").trim();
+      const key = value.toLowerCase();
+      if (!value || seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      roots.push(value);
+    };
+
+    if (activatedWorkspaceRootDirectory || defaultWorkingDirectory) {
+      addRoot(activatedWorkspaceRootDirectory || defaultWorkingDirectory);
+    }
+
+    workspaces.forEach((workspace) => {
+      addRoot(getWorkspaceRootDirectory(workspaceSettings, workspace.id) || defaultWorkingDirectory);
+    });
+
+    return roots;
+  }, [
+    activatedWorkspaceRootDirectory,
+    defaultWorkingDirectory,
+    workspaceSettings,
+    workspaces,
+  ]);
   const hasSelectedWorkspace = Boolean(selectedWorkspace);
   const shouldKeepWorkspaceTerminalMounted = Boolean(shouldShowWorkspaceSetup || activatedWorkspace);
   const shouldRevealWorkspaceTerminal = Boolean(
@@ -4543,6 +4801,332 @@ export default function App() {
 
     showView("settings");
   }, [selectedWorkspace, openWorkspaceSettings, showView]);
+  const openActivatedWorkspaceSettings = useCallback(() => {
+    if (activatedWorkspace) {
+      openWorkspaceSettings(activatedWorkspace.id);
+      return;
+    }
+
+    showView("settings");
+  }, [activatedWorkspace, openWorkspaceSettings, showView]);
+
+  const selectWorkspaceThreadInOverlay = useCallback((workspaceId, threadId) => {
+    setWorkspaceThreads((threads) => selectWorkspaceThread(threads, workspaceId, threadId));
+  }, []);
+
+  const requestWorkspaceThreadTitle = useCallback((event = {}) => {
+    const workspaceId = String(event.workspaceId || "");
+    const threadId = String(event.threadId || "");
+    const titleRequestId = String(event.titleRequestId || "");
+    const userMessage = String(event.userMessage || "").trim();
+    const repoPath = String(event.repoPath || "");
+    if (!workspaceId || !threadId || !titleRequestId || !userMessage || !repoPath) {
+      return;
+    }
+
+    const requestKey = `${workspaceId}:${threadId}:${titleRequestId}`;
+    if (workspaceThreadTitleRequestsRef.current.has(requestKey)) {
+      return;
+    }
+    workspaceThreadTitleRequestsRef.current.add(requestKey);
+
+    invoke("cloud_mcp_generate_thread_title", {
+      agentId: event.agentId || "",
+      repoPath,
+      threadId,
+      userMessage,
+      workspaceId,
+      workspaceName: event.workspaceName || "",
+    })
+      .then((result) => {
+        const title = String(result?.title || result?.data?.title || "").trim();
+        if (!title) {
+          return;
+        }
+
+        setWorkspaceThreads((threads) => updateWorkspaceThreadTitle(threads, {
+          status: "ready",
+          threadId,
+          title,
+          titleRequestId,
+          workspaceId,
+        }));
+      })
+      .catch(() => {
+        setWorkspaceThreads((threads) => updateWorkspaceThreadTitle(threads, {
+          status: "error",
+          threadId,
+          title: getWorkspaceThreadTitlePlaceholder(userMessage),
+          titleRequestId,
+          workspaceId,
+        }));
+      })
+      .finally(() => {
+        workspaceThreadTitleRequestsRef.current.delete(requestKey);
+      });
+  }, []);
+
+  const requestWorkspaceThreadTranscript = useCallback((event = {}) => {
+    const workspaceId = String(event.workspaceId || "").trim();
+    const threadId = String(event.threadId || "").trim();
+    const agentId = String(event.agentId || event.currentAgent || "codex").trim().toLowerCase();
+    if (!workspaceId || !threadId || !["claude", "codex", "opencode"].includes(agentId)) {
+      return;
+    }
+
+    const requestedProviderSessionId = String(
+      event.nativeSessionId
+        || event.providerSessionId
+        || "",
+    ).trim();
+    const requestedCwd = String(
+      event.worktreePath
+        || event.cwd
+        || "",
+    ).trim();
+    const requestedRepoPath = String(event.repoPath || "").trim();
+
+    const requestKey = `${workspaceId}:${threadId}:${requestedProviderSessionId || requestedCwd || "pending"}`;
+    const existingRequest = workspaceThreadTranscriptRequestsRef.current.get(requestKey);
+    if (existingRequest?.inFlight) {
+      return;
+    }
+    if (existingRequest?.timer) {
+      window.clearTimeout(existingRequest.timer);
+    }
+
+    const runRequest = () => {
+      workspaceThreadTranscriptRequestsRef.current.set(requestKey, { inFlight: true, timer: 0 });
+      const thread = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
+      if (!thread) {
+        workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
+        return;
+      }
+
+      const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+      const providerSessionId = String(
+        requestedProviderSessionId
+          || thread.transcriptSessionId
+          || providerBinding?.nativeSessionId
+          || "",
+      ).trim();
+      const cwd = String(
+        requestedCwd
+          || thread.coordination?.worktreePath
+          || requestedRepoPath
+          || "",
+      ).trim();
+
+      if (!providerSessionId && !cwd) {
+        workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
+        return;
+      }
+
+      invoke("agent_thread_transcript", {
+        request: {
+          agentId,
+          cwd,
+          maxMessages: 320,
+          providerSessionId,
+        },
+      })
+        .then((result) => {
+          const messages = Array.isArray(result?.messages) ? result.messages : [];
+          const sessionId = String(result?.sessionId || providerSessionId || "").trim();
+          if (!sessionId && messages.length === 0) {
+            return;
+          }
+
+          setWorkspaceThreads((threads) => hydrateWorkspaceThreadSessionTranscript(threads, {
+            agentId,
+            latestTimestamp: result?.latestTimestamp || "",
+            messages,
+            providerSessionId: sessionId,
+            rolloutPath: result?.rolloutPath || "",
+            sessionId,
+            sessionTitle: result?.sessionTitle || "",
+            source: `${agentId}-session`,
+            sourcePath: result?.rolloutPath || "",
+            threadId,
+            workspaceId,
+          }));
+        })
+        .catch(() => {})
+        .finally(() => {
+          window.setTimeout(() => {
+            const current = workspaceThreadTranscriptRequestsRef.current.get(requestKey);
+            if (current?.inFlight) {
+              workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
+            }
+          }, 900);
+        });
+    };
+
+    const delayMs = Math.max(0, Number.parseInt(event.delayMs, 10) || 0);
+    const timer = window.setTimeout(runRequest, delayMs);
+    workspaceThreadTranscriptRequestsRef.current.set(requestKey, { inFlight: false, timer });
+  }, []);
+
+  const handleThreadTerminalLifecycle = useCallback((event = {}) => {
+    if (!event.workspaceId) {
+      return;
+    }
+
+    let lifecycleEvent = event;
+    if (event.type === "message-submitted") {
+      const existingThread = event.threadId
+        ? workspaceThreadsRef.current?.[event.workspaceId]?.threads?.[event.threadId]
+        : getWorkspaceThreadForTerminalIndex(
+          workspaceThreadsRef.current,
+          event.workspaceId,
+          event.terminalIndex,
+        );
+      const needsTitle = !existingThread || !["pending", "ready"].includes(existingThread.titleStatus);
+      const canRequestTitle = needsTitle
+        && String(event.repoPath || "").trim()
+        && String(event.userMessage || "").trim();
+      lifecycleEvent = {
+        ...event,
+        messageId: `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+        threadId: event.threadId
+          || existingThread?.id
+          || createWorkspaceThreadId(event.workspaceId, event.terminalIndex),
+        title: needsTitle ? getWorkspaceThreadTitlePlaceholder(event.userMessage) : "",
+        titleRequestId: canRequestTitle
+          ? `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`
+          : "",
+      };
+      if (canRequestTitle) {
+        requestWorkspaceThreadTitle(lifecycleEvent);
+      }
+    }
+
+    setWorkspaceThreads((threads) => {
+      if (lifecycleEvent.type === "provider-session") {
+        return updateWorkspaceThreadProviderSession(threads, lifecycleEvent);
+      }
+
+      if (lifecycleEvent.type === "model-selected") {
+        return updateWorkspaceThreadProviderModel(threads, lifecycleEvent);
+      }
+
+      if (lifecycleEvent.type === "agent-output") {
+        return markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
+      }
+
+      if (lifecycleEvent.type === "message-submitted") {
+        return materializeWorkspaceThreadForTerminal(threads, lifecycleEvent);
+      }
+
+      if (lifecycleEvent.type === "closed" || lifecycleEvent.type === "exited" || lifecycleEvent.type === "error") {
+        return markWorkspaceThreadTerminalDetached(threads, {
+          status: lifecycleEvent.type === "error" ? "error" : lifecycleEvent.type,
+          instanceId: lifecycleEvent.instanceId,
+          paneId: lifecycleEvent.paneId,
+          terminalIndex: lifecycleEvent.terminalIndex,
+          threadId: lifecycleEvent.threadId,
+          workspaceId: lifecycleEvent.workspaceId,
+        });
+      }
+
+      if (lifecycleEvent.threadId) {
+        return bindWorkspaceThreadTerminal(threads, lifecycleEvent);
+      }
+
+      return updateWorkspaceActiveTerminal(threads, lifecycleEvent);
+    });
+
+    if (
+      ["claude", "codex", "opencode"].includes(
+        String(lifecycleEvent.agentId || lifecycleEvent.currentAgent || "").toLowerCase(),
+      )
+      && ["agent-output", "message-submitted", "opened", "provider-session"].includes(lifecycleEvent.type)
+    ) {
+      requestWorkspaceThreadTranscript({
+        ...lifecycleEvent,
+        delayMs: lifecycleEvent.type === "agent-output"
+          ? 650
+          : lifecycleEvent.type === "message-submitted"
+            ? 900
+            : 120,
+      });
+    }
+  }, [requestWorkspaceThreadTitle, requestWorkspaceThreadTranscript]);
+
+  useEffect(() => {
+    let unlistenPromptSubmitted = null;
+    let cancelled = false;
+
+    listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
+      const payload = promptEvent?.payload || {};
+      const userMessage = String(payload.prompt || "").trim();
+      const workspaceId = String(payload.workspaceId || "").trim();
+      if (!userMessage || !workspaceId) {
+        return;
+      }
+
+      handleThreadTerminalLifecycle({
+        agentId: payload.agentId || payload.agentKind || "",
+        instanceId: payload.instanceId,
+        paneId: payload.paneId || "",
+        repoPath: workspaceSettingsRef.current?.[workspaceId]?.rootDirectory || defaultWorkingDirectory || "",
+        status: "active",
+        terminalIndex: payload.terminalIndex,
+        threadId: payload.threadId || "",
+        type: "message-submitted",
+        userMessage,
+        workspaceId,
+        workspaceName: payload.workspaceName || "",
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+
+      unlistenPromptSubmitted = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenPromptSubmitted) {
+        unlistenPromptSubmitted();
+      }
+    };
+  }, [defaultWorkingDirectory, handleThreadTerminalLifecycle]);
+
+  useEffect(() => {
+    Object.entries(workspaceThreads || {}).forEach(([workspaceId, entry]) => {
+      const threads = entry?.threads || {};
+      (entry?.threadOrder || Object.keys(threads)).forEach((threadId) => {
+        const thread = threads[threadId];
+        const agentId = String(thread?.currentAgent || "").toLowerCase();
+        if (!thread || !["claude", "codex", "opencode"].includes(agentId)) {
+          return;
+        }
+
+        const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+        const hasVisibleTranscript = Array.isArray(thread.messages) && thread.messages.length > 0;
+        const hasSessionPointer = Boolean(
+          thread.transcriptSessionId
+            || providerBinding?.nativeSessionId
+            || thread.coordination?.worktreePath,
+        );
+        if (hasVisibleTranscript || !hasSessionPointer) {
+          return;
+        }
+
+        requestWorkspaceThreadTranscript({
+          agentId,
+          delayMs: 80,
+          providerSessionId: thread.transcriptSessionId || providerBinding?.nativeSessionId || "",
+          threadId,
+          worktreePath: thread.coordination?.worktreePath || "",
+          workspaceId,
+        });
+      });
+    });
+  }, [requestWorkspaceThreadTranscript, workspaceThreads]);
 
   const handlePreparedTerminalChange = useCallback((session) => {
     if (!session?.paneId) {
@@ -4556,6 +5140,7 @@ export default function App() {
         agentId: session.agentId || "",
         instanceId: session.instanceId,
         paneId: session.paneId,
+        threadId: session.threadId || "",
         terminalIndex: session.terminalIndex,
         workspaceId: session.workspaceId || "",
       });
@@ -4581,18 +5166,29 @@ export default function App() {
         && session.agentId === terminalRoleByIndex.get(session.terminalIndex)
       ))
       .sort((left, right) => left.terminalIndex - right.terminalIndex)
-      .map((session) => ({
-        instanceId: session.instanceId,
-        model: "",
-        paneId: session.paneId,
-        provider: session.agentId,
-        workspaceId: activatedWorkspace.id,
-      }));
+      .map((session) => {
+        const providerBinding = getWorkspaceThreadProviderBinding(
+          workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId],
+          session.agentId,
+        );
+
+        return {
+          instanceId: session.instanceId,
+          model: providerBinding?.modelId || "",
+          paneId: session.paneId,
+          provider: session.agentId,
+          providerSessionId: providerBinding?.nativeSessionId || "",
+          threadId: session.threadId || "",
+          terminalIndex: session.terminalIndex,
+          workspaceId: activatedWorkspace.id,
+        };
+      });
   }, [
     activeAgent,
     activatedWorkspace?.id,
     activatedWorkspaceAgentTerminalEntries,
     preparedTerminalVersion,
+    workspaceThreads,
   ]);
   const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.length;
   const shouldHoldWorkspaceRevealForTerminalBatch = Boolean(
@@ -4628,6 +5224,49 @@ export default function App() {
 
     invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
       .then((result) => {
+        const results = Array.isArray(result?.results) ? result.results : [];
+        results.forEach((paneResult) => {
+          if (!paneResult?.started) {
+            return;
+          }
+
+          const request = preparedWorkspaceTerminalRequests.find((candidate) => (
+            candidate.paneId === paneResult.paneId
+            && Number(candidate.instanceId || 0) === Number(paneResult.instanceId || 0)
+          ));
+          if (!request) {
+            return;
+          }
+
+          const terminalLifecycleEvent = {
+            agentId: request.provider,
+            instanceId: paneResult.instanceId,
+            model: request.model || "",
+            modelSource: request.model ? "session-restore" : "",
+            paneId: paneResult.paneId,
+            status: "active",
+            terminalIndex: request.terminalIndex,
+            threadId: request.threadId,
+            workspaceId: request.workspaceId,
+          };
+
+          setWorkspaceThreads((threads) => (
+            request.threadId
+              ? bindWorkspaceThreadTerminal(threads, terminalLifecycleEvent)
+              : updateWorkspaceActiveTerminal(threads, terminalLifecycleEvent)
+          ));
+
+          if (request.model && request.providerSessionId) {
+            const restoreModelCommand = `/model ${request.model}`;
+            window.setTimeout(() => {
+              invoke("terminal_write", {
+                data: `${restoreModelCommand}\r`,
+                instanceId: paneResult.instanceId,
+                paneId: paneResult.paneId,
+              }).catch(() => {});
+            }, 650);
+          }
+        });
         workspaceAgentBatchInFlightKeyRef.current = "";
         setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
         setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
@@ -5048,6 +5687,16 @@ export default function App() {
                         <span>Spec Graph</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="Web"
+                        data-active={activeView === "web"}
+                        onClick={() => showView("web")}
+                        title="Web"
+                        type="button"
+                      >
+                        <ButtonBrowserIcon aria-hidden="true" />
+                        <span>Web</span>
+                      </RailActionButton>
+                      <RailActionButton
                         aria-label="MCPs"
                         data-active={activeView === "mcps"}
                         onClick={() => showView("mcps")}
@@ -5060,6 +5709,17 @@ export default function App() {
                     </>
                   )}
                   <RailGlobalActions aria-label="Global controls">
+                    <RailActionButton
+                      aria-label="Processes"
+                      data-active={activeView === "processes"}
+                      data-scope="global"
+                      onClick={() => showView("processes")}
+                      title="Processes"
+                      type="button"
+                    >
+                      <ButtonProcessIcon aria-hidden="true" />
+                      <span>Processes</span>
+                    </RailActionButton>
                     <RailActionButton
                       aria-label="Audio"
                       data-active={activeView === "audio"}
@@ -5108,6 +5768,7 @@ export default function App() {
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
                     >
                       <TerminalView
+                        defaultWorkingDirectory={defaultWorkingDirectory}
                         terminalWorkspace={activatedWorkspace}
                         terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
                         terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
@@ -5121,6 +5782,9 @@ export default function App() {
                         changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                         createFirstWorkspace={createFirstWorkspace}
                         handlePreparedTerminalChange={handlePreparedTerminalChange}
+                        onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
+                        onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
+                        onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
                         refreshAgentStatuses={refreshAgentStatuses}
                         reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
                         setWorkspaceName={setWorkspaceName}
@@ -5129,6 +5793,7 @@ export default function App() {
                         showSettingsView={showSettingsView}
                         splitWorkspaceTerminal={splitWorkspaceTerminal}
                         terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
+                        terminalThreadsByIndex={activatedWorkspaceThreadsByIndex}
                         viewMotion={viewMotion}
                         workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
                         workspaceError={workspaceError}
@@ -5136,6 +5801,8 @@ export default function App() {
                         workspaceSyncState={workspaceSyncState}
                         workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
                         workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
+                        workspaceThreads={workspaceThreads}
+                        workspaces={workspaces}
                       />
                     </WorkspaceRuntimeLayer>
                   )}
@@ -5581,6 +6248,25 @@ export default function App() {
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view the spec graph." viewMotion={viewMotion} />
                   )}
+                </ForgeWorkspace>
+              ) : visibleView === "web" ? (
+                <ForgeWorkspace aria-label="Workspace web" data-motion={viewMotion}>
+                  {selectedWorkspace ? (
+                    <WebWorkspaceView
+                      defaultWorkingDirectory={defaultWorkingDirectory}
+                      rootDirectory={selectedWorkspaceFileRoot}
+                      workspace={selectedWorkspace}
+                    />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to open a web view." viewMotion={viewMotion} />
+                  )}
+                </ForgeWorkspace>
+              ) : visibleView === "processes" ? (
+                <ForgeWorkspace aria-label="Processes" data-motion={viewMotion}>
+                  <ProcessesView
+                    onCloseTrackedTerminal={closeTrackedProcessTerminal}
+                    workspaceRoots={processKnownRoots}
+                  />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (
                 <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>

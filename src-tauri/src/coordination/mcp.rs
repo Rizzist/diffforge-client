@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::{
@@ -995,6 +995,12 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
         );
     }
     let explicit_task_id = value_has_nonempty_string(&input, "task_id");
+    if let Some(object) = input.as_object_mut() {
+        object.insert(
+            "__explicit_task_id_provided".to_string(),
+            json!(explicit_task_id),
+        );
+    }
     apply_context_defaults(context, &mut input);
     if matches!(tool, "acquire_lease" | "checkpoint" | "submit_patch") && !explicit_task_id {
         if let Some(object) = input.as_object_mut() {
@@ -1072,6 +1078,18 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         .filter(|value| !value.trim().is_empty());
     let input_task_id_is_session_id =
         task_id.is_some_and(|task_id| session_id == Some(task_id.trim()));
+    let explicit_task_id_provided = input["__explicit_task_id_provided"]
+        .as_bool()
+        .unwrap_or(false);
+    let requested_task_is_existing_non_reusable = if input_task_id_is_session_id {
+        false
+    } else if let Some(task_id) = task_id {
+        existing_local_task_status(kernel, task_id)?
+            .as_deref()
+            .is_some_and(|status| !CoordinationKernel::task_status_allows_start_reuse(status))
+    } else {
+        false
+    };
     let requested_lane = input["lane"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
@@ -1104,7 +1122,12 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         agent_id,
         session_id,
         local_task_hint.as_deref().or_else(|| {
-            task_id.and_then(|task_id| (!input_task_id_is_session_id).then_some(task_id))
+            task_id.and_then(|task_id| {
+                (explicit_task_id_provided
+                    && !input_task_id_is_session_id
+                    && !requested_task_is_existing_non_reusable)
+                    .then_some(task_id)
+            })
         }),
         input["worktree_id"].as_str(),
         input["worktree_path"].as_str(),
@@ -1164,8 +1187,14 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     }
 
     if let Some(object) = data.as_object_mut() {
+        let brief = object
+            .get("brief")
+            .cloned()
+            .map(|brief| start_task_brief_for_agent(&brief))
+            .unwrap_or_else(|| json!({}));
+        object.insert("brief".to_string(), brief);
         object.insert("start_plan".to_string(), json!(start_plan));
-        object.insert("cloud".to_string(), json!({"ok": true, "response": cloud}));
+        object.insert("cloud".to_string(), cloud_start_task_for_agent(&cloud));
         object.insert("cloud_task_id".to_string(), json!(cloud_task_id));
         object.insert(
             "task_id_source".to_string(),
@@ -1182,6 +1211,180 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         }
     }
     Ok(api_ok(data))
+}
+
+fn start_task_brief_for_agent(brief: &Value) -> Value {
+    pick_fields(
+        brief,
+        &[
+            "task_dependencies",
+            "scheduler",
+            "active_leases",
+            "pending_approvals",
+            "db_change_requests",
+            "open_workspace_violations",
+        ],
+    )
+}
+
+fn cloud_start_task_for_agent(response: &Value) -> Value {
+    let context_pack = &response["context_pack"];
+    let mut view = Map::new();
+    view.insert("ok".to_string(), json!(true));
+    if let Some(task_id) = cloud_start_task_id(response) {
+        view.insert("task_id".to_string(), json!(task_id));
+    }
+    insert_if_present(
+        &mut view,
+        "current_work",
+        cloud_current_work_for_agent(&context_pack["current_work"]),
+    );
+    insert_if_present(
+        &mut view,
+        "peer_work",
+        array_map(&context_pack["peers"], cloud_peer_work_for_agent),
+    );
+    insert_if_present(
+        &mut view,
+        "lane_conflicts",
+        array_map(
+            &context_pack["conflicts"]["lanes"],
+            cloud_lane_conflict_for_agent,
+        ),
+    );
+    insert_if_present(
+        &mut view,
+        "context_error",
+        pick_fields(context_pack, &["ok", "error", "message"]),
+    );
+    insert_if_present(
+        &mut view,
+        "spec_summary",
+        cloud_spec_summary_for_agent(&context_pack["spec"]),
+    );
+    insert_if_present(
+        &mut view,
+        "spec_graph_summary",
+        cloud_spec_graph_summary_for_agent(&response["spec_graph"]),
+    );
+    insert_if_present(
+        &mut view,
+        "spec_activity",
+        pick_fields(
+            &response["spec_activity"],
+            &["recorded", "node_ids", "reason", "warnings", "error"],
+        ),
+    );
+    insert_if_present(&mut view, "guidance", context_pack["guidance"].clone());
+    Value::Object(view)
+}
+
+fn cloud_current_work_for_agent(current_work: &Value) -> Value {
+    pick_fields(
+        current_work,
+        &[
+            "status",
+            "lane",
+            "suggested_lane",
+            "summary",
+            "claimed_paths",
+            "local_task_id",
+            "prompt_summary",
+        ],
+    )
+}
+
+fn cloud_peer_work_for_agent(peer: &Value) -> Value {
+    pick_fields(
+        peer,
+        &[
+            "agent_id",
+            "agent_label",
+            "status",
+            "lane",
+            "progress",
+            "claimed_paths",
+            "local_task_id",
+            "last_seen_at",
+        ],
+    )
+}
+
+fn cloud_lane_conflict_for_agent(conflict: &Value) -> Value {
+    pick_fields(
+        conflict,
+        &["agent_id", "lane", "claimed_paths", "reason", "updated_at"],
+    )
+}
+
+fn cloud_spec_summary_for_agent(spec: &Value) -> Value {
+    pick_fields(
+        spec,
+        &[
+            "nodes",
+            "active_specs",
+            "warnings",
+            "guards",
+            "active_agents",
+            "candidate_slugs",
+        ],
+    )
+}
+
+fn cloud_spec_graph_summary_for_agent(spec_graph: &Value) -> Value {
+    pick_fields(
+        spec_graph,
+        &[
+            "ok",
+            "error",
+            "message",
+            "graph_stats",
+            "agent_work",
+            "node_count",
+        ],
+    )
+}
+
+fn pick_fields(source: &Value, fields: &[&str]) -> Value {
+    let mut view = Map::new();
+    if let Some(source) = source.as_object() {
+        for field in fields {
+            if let Some(value) = source.get(*field) {
+                insert_if_present(&mut view, field, value.clone());
+            }
+        }
+    }
+    Value::Object(view)
+}
+
+fn array_map(source: &Value, mapper: fn(&Value) -> Value) -> Value {
+    let values = source
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(mapper)
+                .filter(value_has_content)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(values)
+}
+
+fn insert_if_present(view: &mut Map<String, Value>, key: &str, value: Value) {
+    if value_has_content(&value) {
+        view.insert(key.to_string(), value);
+    }
+}
+
+fn value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        _ => true,
+    }
 }
 
 fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -1272,9 +1475,9 @@ fn existing_local_task_id_for_start(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if !kernel
-            .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
-            .is_empty()
+        if existing_local_task_status(kernel, task_id)?
+            .as_deref()
+            .is_some_and(CoordinationKernel::task_status_allows_start_reuse)
         {
             return Ok(Some(task_id.to_string()));
         }
@@ -1296,13 +1499,25 @@ fn existing_local_task_id_for_start(
     let Some(task_id) = task_id else {
         return Ok(None);
     };
-    if kernel
-        .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
-        .is_empty()
+    if existing_local_task_status(kernel, &task_id)?
+        .as_deref()
+        .is_some_and(CoordinationKernel::task_status_allows_start_reuse)
     {
-        return Ok(None);
+        Ok(Some(task_id))
+    } else {
+        Ok(None)
     }
-    Ok(Some(task_id))
+}
+
+fn existing_local_task_status(
+    kernel: &CoordinationKernel,
+    task_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(kernel
+        .query_json("SELECT status FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+        .into_iter()
+        .next()
+        .and_then(|task| task["status"].as_str().map(str::to_string)))
 }
 
 fn cloud_start_task_id(response: &Value) -> Option<String> {
@@ -1390,7 +1605,14 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let task_status = task["status"].as_str().unwrap_or_default();
     if matches!(
         task_status,
-        "done" | "completed" | "merged" | "cancelled" | "interrupted" | "skipped"
+        "done"
+            | "completed"
+            | "merged"
+            | "cancelled"
+            | "interrupted"
+            | "skipped"
+            | "patch_submitted"
+            | "resolved_patch_submitted"
     ) {
         return Ok(api_error(
             "checkpoint_task_not_active",
@@ -1834,6 +2056,101 @@ mod tests {
             cloud_start_task_id(&response).as_deref(),
             Some("server-task-123")
         );
+    }
+
+    #[test]
+    fn cloud_start_task_agent_view_keeps_peer_and_spec_summary_only() {
+        let response = json!({
+            "task_id": "task-cloud-1",
+            "task": {
+                "id": "task-cloud-1",
+                "title": "Verbose Cloud task",
+                "body": "This full task body should not be echoed to the agent."
+            },
+            "event": {
+                "history": "noisy event payload"
+            },
+            "spec_activity": {
+                "recorded": true,
+                "node_ids": ["spec-node-1"],
+                "raw": "drop"
+            },
+            "context_pack": {
+                "kind": "cloud_context_pack",
+                "identity": {
+                    "repo_id": "repo-test",
+                    "workspace_id": "workspace-test"
+                },
+                "current_work": {
+                    "status": "active",
+                    "lane": "cloud-mcp-context",
+                    "suggested_lane": "cloud-mcp-context",
+                    "summary": "Trimming start_task payloads.",
+                    "local_task_id": "task-cloud-1",
+                    "metadata_json": {"drop": true}
+                },
+                "peers": [{
+                    "agent_id": "agent-peer",
+                    "agent_label": "Codex 2",
+                    "status": "active",
+                    "lane": "desktop-ui",
+                    "progress": "Updating the terminal toolbar.",
+                    "claimed_paths": ["file:src/App.tsx"],
+                    "local_task_id": "peer-task",
+                    "metadata_json": {"drop": true}
+                }],
+                "conflicts": {
+                    "lanes": [{
+                        "agent_id": "agent-peer",
+                        "lane": "desktop-ui",
+                        "claimed_paths": ["file:src/App.tsx"],
+                        "reason": "Editing toolbar",
+                        "payload": {"drop": true}
+                    }],
+                    "spec_warnings": [{"message": "duplicated in spec summary"}]
+                },
+                "spec": {
+                    "nodes": [{"id": "spec-node-1", "title": "Terminal coordination"}],
+                    "active_specs": [{"statement": "Agents must use start_task before leases."}],
+                    "warnings": [{"message": "A peer may be editing nearby UI."}],
+                    "guards": ["Do not edit the shared project root."],
+                    "active_agents": [{"agent_id": "agent-peer", "summary": "Toolbar work"}],
+                    "candidate_slugs": ["terminal-coordination"]
+                },
+                "history": {
+                    "events": [{"summary": "old noisy history"}]
+                },
+                "guidance": ["Account for active peers before editing."]
+            },
+            "spec_graph": {
+                "kind": "project_spec_graph",
+                "repo_id": "repo-test",
+                "workspace_id": "workspace-test",
+                "graph_stats": {"node_count": 5},
+                "agent_work": {"active": 2},
+                "node_count": 5
+            }
+        });
+
+        let view = cloud_start_task_for_agent(&response);
+
+        assert_eq!(view["ok"].as_bool(), Some(true));
+        assert_eq!(view["task_id"].as_str(), Some("task-cloud-1"));
+        assert_eq!(
+            view["peer_work"][0]["progress"].as_str(),
+            Some("Updating the terminal toolbar.")
+        );
+        assert_eq!(
+            view["spec_summary"]["active_specs"][0]["statement"].as_str(),
+            Some("Agents must use start_task before leases.")
+        );
+        assert_eq!(view["spec_graph_summary"]["node_count"].as_u64(), Some(5));
+        assert_eq!(view["spec_activity"]["recorded"].as_bool(), Some(true));
+        assert!(view.get("event").is_none());
+        assert!(view.get("context_pack").is_none());
+        assert!(view["peer_work"][0].get("metadata_json").is_none());
+        assert!(view["lane_conflicts"][0].get("payload").is_none());
+        assert!(view["spec_graph_summary"].get("repo_id").is_none());
     }
 
     #[test]

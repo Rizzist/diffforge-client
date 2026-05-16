@@ -10,10 +10,10 @@ import {
 const elk = new ELK();
 
 const NODE_COLLISION_PADDING = {
-  workspace: 34,
-  folder: 26,
+  workspace: 36,
+  folder: 18,
   file: 24,
-  abstract: 30,
+  abstract: 32,
 };
 
 function setNodeCenter(layout, node, center) {

@@ -14,6 +14,7 @@ use super::schema::{
     DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION, MIGRATION_NAME,
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
+    TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
 };
 
 pub const REPO_ID: &str = "local";
@@ -298,6 +299,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
         )?);
     }
     diagnostics.push(apply_dependency_graph_migration(connection)?);
+    diagnostics.push(apply_task_lifecycle_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -442,6 +444,40 @@ fn apply_dependency_graph_migration(
         0..0,
         ["DEPENDENCY_GRAPH_SCHEMA_SQL executed idempotently".to_string()],
     );
+    Ok(migration)
+}
+
+fn apply_task_lifecycle_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, TASK_LIFECYCLE_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            TASK_LIFECYCLE_MIGRATION_VERSION,
+            TASK_LIFECYCLE_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let mut details = Vec::new();
+    for (table, column, definition) in [
+        ("tasks", "started_at", "TEXT"),
+        ("tasks", "finished_at", "TEXT"),
+    ] {
+        let added = ensure_column(connection, table, column, definition)?;
+        details.push(format!(
+            "{}.{} {}",
+            table,
+            column,
+            if added { "added" } else { "already_present" }
+        ));
+    }
+    let mut migration = record_migration_if_missing(
+        connection,
+        TASK_LIFECYCLE_MIGRATION_VERSION,
+        TASK_LIFECYCLE_MIGRATION_NAME,
+    )?;
+    migration.details.splice(0..0, details);
     Ok(migration)
 }
 

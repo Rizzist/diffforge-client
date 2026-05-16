@@ -439,6 +439,11 @@ fn resolve_agent_command_candidates(definition: AgentDefinition) -> Vec<String> 
 
         candidates.push(path);
     }
+    for path in agent_path_command_candidates(definition) {
+        if !candidates.iter().any(|candidate| candidate == &path) {
+            candidates.push(path);
+        }
+    }
 
     if !candidates
         .iter()
@@ -448,6 +453,34 @@ fn resolve_agent_command_candidates(definition: AgentDefinition) -> Vec<String> 
     }
 
     candidates
+}
+
+#[cfg(windows)]
+fn agent_path_command_candidates(definition: AgentDefinition) -> Vec<String> {
+    let Some(path_value) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let suffixes = [".cmd", ".exe", ".bat", ""];
+    let mut candidates = Vec::new();
+
+    for directory in env::split_paths(&path_value) {
+        for suffix in suffixes {
+            let candidate = directory.join(format!("{}{}", definition.binary, suffix));
+            if candidate.exists() {
+                let path = candidate.to_string_lossy().to_string();
+                if !candidates.iter().any(|existing| existing == &path) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+fn agent_path_command_candidates(_definition: AgentDefinition) -> Vec<String> {
+    Vec::new()
 }
 
 fn agent_command_candidates(definition: AgentDefinition) -> Vec<String> {
@@ -699,6 +732,15 @@ fn terminal_args_with_codex_mcp_identity(
     next
 }
 
+fn terminal_coordination_env_value(
+    coordination: &TerminalCoordinationSession,
+    key: &str,
+) -> Option<String> {
+    coordination.env_vars.iter().find_map(|(candidate, value)| {
+        (candidate == key && !value.trim().is_empty()).then(|| value.clone())
+    })
+}
+
 fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
     if !terminal_args_have_option(args, "--no-alt-screen", "") {
         args.push("--no-alt-screen".to_string());
@@ -741,10 +783,7 @@ fn apply_claude_coordinated_auto_approval_args(
     }
     if !terminal_args_have_any_option(args, &["--mcp-config"]) {
         args.push("--mcp-config".to_string());
-        args.push(claude_coordination_mcp_config_arg(
-            coordination,
-            coordination_args,
-        ));
+        args.push(claude_coordination_mcp_config_arg(coordination, coordination_args));
     }
 }
 
@@ -765,6 +804,10 @@ fn claude_coordination_mcp_config_arg(
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
 ) -> String {
+    if let Some(path) = claude_coordination_mcp_config_path_arg(coordination) {
+        return path;
+    }
+
     json!({
         "mcpServers": {
             "coordination-kernel": {
@@ -789,6 +832,48 @@ fn claude_coordination_mcp_config_arg(
         }
     })
     .to_string()
+}
+
+fn claude_coordination_mcp_config_path_arg(
+    coordination: &TerminalCoordinationSession,
+) -> Option<String> {
+    [
+        "CLAUDE_MCP_CONFIG",
+        "CLAUDE_CODE_MCP_CONFIG",
+        "COORDINATION_MCP_CONFIG_PATH",
+        "MCP_CONFIG_PATH",
+    ]
+    .iter()
+    .find_map(|key| terminal_coordination_env_value(coordination, key))
+}
+
+fn validate_terminal_agent_launch_args_for_platform(
+    provider_id: &str,
+    args: &[String],
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let provider_id = provider_id.trim().to_ascii_lowercase();
+        if provider_id.contains("claude") && terminal_args_have_inline_claude_mcp_config(args) {
+            return Err(
+                "Claude Code launch on Windows requires a file-backed MCP config; inline JSON is unsafe through the Windows terminal launch path."
+                    .to_string(),
+            );
+        }
+    }
+
+    let _ = provider_id;
+    let _ = args;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminal_args_have_inline_claude_mcp_config(args: &[String]) -> bool {
+    args.windows(2).any(|pair| {
+        (pair[0] == "--mcp-config")
+            && pair[1].trim_start().starts_with('{')
+            && pair[1].contains("mcpServers")
+    })
 }
 
 fn terminal_args_have_option(args: &[String], long: &str, short: &str) -> bool {
@@ -1228,6 +1313,7 @@ fn build_agent_status(
     npm_update_available: bool,
 ) -> AgentStatus {
     let definition = agent_definition(provider);
+    let image_input = agent_image_input_status(provider);
 
     AgentStatus {
         id: definition.id,
@@ -1248,7 +1334,205 @@ fn build_agent_status(
         npm_update_available,
         recommend_native_install: runtime_status.recommend_native_install,
         connect_command: definition.connect_command,
+        image_input_supported: image_input.supported,
+        image_input_support: image_input.support,
+        image_input_reason: image_input.reason,
+        active_model: image_input.active_model,
+        active_model_supports_images: image_input.active_model_supports_images,
     }
+}
+
+fn agent_image_input_status(provider: AgentProvider) -> AgentImageInputStatus {
+    match provider {
+        AgentProvider::Codex => AgentImageInputStatus {
+            supported: true,
+            support: "supported",
+            reason: "Codex CLI supports image input.".to_string(),
+            active_model: String::new(),
+            active_model_supports_images: true,
+        },
+        AgentProvider::Claude => AgentImageInputStatus {
+            supported: true,
+            support: "supported",
+            reason: "Claude Code supports image input.".to_string(),
+            active_model: String::new(),
+            active_model_supports_images: true,
+        },
+        AgentProvider::OpenCode => {
+            let active_model = detect_opencode_configured_model().unwrap_or_default();
+
+            if active_model.is_empty() {
+                return AgentImageInputStatus {
+                    supported: false,
+                    support: "conditional",
+                    reason: "OpenCode image input depends on the selected model; no configured model was detected.".to_string(),
+                    active_model,
+                    active_model_supports_images: false,
+                };
+            }
+
+            match opencode_model_supports_images(&active_model) {
+                Some(true) => AgentImageInputStatus {
+                    supported: true,
+                    support: "supported",
+                    reason: format!("OpenCode is configured with an image-capable model ({active_model})."),
+                    active_model,
+                    active_model_supports_images: true,
+                },
+                Some(false) => AgentImageInputStatus {
+                    supported: false,
+                    support: "unsupported",
+                    reason: format!("OpenCode is configured with a text-only model ({active_model})."),
+                    active_model,
+                    active_model_supports_images: false,
+                },
+                None => AgentImageInputStatus {
+                    supported: false,
+                    support: "unknown",
+                    reason: format!("OpenCode model image support is unknown for {active_model}."),
+                    active_model,
+                    active_model_supports_images: false,
+                },
+            }
+        }
+    }
+}
+
+fn detect_opencode_configured_model() -> Option<String> {
+    ["OPENCODE_MODEL", "OPEN_CODE_MODEL"]
+        .iter()
+        .find_map(|key| env::var(key).ok().and_then(clean_opencode_model_id))
+        .or_else(|| {
+            opencode_config_paths()
+                .into_iter()
+                .find_map(|path| read_opencode_model_from_config(&path))
+        })
+}
+
+fn clean_opencode_model_id(value: String) -> Option<String> {
+    let model = value.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    Some(model.chars().take(MAX_FORGE_MODEL_LENGTH).collect())
+}
+
+fn opencode_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(current_dir) = env::current_dir() {
+        paths.push(current_dir.join("opencode.json"));
+        paths.push(current_dir.join(".opencode.json"));
+    }
+
+    if let Some(home) = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
+        paths.push(home.join(".config").join("opencode").join("opencode.json"));
+        paths.push(home.join(".config").join("opencode").join("config.json"));
+        paths.push(home.join(".opencode").join("opencode.json"));
+        paths.push(home.join(".opencode").join("config.json"));
+        paths.push(home.join(".opencode.json"));
+    }
+
+    if let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from) {
+        paths.push(app_data.join("opencode").join("opencode.json"));
+        paths.push(app_data.join("opencode").join("config.json"));
+    }
+
+    paths
+}
+
+fn read_opencode_model_from_config(path: &Path) -> Option<String> {
+    let body = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&body).ok()?;
+
+    opencode_model_from_config_value(&value).and_then(clean_opencode_model_id)
+}
+
+fn opencode_model_from_config_value(value: &Value) -> Option<String> {
+    [
+        "model",
+        "defaultModel",
+        "default_model",
+        "selectedModel",
+        "selected_model",
+    ]
+    .iter()
+    .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
+    .or_else(|| {
+        value
+            .get("agent")
+            .and_then(opencode_model_from_config_value)
+    })
+    .or_else(|| {
+        let provider = value.get("provider").and_then(Value::as_str)?;
+        value
+            .get("providers")
+            .and_then(|providers| providers.get(provider))
+            .and_then(opencode_model_from_config_value)
+    })
+}
+
+fn opencode_model_supports_images(model: &str) -> Option<bool> {
+    let normalized = model.trim().to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let text_only_markers = [
+        "gpt-3.5",
+        "o1-mini",
+        "o3-mini",
+        "deepseek",
+        "codestral",
+        "devstral",
+        "llama",
+        "qwen-coder",
+        "kimi",
+    ];
+    if text_only_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return Some(false);
+    }
+
+    let vision_markers = [
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "claude-3",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+        "sonnet-4",
+        "opus-4",
+        "gemini",
+        "pixtral",
+        "llava",
+        "minicpm-v",
+        "vision",
+        "multimodal",
+        "omni",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+    ];
+    if vision_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || normalized.contains("-vl")
+        || normalized.contains("/vl")
+        || normalized.ends_with(":vl")
+    {
+        return Some(true);
+    }
+
+    None
 }
 
 fn install_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
@@ -1724,6 +2008,135 @@ fn prepare_prompt_images(
     }
 
     Ok(Some(PreparedPromptImages { directory, paths }))
+}
+
+fn todo_attachment_directory(prefix: &str) -> Result<PathBuf, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("Unable to prepare todo attachment directory: {error}"))?
+        .as_millis();
+    let directory = env::temp_dir()
+        .join("diffforge-todo-attachments")
+        .join(format!("{}-{}-{timestamp}", std::process::id(), prefix));
+
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Unable to prepare todo attachment directory: {error}"))?;
+
+    Ok(directory)
+}
+
+fn save_todo_image_attachments_for(
+    images: Vec<ForgePromptImage>,
+) -> Result<Vec<SavedTodoImageAttachment>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if images.len() > MAX_FORGE_IMAGES {
+        return Err(format!(
+            "Attach up to {MAX_FORGE_IMAGES} images per todo."
+        ));
+    }
+
+    let mut decoded_images = Vec::with_capacity(images.len());
+    let mut total_bytes = 0usize;
+
+    for (index, image) in images.iter().enumerate() {
+        let mime_type = image.mime_type.trim().to_ascii_lowercase();
+        let decoded = decode_prompt_image(image, index)?;
+        total_bytes += decoded.1.len();
+
+        if total_bytes > MAX_FORGE_IMAGE_TOTAL_BYTES {
+            return Err("Images must be 8 MB total or smaller.".to_string());
+        }
+
+        decoded_images.push((decoded.0, decoded.1, mime_type));
+    }
+
+    let directory = todo_attachment_directory("images")?;
+    let mut saved_images = Vec::with_capacity(decoded_images.len());
+
+    for (file_name, bytes, mime_type) in decoded_images {
+        let path = directory.join(&file_name);
+        if let Err(error) = fs::write(&path, bytes) {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(format!("Unable to write image attachment: {error}"));
+        }
+
+        saved_images.push(SavedTodoImageAttachment {
+            name: file_name,
+            mime_type,
+            path: path.to_string_lossy().to_string(),
+        });
+    }
+
+    Ok(saved_images)
+}
+
+fn sanitized_text_attachment_stem(title: &str, line_count: usize) -> String {
+    let cleaned = title
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(48)
+        .collect::<String>();
+
+    if cleaned.is_empty() {
+        format!("pasted-lines-{line_count}")
+    } else {
+        cleaned
+    }
+}
+
+fn save_todo_text_attachment_for(
+    request: TodoTextAttachmentRequest,
+) -> Result<SavedTodoTextAttachment, String> {
+    let text = request.text.replace("\r\n", "\n").replace('\r', "\n");
+    let byte_count = text.as_bytes().len();
+
+    if text.trim().is_empty() {
+        return Err("Pasted text attachment is empty.".to_string());
+    }
+
+    if byte_count > MAX_TODO_TEXT_ATTACHMENT_BYTES {
+        return Err("Pasted text attachment is too large.".to_string());
+    }
+
+    let line_count = text.lines().count().max(1);
+    let title = request
+        .title
+        .map(|value| value.trim().chars().take(80).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("[pasted-lines {line_count}]"));
+    let directory = todo_attachment_directory("text")?;
+    let file_name = format!("{}.txt", sanitized_text_attachment_stem(&title, line_count));
+    let path = directory.join(file_name);
+
+    fs::write(&path, text)
+        .map_err(|error| format!("Unable to write pasted text attachment: {error}"))?;
+
+    Ok(SavedTodoTextAttachment {
+        line_count,
+        path: path.to_string_lossy().to_string(),
+        title,
+    })
+}
+
+#[tauri::command]
+async fn save_todo_image_attachments(
+    images: Vec<ForgePromptImage>,
+) -> Result<Vec<SavedTodoImageAttachment>, String> {
+    tauri::async_runtime::spawn_blocking(move || save_todo_image_attachments_for(images))
+        .await
+        .map_err(|error| format!("Unable to prepare todo image attachments: {error}"))?
+}
+
+#[tauri::command]
+async fn save_todo_text_attachment(
+    request: TodoTextAttachmentRequest,
+) -> Result<SavedTodoTextAttachment, String> {
+    tauri::async_runtime::spawn_blocking(move || save_todo_text_attachment_for(request))
+        .await
+        .map_err(|error| format!("Unable to prepare pasted text attachment: {error}"))?
 }
 
 fn run_forge_prompt_for(request: ForgePromptRequest) -> Result<ForgeRunResult, String> {

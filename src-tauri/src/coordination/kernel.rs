@@ -1022,8 +1022,9 @@ impl CoordinationKernel {
             .execute(
                 "INSERT INTO tasks(
                     id, title, body, status, priority, risk_level, context_run_id,
-                    source_plan_item_id, assigned_role, expected_output, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                    source_plan_item_id, assigned_role, expected_output, started_at, finished_at,
+                    created_at, updated_at
+                ) VALUES(?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?10)",
                 params![
                     id,
                     title,
@@ -1051,6 +1052,93 @@ impl CoordinationKernel {
         )?;
 
         Ok(json!({"id": id, "title": title, "status": "ready"}))
+    }
+
+    pub(crate) fn task_status_allows_start_reuse(status: &str) -> bool {
+        !matches!(
+            status,
+            "done"
+                | "completed"
+                | "merged"
+                | "cancelled"
+                | "interrupted"
+                | "skipped"
+                | "patch_submitted"
+                | "resolved_patch_submitted"
+        )
+    }
+
+    fn reusable_session_task_id_for_start(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(task_id) = self
+            .query_json(
+                "SELECT task_id FROM agent_sessions WHERE id=?1 LIMIT 1",
+                &[&session_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|session| {
+                session["task_id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        else {
+            return Ok(None);
+        };
+
+        let task = self
+            .query_json("SELECT status FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+            .into_iter()
+            .next();
+        let Some(status) = task
+            .as_ref()
+            .and_then(|task| task["status"].as_str())
+            .map(str::to_string)
+        else {
+            let now = now_rfc3339();
+            let _ = self.clear_session_task_if_current(session_id, &task_id, &now);
+            return Ok(None);
+        };
+        if Self::task_status_allows_start_reuse(&status) {
+            Ok(Some(task_id))
+        } else {
+            let now = now_rfc3339();
+            let _ = self.clear_session_task_if_current(session_id, &task_id, &now);
+            Ok(None)
+        }
+    }
+
+    fn clear_session_task_if_current(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        now: &str,
+    ) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET task_id=NULL, updated_at=?1
+                 WHERE id=?2 AND task_id=?3",
+                params![now, session_id, task_id],
+            )
+            .map_err(|error| format!("Unable to clear completed session task: {error}"))
+    }
+
+    fn task_parked_or_resume_ready_intent_count(&self, task_id: &str) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM task_resource_intents
+                 WHERE task_id=?1
+                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to inspect parked task intents: {error}"))
     }
 
     pub fn add_task_dependency(
@@ -1236,12 +1324,16 @@ impl CoordinationKernel {
             self.conn
                 .execute(
                     "UPDATE tasks
-                     SET status=?1, updated_at=?2
+                     SET status=?1,
+                         finished_at=COALESCE(finished_at, ?2),
+                         updated_at=?2
                      WHERE id=?3 AND claimed_session_id=?4
                        AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted')",
                     params![&status, now, task_id, session_id],
                 )
                 .map_err(|error| format!("Unable to mark task {status}: {error}"))?;
+            let cleared_session_task =
+                self.clear_session_task_if_current(session_id, task_id, &now)?;
             let released_leases = self.release_active_leases_for_task_with_event(
                 task_id,
                 &format!("task_{status}"),
@@ -1268,6 +1360,7 @@ impl CoordinationKernel {
                     "reason": reason,
                     "released_leases": released_leases,
                     "status": status.clone(),
+                    "cleared_session_task": cleared_session_task,
                     "updated_resource_intents": updated_resource_intents,
                     "stopped_queue_refresh": stopped_queue_refresh,
                 }),
@@ -1506,7 +1599,12 @@ impl CoordinationKernel {
                 .conn
                 .execute(
                     "UPDATE tasks
-                     SET status='claimed', claimed_by_agent_id=?1, claimed_session_id=?2, updated_at=?3
+                     SET status='claimed',
+                         claimed_by_agent_id=?1,
+                         claimed_session_id=?2,
+                         started_at=COALESCE(started_at, ?3),
+                         finished_at=NULL,
+                         updated_at=?3
                      WHERE id=?4
                        AND (claimed_session_id IS NULL OR claimed_session_id='')
                        AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
@@ -1954,7 +2052,7 @@ impl CoordinationKernel {
                   )
              LEFT JOIN agent_slots dependency_slot ON dependency_slot.id = dependency_session.agent_slot_id
              WHERE i.task_id=?1
-               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
              ORDER BY i.updated_at ASC",
             &[&task_id],
         )?;
@@ -2120,7 +2218,7 @@ impl CoordinationKernel {
                      LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
                      WHERE t.status='ready'
                        AND t.id != COALESCE(?3, '')
-                       AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+                       AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
                        AND (
                             t.claimed_session_id IS NULL
                             OR t.claimed_session_id=''
@@ -2200,7 +2298,7 @@ impl CoordinationKernel {
              LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
              WHERE t.status='ready'
                AND t.id != COALESCE(?4, '')
-               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready')
+               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
                AND (
                     t.claimed_session_id IS NULL
                     OR t.claimed_session_id=''
@@ -2309,7 +2407,7 @@ impl CoordinationKernel {
             .execute(
                 "UPDATE task_resource_intents
                  SET status='resume_requested', updated_at=?1
-                 WHERE task_id=?2 AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                 WHERE task_id=?2 AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
                 params![now, task_id],
             )
             .map_err(|error| format!("Unable to mark task resume requested: {error}"))?;
@@ -3378,7 +3476,7 @@ impl CoordinationKernel {
                         "SELECT COUNT(1)
                          FROM task_resource_intents
                          WHERE task_id=?1
-                           AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                           AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
                         params![task_id],
                         |row| row.get(0),
                     )
@@ -3388,7 +3486,9 @@ impl CoordinationKernel {
                         .conn
                         .execute(
                             "UPDATE tasks
-                             SET status='interrupted', updated_at=?1
+                             SET status='interrupted',
+                                 finished_at=COALESCE(finished_at, ?1),
+                                 updated_at=?1
                              WHERE id=?2
                                AND claimed_session_id=?3
                                AND status IN ('ready', 'blocked', 'claimed')",
@@ -3404,7 +3504,7 @@ impl CoordinationKernel {
                                 "UPDATE task_resource_intents
                                  SET status='interrupted', updated_at=?1
                                  WHERE task_id=?2
-                                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
+                                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
                                 params![now, task_id],
                             )
                             .map_err(|error| {
@@ -3452,7 +3552,9 @@ impl CoordinationKernel {
                 self.conn
                     .execute(
                         "UPDATE tasks
-                         SET status='interrupted', updated_at=?1
+                         SET status='interrupted',
+                             finished_at=COALESCE(finished_at, ?1),
+                             updated_at=?1
                          WHERE id=?2
                            AND claimed_session_id=?3
                            AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
@@ -3677,7 +3779,9 @@ impl CoordinationKernel {
                     .conn
                     .execute(
                         "UPDATE tasks
-                         SET status='interrupted', updated_at=?1
+                         SET status='interrupted',
+                             finished_at=COALESCE(finished_at, ?1),
+                             updated_at=?1
                          WHERE id=?2
                            AND claimed_session_id=?3
                            AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
@@ -4573,6 +4677,19 @@ impl CoordinationKernel {
     ) -> Result<Value, String> {
         let session = self.ensure_session_active(session_id, agent_id)?;
         self.ensure_session_owns_task(session_id, task_id)?;
+        let task = self.query_one(
+            "SELECT status FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let task_status = task["status"].as_str().unwrap_or_default();
+        if !Self::task_status_allows_start_reuse(task_status) {
+            return Ok(api_error(
+                "task_not_active",
+                "Cannot acquire a lease for a task that has already ended or submitted a patch.",
+                json!({"task_id": task_id, "status": task_status}),
+            ));
+        }
         let agent_slot_id = session["agent_slot_id"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -6410,6 +6527,23 @@ impl CoordinationKernel {
                     "reason": "patch_id_missing",
                 })
             };
+            let post_submit_task = self
+                .query_json("SELECT status FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])
+                .ok()
+                .and_then(|rows| rows.into_iter().next());
+            let post_submit_status = post_submit_task
+                .as_ref()
+                .and_then(|task| task["status"].as_str())
+                .unwrap_or("patch_submitted");
+            let parked_intent_count = self
+                .task_parked_or_resume_ready_intent_count(task_id)
+                .unwrap_or(0);
+            let cleared_session_task = if post_submit_status == "blocked" || parked_intent_count > 0
+            {
+                0
+            } else {
+                self.clear_session_task_if_current(session_id, task_id, &now_rfc3339())?
+            };
             return Ok(api_ok_warnings(
                 json!({
                     "patch_id": validation.patch_id,
@@ -6417,7 +6551,10 @@ impl CoordinationKernel {
                     "changed_files": validation.changed_files,
                     "diff_artifact_id": validation.diff_artifact_id,
                     "merge_resolution": merge_resolution,
-                    "auto_merge": auto_merge
+                    "auto_merge": auto_merge,
+                    "post_submit_task_status": post_submit_status,
+                    "parked_intent_count": parked_intent_count,
+                    "cleared_session_task": cleared_session_task
                 }),
                 validation.warnings,
             ));
@@ -6432,12 +6569,16 @@ impl CoordinationKernel {
             self.conn
                 .execute(
                     "UPDATE tasks
-                     SET status='skipped', updated_at=?1
+                     SET status='skipped',
+                         finished_at=COALESCE(finished_at, ?1),
+                         updated_at=?1
                      WHERE id=?2
                        AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
                     params![now, task_id],
                 )
                 .map_err(|error| format!("Unable to mark no-op task skipped: {error}"))?;
+            let cleared_session_task =
+                self.clear_session_task_if_current(session_id, task_id, &now)?;
             let released_leases = self.release_active_leases_for_task_with_event(
                 task_id,
                 "no_changed_files_submit",
@@ -6464,6 +6605,7 @@ impl CoordinationKernel {
                     "validation_status": validation_status.clone(),
                     "changed_files": changed_files.clone(),
                     "released_leases": released_leases.clone(),
+                    "cleared_session_task": cleared_session_task,
                     "task_status": "skipped",
                     "reason": "no_changed_files",
                     "terminal_policy": "submit_without_diff_completes_as_noop",
@@ -6476,6 +6618,7 @@ impl CoordinationKernel {
                     "task_status": "skipped",
                     "changed_files": [],
                     "released_leases": released_leases,
+                    "cleared_session_task": cleared_session_task,
                     "noop": true,
                     "reason": "no_changed_files",
                 }),
@@ -8245,20 +8388,40 @@ impl CoordinationKernel {
                 } else {
                     false
                 };
+                let task_status_after_merge = if task_has_parked_slices {
+                    "blocked"
+                } else {
+                    "merged"
+                };
+                let task_updated_at = now_rfc3339();
                 self.conn
                     .execute(
-                        "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3",
+                        "UPDATE tasks
+                         SET status=?1,
+                             finished_at=CASE
+                               WHEN ?1='blocked' THEN NULL
+                               ELSE COALESCE(finished_at, ?2)
+                             END,
+                             updated_at=?2
+                         WHERE id=?3",
                         params![
-                            if task_has_parked_slices {
-                                "blocked"
-                            } else {
-                                "merged"
-                            },
-                            now_rfc3339(),
+                            task_status_after_merge,
+                            task_updated_at,
                             patch["task_id"].as_str()
                         ],
                     )
                     .map_err(|error| format!("Unable to update task after merge: {error}"))?;
+                let cleared_session_task = if !task_has_parked_slices {
+                    if let (Some(task_id), Some(session_id)) =
+                        (patch["task_id"].as_str(), patch["session_id"].as_str())
+                    {
+                        self.clear_session_task_if_current(session_id, task_id, &task_updated_at)?
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
                 let released_leases = if let Some(task_id) = patch["task_id"].as_str() {
                     self.conn
                         .execute(
@@ -8308,6 +8471,8 @@ impl CoordinationKernel {
                         "commit": commit.clone(),
                         "source_worktree_refresh": source_worktree_refresh.clone(),
                         "released_leases": released_leases.clone(),
+                        "task_status": task_status_after_merge,
+                        "cleared_session_task": cleared_session_task,
                         "root_fast_forward": root_fast_forward.clone(),
                         "post_merge_schedule": post_merge_schedule.clone(),
                     }),
@@ -10996,45 +11161,38 @@ impl CoordinationKernel {
         let task_id_is_session_id = raw_task_id.is_some_and(|value| session_id == Some(value));
         let requested_task_id = raw_task_id.filter(|value| session_id != Some(*value));
         let session_task_id = session_id.and_then(|session_id| {
-            self.query_json(
-                "SELECT task_id FROM agent_sessions WHERE id=?1 LIMIT 1",
-                &[&session_id],
-            )
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|session| {
-                session["task_id"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            })
+            self.reusable_session_task_id_for_start(session_id)
+                .ok()
+                .flatten()
         });
         let mut created_task = false;
         let mut reused_task = false;
         let ignored_session_id_task_id = task_id_is_session_id;
         let mut create_with_task_id = None::<String>;
         let effective_task_id = if let Some(task_id) = requested_task_id {
-            if self
-                .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
-                .is_empty()
-            {
+            let requested_task = self
+                .query_json("SELECT status FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
+                .into_iter()
+                .next();
+            if let Some(requested_task) = requested_task {
+                let status = requested_task["status"].as_str().unwrap_or_default();
+                if Self::task_status_allows_start_reuse(status) {
+                    reused_task = true;
+                    Some(task_id.to_string())
+                } else {
+                    return Ok(api_error(
+                        "task_not_resumable",
+                        "Task has already ended; start a new task instead of reusing this task_id.",
+                        json!({"task_id": task_id, "status": status}),
+                    ));
+                }
+            } else {
                 create_with_task_id = Some(task_id.to_string());
                 None
-            } else {
-                reused_task = true;
-                Some(task_id.to_string())
             }
         } else if let Some(task_id) = session_task_id {
-            if self
-                .query_json("SELECT id FROM tasks WHERE id=?1 LIMIT 1", &[&task_id])?
-                .is_empty()
-            {
-                None
-            } else {
-                reused_task = true;
-                Some(task_id)
-            }
+            reused_task = true;
+            Some(task_id)
         } else {
             None
         };
@@ -16722,6 +16880,173 @@ mod tests {
             .query_json("SELECT * FROM leases WHERE task_id=?1", &[&task_id])
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn agent_mcp_start_task_after_cancel_creates_new_task() {
+        let repo = init_git_repo("mcp_start_after_cancel_new_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let context = crate::coordination::mcp::McpContext {
+            repo_path: Some(process_path_text(&repo)),
+            agent_id: Some(agent_id.clone()),
+            session_id: Some(session_id.clone()),
+            ..crate::coordination::mcp::McpContext::default()
+        };
+
+        let first_cloud_url = fake_cloud_mcp_url("cloud-before-cancel", false);
+        let first = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": first_cloud_url.as_str(),
+                "plan": "Start the first task."
+            }),
+        );
+        assert_eq!(first["ok"].as_bool(), Some(true));
+        let first_task_id = first["data"]["task_id"].as_str().unwrap().to_string();
+
+        let stopped = kernel
+            .mark_terminal_task_stopped(
+                &first_task_id,
+                &session_id,
+                "cancelled",
+                "test_cancel_before_next_prompt",
+            )
+            .unwrap();
+        assert_eq!(stopped["status"].as_str(), Some("cancelled"));
+        let first_task = kernel
+            .query_one(
+                "SELECT status, started_at, finished_at FROM tasks WHERE id=?1",
+                &[&first_task_id],
+                "missing first task",
+            )
+            .unwrap();
+        assert_eq!(first_task["status"].as_str(), Some("cancelled"));
+        assert!(first_task["started_at"].as_str().is_some());
+        assert!(first_task["finished_at"].as_str().is_some());
+        let session_after_cancel = kernel
+            .query_one(
+                "SELECT task_id FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert!(session_after_cancel["task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+
+        let next_cloud_url = fake_cloud_mcp_url("cloud-after-cancel", false);
+        let next = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": next_cloud_url.as_str(),
+                "plan": "Start the next task after cancelling the first."
+            }),
+        );
+        assert_eq!(next["ok"].as_bool(), Some(true));
+        assert_eq!(next["data"]["task_id"].as_str(), Some("cloud-after-cancel"));
+        assert_eq!(next["data"]["created_task"].as_bool(), Some(true));
+        assert_ne!(
+            next["data"]["task_id"].as_str(),
+            Some(first_task_id.as_str())
+        );
+    }
+
+    #[test]
+    fn agent_mcp_start_task_reuses_parked_task_id_for_resume() {
+        let repo = init_git_repo("mcp_start_parked_resume_same_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let context = crate::coordination::mcp::McpContext {
+            repo_path: Some(process_path_text(&repo)),
+            agent_id: Some(agent_id.clone()),
+            session_id: Some(session_id.clone()),
+            ..crate::coordination::mcp::McpContext::default()
+        };
+
+        let first_cloud_url = fake_cloud_mcp_url("cloud-parked-original", false);
+        let first = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": first_cloud_url.as_str(),
+                "plan": "Start work that will park on a dependency."
+            }),
+        );
+        assert_eq!(first["ok"].as_bool(), Some(true));
+        let task_id = first["data"]["task_id"].as_str().unwrap().to_string();
+
+        let now = now_rfc3339();
+        kernel
+            .conn
+            .execute(
+                "UPDATE tasks SET status='blocked', updated_at=?1 WHERE id=?2",
+                params![now, &task_id],
+            )
+            .unwrap();
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO task_resource_intents(
+                    id, task_id, resource_key, intent_summary, status, lease_id,
+                    depends_on_task_id, created_at, updated_at
+                 ) VALUES(?1, ?2, 'file:index.html', 'Waiting for dependency', 'parked', NULL, NULL, ?3, ?3)",
+                params![uuid(), &task_id, now_rfc3339()],
+            )
+            .unwrap();
+        kernel
+            .mark_task_resume_requested(
+                &task_id,
+                &session_id,
+                "test_terminal_resume_prompt_written",
+            )
+            .unwrap();
+        let resume_intent = kernel
+            .query_one(
+                "SELECT status FROM task_resource_intents WHERE task_id=?1 LIMIT 1",
+                &[&task_id],
+                "Resume intent missing.",
+            )
+            .unwrap();
+        assert_eq!(resume_intent["status"].as_str(), Some("resume_requested"));
+
+        let resume_cloud_url = fake_cloud_mcp_url("cloud-should-not-replace-parked", false);
+        let resumed = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": resume_cloud_url.as_str(),
+                "plan": "Resume the parked task after the dependency clears."
+            }),
+        );
+        assert_eq!(resumed["ok"].as_bool(), Some(true));
+        assert_eq!(resumed["data"]["task_id"].as_str(), Some(task_id.as_str()));
+        assert_eq!(
+            resumed["data"]["cloud_task_id"].as_str(),
+            Some(task_id.as_str())
+        );
+        assert_eq!(
+            resumed["data"]["task_id_source"].as_str(),
+            Some("cloud_confirmed_existing")
+        );
+        assert_eq!(resumed["data"]["reused_task"].as_bool(), Some(true));
+        assert_ne!(
+            resumed["data"]["task_id"].as_str(),
+            Some("cloud-should-not-replace-parked")
+        );
     }
 
     #[test]

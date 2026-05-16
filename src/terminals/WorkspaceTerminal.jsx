@@ -420,6 +420,11 @@ import {
   readTerminalStabilityRuntimeEnabled,
   sanitizeTerminalDiagnosticText,
 } from "./terminalStabilityRecovery.jsx";
+import WorkspaceThreadsOverlay from "../threads/WorkspaceThreadsOverlay.jsx";
+import {
+  createWorkspaceThreadId,
+  getWorkspaceThreadProviderBinding,
+} from "../threads/workspaceThreads";
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
@@ -469,6 +474,43 @@ const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
 const TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const TODO_DRAG_MIME = "application/x-diffforge-todo";
 let activeTerminalKeyboardTarget = null;
+
+function stripAnsiForSessionCapture(value) {
+  return String(value || "")
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[()][A-Za-z0-9]/g, "");
+}
+
+function extractNativeSessionIdFromOutput(agentId, text) {
+  const output = stripAnsiForSessionCapture(text);
+  const patterns = agentId === "codex"
+    ? [
+      /\bcodex(?:\.cmd|\.exe)?\s+resume\s+([0-9a-fA-F-]{8,}|[^\s"'`]+)/i,
+      /\bresume\s+([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b/i,
+    ]
+    : agentId === "claude"
+      ? [
+        /\bclaude(?:\.cmd|\.exe)?\s+--resume\s+([^\s"'`]+)/i,
+        /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
+      ]
+      : agentId === "opencode"
+        ? [
+          /\bopencode(?:\.cmd|\.exe)?\s+(?:--session|-s)\s+([^\s"'`]+)/i,
+          /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
+        ]
+        : [];
+
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    const sessionId = String(match?.[1] || "").trim();
+    if (sessionId) {
+      return sessionId;
+    }
+  }
+
+  return "";
+}
 
 const terminalKeyboardTargetMatches = (paneId, instanceId) => (
   activeTerminalKeyboardTarget?.paneId === paneId
@@ -839,6 +881,30 @@ function isTerminalGeneratedReplyInput(data) {
     || /^\x1b\[\??[0-9;]*c$/.test(text);
 }
 
+function terminalInputChunkHasVisibleText(data) {
+  return terminalInputChunkVisibleText(data).trim().length > 0;
+}
+
+function terminalInputChunkVisibleText(data) {
+  return String(data || "")
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/[\u0000-\u001F\u007F]/g, "");
+}
+
+function applyTerminalInputChunkToDraft(draft, data) {
+  const text = String(data || "");
+  if (text === "\x7f" || text === "\b") {
+    return draft.slice(0, -1);
+  }
+
+  const visibleText = terminalInputChunkVisibleText(text);
+  if (!visibleText) {
+    return draft;
+  }
+
+  return `${draft}${visibleText}`;
+}
+
 function getTerminalKeyDebugFields(event, extraFields = {}) {
   return {
     altKey: Boolean(event.altKey),
@@ -876,6 +942,36 @@ function getSafePaneToken(value) {
 
 export function getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId = "agent") {
   return `${WORKSPACE_TERMINAL_PANE_PREFIX}-${getSafePaneToken(workspaceId)}-${terminalIndex}-${agentId || "agent"}`;
+}
+
+function getNextThreadTerminalIndex(workspaceThreads, workspaceId) {
+  const usedIndexes = new Set();
+  const entry = workspaceThreads?.[workspaceId];
+
+  Object.values(entry?.threads || {}).forEach((thread) => {
+    const terminalIndex = Number.parseInt(
+      thread?.terminalIndex ?? thread?.terminalBinding?.terminalIndex,
+      10,
+    );
+    if (Number.isInteger(terminalIndex) && terminalIndex >= 0) {
+      usedIndexes.add(terminalIndex);
+    }
+  });
+
+  Object.values(entry?.terminals || {}).forEach((terminal) => {
+    const terminalIndex = Number.parseInt(terminal?.terminalIndex, 10);
+    if (Number.isInteger(terminalIndex) && terminalIndex >= 0) {
+      usedIndexes.add(terminalIndex);
+    }
+  });
+
+  for (let index = MAX_WORKSPACE_TERMINAL_COUNT; index < 60000; index += 1) {
+    if (!usedIndexes.has(index)) {
+      return index;
+    }
+  }
+
+  return MAX_WORKSPACE_TERMINAL_COUNT;
 }
 
 function getTerminalAgentKind(agentId) {
@@ -1109,17 +1205,24 @@ function WorkspaceTerminal({
   onRecheckAgents,
   onBeginTerminalDrag,
   onSplitTerminal,
+  onSelectWorkspaceThread,
+  onThreadTerminalLifecycle,
   onToggleFullscreenTerminal,
   prewarmShell = false,
   terminalIndex = 0,
   terminalCount = 1,
   terminalRole = "",
+  thread = null,
+  threadsViewActive = false,
   todoDropActive = false,
   todoDropTarget = false,
   useWebglRenderer = TERMINAL_ENABLE_WEBGL_RENDERER,
   workingDirectory,
   workspace,
   workspaceError,
+  workspaceThreads = {},
+  workspaces = [],
+  selectedWorkspaceThreadId = "",
 }) {
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
@@ -1130,6 +1233,7 @@ function WorkspaceTerminal({
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
+  const hiddenThreadTerminalsRef = useRef(new Map());
   const terminalActiveRef = useRef(Boolean(isActive));
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1161,7 +1265,18 @@ function WorkspaceTerminal({
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const terminalThreadId = thread?.id || "";
+  const terminalThreadSlotKey = thread?.slotKey
+    || String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
+  const terminalThreadActivityStatus = thread?.activityStatus || "idle";
+  const terminalThreadIdRef = useRef(terminalThreadId);
+  const terminalThreadSlotKeyRef = useRef(terminalThreadSlotKey);
+  const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
+  const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const threadProviderBinding = getWorkspaceThreadProviderBinding(thread, terminalAgentKind);
+  const threadProviderSessionId = threadProviderBinding?.nativeSessionId || "";
+  const threadProviderModel = threadProviderBinding?.modelId || "";
   const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
     agentKind: terminalAgentKind,
     isGenericTerminal,
@@ -1178,6 +1293,23 @@ function WorkspaceTerminal({
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
     : `${agent?.label || "Agent"} terminal`;
+  useEffect(() => {
+    terminalThreadIdRef.current = terminalThreadId;
+    terminalThreadSlotKeyRef.current = terminalThreadSlotKey;
+  }, [terminalThreadId, terminalThreadSlotKey]);
+  useEffect(() => {
+    terminalThreadActivityStatusRef.current = terminalThreadActivityStatus;
+  }, [terminalThreadActivityStatus]);
+  useEffect(() => () => {
+    hiddenThreadTerminalsRef.current.forEach((session) => {
+      invoke("terminal_close", {
+        instanceId: session.instanceId || undefined,
+        paneId: session.paneId,
+        preserveCoordinationSession: true,
+      }).catch(() => {});
+    });
+    hiddenThreadTerminalsRef.current.clear();
+  }, []);
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
     const terminal = xtermRef.current;
     if (!terminal) {
@@ -1223,6 +1355,329 @@ function WorkspaceTerminal({
         // Terminal may have been disposed between activation and the deferred focus pass.
       }
     }, 0);
+  }, []);
+  const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "") => {
+    if (isGenericTerminal) {
+      return;
+    }
+
+    terminalThreadActivityStatusRef.current = "thinking";
+    onThreadTerminalLifecycle?.({
+      agentId: agent?.id || terminalAgentKind,
+      instanceId,
+      paneId,
+      repoPath: workingDirectory || "",
+      slotKey: terminalThreadSlotKeyRef.current,
+      status: "active",
+      terminalIndex,
+      threadId: terminalThreadIdRef.current,
+      type: "message-submitted",
+      userMessage,
+      workspaceId: workspace?.id || "",
+      workspaceName: workspace?.name || "",
+    });
+  }, [
+    agent?.id,
+    isGenericTerminal,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    workingDirectory,
+    workspace?.id,
+    workspace?.name,
+  ]);
+  const submitWorkspaceThreadMessage = useCallback(async ({ message, model, thread: targetThread, workspace: targetWorkspace }) => {
+    const text = String(message || "").trim();
+    const modelId = String(model || "").trim();
+    const agentId = getTerminalAgentKind(targetThread?.currentAgent || terminalAgentKind);
+    const providerBinding = getWorkspaceThreadProviderBinding(targetThread, agentId);
+    const binding = providerBinding?.terminalBinding || targetThread?.terminalBinding;
+    if (!text || !binding?.paneId || !binding?.instanceId) {
+      throw new Error("No active terminal is bound to this thread.");
+    }
+
+    if (targetThread.id === terminalThreadIdRef.current) {
+      terminalThreadActivityStatusRef.current = "thinking";
+    }
+
+    const lifecycleEvent = {
+      agentId,
+      instanceId: binding.instanceId,
+      model: modelId,
+      modelSource: modelId ? "composer" : "",
+      paneId: binding.paneId,
+      repoPath: targetWorkspace?.id === workspace?.id
+        ? workingDirectory || ""
+        : targetThread.coordination?.worktreePath || workingDirectory || "",
+      slotKey: targetThread.slotKey || String(Math.max(0, Number.parseInt(targetThread.terminalIndex, 10) || 0) + 1),
+      status: "active",
+      terminalIndex: targetThread.terminalIndex ?? binding.terminalIndex,
+      threadId: targetThread.id,
+      type: "message-submitted",
+      userMessage: text,
+      workspaceId: targetThread.workspaceId || targetWorkspace?.id || workspace?.id || "",
+      workspaceName: targetWorkspace?.name || workspace?.name || "",
+    };
+
+    onThreadTerminalLifecycle?.(lifecycleEvent);
+
+    await invoke("terminal_write", {
+      data: `${text}\r`,
+      instanceId: binding.instanceId,
+      paneId: binding.paneId,
+      promptEventText: text,
+    });
+  }, [
+    onThreadTerminalLifecycle,
+    terminalAgentKind,
+    workingDirectory,
+    workspace?.id,
+    workspace?.name,
+  ]);
+  const createWorkspaceThreadChat = useCallback(async ({ agentId, message, model, workspace: targetWorkspace }) => {
+    const text = String(message || "").trim();
+    const nextAgentId = getTerminalAgentKind(agentId);
+    const targetWorkspaceId = targetWorkspace?.id || workspace?.id || "";
+    const targetWorkspaceName = targetWorkspace?.name || workspace?.name || "";
+
+    if (!text) {
+      throw new Error("Write a message before starting a chat.");
+    }
+
+    if (!["codex", "claude", "opencode"].includes(nextAgentId)) {
+      throw new Error("Choose a coding agent before starting a chat.");
+    }
+
+    if (!workspace?.id || targetWorkspaceId !== workspace.id) {
+      throw new Error("Open the workspace before starting a chat there.");
+    }
+
+    const terminalIndex = getNextThreadTerminalIndex(workspaceThreads, targetWorkspaceId);
+    const threadId = createWorkspaceThreadId(targetWorkspaceId, terminalIndex);
+    const paneId = getWorkspaceTerminalPaneId(targetWorkspaceId, terminalIndex, nextAgentId);
+    const instanceId = getNextWorkspaceTerminalInstanceId();
+    const slotKey = String(terminalIndex + 1);
+    const requestedModel = String(model || "").trim();
+    const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+    let providerSessionCaptureBuffer = "";
+    let capturedProviderSessionId = "";
+    let providerSessionPublished = false;
+    let threadMaterialized = false;
+    let activitySettled = false;
+
+    const publishProviderSession = (nativeSessionId) => {
+      if (!threadMaterialized || providerSessionPublished || !nativeSessionId) {
+        return;
+      }
+
+      providerSessionPublished = true;
+      onThreadTerminalLifecycle?.({
+        agentId: nextAgentId,
+        instanceId,
+        model: requestedModel,
+        modelSource: requestedModel ? "new-chat" : "",
+        nativeSessionId,
+        nativeSessionKind: "session",
+        nativeSessionSource: "terminal-output",
+        paneId,
+        terminalIndex,
+        threadId,
+        type: "provider-session",
+        workspaceId: targetWorkspaceId,
+      });
+    };
+
+    const outputChannel = new Channel((messageChunk) => {
+      const data = messageChunk instanceof ArrayBuffer
+        ? new Uint8Array(messageChunk)
+        : ArrayBuffer.isView(messageChunk)
+          ? new Uint8Array(messageChunk.buffer, messageChunk.byteOffset, messageChunk.byteLength)
+          : null;
+
+      if (!data?.byteLength) {
+        return;
+      }
+
+      const outputText = outputTextDecoder.decode(data, { stream: true });
+      const cleanOutputText = stripAnsiForSessionCapture(outputText);
+      if (!capturedProviderSessionId) {
+        providerSessionCaptureBuffer = stripAnsiForSessionCapture(
+          `${providerSessionCaptureBuffer}${cleanOutputText}`,
+        ).slice(-2400);
+        const nativeSessionId = extractNativeSessionIdFromOutput(
+          nextAgentId,
+          providerSessionCaptureBuffer,
+        );
+        if (nativeSessionId) {
+          capturedProviderSessionId = nativeSessionId;
+          publishProviderSession(nativeSessionId);
+        }
+      }
+
+      if (threadMaterialized && !activitySettled && cleanOutputText.trim()) {
+        activitySettled = true;
+        onThreadTerminalLifecycle?.({
+          activityStatus: "idle",
+          agentId: nextAgentId,
+          instanceId,
+          paneId,
+          terminalIndex,
+          threadId,
+          type: "agent-output",
+          workspaceId: targetWorkspaceId,
+        });
+      }
+    });
+
+    hiddenThreadTerminalsRef.current.set(paneId, {
+      instanceId,
+      outputChannel,
+      paneId,
+      threadId,
+    });
+
+    try {
+      const openResult = await invoke("terminal_open", {
+        request: {
+          paneId,
+          instanceId,
+          kind: nextAgentId,
+          provider: nextAgentId,
+          providerSessionId: "",
+          model: requestedModel,
+          plainShell: false,
+          preserveCoordinationSession: false,
+          slotKey,
+          terminalIndex,
+          threadId,
+          workingDirectory: workingDirectory || "",
+          workspaceId: targetWorkspaceId,
+          workspaceName: targetWorkspaceName,
+          cols: 100,
+          rows: 32,
+        },
+        outputChannel,
+      });
+
+      hiddenThreadTerminalsRef.current.set(paneId, {
+        instanceId: openResult?.instanceId || instanceId,
+        outputChannel,
+        paneId,
+        threadId,
+      });
+
+      onThreadTerminalLifecycle?.({
+        agentBranch: openResult?.agentBranch || "",
+        agentId: nextAgentId,
+        coordinationAgentId: openResult?.agentId || "",
+        coordinationMode: openResult?.coordinationMode || "",
+        instanceId: openResult?.instanceId || instanceId,
+        model: requestedModel,
+        modelSource: requestedModel ? "new-chat" : "",
+        paneId,
+        repoPath: workingDirectory || "",
+        sessionId: openResult?.sessionId || "",
+        slotKey: openResult?.slotKey || slotKey,
+        status: "active",
+        terminalIndex,
+        threadId,
+        title: text,
+        type: "message-submitted",
+        userMessage: text,
+        workspaceId: targetWorkspaceId,
+        workspaceName: targetWorkspaceName,
+        worktreePath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
+      });
+      threadMaterialized = true;
+      if (capturedProviderSessionId) {
+        publishProviderSession(capturedProviderSessionId);
+      }
+
+      await invoke("terminal_write", {
+        data: `${text}\r`,
+        instanceId: openResult?.instanceId || instanceId,
+        paneId,
+        promptEventText: text,
+      });
+
+      return {
+        threadId,
+        workspace: targetWorkspace || workspace,
+        workspaceId: targetWorkspaceId,
+      };
+    } catch (error) {
+      hiddenThreadTerminalsRef.current.delete(paneId);
+      invoke("terminal_close", {
+        instanceId,
+        paneId,
+        preserveCoordinationSession: false,
+      }).catch(() => {});
+      throw error;
+    }
+  }, [
+    onThreadTerminalLifecycle,
+    workingDirectory,
+    workspace,
+    workspaceThreads,
+  ]);
+  const changeWorkspaceThreadModel = useCallback(async ({ model, thread: targetThread }) => {
+    const nextModel = String(model || "").trim();
+    const agentId = getTerminalAgentKind(targetThread?.currentAgent || terminalAgentKind);
+    const providerBinding = getWorkspaceThreadProviderBinding(targetThread, agentId);
+    const binding = providerBinding?.terminalBinding || targetThread?.terminalBinding;
+    if (!nextModel || !binding?.paneId || !binding?.instanceId) {
+      throw new Error("No active terminal is bound to this thread.");
+    }
+
+    if (
+      nextModel.length > 120
+      || !nextModel.split("").every((character) => /[A-Za-z0-9._:/-]/.test(character))
+    ) {
+      throw new Error("Model id is invalid.");
+    }
+
+    const command = `/model ${nextModel}`;
+    await invoke("terminal_write", {
+      data: `${command}\r`,
+      instanceId: binding.instanceId,
+      paneId: binding.paneId,
+    });
+    onThreadTerminalLifecycle?.({
+      agentId,
+      instanceId: binding.instanceId,
+      model: nextModel,
+      modelId: nextModel,
+      modelSource: "user",
+      paneId: binding.paneId,
+      terminalIndex: targetThread.terminalIndex ?? binding.terminalIndex,
+      threadId: targetThread.id,
+      type: "model-selected",
+      workspaceId: targetThread.workspaceId || workspace?.id || "",
+    });
+  }, [onThreadTerminalLifecycle, terminalAgentKind, workspace?.id]);
+  const changeWorkspaceThreadAgent = useCallback(async ({ agentId, thread: targetThread, workspace: targetWorkspace }) => {
+    const nextAgentId = getTerminalAgentKind(agentId);
+    const targetTerminalIndex = Number.parseInt(
+      targetThread?.terminalIndex ?? targetThread?.terminalBinding?.terminalIndex,
+      10,
+    );
+    if (!targetThread?.id || !targetThread?.workspaceId || !Number.isInteger(targetTerminalIndex)) {
+      throw new Error("This thread is not attached to a workspace terminal slot.");
+    }
+
+    onChangeTerminalRole?.({
+      role: nextAgentId,
+      source: "thread_agent_switch",
+      terminalIndex: targetTerminalIndex,
+      threadId: targetThread.id,
+      workspaceId: targetThread.workspaceId || targetWorkspace?.id || workspace?.id || "",
+    });
+  }, [onChangeTerminalRole, workspace?.id]);
+  const handleThreadsViewActiveThreadChange = useCallback((selection = {}) => {
+    threadsViewSelectedThreadRef.current = selection?.thread
+      ? selection
+      : null;
   }, []);
   const activateTerminalPane = useCallback((source = "terminal_activation") => {
     const instanceId = terminalInstanceIdRef.current || 0;
@@ -5443,6 +5898,9 @@ function WorkspaceTerminal({
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
+        const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+        let providerSessionCaptureBuffer = "";
+        let capturedProviderSessionId = threadProviderSessionId || "";
         const outputChannel = new Channel((message) => {
           if (isDisposed) {
             return;
@@ -5566,6 +6024,31 @@ function WorkspaceTerminal({
             return;
           }
 
+          if (!capturedProviderSessionId && !isGenericTerminal && terminalThreadIdRef.current) {
+            providerSessionCaptureBuffer = stripAnsiForSessionCapture(
+              `${providerSessionCaptureBuffer}${outputTextDecoder.decode(terminalData, { stream: true })}`,
+            ).slice(-2400);
+            const nativeSessionId = extractNativeSessionIdFromOutput(
+              terminalAgentKind,
+              providerSessionCaptureBuffer,
+            );
+            if (nativeSessionId) {
+              capturedProviderSessionId = nativeSessionId;
+              onThreadTerminalLifecycle?.({
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                nativeSessionId,
+                nativeSessionKind: "session",
+                nativeSessionSource: "terminal-output",
+                paneId,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current,
+                type: "provider-session",
+                workspaceId: workspace?.id || "",
+              });
+            }
+          }
+
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
           outputBytes += terminalData.byteLength;
@@ -5576,6 +6059,24 @@ function WorkspaceTerminal({
             ? outputByteStats.visibleChars
             : getTerminalOutputVisibleCharCount(terminalData, 1);
           const hasVisibleOutput = visibleChars > 0;
+          if (
+            hasVisibleOutput
+            && !isGenericTerminal
+            && terminalThreadIdRef.current
+            && terminalThreadActivityStatusRef.current === "thinking"
+          ) {
+            terminalThreadActivityStatusRef.current = "idle";
+            onThreadTerminalLifecycle?.({
+              activityStatus: "idle",
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current,
+              type: "agent-output",
+              workspaceId: workspace?.id || "",
+            });
+          }
           const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
           const shouldCollectOutputDebug = isFirstOutputChunk
             || isFirstVisibleOutputChunk;
@@ -5667,6 +6168,14 @@ function WorkspaceTerminal({
                 ? "Process ended."
                 : `Process exited with code ${event.payload.exitCode}.`,
             );
+            onThreadTerminalLifecycle?.({
+              instanceId: terminalInstanceId,
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current,
+              type: "exited",
+              workspaceId: workspace?.id || "",
+            });
           }
         }));
         disposables.push(await listen(TERMINAL_INPUT_ERROR_EVENT, (event) => {
@@ -5681,6 +6190,8 @@ function WorkspaceTerminal({
         let terminalInputBuffer = "";
         let terminalInputFlushTimer = 0;
         let terminalInputWriteChain = Promise.resolve();
+        let terminalSubmittedInputHasText = false;
+        let terminalSubmittedInputText = "";
         const writeTerminalInputChunk = (data, reason) => {
           const isEscapeInput = String(data || "").includes("\x1b");
           const escapeDebugFields = isEscapeInput
@@ -5809,6 +6320,27 @@ function WorkspaceTerminal({
             });
           }
 
+          if (!startupControlReply && terminalInputChunkHasVisibleText(safeData)) {
+            terminalSubmittedInputHasText = true;
+          }
+          if (!startupControlReply) {
+            terminalSubmittedInputText = applyTerminalInputChunkToDraft(
+              terminalSubmittedInputText,
+              safeData,
+            );
+          }
+          const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
+          if (!startupControlReply && isSubmitInput) {
+            if (terminalSubmittedInputHasText) {
+              recordSubmittedAgentMessage(
+                terminalInstanceId,
+                terminalSubmittedInputText.trim(),
+              );
+            }
+            terminalSubmittedInputHasText = false;
+            terminalSubmittedInputText = "";
+          }
+
           if (safeData.startsWith("\x1b")) {
             flushTerminalInput("escape_sequence_flush_before");
             writeTerminalInputChunk(
@@ -5827,12 +6359,11 @@ function WorkspaceTerminal({
             || safeData === "\b"
             || safeData === "\x1b[3~";
           if (
-            safeData.includes("\r")
-            || safeData.includes("\n")
+            isSubmitInput
             || terminalInputBuffer.length >= TERMINAL_INPUT_BATCH_MAX_CHARS
           ) {
             flushTerminalInput(
-              safeData.includes("\r") || safeData.includes("\n")
+              isSubmitInput
                 ? "submit"
                 : "buffer_limit",
             );
@@ -6101,11 +6632,13 @@ function WorkspaceTerminal({
               instanceId: terminalInstanceId,
               kind: openKind,
               provider: openProvider,
-              model: "",
+              providerSessionId: threadProviderSessionId,
+              model: threadProviderModel,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
-              slotKey: String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1),
+              slotKey: terminalThreadSlotKeyRef.current,
               terminalIndex,
+              threadId: terminalThreadIdRef.current,
               workingDirectory: workingDirectory || "",
               workspaceId: workspace?.id || "",
               workspaceName: workspace?.name || "",
@@ -6147,6 +6680,25 @@ function WorkspaceTerminal({
         hasOpenPty = true;
         startupControlReplyBridgeOpen = false;
         setTerminalLaunchInfo(openResult || null);
+        terminalThreadSlotKeyRef.current = openResult?.slotKey || terminalThreadSlotKeyRef.current;
+        onThreadTerminalLifecycle?.({
+          agentBranch: openResult?.agentBranch || "",
+          agentId: agent?.id || terminalAgentKind,
+          coordinationAgentId: openResult?.agentId || "",
+          coordinationMode: openResult?.coordinationMode || "",
+          instanceId: terminalInstanceId,
+          model: threadProviderModel,
+          modelSource: threadProviderModel ? "session-restore" : "",
+          paneId,
+          sessionId: openResult?.sessionId || "",
+          slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
+          status: shouldPrewarmShell ? "starting" : "active",
+          terminalIndex,
+          threadId: terminalThreadIdRef.current,
+          type: "opened",
+          workspaceId: workspace?.id || "",
+          worktreePath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
+        });
         if (shouldPrewarmShell) {
           runtimeTerminalState = "prewarmed";
           setTerminalState("prewarmed");
@@ -6178,6 +6730,26 @@ function WorkspaceTerminal({
 
         focusTerminalKeyboardInput();
 
+        if (
+          threadProviderModel
+          && threadProviderSessionId
+          && !isGenericTerminal
+          && !shouldPrewarmShell
+        ) {
+          const restoreModelCommand = `/model ${threadProviderModel}`;
+          window.setTimeout(() => {
+            if (isDisposed) {
+              return;
+            }
+
+            invoke("terminal_write", {
+              data: `${restoreModelCommand}\r`,
+              instanceId: terminalInstanceId,
+              paneId,
+            }).catch(() => {});
+          }, 650);
+        }
+
         if (shouldPrewarmShell) {
           onPreparedTerminalChange?.({
             agentId: agent.id,
@@ -6185,6 +6757,7 @@ function WorkspaceTerminal({
             paneId,
             ready: true,
             terminalIndex,
+            threadId: terminalThreadIdRef.current,
             workspaceId: workspace?.id || "",
           });
 
@@ -6207,6 +6780,14 @@ function WorkspaceTerminal({
           const errorMessage = getErrorMessage(error, `Unable to launch ${agent.label}.`);
           setPaneStage("error", "Terminal Launch Failed", errorMessage);
           setTerminalError(errorMessage);
+          onThreadTerminalLifecycle?.({
+            agentId: agent?.id || terminalAgentKind,
+            paneId,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current,
+            type: "error",
+            workspaceId: workspace?.id || "",
+          });
         }
       }
     }
@@ -6254,6 +6835,7 @@ function WorkspaceTerminal({
         paneId,
         ready: false,
         terminalIndex,
+        threadId: terminalThreadIdRef.current,
         workspaceId: workspace?.id || "",
       });
       clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceId);
@@ -6266,7 +6848,7 @@ function WorkspaceTerminal({
       }).catch(() => {});
       terminal.dispose();
     };
-  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, paneId, requestTerminalAudioInputTarget, restartKey, terminalAgentKind, terminalClosed, terminalRoleId, terminalScrollStabilityMode, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, isGenericTerminal, onPreparedTerminalChange, onThreadTerminalLifecycle, paneId, recordSubmittedAgentMessage, requestTerminalAudioInputTarget, restartKey, terminalAgentKind, terminalClosed, terminalRoleId, terminalScrollStabilityMode, threadProviderModel, threadProviderSessionId, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
 
   const [terminalDropActive, setTerminalDropActive] = useState(false);
 
@@ -6335,17 +6917,19 @@ function WorkspaceTerminal({
     }
 
     setTerminalError("");
+    recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt);
 
     try {
       await invoke("terminal_write", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
         data: `${prompt}${isGenericTerminal ? "" : "\r"}`,
+        promptEventText: prompt,
       });
     } catch (error) {
       setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
     }
-  }, [isGenericTerminal, paneId, terminalClosed, terminalClosing]);
+  }, [isGenericTerminal, paneId, recordSubmittedAgentMessage, terminalClosed, terminalClosing]);
 
   const pointerTodoDropVisible = Boolean(todoDropActive) && !terminalClosed && !terminalClosing;
   const nativeTodoDropVisible = terminalDropActive && !terminalClosed && !terminalClosing;
@@ -6395,12 +6979,21 @@ function WorkspaceTerminal({
       title: "Terminal Closed",
       visible: false,
     });
+    onThreadTerminalLifecycle?.({
+      instanceId: terminalInstanceIdRef.current || undefined,
+      paneId,
+      terminalIndex,
+      threadId: terminalThreadIdRef.current,
+      type: "closed",
+      workspaceId: workspace?.id || "",
+    });
     onCloseTerminal?.({
       paneId,
+      threadId: terminalThreadIdRef.current,
       terminalIndex,
       workspaceId: workspace?.id || "",
     });
-  }, [onCloseTerminal, paneId, terminalClosed, terminalIndex, workspace?.id]);
+  }, [onCloseTerminal, onThreadTerminalLifecycle, paneId, terminalClosed, terminalIndex, workspace?.id]);
 
   const cancelParkedPrompt = useCallback(async () => {
     if (!parkedPrompt?.taskId || terminalClosingRef.current) {
@@ -6436,6 +7029,31 @@ function WorkspaceTerminal({
     const nextRoleId = String(roleId || terminalAgentKind).toLowerCase();
     setRestartRoleMenuOpen(false);
 
+    if (threadsViewActive) {
+      const selectedThread = threadsViewSelectedThreadRef.current?.thread || thread;
+      const selectedWorkspaceId = selectedThread?.workspaceId
+        || threadsViewSelectedThreadRef.current?.workspaceId
+        || workspace?.id
+        || "";
+      const selectedTerminalIndex = Number.parseInt(
+        selectedThread?.terminalIndex ?? selectedThread?.terminalBinding?.terminalIndex,
+        10,
+      );
+
+      if (!selectedThread?.id || !selectedWorkspaceId || !Number.isInteger(selectedTerminalIndex)) {
+        return;
+      }
+
+      onChangeTerminalRole?.({
+        role: nextRoleId,
+        source: "thread_restart_menu",
+        terminalIndex: selectedTerminalIndex,
+        threadId: selectedThread.id,
+        workspaceId: selectedWorkspaceId,
+      });
+      return;
+    }
+
     if (nextRoleId && nextRoleId !== terminalAgentKind) {
       onChangeTerminalRole?.({
         role: nextRoleId,
@@ -6458,11 +7076,20 @@ function WorkspaceTerminal({
       visible: true,
     });
     setRestartKey((key) => key + 1);
-  }, [isGenericTerminal, onChangeTerminalRole, terminalAgentKind, terminalClosing, terminalIndex, workspace?.id]);
+  }, [
+    isGenericTerminal,
+    onChangeTerminalRole,
+    terminalAgentKind,
+    terminalClosing,
+    terminalIndex,
+    thread,
+    threadsViewActive,
+    workspace?.id,
+  ]);
 
-  const canSplitTerminal = terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
+  const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
   const splitTerminal = useCallback((direction) => {
-    if (terminalClosed || terminalClosing || !canSplitTerminal) {
+    if (threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal) {
       return;
     }
 
@@ -6479,6 +7106,7 @@ function WorkspaceTerminal({
     terminalClosed,
     terminalClosing,
     terminalIndex,
+    threadsViewActive,
     workspace?.id,
   ]);
   const splitTerminalHorizontal = useCallback(() => {
@@ -6510,6 +7138,7 @@ function WorkspaceTerminal({
     terminalIndex,
     workspace?.id,
   ]);
+  const handleTerminalCloseButtonClick = threadsViewActive ? toggleTerminalFullscreen : closeTerminal;
   const beginTerminalDrag = useCallback((event) => {
     if (
       terminalClosed
@@ -6555,6 +7184,8 @@ function WorkspaceTerminal({
   ].filter(Boolean);
   const hasTerminalStatusError = terminalStatusErrorDetails.length > 0;
   const isTerminalStatusErrorOverlay = hasTerminalStatusError || terminalState === "error";
+  const isTerminalStatusFinalOverlay = terminalState === "exited";
+  const showTerminalStatusSpinner = !isTerminalStatusErrorOverlay && !isTerminalStatusFinalOverlay;
   const showTerminalStatusOverlay = Boolean(
     (isTerminalStatusErrorOverlay || terminalStatus?.visible)
     && !terminalClosed
@@ -6631,6 +7262,10 @@ function WorkspaceTerminal({
       ref={containerRef}
     />
   );
+  const restartMenuThread = threadsViewSelectedThreadRef.current?.thread || thread;
+  const restartMenuAgentKind = threadsViewActive
+    ? getTerminalAgentKind(restartMenuThread?.currentAgent || terminalAgentKind)
+    : terminalAgentKind;
 
   return (
     <TerminalWorkspaceSurface
@@ -6639,6 +7274,7 @@ function WorkspaceTerminal({
       data-terminal-fullscreen={isFullscreen ? "true" : undefined}
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
       data-terminal-index={terminalIndex}
+      data-threads-view={threadsViewActive ? "true" : undefined}
       onFocusCapture={handleTerminalSurfaceFocusCapture}
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
       ref={surfaceRef}
@@ -6662,27 +7298,27 @@ function WorkspaceTerminal({
         </TerminalRestartButton>
         <TerminalRestartButton
           aria-label="Split terminal horizontally"
-          disabled={terminalClosed || terminalClosing || !canSplitTerminal}
+          disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
           onClick={splitTerminalHorizontal}
-          title={canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
+          title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
           type="button"
         >
           <ButtonSplitHorizontalIcon aria-hidden="true" />
         </TerminalRestartButton>
         <TerminalRestartButton
           aria-label="Split terminal vertically"
-          disabled={terminalClosed || terminalClosing || !canSplitTerminal}
+          disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
           onClick={splitTerminalVertical}
-          title={canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
+          title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
           type="button"
         >
           <ButtonSplitVerticalIcon aria-hidden="true" />
         </TerminalRestartButton>
         <TerminalRestartButton
-          aria-label={isFullscreen ? "Exit terminal fullscreen" : "Make terminal fullscreen"}
+          aria-label={isFullscreen ? "Exit terminal fullscreen" : "Open terminal threads"}
           disabled={terminalClosed || terminalClosing}
           onClick={toggleTerminalFullscreen}
-          title={isFullscreen ? "Exit fullscreen" : "Make terminal fullscreen"}
+          title={isFullscreen ? "Exit fullscreen" : "Open terminal threads"}
           type="button"
         >
           {isFullscreen ? (
@@ -6698,10 +7334,10 @@ function WorkspaceTerminal({
           <TerminalRestartButton
             aria-expanded={restartRoleMenuOpen ? "true" : "false"}
             aria-haspopup="menu"
-            aria-label="Restart terminal"
-            disabled={terminalClosing}
+            aria-label={threadsViewActive ? "Switch thread agent" : "Restart terminal"}
+            disabled={terminalClosed || terminalClosing}
             onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
-            title="Restart terminal or choose runtime"
+            title={threadsViewActive ? "Switch selected thread agent" : "Restart terminal or choose runtime"}
             type="button"
           >
             <ButtonRefreshIcon aria-hidden="true" />
@@ -6710,23 +7346,31 @@ function WorkspaceTerminal({
             {getTerminalRoleSwitchOptions(agentStatuses).map((option) => (
               <TerminalRestartOption
                 data-role={option.id}
-                data-selected={option.id === terminalAgentKind ? "true" : "false"}
+                data-selected={option.id === restartMenuAgentKind ? "true" : "false"}
                 key={option.id}
                 onClick={() => restartTerminalAs(option.id)}
                 role="menuitem"
-                title={`Restart as ${option.label}`}
+                title={threadsViewActive ? `Switch selected thread to ${option.label}` : `Restart as ${option.label}`}
                 type="button"
               >
-                <strong>{option.id === terminalAgentKind ? `Restart ${option.label}` : option.label}</strong>
+                <strong>
+                  {threadsViewActive
+                    ? option.id === restartMenuAgentKind
+                      ? `${option.label} selected`
+                      : `Switch to ${option.label}`
+                    : option.id === terminalAgentKind
+                      ? `Restart ${option.label}`
+                      : option.label}
+                </strong>
               </TerminalRestartOption>
             ))}
           </TerminalRestartDropdown>
         </TerminalRestartMenu>
         <TerminalCloseButton
-          aria-label="Close terminal"
+          aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
           disabled={terminalClosed || terminalClosing}
-          onClick={closeTerminal}
-          title="Close terminal"
+          onClick={handleTerminalCloseButtonClick}
+          title={threadsViewActive ? "Exit threads view" : "Close terminal"}
           type="button"
         >
           <ButtonCloseIcon aria-hidden="true" />
@@ -6749,6 +7393,20 @@ function WorkspaceTerminal({
         ) : (
           <>
             {xtermSurface}
+            <WorkspaceThreadsOverlay
+              agentStatuses={agentStatuses}
+              onActiveThreadChange={handleThreadsViewActiveThreadChange}
+              onClose={toggleTerminalFullscreen}
+              onCreateChat={createWorkspaceThreadChat}
+              onSelectModel={changeWorkspaceThreadModel}
+              onSelectThread={onSelectWorkspaceThread}
+              onSubmitMessage={submitWorkspaceThreadMessage}
+              open={threadsViewActive}
+              selectedThreadId={selectedWorkspaceThreadId || terminalThreadId}
+              selectedWorkspaceId={workspace?.id || ""}
+              workspaceThreads={workspaceThreads}
+              workspaces={workspaces}
+            />
             {showTerminalStatusOverlay && (
               <TerminalStatusOverlay
                 aria-live={isTerminalStatusErrorOverlay ? "assertive" : "polite"}
@@ -6759,7 +7417,7 @@ function WorkspaceTerminal({
                 role="status"
               >
                 <div>
-                  {!isTerminalStatusErrorOverlay && <TerminalStatusSpinner aria-hidden="true" />}
+                  {showTerminalStatusSpinner && <TerminalStatusSpinner aria-hidden="true" />}
                   {terminalStatusMode !== "compact" && (
                     <TerminalStatusCopy>
                       <strong>{terminalStatusTitle}</strong>

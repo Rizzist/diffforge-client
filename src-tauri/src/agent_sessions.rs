@@ -1,0 +1,1561 @@
+const CODEX_TRANSCRIPT_DEFAULT_LIMIT: usize = 260;
+const CODEX_TRANSCRIPT_MAX_LIMIT: usize = 420;
+const CODEX_TRANSCRIPT_MAX_TEXT: usize = 12_000;
+const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 8_000;
+const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadTranscriptRequest {
+    agent_id: Option<String>,
+    provider_session_id: Option<String>,
+    cwd: Option<String>,
+    max_messages: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadTranscriptMessage {
+    id: String,
+    role: String,
+    kind: String,
+    text: String,
+    title: String,
+    call_id: String,
+    created_at: String,
+    source: String,
+}
+
+#[derive(Clone)]
+struct CodexRolloutMeta {
+    session_id: String,
+    cwd: String,
+    latest_timestamp: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadTranscriptResult {
+    session_id: String,
+    session_title: String,
+    rollout_path: String,
+    cwd: String,
+    matched_by: String,
+    latest_timestamp: String,
+    messages: Vec<CodexThreadTranscriptMessage>,
+}
+
+fn codex_home_dir() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+fn clean_codex_id(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .trim()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | ':' | '/')
+        })
+        .take(180)
+        .collect()
+}
+
+fn normalize_codex_path_text(value: impl AsRef<str>) -> String {
+    let text = value.as_ref().trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let path = PathBuf::from(text);
+    let path = path.canonicalize().unwrap_or(path);
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    while normalized.ends_with('/') && normalized.len() > 1 {
+        normalized.pop();
+    }
+
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn codex_paths_match(left: &str, right: &str) -> bool {
+    let left = normalize_codex_path_text(left);
+    let right = normalize_codex_path_text(right);
+    !left.is_empty() && left == right
+}
+
+fn collect_codex_rollout_files(root: &Path, files: &mut Vec<PathBuf>) {
+    if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+            return;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_rollout_files(&path, files);
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn sort_rollouts_newest_first(files: &mut [PathBuf]) {
+    files.sort_by(|left, right| {
+        let left_modified = fs::metadata(left).and_then(|metadata| metadata.modified()).ok();
+        let right_modified = fs::metadata(right).and_then(|metadata| metadata.modified()).ok();
+        right_modified.cmp(&left_modified)
+    });
+}
+
+fn value_string(value: Option<&Value>) -> String {
+    value.and_then(Value::as_str).unwrap_or_default().trim().to_string()
+}
+
+fn first_value_string(values: &[Option<&Value>]) -> String {
+    values
+        .iter()
+        .map(|value| value_string(*value))
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars().take(max_chars) {
+        output.push(character);
+    }
+    output
+}
+
+fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remainder = text;
+
+    while let Some(index) = remainder.find(prefix) {
+        output.push_str(&remainder[..index]);
+        output.push_str(prefix);
+        output.push_str("[redacted]");
+        let secret_start = index + prefix.len();
+        let secret_tail = &remainder[secret_start..];
+        let secret_end = secret_tail
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+                    )
+            })
+            .unwrap_or(secret_tail.len());
+        remainder = &secret_tail[secret_end..];
+    }
+
+    output.push_str(remainder);
+    output
+}
+
+fn redact_codex_transcript_secrets(text: &str) -> String {
+    [
+        "sk-proj-",
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "glpat-",
+    ]
+    .iter()
+    .fold(text.to_string(), |current, prefix| {
+        redact_prefixed_secret(&current, prefix)
+    })
+}
+
+fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> String {
+    let redacted = redact_codex_transcript_secrets(value.as_ref());
+    let mut output = String::with_capacity(redacted.len().min(max_chars));
+    let mut previous_was_newline = false;
+    let mut blank_lines = 0usize;
+
+    for character in redacted.chars() {
+        let character = match character {
+            '\r' => '\n',
+            '\n' | '\t' => character,
+            value if value.is_control() => ' ',
+            value => value,
+        };
+
+        if character == '\n' {
+            if previous_was_newline {
+                blank_lines += 1;
+                if blank_lines > 2 {
+                    continue;
+                }
+            } else {
+                blank_lines = 0;
+            }
+            previous_was_newline = true;
+        } else if !character.is_whitespace() {
+            previous_was_newline = false;
+            blank_lines = 0;
+        }
+
+        output.push(character);
+        if output.chars().count() >= max_chars {
+            break;
+        }
+    }
+
+    output.trim().to_string()
+}
+
+fn clean_codex_title(value: impl AsRef<str>, fallback: &str) -> String {
+    let title = clean_codex_transcript_text(value, 160)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        fallback.to_string()
+    } else if title.chars().count() > 96 {
+        format!("{}...", truncate_chars(&title, 93).trim())
+    } else {
+        title
+    }
+}
+
+fn codex_content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(codex_content_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => {
+            for key in ["text", "input_text", "output_text", "message"] {
+                if let Some(text) = object.get(key).and_then(Value::as_str) {
+                    return text.to_string();
+                }
+            }
+
+            if let Some(content) = object.get("content") {
+                return codex_content_text(content);
+            }
+
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn codex_summary_text(payload: &Value) -> String {
+    let Some(summary) = payload.get("summary") else {
+        return String::new();
+    };
+
+    codex_content_text(summary)
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn parse_call_arguments(arguments: &Value) -> Option<Value> {
+    if let Some(arguments) = arguments.as_str() {
+        return serde_json::from_str(arguments).ok();
+    }
+
+    if arguments.is_object() || arguments.is_array() {
+        return Some(arguments.clone());
+    }
+
+    None
+}
+
+fn command_title(command: &str, fallback: &str) -> String {
+    let first_line = command.lines().next().unwrap_or(command).trim();
+    if first_line.is_empty() {
+        return fallback.to_string();
+    }
+
+    format!("Ran {}", clean_codex_title(first_line, fallback))
+}
+
+fn codex_function_call_message(
+    line_index: usize,
+    timestamp: &str,
+    payload: &Value,
+) -> Option<CodexThreadTranscriptMessage> {
+    let name = value_string(payload.get("name"));
+    let call_id = value_string(payload.get("call_id"));
+    let arguments = payload.get("arguments").unwrap_or(&Value::Null);
+    let parsed_arguments = parse_call_arguments(arguments);
+    let fallback_title = if name.is_empty() {
+        "Called tool".to_string()
+    } else {
+        format!("Called {name}")
+    };
+
+    let (title, text) = if name == "shell_command" {
+        let command = parsed_arguments
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let workdir = parsed_arguments
+            .as_ref()
+            .and_then(|value| value.get("workdir"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let timeout = parsed_arguments
+            .as_ref()
+            .and_then(|value| value.get("timeout_ms"))
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        if !command.trim().is_empty() {
+            lines.push(format!("$ {}", command.trim()));
+        }
+        if !workdir.trim().is_empty() {
+            lines.push(format!("workdir: {}", workdir.trim()));
+        }
+        if !timeout.trim().is_empty() {
+            lines.push(format!("timeout: {timeout} ms"));
+        }
+        (
+            command_title(command, "Ran command"),
+            lines.join("\n"),
+        )
+    } else {
+        let text = parsed_arguments
+            .as_ref()
+            .map(pretty_json)
+            .unwrap_or_else(|| codex_content_text(arguments));
+        (fallback_title, text)
+    };
+
+    let text = clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    if text.is_empty() && title.is_empty() {
+        return None;
+    }
+
+    Some(CodexThreadTranscriptMessage {
+        id: format!("codex-{line_index}-tool-call"),
+        role: "activity".to_string(),
+        kind: "tool_call".to_string(),
+        text,
+        title: clean_codex_title(title, "Called tool"),
+        call_id,
+        created_at: timestamp.to_string(),
+        source: "codex".to_string(),
+    })
+}
+
+fn codex_function_output_message(
+    line_index: usize,
+    timestamp: &str,
+    payload: &Value,
+) -> Option<CodexThreadTranscriptMessage> {
+    let call_id = value_string(payload.get("call_id"));
+    let output = clean_codex_transcript_text(
+        codex_content_text(payload.get("output").unwrap_or(&Value::Null)),
+        CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+    );
+
+    if output.is_empty() {
+        return None;
+    }
+
+    Some(CodexThreadTranscriptMessage {
+        id: format!("codex-{line_index}-tool-output"),
+        role: "activity".to_string(),
+        kind: "tool_output".to_string(),
+        text: output,
+        title: "Tool output".to_string(),
+        call_id,
+        created_at: timestamp.to_string(),
+        source: "codex".to_string(),
+    })
+}
+
+fn codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in std::io::BufRead::lines(reader).take(120).flatten() {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let latest_timestamp = value_string(value.get("timestamp"));
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        return Some(CodexRolloutMeta {
+            session_id: clean_codex_id(value_string(payload.get("id"))),
+            cwd: value_string(payload.get("cwd")),
+            latest_timestamp,
+            title: String::new(),
+        });
+    }
+
+    None
+}
+
+fn push_codex_message(
+    messages: &mut Vec<CodexThreadTranscriptMessage>,
+    seen: &mut HashSet<String>,
+    message: Option<CodexThreadTranscriptMessage>,
+) {
+    let Some(message) = message else {
+        return;
+    };
+    if message.text.trim().is_empty() && message.title.trim().is_empty() {
+        return;
+    }
+
+    let key = if !message.call_id.is_empty() {
+        format!(
+            "{}:{}:{}:{}",
+            message.role,
+            message.kind,
+            message.call_id,
+            message.text
+        )
+    } else {
+        format!("{}:{}:{}", message.role, message.kind, message.text)
+    };
+    if !seen.insert(key) {
+        return;
+    }
+
+    messages.push(message);
+}
+
+fn codex_messages_from_event(
+    line_index: usize,
+    timestamp: &str,
+    payload: &Value,
+) -> Vec<CodexThreadTranscriptMessage> {
+    let event_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+    match event_type {
+        "user_message" => {
+            let mut text = value_string(payload.get("message"));
+            let image_count = payload
+                .get("images")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+                + payload
+                    .get("local_images")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+            if image_count > 0 {
+                if !text.trim().is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("[{image_count} image attachment(s)]"));
+            }
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-user"),
+                role: "user".to_string(),
+                kind: "message".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT),
+                title: String::new(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+            }]
+        }
+        "agent_message" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-assistant-event"),
+            role: "assistant".to_string(),
+            kind: "message".to_string(),
+            text: clean_codex_transcript_text(
+                value_string(payload.get("message")),
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            ),
+            title: String::new(),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+        }],
+        "task_complete" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-task-complete"),
+            role: "assistant".to_string(),
+            kind: "message".to_string(),
+            text: clean_codex_transcript_text(
+                value_string(payload.get("last_agent_message")),
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            ),
+            title: String::new(),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+        }],
+        "patch_apply_end" => {
+            let success = payload.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let stdout = value_string(payload.get("stdout"));
+            let stderr = value_string(payload.get("stderr"));
+            let text = [stdout, stderr]
+                .into_iter()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-patch"),
+                role: "activity".to_string(),
+                kind: "patch".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: if success { "Patch applied" } else { "Patch failed" }.to_string(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+            }]
+        }
+        "context_compacted" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-compact"),
+            role: "activity".to_string(),
+            kind: "context".to_string(),
+            text: "Context compacted".to_string(),
+            title: "Context compacted".to_string(),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+        }],
+        "mcp_tool_call_end" => {
+            let invocation = payload.get("invocation").unwrap_or(&Value::Null);
+            let server = value_string(invocation.get("server"));
+            let tool = value_string(invocation.get("tool"));
+            let mut title = String::from("MCP tool");
+            if !server.is_empty() || !tool.is_empty() {
+                title = format!(
+                    "MCP {}{}",
+                    server,
+                    if tool.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" / {tool}")
+                    }
+                );
+            }
+            let text = payload
+                .get("result")
+                .map(pretty_json)
+                .or_else(|| payload.get("error").map(pretty_json))
+                .unwrap_or_default();
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-mcp"),
+                role: "activity".to_string(),
+                kind: "tool_output".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: clean_codex_title(title, "MCP tool"),
+                call_id: value_string(invocation.get("call_id")),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn codex_messages_from_response_item(
+    line_index: usize,
+    timestamp: &str,
+    payload: &Value,
+) -> Vec<CodexThreadTranscriptMessage> {
+    let item_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+    match item_type {
+        "message" => {
+            let role = payload.get("role").and_then(Value::as_str).unwrap_or_default();
+            if role != "assistant" {
+                return Vec::new();
+            }
+
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-assistant"),
+                role: "assistant".to_string(),
+                kind: "message".to_string(),
+                text: clean_codex_transcript_text(
+                    codex_content_text(payload.get("content").unwrap_or(&Value::Null)),
+                    CODEX_TRANSCRIPT_MAX_TEXT,
+                ),
+                title: String::new(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+            }]
+        }
+        "function_call" | "custom_tool_call" => {
+            codex_function_call_message(line_index, timestamp, payload)
+                .into_iter()
+                .collect()
+        }
+        "function_call_output" | "custom_tool_call_output" => {
+            codex_function_output_message(line_index, timestamp, payload)
+                .into_iter()
+                .collect()
+        }
+        "web_search_call" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-web-search"),
+            role: "activity".to_string(),
+            kind: "web".to_string(),
+            text: clean_codex_transcript_text(pretty_json(payload), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: "Searched web".to_string(),
+            call_id: value_string(payload.get("id")),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+        }],
+        "reasoning" => {
+            let summary = clean_codex_transcript_text(
+                codex_summary_text(payload),
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            if summary.is_empty() {
+                Vec::new()
+            } else {
+                vec![CodexThreadTranscriptMessage {
+                    id: format!("codex-{line_index}-reasoning"),
+                    role: "activity".to_string(),
+                    kind: "reasoning".to_string(),
+                    text: summary,
+                    title: "Reasoning".to_string(),
+                    call_id: String::new(),
+                    created_at: timestamp.to_string(),
+                    source: "codex".to_string(),
+                }]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_codex_rollout(
+    path: &Path,
+    max_messages: usize,
+) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Unable to open Codex rollout {}: {error}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut meta = CodexRolloutMeta {
+        session_id: String::new(),
+        cwd: String::new(),
+        latest_timestamp: String::new(),
+        title: String::new(),
+    };
+    let mut messages = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value_string(value.get("timestamp"));
+        if !timestamp.is_empty() {
+            meta.latest_timestamp = timestamp.clone();
+        }
+
+        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        match record_type {
+            "session_meta" => {
+                meta.session_id = clean_codex_id(value_string(payload.get("id")));
+                meta.cwd = value_string(payload.get("cwd"));
+            }
+            "event_msg" => {
+                for message in codex_messages_from_event(line_index, &timestamp, payload) {
+                    push_codex_message(&mut messages, &mut seen, Some(message));
+                }
+            }
+            "response_item" => {
+                for message in codex_messages_from_response_item(line_index, &timestamp, payload) {
+                    push_codex_message(&mut messages, &mut seen, Some(message));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if messages.len() > max_messages {
+        messages = messages[messages.len() - max_messages..].to_vec();
+    }
+
+    Ok((meta, messages))
+}
+
+fn find_codex_rollout(
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
+    let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
+    let sessions_dir = codex_home.join("sessions");
+    if !sessions_dir.exists() {
+        return Err(format!(
+            "Codex sessions directory does not exist: {}",
+            sessions_dir.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_codex_rollout_files(&sessions_dir, &mut files);
+    sort_rollouts_newest_first(&mut files);
+
+    if files.is_empty() {
+        return Err("No Codex rollout transcripts were found.".to_string());
+    }
+
+    let requested_session_id = clean_codex_id(provider_session_id);
+    if !requested_session_id.is_empty() {
+        for path in &files {
+            let name_match = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&requested_session_id));
+            let Some(meta) = codex_rollout_meta(path) else {
+                continue;
+            };
+            if name_match || meta.session_id == requested_session_id {
+                return Ok((path.clone(), meta, "sessionId".to_string()));
+            }
+        }
+    }
+
+    if !cwd.trim().is_empty() {
+        for path in &files {
+            let Some(meta) = codex_rollout_meta(path) else {
+                continue;
+            };
+            if codex_paths_match(&meta.cwd, cwd) {
+                return Ok((path.clone(), meta, "cwd".to_string()));
+            }
+        }
+    }
+
+    Err("No Codex transcript matched this thread session.".to_string())
+}
+
+fn claude_home_dir() -> Option<PathBuf> {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claude")))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+}
+
+fn claude_project_dir_name(cwd: &str) -> String {
+    cwd.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn collect_claude_session_files(root: &Path, files: &mut Vec<PathBuf>) {
+    if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+            return;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            collect_claude_session_files(&path, files);
+            continue;
+        }
+
+        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(clean_codex_id)
+        .unwrap_or_default();
+    let mut cwd = String::new();
+    let mut latest_timestamp = String::new();
+    let mut title = String::new();
+
+    for line in std::io::BufRead::lines(reader).take(80).flatten() {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value_string(value.get("timestamp"));
+        if !timestamp.is_empty() {
+            latest_timestamp = timestamp;
+        }
+        let next_session_id = clean_codex_id(value_string(value.get("sessionId")));
+        if !next_session_id.is_empty() {
+            session_id = next_session_id;
+        }
+        let next_cwd = value_string(value.get("cwd"));
+        if !next_cwd.is_empty() {
+            cwd = next_cwd;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("ai-title") {
+            title = clean_codex_title(value_string(value.get("aiTitle")), "");
+        }
+        if !session_id.is_empty() && !cwd.is_empty() {
+            break;
+        }
+    }
+
+    if session_id.is_empty() {
+        return None;
+    }
+
+    Some(CodexRolloutMeta {
+        session_id,
+        cwd,
+        latest_timestamp,
+        title,
+    })
+}
+
+fn find_claude_session(
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
+    let claude_home =
+        claude_home_dir().ok_or_else(|| "Unable to locate Claude Code home.".to_string())?;
+    let projects_dir = claude_home.join("projects");
+    if !projects_dir.exists() {
+        return Err(format!(
+            "Claude Code projects directory does not exist: {}",
+            projects_dir.display()
+        ));
+    }
+
+    let requested_session_id = clean_codex_id(provider_session_id);
+    if !requested_session_id.is_empty() {
+        let direct_matches = fs::read_dir(&projects_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter_map(|entry| {
+                let path = entry.path().join(format!("{requested_session_id}.jsonl"));
+                if path.exists() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for path in direct_matches {
+            if let Some(meta) = claude_file_meta(&path) {
+                return Ok((path, meta, "sessionId".to_string()));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    if !cwd.trim().is_empty() {
+        let encoded = claude_project_dir_name(cwd);
+        for candidate in [
+            projects_dir.join(&encoded),
+            projects_dir.join(encoded.to_lowercase()),
+        ] {
+            if candidate.exists() {
+                collect_claude_session_files(&candidate, &mut files);
+            }
+        }
+    }
+    collect_claude_session_files(&projects_dir, &mut files);
+    sort_rollouts_newest_first(&mut files);
+
+    if !requested_session_id.is_empty() {
+        for path in &files {
+            let file_match = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|name| name == requested_session_id);
+            let Some(meta) = claude_file_meta(path) else {
+                continue;
+            };
+            if file_match || meta.session_id == requested_session_id {
+                return Ok((path.clone(), meta, "sessionId".to_string()));
+            }
+        }
+    }
+
+    if !cwd.trim().is_empty() {
+        for path in &files {
+            let Some(meta) = claude_file_meta(path) else {
+                continue;
+            };
+            if codex_paths_match(&meta.cwd, cwd) {
+                return Ok((path.clone(), meta, "cwd".to_string()));
+            }
+        }
+    }
+
+    Err("No Claude Code transcript matched this thread session.".to_string())
+}
+
+fn claude_content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.to_string(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                match item_type {
+                    "text" => item.get("text").and_then(Value::as_str).map(str::to_string),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn claude_activity_from_block(
+    line_index: usize,
+    block_index: usize,
+    timestamp: &str,
+    block: &Value,
+) -> Option<CodexThreadTranscriptMessage> {
+    let block_type = block.get("type").and_then(Value::as_str).unwrap_or_default();
+    match block_type {
+        "tool_use" => {
+            let name = value_string(block.get("name"));
+            let call_id = value_string(block.get("id"));
+            let input = block
+                .get("input")
+                .map(pretty_json)
+                .unwrap_or_else(|| "{}".to_string());
+            Some(CodexThreadTranscriptMessage {
+                id: format!("claude-{line_index}-{block_index}-tool-call"),
+                role: "activity".to_string(),
+                kind: "tool_call".to_string(),
+                text: clean_codex_transcript_text(input, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: if name.is_empty() {
+                    "Tool call".to_string()
+                } else {
+                    format!("Called {name}")
+                },
+                call_id,
+                created_at: timestamp.to_string(),
+                source: "claude".to_string(),
+            })
+        }
+        "tool_result" => {
+            let call_id = value_string(block.get("tool_use_id"));
+            let content = block
+                .get("content")
+                .map(claude_content_text)
+                .unwrap_or_default();
+            Some(CodexThreadTranscriptMessage {
+                id: format!("claude-{line_index}-{block_index}-tool-output"),
+                role: "activity".to_string(),
+                kind: "tool_output".to_string(),
+                text: clean_codex_transcript_text(content, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: "Tool output".to_string(),
+                call_id,
+                created_at: timestamp.to_string(),
+                source: "claude".to_string(),
+            })
+        }
+        "thinking" => {
+            let thinking = value_string(block.get("thinking"));
+            if thinking.is_empty() {
+                None
+            } else {
+                Some(CodexThreadTranscriptMessage {
+                    id: format!("claude-{line_index}-{block_index}-reasoning"),
+                    role: "activity".to_string(),
+                    kind: "reasoning".to_string(),
+                    text: clean_codex_transcript_text(thinking, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                    title: "Reasoning".to_string(),
+                    call_id: String::new(),
+                    created_at: timestamp.to_string(),
+                    source: "claude".to_string(),
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_claude_session(
+    path: &Path,
+    max_messages: usize,
+) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Unable to open Claude Code transcript {}: {error}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut meta = CodexRolloutMeta {
+        session_id: path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(clean_codex_id)
+            .unwrap_or_default(),
+        cwd: String::new(),
+        latest_timestamp: String::new(),
+        title: String::new(),
+    };
+    let mut messages = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value_string(value.get("timestamp"));
+        if !timestamp.is_empty() {
+            meta.latest_timestamp = timestamp.clone();
+        }
+        let session_id = clean_codex_id(value_string(value.get("sessionId")));
+        if !session_id.is_empty() {
+            meta.session_id = session_id;
+        }
+        let cwd = value_string(value.get("cwd"));
+        if !cwd.is_empty() {
+            meta.cwd = cwd;
+        }
+
+        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        if entry_type == "ai-title" {
+            meta.title = clean_codex_title(value_string(value.get("aiTitle")), "");
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let content = message.get("content").unwrap_or(&Value::Null);
+
+        if entry_type == "user" || entry_type == "assistant" {
+            let role = if entry_type == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            let text = clean_codex_transcript_text(
+                claude_content_text(content),
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            );
+            if !text.is_empty() {
+                push_codex_message(
+                    &mut messages,
+                    &mut seen,
+                    Some(CodexThreadTranscriptMessage {
+                        id: format!("claude-{line_index}-{role}"),
+                        role: role.to_string(),
+                        kind: "message".to_string(),
+                        text,
+                        title: String::new(),
+                        call_id: String::new(),
+                        created_at: timestamp.clone(),
+                        source: "claude".to_string(),
+                    }),
+                );
+            }
+
+            if let Some(blocks) = content.as_array() {
+                for (block_index, block) in blocks.iter().enumerate() {
+                    push_codex_message(
+                        &mut messages,
+                        &mut seen,
+                        claude_activity_from_block(line_index, block_index, &timestamp, block),
+                    );
+                }
+            }
+        }
+    }
+
+    if messages.len() > max_messages {
+        messages = messages[messages.len() - max_messages..].to_vec();
+    }
+
+    Ok((meta, messages))
+}
+
+fn opencode_data_home() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env::var_os("OPENCODE_DATA_DIR") {
+        candidates.push(PathBuf::from(value));
+    }
+    if let Some(value) = env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(value).join("opencode"));
+    }
+    if let Some(value) = env::var_os("USERPROFILE") {
+        let home = PathBuf::from(value);
+        candidates.push(home.join(".local").join("share").join("opencode"));
+        candidates.push(home.join("AppData").join("Roaming").join("opencode"));
+        candidates.push(home.join("AppData").join("Local").join("opencode"));
+    }
+    if let Some(value) = env::var_os("HOME") {
+        candidates.push(PathBuf::from(value).join(".local").join("share").join("opencode"));
+    }
+
+    candidates
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    opencode_data_home()
+        .into_iter()
+        .map(|path| path.join("opencode.db"))
+        .find(|path| path.exists())
+}
+
+fn opencode_timestamp(value: i64) -> String {
+    if value <= 0 {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+fn opencode_json_text(value: Option<&Value>) -> String {
+    value
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            Value::Array(_) | Value::Object(_) => pretty_json(value),
+            _ => value.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+fn opencode_part_message(
+    message_id: &str,
+    role: &str,
+    part_id: &str,
+    timestamp: &str,
+    data: &Value,
+) -> Option<CodexThreadTranscriptMessage> {
+    let part_type = data.get("type").and_then(Value::as_str).unwrap_or_default();
+    let message_role = if role == "assistant" { "assistant" } else { "user" };
+    match part_type {
+        "text" => {
+            let text = first_value_string(&[data.get("text"), data.get("content")]);
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-text"),
+                role: message_role.to_string(),
+                kind: "message".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT),
+                title: String::new(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+            })
+        }
+        "reasoning" => {
+            let text = first_value_string(&[data.get("text"), data.get("content")]);
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-reasoning"),
+                role: "activity".to_string(),
+                kind: "reasoning".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: "Reasoning".to_string(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+            })
+        }
+        "tool" => {
+            let tool = first_value_string(&[data.get("tool"), data.get("name"), data.get("title")]);
+            let call_id = first_value_string(&[data.get("callID"), data.get("callId"), data.get("id")]);
+            let state = data.get("state").unwrap_or(&Value::Null);
+            let input = opencode_json_text(data.get("input").or_else(|| state.get("input")));
+            let output = opencode_json_text(
+                data.get("output")
+                    .or_else(|| data.get("result"))
+                    .or_else(|| state.get("output"))
+                    .or_else(|| state.get("result")),
+            );
+            let mut sections = Vec::new();
+            if !input.trim().is_empty() {
+                sections.push(format!("input:\n{input}"));
+            }
+            if !output.trim().is_empty() {
+                sections.push(format!("output:\n{output}"));
+            }
+            if sections.is_empty() {
+                sections.push(pretty_json(data));
+            }
+            Some(CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-tool"),
+                role: "activity".to_string(),
+                kind: if output.trim().is_empty() {
+                    "tool_call".to_string()
+                } else {
+                    "tool_output".to_string()
+                },
+                text: clean_codex_transcript_text(
+                    sections.join("\n\n"),
+                    CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+                ),
+                title: if tool.is_empty() {
+                    "Tool".to_string()
+                } else {
+                    format!("Tool {tool}")
+                },
+                call_id,
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+            })
+        }
+        "patch" => Some(CodexThreadTranscriptMessage {
+            id: format!("opencode-{message_id}-{part_id}-patch"),
+            role: "activity".to_string(),
+            kind: "patch".to_string(),
+            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: "Patch".to_string(),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "opencode".to_string(),
+        }),
+        "file" => Some(CodexThreadTranscriptMessage {
+            id: format!("opencode-{message_id}-{part_id}-file"),
+            role: "activity".to_string(),
+            kind: "file".to_string(),
+            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: "File".to_string(),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "opencode".to_string(),
+        }),
+        "step-start" | "step-finish" | "snapshot" => Some(CodexThreadTranscriptMessage {
+            id: format!("opencode-{message_id}-{part_id}-{part_type}"),
+            role: "activity".to_string(),
+            kind: part_type.replace('-', "_"),
+            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: part_type.replace('-', " "),
+            call_id: String::new(),
+            created_at: timestamp.to_string(),
+            source: "opencode".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn opencode_message_role(data: &Value) -> String {
+    let role = first_value_string(&[
+        data.get("role"),
+        data.get("type"),
+        data.get("info").and_then(|info| info.get("role")),
+    ]);
+    if role == "assistant" {
+        "assistant".to_string()
+    } else {
+        "user".to_string()
+    }
+}
+
+fn find_opencode_session(
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<(String, String, String, String), String> {
+    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+    let requested_session_id = clean_codex_id(provider_session_id);
+
+    if !requested_session_id.is_empty() {
+        let mut statement = connection
+            .prepare("select id, title, directory, time_updated from session where id = ?1 limit 1")
+            .map_err(|error| format!("Unable to query OpenCode sessions: {error}"))?;
+        let mut rows = statement
+            .query(rusqlite::params![requested_session_id])
+            .map_err(|error| format!("Unable to query OpenCode session: {error}"))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|error| format!("Unable to read OpenCode session row: {error}"))?
+        {
+            return Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+                "sessionId".to_string(),
+            ));
+        }
+    }
+
+    if !cwd.trim().is_empty() {
+        let mut statement = connection
+            .prepare("select id, title, directory, time_updated from session order by time_updated desc")
+            .map_err(|error| format!("Unable to query OpenCode sessions: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            })
+            .map_err(|error| format!("Unable to list OpenCode sessions: {error}"))?;
+        for row in rows.flatten() {
+            if codex_paths_match(&row.2, cwd) {
+                return Ok((row.0, row.1, row.2, "cwd".to_string()));
+            }
+        }
+    }
+
+    Err("No OpenCode session matched this thread session.".to_string())
+}
+
+fn parse_opencode_session(
+    session_id: &str,
+    _title: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
+    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+
+    let mut part_statement = connection
+        .prepare(
+            "select id, message_id, time_created, data from part where session_id = ?1 order by time_created, id",
+        )
+        .map_err(|error| format!("Unable to query OpenCode parts: {error}"))?;
+    let part_rows = part_statement
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, i64>(2).unwrap_or_default(),
+                row.get::<_, String>(3).unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| format!("Unable to read OpenCode parts: {error}"))?;
+    let mut parts_by_message: HashMap<String, Vec<(String, i64, Value)>> = HashMap::new();
+    for row in part_rows.flatten() {
+        let data = serde_json::from_str::<Value>(&row.3).unwrap_or(Value::Null);
+        parts_by_message.entry(row.1).or_default().push((row.0, row.2, data));
+    }
+
+    let mut message_statement = connection
+        .prepare(
+            "select id, time_created, data from message where session_id = ?1 order by time_created, id",
+        )
+        .map_err(|error| format!("Unable to query OpenCode messages: {error}"))?;
+    let message_rows = message_statement
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, i64>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| format!("Unable to read OpenCode messages: {error}"))?;
+
+    let mut messages = Vec::new();
+    let mut seen = HashSet::new();
+    let mut latest_timestamp = String::new();
+    for row in message_rows.flatten() {
+        let message_data = serde_json::from_str::<Value>(&row.2).unwrap_or(Value::Null);
+        let role = opencode_message_role(&message_data);
+        let timestamp = opencode_timestamp(row.1);
+        if !timestamp.is_empty() {
+            latest_timestamp = timestamp.clone();
+        }
+
+        let message_text = first_value_string(&[
+            message_data.get("text"),
+            message_data.get("content"),
+            message_data.get("message"),
+        ]);
+        if !message_text.trim().is_empty() {
+            push_codex_message(
+                &mut messages,
+                &mut seen,
+                Some(CodexThreadTranscriptMessage {
+                    id: format!("opencode-{}-message", row.0),
+                    role: role.clone(),
+                    kind: "message".to_string(),
+                    text: clean_codex_transcript_text(message_text, CODEX_TRANSCRIPT_MAX_TEXT),
+                    title: String::new(),
+                    call_id: String::new(),
+                    created_at: timestamp.clone(),
+                    source: "opencode".to_string(),
+                }),
+            );
+        }
+
+        for (part_id, part_time, part_data) in parts_by_message.remove(&row.0).unwrap_or_default() {
+            let part_timestamp = opencode_timestamp(part_time);
+            push_codex_message(
+                &mut messages,
+                &mut seen,
+                opencode_part_message(&row.0, &role, &part_id, &part_timestamp, &part_data),
+            );
+        }
+    }
+
+    if messages.len() > max_messages {
+        messages = messages[messages.len() - max_messages..].to_vec();
+    }
+
+    Ok((
+        CodexRolloutMeta {
+            session_id: clean_codex_id(session_id),
+            cwd: cwd.to_string(),
+            latest_timestamp,
+            title: clean_codex_title(_title, ""),
+        },
+        messages,
+    ))
+}
+
+#[tauri::command]
+async fn agent_thread_transcript(
+    request: CodexThreadTranscriptRequest,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
+        .to_lowercase();
+    let provider_session_id = request.provider_session_id.unwrap_or_default();
+    let cwd = request.cwd.unwrap_or_default();
+    let max_messages = request
+        .max_messages
+        .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
+        .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
+
+    if agent_id == "claude" {
+        let (path, initial_meta, matched_by) = find_claude_session(&provider_session_id, &cwd)?;
+        let (parsed_meta, messages) = parse_claude_session(&path, max_messages)?;
+        let session_id = if parsed_meta.session_id.is_empty() {
+            initial_meta.session_id
+        } else {
+            parsed_meta.session_id
+        };
+        let cwd = if parsed_meta.cwd.is_empty() {
+            initial_meta.cwd
+        } else {
+            parsed_meta.cwd
+        };
+        let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+            initial_meta.latest_timestamp
+        } else {
+            parsed_meta.latest_timestamp
+        };
+
+        return Ok(CodexThreadTranscriptResult {
+            session_id,
+            session_title: if parsed_meta.title.is_empty() {
+                initial_meta.title
+            } else {
+                parsed_meta.title
+            },
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd,
+            matched_by,
+            latest_timestamp,
+            messages,
+        });
+    }
+
+    if agent_id == "opencode" {
+        let (session_id, title, session_cwd, matched_by) =
+            find_opencode_session(&provider_session_id, &cwd)?;
+        let (parsed_meta, messages) =
+            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
+        return Ok(CodexThreadTranscriptResult {
+            session_id: parsed_meta.session_id,
+            session_title: parsed_meta.title,
+            rollout_path: opencode_db_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            cwd: parsed_meta.cwd,
+            matched_by,
+            latest_timestamp: parsed_meta.latest_timestamp,
+            messages,
+        });
+    }
+
+    let (path, initial_meta, matched_by) = find_codex_rollout(&provider_session_id, &cwd)?;
+    let (parsed_meta, messages) = parse_codex_rollout(&path, max_messages)?;
+    let session_id = if parsed_meta.session_id.is_empty() {
+        initial_meta.session_id
+    } else {
+        parsed_meta.session_id
+    };
+    let cwd = if parsed_meta.cwd.is_empty() {
+        initial_meta.cwd
+    } else {
+        parsed_meta.cwd
+    };
+    let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+        initial_meta.latest_timestamp
+    } else {
+        parsed_meta.latest_timestamp
+    };
+
+    Ok(CodexThreadTranscriptResult {
+        session_id,
+        session_title: if parsed_meta.title.is_empty() {
+            initial_meta.title
+        } else {
+            parsed_meta.title
+        },
+        rollout_path: path.to_string_lossy().to_string(),
+        cwd,
+        matched_by,
+        latest_timestamp,
+        messages,
+    })
+}
