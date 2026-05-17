@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
+export const TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED = false;
+export const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED = true;
 
 const TERMINAL_DIAGNOSTIC_HEARTBEAT_MS = 100;
 const TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS = 120;
@@ -30,7 +32,7 @@ export function isTerminalDiagnosticLoggingEnabled() {
 }
 
 export function syncTerminalDiagnosticLogging(forceEnabled = false) {
-  if (forceEnabled) {
+  if (forceEnabled && TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED) {
     backendLoggingForceEnabled = true;
   }
 
@@ -57,7 +59,7 @@ export function syncTerminalDiagnosticLogging(forceEnabled = false) {
 }
 
 export function logTerminalDiagnosticEvent(phase, fields = {}, options = {}) {
-  const force = Boolean(options.force);
+  const force = Boolean(options.force) && TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED;
   if (!force && !isTerminalDiagnosticLoggingEnabled()) {
     return;
   }
@@ -85,6 +87,20 @@ export function logTerminalDiagnosticEvent(phase, fields = {}, options = {}) {
       }
     })
     .catch(() => {});
+}
+
+export function logThreadBridgeDiagnosticEvent(phase, fields = {}) {
+  if (!THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED) {
+    return;
+  }
+
+  invoke("thread_bridge_diagnostic_log", {
+    phase: cleanDiagnosticText(phase),
+    fields: {
+      source: "frontend",
+      ...fields,
+    },
+  }).catch(() => {});
 }
 
 export function logTerminalDiagnosticDuration(phase, startedAtMs, fields = {}, options = {}) {

@@ -2003,6 +2003,7 @@ function TerminalView({
   onOpenWorkspaceSettings,
   onArchiveWorkspaceThread,
   onSelectWorkspaceThread,
+  onToggleWorkspaceThreadPinned,
   onWorkspaceThreadsViewStateChange,
   onThreadTerminalLifecycle,
   refreshAgentStatuses,
@@ -2977,6 +2978,7 @@ function TerminalView({
                 onRecheckAgents={refreshAgentStatuses}
                 onSplitTerminal={handleSplitTerminal}
                 onSelectWorkspaceThread={onSelectWorkspaceThread}
+                onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
                 onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
                 onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
@@ -3022,6 +3024,7 @@ function TerminalView({
       onRecheckAgents={refreshAgentStatuses}
       onSplitTerminal={handleSplitTerminal}
       onSelectWorkspaceThread={onSelectWorkspaceThread}
+      onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
       onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
       onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}

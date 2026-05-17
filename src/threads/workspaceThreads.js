@@ -34,14 +34,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function hasStorage() {
-  try {
-    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
-  } catch {
-    return false;
-  }
-}
-
 function cleanText(value, fallback = "") {
   const text = String(value || "")
     .replace(/[\u0000-\u001F\u007F]/g, " ")
@@ -1515,6 +1507,7 @@ function normalizeThread(thread, workspaceId, options = {}) {
     messages,
     latestTurn,
     pendingPrompt,
+    pinnedAt: cleanText(thread.pinnedAt),
     projectionEvents,
     preferredAgent,
     freshSessionStartedAt: options.stripLiveBindings ? "" : cleanText(thread.freshSessionStartedAt),
@@ -1584,6 +1577,7 @@ function archiveThreadRecord(thread, archivedAt = nowIso()) {
     activityStatus: "idle",
     archivedAt: cleanText(thread.archivedAt, archivedAt),
     latestTurn: archivedLatestTurn,
+    pinnedAt: "",
     providerBindings,
     status: "closed",
     terminalBinding: null,
@@ -1780,32 +1774,20 @@ export function normalizeWorkspaceThreads(value, options = {}) {
 }
 
 export function readWorkspaceThreads() {
-  if (!hasStorage()) {
-    return {};
-  }
-
-  try {
-    return normalizeWorkspaceThreads(
-      JSON.parse(window.localStorage.getItem(WORKSPACE_THREADS_STORAGE_KEY) || "{}"),
-      { stripLiveBindings: true, stripMessages: true },
-    );
-  } catch {
-    return {};
-  }
+  return {};
 }
 
 export function persistWorkspaceThreads(threads) {
-  if (!hasStorage()) {
-    return;
-  }
+  return normalizeWorkspaceThreads(threads, { stripLiveBindings: true, stripMessages: true });
+}
 
+export function clearWorkspaceThreadsBrowserPersistence() {
   try {
-    window.localStorage.setItem(
-      WORKSPACE_THREADS_STORAGE_KEY,
-      JSON.stringify(normalizeWorkspaceThreads(threads, { stripLiveBindings: true, stripMessages: true })),
-    );
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.removeItem(WORKSPACE_THREADS_STORAGE_KEY);
+    }
   } catch {
-    // Thread metadata is recoverable convenience state.
+    // Browser thread metadata was only a legacy cache; failing to clear it must not block startup.
   }
 }
 
@@ -2056,6 +2038,20 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   }
 
   const existing = entry.terminals[key] || {};
+  const nextThreadId = cleanText(options.threadId ?? event.threadId ?? existing.threadId);
+  const displacedThreadId = cleanText(existing.threadId);
+  if (nextThreadId && displacedThreadId && displacedThreadId !== nextThreadId) {
+    detachThreadFromTerminalBinding(entry, displacedThreadId, {
+      agentId: existing.agentId || event.agentId || event.currentAgent,
+      currentAgent: existing.agentId || event.currentAgent || event.agentId,
+      instanceId: existing.instanceId,
+      paneId: existing.paneId,
+      status: "closed",
+      terminalIndex,
+      threadId: displacedThreadId,
+      workspaceId: event.workspaceId,
+    });
+  }
   const now = nowIso();
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
@@ -2065,7 +2061,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
     terminalIndex,
-    threadId: options.threadId ?? event.threadId ?? existing.threadId,
+    threadId: nextThreadId,
     updatedAt: now,
     worktreePath: event.worktreePath || existing.worktreePath,
   });
@@ -2085,6 +2081,84 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   return terminal;
 }
 
+function detachThreadFromTerminalBinding(entry, threadId, event = {}) {
+  const safeThreadId = cleanText(threadId);
+  if (!safeThreadId) {
+    return false;
+  }
+
+  const existing = entry?.threads?.[safeThreadId];
+  if (!existing) {
+    return false;
+  }
+
+  const now = nowIso();
+  const status = cleanText(event.status, "closed").toLowerCase();
+  const detachedStatus = status === "error" ? "error" : "closed";
+  const agentId = cleanAgentId(
+    event.agentId
+      || event.currentAgent
+      || existing.currentAgent,
+  );
+  const terminalBinding = normalizeTerminalBinding({
+    instanceId: cleanText(existing.terminalBinding?.instanceId),
+    paneId: cleanText(existing.terminalBinding?.paneId),
+    terminalIndex: existing.terminalIndex,
+  });
+  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const latestTurn = existingLatestTurn?.state === "running"
+    ? normalizeThreadLatestTurn({
+      ...existingLatestTurn,
+      completedAt: now,
+      error: detachedStatus === "error" ? "Terminal detached" : existingLatestTurn.error,
+      state: detachedStatus === "error" ? "error" : "interrupted",
+      updatedAt: now,
+    })
+    : existingLatestTurn;
+  const providerBindings = normalizeProviderBindings(
+    existing.providerBindings,
+    existing.currentAgent,
+    {
+      coordination: existing.coordination,
+      lastActiveAt: existing.lastActiveAt,
+      lastMessageAt: existing.lastMessageAt,
+      messageCount: existing.messageCount,
+      status: existing.status,
+      terminalBinding,
+      updatedAt: existing.updatedAt,
+    },
+  );
+  if (isThreadAgentId(agentId)) {
+    providerBindings[agentId] = {
+      ...normalizeProviderBinding(providerBindings[agentId], agentId, {
+        activityStatus: "idle",
+        coordination: existing.coordination,
+        lastActiveAt: existing.lastActiveAt,
+        lastMessageAt: existing.lastMessageAt,
+        messageCount: existing.messageCount,
+        status: detachedStatus,
+        terminalBinding: null,
+        updatedAt: now,
+      }),
+      activityStatus: "idle",
+      status: detachedStatus,
+      terminalBinding: null,
+      updatedAt: now,
+    };
+  }
+
+  entry.threads[safeThreadId] = {
+    ...existing,
+    activityStatus: "idle",
+    latestTurn,
+    providerBindings,
+    status: detachedStatus,
+    terminalBinding: null,
+    updatedAt: now,
+  };
+  return true;
+}
+
 function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {}) {
   const existing = entry.threads[threadId];
   if (!existing) {
@@ -2097,6 +2171,14 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     threadId,
   });
   const activeTerminal = terminalKey ? entry.terminals[terminalKey] : null;
+  const displacedThreadId = cleanText(activeTerminal?.threadId);
+  if (displacedThreadId && displacedThreadId !== threadId) {
+    detachThreadFromTerminalBinding(entry, displacedThreadId, {
+      ...event,
+      status: "closed",
+      threadId: displacedThreadId,
+    });
+  }
   const terminalIndex = normalizeTerminalIndex(event.terminalIndex ?? activeTerminal?.terminalIndex ?? existing.terminalIndex);
   const now = nowIso();
   const agentId = cleanAgentId(
@@ -3373,6 +3455,34 @@ export function deleteWorkspaceThread(state, workspaceId, threadId) {
   return archiveWorkspaceThread(state, workspaceId, threadId);
 }
 
+export function toggleWorkspaceThreadPinned(state, workspaceId, threadId) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  const safeThreadId = cleanText(threadId);
+  if (!safeWorkspaceId || !safeThreadId) {
+    return state || {};
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[safeWorkspaceId]
+    ? ensureWorkspaceEntry(currentState, safeWorkspaceId)
+    : null;
+  const existing = entry?.threads?.[safeThreadId];
+  if (!entry || !existing || !getWorkspaceThreadCanPin(existing)) {
+    return state || {};
+  }
+
+  entry.threads[safeThreadId] = {
+    ...existing,
+    pinnedAt: cleanText(existing.pinnedAt) ? "" : nowIso(),
+    updatedAt: nowIso(),
+  };
+
+  return {
+    ...currentState,
+    [safeWorkspaceId]: entry,
+  };
+}
+
 function getThreadSessionLabel(thread) {
   if (!thread) {
     return "";
@@ -3407,6 +3517,14 @@ export function getWorkspaceThreadHasSession(thread) {
 
 export function getWorkspaceThreadCanArchive(thread) {
   return getWorkspaceThreadHasSession(thread);
+}
+
+export function getWorkspaceThreadCanPin(thread) {
+  return getWorkspaceThreadCanArchive(thread);
+}
+
+export function getWorkspaceThreadIsPinned(thread) {
+  return Boolean(getWorkspaceThreadCanPin(thread) && cleanText(thread?.pinnedAt));
 }
 
 function getThreadNativeTitleLabel(thread) {

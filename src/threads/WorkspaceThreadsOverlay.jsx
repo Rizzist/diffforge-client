@@ -2,6 +2,7 @@ import { ChevronLeft } from "@styled-icons/material-rounded/ChevronLeft";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Edit } from "@styled-icons/fa-regular/Edit";
+import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Search } from "@styled-icons/material-rounded/Search";
 import { memo, useEffect } from "react";
 import styled, { keyframes } from "styled-components";
@@ -9,11 +10,19 @@ import styled, { keyframes } from "styled-components";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
   getWorkspaceThreadCanArchive,
-  getWorkspaceThreadHasSession,
+  getWorkspaceThreadCanPin,
+  getWorkspaceThreadIsPinned,
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
   getWorkspaceThreadTurnState,
 } from "./workspaceThreads";
+
+const THREAD_VIEW_STATE = {
+  LIVE_SESSION: "live-session",
+  LIVE_NO_SESSION: "live-no-session",
+  DETACHED_SESSION: "detached-session",
+  INACTIVE_NO_SESSION: "inactive-no-session",
+};
 
 const overlayFadeIn = keyframes`
   from {
@@ -44,20 +53,29 @@ const OverlayRoot = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  --thread-bg: #09090b;
-  --thread-card: #0d0d10;
-  --thread-fg: #f4f4f5;
-  --thread-muted: #a1a1aa;
-  --thread-muted-soft: rgba(161, 161, 170, 0.58);
-  --thread-border: rgba(255, 255, 255, 0.065);
-  --thread-accent: rgba(255, 255, 255, 0.055);
-  --thread-accent-strong: rgba(255, 255, 255, 0.085);
-  --thread-primary: rgba(98, 132, 255, 0.28);
-  --thread-primary-hover: rgba(98, 132, 255, 0.36);
+  --thread-bg: #050505;
+  --thread-bg-soft: #080808;
+  --thread-card: rgba(32, 32, 32, 0.92);
+  --thread-fg: #f4f7fa;
+  --thread-muted: #a5a7ad;
+  --thread-muted-soft: rgba(165, 167, 173, 0.58);
+  --thread-border: rgba(255, 255, 255, 0.08);
+  --thread-accent: rgba(255, 255, 255, 0.07);
+  --thread-accent-strong: rgba(255, 255, 255, 0.1);
+  --thread-primary: rgba(255, 255, 255, 0.1);
+  --thread-primary-hover: rgba(255, 255, 255, 0.13);
+  --thread-blue: #a8a8a8;
+  --thread-ember: #dfa55a;
+  --thread-green: #3ccb7f;
+  --thread-red: #ef6b6b;
   color: var(--thread-fg);
-  background: var(--thread-bg);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.014) 1px, transparent 1px),
+    #050505;
+  background-size: 86px 86px, 86px 86px, auto;
   animation: ${overlayFadeIn} 140ms ease both;
-  backdrop-filter: blur(7px);
+  backdrop-filter: blur(10px);
   pointer-events: auto;
   user-select: text;
 `;
@@ -66,11 +84,13 @@ const OverlayPanel = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(212px, 256px) minmax(0, 1fr);
+  grid-template-columns: minmax(188px, 220px) minmax(0, 1fr);
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background: var(--thread-bg);
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018), transparent 28%),
+    var(--thread-bg);
   box-shadow: none;
   animation: ${overlayPanelIn} 160ms cubic-bezier(0.16, 1, 0.3, 1) both;
   transition: grid-template-columns 180ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -80,7 +100,7 @@ const OverlayPanel = styled.section`
   }
 
   @media (max-width: 760px) {
-    grid-template-columns: minmax(190px, 72vw) minmax(0, 1fr);
+    grid-template-columns: minmax(180px, 58vw) minmax(0, 1fr);
 
     &[data-rail-collapsed="true"] {
       grid-template-columns: 48px minmax(0, 1fr);
@@ -95,25 +115,30 @@ const ThreadRail = styled.aside`
   min-width: 0;
   min-height: 0;
   overflow: visible;
-  border-right: 1px solid var(--thread-border);
-  background: var(--thread-bg);
+  border-right: 1px solid rgba(255, 255, 255, 0.07);
+  background:
+    radial-gradient(circle at 50% 100%, rgba(255, 255, 255, 0.035), transparent 42%),
+    linear-gradient(180deg, #292929, #262626 55%, #242424);
+  box-shadow: inset -1px 0 0 rgba(0, 0, 0, 0.42);
 `;
 
 const DrawerToggle = styled.button`
   position: absolute;
-  top: 10px;
-  right: -12px;
+  top: 12px;
+  right: -13px;
   z-index: 4;
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 999px;
-  color: var(--thread-muted);
-  background: #111116;
-  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.28);
+  color: #d6d6d6;
+  background: rgba(45, 45, 45, 0.96);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.045),
+    0 10px 22px rgba(0, 0, 0, 0.32);
   transition:
     border-color 130ms ease,
     color 130ms ease,
@@ -121,14 +146,14 @@ const DrawerToggle = styled.button`
     transform 130ms ease;
 
   &:hover {
-    border-color: rgba(255, 255, 255, 0.18);
+    border-color: rgba(255, 255, 255, 0.16);
     color: var(--thread-fg);
-    background: #18181d;
+    background: rgba(58, 58, 58, 0.98);
     transform: translateX(1px);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(98, 132, 255, 0.68);
+    outline: 2px solid rgba(255, 255, 255, 0.22);
     outline-offset: 2px;
   }
 
@@ -142,11 +167,11 @@ const WorkspaceList = styled.div`
   display: grid;
   min-height: 0;
   align-content: start;
-  gap: 8px;
+  gap: 12px;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 42px 8px 10px;
-  background: var(--thread-bg);
+  padding: 26px 12px 16px;
+  background: transparent;
 
   &::-webkit-scrollbar {
     width: 6px;
@@ -158,28 +183,28 @@ const WorkspaceList = styled.div`
 
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(170, 170, 170, 0.16);
   }
 `;
 
 const RailActionStack = styled.div`
   display: grid;
   min-width: 0;
-  padding-bottom: 2px;
+  padding-bottom: 10px;
   align-content: start;
-  gap: 4px;
+  gap: 2px;
 `;
 
 const RailActionButton = styled.button`
   display: flex;
   min-width: 0;
-  height: 32px;
+  height: 30px;
   align-items: center;
   gap: 8px;
   padding: 0 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
-  color: var(--thread-fg);
+  border-radius: 10px;
+  color: #e9e9e9;
   background: transparent;
   text-align: left;
   font: inherit;
@@ -192,13 +217,14 @@ const RailActionButton = styled.button`
   &:hover:not(:disabled),
   &[data-active="true"] {
     color: var(--thread-fg);
-    background: var(--thread-accent);
+    border-color: transparent;
+    background: rgba(255, 255, 255, 0.095);
     opacity: 1;
   }
 
   &:disabled {
-    color: var(--thread-muted-soft);
-    opacity: 0.58;
+    color: rgba(233, 233, 233, 0.72);
+    opacity: 1;
     cursor: not-allowed;
   }
 
@@ -211,8 +237,8 @@ const RailActionButton = styled.button`
   span {
     min-width: 0;
     overflow: hidden;
-    font-size: 13px;
-    font-weight: 540;
+    font-size: 12px;
+    font-weight: 480;
     line-height: 1.2;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -222,15 +248,15 @@ const RailActionButton = styled.button`
 const WorkspaceGroup = styled.section`
   display: grid;
   min-width: 0;
-  gap: 3px;
+  gap: 5px;
 `;
 
 const WorkspaceTopline = styled.div`
   min-width: 0;
-  padding: 7px 8px 4px;
-  color: var(--thread-muted);
-  font-size: 12px;
-  font-weight: 560;
+  padding: 0 5px;
+  color: rgba(225, 225, 225, 0.52);
+  font-size: 11px;
+  font-weight: 460;
   letter-spacing: 0;
   line-height: 1.2;
   text-transform: none;
@@ -247,10 +273,10 @@ const WorkspaceTopline = styled.div`
 const ThreadList = styled.div`
   display: grid;
   min-width: 0;
-  gap: 4px;
-  margin: 0 14px;
-  padding: 2px 0 2px 10px;
-  border-left: 1px solid var(--thread-border);
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  border-left: 0;
 `;
 
 const CollapsedThreadList = styled(ThreadList)`
@@ -267,8 +293,10 @@ const CollapsedRail = styled.div`
   gap: 8px;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 42px 8px 10px;
-  background: var(--thread-bg);
+  padding: 28px 8px 10px;
+  background:
+    radial-gradient(circle at 50% 100%, rgba(255, 255, 255, 0.035), transparent 42%),
+    linear-gradient(180deg, #292929, #262626 55%, #242424);
 `;
 
 const CollapsedRailActionStack = styled.div`
@@ -286,8 +314,8 @@ const CollapsedRailActionButton = styled.button`
   place-items: center;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 8px;
-  color: var(--thread-fg);
+  border-radius: 10px;
+  color: #e9e9e9;
   background: transparent;
   opacity: 1;
   transition:
@@ -298,7 +326,7 @@ const CollapsedRailActionButton = styled.button`
   &:hover:not(:disabled),
   &[data-active="true"] {
     color: var(--thread-fg);
-    background: var(--thread-accent);
+    background: rgba(255, 255, 255, 0.095);
     opacity: 1;
   }
 
@@ -355,7 +383,7 @@ const CollapsedThreadButton = styled.button`
     border-color 130ms ease;
 
   &[data-selected="true"] {
-    border-color: rgba(98, 132, 255, 0.24);
+    border-color: rgba(255, 255, 255, 0.16);
     background: var(--thread-primary);
   }
 
@@ -364,22 +392,23 @@ const CollapsedThreadButton = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(98, 132, 255, 0.68);
+    outline: 2px solid rgba(255, 255, 255, 0.22);
     outline-offset: 2px;
   }
 `;
 
 const ThreadRow = styled.div`
-  display: flex;
+  position: relative;
+  display: grid;
   min-width: 0;
-  height: 28px;
+  height: 27px;
+  grid-template-columns: minmax(0, 1fr) 15px;
   align-items: center;
-  justify-content: space-between;
-  gap: 4px;
-  padding: 0 4px 0 8px;
+  gap: 3px;
+  padding: 0 4px 0 7px;
   border: 1px solid transparent;
   border-radius: 8px;
-  color: var(--thread-muted);
+  color: rgba(236, 236, 236, 0.86);
   background: transparent;
   font: inherit;
   text-align: left;
@@ -389,18 +418,19 @@ const ThreadRow = styled.div`
     color 130ms ease;
 
   &[data-selected="true"] {
-    border-color: rgba(98, 132, 255, 0.22);
+    border-color: transparent;
     color: var(--thread-fg);
-    background: var(--thread-primary);
+    background: rgba(255, 255, 255, 0.105);
   }
 
   &:hover {
     color: var(--thread-fg);
-    background: var(--thread-accent);
+    border-color: transparent;
+    background: rgba(255, 255, 255, 0.075);
   }
 
   &[data-selected="true"]:hover {
-    background: var(--thread-primary-hover);
+    background: rgba(255, 255, 255, 0.13);
   }
 `;
 
@@ -408,10 +438,8 @@ const ThreadSelectButton = styled.button`
   display: flex;
   min-width: 0;
   height: 100%;
-  flex: 1 1 auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
   padding: 0;
   border: 0;
   color: inherit;
@@ -422,8 +450,8 @@ const ThreadSelectButton = styled.button`
   strong {
     min-width: 0;
     overflow: hidden;
-    font-size: 12px;
-    font-weight: 520;
+    font-size: 11px;
+    font-weight: 480;
     letter-spacing: 0;
     line-height: 1.2;
     text-overflow: ellipsis;
@@ -431,7 +459,7 @@ const ThreadSelectButton = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(98, 132, 255, 0.68);
+    outline: 2px solid rgba(255, 255, 255, 0.22);
     outline-offset: 2px;
   }
 `;
@@ -441,19 +469,86 @@ const ThreadRowText = styled.span`
   min-width: 0;
   align-items: center;
   gap: 5px;
+  transition: padding-left 130ms ease;
+
+  ${ThreadRow}[data-can-pin="true"]:hover &,
+  ${ThreadRow}[data-pinned="true"] & {
+    padding-left: 17px;
+  }
+`;
+
+const ThreadPinButton = styled.button`
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  z-index: 2;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: rgba(244, 244, 244, 0.74);
+  background: rgba(58, 58, 58, 0.98);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition:
+    background 130ms ease,
+    color 130ms ease,
+    opacity 130ms ease;
+
+  ${ThreadRow}:hover &,
+  ${ThreadRow}:focus-within &,
+  ${ThreadRow}[data-pinned="true"] & {
+    opacity: 1;
+  }
+
+  ${ThreadRow}[data-pinned="true"] & {
+    color: #f2c24e;
+    background: rgba(62, 52, 30, 0.9);
+  }
+
+  &:hover {
+    color: #ffe39a;
+    background: rgba(84, 68, 34, 0.98);
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    outline: 2px solid rgba(242, 194, 78, 0.48);
+    outline-offset: 1px;
+  }
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+`;
+
+const ThreadStatusSlot = styled.span`
+  position: relative;
+  display: grid;
+  width: 15px;
+  height: 18px;
+  place-items: center;
+  justify-self: end;
 `;
 
 const ThreadArchiveButton = styled.button`
+  position: absolute;
+  inset: 0;
+  z-index: 1;
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
   border: 0;
   border-radius: 7px;
-  color: var(--thread-muted-soft);
-  background: transparent;
+  color: rgba(244, 244, 244, 0.72);
+  background: rgba(58, 58, 58, 0.98);
   opacity: 0;
   transition:
     background 130ms ease,
@@ -466,8 +561,8 @@ const ThreadArchiveButton = styled.button`
   }
 
   &:hover {
-    color: #fecaca;
-    background: rgba(248, 113, 113, 0.12);
+    color: #ffd6d6;
+    background: rgba(239, 107, 107, 0.14);
   }
 
   &:focus-visible {
@@ -477,8 +572,8 @@ const ThreadArchiveButton = styled.button`
   }
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 12px;
+    height: 12px;
   }
 `;
 
@@ -487,64 +582,49 @@ const TerminalStateDot = styled.span`
   height: 6px;
   flex: 0 0 auto;
   border-radius: 99px;
-  background: #71717a;
+  background: #7a8493;
 
-  &[data-nosession="true"] {
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"] {
+    background: var(--thread-green);
+    box-shadow: 0 0 11px rgba(60, 203, 127, 0.32);
+  }
+
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_NO_SESSION}"] {
     background: #fcd34d;
     box-shadow: 0 0 10px rgba(252, 211, 77, 0.24);
   }
 
-  &[data-live="true"] {
-    background: #34d399;
-    box-shadow: 0 0 10px rgba(52, 211, 153, 0.28);
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="starting"] {
+    background: #dfa55a;
+    box-shadow: 0 0 11px rgba(223, 165, 90, 0.28);
   }
 
-  &[data-live="true"][data-nosession="true"] {
-    background: #fcd34d;
-    box-shadow: 0 0 10px rgba(252, 211, 77, 0.24);
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="error"] {
+    background: var(--thread-red);
+    box-shadow: 0 0 11px rgba(239, 107, 107, 0.28);
   }
 
-  &[data-state="starting"] {
-    background: #fbbf24;
-    box-shadow: 0 0 10px rgba(251, 191, 36, 0.24);
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="running"] {
+    background: #f2c24e;
+    box-shadow: 0 0 11px rgba(242, 194, 78, 0.3);
   }
 
-  &[data-state="error"] {
-    background: #f87171;
-    box-shadow: 0 0 10px rgba(248, 113, 113, 0.24);
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="completed"] {
+    background: var(--thread-green);
+    box-shadow: 0 0 11px rgba(60, 203, 127, 0.32);
   }
 
-  &[data-state="running"] {
-    background: #fcd34d;
-    box-shadow: 0 0 10px rgba(252, 211, 77, 0.26);
-  }
-
-  &[data-state="completed"] {
-    background: #34d399;
-    box-shadow: 0 0 10px rgba(52, 211, 153, 0.28);
-  }
-
-  &[data-state="interrupted"] {
-    background: #fbbf24;
-    box-shadow: 0 0 10px rgba(251, 191, 36, 0.24);
-  }
-
-  &[data-live="true"][data-nosession="false"]:not([data-state="error"]) {
-    background: #34d399;
-    box-shadow: 0 0 10px rgba(52, 211, 153, 0.28);
-  }
-
-  &[data-live="true"][data-nosession="true"] {
-    background: #fcd34d;
-    box-shadow: 0 0 10px rgba(252, 211, 77, 0.24);
+  &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="interrupted"] {
+    background: #dfa55a;
+    box-shadow: 0 0 11px rgba(223, 165, 90, 0.28);
   }
 `;
 
 const EmptyThreads = styled.div`
-  padding: 7px 8px;
+  padding: 4px 10px;
   color: var(--thread-muted-soft);
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 460;
 `;
 
 function getThreadRows(workspaceThreads, workspaceId) {
@@ -555,7 +635,25 @@ function getThreadRows(workspaceThreads, workspaceId) {
 
   return (entry.threadOrder || [])
     .map((threadId) => entry.threads?.[threadId])
-    .filter((thread) => thread?.materialized);
+    .filter((thread) => thread?.materialized)
+    .map((thread, index) => ({
+      thread,
+      threadState: getThreadState(thread, entry),
+      index,
+    }))
+    .filter(({ threadState }) => (
+      threadState.threadViewState !== THREAD_VIEW_STATE.INACTIVE_NO_SESSION
+    ))
+    .map(({ thread, index }) => ({ index, thread }))
+    .sort((left, right) => {
+      const leftPinned = getWorkspaceThreadIsPinned(left.thread);
+      const rightPinned = getWorkspaceThreadIsPinned(right.thread);
+      if (leftPinned !== rightPinned) {
+        return leftPinned ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map(({ thread }) => thread);
 }
 
 function terminalMatchesThreadBinding(terminal, terminalBinding) {
@@ -578,7 +676,7 @@ function getThreadState(thread, entry) {
   const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
   const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
   const turnState = getWorkspaceThreadTurnState(thread);
-  const hasSession = getWorkspaceThreadHasSession(thread);
+  const hasSession = Boolean(thread?.transcriptSessionId || providerBinding?.nativeSessionId);
   const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
@@ -591,25 +689,42 @@ function getThreadState(thread, entry) {
       && ["active", "starting"].includes(String(mappedTerminal?.status || "").toLowerCase())
       && ["active", "starting"].includes(String(thread?.status || "").toLowerCase()),
   );
-  const dotState = turnState === "error"
-    ? "error"
-    : hasSession && isActiveTerminal
-      ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
+  let threadViewState = THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
+  if (isActiveTerminal) {
+    threadViewState = hasSession
+      ? THREAD_VIEW_STATE.LIVE_SESSION
+      : THREAD_VIEW_STATE.LIVE_NO_SESSION;
+  } else if (hasSession) {
+    threadViewState = THREAD_VIEW_STATE.DETACHED_SESSION;
+  }
+
+  const dotState = isActiveTerminal
+    ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
+    : turnState === "error"
+      ? "error"
       : turnState === "running"
         ? "running"
         : turnState === "interrupted"
           ? "interrupted"
-          : isActiveTerminal
-            ? thread?.status || "idle"
-            : "idle";
+          : "idle";
 
   return {
     canArchive: getWorkspaceThreadCanArchive(thread),
+    canPin: getWorkspaceThreadCanPin(thread),
     isLive: Boolean(hasSession && isActiveTerminal),
-    isNonSessionActive: !hasSession,
+    isNonSessionActive: threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION,
     label: getWorkspaceThreadLabel(thread),
+    pinned: getWorkspaceThreadIsPinned(thread),
     state: dotState,
+    threadViewState,
   };
+}
+
+function isThreadVisibleInOverlay(thread, entry) {
+  return Boolean(
+    thread?.materialized
+      && getThreadState(thread, entry).threadViewState !== THREAD_VIEW_STATE.INACTIVE_NO_SESSION,
+  );
 }
 
 function WorkspaceThreadsOverlay({
@@ -623,6 +738,7 @@ function WorkspaceThreadsOverlay({
   onSelectModel,
   onSelectThread,
   onSubmitMessage,
+  onTogglePinnedThread,
   onViewStateChange,
   open,
   selectedThreadId,
@@ -685,13 +801,14 @@ function WorkspaceThreadsOverlay({
   const hasVisibleThreads = collapsedThreadGroups.length > 0;
   const selectedThreadFromLocal = workspaceThreads?.[localSelection.workspaceId]
     ?.threads?.[localSelection.threadId];
+  const selectedThreadEntry = workspaceThreads?.[localSelection.workspaceId];
   const fallbackSelection = collapsedThreadGroups[0]?.threads?.[0]
     ? {
       thread: collapsedThreadGroups[0].threads[0],
       workspace: collapsedThreadGroups[0].workspace,
     }
     : { thread: null, workspace: null };
-  const activeThread = selectedThreadFromLocal?.materialized
+  const activeThread = isThreadVisibleInOverlay(selectedThreadFromLocal, selectedThreadEntry)
     ? selectedThreadFromLocal
     : fallbackSelection.thread;
   const activeWorkspace = activeThread
@@ -719,6 +836,11 @@ function WorkspaceThreadsOverlay({
     event.preventDefault();
     event.stopPropagation();
     onArchiveThread?.(workspaceId, threadId);
+  };
+  const togglePinnedThread = (event, workspaceId, threadId) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onTogglePinnedThread?.(workspaceId, threadId);
   };
   const openNewChat = () => {
     const workspaceId = newChatWorkspace?.id || selectedWorkspaceId || activeWorkspaceId || "";
@@ -835,7 +957,13 @@ function WorkspaceThreadsOverlay({
                     {threads.map((thread) => {
                       const isSelected = visibleActiveWorkspaceId === workspace.id
                         && visibleActiveThreadId === thread.id;
-                      const { isLive, isNonSessionActive, label, state } = getThreadState(
+                      const {
+                        isLive,
+                        isNonSessionActive,
+                        label,
+                        state,
+                        threadViewState,
+                      } = getThreadState(
                         thread,
                         workspaceThreads?.[workspace.id],
                       );
@@ -855,6 +983,7 @@ function WorkspaceThreadsOverlay({
                             data-live={isLive ? "true" : "false"}
                             data-nosession={isNonSessionActive ? "true" : "false"}
                             data-state={state}
+                            data-view-state={threadViewState}
                           />
                         </CollapsedThreadButton>
                       );
@@ -892,18 +1021,34 @@ function WorkspaceThreadsOverlay({
                           && visibleActiveThreadId === thread.id;
                         const {
                           canArchive,
+                          canPin,
                           isLive,
                           isNonSessionActive,
                           label,
+                          pinned,
                           state,
+                          threadViewState,
                         } = getThreadState(thread, workspaceThreads?.[workspace.id]);
 
                         return (
                           <ThreadRow
+                            data-can-pin={canPin ? "true" : "false"}
+                            data-can-archive={canArchive ? "true" : "false"}
+                            data-pinned={pinned ? "true" : "false"}
                             data-selected={isSelected ? "true" : "false"}
                             key={thread.id}
                             title={label}
                           >
+                            {canPin ? (
+                              <ThreadPinButton
+                                aria-label={pinned ? `Unpin ${label}` : `Pin ${label}`}
+                                onClick={(event) => togglePinnedThread(event, workspace.id, thread.id)}
+                                title={pinned ? "Unpin thread" : "Pin thread"}
+                                type="button"
+                              >
+                                <PushPin aria-hidden="true" />
+                              </ThreadPinButton>
+                            ) : null}
                             <ThreadSelectButton
                               onClick={() => selectThread(workspace.id, thread.id)}
                               type="button"
@@ -911,23 +1056,26 @@ function WorkspaceThreadsOverlay({
                               <ThreadRowText>
                                 <strong>{label}</strong>
                               </ThreadRowText>
-                              <TerminalStateDot
-                                aria-hidden="true"
-                                data-live={isLive ? "true" : "false"}
-                                data-nosession={isNonSessionActive ? "true" : "false"}
-                                data-state={state}
-                              />
                             </ThreadSelectButton>
-                            {canArchive ? (
-                              <ThreadArchiveButton
-                                aria-label={`Archive ${label}`}
-                                onClick={(event) => archiveThread(event, workspace.id, thread.id)}
-                                title="Archive thread"
-                                type="button"
-                              >
-                                <DeleteOutline aria-hidden="true" />
-                              </ThreadArchiveButton>
-                            ) : null}
+                            <ThreadStatusSlot>
+                          <TerminalStateDot
+                            aria-hidden="true"
+                            data-live={isLive ? "true" : "false"}
+                            data-nosession={isNonSessionActive ? "true" : "false"}
+                            data-state={state}
+                            data-view-state={threadViewState}
+                          />
+                              {canArchive ? (
+                                <ThreadArchiveButton
+                                  aria-label={`Archive ${label}`}
+                                  onClick={(event) => archiveThread(event, workspace.id, thread.id)}
+                                  title="Archive thread"
+                                  type="button"
+                                >
+                                  <DeleteOutline aria-hidden="true" />
+                                </ThreadArchiveButton>
+                              ) : null}
+                            </ThreadStatusSlot>
                           </ThreadRow>
                         );
                       }) : (

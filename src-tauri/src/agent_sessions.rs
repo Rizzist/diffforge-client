@@ -13,6 +13,15 @@ struct CodexThreadTranscriptRequest {
     max_messages: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadSessionDiscoverRequest {
+    agent_id: Option<String>,
+    cwd: Option<String>,
+    expected_user_message: Option<String>,
+    max_messages: Option<usize>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptMessage {
@@ -26,7 +35,7 @@ struct CodexThreadTranscriptMessage {
     source: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct CodexRolloutMeta {
     session_id: String,
     cwd: String,
@@ -66,7 +75,7 @@ fn clean_codex_id(value: impl AsRef<str>) -> String {
         .collect()
 }
 
-fn normalize_codex_path_text(value: impl AsRef<str>) -> String {
+fn normalize_agent_path_text(value: impl AsRef<str>) -> String {
     let text = value.as_ref().trim();
     if text.is_empty() {
         return String::new();
@@ -86,10 +95,49 @@ fn normalize_codex_path_text(value: impl AsRef<str>) -> String {
     }
 }
 
-fn codex_paths_match(left: &str, right: &str) -> bool {
-    let left = normalize_codex_path_text(left);
-    let right = normalize_codex_path_text(right);
+fn agent_paths_match(left: &str, right: &str) -> bool {
+    let left = normalize_agent_path_text(left);
+    let right = normalize_agent_path_text(right);
     !left.is_empty() && left == right
+}
+
+fn normalize_prompt_match_text(value: impl AsRef<str>) -> String {
+    let mut output = String::new();
+    let mut previous_space = false;
+    for character in value.as_ref().replace('\r', "\n").chars() {
+        let character = match character {
+            '\u{0000}'..='\u{0008}' | '\u{000B}'..='\u{001F}' | '\u{007F}' => ' ',
+            '\t' => ' ',
+            value => value,
+        };
+        if character == ' ' {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+        output.push(character);
+    }
+
+    while output.contains("\n\n\n\n") {
+        output = output.replace("\n\n\n\n", "\n\n\n");
+    }
+
+    output.trim().to_string()
+}
+
+fn transcript_has_exact_user_prompt(
+    messages: &[CodexThreadTranscriptMessage],
+    expected_user_message: &str,
+) -> bool {
+    let expected = normalize_prompt_match_text(expected_user_message);
+    !expected.is_empty()
+        && messages.iter().any(|message| {
+            message.role.eq_ignore_ascii_case("user")
+                && normalize_prompt_match_text(&message.text) == expected
+        })
 }
 
 fn collect_codex_rollout_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -825,7 +873,7 @@ fn parse_codex_rollout(
 
 fn find_codex_rollout(
     provider_session_id: &str,
-    cwd: &str,
+    _cwd: &str,
 ) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
     let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
     let sessions_dir = codex_home.join("sessions");
@@ -856,17 +904,6 @@ fn find_codex_rollout(
             };
             if name_match || meta.session_id == requested_session_id {
                 return Ok((path.clone(), meta, "sessionId".to_string()));
-            }
-        }
-    }
-
-    if !cwd.trim().is_empty() {
-        for path in &files {
-            let Some(meta) = codex_rollout_meta(path) else {
-                continue;
-            };
-            if codex_paths_match(&meta.cwd, cwd) {
-                return Ok((path.clone(), meta, "cwd".to_string()));
             }
         }
     }
@@ -1033,17 +1070,6 @@ fn find_claude_session(
             };
             if file_match || meta.session_id == requested_session_id {
                 return Ok((path.clone(), meta, "sessionId".to_string()));
-            }
-        }
-    }
-
-    if !cwd.trim().is_empty() {
-        for path in &files {
-            let Some(meta) = claude_file_meta(path) else {
-                continue;
-            };
-            if codex_paths_match(&meta.cwd, cwd) {
-                return Ok((path.clone(), meta, "cwd".to_string()));
             }
         }
     }
@@ -1586,7 +1612,7 @@ fn opencode_message_role(data: &Value) -> String {
 
 fn find_opencode_session(
     provider_session_id: &str,
-    cwd: &str,
+    _cwd: &str,
 ) -> Result<(String, String, String, String), String> {
     let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
     let connection = rusqlite::Connection::open_with_flags(
@@ -1616,27 +1642,224 @@ fn find_opencode_session(
         }
     }
 
+    Err("No OpenCode session matched this thread session.".to_string())
+}
+
+fn discover_codex_session_by_prompt(
+    expected_user_message: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
+    let sessions_dir = codex_home.join("sessions");
+    if !sessions_dir.exists() {
+        return Err(format!(
+            "Codex sessions directory does not exist: {}",
+            sessions_dir.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_codex_rollout_files(&sessions_dir, &mut files);
+    sort_rollouts_newest_first(&mut files);
+
+    for path in files {
+        let initial_meta = codex_rollout_meta(&path).unwrap_or_default();
+        let Ok((parsed_meta, messages)) = parse_codex_rollout(&path, max_messages) else {
+            continue;
+        };
+        let session_id = if parsed_meta.session_id.is_empty() {
+            initial_meta.session_id
+        } else {
+            parsed_meta.session_id
+        };
+        if session_id.is_empty() {
+            continue;
+        }
+        let session_cwd = if parsed_meta.cwd.is_empty() {
+            initial_meta.cwd
+        } else {
+            parsed_meta.cwd
+        };
+        if !cwd.trim().is_empty() && !agent_paths_match(&session_cwd, cwd) {
+            continue;
+        }
+        if !transcript_has_exact_user_prompt(&messages, expected_user_message) {
+            continue;
+        }
+
+        let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+            initial_meta.latest_timestamp
+        } else {
+            parsed_meta.latest_timestamp
+        };
+        let session_title = first_non_empty_title(&[
+            parsed_meta.title,
+            initial_meta.title,
+            codex_session_index_title(&session_id),
+        ]);
+
+        return Ok(CodexThreadTranscriptResult {
+            session_id,
+            session_title,
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd: session_cwd,
+            matched_by: if cwd.trim().is_empty() {
+                "prompt".to_string()
+            } else {
+                "prompt+cwd".to_string()
+            },
+            latest_timestamp,
+            messages,
+        });
+    }
+
+    Err("No Codex session matched this prompt.".to_string())
+}
+
+fn discover_claude_session_by_prompt(
+    expected_user_message: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let claude_home =
+        claude_home_dir().ok_or_else(|| "Unable to locate Claude Code home.".to_string())?;
+    let projects_dir = claude_home.join("projects");
+    if !projects_dir.exists() {
+        return Err(format!(
+            "Claude Code projects directory does not exist: {}",
+            projects_dir.display()
+        ));
+    }
+
+    let mut files = Vec::new();
     if !cwd.trim().is_empty() {
-        let mut statement = connection
-            .prepare("select id, title, directory, time_updated from session order by time_updated desc")
-            .map_err(|error| format!("Unable to query OpenCode sessions: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            })
-            .map_err(|error| format!("Unable to list OpenCode sessions: {error}"))?;
-        for row in rows.flatten() {
-            if codex_paths_match(&row.2, cwd) {
-                return Ok((row.0, row.1, row.2, "cwd".to_string()));
+        let encoded = claude_project_dir_name(cwd);
+        for candidate in [
+            projects_dir.join(&encoded),
+            projects_dir.join(encoded.to_lowercase()),
+        ] {
+            if candidate.exists() {
+                collect_claude_session_files(&candidate, &mut files);
             }
         }
     }
+    collect_claude_session_files(&projects_dir, &mut files);
+    sort_rollouts_newest_first(&mut files);
 
-    Err("No OpenCode session matched this thread session.".to_string())
+    for path in files {
+        let Some(initial_meta) = claude_file_meta(&path) else {
+            continue;
+        };
+        let Ok((parsed_meta, messages)) = parse_claude_session(&path, max_messages) else {
+            continue;
+        };
+        let session_id = if parsed_meta.session_id.is_empty() {
+            initial_meta.session_id
+        } else {
+            parsed_meta.session_id
+        };
+        if session_id.is_empty() {
+            continue;
+        }
+        let session_cwd = if parsed_meta.cwd.is_empty() {
+            initial_meta.cwd
+        } else {
+            parsed_meta.cwd
+        };
+        if !cwd.trim().is_empty() && !agent_paths_match(&session_cwd, cwd) {
+            continue;
+        }
+        if !transcript_has_exact_user_prompt(&messages, expected_user_message) {
+            continue;
+        }
+        let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+            initial_meta.latest_timestamp
+        } else {
+            parsed_meta.latest_timestamp
+        };
+
+        return Ok(CodexThreadTranscriptResult {
+            session_id,
+            session_title: if parsed_meta.title.is_empty() {
+                initial_meta.title
+            } else {
+                parsed_meta.title
+            },
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd: session_cwd,
+            matched_by: if cwd.trim().is_empty() {
+                "prompt".to_string()
+            } else {
+                "prompt+cwd".to_string()
+            },
+            latest_timestamp,
+            messages,
+        });
+    }
+
+    Err("No Claude Code session matched this prompt.".to_string())
+}
+
+fn discover_opencode_session_by_prompt(
+    expected_user_message: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+    let mut statement = connection
+        .prepare("select id, title, directory, time_updated from session order by time_updated desc")
+        .map_err(|error| format!("Unable to query OpenCode sessions: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| format!("Unable to list OpenCode sessions: {error}"))?;
+
+    for row in rows.flatten() {
+        let session_id = row.0;
+        let title = row.1;
+        let session_cwd = row.2;
+        if session_id.trim().is_empty() {
+            continue;
+        }
+        if !cwd.trim().is_empty() && !agent_paths_match(&session_cwd, cwd) {
+            continue;
+        }
+        let Ok((parsed_meta, messages)) =
+            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)
+        else {
+            continue;
+        };
+        if !transcript_has_exact_user_prompt(&messages, expected_user_message) {
+            continue;
+        }
+
+        return Ok(CodexThreadTranscriptResult {
+            session_id: parsed_meta.session_id,
+            session_title: parsed_meta.title,
+            rollout_path: db_path.to_string_lossy().to_string(),
+            cwd: parsed_meta.cwd,
+            matched_by: if cwd.trim().is_empty() {
+                "prompt".to_string()
+            } else {
+                "prompt+cwd".to_string()
+            },
+            latest_timestamp: parsed_meta.latest_timestamp,
+            messages,
+        });
+    }
+
+    Err("No OpenCode session matched this prompt.".to_string())
 }
 
 fn parse_opencode_session(
@@ -1745,17 +1968,49 @@ fn parse_opencode_session(
 }
 
 #[tauri::command]
-async fn agent_thread_transcript(
-    request: CodexThreadTranscriptRequest,
+async fn agent_thread_session_discover(
+    request: CodexThreadSessionDiscoverRequest,
 ) -> Result<CodexThreadTranscriptResult, String> {
     let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
         .to_lowercase();
-    let provider_session_id = request.provider_session_id.unwrap_or_default();
+    let expected_user_message = request.expected_user_message.unwrap_or_default();
+    if normalize_prompt_match_text(&expected_user_message).is_empty() {
+        return Err("Expected user message is required to discover an agent session.".to_string());
+    }
+
     let cwd = request.cwd.unwrap_or_default();
     let max_messages = request
         .max_messages
         .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
         .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
+
+    if agent_id == "claude" {
+        return discover_claude_session_by_prompt(&expected_user_message, &cwd, max_messages);
+    }
+
+    if agent_id == "opencode" {
+        return discover_opencode_session_by_prompt(&expected_user_message, &cwd, max_messages);
+    }
+
+    discover_codex_session_by_prompt(&expected_user_message, &cwd, max_messages)
+}
+
+#[tauri::command]
+async fn agent_thread_transcript(
+    request: CodexThreadTranscriptRequest,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
+        .to_lowercase();
+    let provider_session_id = clean_codex_id(request.provider_session_id.unwrap_or_default());
+    let cwd = request.cwd.unwrap_or_default();
+    let max_messages = request
+        .max_messages
+        .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
+        .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
+
+    if provider_session_id.is_empty() {
+        return Err("Provider session id is required to read an agent transcript.".to_string());
+    }
 
     if agent_id == "claude" {
         let (path, initial_meta, matched_by) = find_claude_session(&provider_session_id, &cwd)?;

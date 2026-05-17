@@ -100,7 +100,9 @@ const APP_SHUTDOWN_PHASE_EXITING: u8 = 5;
 const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
+const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
@@ -135,6 +137,7 @@ static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
@@ -327,7 +330,8 @@ impl TerminalDiagnosticState {
     }
 
     fn is_enabled(&self) -> bool {
-        TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || self.enabled.load(Ordering::Relaxed)
+        TERMINAL_DIAGNOSTIC_LOGGING_ENABLED
+            || (TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED && self.enabled.load(Ordering::Relaxed))
     }
 }
 
@@ -1277,6 +1281,7 @@ include!("validation.rs");
 include!("platform.rs");
 include!("process.rs");
 include!("workspace_files.rs");
+include!("workspace_threads_store.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("terminal_cli.rs");
@@ -1299,6 +1304,10 @@ fn diagnostic_log_path(file_name: &str) -> PathBuf {
 
 fn terminal_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(TERMINAL_DIAGNOSTIC_LOG_FILE)
+}
+
+fn thread_bridge_diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path(THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE)
 }
 
 fn windows_terminal_diagnostic_log_path() -> PathBuf {
@@ -1332,6 +1341,32 @@ fn write_terminal_diagnostic_log_entry(entry: Value) {
     }
 
     let lock = TERMINAL_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn write_thread_bridge_diagnostic_log_entry(entry: Value) {
+    let log_path = thread_bridge_diagnostic_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
     let Ok(_guard) = lock.lock() else {
         return;
     };
@@ -1420,7 +1455,8 @@ fn terminal_set_diagnostic_logging(
     state: State<'_, TerminalDiagnosticState>,
     enabled: bool,
 ) -> bool {
-    let resolved_enabled = TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || enabled;
+    let resolved_enabled = TERMINAL_DIAGNOSTIC_LOGGING_ENABLED
+        || (TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED && enabled);
     state.enabled.store(resolved_enabled, Ordering::Relaxed);
 
     if resolved_enabled {
@@ -1450,6 +1486,20 @@ fn terminal_diagnostic_log(
     }
 
     write_terminal_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
+    write_thread_bridge_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
         "source": "frontend",
@@ -1985,6 +2035,8 @@ pub fn run() {
             list_workspace_directory,
             read_workspace_file,
             read_workspace_file_diff,
+            workspace_threads_read,
+            workspace_threads_persist,
             workspace_web_normalize_url,
             workspace_web_navigate,
             workspace_web_reload,
@@ -2029,6 +2081,7 @@ pub fn run() {
             cloud_mcp_start_spec_graph_sync,
             cloud_mcp_stop_spec_graph_sync,
             cloud_mcp_get_spec_graph,
+            agent_thread_session_discover,
             agent_thread_transcript,
             terminal_open,
             terminal_start_agent,
@@ -2039,6 +2092,7 @@ pub fn run() {
             terminal_windows_pty_info,
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,
+            thread_bridge_diagnostic_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,
             terminal_delete_selection,

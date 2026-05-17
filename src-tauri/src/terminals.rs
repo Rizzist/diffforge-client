@@ -3905,6 +3905,21 @@ async fn terminal_write_inner(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
+            write_thread_bridge_diagnostic_log_entry(json!({
+                "ts_ms": current_time_ms(),
+                "phase": "backend.bridge.terminal_write.missing_session",
+                "source": "backend",
+                "app_pid": std::process::id(),
+                "thread": terminal_diagnostic_thread_label(),
+                "fields": {
+                    "data_len": data.len(),
+                    "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "has_prompt_event_text": true,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "thread_id": thread_id.as_deref().unwrap_or_default(),
+                },
+            }));
             return Err("Terminal session is not running.".to_string());
         }
         return Ok(());
@@ -3945,6 +3960,16 @@ async fn terminal_write_inner(
         return Ok(());
     }
 
+    write_terminal_input(
+        Some(&app),
+        state,
+        &pane_id,
+        instance_id,
+        &data,
+        "terminal.write.skipped_stale_or_missing",
+    )
+    .await?;
+
     let observed_prompt = terminal_observe_submitted_prompt(&instance, &data).await;
     if let Some(prompt) = observed_prompt {
         let event_prompt = prompt_event_text
@@ -3960,6 +3985,22 @@ async fn terminal_write_inner(
             prompt_event_id.as_deref(),
             thread_id.as_deref(),
         );
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.prompt_observed",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "data_len": data.len(),
+                "event_prompt_len": event_prompt.len(),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance.id,
+                "observed_prompt_len": prompt.len(),
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            },
+        }));
         if *instance.agent_started.lock().await {
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
@@ -3984,18 +4025,31 @@ async fn terminal_write_inner(
                 .await;
             });
         }
+    } else if prompt_event_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || prompt_event_text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.prompt_not_observed",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "data_len": data.len(),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            },
+        }));
     }
 
-    write_terminal_input(
-        Some(&app),
-        state,
-        &pane_id,
-        instance_id,
-        &data,
-        "terminal.write.skipped_stale_or_missing",
-    )
-    .await
-    .map(|_| ())
+    Ok(())
 }
 
 #[tauri::command]

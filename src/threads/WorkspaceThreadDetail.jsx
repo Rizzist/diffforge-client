@@ -27,19 +27,30 @@ const DetailRoot = styled.main`
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
-  --thread-bg: #09090b;
-  --thread-card: #0d0d10;
-  --thread-fg: #f4f4f5;
-  --thread-muted: #a1a1aa;
-  --thread-muted-soft: rgba(161, 161, 170, 0.48);
-  --thread-border: rgba(255, 255, 255, 0.065);
-  --thread-accent: rgba(255, 255, 255, 0.055);
-  --thread-secondary: rgba(255, 255, 255, 0.045);
-  --thread-ring: rgba(98, 132, 255, 0.46);
+  --thread-bg: #1f1f1f;
+  --thread-bg-soft: #242424;
+  --thread-card: rgba(28, 28, 28, 0.92);
+  --thread-card-raised: rgba(34, 34, 34, 0.94);
+  --thread-fg: #f4f7fa;
+  --thread-muted: #a5a7ad;
+  --thread-muted-soft: rgba(165, 167, 173, 0.58);
+  --thread-border: rgba(255, 255, 255, 0.08);
+  --thread-border-strong: rgba(255, 255, 255, 0.16);
+  --thread-accent: rgba(255, 255, 255, 0.07);
+  --thread-secondary: #222222;
+  --thread-ring: rgba(255, 255, 255, 0.22);
+  --thread-ember: #dfa55a;
+  --thread-blue: #c6c6c6;
+  --thread-green: #3ccb7f;
   color: var(--thread-fg);
-  background: var(--thread-bg);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.016) 1px, transparent 1px),
+    linear-gradient(180deg, #1f1f1f, #1c1c1c 42%, #1a1a1a);
+  background-size: 86px 86px, 86px 86px, auto;
   font-family:
     Inter,
+    "Segoe UI Variable",
     ui-sans-serif,
     system-ui,
     -apple-system,
@@ -48,10 +59,11 @@ const DetailRoot = styled.main`
     sans-serif;
   user-select: text;
   -webkit-user-select: text;
+  isolation: isolate;
 
   *::selection {
     color: #ffffff;
-    background: rgba(85, 132, 199, 0.42);
+    background: rgba(120, 120, 120, 0.46);
   }
 `;
 
@@ -60,7 +72,9 @@ const TranscriptScroll = styled.div`
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  background: var(--thread-bg);
+  background:
+    linear-gradient(180deg, rgba(31, 31, 31, 0.2), rgba(31, 31, 31, 0.58)),
+    transparent;
   user-select: text;
   -webkit-user-select: text;
 
@@ -74,18 +88,18 @@ const TranscriptScroll = styled.div`
 
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(170, 170, 170, 0.16);
   }
 `;
 
 const TranscriptInner = styled.div`
   display: grid;
-  width: min(100%, 768px);
+  width: min(100%, 880px);
   min-height: 100%;
   align-content: end;
   gap: 0;
   margin: 0 auto;
-  padding: 28px 24px 20px;
+  padding: 42px 28px 26px;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -93,10 +107,11 @@ const TranscriptInner = styled.div`
 const EmptyThread = styled.div`
   align-self: center;
   justify-self: center;
-  max-width: 360px;
+  max-width: 380px;
   color: var(--thread-muted-soft);
   font-size: 13px;
-  line-height: 1.45;
+  font-weight: 520;
+  line-height: 1.5;
   text-align: center;
 `;
 
@@ -104,10 +119,10 @@ const UserCell = styled.article`
   display: flex;
   min-width: 0;
   justify-content: flex-end;
-  padding: 0 0 16px;
+  padding: 2px 0 18px;
   color: var(--thread-fg);
-  font-size: 14px;
-  line-height: 1.58;
+  font-size: 12px;
+  line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -122,10 +137,10 @@ const MessageText = styled.div`
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--thread-fg);
-  font-size: 14px;
-  font-weight: 430;
+  font-size: 12px;
+  font-weight: 470;
   letter-spacing: 0;
-  line-height: 1.65;
+  line-height: 1.58;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -136,16 +151,18 @@ const MessageBody = styled.div`
   gap: 7px;
 
   article[data-message-role="user"] & {
-    max-width: min(80%, 620px);
-    border: 1px solid var(--thread-border);
-    border-radius: 18px 18px 4px;
-    padding: 12px 15px;
-    background: var(--thread-secondary);
+    max-width: min(78%, 520px);
+    border: 0;
+    border-radius: 18px;
+    padding: 11px 14px 12px;
+    color: #dedede;
+    background: #202020;
+    box-shadow: none;
   }
 
   article[data-message-role="assistant"] & {
     width: 100%;
-    padding: 1px 4px;
+    padding: 2px 3px;
   }
 
   article[data-message-role="activity"] & {
@@ -158,10 +175,10 @@ const MessageInlineCode = styled.code`
   border-radius: 6px;
   padding: 1px 5px 2px;
   color: #f8fafc;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.11);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.92em;
-  font-weight: 560;
+  font-weight: 620;
 `;
 
 const MessageFileLink = styled.button`
@@ -169,7 +186,7 @@ const MessageFileLink = styled.button`
   min-width: 0;
   padding: 0;
   border: 0;
-  color: #93c5fd;
+  color: var(--thread-blue);
   background: transparent;
   font: inherit;
   font-weight: 560;
@@ -179,7 +196,7 @@ const MessageFileLink = styled.button`
   -webkit-user-select: text;
 
   &:hover {
-    color: #bfdbfe;
+    color: #f2f2f2;
     text-decoration: underline;
     text-underline-offset: 2px;
   }
@@ -188,9 +205,9 @@ const MessageFileLink = styled.button`
 const AssistantCell = styled.article`
   display: block;
   min-width: 0;
-  padding: 0 0 16px;
+  padding: 2px 0 20px;
   color: var(--thread-fg);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
@@ -204,11 +221,15 @@ const AssistantPrefix = styled.span`
 const TranscriptActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
-  gap: 8px;
-  padding: 2px 4px 12px;
+  gap: 10px;
+  margin: 0 0 18px;
+  border: 1px solid var(--thread-border);
+  border-radius: 8px;
+  padding: 10px 12px;
   color: var(--thread-muted);
   font-size: 12px;
   line-height: 1.5;
+  background: rgba(32, 32, 32, 0.56);
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -234,7 +255,7 @@ const TranscriptActivityTitle = styled.div`
 
 const TranscriptActivityStatus = styled.span`
   min-width: 0;
-  color: var(--thread-muted-soft);
+  color: rgba(223, 165, 90, 0.82);
   font-size: 10px;
   font-weight: 520;
   line-height: 1;
@@ -249,8 +270,8 @@ const TranscriptActivityBody = styled.pre`
   margin: 6px 0 0;
   overflow-x: hidden;
   overflow-y: auto;
-  border-left: 1px solid var(--thread-border);
-  padding: 2px 0 2px 11px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 2px 0 2px 12px;
   color: var(--thread-muted);
   background: transparent;
   font: inherit;
@@ -266,8 +287,8 @@ const TranscriptActivityBody = styled.pre`
 const ActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
-  gap: 8px;
-  padding: 0 4px 12px;
+  gap: 10px;
+  padding: 0 3px 18px;
   color: var(--thread-muted);
   font-size: 12px;
   line-height: 1.5;
@@ -276,7 +297,7 @@ const ActivityCell = styled.article`
 `;
 
 const ActivityBullet = styled.span`
-  color: var(--thread-muted-soft);
+  color: var(--thread-blue);
   user-select: none;
 `;
 
@@ -284,6 +305,7 @@ const ActivityText = styled.div`
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-weight: 560;
   white-space: nowrap;
   user-select: text;
   -webkit-user-select: text;
@@ -299,50 +321,59 @@ const ActivityText = styled.div`
 
 const ComposerShell = styled.form`
   display: grid;
-  width: min(100%, 832px);
+  width: min(100%, 640px);
   gap: 8px;
   margin: 0 auto;
-  padding: 0 24px 18px;
-  background: var(--thread-bg);
+  padding: 0 22px 24px;
+  background: transparent;
   user-select: none;
 `;
 
 const ComposerBox = styled.div`
   display: grid;
-  min-height: 118px;
-  grid-template-rows: auto minmax(70px, auto) auto;
-  overflow: hidden;
-  border: 1px solid var(--thread-border);
-  border-radius: 20px;
-  background: var(--thread-card);
-  box-shadow: none;
+  min-height: 88px;
+  grid-template-rows: auto minmax(42px, auto) auto;
+  position: relative;
+  overflow: visible;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 22px;
+  background: #2f2f2f;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.035),
+    0 -14px 40px rgba(0, 0, 0, 0.26);
   transition:
     border-color 160ms ease,
-    background 160ms ease;
+    background 160ms ease,
+    box-shadow 160ms ease;
 
   &:focus-within {
     border-color: var(--thread-ring);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.055),
+      0 0 0 1px rgba(255, 255, 255, 0.08),
+      0 -18px 52px rgba(0, 0, 0, 0.32);
   }
 `;
 
 const ComposerInput = styled.textarea`
   width: 100%;
-  min-height: 70px;
-  max-height: 200px;
+  min-height: 42px;
+  max-height: 126px;
   resize: none;
-  padding: 15px 16px 8px;
+  padding: 13px 16px 5px;
   border: 0;
   outline: none;
-  color: var(--thread-fg);
+  color: #d6d6d6;
   background: transparent;
   font: inherit;
-  font-size: 14px;
-  line-height: 1.65;
+  font-size: 12px;
+  font-weight: 470;
+  line-height: 1.5;
   user-select: text;
   -webkit-user-select: text;
 
   &::placeholder {
-    color: var(--thread-muted-soft);
+    color: #808080;
   }
 
   &:disabled {
@@ -356,7 +387,7 @@ const ComposerFooter = styled.div`
   min-width: 0;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   padding: 0 12px 12px;
   user-select: none;
 `;
@@ -364,8 +395,9 @@ const ComposerFooter = styled.div`
 const ComposerHint = styled.span`
   min-width: 0;
   overflow: hidden;
-  color: var(--thread-muted-soft);
-  font-size: 11px;
+  color: rgba(170, 170, 170, 0.5);
+  font-size: 12px;
+  font-weight: 640;
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -375,33 +407,44 @@ const ComposerControls = styled.div`
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
+`;
+
+const ComposerActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
 `;
 
 const ComposerToolButton = styled.button`
   display: inline-flex;
   min-width: 0;
-  height: 24px;
+  height: 29px;
   align-items: center;
   justify-content: center;
   gap: 5px;
-  padding: 0 7px;
-  border: 0;
+  padding: 0 9px;
+  border: 1px solid transparent;
   border-radius: 8px;
-  color: var(--thread-muted);
-  background: transparent;
+  color: #a8a8a8;
+  background: rgba(255, 255, 255, 0.04);
   font: inherit;
   font-size: 11px;
+  font-weight: 620;
   line-height: 1;
   user-select: none;
   transition:
     background 120ms ease,
+    border-color 120ms ease,
     color 120ms ease,
     opacity 120ms ease;
 
   &:hover:not(:disabled) {
-    color: var(--thread-fg);
-    background: var(--thread-accent);
+    color: #f2f2f2;
+    border-color: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.075);
   }
 
   &:disabled {
@@ -410,8 +453,8 @@ const ComposerToolButton = styled.button`
   }
 
   svg {
-    width: 16px;
-    height: 16px;
+    width: 17px;
+    height: 17px;
   }
 `;
 
@@ -422,7 +465,38 @@ const ModelMenuWrap = styled.div`
 
 const ModelButton = styled(ComposerToolButton)`
   max-width: min(260px, 38vw);
-  color: var(--thread-fg);
+  color: #e6e6e6;
+  background: rgba(255, 255, 255, 0.045);
+
+  &[data-empty="true"] {
+    width: 30px;
+    padding: 0;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+    color: var(--thread-muted-soft);
+  }
+`;
+
+const AgentButton = styled(ComposerToolButton)`
+  max-width: min(150px, 28vw);
+  color: #e6e6e6;
+  cursor: default;
+  pointer-events: none;
+
+  &:hover {
+    border-color: transparent;
+    background: rgba(255, 255, 255, 0.045);
+  }
 
   span {
     min-width: 0;
@@ -441,15 +515,19 @@ const ModelButton = styled(ComposerToolButton)`
 const ModelDropdown = styled.div`
   position: absolute;
   right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 4;
+  bottom: calc(100% + 8px);
+  z-index: 20;
   display: none;
   width: min(280px, 70vw);
-  overflow: hidden;
-  border: 1px solid var(--thread-border);
-  border-radius: 12px;
-  background: var(--thread-card);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  max-height: min(320px, 48vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(32, 32, 32, 0.98);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 18px 48px rgba(0, 0, 0, 0.48);
 
   &[data-open="true"] {
     display: grid;
@@ -460,7 +538,7 @@ const ModelOption = styled.button`
   display: grid;
   min-width: 0;
   gap: 3px;
-  padding: 9px 10px;
+  padding: 10px 11px;
   border: 0;
   color: var(--thread-fg);
   background: transparent;
@@ -470,7 +548,7 @@ const ModelOption = styled.button`
 
   &:hover,
   &[data-selected="true"] {
-    background: var(--thread-accent);
+    background: rgba(255, 255, 255, 0.08);
   }
 
   strong {
@@ -497,7 +575,7 @@ const AttachmentStrip = styled.div`
   min-width: 0;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 8px 9px 0;
+  padding: 9px 10px 0;
 
   &:empty {
     display: none;
@@ -510,11 +588,11 @@ const AttachmentChip = styled.span`
   height: 24px;
   align-items: center;
   gap: 6px;
-  border: 1px solid var(--thread-border);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
   padding: 0 6px 0 8px;
   color: var(--thread-fg);
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(255, 255, 255, 0.045);
   font-size: 11px;
   line-height: 1;
   user-select: none;
@@ -553,15 +631,16 @@ const HiddenFileInput = styled.input`
 
 const SendButton = styled.button`
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: 34px;
+  height: 34px;
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
   border: 0;
   border-radius: 999px;
-  color: #09090b;
-  background: #f4f4f5;
+  color: #1a1a1a;
+  background: #8c8c8c;
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.32);
   user-select: none;
   transition:
     background 130ms ease,
@@ -569,7 +648,7 @@ const SendButton = styled.button`
     opacity 130ms ease;
 
   &:hover:not(:disabled) {
-    background: #ffffff;
+    background: #a2a2a2;
   }
 
   &:disabled {
@@ -578,13 +657,13 @@ const SendButton = styled.button`
   }
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 19px;
+    height: 19px;
   }
 `;
 
 const ComposerError = styled.div`
-  color: #fca5a5;
+  color: #ef6b6b;
   font-size: 11px;
   line-height: 1.35;
 `;
@@ -597,29 +676,33 @@ const NewChatRoot = styled.main`
   padding: 36px 24px;
   overflow-x: hidden;
   overflow-y: auto;
-  --thread-bg: #09090b;
-  --thread-card: #0d0d10;
-  --thread-fg: #f4f4f5;
-  --thread-muted: #a1a1aa;
-  --thread-muted-soft: rgba(161, 161, 170, 0.48);
-  --thread-border: rgba(255, 255, 255, 0.065);
-  --thread-accent: rgba(255, 255, 255, 0.055);
-  --thread-ring: rgba(98, 132, 255, 0.46);
+  --thread-bg: #1f1f1f;
+  --thread-card: rgba(32, 32, 32, 0.92);
+  --thread-fg: #f4f7fa;
+  --thread-muted: #a5a7ad;
+  --thread-muted-soft: rgba(165, 167, 173, 0.58);
+  --thread-border: rgba(255, 255, 255, 0.08);
+  --thread-accent: rgba(255, 255, 255, 0.07);
+  --thread-ring: rgba(255, 255, 255, 0.22);
   color: var(--thread-fg);
-  background: var(--thread-bg);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.016) 1px, transparent 1px),
+    linear-gradient(180deg, #1f1f1f, #1c1c1c 42%, #1a1a1a);
+  background-size: 86px 86px, 86px 86px, auto;
 `;
 
 const NewChatCenter = styled.form`
   display: grid;
-  width: min(100%, 832px);
-  gap: 28px;
+  width: min(100%, 640px);
+  gap: 26px;
 `;
 
 const NewChatTitle = styled.h1`
   margin: 0;
   color: var(--thread-fg);
-  font-size: clamp(25px, 4vw, 40px);
-  font-weight: 430;
+  font-size: clamp(25px, 4vw, 38px);
+  font-weight: 560;
   letter-spacing: 0;
   line-height: 1.12;
   text-align: center;
@@ -627,13 +710,16 @@ const NewChatTitle = styled.h1`
 
 const NewChatBox = styled.div`
   display: grid;
-  min-height: 132px;
-  grid-template-rows: minmax(76px, auto) auto;
-  overflow: hidden;
-  border: 1px solid var(--thread-border);
-  border-radius: 20px;
-  background: var(--thread-card);
-  box-shadow: none;
+  min-height: 94px;
+  grid-template-rows: minmax(46px, auto) auto;
+  position: relative;
+  overflow: visible;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 22px;
+  background: #2f2f2f;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 22px 56px rgba(0, 0, 0, 0.3);
 
   &:focus-within {
     border-color: var(--thread-ring);
@@ -642,22 +728,23 @@ const NewChatBox = styled.div`
 
 const NewChatInput = styled.textarea`
   width: 100%;
-  min-height: 76px;
-  max-height: 220px;
+  min-height: 46px;
+  max-height: 126px;
   resize: none;
-  padding: 15px 16px 8px;
+  padding: 13px 16px 5px;
   border: 0;
   outline: 0;
-  color: var(--thread-fg);
+  color: #d6d6d6;
   background: transparent;
   font: inherit;
-  font-size: 16px;
-  line-height: 1.6;
+  font-size: 12px;
+  font-weight: 470;
+  line-height: 1.5;
   user-select: text;
   -webkit-user-select: text;
 
   &::placeholder {
-    color: var(--thread-muted-soft);
+    color: #808080;
   }
 
   &:disabled {
@@ -687,13 +774,13 @@ const NewChatSelect = styled.select`
   max-width: 190px;
   height: 32px;
   min-width: 112px;
-  border: 1px solid transparent;
-  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
   padding: 0 28px 0 12px;
-  color: var(--thread-fg);
+  color: #e6e6e6;
   background: rgba(255, 255, 255, 0.045);
   font: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 650;
   outline: none;
 
@@ -702,6 +789,8 @@ const NewChatSelect = styled.select`
     cursor: not-allowed;
   }
 `;
+
+const NewChatActions = styled(ComposerActions)``;
 
 const NewChatProject = styled.div`
   min-width: 0;
@@ -718,7 +807,7 @@ const NewChatProject = styled.div`
 const NewChatAttachButton = styled(ComposerToolButton)`
   width: 32px;
   height: 32px;
-  border-radius: 999px;
+  border-radius: 8px;
   color: var(--thread-muted);
   background: transparent;
 
@@ -731,7 +820,6 @@ const NewChatSendButton = styled(SendButton)`
   width: 40px;
   height: 40px;
   border-radius: 999px;
-  background: #f4f4f5;
 
   svg {
     width: 22px;
@@ -769,10 +857,11 @@ const MODEL_OPTIONS = {
     { detail: "Fastest Claude option", label: "Haiku", value: "haiku" },
   ],
   codex: [
-    { detail: "Codex default", label: "5.5 Extra High", value: "gpt-5.5" },
+    { detail: "Latest Codex model", label: "5.5", value: "gpt-5.5" },
     { detail: "Balanced coding model", label: "5.4", value: "gpt-5.4" },
     { detail: "Fast coding model", label: "5.3 Codex Spark", value: "gpt-5.3-codex-spark" },
-    { detail: "Reasoning model", label: "o3", value: "o3" },
+    { detail: "Long-running work model", label: "5.2", value: "gpt-5.2" },
+    { detail: "Older Codex model", label: "5.1", value: "gpt-5.1" },
   ],
   opencode: [
     { detail: "Vision capable when configured in OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
@@ -913,7 +1002,7 @@ function getModelOptions(agentId, status, binding = null) {
   } else {
     options.push({
       detail: "Use the agent default",
-      label: "Default",
+      label: "Agent default",
       value: "",
     });
   }
@@ -972,6 +1061,16 @@ function getImageInputSupport(agentId, status, selectedModel) {
     reason: "This terminal does not accept image input.",
     supported: false,
   };
+}
+
+function getVisibleModelLabel(option) {
+  const label = String(option?.label || "").trim();
+  const value = String(option?.value || "").trim();
+  return value ? label : "";
+}
+
+function getModelButtonLabel(option) {
+  return getVisibleModelLabel(option) || "Model";
 }
 
 function readImageFile(file) {
@@ -1079,8 +1178,8 @@ function NewChatView({
     [activeAgentId, activeAgentStatus],
   );
   const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const modelButtonLabel = getModelButtonLabel(selectedModelOption);
   const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
-  const workspaceName = workspace?.name || "Current workspace";
   const submitDisabled = sending
     || selectedAgentOption?.disabled
     || !workspace?.id
@@ -1139,7 +1238,7 @@ function NewChatView({
       await onCreateChat?.({
         agentId: activeAgentId,
         message,
-        model: selectedModel,
+        model: "",
         workspace,
       });
       setDraft("");
@@ -1183,7 +1282,7 @@ function NewChatView({
               }
             }}
             placeholder={`Ask ${AGENT_LABELS[activeAgentId] || "an agent"} anything`}
-            rows={3}
+            rows={1}
             spellCheck="true"
             value={draft}
           />
@@ -1218,6 +1317,8 @@ function NewChatView({
                   </option>
                 ))}
               </NewChatSelect>
+            </NewChatControls>
+            <NewChatActions>
               <ModelMenuWrap
                 onBlur={(event) => {
                   if (!event.currentTarget.contains(event.relatedTarget)) {
@@ -1233,7 +1334,7 @@ function NewChatView({
                   title={selectedModelOption?.detail || "Model"}
                   type="button"
                 >
-                  <span>{selectedModelOption?.label || "Default"}</span>
+                  <span>{modelButtonLabel}</span>
                   <ExpandMore aria-hidden="true" />
                 </ModelButton>
                 <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
@@ -1241,6 +1342,7 @@ function NewChatView({
                     <ModelOption
                       data-selected={option.value === selectedModel ? "true" : "false"}
                       key={option.value || option.label}
+                      onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
                         setSelectedModel(option.value);
                         setModelMenuOpen(false);
@@ -1255,16 +1357,15 @@ function NewChatView({
                   ))}
                 </ModelDropdown>
               </ModelMenuWrap>
-              <NewChatProject title={workspaceName}>{workspaceName}</NewChatProject>
-            </NewChatControls>
-            <NewChatSendButton
-              aria-label="Start chat"
-              disabled={submitDisabled}
-              title="Start chat"
-              type="submit"
-            >
-              <ArrowUpward aria-hidden="true" />
-            </NewChatSendButton>
+              <NewChatSendButton
+                aria-label="Start chat"
+                disabled={submitDisabled}
+                title="Start chat"
+                type="submit"
+              >
+                <ArrowUpward aria-hidden="true" />
+              </NewChatSendButton>
+            </NewChatActions>
           </NewChatToolbar>
         </NewChatBox>
         <NewChatFooter>
@@ -1557,12 +1658,12 @@ function WorkspaceThreadDetail({
     thread?.workspaceId || workspace?.id || "",
     thread?.id || "",
     activeTerminalBinding?.paneId || "",
-    activeTerminalBinding?.instanceId || "",
   ].join(":");
   const syncedComposerDraft = String(composerDrafts?.[composerSyncKey] || "");
   const canSubmit = Boolean(thread && (hasActiveTerminalBinding || hasProviderSession));
   const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
   const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const modelButtonLabel = getModelButtonLabel(selectedModelOption);
   const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
   const placeholder = hasActiveTerminalBinding
     ? `Ask ${agentLabel} to work in this thread`
@@ -1625,7 +1726,7 @@ function WorkspaceThreadDetail({
     ));
   };
 
-  const selectModel = async (option) => {
+  const selectModel = (option) => {
     const nextModel = String(option?.value || "").trim();
     setSelectedModel(nextModel);
     setModelMenuOpen(false);
@@ -1635,16 +1736,14 @@ function WorkspaceThreadDetail({
       return;
     }
 
-    try {
-      await onSelectModel?.({
-        agentId: activeAgentId,
-        model: nextModel,
-        thread,
-        workspace,
-      });
-    } catch (modelError) {
+    Promise.resolve(onSelectModel?.({
+      agentId: activeAgentId,
+      model: nextModel,
+      thread,
+      workspace,
+    })).catch((modelError) => {
       setError(modelError?.message || "Unable to change model.");
-    }
+    });
   };
 
   const submitDraft = async () => {
@@ -1663,7 +1762,7 @@ function WorkspaceThreadDetail({
 
       await onSubmitMessage?.({
         message,
-        model: selectedModel,
+        model: "",
         thread,
         workspace,
       });
@@ -1704,10 +1803,6 @@ function WorkspaceThreadDetail({
     <DetailRoot aria-label={getWorkspaceThreadLabel(thread)}>
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
-          {messages.length === 0 && activityItems.length === 0 ? (
-            <EmptyThread>{getWorkspaceThreadLabel(thread)}</EmptyThread>
-          ) : null}
-
           {transcriptItems.map((item) => (
             <ThreadMessage key={item.id} message={item.message} workspace={workspace} />
           ))}
@@ -1774,7 +1869,7 @@ function WorkspaceThreadDetail({
               }
             }}
             placeholder={placeholder}
-            rows={2}
+            rows={1}
             spellCheck="true"
             value={draft}
           />
@@ -1798,6 +1893,17 @@ function WorkspaceThreadDetail({
               >
                 <AddPhotoAlternate aria-hidden="true" />
               </ComposerToolButton>
+              <AgentButton
+                aria-disabled="true"
+                tabIndex={-1}
+                title={AGENT_LABELS[activeAgentId] || "Agent"}
+                type="button"
+              >
+                <span>{AGENT_LABELS[activeAgentId] || "Agent"}</span>
+                <ExpandMore aria-hidden="true" />
+              </AgentButton>
+            </ComposerControls>
+            <ComposerActions>
               <ModelMenuWrap
                 onBlur={(event) => {
                   if (!event.currentTarget.contains(event.relatedTarget)) {
@@ -1812,7 +1918,7 @@ function WorkspaceThreadDetail({
                   title={selectedModelOption?.detail || "Model"}
                   type="button"
                 >
-                  <span>{selectedModelOption?.label || "Default"}</span>
+                  <span>{modelButtonLabel}</span>
                   <ExpandMore aria-hidden="true" />
                 </ModelButton>
                 <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
@@ -1820,6 +1926,7 @@ function WorkspaceThreadDetail({
                     <ModelOption
                       data-selected={option.value === selectedModel ? "true" : "false"}
                       key={option.value || option.label}
+                      onMouseDown={(event) => event.preventDefault()}
                       onClick={() => selectModel(option)}
                       role="menuitem"
                       title={option.detail}
@@ -1831,16 +1938,15 @@ function WorkspaceThreadDetail({
                   ))}
                 </ModelDropdown>
               </ModelMenuWrap>
-            </ComposerControls>
-            <ComposerHint>{workspace?.name || thread.workspaceId || "Workspace"}</ComposerHint>
-            <SendButton
-              aria-label="Send message"
-              disabled={submitDisabled}
-              title="Send message"
-              type="submit"
-            >
-              <ArrowUpward aria-hidden="true" />
-            </SendButton>
+              <SendButton
+                aria-label="Send message"
+                disabled={submitDisabled}
+                title="Send message"
+                type="submit"
+              >
+                <ArrowUpward aria-hidden="true" />
+              </SendButton>
+            </ComposerActions>
           </ComposerFooter>
         </ComposerBox>
         {error ? <ComposerError>{error}</ComposerError> : null}
