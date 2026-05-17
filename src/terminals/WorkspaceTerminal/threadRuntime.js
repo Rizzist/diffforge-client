@@ -230,6 +230,7 @@ const workspaceThreadComposerDraftStore = new Map();
 const workspaceThreadComposerDraftSubscribers = new Set();
 const workspaceThreadComposerAttachmentStore = new Map();
 const workspaceThreadComposerAttachmentSubscribers = new Set();
+let activeWorkspaceFileDrag = null;
 
 export function getWorkspaceThreadComposerDraftStore() {
   return workspaceThreadComposerDraftStore;
@@ -244,8 +245,10 @@ function getComposerAttachmentLogSummary(attachments) {
     .map((attachment) => ({
       dataUrlLength: String(attachment?.dataUrl || "").length,
       id: String(attachment?.id || ""),
+      kind: String(attachment?.kind || ""),
       mimeType: String(attachment?.mimeType || ""),
       name: String(attachment?.name || ""),
+      relativePath: String(attachment?.relativePath || ""),
       savedPathPresent: Boolean(attachment?.savedPath),
       size: Number(attachment?.size || 0),
       source: String(attachment?.source || ""),
@@ -272,7 +275,10 @@ function normalizeWorkspaceThreadComposerAttachment(attachment, index = 0) {
   const mimeType = String(attachment.mimeType || attachment.type || "").trim()
     || dataUrl.match(/^data:([^;]+);/i)?.[1]
     || "";
-  const name = String(attachment.name || `image-${index + 1}`).trim() || `image-${index + 1}`;
+  const relativePath = String(attachment.relativePath || "").trim().replace(/\\/g, "/");
+  const kind = String(attachment.kind || (mimeType.startsWith("image/") ? "image" : "file")).trim() || "file";
+  const name = String(attachment.name || relativePath.split("/").filter(Boolean).pop() || `attachment-${index + 1}`).trim()
+    || `attachment-${index + 1}`;
 
   if (!dataUrl && !savedPath) {
     return null;
@@ -281,8 +287,10 @@ function normalizeWorkspaceThreadComposerAttachment(attachment, index = 0) {
   return {
     dataUrl,
     id: String(attachment.id || createComposerAttachmentId()),
+    kind,
     mimeType,
     name,
+    relativePath,
     savedPath,
     size: Number(attachment.size || 0),
     source: String(attachment.source || "unknown"),
@@ -988,6 +996,90 @@ export function getDraggedTodoPrompt(dataTransfer) {
 export function isTodoDragTransfer(dataTransfer) {
   const transferTypes = Array.from(dataTransfer?.types || []);
   return transferTypes.includes(TODO_DRAG_MIME) || transferTypes.includes("text/plain");
+}
+
+export const WORKSPACE_FILE_DRAG_MIME = "application/x-diffforge-workspace-file";
+export const WORKSPACE_FILE_POINTER_DROP_EVENT = "diffforge:workspace-file-pointer-drop";
+
+export function getDraggedWorkspaceFile(dataTransfer) {
+  const customPayload = dataTransfer?.getData(WORKSPACE_FILE_DRAG_MIME);
+  if (!customPayload) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(customPayload);
+    const path = String(parsed?.path || parsed?.savedPath || "").trim();
+    const relativePath = String(parsed?.relativePath || "").trim().replace(/\\/g, "/");
+    if (!path && !relativePath) {
+      return null;
+    }
+
+    return {
+      kind: "file",
+      mimeType: String(parsed?.mimeType || parsed?.type || "").trim(),
+      name: String(parsed?.name || relativePath.split("/").filter(Boolean).pop() || path.split(/[\\/]/).filter(Boolean).pop() || "file").trim(),
+      path,
+      relativePath,
+      size: Number(parsed?.size || 0),
+      workspaceId: String(parsed?.workspaceId || "").trim(),
+      workspaceRoot: String(parsed?.workspaceRoot || "").trim(),
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+export function isWorkspaceFileDragTransfer(dataTransfer) {
+  return Array.from(dataTransfer?.types || []).includes(WORKSPACE_FILE_DRAG_MIME);
+}
+
+export function setActiveWorkspaceFileDrag(file) {
+  activeWorkspaceFileDrag = file && typeof file === "object" ? { ...file } : null;
+}
+
+export function getActiveWorkspaceFileDrag() {
+  return activeWorkspaceFileDrag ? { ...activeWorkspaceFileDrag } : null;
+}
+
+export function clearActiveWorkspaceFileDrag() {
+  activeWorkspaceFileDrag = null;
+}
+
+function inferWorkspaceFileMimeType(path) {
+  const extension = String(path || "").toLowerCase().split(".").pop();
+  if (["png"].includes(extension)) return "image/png";
+  if (["jpg", "jpeg"].includes(extension)) return "image/jpeg";
+  if (["webp"].includes(extension)) return "image/webp";
+  if (["gif"].includes(extension)) return "image/gif";
+  if (["svg"].includes(extension)) return "image/svg+xml";
+  if (["txt", "log"].includes(extension)) return "text/plain";
+  if (["md", "markdown"].includes(extension)) return "text/markdown";
+  if (["json"].includes(extension)) return "application/json";
+  return "";
+}
+
+export function workspaceFileToComposerAttachment(file, source = "workspace_file_drag") {
+  const path = String(file?.path || file?.savedPath || "").trim();
+  const relativePath = String(file?.relativePath || "").trim().replace(/\\/g, "/");
+  if (!path && !relativePath) {
+    return null;
+  }
+
+  const name = String(file?.name || relativePath.split("/").filter(Boolean).pop() || path.split(/[\\/]/).filter(Boolean).pop() || "file").trim();
+  const mimeType = String(file?.mimeType || file?.type || "").trim()
+    || inferWorkspaceFileMimeType(relativePath || path);
+  return {
+    id: createComposerAttachmentId(),
+    kind: mimeType.startsWith("image/") ? "image" : "file",
+    mimeType,
+    name: name || "file",
+    relativePath,
+    savedPath: path,
+    size: Number(file?.size || 0),
+    source,
+    status: "queued",
+  };
 }
 
 export function isTerminalSessionMissingError(error) {

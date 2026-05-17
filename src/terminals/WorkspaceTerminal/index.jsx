@@ -355,7 +355,7 @@ import {
   stripLiveViewControlSequences,
 } from "../liveViewSanitizer.js";
 import WorkspaceThreadsOverlay from "../../threads/WorkspaceThreadsOverlay.jsx";
-import { logBigViewSyncDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
+import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
 import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
@@ -491,6 +491,7 @@ import {
   getAgentTone,
   getDefaultTerminalIndexes,
   getDraggedTodoPrompt,
+  getDraggedWorkspaceFile,
   getErrorMessage,
   getNextWorkspaceTerminalInstanceId,
   getPlainDomRect,
@@ -512,6 +513,7 @@ import {
   isTerminalGeneratedReplyInput,
   isTerminalSessionMissingError,
   isTodoDragTransfer,
+  isWorkspaceFileDragTransfer,
   normalizeTerminalDimension,
   normalizeWorkspaceTerminalIndexes,
   appendWorkspaceThreadComposerAttachments,
@@ -523,6 +525,7 @@ import {
   terminalInputChunkHasVisibleText,
   terminalInputChunkVisibleText,
   waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
+  workspaceFileToComposerAttachment,
 } from "./threadRuntime.js";
 
 export {
@@ -584,18 +587,39 @@ function readTerminalImageFile(file) {
   });
 }
 
-function formatSavedTerminalImageAttachments(images) {
+function formatSavedTerminalImageAttachments(images, startIndex = 0) {
   return (Array.isArray(images) ? images : [])
     .map((image, index) => {
-      const name = String(image?.name || `image-${index + 1}`).trim();
+      const name = String(image?.name || `image-${startIndex + index + 1}`).trim();
       const path = String(image?.path || "").trim();
-      return path ? `[image-attached ${index + 1}] ${name} -> ${path}` : "";
+      return path ? `[image-attached ${startIndex + index + 1}] ${name} -> ${path}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatSavedTerminalFileAttachments(attachments, startIndex = 0) {
+  return (Array.isArray(attachments) ? attachments : [])
+    .map((attachment, index) => {
+      const path = String(attachment?.savedPath || attachment?.path || "").trim();
+      if (!path) {
+        return "";
+      }
+
+      const name = String(attachment?.name || `file-${startIndex + index + 1}`).trim();
+      const mimeType = String(attachment?.mimeType || "").trim();
+      const label = mimeType.startsWith("image/") || String(attachment?.kind || "") === "image"
+        ? "image-attached"
+        : "file-attached";
+      return `[${label} ${startIndex + index + 1}] ${name} -> ${path}`;
     })
     .filter(Boolean)
     .join("\n");
 }
 
 async function saveTerminalImageAttachments(attachments) {
+  const savedPathAttachments = (Array.isArray(attachments) ? attachments : [])
+    .filter((attachment) => String(attachment?.savedPath || attachment?.path || "").trim());
   const images = (Array.isArray(attachments) ? attachments : [])
     .map((attachment) => ({
       dataUrl: attachment.dataUrl,
@@ -604,21 +628,43 @@ async function saveTerminalImageAttachments(attachments) {
     }))
     .filter((attachment) => attachment.dataUrl && attachment.mimeType);
 
-  if (!images.length) {
+  if (!images.length && !savedPathAttachments.length) {
     return "";
   }
 
-  const savedImages = await invoke("save_todo_image_attachments", { images });
-  const imageBlock = formatSavedTerminalImageAttachments(savedImages);
-  if (!imageBlock) {
+  const blocks = [];
+  if (savedPathAttachments.length) {
+    blocks.push(formatSavedTerminalFileAttachments(savedPathAttachments, 0));
+  }
+  if (images.length) {
+    const savedImages = await invoke("save_todo_image_attachments", { images });
+    blocks.push(formatSavedTerminalImageAttachments(savedImages, savedPathAttachments.length));
+  }
+
+  const attachmentBlock = blocks.filter(Boolean).join("\n");
+  if (!attachmentBlock) {
     throw new Error("Unable to prepare image attachment.");
   }
-  return imageBlock;
+  return attachmentBlock;
 }
 
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const TERMINAL_PATH_LINK_PATTERN = /((?:~\/|\/)[^\s"'`<>()\[\]{}|;,]+(?:\.[A-Za-z0-9]+)(?::\d+)?)/g;
+const TODO_DROP_OVERLAY_UNSUPPORTED_STYLE = {
+  border: "2px dotted rgba(248, 113, 113, 0.96)",
+  background: "rgba(45, 8, 13, 0.62)",
+  boxShadow: "inset 0 0 0 1px rgba(248, 113, 113, 0.28), 0 0 34px rgba(248, 113, 113, 0.16)",
+};
+const TODO_DROP_OVERLAY_UNSUPPORTED_LABEL_STYLE = {
+  border: "1px solid rgba(248, 113, 113, 0.42)",
+  color: "#fee2e2",
+  background: "linear-gradient(135deg, rgba(55, 12, 18, 0.98), rgba(26, 8, 11, 0.94))",
+  maxWidth: "min(420px, calc(100% - 32px))",
+  textAlign: "center",
+  textTransform: "none",
+  whiteSpace: "normal",
+};
 
 function cleanTerminalPathLink(value) {
   return String(value || "")
@@ -695,6 +741,7 @@ function WorkspaceTerminal({
   threadsViewActive = false,
   todoDropActive = false,
   todoDropTarget = false,
+  todoDropUnsupportedMessage = "",
   useWebglRenderer = TERMINAL_ENABLE_WEBGL_RENDERER,
   workingDirectory,
   workspace,
@@ -8374,12 +8421,34 @@ function WorkspaceTerminal({
     pendingPromptSendTimersRef.current.clear();
   }, []);
 
+  const getDragDiagnosticFields = useCallback((event) => ({
+    hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
+    hasTodoType: isTodoDragTransfer(event.dataTransfer),
+    paneId,
+    terminalIndex,
+    threadId: terminalThreadIdRef.current || "",
+    types: Array.from(event.dataTransfer?.types || []),
+    workspaceId: workspace?.id || "",
+  }), [paneId, terminalIndex, workspace?.id]);
+
+  const handleTerminalRawDragEnterCapture = useCallback((event) => {
+    logFileDragDiagnosticEvent("tui.raw_drag_enter_capture", getDragDiagnosticFields(event));
+  }, [getDragDiagnosticFields]);
+
+  const handleTerminalRawDragOverCapture = useCallback((event) => {
+    logFileDragDiagnosticEvent("tui.raw_drag_over_capture", getDragDiagnosticFields(event));
+  }, [getDragDiagnosticFields]);
+
+  const handleTerminalRawDropCapture = useCallback((event) => {
+    logFileDragDiagnosticEvent("tui.raw_drop_capture", getDragDiagnosticFields(event));
+  }, [getDragDiagnosticFields]);
+
   const handleTerminalTodoDragEnter = useCallback((event) => {
     if (terminalClosed || terminalClosing) {
       return;
     }
 
-    if (!isTodoDragTransfer(event.dataTransfer)) {
+    if (!isTodoDragTransfer(event.dataTransfer) && !isWorkspaceFileDragTransfer(event.dataTransfer)) {
       return;
     }
 
@@ -8387,14 +8456,22 @@ function WorkspaceTerminal({
     event.stopPropagation();
     setTerminalDropActive(true);
     event.dataTransfer.dropEffect = "copy";
-  }, [terminalClosed, terminalClosing]);
+    if (isWorkspaceFileDragTransfer(event.dataTransfer)) {
+      logFileDragDiagnosticEvent("tui.drag_enter", {
+        paneId,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+    }
+  }, [paneId, terminalClosed, terminalClosing, terminalIndex, workspace?.id]);
 
   const handleTerminalTodoDragOver = useCallback((event) => {
     if (terminalClosed || terminalClosing) {
       return;
     }
 
-    if (!isTodoDragTransfer(event.dataTransfer)) {
+    if (!isTodoDragTransfer(event.dataTransfer) && !isWorkspaceFileDragTransfer(event.dataTransfer)) {
       return;
     }
 
@@ -8402,10 +8479,18 @@ function WorkspaceTerminal({
     event.stopPropagation();
     setTerminalDropActive(true);
     event.dataTransfer.dropEffect = "copy";
-  }, [terminalClosed, terminalClosing]);
+    if (isWorkspaceFileDragTransfer(event.dataTransfer)) {
+      logFileDragDiagnosticEvent("tui.drag_over", {
+        paneId,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+    }
+  }, [paneId, terminalClosed, terminalClosing, terminalIndex, workspace?.id]);
 
   const handleTerminalTodoDragLeave = useCallback((event) => {
-    if (!isTodoDragTransfer(event.dataTransfer)) {
+    if (!isTodoDragTransfer(event.dataTransfer) && !isWorkspaceFileDragTransfer(event.dataTransfer)) {
       return;
     }
 
@@ -8436,6 +8521,56 @@ function WorkspaceTerminal({
     activateTerminalPane("todo_native_drop");
     requestTerminalAudioInputTarget(true);
     focusTerminalKeyboardInput(true);
+
+    if (isWorkspaceFileDragTransfer(event.dataTransfer)) {
+      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
+      const attachment = workspaceFileToComposerAttachment(workspaceFile, "tui_fileviewer_drop");
+      const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceIdRef.current || 0);
+      logFileDragDiagnosticEvent("tui.drop_received", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(syncKey),
+        instanceId: terminalInstanceIdRef.current || "",
+        paneId,
+        relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      if (attachment && syncKey) {
+        appendWorkspaceThreadComposerAttachments(syncKey, [attachment], {
+          fields: {
+            agentId: terminalAgentKind,
+            instanceId: terminalInstanceIdRef.current || "",
+            paneId,
+            relativePath: attachment.relativePath || "",
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+          },
+          source: "tui_fileviewer_drop",
+        });
+        logFileDragDiagnosticEvent("tui.attachment_appended", {
+          attachmentName: attachment.name,
+          attachmentPath: attachment.savedPath,
+          kind: attachment.kind,
+          paneId,
+          relativePath: attachment.relativePath || "",
+          syncKey,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+        return;
+      }
+      logFileDragDiagnosticEvent("tui.drop_skip", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(syncKey),
+        paneId,
+        reason: !attachment ? "missing_attachment" : "missing_sync_key",
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+    }
 
     const prompt = getDraggedTodoPrompt(event.dataTransfer);
     if (!prompt) {
@@ -8498,7 +8633,20 @@ function WorkspaceTerminal({
         workspaceId: workspace?.id || "",
       });
     }
-  }, [isGenericTerminal, paneId, recordSubmittedAgentMessage, terminalClosed, terminalClosing]);
+  }, [
+    activateTerminalPane,
+    focusTerminalKeyboardInput,
+    getCurrentThreadComposerSyncKey,
+    isGenericTerminal,
+    paneId,
+    recordSubmittedAgentMessage,
+    requestTerminalAudioInputTarget,
+    terminalAgentKind,
+    terminalClosed,
+    terminalClosing,
+    terminalIndex,
+    workspace?.id,
+  ]);
 
   const terminalComposerSyncKey = getCurrentThreadComposerSyncKey();
   const terminalComposerAttachments = terminalComposerSyncKey
@@ -8539,6 +8687,9 @@ function WorkspaceTerminal({
   const nativeTodoDropVisible = terminalDropActive && !terminalClosed && !terminalClosing;
   const todoDropOverlayVisible = pointerTodoDropVisible || nativeTodoDropVisible;
   const todoDropOverlayTarget = nativeTodoDropVisible || Boolean(todoDropTarget);
+  const todoDropOverlayUnsupportedMessage = todoDropOverlayTarget
+    ? String(todoDropUnsupportedMessage || "").trim()
+    : "";
 
   const closeTerminal = useCallback(async () => {
     if (terminalClosed || terminalClosingRef.current) {
@@ -8867,9 +9018,12 @@ function WorkspaceTerminal({
       data-active={terminalFocused ? "true" : "false"}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
       data-parked={parkedPrompt ? "true" : "false"}
+      onDragEnterCapture={handleTerminalRawDragEnterCapture}
       onDragEnter={handleTerminalTodoDragEnter}
       onDragLeave={handleTerminalTodoDragLeave}
+      onDragOverCapture={handleTerminalRawDragOverCapture}
       onDragOver={handleTerminalTodoDragOver}
+      onDropCapture={handleTerminalRawDropCapture}
       onDrop={handleTerminalTodoDrop}
       onPaste={(event) => queueClipboardImagesForCurrentTerminal(event, "xterm_surface")}
       ref={containerRef}
@@ -9230,10 +9384,18 @@ function WorkspaceTerminal({
                 style={{
                   ...TODO_DROP_OVERLAY_STYLE,
                   ...(todoDropOverlayTarget ? TODO_DROP_OVERLAY_TARGET_STYLE : {}),
+                  ...(todoDropOverlayUnsupportedMessage ? TODO_DROP_OVERLAY_UNSUPPORTED_STYLE : {}),
                 }}
               >
                 {todoDropOverlayTarget && (
-                  <div style={TODO_DROP_OVERLAY_LABEL_STYLE}>Drop here</div>
+                  <div
+                    style={{
+                      ...TODO_DROP_OVERLAY_LABEL_STYLE,
+                      ...(todoDropOverlayUnsupportedMessage ? TODO_DROP_OVERLAY_UNSUPPORTED_LABEL_STYLE : {}),
+                    }}
+                  >
+                    {todoDropOverlayUnsupportedMessage || "Drop here"}
+                  </div>
                 )}
               </div>
             )}

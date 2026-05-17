@@ -9,10 +9,16 @@ import styled, { keyframes } from "styled-components";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import {
   appendWorkspaceThreadComposerAttachments,
+  clearActiveWorkspaceFileDrag,
+  getActiveWorkspaceFileDrag,
+  getDraggedWorkspaceFile,
+  isWorkspaceFileDragTransfer,
   removeWorkspaceThreadComposerAttachment,
   setWorkspaceThreadComposerAttachments,
+  WORKSPACE_FILE_POINTER_DROP_EVENT,
+  workspaceFileToComposerAttachment,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
-import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
+import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
@@ -1114,18 +1120,39 @@ function getClipboardImageFiles(clipboardData) {
     });
 }
 
-function formatSavedImageAttachments(images) {
+function formatSavedImageAttachments(images, startIndex = 0) {
   return (Array.isArray(images) ? images : [])
     .map((image, index) => {
-      const name = String(image?.name || `image-${index + 1}`).trim();
+      const name = String(image?.name || `image-${startIndex + index + 1}`).trim();
       const path = String(image?.path || "").trim();
-      return path ? `[image-attached ${index + 1}] ${name} -> ${path}` : "";
+      return path ? `[image-attached ${startIndex + index + 1}] ${name} -> ${path}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatSavedFileAttachments(attachments, startIndex = 0) {
+  return (Array.isArray(attachments) ? attachments : [])
+    .map((attachment, index) => {
+      const path = String(attachment?.savedPath || attachment?.path || "").trim();
+      if (!path) {
+        return "";
+      }
+
+      const name = String(attachment?.name || `file-${startIndex + index + 1}`).trim();
+      const mimeType = String(attachment?.mimeType || "").trim();
+      const label = mimeType.startsWith("image/") || String(attachment?.kind || "") === "image"
+        ? "image-attached"
+        : "file-attached";
+      return `[${label} ${startIndex + index + 1}] ${name} -> ${path}`;
     })
     .filter(Boolean)
     .join("\n");
 }
 
 async function saveImageAttachments(attachments) {
+  const savedPathAttachments = (Array.isArray(attachments) ? attachments : [])
+    .filter((attachment) => String(attachment?.savedPath || attachment?.path || "").trim());
   const images = (Array.isArray(attachments) ? attachments : [])
     .map((attachment) => ({
       dataUrl: attachment.dataUrl,
@@ -1134,13 +1161,20 @@ async function saveImageAttachments(attachments) {
     }))
     .filter((attachment) => attachment.dataUrl && attachment.mimeType);
 
-  if (!images.length) {
+  if (!images.length && !savedPathAttachments.length) {
     return "";
   }
 
-  const savedImages = await invoke("save_todo_image_attachments", { images });
-  const imageBlock = formatSavedImageAttachments(savedImages);
+  const blocks = [];
+  if (savedPathAttachments.length) {
+    blocks.push(formatSavedFileAttachments(savedPathAttachments, 0));
+  }
+  if (images.length) {
+    const savedImages = await invoke("save_todo_image_attachments", { images });
+    blocks.push(formatSavedImageAttachments(savedImages, savedPathAttachments.length));
+  }
 
+  const imageBlock = blocks.filter(Boolean).join("\n");
   if (!imageBlock) {
     throw new Error("Unable to prepare image attachment.");
   }
@@ -1186,6 +1220,7 @@ function NewChatView({
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const composerBoxRef = useRef(null);
   const fileInputRef = useRef(null);
   const agentOptions = useMemo(() => getNewChatAgentOptions(agentStatuses), [agentStatuses]);
   const selectedAgentOption = agentOptions.find((option) => option.id === agentId) || agentOptions[0];
@@ -1311,6 +1346,280 @@ function NewChatView({
       workspaceId: workspace?.id || "",
     });
     addImageFiles(imageFiles);
+  };
+
+  const handleComposerDragOver = (event) => {
+    if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleComposerDrop = (event) => {
+    if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
+    const attachment = workspaceFileToComposerAttachment(workspaceFile, "bigview_fileviewer_drop");
+    if (!attachment || !composerSyncKey) {
+      return;
+    }
+
+    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
+      fields: {
+        agentId: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instanceId || "",
+        bindingPaneId: activeTerminalBinding?.paneId || "",
+        relativePath: attachment.relativePath || "",
+        selectedModel: currentTuiModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      },
+      source: "bigview_fileviewer_drop",
+    });
+  };
+
+  const queueWorkspaceFileForBigView = (workspaceFile, source = "bigview_fileviewer_global_drop") => {
+    const attachment = workspaceFileToComposerAttachment(workspaceFile, source);
+    logFileDragDiagnosticEvent("bigview.global_drop_resolved", {
+      attachmentCreated: Boolean(attachment),
+      composerSyncKey,
+      hasSyncKey: Boolean(composerSyncKey),
+      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+      source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    if (!attachment || !composerSyncKey) {
+      logFileDragDiagnosticEvent("bigview.global_drop_skip", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(composerSyncKey),
+        reason: !attachment ? "missing_attachment" : "missing_sync_key",
+        source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      return false;
+    }
+
+    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
+      fields: {
+        agentId: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instanceId || "",
+        bindingPaneId: activeTerminalBinding?.paneId || "",
+        relativePath: attachment.relativePath || "",
+        selectedModel: currentTuiModel || "",
+        source,
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      },
+      source,
+    });
+    logFileDragDiagnosticEvent("bigview.global_attachment_appended", {
+      attachmentName: attachment.name,
+      attachmentPath: attachment.savedPath,
+      composerSyncKey,
+      kind: attachment.kind,
+      relativePath: attachment.relativePath || "",
+      source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    return true;
+  };
+
+  useEffect(() => {
+    const handleWorkspaceFileDragOver = (event) => {
+      if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
+        return;
+      }
+
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const insideComposer = Boolean(rect)
+        && event.clientX >= rect.left
+        && event.clientX <= rect.right
+        && event.clientY >= rect.top
+        && event.clientY <= rect.bottom;
+      if (!insideComposer) {
+        return;
+      }
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      logFileDragDiagnosticEvent("bigview.global_drag_over", {
+        composerSyncKey,
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+    };
+
+    const handleWorkspaceFileDrop = (event) => {
+      if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
+        return;
+      }
+
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const insideComposer = Boolean(rect)
+        && event.clientX >= rect.left
+        && event.clientX <= rect.right
+        && event.clientY >= rect.top
+        && event.clientY <= rect.bottom;
+      if (!insideComposer) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
+      logFileDragDiagnosticEvent("bigview.global_drop", {
+        filePresent: Boolean(workspaceFile),
+        relativePath: workspaceFile?.relativePath || "",
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_global_drop");
+    };
+
+    window.addEventListener("dragover", handleWorkspaceFileDragOver, true);
+    window.addEventListener("drop", handleWorkspaceFileDrop, true);
+    return () => {
+      window.removeEventListener("dragover", handleWorkspaceFileDragOver, true);
+      window.removeEventListener("drop", handleWorkspaceFileDrop, true);
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
+    const handleWorkspaceFilePointerDrop = (event) => {
+      const detail = event?.detail || {};
+      const workspaceFile = detail.file && typeof detail.file === "object" ? detail.file : null;
+      if (!workspaceFile) {
+        return;
+      }
+
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const clientX = Number(detail.clientX || 0);
+      const clientY = Number(detail.clientY || 0);
+      const insideComposer = Boolean(rect)
+        && clientX >= rect.left
+        && clientX <= rect.right
+        && clientY >= rect.top
+        && clientY <= rect.bottom;
+      logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
+        composerSyncKey,
+        insideComposer,
+        relativePath: workspaceFile.relativePath || "",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (!insideComposer) {
+        return;
+      }
+
+      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_pointer_drop")) {
+        detail.handled = true;
+        clearActiveWorkspaceFileDrag();
+      }
+    };
+
+    window.addEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    return () => {
+      window.removeEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
+    const handleWorkspaceFilePointerDrop = (event) => {
+      const detail = event?.detail || {};
+      const workspaceFile = detail.file && typeof detail.file === "object" ? detail.file : null;
+      if (!workspaceFile) {
+        return;
+      }
+
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const clientX = Number(detail.clientX || 0);
+      const clientY = Number(detail.clientY || 0);
+      const insideComposer = Boolean(rect)
+        && clientX >= rect.left
+        && clientX <= rect.right
+        && clientY >= rect.top
+        && clientY <= rect.bottom;
+      logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
+        composerSyncKey,
+        insideComposer,
+        relativePath: workspaceFile.relativePath || "",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (!insideComposer) {
+        return;
+      }
+
+      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_pointer_drop")) {
+        detail.handled = true;
+        clearActiveWorkspaceFileDrag();
+      }
+    };
+
+    window.addEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    return () => {
+      window.removeEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  const getComposerDragDiagnosticFields = (event) => ({
+    composerSyncKey,
+    hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
+    threadId: thread?.id || "",
+    types: Array.from(event.dataTransfer?.types || []),
+    workspaceId: workspace?.id || thread?.workspaceId || "",
+  });
+
+  const handleComposerRawDragEnterCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drag_enter_capture", getComposerDragDiagnosticFields(event));
+  };
+
+  const handleComposerRawDragOverCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drag_over_capture", getComposerDragDiagnosticFields(event));
+  };
+
+  const handleComposerRawDropCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drop_capture", getComposerDragDiagnosticFields(event));
   };
 
   const removeAttachment = (attachmentId) => {
@@ -1846,6 +2155,7 @@ function WorkspaceThreadDetail({
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const composerBoxRef = useRef(null);
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
   const messages = Array.isArray(thread?.messages)
@@ -2107,6 +2417,300 @@ function WorkspaceThreadDetail({
       workspaceId: workspace?.id || thread?.workspaceId || "",
     });
     addImageFiles(imageFiles);
+  };
+
+  const handleComposerDragOver = (event) => {
+    const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+    const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+    if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    logFileDragDiagnosticEvent("bigview.drag_over", {
+      composerSyncKey,
+      hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+      hasWorkspaceFileTransfer,
+      threadId: thread?.id || "",
+      types: Array.from(event.dataTransfer?.types || []),
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+  };
+
+  const handleComposerDrop = (event) => {
+    const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+    const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+    if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer) || activeWorkspaceFile;
+    const attachment = workspaceFileToComposerAttachment(workspaceFile, "bigview_fileviewer_drop");
+    logFileDragDiagnosticEvent("bigview.drop_received", {
+      attachmentCreated: Boolean(attachment),
+      composerSyncKey,
+      hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+      hasSyncKey: Boolean(composerSyncKey),
+      hasWorkspaceFileTransfer,
+      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+      threadId: thread?.id || "",
+      types: Array.from(event.dataTransfer?.types || []),
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    if (!attachment || !composerSyncKey) {
+      logFileDragDiagnosticEvent("bigview.drop_skip", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(composerSyncKey),
+        reason: !attachment ? "missing_attachment" : "missing_sync_key",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      return;
+    }
+
+    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
+      fields: {
+        agentId: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instanceId || "",
+        bindingPaneId: activeTerminalBinding?.paneId || "",
+        relativePath: attachment.relativePath || "",
+        selectedModel: currentTuiModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      },
+      source: "bigview_fileviewer_drop",
+    });
+    logFileDragDiagnosticEvent("bigview.attachment_appended", {
+      attachmentName: attachment.name,
+      attachmentPath: attachment.savedPath,
+      composerSyncKey,
+      kind: attachment.kind,
+      relativePath: attachment.relativePath || "",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+  };
+
+  const queueWorkspaceFileForBigView = (workspaceFile, source = "bigview_fileviewer_global_drop") => {
+    const attachment = workspaceFileToComposerAttachment(workspaceFile, source);
+    logFileDragDiagnosticEvent("bigview.global_drop_resolved", {
+      attachmentCreated: Boolean(attachment),
+      composerSyncKey,
+      hasSyncKey: Boolean(composerSyncKey),
+      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+      source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    if (!attachment || !composerSyncKey) {
+      logFileDragDiagnosticEvent("bigview.global_drop_skip", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(composerSyncKey),
+        reason: !attachment ? "missing_attachment" : "missing_sync_key",
+        source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      return false;
+    }
+
+    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
+      fields: {
+        agentId: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instanceId || "",
+        bindingPaneId: activeTerminalBinding?.paneId || "",
+        relativePath: attachment.relativePath || "",
+        selectedModel: currentTuiModel || "",
+        source,
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      },
+      source,
+    });
+    logFileDragDiagnosticEvent("bigview.global_attachment_appended", {
+      attachmentName: attachment.name,
+      attachmentPath: attachment.savedPath,
+      composerSyncKey,
+      kind: attachment.kind,
+      relativePath: attachment.relativePath || "",
+      source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    return true;
+  };
+
+  useEffect(() => {
+    const handleWorkspaceFileDragOver = (event) => {
+      const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+      const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+      if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+        return;
+      }
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const insideComposer = Boolean(rect)
+        && event.clientX >= rect.left
+        && event.clientX <= rect.right
+        && event.clientY >= rect.top
+        && event.clientY <= rect.bottom;
+      logFileDragDiagnosticEvent("bigview.global_drag_over_raw", {
+        composerSyncKey,
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        insideComposer,
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (!insideComposer) {
+        return;
+      }
+
+      logFileDragDiagnosticEvent("bigview.global_drag_over", {
+        composerSyncKey,
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+    };
+
+    const handleWorkspaceFileDrop = (event) => {
+      const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+      const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+      if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+        return;
+      }
+
+      event.preventDefault();
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const insideComposer = Boolean(rect)
+        && event.clientX >= rect.left
+        && event.clientX <= rect.right
+        && event.clientY >= rect.top
+        && event.clientY <= rect.bottom;
+      logFileDragDiagnosticEvent("bigview.global_drop_raw", {
+        composerSyncKey,
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        insideComposer,
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (!insideComposer) {
+        return;
+      }
+
+      event.stopPropagation();
+      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer) || activeWorkspaceFile;
+      logFileDragDiagnosticEvent("bigview.global_drop", {
+        filePresent: Boolean(workspaceFile),
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        relativePath: workspaceFile?.relativePath || "",
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_global_drop")) {
+        clearActiveWorkspaceFileDrag();
+      }
+    };
+
+    window.addEventListener("dragover", handleWorkspaceFileDragOver, true);
+    window.addEventListener("drop", handleWorkspaceFileDrop, true);
+    return () => {
+      window.removeEventListener("dragover", handleWorkspaceFileDragOver, true);
+      window.removeEventListener("drop", handleWorkspaceFileDrop, true);
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
+    const handleWorkspaceFilePointerDrop = (event) => {
+      const detail = event?.detail || {};
+      const workspaceFile = detail.file && typeof detail.file === "object" ? detail.file : null;
+      if (!workspaceFile) {
+        return;
+      }
+
+      const rect = composerBoxRef.current?.getBoundingClientRect?.();
+      const clientX = Number(detail.clientX || 0);
+      const clientY = Number(detail.clientY || 0);
+      const insideComposer = Boolean(rect)
+        && clientX >= rect.left
+        && clientX <= rect.right
+        && clientY >= rect.top
+        && clientY <= rect.bottom;
+      logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
+        composerSyncKey,
+        insideComposer,
+        relativePath: workspaceFile.relativePath || "",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (!insideComposer) {
+        return;
+      }
+
+      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_pointer_drop")) {
+        detail.handled = true;
+        clearActiveWorkspaceFileDrag();
+      }
+    };
+
+    window.addEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    return () => {
+      window.removeEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  const getComposerDragDiagnosticFields = (event) => ({
+    composerSyncKey,
+    hasActiveWorkspaceFile: Boolean(getActiveWorkspaceFileDrag()),
+    hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
+    threadId: thread?.id || "",
+    types: Array.from(event.dataTransfer?.types || []),
+    workspaceId: workspace?.id || thread?.workspaceId || "",
+  });
+
+  const handleComposerRawDragEnterCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drag_enter_capture", getComposerDragDiagnosticFields(event));
+  };
+
+  const handleComposerRawDragOverCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drag_over_capture", getComposerDragDiagnosticFields(event));
+  };
+
+  const handleComposerRawDropCapture = (event) => {
+    logFileDragDiagnosticEvent("bigview.raw_drop_capture", getComposerDragDiagnosticFields(event));
   };
 
   const removeAttachment = (attachmentId) => {
@@ -2389,7 +2993,14 @@ function WorkspaceThreadDetail({
           ref={fileInputRef}
           type="file"
         />
-        <ComposerBox>
+        <ComposerBox
+          ref={composerBoxRef}
+          onDragEnterCapture={handleComposerRawDragEnterCapture}
+          onDragOverCapture={handleComposerRawDragOverCapture}
+          onDragOver={handleComposerDragOver}
+          onDropCapture={handleComposerRawDropCapture}
+          onDrop={handleComposerDrop}
+        >
           <AttachmentStrip>
             {attachments.map((attachment) => (
               <AttachmentChip key={attachment.id} title={attachment.name}>

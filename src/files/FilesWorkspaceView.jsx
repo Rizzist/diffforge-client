@@ -322,6 +322,11 @@ import {
   FileFolderTreeIcon,
   FileDocumentIcon
 } from "../app/appStyles";
+import { logFileDragDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
+import {
+  clearActiveWorkspaceFileDrag,
+  setActiveWorkspaceFileDrag,
+} from "../terminals/WorkspaceTerminal/threadRuntime.js";
 
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
@@ -331,6 +336,45 @@ const FILE_PREVIEW_DEFAULT_SIZE = 72;
 const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
+const WORKSPACE_FILE_DRAG_MIME = "application/x-diffforge-workspace-file";
+
+function joinWorkspaceFilePath(root, relativePath) {
+  const cleanRoot = String(root || "").replace(/\/+$/g, "");
+  const cleanRelativePath = String(relativePath || "").replace(/\\/g, "/").replace(/^\/+/g, "");
+  return cleanRoot && cleanRelativePath ? `${cleanRoot}/${cleanRelativePath}` : cleanRelativePath;
+}
+
+function getFileDragElementSummary(element) {
+  if (!element || typeof element !== "object") {
+    return null;
+  }
+
+  const dataAttrs = {};
+  Array.from(element.attributes || []).forEach((attribute) => {
+    if (String(attribute.name || "").startsWith("data-")) {
+      dataAttrs[attribute.name] = String(attribute.value || "");
+    }
+  });
+
+  return {
+    className: typeof element.className === "string" ? element.className.slice(0, 220) : "",
+    dataAttrs,
+    id: String(element.id || ""),
+    tagName: String(element.tagName || "").toLowerCase(),
+  };
+}
+
+function getFileDragPointDiagnostic(event) {
+  const clientX = Number(event?.clientX || 0);
+  const clientY = Number(event?.clientY || 0);
+  const targetElement = clientX || clientY ? document.elementFromPoint(clientX, clientY) : null;
+  return {
+    clientX,
+    clientY,
+    targetElement: getFileDragElementSummary(targetElement),
+    types: Array.from(event?.dataTransfer?.types || []),
+  };
+}
 const FILE_PREVIEW_MODES = [
   { id: "file", label: "File" },
   { id: "review", label: "Review" },
@@ -956,11 +1000,21 @@ function FileTreeNode({
   directoryStates,
   entry,
   expandedDirectories,
+  onBeginWorkspaceFileDrag,
   onOpenFile,
   onToggleDirectory,
   selectedFilePath,
+  workspaceId,
+  workspaceRoot,
   depth = 0,
 }) {
+  const fileDragDebugRef = useRef({
+    cleanup: null,
+    lastLogAt: 0,
+    lastPoint: null,
+  });
+  const filePointerDragRef = useRef(null);
+  const suppressFileClickRef = useRef(false);
   const isDirectory = entry.kind === "directory";
   const directoryPath = entry.relativePath || "";
   const isExpanded = Boolean(expandedDirectories[directoryPath]);
@@ -976,6 +1030,22 @@ function FileTreeNode({
     }
     : getFileIconMeta(entry.relativePath || entry.name);
   const fileTypeLabel = isDirectory ? "Folder" : getFileLanguage(entry.relativePath || entry.name);
+  const getWorkspaceFilePayload = () => {
+    const relativePath = String(entry.relativePath || entry.name || "").replace(/\\/g, "/").replace(/^\/+/g, "");
+    const absolutePath = joinWorkspaceFilePath(workspaceRoot, relativePath);
+    return {
+      absolutePath,
+      payload: {
+        kind: "file",
+        name: getExplorerFileName(relativePath),
+        path: absolutePath,
+        relativePath,
+        workspaceId: workspaceId || "",
+        workspaceRoot: workspaceRoot || "",
+      },
+      relativePath,
+    };
+  };
 
   return (
     <FileTreeItem>
@@ -983,7 +1053,157 @@ function FileTreeNode({
         $depth={depth}
         data-git-status={gitStatus || undefined}
         data-selected={!isDirectory && selectedFilePath === entry.relativePath}
+        draggable={false}
+        onPointerCancel={(event) => {
+          if (filePointerDragRef.current?.pointerId === event.pointerId) {
+            filePointerDragRef.current = null;
+          }
+        }}
+        onPointerDown={(event) => {
+          if (isDirectory || event.button !== 0 || !onBeginWorkspaceFileDrag) {
+            return;
+          }
+
+          const { absolutePath, payload, relativePath } = getWorkspaceFilePayload();
+          const rect = event.currentTarget.getBoundingClientRect();
+          filePointerDragRef.current = {
+            absolutePath,
+            payload,
+            pointerId: event.pointerId,
+            rect,
+            relativePath,
+            startX: event.clientX,
+            startY: event.clientY,
+          };
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = filePointerDragRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) {
+            return;
+          }
+
+          const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+          if (distance < 5) {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+          suppressFileClickRef.current = true;
+          filePointerDragRef.current = null;
+          setActiveWorkspaceFileDrag(drag.payload);
+          onBeginWorkspaceFileDrag?.({
+            clientX: event.clientX,
+            clientY: event.clientY,
+            file: drag.payload,
+            height: Math.max(36, Number(drag.rect?.height || 0)),
+            offsetX: Math.max(12, Math.min(Number(drag.rect?.width || 220) - 4, drag.startX - Number(drag.rect?.left || 0))),
+            offsetY: Math.max(8, Math.min(Number(drag.rect?.height || 40) - 4, drag.startY - Number(drag.rect?.top || 0))),
+            pointerId: event.pointerId,
+            width: Math.max(220, Number(drag.rect?.width || 0)),
+          });
+          logFileDragDiagnosticEvent("fileviewer.pointer_drag_start", {
+            clientX: event.clientX,
+            clientY: event.clientY,
+            hasAbsolutePath: Boolean(drag.absolutePath),
+            name: drag.payload.name,
+            path: drag.absolutePath,
+            relativePath: drag.relativePath,
+            workspaceId: workspaceId || "",
+          });
+        }}
+        onPointerUp={(event) => {
+          if (filePointerDragRef.current?.pointerId === event.pointerId) {
+            filePointerDragRef.current = null;
+          }
+        }}
+        onDrag={(event) => {
+          if (isDirectory) {
+            return;
+          }
+
+          const now = Date.now();
+          const diagnostic = getFileDragPointDiagnostic(event);
+          fileDragDebugRef.current.lastPoint = diagnostic;
+          if (now - Number(fileDragDebugRef.current.lastLogAt || 0) < 180) {
+            return;
+          }
+
+          fileDragDebugRef.current.lastLogAt = now;
+          logFileDragDiagnosticEvent("fileviewer.drag_move", {
+            ...diagnostic,
+            relativePath: String(entry.relativePath || entry.name || "").replace(/\\/g, "/").replace(/^\/+/g, ""),
+            workspaceId: workspaceId || "",
+          });
+        }}
+        onDragStart={(event) => {
+          if (isDirectory) {
+            return;
+          }
+
+          const relativePath = String(entry.relativePath || entry.name || "").replace(/\\/g, "/").replace(/^\/+/g, "");
+          const absolutePath = joinWorkspaceFilePath(workspaceRoot, relativePath);
+          const payload = {
+            kind: "file",
+            name: getExplorerFileName(relativePath),
+            path: absolutePath,
+            relativePath,
+            workspaceId: workspaceId || "",
+            workspaceRoot: workspaceRoot || "",
+          };
+          event.dataTransfer.effectAllowed = "copy";
+          event.dataTransfer.setData(WORKSPACE_FILE_DRAG_MIME, JSON.stringify(payload));
+          event.dataTransfer.setData("text/plain", absolutePath || relativePath);
+          setActiveWorkspaceFileDrag(payload);
+          const logWindowDragEvent = (phase) => (windowEvent) => {
+            logFileDragDiagnosticEvent(phase, {
+              ...getFileDragPointDiagnostic(windowEvent),
+              relativePath,
+              workspaceId: workspaceId || "",
+            });
+          };
+          const windowDragOverListener = logWindowDragEvent("fileviewer.window_drag_over_capture");
+          const windowDropListener = logWindowDragEvent("fileviewer.window_drop_capture");
+          window.addEventListener("dragover", windowDragOverListener, true);
+          window.addEventListener("drop", windowDropListener, true);
+          fileDragDebugRef.current.cleanup?.();
+          fileDragDebugRef.current.cleanup = () => {
+            window.removeEventListener("dragover", windowDragOverListener, true);
+            window.removeEventListener("drop", windowDropListener, true);
+            fileDragDebugRef.current.cleanup = null;
+          };
+          logFileDragDiagnosticEvent("fileviewer.drag_start", {
+            ...getFileDragPointDiagnostic(event),
+            hasAbsolutePath: Boolean(absolutePath),
+            name: payload.name,
+            path: absolutePath,
+            relativePath,
+            workspaceId: workspaceId || "",
+          });
+        }}
+        onDragEnd={(event) => {
+          fileDragDebugRef.current.cleanup?.();
+          logFileDragDiagnosticEvent("fileviewer.drag_end", {
+            ...getFileDragPointDiagnostic(event),
+            lastPoint: fileDragDebugRef.current.lastPoint,
+            relativePath: String(entry.relativePath || entry.name || "").replace(/\\/g, "/").replace(/^\/+/g, ""),
+            workspaceId: workspaceId || "",
+          });
+          window.setTimeout(() => {
+            clearActiveWorkspaceFileDrag();
+            logFileDragDiagnosticEvent("fileviewer.drag_end_clear", {
+              relativePath: String(entry.relativePath || entry.name || "").replace(/\\/g, "/").replace(/^\/+/g, ""),
+              workspaceId: workspaceId || "",
+            });
+          }, 120);
+        }}
         onClick={() => {
+          if (suppressFileClickRef.current) {
+            suppressFileClickRef.current = false;
+            return;
+          }
+
           if (isDirectory) {
             onToggleDirectory(entry);
             return;
@@ -1040,9 +1260,12 @@ function FileTreeNode({
               entry={childEntry}
               expandedDirectories={expandedDirectories}
               key={`${childEntry.kind}-${childEntry.relativePath}`}
+              onBeginWorkspaceFileDrag={onBeginWorkspaceFileDrag}
               onOpenFile={onOpenFile}
               onToggleDirectory={onToggleDirectory}
               selectedFilePath={selectedFilePath}
+              workspaceId={workspaceId}
+              workspaceRoot={workspaceRoot}
             />
           ))}
         </FileTreeChildren>
@@ -1053,6 +1276,7 @@ function FileTreeNode({
 
 export default function FilesWorkspaceView({
   defaultWorkingDirectory,
+  onBeginWorkspaceFileDrag,
   onOpenWorkspaceSettings,
   rootDirectory,
   workspace,
@@ -1467,9 +1691,12 @@ export default function FilesWorkspaceView({
                   directoryStates={directoryStates}
                   entry={rootEntry}
                   expandedDirectories={expandedDirectories}
+                  onBeginWorkspaceFileDrag={onBeginWorkspaceFileDrag}
                   onOpenFile={openFile}
                   onToggleDirectory={toggleDirectory}
                   selectedFilePath={selectedFile?.relativePath || ""}
+                  workspaceId={workspaceId}
+                  workspaceRoot={workspaceRoot}
                 />
               ) : (
                 <FileTreeEmpty>Set a workspace directory in settings.</FileTreeEmpty>

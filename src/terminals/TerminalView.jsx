@@ -21,7 +21,7 @@ import {
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
-import { logBigViewSyncDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
+import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
@@ -31,8 +31,15 @@ import WorkspaceTerminal, {
 } from "./WorkspaceTerminal.jsx";
 import {
   appendWorkspaceThreadComposerAttachments,
+  clearActiveWorkspaceFileDrag,
+  getActiveWorkspaceFileDrag,
+  getDraggedWorkspaceFile,
   getThreadComposerSyncKey,
+  isWorkspaceFileDragTransfer,
+  setActiveWorkspaceFileDrag,
   setWorkspaceThreadComposerDraft,
+  WORKSPACE_FILE_POINTER_DROP_EVENT,
+  workspaceFileToComposerAttachment,
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
@@ -1466,6 +1473,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   draft,
   dropError = "",
   items,
+  onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
   onDraftChange,
   onOpenWorkspaceSettings,
@@ -1808,6 +1816,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         <WorkspaceToolSurface data-tool="files">
           <FilesWorkspaceView
             defaultWorkingDirectory={defaultWorkingDirectory}
+            onBeginWorkspaceFileDrag={onBeginWorkspaceFileDrag}
             onOpenWorkspaceSettings={onOpenWorkspaceSettings}
             rootDirectory={rootDirectory}
             workspace={workspace}
@@ -2015,9 +2024,13 @@ function TerminalView({
   const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
   const terminalDragActive = Boolean(terminalDragState);
+  const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
+    && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
   const [todoDragState, setTodoDragState] = useState(null);
   const [todoDropError, setTodoDropError] = useState("");
   const todoDragActive = Boolean(todoDragState);
+  const [workspaceFileDragState, setWorkspaceFileDragState] = useState(null);
+  const workspaceFileDragActive = Boolean(workspaceFileDragState);
   const [todoQueueDraft, setTodoQueueDraft] = useState("");
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
@@ -2029,12 +2042,17 @@ function TerminalView({
   const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
   const todoDragStateRef = useRef(null);
+  const workspaceFileDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
   const todoQueueStorageKey = useMemo(
     () => getTodoQueueStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
   todoQueueStorageKeyRef.current = todoQueueStorageKey;
+  const updateWorkspaceFileDragState = useCallback((nextState) => {
+    workspaceFileDragStateRef.current = nextState || null;
+    setWorkspaceFileDragState(nextState || null);
+  }, []);
   const getTerminalAgent = useCallback((terminalIndex) => (
     Object.prototype.hasOwnProperty.call(terminalAgentsByIndex, terminalIndex)
       ? terminalAgentsByIndex[terminalIndex]
@@ -2067,6 +2085,148 @@ function TerminalView({
       });
     })()
   ), [agentStatuses, getTerminalAgent, getTerminalRole, getTerminalThread]);
+  const getTerminalTodoDropUnsupportedMessage = useCallback((terminalIndex) => {
+    const image = getTodoQueueItemImage(todoDragState);
+    if (!image) {
+      return "";
+    }
+
+    const capability = getTerminalImageInputSupport(terminalIndex);
+    return capability?.supported ? "" : getTodoImageUnsupportedDropMessage(capability);
+  }, [getTerminalImageInputSupport, todoDragState]);
+  const resolveTerminalDropTarget = useCallback((clientX, clientY) => {
+    const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+    if (!containerRect) {
+      return null;
+    }
+
+    return getTodoDropTargetFromPoint({
+      clientX,
+      clientY,
+      containerRect,
+      fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
+      rects: terminalLayoutRectsRef.current,
+      terminalIndexes: logicalTerminalIndexes,
+    });
+  }, [fullscreenActive, fullscreenTerminalIndex, logicalTerminalIndexes]);
+  const queueWorkspaceFileForTerminalIndex = useCallback((workspaceFile, targetTerminalIndex, source = "fileviewer_global_drop") => {
+    if (!Number.isInteger(targetTerminalIndex)) {
+      logFileDragDiagnosticEvent("terminal_grid.drop_skip", {
+        reason: "missing_target_terminal",
+        source,
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return false;
+    }
+
+    const paneId = getTerminalPaneId(targetTerminalIndex);
+    const targetRole = String(getTerminalRole(targetTerminalIndex) || "").toLowerCase();
+    const targetThread = getTerminalThread(targetTerminalIndex);
+    const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+    const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
+    const syncKey = getThreadComposerSyncKey(targetThread, {
+      ...targetBinding,
+      paneId: targetBinding?.paneId || paneId,
+    });
+    const attachment = workspaceFileToComposerAttachment(workspaceFile, source);
+
+    logFileDragDiagnosticEvent("terminal_grid.drop_resolved", {
+      attachmentCreated: Boolean(attachment),
+      hasPaneId: Boolean(paneId),
+      hasSyncKey: Boolean(syncKey),
+      paneId,
+      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+      source,
+      targetRole,
+      targetTerminalIndex,
+      threadId: targetThread?.id || "",
+      workspaceId: terminalWorkspace?.id || "",
+    });
+
+    if (!attachment || !syncKey) {
+      logFileDragDiagnosticEvent("terminal_grid.drop_skip", {
+        attachmentCreated: Boolean(attachment),
+        hasSyncKey: Boolean(syncKey),
+        paneId,
+        reason: !attachment ? "missing_attachment" : "missing_sync_key",
+        source,
+        targetTerminalIndex,
+        threadId: targetThread?.id || "",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return false;
+    }
+
+    setActiveTerminalPaneId(paneId);
+    window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+      detail: {
+        paneId,
+        reason: "fileviewer_drop",
+        terminalIndex: targetTerminalIndex,
+      },
+    }));
+    appendWorkspaceThreadComposerAttachments(syncKey, [attachment], {
+      fields: {
+        paneId,
+        relativePath: attachment.relativePath || "",
+        source,
+        surface: "terminal_grid",
+        targetRole,
+        targetTerminalIndex,
+        threadId: targetThread?.id || "",
+        workspaceId: terminalWorkspace?.id || "",
+      },
+      source,
+    });
+    logFileDragDiagnosticEvent("terminal_grid.attachment_appended", {
+      attachmentName: attachment.name,
+      attachmentPath: attachment.savedPath,
+      kind: attachment.kind,
+      paneId,
+      relativePath: attachment.relativePath || "",
+      source,
+      syncKey,
+      targetTerminalIndex,
+      threadId: targetThread?.id || "",
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    return true;
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    terminalWorkspace?.id,
+  ]);
+  const handleBeginWorkspaceFileDrag = useCallback((drag = {}) => {
+    const file = drag.file && typeof drag.file === "object" ? drag.file : null;
+    if (!file) {
+      return;
+    }
+
+    const width = Math.max(220, Number(drag.width || 0));
+    const height = Math.max(36, Number(drag.height || 0));
+    const offsetX = Math.max(12, Math.min(width - 4, Number(drag.offsetX || width / 2)));
+    const offsetY = Math.max(8, Math.min(height - 4, Number(drag.offsetY || height / 2)));
+    setActiveWorkspaceFileDrag(file);
+    updateWorkspaceFileDragState({
+      file,
+      height,
+      offsetX,
+      offsetY,
+      pointerId: drag.pointerId,
+      targetTerminalIndex: resolveTerminalDropTarget(Number(drag.clientX || 0), Number(drag.clientY || 0)),
+      width,
+      x: Number(drag.clientX || 0) - offsetX,
+      y: Number(drag.clientY || 0) - offsetY,
+    });
+    logFileDragDiagnosticEvent("fileviewer.pointer_drag_state_start", {
+      clientX: Number(drag.clientX || 0),
+      clientY: Number(drag.clientY || 0),
+      name: file.name || "",
+      relativePath: file.relativePath || "",
+      workspaceId: file.workspaceId || terminalWorkspace?.id || "",
+    });
+  }, [resolveTerminalDropTarget, terminalWorkspace?.id, updateWorkspaceFileDragState]);
   const visibleTerminalPaneIds = useMemo(() => (
     terminalWorkspace
       ? logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
@@ -2094,8 +2254,6 @@ function TerminalView({
 
     return terminal ? getTerminalPaneId(Number.parseInt(terminal.terminalIndex, 10)) : "";
   }, [getTerminalPaneId, workspaceThreadEntry]);
-  const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
-    && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
   const fullscreenState = fullscreenActive
     ? fullscreenMotion.phase === "opening" || fullscreenMotion.phase === "closing"
       ? fullscreenMotion.phase
@@ -2914,6 +3072,203 @@ function TerminalView({
     updateTerminalDragState,
   ]);
 
+  useEffect(() => {
+    if (!workspaceFileDragActive) {
+      return undefined;
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousTouchAction = document.body.style.touchAction;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.touchAction = "none";
+    document.body.style.userSelect = "none";
+
+    const commitDrag = (clientX, clientY) => {
+      const currentDrag = workspaceFileDragStateRef.current;
+      if (!currentDrag?.file) {
+        return;
+      }
+
+      const targetTerminalIndex = resolveTerminalDropTarget(clientX, clientY);
+      updateWorkspaceFileDragState(null);
+      if (Number.isInteger(targetTerminalIndex)) {
+        const queued = queueWorkspaceFileForTerminalIndex(
+          currentDrag.file,
+          targetTerminalIndex,
+          "fileviewer_pointer_drop",
+        );
+        if (queued) {
+          clearActiveWorkspaceFileDrag();
+        }
+        logFileDragDiagnosticEvent("fileviewer.pointer_drop_terminal", {
+          queued,
+          relativePath: currentDrag.file.relativePath || "",
+          targetTerminalIndex,
+          workspaceId: currentDrag.file.workspaceId || terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      const detail = {
+        clientX,
+        clientY,
+        file: currentDrag.file,
+        handled: false,
+        workspaceId: currentDrag.file.workspaceId || terminalWorkspace?.id || "",
+      };
+      window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_POINTER_DROP_EVENT, { detail }));
+      clearActiveWorkspaceFileDrag();
+      logFileDragDiagnosticEvent("fileviewer.pointer_drop_dispatch", {
+        handled: Boolean(detail.handled),
+        relativePath: currentDrag.file.relativePath || "",
+        workspaceId: detail.workspaceId,
+      });
+    };
+
+    const handlePointerMove = (event) => {
+      const currentDrag = workspaceFileDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      updateWorkspaceFileDragState({
+        ...currentDrag,
+        targetTerminalIndex: resolveTerminalDropTarget(event.clientX, event.clientY),
+        x: event.clientX - currentDrag.offsetX,
+        y: event.clientY - currentDrag.offsetY,
+      });
+    };
+
+    const handlePointerUp = (event) => {
+      const currentDrag = workspaceFileDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      commitDrag(event.clientX, event.clientY);
+    };
+
+    const handlePointerCancel = (event) => {
+      const currentDrag = workspaceFileDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      updateWorkspaceFileDragState(null);
+      window.setTimeout(clearActiveWorkspaceFileDrag, 80);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp, { passive: false });
+    window.addEventListener("pointercancel", handlePointerCancel);
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.touchAction = previousTouchAction;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
+  }, [
+    queueWorkspaceFileForTerminalIndex,
+    resolveTerminalDropTarget,
+    terminalWorkspace?.id,
+    updateWorkspaceFileDragState,
+    workspaceFileDragActive,
+  ]);
+
+  useEffect(() => {
+    if (!hasVisibleWorkspaceTerminalPanes) {
+      return undefined;
+    }
+
+    const handleWorkspaceFileDragOver = (event) => {
+      const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+      const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+      if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+        return;
+      }
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      const targetTerminalIndex = resolveTerminalDropTarget(event.clientX, event.clientY);
+      logFileDragDiagnosticEvent("terminal_grid.global_drag_over_raw", {
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      if (!Number.isInteger(targetTerminalIndex)) {
+        return;
+      }
+
+      logFileDragDiagnosticEvent("terminal_grid.global_drag_over", {
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        targetTerminalIndex,
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    };
+
+    const handleWorkspaceFileDrop = (event) => {
+      const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+      const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+      if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+        return;
+      }
+
+      event.preventDefault();
+      const targetTerminalIndex = resolveTerminalDropTarget(event.clientX, event.clientY);
+      logFileDragDiagnosticEvent("terminal_grid.global_drop_raw", {
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      if (!Number.isInteger(targetTerminalIndex)) {
+        logFileDragDiagnosticEvent("terminal_grid.global_drop_ignored", {
+          reason: "outside_terminal_grid",
+          types: Array.from(event.dataTransfer?.types || []),
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      event.stopPropagation();
+      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer) || activeWorkspaceFile;
+      logFileDragDiagnosticEvent("terminal_grid.global_drop", {
+        filePresent: Boolean(workspaceFile),
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        relativePath: workspaceFile?.relativePath || "",
+        targetTerminalIndex,
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      if (queueWorkspaceFileForTerminalIndex(workspaceFile, targetTerminalIndex, "fileviewer_global_drop")) {
+        clearActiveWorkspaceFileDrag();
+      }
+    };
+
+    window.addEventListener("dragover", handleWorkspaceFileDragOver, true);
+    window.addEventListener("drop", handleWorkspaceFileDrop, true);
+    return () => {
+      window.removeEventListener("dragover", handleWorkspaceFileDragOver, true);
+      window.removeEventListener("drop", handleWorkspaceFileDrop, true);
+    };
+  }, [
+    hasVisibleWorkspaceTerminalPanes,
+    queueWorkspaceFileForTerminalIndex,
+    resolveTerminalDropTarget,
+    terminalWorkspace?.id,
+  ]);
+
   const handleToggleFullscreenTerminal = useCallback(({ paneId, panelRect, surfaceRect, terminalIndex }) => {
     if (paneId) {
       setActiveTerminalPaneId(paneId);
@@ -3131,8 +3486,14 @@ function TerminalView({
                 terminalRole={getTerminalRole(terminalIndex)}
                 thread={getTerminalThread(terminalIndex)}
                 threadsViewActive={fullscreenThisTerminal}
-                todoDropActive={todoDragActive}
-                todoDropTarget={todoDragState?.targetTerminalIndex === terminalIndex}
+                todoDropActive={todoDragActive || workspaceFileDragActive}
+                todoDropTarget={
+                  todoDragState?.targetTerminalIndex === terminalIndex
+                    || workspaceFileDragState?.targetTerminalIndex === terminalIndex
+                }
+                todoDropUnsupportedMessage={todoDragState?.targetTerminalIndex === terminalIndex
+                  ? getTerminalTodoDropUnsupportedMessage(terminalIndex)
+                  : ""}
                 workingDirectory={terminalWorkspaceWorkingDirectory}
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
@@ -3177,6 +3538,14 @@ function TerminalView({
       terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
       thread={getTerminalThread(logicalTerminalIndexes[0] || 0)}
       threadsViewActive={false}
+      todoDropActive={todoDragActive || workspaceFileDragActive}
+      todoDropTarget={
+        todoDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
+          || workspaceFileDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
+      }
+      todoDropUnsupportedMessage={todoDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
+        ? getTerminalTodoDropUnsupportedMessage(logicalTerminalIndexes[0] || 0)
+        : ""}
       workingDirectory={terminalWorkspaceWorkingDirectory}
       workspace={terminalWorkspace}
       workspaceError={workspaceError}
@@ -3239,6 +3608,7 @@ function TerminalView({
                         draft={todoQueueDraft}
                         dropError={todoDropError}
                         items={todoQueueItems}
+                        onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
                         onBeginTodoDrag={handleBeginTodoDrag}
                         onDraftChange={setTodoQueueDraft}
                         onOpenWorkspaceSettings={onOpenWorkspaceSettings}
@@ -3280,6 +3650,24 @@ function TerminalView({
                   {normalizeTodoQueueText(todoDragState.text) && (
                     <TodoDragPreviewText>{todoDragState.text}</TodoDragPreviewText>
                   )}
+                </TodoQueueItemContent>
+              </TodoDragPreview>
+            )}
+            {workspaceFileDragState && (
+              <TodoDragPreview
+                aria-hidden="true"
+                style={{
+                  "--todo-drag-width": `${Math.max(220, Number(workspaceFileDragState.width || 0))}px`,
+                  "--todo-drag-x": `${Math.round(Number(workspaceFileDragState.x || 0))}px`,
+                  "--todo-drag-y": `${Math.round(Number(workspaceFileDragState.y || 0))}px`,
+                }}
+              >
+                <TodoQueueItemContent data-has-preview="false">
+                  <TodoDragPreviewText>
+                    {workspaceFileDragState.file?.name
+                      || workspaceFileDragState.file?.relativePath
+                      || "Workspace file"}
+                  </TodoDragPreviewText>
                 </TodoQueueItemContent>
               </TodoDragPreview>
             )}
