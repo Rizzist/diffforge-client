@@ -5,6 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   AUDIO_TRANSCRIPTION_RESULT_EVENT,
+  AUDIO_RECORDER_MODE_PUSH_TO_TALK,
+  AUDIO_RECORDER_MODE_VOICE_ACTIVITY,
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
   AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
   arrayBufferToBase64,
@@ -15,6 +17,7 @@ import {
   markAudioInputSetupReady,
   prepareWhisperModel,
   publishAudioTranscriptionResult,
+  readAudioRecorderMode,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
@@ -22,6 +25,7 @@ import {
   readDeepgramLanguage,
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
+  writeAudioRecorderMode,
   writeAudioTranscriptionProvider,
   writeAutoOpenAudioRecorder,
   writeDeepgramApiKey,
@@ -357,6 +361,7 @@ const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
+const AUDIO_VAD_EVENT = "forge-audio-vad-event";
 const AUDIO_RECORDING_MAX_SECONDS = 90;
 const AUDIO_RECORDING_TIMER_MS = 250;
 const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
@@ -853,6 +858,7 @@ export default function AudioWorkspaceView({
   const [deepgramApiKey, setDeepgramApiKey] = useState(readDeepgramApiKey);
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
+  const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [historyScrollTop, setHistoryScrollTop] = useState(0);
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
@@ -1094,6 +1100,13 @@ export default function AudioWorkspaceView({
     });
   }, []);
 
+  const updateRecorderMode = useCallback((event) => {
+    const nextMode = event.target.value;
+    setRecorderMode(nextMode);
+    writeAudioRecorderMode(nextMode);
+    notifyAudioSettingsChanged("recorder-mode");
+  }, []);
+
   const handleAudioHistoryScroll = useCallback((event) => {
     setHistoryScrollTop(event.currentTarget.scrollTop || 0);
   }, []);
@@ -1307,6 +1320,7 @@ export default function AudioWorkspaceView({
     const handleStorage = (event) => {
       if (event.key?.startsWith?.("diffforge.audio.")) {
         setAudioHistory(readAudioTranscriptionHistory());
+        setRecorderMode(readAudioRecorderMode());
         setAudioMode(readAudioTranscriptionProvider());
         setDeepgramApiKey(readDeepgramApiKey());
         setDeepgramLanguage(readDeepgramLanguage());
@@ -1422,7 +1436,11 @@ export default function AudioWorkspaceView({
             <AudioDeviceHeader>
               <div>
                 <SettingsLabel>Recorder</SettingsLabel>
-                <SettingsHint>{recorderOpen ? "Floating recorder is open." : "Floating push-to-talk recorder."}</SettingsHint>
+                <SettingsHint>{recorderOpen
+                  ? "Floating recorder is open."
+                  : recorderMode === AUDIO_RECORDER_MODE_VOICE_ACTIVITY
+                    ? "Floating recorder listens for speech."
+                    : "Floating push-to-talk recorder."}</SettingsHint>
               </div>
             </AudioDeviceHeader>
             <AudioRecorderActions>
@@ -1552,8 +1570,13 @@ export default function AudioWorkspaceView({
 
           <AudioCloudField>
             Mode
-            <AudioDeviceSelect aria-label="Recorder mode" disabled value="push-to-talk">
-              <option value="push-to-talk">Push to Talk</option>
+            <AudioDeviceSelect
+              aria-label="Recorder mode"
+              onChange={updateRecorderMode}
+              value={recorderMode}
+            >
+              <option value={AUDIO_RECORDER_MODE_PUSH_TO_TALK}>Push to Talk</option>
+              <option value={AUDIO_RECORDER_MODE_VOICE_ACTIVITY}>Voice Activity</option>
             </AudioDeviceSelect>
           </AudioCloudField>
 
@@ -1803,6 +1826,7 @@ export function AudioWidgetWindow() {
   const [widgetFrameMode, setWidgetFrameModeState] = useState("compact");
   const [shortcutStatus, setShortcutStatus] = useState(fallbackShortcutStatus);
   const [realtimeTranscript, setRealtimeTranscript] = useState("");
+  const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -1811,12 +1835,18 @@ export function AudioWidgetWindow() {
   const recordingRunRef = useRef(0);
   const stopAfterStartRef = useRef(false);
   const stopRecordingRef = useRef(null);
+  const vadActiveRef = useRef(false);
+  const recorderModeRef = useRef(recorderMode);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
 
   useEffect(() => {
     widgetStateRef.current = widgetState;
   }, [widgetState]);
+
+  useEffect(() => {
+    recorderModeRef.current = recorderMode;
+  }, [recorderMode]);
 
   const setWidgetFrameMode = useCallback((nextMode) => {
     widgetFrameModeRef.current = nextMode;
@@ -1825,11 +1855,13 @@ export function AudioWidgetWindow() {
 
   const resetWidgetToStartState = useCallback(() => {
     const currentProvider = readAudioTranscriptionProvider();
+    const currentRecorderMode = readAudioRecorderMode();
     const currentApiKey = readDeepgramApiKey();
     const currentLanguage = readDeepgramLanguage();
     const hasSetup = hasAudioInputSetup();
 
     setTranscriptionProvider(currentProvider);
+    setRecorderMode(currentRecorderMode);
     setDeepgramApiKey(currentApiKey);
     setDeepgramLanguage(currentLanguage);
     setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
@@ -1916,6 +1948,54 @@ export function AudioWidgetWindow() {
     await audioBuffer?.close?.().catch(() => {});
   }, []);
 
+  const stopVoiceActivityDetection = useCallback(async () => {
+    if (!vadActiveRef.current) {
+      return;
+    }
+
+    vadActiveRef.current = false;
+    await invoke("stop_silero_vad").catch(() => {});
+  }, []);
+
+  const startVoiceActivityDetection = useCallback(async () => {
+    if (vadActiveRef.current || recorderModeRef.current !== AUDIO_RECORDER_MODE_VOICE_ACTIVITY) {
+      return;
+    }
+
+    if (!hasAudioInputSetup()) {
+      return;
+    }
+
+    const currentProvider = readAudioTranscriptionProvider();
+    const providerReady = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      ? Boolean(readDeepgramApiKey().trim())
+      : Boolean(modelStatus?.installed);
+
+    if (!providerReady) {
+      return;
+    }
+
+    vadActiveRef.current = true;
+    try {
+      await invoke("start_silero_vad", {
+        request: {
+          deviceId: readSelectedAudioInputDeviceId(),
+        },
+      });
+      if (recorderModeRef.current === AUDIO_RECORDER_MODE_VOICE_ACTIVITY
+        && widgetStateRef.current === "ready") {
+        setMessage("Listening for speech");
+      }
+    } catch (vadError) {
+      vadActiveRef.current = false;
+      if (recorderModeRef.current === AUDIO_RECORDER_MODE_VOICE_ACTIVITY) {
+        widgetStateRef.current = "error";
+        setWidgetState("error");
+        setError(getErrorMessage(vadError, "Unable to start voice activity detection."));
+      }
+    }
+  }, [modelStatus?.installed]);
+
   const waitForWarmPrerollBuffer = useCallback(async () => {
     const audioBuffer = await startWarmBuffer();
     const bufferedMs = Date.now() - audioBufferReadyAtRef.current;
@@ -1927,7 +2007,7 @@ export function AudioWidgetWindow() {
     return audioBuffer;
   }, [startWarmBuffer]);
 
-  const startRecording = useCallback(async () => {
+  const startRecording = useCallback(async ({ skipPrerollWait = false } = {}) => {
     const currentState = widgetStateRef.current;
     const currentProvider = readAudioTranscriptionProvider();
 
@@ -1967,7 +2047,7 @@ export function AudioWidgetWindow() {
     let captureBegan = false;
 
     try {
-      audioBuffer = await waitForWarmPrerollBuffer();
+      audioBuffer = skipPrerollWait ? await startWarmBuffer() : await waitForWarmPrerollBuffer();
       if (recordingRunRef.current !== recordingRunId) {
         if (audioBufferRef.current === audioBuffer) {
           await closeWarmBuffer();
@@ -2035,17 +2115,21 @@ export function AudioWidgetWindow() {
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
+      pushToTalkDownRef.current = false;
+      stopAfterStartRef.current = false;
       widgetStateRef.current = "error";
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
     }
-  }, [closeWarmBuffer, modelStatus?.installed, waitForWarmPrerollBuffer]);
+  }, [closeWarmBuffer, modelStatus?.installed, startWarmBuffer, waitForWarmPrerollBuffer]);
 
   const refreshStatus = useCallback(async () => {
     const currentProvider = readAudioTranscriptionProvider();
+    const currentRecorderMode = readAudioRecorderMode();
     const currentApiKey = readDeepgramApiKey();
     const currentLanguage = readDeepgramLanguage();
     setTranscriptionProvider(currentProvider);
+    setRecorderMode(currentRecorderMode);
     setDeepgramApiKey(currentApiKey);
     setDeepgramLanguage(currentLanguage);
     widgetStateRef.current = "checking";
@@ -2376,6 +2460,7 @@ export function AudioWidgetWindow() {
     recordingRunRef.current += 1;
     pushToTalkDownRef.current = false;
     stopAfterStartRef.current = false;
+    await stopVoiceActivityDetection();
 
     const currentProvider = readAudioTranscriptionProvider();
 
@@ -2387,7 +2472,7 @@ export function AudioWidgetWindow() {
 
     await closeWarmBuffer();
     resetWidgetToStartState();
-  }, [closeWarmBuffer, resetWidgetToStartState]);
+  }, [closeWarmBuffer, resetWidgetToStartState, stopVoiceActivityDetection]);
 
   const forwardEscapeToActiveTerminal = useCallback((fields = {}) => {
     invoke("terminal_write_to_audio_input_target", { data: "\x1b" })
@@ -2406,9 +2491,10 @@ export function AudioWidgetWindow() {
     refreshShortcutStatus();
 
     return () => {
+      stopVoiceActivityDetection();
       closeWarmBuffer();
     };
-  }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
+  }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus, stopVoiceActivityDetection]);
 
   useEffect(() => {
     if (widgetState !== "ready" || !hasAudioInputSetup()) {
@@ -2441,6 +2527,37 @@ export function AudioWidgetWindow() {
   }, [deepgramApiKey, modelStatus?.installed, startWarmBuffer, transcriptionProvider, widgetState]);
 
   useEffect(() => {
+    const providerReady = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      ? Boolean(deepgramApiKey.trim())
+      : Boolean(modelStatus?.installed);
+    const shouldListen = recorderMode === AUDIO_RECORDER_MODE_VOICE_ACTIVITY
+      && hasAudioInputSetup()
+      && providerReady
+      && widgetState !== "missing"
+      && widgetState !== "setup"
+      && widgetState !== "error"
+      && widgetState !== "checking"
+      && widgetState !== "warming"
+      && widgetState !== "transcribing";
+
+    if (shouldListen) {
+      startVoiceActivityDetection();
+      return undefined;
+    }
+
+    stopVoiceActivityDetection();
+    return undefined;
+  }, [
+    deepgramApiKey,
+    modelStatus?.installed,
+    recorderMode,
+    startVoiceActivityDetection,
+    stopVoiceActivityDetection,
+    transcriptionProvider,
+    widgetState,
+  ]);
+
+  useEffect(() => {
     if (widgetState === "setup" || widgetState === "missing" || widgetState === "error") {
       closeWarmBuffer();
     }
@@ -2469,6 +2586,7 @@ export function AudioWidgetWindow() {
     };
 
     const syncAudioSettings = () => {
+      setRecorderMode(readAudioRecorderMode());
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());
@@ -2560,6 +2678,62 @@ export function AudioWidgetWindow() {
       unlisten();
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(AUDIO_VAD_EVENT, (event) => {
+      if (disposed || recorderModeRef.current !== AUDIO_RECORDER_MODE_VOICE_ACTIVITY) {
+        return;
+      }
+
+      const phase = String(event.payload?.phase || "");
+      if (phase === "listening") {
+        if (widgetStateRef.current === "ready") {
+          setMessage("Listening for speech");
+        }
+        return;
+      }
+
+      if (phase === "speech-start") {
+        const currentState = widgetStateRef.current;
+        if (currentState !== "ready") {
+          return;
+        }
+
+        pushToTalkDownRef.current = true;
+        stopAfterStartRef.current = false;
+        startRecording({ skipPrerollWait: true });
+        return;
+      }
+
+      if (phase === "speech-end") {
+        releasePushToTalk();
+        return;
+      }
+
+      if (phase === "error") {
+        widgetStateRef.current = "error";
+        setWidgetState("error");
+        setError(event.payload?.message || "Voice activity detection stopped.");
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [releasePushToTalk, startRecording]);
 
   useEffect(() => {
     if (widgetState !== "recording") {

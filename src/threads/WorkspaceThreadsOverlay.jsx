@@ -116,9 +116,9 @@ const ThreadRail = styled.aside`
   min-height: 0;
   overflow: visible;
   border-right: 1px solid rgba(255, 255, 255, 0.07);
-  background:
-    radial-gradient(circle at 50% 100%, rgba(255, 255, 255, 0.035), transparent 42%),
-    linear-gradient(180deg, #292929, #262626 55%, #242424);
+  background-color: #101820;
+  background-image: url("/textures/thread-rail-carbon-fiber.png");
+  background-repeat: repeat;
   box-shadow: inset -1px 0 0 rgba(0, 0, 0, 0.42);
 `;
 
@@ -294,9 +294,9 @@ const CollapsedRail = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 28px 8px 10px;
-  background:
-    radial-gradient(circle at 50% 100%, rgba(255, 255, 255, 0.035), transparent 42%),
-    linear-gradient(180deg, #292929, #262626 55%, #242424);
+  background-color: #101820;
+  background-image: url("/textures/thread-rail-carbon-fiber.png");
+  background-repeat: repeat;
 `;
 
 const CollapsedRailActionStack = styled.div`

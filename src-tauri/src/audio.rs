@@ -189,6 +189,11 @@ struct NativeAudioChunk {
     timestamp: Instant,
 }
 
+struct NativeVadAudioChunk {
+    sample_rate: u32,
+    samples: Vec<f32>,
+}
+
 struct NativeAudioShared {
     capture_chunk_count: u64,
     capture_input_ms: f64,
@@ -201,6 +206,7 @@ struct NativeAudioShared {
     realtime_audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     sample_rate: u32,
     total_samples: usize,
+    vad_audio_tx: Option<std::sync::mpsc::Sender<NativeVadAudioChunk>>,
 }
 
 impl NativeAudioShared {
@@ -217,6 +223,7 @@ impl NativeAudioShared {
             realtime_audio_tx: None,
             sample_rate,
             total_samples: 0,
+            vad_audio_tx: None,
         }
     }
 }
@@ -235,10 +242,17 @@ enum NativeAudioCommand {
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
+    AttachVad {
+        audio_tx: std::sync::mpsc::Sender<NativeVadAudioChunk>,
+        response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
+    },
     Begin {
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     DetachRealtime {
+        response: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    DetachVad {
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Finish {
@@ -282,6 +296,19 @@ impl NativeAudioWorker {
             .map_err(|_| "Native audio worker did not respond.".to_string())?
     }
 
+    fn attach_vad_stream(
+        &self,
+        audio_tx: std::sync::mpsc::Sender<NativeVadAudioChunk>,
+    ) -> Result<AudioInputMonitorStatus, String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(NativeAudioCommand::AttachVad { audio_tx, response })
+            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Native audio worker did not respond.".to_string())?
+    }
+
     fn begin_capture(&self) -> Result<(), String> {
         let (response, response_rx) = std::sync::mpsc::channel();
         self.command_tx
@@ -306,6 +333,16 @@ impl NativeAudioWorker {
         let (response, response_rx) = std::sync::mpsc::channel();
         self.command_tx
             .send(NativeAudioCommand::DetachRealtime { response })
+            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Native audio worker did not respond.".to_string())?
+    }
+
+    fn detach_vad_stream(&self) -> Result<(), String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(NativeAudioCommand::DetachVad { response })
             .map_err(|_| "Native audio worker is unavailable.".to_string())?;
         response_rx
             .recv()
@@ -354,6 +391,665 @@ fn inactive_native_audio_status() -> AudioInputMonitorStatus {
     }
 }
 
+#[derive(Clone)]
+struct SileroVadRuntimeConfig {
+    threshold: f32,
+    end_threshold: f32,
+    min_speech_ms: u64,
+    min_silence_ms: u64,
+    speech_pad_ms: u64,
+    max_speech_ms: u64,
+}
+
+const SILERO_VAD_SAMPLE_RATE: u32 = 16_000;
+const SILERO_VAD_CHUNK_SAMPLES: usize = silero_vad_burn::CHUNK_SIZE;
+
+type SileroVadBackend = burn_ndarray::NdArray;
+
+struct SileroVadModel {
+    device: burn_ndarray::NdArrayDevice,
+    model: silero_vad_burn::SileroVAD6Model<SileroVadBackend>,
+    predict_state: Option<silero_vad_burn::PredictState<SileroVadBackend>>,
+    pending_samples: Vec<f32>,
+}
+
+struct SileroVadSegment {
+    start_sample: u64,
+    end_sample: u64,
+}
+
+struct SileroVadSegmenter {
+    config: SileroVadRuntimeConfig,
+    current_sample: u64,
+    active_start: Option<u64>,
+    active_raw_start: Option<u64>,
+    tentative_end: Option<u64>,
+}
+
+struct SileroVadRuntimeSession {
+    status: SileroVadStatus,
+    stop: Arc<AtomicBool>,
+}
+
+enum SileroVadCommand {
+    Start {
+        app: AppHandle,
+        input_worker: NativeAudioWorker,
+        request: SileroVadStartRequest,
+        response: std::sync::mpsc::Sender<Result<SileroVadStatus, String>>,
+    },
+    Stop {
+        input_worker: NativeAudioWorker,
+        response: std::sync::mpsc::Sender<Result<SileroVadStatus, String>>,
+    },
+    Status {
+        response: std::sync::mpsc::Sender<Result<SileroVadStatus, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct SileroVadWorker {
+    command_tx: std::sync::mpsc::Sender<SileroVadCommand>,
+}
+
+impl SileroVadWorker {
+    fn new() -> Self {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<SileroVadCommand>();
+
+        thread::spawn(move || silero_vad_worker_loop(command_rx));
+
+        Self { command_tx }
+    }
+
+    fn start(
+        &self,
+        app: AppHandle,
+        input_worker: NativeAudioWorker,
+        request: SileroVadStartRequest,
+    ) -> Result<SileroVadStatus, String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(SileroVadCommand::Start {
+                app,
+                input_worker,
+                request,
+                response,
+            })
+            .map_err(|_| "Silero VAD worker is unavailable.".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Silero VAD worker did not respond.".to_string())?
+    }
+
+    fn stop(&self, input_worker: NativeAudioWorker) -> Result<SileroVadStatus, String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(SileroVadCommand::Stop {
+                input_worker,
+                response,
+            })
+            .map_err(|_| "Silero VAD worker is unavailable.".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Silero VAD worker did not respond.".to_string())?
+    }
+
+    fn status(&self) -> Result<SileroVadStatus, String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(SileroVadCommand::Status { response })
+            .map_err(|_| "Silero VAD worker is unavailable.".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Silero VAD worker did not respond.".to_string())?
+    }
+}
+
+fn sanitize_vad_probability(value: Option<f32>, fallback: f32) -> f32 {
+    value
+        .filter(|candidate| candidate.is_finite())
+        .unwrap_or(fallback)
+        .clamp(0.01, 0.99)
+}
+
+fn sanitize_vad_duration_ms(value: Option<u64>, fallback: u64, min: u64, max: u64) -> u64 {
+    value.unwrap_or(fallback).clamp(min, max)
+}
+
+fn silero_vad_runtime_config(request: &SileroVadStartRequest) -> SileroVadRuntimeConfig {
+    let threshold = sanitize_vad_probability(request.threshold, AUDIO_VAD_START_THRESHOLD);
+    let end_threshold = sanitize_vad_probability(request.end_threshold, AUDIO_VAD_END_THRESHOLD)
+        .min((threshold - 0.05).max(0.01));
+
+    SileroVadRuntimeConfig {
+        threshold,
+        end_threshold,
+        min_speech_ms: sanitize_vad_duration_ms(
+            request.min_speech_ms,
+            AUDIO_VAD_MIN_SPEECH_MS,
+            100,
+            2_000,
+        ),
+        min_silence_ms: sanitize_vad_duration_ms(
+            request.min_silence_ms,
+            AUDIO_VAD_MIN_SILENCE_MS,
+            250,
+            3_000,
+        ),
+        speech_pad_ms: sanitize_vad_duration_ms(
+            request.speech_pad_ms,
+            AUDIO_VAD_SPEECH_PAD_MS,
+            0,
+            2_000,
+        ),
+        max_speech_ms: sanitize_vad_duration_ms(
+            request.max_speech_ms,
+            (AUDIO_CAPTURE_MAX_SECONDS * 1000.0).round() as u64,
+            5_000,
+            (AUDIO_CAPTURE_MAX_SECONDS * 1000.0).round() as u64,
+        ),
+    }
+}
+
+fn silero_vad_samples_for_ms(duration_ms: u64) -> u64 {
+    ((duration_ms as u128 * SILERO_VAD_SAMPLE_RATE as u128) / 1000) as u64
+}
+
+impl SileroVadModel {
+    fn new() -> Result<Self, String> {
+        let device = burn_ndarray::NdArrayDevice::default();
+        let model = silero_vad_burn::SileroVAD6Model::<SileroVadBackend>::new(&device)
+            .map_err(silero_vad_error_message)?;
+        let predict_state = Some(silero_vad_burn::PredictState::default(&device));
+
+        Ok(Self {
+            device,
+            model,
+            predict_state,
+            pending_samples: Vec::with_capacity(SILERO_VAD_CHUNK_SAMPLES * 2),
+        })
+    }
+
+    fn process_samples(&mut self, samples: &[f32]) -> Result<Vec<f32>, String> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.pending_samples.extend_from_slice(samples);
+        let mut probabilities = Vec::new();
+
+        while self.pending_samples.len() >= SILERO_VAD_CHUNK_SAMPLES {
+            let chunk = self
+                .pending_samples
+                .drain(..SILERO_VAD_CHUNK_SAMPLES)
+                .collect::<Vec<_>>();
+            probabilities.push(self.infer_chunk(&chunk)?);
+        }
+
+        Ok(probabilities)
+    }
+
+    fn infer_chunk(&mut self, chunk: &[f32]) -> Result<f32, String> {
+        let input =
+            burn::tensor::Tensor::<SileroVadBackend, 1>::from_data(chunk, &self.device).unsqueeze();
+        let predict_state = self
+            .predict_state
+            .take()
+            .unwrap_or_else(|| silero_vad_burn::PredictState::default(&self.device));
+        let (next_state, output) = self
+            .model
+            .predict(predict_state, input)
+            .map_err(silero_vad_error_message)?;
+        self.predict_state = Some(next_state);
+
+        let probabilities = output
+            .into_data()
+            .to_vec::<f32>()
+            .map_err(silero_vad_error_message)?;
+        probabilities
+            .first()
+            .copied()
+            .ok_or_else(|| "Silero VAD returned no probability.".to_string())
+    }
+}
+
+impl SileroVadSegment {
+    fn sample_count(&self) -> u64 {
+        self.end_sample.saturating_sub(self.start_sample)
+    }
+}
+
+impl SileroVadSegmenter {
+    fn new(config: SileroVadRuntimeConfig) -> Self {
+        Self {
+            config,
+            current_sample: 0,
+            active_start: None,
+            active_raw_start: None,
+            tentative_end: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_start.is_some()
+    }
+
+    fn push_probability(&mut self, probability: f32) -> Option<SileroVadSegment> {
+        let frame_samples = SILERO_VAD_CHUNK_SAMPLES as u64;
+        let frame_start = self.current_sample;
+        self.current_sample = self.current_sample.saturating_add(frame_samples);
+
+        if probability >= self.config.threshold {
+            self.tentative_end = None;
+            if self.active_start.is_none() {
+                self.active_start =
+                    Some(frame_start.saturating_sub(silero_vad_samples_for_ms(
+                        self.config.speech_pad_ms,
+                    )));
+                self.active_raw_start = Some(frame_start);
+                return None;
+            }
+        }
+
+        let start = self.active_start?;
+        let raw_start = self.active_raw_start?;
+        let raw_speech_samples = frame_start.saturating_sub(raw_start);
+
+        if raw_speech_samples > silero_vad_samples_for_ms(self.config.max_speech_ms) {
+            let raw_end = self.tentative_end.unwrap_or(frame_start);
+            self.clear_active();
+            return self.build_segment(start, raw_start, raw_end);
+        }
+
+        if probability >= self.config.end_threshold {
+            return None;
+        }
+
+        let silence_start = *self.tentative_end.get_or_insert(frame_start);
+        let silence_samples = frame_start.saturating_sub(silence_start);
+
+        if silence_samples < silero_vad_samples_for_ms(self.config.min_silence_ms) {
+            return None;
+        }
+
+        self.clear_active();
+        self.build_segment(start, raw_start, silence_start)
+    }
+
+    fn build_segment(
+        &self,
+        start_sample: u64,
+        raw_start: u64,
+        raw_end: u64,
+    ) -> Option<SileroVadSegment> {
+        if raw_end.saturating_sub(raw_start) < silero_vad_samples_for_ms(self.config.min_speech_ms)
+        {
+            return None;
+        }
+
+        let end_sample = raw_end
+            .saturating_add(silero_vad_samples_for_ms(self.config.speech_pad_ms))
+            .min(self.current_sample);
+
+        Some(SileroVadSegment {
+            start_sample,
+            end_sample,
+        })
+    }
+
+    fn clear_active(&mut self) {
+        self.active_start = None;
+        self.active_raw_start = None;
+        self.tentative_end = None;
+    }
+}
+
+fn inactive_silero_vad_status() -> SileroVadStatus {
+    SileroVadStatus {
+        active: false,
+        device_id: String::new(),
+        label: String::new(),
+        sample_rate: SILERO_VAD_SAMPLE_RATE,
+        threshold: AUDIO_VAD_START_THRESHOLD,
+        end_threshold: AUDIO_VAD_END_THRESHOLD,
+        min_speech_ms: AUDIO_VAD_MIN_SPEECH_MS,
+        min_silence_ms: AUDIO_VAD_MIN_SILENCE_MS,
+        speech_pad_ms: AUDIO_VAD_SPEECH_PAD_MS,
+        max_speech_ms: (AUDIO_CAPTURE_MAX_SECONDS * 1000.0).round() as u64,
+    }
+}
+
+fn silero_vad_status_from_monitor(
+    monitor_status: &AudioInputMonitorStatus,
+    config: &SileroVadRuntimeConfig,
+) -> SileroVadStatus {
+    SileroVadStatus {
+        active: true,
+        device_id: monitor_status.device_id.clone(),
+        label: monitor_status.label.clone(),
+        sample_rate: SILERO_VAD_SAMPLE_RATE,
+        threshold: config.threshold,
+        end_threshold: config.end_threshold,
+        min_speech_ms: config.min_speech_ms,
+        min_silence_ms: config.min_silence_ms,
+        speech_pad_ms: config.speech_pad_ms,
+        max_speech_ms: config.max_speech_ms,
+    }
+}
+
+fn silero_vad_error_message(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    if message.to_lowercase().contains("onnx") {
+        format!("Unable to start Silero VAD ONNX model: {message}")
+    } else {
+        format!("Unable to start Silero VAD: {message}")
+    }
+}
+
+fn emit_silero_vad_event(
+    app: &AppHandle,
+    phase: &str,
+    status: &SileroVadStatus,
+    speech: bool,
+    segment_id: String,
+    probability: Option<f32>,
+    speech_ms: u64,
+    message: impl Into<String>,
+) {
+    let event = SileroVadEvent {
+        phase: phase.to_string(),
+        active: status.active,
+        speech,
+        segment_id,
+        probability,
+        speech_ms,
+        device_id: status.device_id.clone(),
+        label: status.label.clone(),
+        sample_rate: status.sample_rate,
+        created_at_ms: current_time_ms(),
+        message: message.into(),
+    };
+    let _ = app.emit(AUDIO_VAD_EVENT, event);
+}
+
+fn silero_vad_segment_id() -> String {
+    format!("vad-{}", current_time_ms())
+}
+
+fn run_silero_vad_audio_loop(
+    app: AppHandle,
+    audio_rx: std::sync::mpsc::Receiver<NativeVadAudioChunk>,
+    stop: Arc<AtomicBool>,
+    status: SileroVadStatus,
+    mut model: SileroVadModel,
+    mut segmenter: SileroVadSegmenter,
+) {
+    emit_silero_vad_event(
+        &app,
+        "listening",
+        &status,
+        false,
+        String::new(),
+        None,
+        0,
+        "Listening for speech",
+    );
+
+    let mut active_segment_id = String::new();
+    let mut speech_started_at: Option<Instant> = None;
+
+    while !stop.load(Ordering::Acquire) {
+        let audio_chunk = match audio_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => chunk,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if audio_chunk.samples.is_empty() {
+            continue;
+        }
+
+        let samples = match resample_whisper_audio_to_16khz(
+            &audio_chunk.samples,
+            audio_chunk.sample_rate,
+        ) {
+            Ok(samples) => samples,
+            Err(error) => {
+                emit_silero_vad_event(
+                    &app,
+                    "error",
+                    &status,
+                    segmenter.is_active(),
+                    active_segment_id.clone(),
+                    None,
+                    speech_started_at
+                        .map(|started_at| started_at.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                    error,
+                );
+                break;
+            }
+        };
+
+        let probabilities = match model.process_samples(&samples) {
+            Ok(probabilities) => probabilities.to_vec(),
+            Err(error) => {
+                emit_silero_vad_event(
+                    &app,
+                    "error",
+                    &status,
+                    segmenter.is_active(),
+                    active_segment_id.clone(),
+                    None,
+                    speech_started_at
+                        .map(|started_at| started_at.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                    silero_vad_error_message(error),
+                );
+                break;
+            }
+        };
+
+        for probability in probabilities {
+            let was_active = segmenter.is_active();
+            let segment = segmenter.push_probability(probability);
+            let is_active = segmenter.is_active();
+
+            if !was_active && is_active {
+                active_segment_id = silero_vad_segment_id();
+                speech_started_at = Some(Instant::now());
+                emit_silero_vad_event(
+                    &app,
+                    "speech-start",
+                    &status,
+                    true,
+                    active_segment_id.clone(),
+                    Some(probability),
+                    0,
+                    "Speech detected",
+                );
+            }
+
+            if let Some(segment) = segment {
+                let speech_ms = ((segment.sample_count() * 1000)
+                    / u64::from(SILERO_VAD_SAMPLE_RATE))
+                .max(
+                    speech_started_at
+                        .map(|started_at| started_at.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                );
+                let segment_id = if active_segment_id.is_empty() {
+                    silero_vad_segment_id()
+                } else {
+                    active_segment_id.clone()
+                };
+                emit_silero_vad_event(
+                    &app,
+                    "speech-end",
+                    &status,
+                    false,
+                    segment_id,
+                    Some(probability),
+                    speech_ms,
+                    "Speech ended",
+                );
+                active_segment_id.clear();
+                speech_started_at = None;
+            } else if was_active && !is_active && !active_segment_id.is_empty() {
+                emit_silero_vad_event(
+                    &app,
+                    "speech-end",
+                    &status,
+                    false,
+                    active_segment_id.clone(),
+                    Some(probability),
+                    speech_started_at
+                        .map(|started_at| started_at.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                    "Speech ended",
+                );
+                active_segment_id.clear();
+                speech_started_at = None;
+            }
+        }
+    }
+
+    let mut stopped_status = status;
+    stopped_status.active = false;
+    emit_silero_vad_event(
+        &app,
+        "stopped",
+        &stopped_status,
+        false,
+        active_segment_id,
+        None,
+        speech_started_at
+            .map(|started_at| started_at.elapsed().as_millis() as u64)
+            .unwrap_or(0),
+        "Voice activity detection stopped",
+    );
+}
+
+fn stop_silero_vad_runtime_session(
+    session: &mut Option<SileroVadRuntimeSession>,
+    input_worker: &NativeAudioWorker,
+) -> SileroVadStatus {
+    let Some(active_session) = session.take() else {
+        return inactive_silero_vad_status();
+    };
+
+    active_session.stop.store(true, Ordering::Release);
+    let _ = input_worker.detach_vad_stream();
+    let _ = input_worker.stop_monitor(Some(AudioInputMonitorRequest {
+        device_id: None,
+        owner: Some(AUDIO_VAD_OWNER.to_string()),
+    }));
+
+    inactive_silero_vad_status()
+}
+
+fn start_silero_vad_runtime_session(
+    app: AppHandle,
+    input_worker: NativeAudioWorker,
+    request: SileroVadStartRequest,
+) -> Result<SileroVadRuntimeSession, String> {
+    let started_at = Instant::now();
+    let config = silero_vad_runtime_config(&request);
+    let model = SileroVadModel::new()?;
+    let segmenter = SileroVadSegmenter::new(config.clone());
+    let monitor_request = AudioInputMonitorRequest {
+        device_id: request.device_id.clone(),
+        owner: Some(AUDIO_VAD_OWNER.to_string()),
+    };
+    let monitor_status = input_worker.start_monitor(app.clone(), monitor_request.clone())?;
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<NativeVadAudioChunk>();
+
+    if let Err(error) = input_worker.attach_vad_stream(audio_tx) {
+        let _ = input_worker.stop_monitor(Some(monitor_request));
+        return Err(error);
+    }
+
+    let status = silero_vad_status_from_monitor(&monitor_status, &config);
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let loop_status = status.clone();
+
+    let spawn_result = thread::Builder::new()
+        .name("silero-vad-audio".to_string())
+        .spawn(move || {
+            run_silero_vad_audio_loop(
+                app,
+                audio_rx,
+                loop_stop,
+                loop_status,
+                model,
+                segmenter,
+            );
+        });
+
+    if let Err(error) = spawn_result {
+        let _ = input_worker.detach_vad_stream();
+        let _ = input_worker.stop_monitor(Some(monitor_request));
+        return Err(format!("Unable to start Silero VAD worker thread: {error}"));
+    }
+
+    log_whisper_local_audio_event(
+        "audio.vad.start.done",
+        Some(started_at.elapsed()),
+        json!({
+            "device_id": &status.device_id,
+            "label": &status.label,
+            "sample_rate": status.sample_rate,
+            "threshold": status.threshold,
+            "end_threshold": status.end_threshold,
+            "min_speech_ms": status.min_speech_ms,
+            "min_silence_ms": status.min_silence_ms,
+            "speech_pad_ms": status.speech_pad_ms,
+            "max_speech_ms": status.max_speech_ms,
+        }),
+    );
+
+    Ok(SileroVadRuntimeSession { status, stop })
+}
+
+fn silero_vad_worker_loop(command_rx: std::sync::mpsc::Receiver<SileroVadCommand>) {
+    let mut session: Option<SileroVadRuntimeSession> = None;
+
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            SileroVadCommand::Start {
+                app,
+                input_worker,
+                request,
+                response,
+            } => {
+                let _ = stop_silero_vad_runtime_session(&mut session, &input_worker);
+                let result =
+                    start_silero_vad_runtime_session(app, input_worker, request).map(|next| {
+                        let status = next.status.clone();
+                        session = Some(next);
+                        status
+                    });
+                let _ = response.send(result);
+            }
+            SileroVadCommand::Stop {
+                input_worker,
+                response,
+            } => {
+                let status = stop_silero_vad_runtime_session(&mut session, &input_worker);
+                let _ = response.send(Ok(status));
+            }
+            SileroVadCommand::Status { response } => {
+                let status = session
+                    .as_ref()
+                    .map(|session| session.status.clone())
+                    .unwrap_or_else(inactive_silero_vad_status);
+                let _ = response.send(Ok(status));
+            }
+        }
+    }
+}
+
 fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>) {
     let mut session: Option<NativeAudioSession> = None;
 
@@ -363,12 +1059,20 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 let result = attach_native_audio_realtime_stream(session.as_ref(), audio_tx);
                 let _ = response.send(result);
             }
+            NativeAudioCommand::AttachVad { audio_tx, response } => {
+                let result = attach_native_audio_vad_stream(session.as_ref(), audio_tx);
+                let _ = response.send(result);
+            }
             NativeAudioCommand::Begin { response } => {
                 let result = begin_native_audio_capture_for_session(session.as_ref());
                 let _ = response.send(result);
             }
             NativeAudioCommand::DetachRealtime { response } => {
                 let result = detach_native_audio_realtime_stream(session.as_ref());
+                let _ = response.send(result);
+            }
+            NativeAudioCommand::DetachVad { response } => {
+                let result = detach_native_audio_vad_stream(session.as_ref());
                 let _ = response.send(result);
             }
             NativeAudioCommand::Finish { response } => {
@@ -567,6 +1271,8 @@ fn process_native_audio_samples(
 
     let mut realtime_audio = None;
     let mut realtime_audio_tx = None;
+    let vad_audio;
+    let vad_audio_tx;
     let stats = {
         let mut shared = match shared.lock() {
             Ok(shared) => shared,
@@ -582,6 +1288,16 @@ fn process_native_audio_samples(
                 realtime_audio = Some(encode_linear16_audio(&samples));
             }
         }
+
+        vad_audio_tx = shared.vad_audio_tx.clone();
+        vad_audio = if vad_audio_tx.is_some() {
+            Some(NativeVadAudioChunk {
+                sample_rate: shared.sample_rate,
+                samples: samples.clone(),
+            })
+        } else {
+            None
+        };
 
         shared.input_chunk_count += 1;
         shared.chunks.push_back(NativeAudioChunk {
@@ -624,6 +1340,10 @@ fn process_native_audio_samples(
 
     if let (Some(audio_tx), Some(audio_bytes)) = (realtime_audio_tx, realtime_audio) {
         let _ = audio_tx.send(audio_bytes);
+    }
+
+    if let (Some(audio_tx), Some(audio_chunk)) = (vad_audio_tx, vad_audio) {
+        let _ = audio_tx.send(audio_chunk);
     }
 }
 
@@ -1003,6 +1723,47 @@ fn detach_native_audio_realtime_stream(session: Option<&NativeAudioSession>) -> 
             .lock()
             .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
         shared.realtime_audio_tx = None;
+    }
+
+    Ok(())
+}
+
+fn attach_native_audio_vad_stream(
+    session: Option<&NativeAudioSession>,
+    audio_tx: std::sync::mpsc::Sender<NativeVadAudioChunk>,
+) -> Result<AudioInputMonitorStatus, String> {
+    let active_session = session
+        .ok_or_else(|| "Enable an input source before starting voice activity detection.".to_string())?;
+    let status = {
+        let mut shared = active_session
+            .shared
+            .lock()
+            .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+        shared.vad_audio_tx = Some(audio_tx);
+        native_audio_status(active_session)
+    };
+
+    log_whisper_local_audio_event(
+        "audio.vad.attach",
+        None,
+        json!({
+            "device_id": &status.device_id,
+            "label": &status.label,
+            "sample_rate": status.sample_rate,
+            "owner_count": status.owner_count,
+        }),
+    );
+
+    Ok(status)
+}
+
+fn detach_native_audio_vad_stream(session: Option<&NativeAudioSession>) -> Result<(), String> {
+    if let Some(active_session) = session {
+        let mut shared = active_session
+            .shared
+            .lock()
+            .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+        shared.vad_audio_tx = None;
     }
 
     Ok(())
@@ -2743,6 +3504,39 @@ async fn finish_audio_input_capture(
     audio_state: State<'_, AudioState>,
 ) -> Result<AudioInputCaptureResult, String> {
     audio_state.input_worker.finish_capture()
+}
+
+#[tauri::command]
+async fn start_silero_vad(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    request: SileroVadStartRequest,
+) -> Result<SileroVadStatus, String> {
+    let vad_worker = audio_state.vad_worker.clone();
+    let input_worker = audio_state.input_worker.clone();
+
+    tauri::async_runtime::spawn_blocking(move || vad_worker.start(app, input_worker, request))
+        .await
+        .map_err(|error| format!("Unable to start Silero VAD: {error}"))?
+}
+
+#[tauri::command]
+async fn stop_silero_vad(audio_state: State<'_, AudioState>) -> Result<SileroVadStatus, String> {
+    let vad_worker = audio_state.vad_worker.clone();
+    let input_worker = audio_state.input_worker.clone();
+
+    tauri::async_runtime::spawn_blocking(move || vad_worker.stop(input_worker))
+        .await
+        .map_err(|error| format!("Unable to stop Silero VAD: {error}"))?
+}
+
+#[tauri::command]
+async fn silero_vad_status(audio_state: State<'_, AudioState>) -> Result<SileroVadStatus, String> {
+    let vad_worker = audio_state.vad_worker.clone();
+
+    tauri::async_runtime::spawn_blocking(move || vad_worker.status())
+        .await
+        .map_err(|error| format!("Unable to read Silero VAD status: {error}"))?
 }
 
 #[tauri::command]

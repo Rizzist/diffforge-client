@@ -350,7 +350,7 @@ const ComposerBox = styled.div`
   overflow: visible;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 22px;
-  background: #2f2f2f;
+  background: var(--thread-bg);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.035),
     0 -14px 40px rgba(0, 0, 0, 0.26);
@@ -749,7 +749,7 @@ const NewChatBox = styled.div`
   overflow: visible;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 22px;
-  background: #2f2f2f;
+  background: var(--thread-bg);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.05),
     0 22px 56px rgba(0, 0, 0, 0.3);
