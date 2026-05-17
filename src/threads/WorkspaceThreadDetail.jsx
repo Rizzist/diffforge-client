@@ -56,6 +56,10 @@ const DetailRoot = styled.main`
   --thread-ember: #dfa55a;
   --thread-blue: #c6c6c6;
   --thread-green: #3ccb7f;
+  --thread-detail-font-size: 12px;
+  --thread-detail-small-font-size: 11px;
+  --thread-detail-mini-font-size: 10px;
+  --thread-composer-font-size: 12px;
   color: var(--thread-fg);
   background: var(--thread-bg);
   font-family:
@@ -74,6 +78,13 @@ const DetailRoot = styled.main`
   *::selection {
     color: #ffffff;
     background: rgba(120, 120, 120, 0.46);
+  }
+
+  @media (min-width: 1920px) and (min-height: 980px) {
+    --thread-detail-font-size: 13px;
+    --thread-detail-small-font-size: 12px;
+    --thread-detail-mini-font-size: 11px;
+    --thread-composer-font-size: 13px;
   }
 `;
 
@@ -117,7 +128,7 @@ const EmptyThread = styled.div`
   justify-self: center;
   max-width: 380px;
   color: var(--thread-muted-soft);
-  font-size: 13px;
+  font-size: var(--thread-detail-font-size);
   font-weight: 520;
   line-height: 1.5;
   text-align: center;
@@ -129,7 +140,7 @@ const UserCell = styled.article`
   justify-content: flex-end;
   padding: 2px 0 18px;
   color: var(--thread-fg);
-  font-size: 12px;
+  font-size: var(--thread-detail-font-size);
   line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
@@ -145,7 +156,7 @@ const MessageText = styled.div`
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--thread-fg);
-  font-size: 12px;
+  font-size: var(--thread-detail-font-size);
   font-weight: 470;
   letter-spacing: 0;
   line-height: 1.58;
@@ -215,7 +226,7 @@ const AssistantCell = styled.article`
   min-width: 0;
   padding: 2px 0 20px;
   color: var(--thread-fg);
-  font-size: 12px;
+  font-size: var(--thread-detail-font-size);
   line-height: 1.6;
   user-select: text;
   -webkit-user-select: text;
@@ -235,7 +246,7 @@ const TranscriptActivityCell = styled.article`
   border-radius: 8px;
   padding: 10px 12px;
   color: var(--thread-muted);
-  font-size: 12px;
+  font-size: var(--thread-detail-font-size);
   line-height: 1.5;
   background: #1b1b1b;
   user-select: text;
@@ -264,7 +275,7 @@ const TranscriptActivityTitle = styled.div`
 const TranscriptActivityStatus = styled.span`
   min-width: 0;
   color: rgba(223, 165, 90, 0.82);
-  font-size: 10px;
+  font-size: var(--thread-detail-mini-font-size);
   font-weight: 520;
   line-height: 1;
   text-transform: uppercase;
@@ -284,7 +295,7 @@ const TranscriptActivityBody = styled.pre`
   background: transparent;
   font: inherit;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 11px;
+  font-size: var(--thread-detail-small-font-size);
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -298,7 +309,7 @@ const ActivityCell = styled.article`
   gap: 10px;
   padding: 0 3px 18px;
   color: var(--thread-muted);
-  font-size: 12px;
+  font-size: var(--thread-detail-font-size);
   line-height: 1.5;
   user-select: text;
   -webkit-user-select: text;
@@ -369,7 +380,7 @@ const ComposerInput = styled.textarea`
   color: #d6d6d6;
   background: transparent;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--thread-composer-font-size);
   font-weight: 470;
   line-height: 1.5;
   user-select: text;
@@ -399,7 +410,7 @@ const ComposerHint = styled.span`
   min-width: 0;
   overflow: hidden;
   color: rgba(170, 170, 170, 0.5);
-  font-size: 12px;
+  font-size: var(--thread-composer-font-size);
   font-weight: 640;
   line-height: 1;
   text-overflow: ellipsis;
@@ -434,7 +445,7 @@ const ComposerToolButton = styled.button`
   color: #a8a8a8;
   background: rgba(255, 255, 255, 0.04);
   font: inherit;
-  font-size: 11px;
+  font-size: var(--thread-detail-small-font-size, 11px);
   font-weight: 620;
   line-height: 1;
   user-select: none;
@@ -557,7 +568,7 @@ const ModelOption = styled.button`
 
   strong {
     overflow: hidden;
-    font-size: 12px;
+    font-size: var(--thread-detail-font-size, 12px);
     font-weight: 650;
     line-height: 1.2;
     text-overflow: ellipsis;
@@ -567,7 +578,7 @@ const ModelOption = styled.button`
   span {
     overflow: hidden;
     color: var(--thread-muted);
-    font-size: 11px;
+    font-size: var(--thread-detail-small-font-size, 11px);
     line-height: 1.25;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -597,7 +608,7 @@ const AttachmentChip = styled.span`
   padding: 5px 6px;
   color: var(--thread-fg);
   background: rgba(255, 255, 255, 0.045);
-  font-size: 11px;
+  font-size: var(--thread-detail-small-font-size, 11px);
   line-height: 1;
   user-select: none;
 
@@ -643,7 +654,7 @@ const AttachmentQueueHint = styled.div`
   align-items: center;
   padding: 0 4px;
   color: rgba(253, 230, 138, 0.78);
-  font-size: 10px;
+  font-size: var(--thread-detail-mini-font-size, 10px);
   font-weight: 720;
   line-height: 1;
 `;
@@ -688,7 +699,7 @@ const SendButton = styled.button`
 
 const ComposerError = styled.div`
   color: #ef6b6b;
-  font-size: 11px;
+  font-size: var(--thread-detail-small-font-size, 11px);
   line-height: 1.35;
 `;
 
@@ -959,6 +970,7 @@ const AGENT_LABELS = {
 };
 const IMAGE_ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 const IMAGE_ATTACHMENT_LIMIT = 4;
+const IMAGE_DROP_DIAGNOSTIC_LIMIT = 8;
 const IMAGE_EXTENSION_MIME_TYPES = new Map([
   ["gif", "image/gif"],
   ["jpeg", "image/jpeg"],
@@ -1169,6 +1181,14 @@ function getModelButtonLabel(option) {
   return getVisibleModelLabel(option) || "Model";
 }
 
+function getConcreteModelValue(modelOptions) {
+  return String(
+    (Array.isArray(modelOptions) ? modelOptions : [])
+      .find((option) => String(option?.value || "").trim())?.value
+      || "",
+  ).trim();
+}
+
 function inferImageMimeType(file) {
   const explicitType = String(file?.type || "").trim();
   if (explicitType.startsWith("image/")) {
@@ -1261,6 +1281,98 @@ function getDroppedImageFiles(dataTransfer) {
   const transferFiles = Array.from(dataTransfer?.files || []);
 
   return dedupeImageFiles(itemFiles.concat(transferFiles));
+}
+
+function describeImageDropFile(file) {
+  if (!file) {
+    return null;
+  }
+
+  return {
+    inferredMimeType: inferImageMimeType(file),
+    isImage: isImageFile(file),
+    lastModified: Number(file?.lastModified || 0),
+    mimeType: String(file?.type || ""),
+    name: String(file?.name || ""),
+    size: Number(file?.size || 0),
+  };
+}
+
+function describeImageDropItem(item, index) {
+  let file = null;
+  let fileError = "";
+
+  if (item?.kind === "file") {
+    try {
+      file = item.getAsFile?.() || null;
+    } catch (error) {
+      fileError = error?.message || String(error || "");
+    }
+  }
+
+  return {
+    file: describeImageDropFile(file),
+    fileError,
+    index,
+    kind: String(item?.kind || ""),
+    type: String(item?.type || ""),
+  };
+}
+
+function describeImageDropTransfer(dataTransfer) {
+  const items = Array.from(dataTransfer?.items || []);
+  const files = Array.from(dataTransfer?.files || []);
+
+  return {
+    dropEffect: String(dataTransfer?.dropEffect || ""),
+    effectAllowed: String(dataTransfer?.effectAllowed || ""),
+    fileCount: files.length,
+    files: files.slice(0, IMAGE_DROP_DIAGNOSTIC_LIMIT).map(describeImageDropFile),
+    itemCount: items.length,
+    items: items.slice(0, IMAGE_DROP_DIAGNOSTIC_LIMIT).map(describeImageDropItem),
+    typeCount: Array.from(dataTransfer?.types || []).length,
+    types: Array.from(dataTransfer?.types || []),
+  };
+}
+
+function describeImageDropEnvironment() {
+  return {
+    language: typeof navigator === "undefined" ? "" : String(navigator.language || ""),
+    platform: typeof navigator === "undefined" ? "" : String(navigator.platform || ""),
+    userAgent: typeof navigator === "undefined" ? "" : String(navigator.userAgent || "").slice(0, 220),
+  };
+}
+
+function describeImageSupportDiagnostics({
+  activeAgentId,
+  activeAgentStatus,
+  imageInputSupport,
+  modelOptions,
+  selectedModel,
+  selectedModelOption,
+}) {
+  return {
+    activeAgentId,
+    agentId: activeAgentId,
+    imageSupportActiveModel: imageInputSupport?.activeModel || "",
+    imageSupportReason: imageInputSupport?.reason || "",
+    imageSupportState: imageInputSupport?.state || "",
+    imageSupported: Boolean(imageInputSupport?.supported),
+    modelOptions: (Array.isArray(modelOptions) ? modelOptions : [])
+      .slice(0, IMAGE_DROP_DIAGNOSTIC_LIMIT)
+      .map((option) => ({
+        detail: String(option?.detail || ""),
+        label: String(option?.label || ""),
+        value: String(option?.value || ""),
+      })),
+    selectedModel: selectedModel || "",
+    selectedModelOption: {
+      detail: String(selectedModelOption?.detail || ""),
+      label: String(selectedModelOption?.label || ""),
+      value: String(selectedModelOption?.value || ""),
+    },
+    statusModel: getStatusModel(activeAgentStatus),
+  };
 }
 
 function formatSavedImageAttachments(images, startIndex = 0) {
@@ -1376,9 +1488,10 @@ function NewChatView({
     () => getModelOptions(activeAgentId, activeAgentStatus),
     [activeAgentId, activeAgentStatus],
   );
-  const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const effectiveSelectedModel = selectedModel || getConcreteModelValue(modelOptions);
+  const selectedModelOption = modelOptions.find((option) => option.value === effectiveSelectedModel) || modelOptions[0];
   const modelButtonLabel = getModelButtonLabel(selectedModelOption);
-  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
+  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, effectiveSelectedModel);
   const submitDisabled = sending
     || selectedAgentOption?.disabled
     || !workspace?.id
@@ -1394,10 +1507,37 @@ function NewChatView({
   }, [agentStatuses]);
 
   useEffect(() => {
-    setSelectedModel(modelOptions[0]?.value || "");
+    setSelectedModel(getConcreteModelValue(modelOptions) || modelOptions[0]?.value || "");
     setAgentMenuOpen(false);
     setModelMenuOpen(false);
   }, [activeAgentId, modelOptions]);
+
+  useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.image.capability_state", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: effectiveSelectedModel,
+        selectedModelOption,
+      }),
+      environment: describeImageDropEnvironment(),
+      surface: "new_chat",
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    activeAgentId,
+    activeAgentStatus,
+    imageInputSupport.activeModel,
+    imageInputSupport.reason,
+    imageInputSupport.state,
+    imageInputSupport.supported,
+    modelOptions,
+    effectiveSelectedModel,
+    selectedModelOption,
+    workspace?.id,
+  ]);
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
@@ -1407,7 +1547,7 @@ function NewChatView({
       imageSupportReason: imageInputSupport.reason || "",
       imageSupportState: imageInputSupport.state || "",
       imageSupported: Boolean(imageInputSupport.supported),
-      selectedModel: selectedModel || "",
+      selectedModel: effectiveSelectedModel || "",
       surface: "new_chat",
       workspaceId: workspace?.id || "",
     });
@@ -1417,7 +1557,7 @@ function NewChatView({
     imageInputSupport.reason,
     imageInputSupport.state,
     imageInputSupport.supported,
-    selectedModel,
+    effectiveSelectedModel,
     workspace?.id,
   ]);
 
@@ -1431,15 +1571,11 @@ function NewChatView({
       agentId: activeAgentId,
       attachmentCountBefore: attachments.length,
       fileCount: files.length,
-      files: files.map((file) => ({
-        mimeType: String(file?.type || ""),
-        name: String(file?.name || ""),
-        size: Number(file?.size || 0),
-      })),
+      files: files.map(describeImageDropFile),
       imageSupportReason: imageInputSupport.reason || "",
       imageSupportState: imageInputSupport.state || "",
       imageSupported: Boolean(imageInputSupport.supported),
-      model: selectedModel || "",
+      model: effectiveSelectedModel || "",
       surface: "new_chat",
       workspaceId: workspace?.id || "",
     });
@@ -1453,7 +1589,7 @@ function NewChatView({
         agentId: activeAgentId,
         attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
         attachments: getAttachmentLogSummary(nextAttachments),
-        model: selectedModel || "",
+        model: effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1463,7 +1599,7 @@ function NewChatView({
         agentId: activeAgentId,
         fileCount: files.length,
         message: readError?.message || String(readError || ""),
-        model: selectedModel || "",
+        model: effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1481,16 +1617,31 @@ function NewChatView({
       agentId: activeAgentId,
       attachmentCountBefore: attachments.length,
       fileCount: imageFiles.length,
-      files: imageFiles.map((file) => ({
-        mimeType: String(file?.type || ""),
-        name: String(file?.name || ""),
-        size: Number(file?.size || 0),
-      })),
-      model: selectedModel || "",
+      files: imageFiles.map(describeImageDropFile),
+      model: effectiveSelectedModel || "",
       surface: "new_chat",
       workspaceId: workspace?.id || "",
     });
     addImageFiles(imageFiles);
+  };
+
+  const handleComposerDragEnter = (event) => {
+    logBigViewSyncDiagnosticEvent("bigview.image.drag_enter", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: effectiveSelectedModel,
+        selectedModelOption,
+      }),
+      environment: describeImageDropEnvironment(),
+      hasImageTransfer: hasImageFileTransfer(event.dataTransfer),
+      hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
+      surface: "new_chat",
+      transfer: describeImageDropTransfer(event.dataTransfer),
+      workspaceId: workspace?.id || "",
+    });
   };
 
   const handleComposerDragOver = (event) => {
@@ -1504,16 +1655,20 @@ function NewChatView({
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     logBigViewSyncDiagnosticEvent("bigview.image.drag_over", {
-      agentId: activeAgentId,
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: effectiveSelectedModel,
+        selectedModelOption,
+      }),
+      environment: describeImageDropEnvironment(),
       hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
       hasImageTransfer,
       hasWorkspaceFileTransfer,
-      imageSupportReason: imageInputSupport.reason || "",
-      imageSupportState: imageInputSupport.state || "",
-      imageSupported: Boolean(imageInputSupport.supported),
-      selectedModel: selectedModel || "",
       surface: "new_chat",
-      types: Array.from(event.dataTransfer?.types || []),
+      transfer: describeImageDropTransfer(event.dataTransfer),
       workspaceId: workspace?.id || "",
     });
   };
@@ -1521,23 +1676,40 @@ function NewChatView({
   const handleComposerDrop = (event) => {
     const hasFileTransfer = hasImageFileTransfer(event.dataTransfer);
     const imageFiles = getDroppedImageFiles(event.dataTransfer);
+    logBigViewSyncDiagnosticEvent("bigview.image.drop_received", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: effectiveSelectedModel,
+        selectedModelOption,
+      }),
+      droppedImageCount: imageFiles.length,
+      environment: describeImageDropEnvironment(),
+      hasFileTransfer,
+      hasImageTransfer: imageFiles.length > 0,
+      hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
+      surface: "new_chat",
+      transfer: describeImageDropTransfer(event.dataTransfer),
+      workspaceId: workspace?.id || "",
+    });
     if (imageFiles.length) {
       event.preventDefault();
       event.stopPropagation();
       logBigViewSyncDiagnosticEvent("bigview.image.drop", {
-        agentId: activeAgentId,
+        ...describeImageSupportDiagnostics({
+          activeAgentId,
+          activeAgentStatus,
+          imageInputSupport,
+          modelOptions,
+          selectedModel: effectiveSelectedModel,
+          selectedModelOption,
+        }),
         fileCount: imageFiles.length,
-        files: imageFiles.map((file) => ({
-          mimeType: inferImageMimeType(file),
-          name: String(file?.name || ""),
-          size: Number(file?.size || 0),
-        })),
-        imageSupportReason: imageInputSupport.reason || "",
-        imageSupportState: imageInputSupport.state || "",
-        imageSupported: Boolean(imageInputSupport.supported),
-        selectedModel: selectedModel || "",
+        files: imageFiles.map(describeImageDropFile),
         surface: "new_chat",
-        types: Array.from(event.dataTransfer?.types || []),
+        transfer: describeImageDropTransfer(event.dataTransfer),
         workspaceId: workspace?.id || "",
       });
       addImageFiles(imageFiles);
@@ -1581,11 +1753,17 @@ function NewChatView({
       event.stopPropagation();
       setError("Drop an image file.");
       logBigViewSyncDiagnosticEvent("bigview.image.drop_skip", {
-        agentId: activeAgentId,
+        ...describeImageSupportDiagnostics({
+          activeAgentId,
+          activeAgentStatus,
+          imageInputSupport,
+          modelOptions,
+          selectedModel: effectiveSelectedModel,
+          selectedModelOption,
+        }),
         reason: "missing_image_file",
-        selectedModel: selectedModel || "",
         surface: "new_chat",
-        types: Array.from(event.dataTransfer?.types || []),
+        transfer: describeImageDropTransfer(event.dataTransfer),
         workspaceId: workspace?.id || "",
       });
     }
@@ -1600,7 +1778,7 @@ function NewChatView({
         attachmentCountAfter: nextAttachments.length,
         attachmentCountBefore: currentAttachments.length,
         removedAttachment: getAttachmentLogSummary([removedAttachment])[0] || null,
-        selectedModel: selectedModel || "",
+        selectedModel: effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1616,10 +1794,17 @@ function NewChatView({
 
     const previousDraft = draft;
     const previousAttachments = attachments;
+    const selectedModelPayload = String(effectiveSelectedModel || getConcreteModelValue(modelOptions) || "").trim();
+    const selectedModelPayloadOption = modelOptions.find((option) => option.value === selectedModelPayload)
+      || selectedModelOption;
     setSending(true);
     setError("");
     try {
-      const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, selectedModel);
+      const thinkingPower = getModelThinkingPowerMetadata(
+        activeAgentId,
+        selectedModelPayloadOption,
+        selectedModelPayload,
+      );
       logBigViewSyncDiagnosticEvent("bigview.submit.start", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
@@ -1628,8 +1813,8 @@ function NewChatView({
         imageSupportReason: imageInputSupport.reason || "",
         imageSupportState: imageInputSupport.state || "",
         imageSupported: Boolean(imageInputSupport.supported),
-        modelPayload: "",
-        selectedModel: selectedModel || "",
+        modelPayload: selectedModelPayload,
+        selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
         thinkingPower: thinkingPower.thinkingPower,
         thinkingPowerSource: thinkingPower.source,
@@ -1640,7 +1825,7 @@ function NewChatView({
           agentId: activeAgentId,
           attachmentCount: previousAttachments.length,
           attachments: getAttachmentLogSummary(previousAttachments),
-          selectedModel: selectedModel || "",
+          selectedModel: selectedModelPayload || effectiveSelectedModel || "",
           surface: "new_chat",
           workspaceId: workspace?.id || "",
         });
@@ -1655,7 +1840,7 @@ function NewChatView({
             attachmentCount: previousAttachments.length,
             attachments: getAttachmentLogSummary(previousAttachments),
             message: saveError?.message || String(saveError || ""),
-            selectedModel: selectedModel || "",
+            selectedModel: selectedModelPayload || effectiveSelectedModel || "",
             surface: "new_chat",
             workspaceId: workspace?.id || "",
           });
@@ -1668,7 +1853,7 @@ function NewChatView({
           attachmentCount: previousAttachments.length,
           imageBlockLength: imageBlock.length,
           imageBlockPreview: imageBlock.slice(0, 240),
-          selectedModel: selectedModel || "",
+          selectedModel: selectedModelPayload || effectiveSelectedModel || "",
           surface: "new_chat",
           workspaceId: workspace?.id || "",
         });
@@ -1679,7 +1864,7 @@ function NewChatView({
         attachmentCount: previousAttachments.length,
         imageBlockPresent: Boolean(imageBlock),
         messageLength: message.length,
-        selectedModel: selectedModel || "",
+        selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1687,13 +1872,13 @@ function NewChatView({
       await onCreateChat?.({
         agentId: activeAgentId,
         message,
-        model: "",
+        model: selectedModelPayload,
         workspace,
       });
       logBigViewSyncDiagnosticEvent("bigview.submit.done", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
-        selectedModel: selectedModel || "",
+        selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1707,7 +1892,7 @@ function NewChatView({
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
         message: submitError?.message || String(submitError || ""),
-        selectedModel: selectedModel || "",
+        selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
       });
@@ -1736,6 +1921,7 @@ function NewChatView({
           type="file"
         />
         <NewChatBox
+          onDragEnter={handleComposerDragEnter}
           onDragOver={handleComposerDragOver}
           onDrop={handleComposerDrop}
         >
@@ -1859,7 +2045,7 @@ function NewChatView({
                 <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
                   {modelOptions.map((option) => (
                     <ModelOption
-                      data-selected={option.value === selectedModel ? "true" : "false"}
+                      data-selected={option.value === effectiveSelectedModel ? "true" : "false"}
                       key={option.value || option.label}
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
@@ -2289,6 +2475,46 @@ function WorkspaceThreadDetail({
   ]);
 
   useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.image.capability_state", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: currentTuiModel || "",
+        selectedModelOption,
+      }),
+      bindingInstanceId: activeTerminalBinding?.instanceId || "",
+      bindingPaneId: activeTerminalBinding?.paneId || "",
+      composerSyncKey,
+      environment: describeImageDropEnvironment(),
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+  }, [
+    activeAgentId,
+    activeAgentStatus,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    composerSyncKey,
+    currentTuiModel,
+    hasActiveTerminalBinding,
+    hasProviderSession,
+    imageInputSupport.activeModel,
+    imageInputSupport.reason,
+    imageInputSupport.state,
+    imageInputSupport.supported,
+    modelOptions,
+    selectedModelOption,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
       agentId: activeAgentId,
       attachmentCount: attachments.length,
@@ -2356,11 +2582,7 @@ function WorkspaceThreadDetail({
       attachmentCountBefore: attachments.length,
       canSubmit,
       fileCount: files.length,
-      files: files.map((file) => ({
-        mimeType: String(file?.type || ""),
-        name: String(file?.name || ""),
-        size: Number(file?.size || 0),
-      })),
+      files: files.map(describeImageDropFile),
       hasActiveTerminalBinding,
       hasProviderSession,
       imageSupportReason: imageInputSupport.reason || "",
@@ -2430,11 +2652,7 @@ function WorkspaceThreadDetail({
       agentId: activeAgentId,
       attachmentCountBefore: attachments.length,
       fileCount: imageFiles.length,
-      files: imageFiles.map((file) => ({
-        mimeType: String(file?.type || ""),
-        name: String(file?.name || ""),
-        size: Number(file?.size || 0),
-      })),
+      files: imageFiles.map(describeImageDropFile),
       model: currentTuiModel || "",
       surface: "thread_detail",
       threadId: thread?.id || "",
@@ -2454,12 +2672,21 @@ function WorkspaceThreadDetail({
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     logFileDragDiagnosticEvent("bigview.drag_over", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: currentTuiModel || "",
+        selectedModelOption,
+      }),
       composerSyncKey,
+      environment: describeImageDropEnvironment(),
       hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
       hasImageTransfer,
       hasWorkspaceFileTransfer,
       threadId: thread?.id || "",
-      types: Array.from(event.dataTransfer?.types || []),
+      transfer: describeImageDropTransfer(event.dataTransfer),
       workspaceId: workspace?.id || thread?.workspaceId || "",
     });
   };
@@ -2467,24 +2694,43 @@ function WorkspaceThreadDetail({
   const handleComposerDrop = (event) => {
     const hasFileTransfer = hasImageFileTransfer(event.dataTransfer);
     const imageFiles = getDroppedImageFiles(event.dataTransfer);
+    logBigViewSyncDiagnosticEvent("bigview.image.drop_received", {
+      ...describeImageSupportDiagnostics({
+        activeAgentId,
+        activeAgentStatus,
+        imageInputSupport,
+        modelOptions,
+        selectedModel: currentTuiModel || "",
+        selectedModelOption,
+      }),
+      composerSyncKey,
+      droppedImageCount: imageFiles.length,
+      environment: describeImageDropEnvironment(),
+      hasFileTransfer,
+      hasImageTransfer: imageFiles.length > 0,
+      hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      transfer: describeImageDropTransfer(event.dataTransfer),
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     if (imageFiles.length) {
       event.preventDefault();
       event.stopPropagation();
       logBigViewSyncDiagnosticEvent("bigview.image.drop", {
-        agentId: activeAgentId,
+        ...describeImageSupportDiagnostics({
+          activeAgentId,
+          activeAgentStatus,
+          imageInputSupport,
+          modelOptions,
+          selectedModel: currentTuiModel || "",
+          selectedModelOption,
+        }),
         fileCount: imageFiles.length,
-        files: imageFiles.map((file) => ({
-          mimeType: inferImageMimeType(file),
-          name: String(file?.name || ""),
-          size: Number(file?.size || 0),
-        })),
-        imageSupportReason: imageInputSupport.reason || "",
-        imageSupportState: imageInputSupport.state || "",
-        imageSupported: Boolean(imageInputSupport.supported),
-        model: currentTuiModel || "",
+        files: imageFiles.map(describeImageDropFile),
         surface: "thread_detail",
         threadId: thread?.id || "",
-        types: Array.from(event.dataTransfer?.types || []),
+        transfer: describeImageDropTransfer(event.dataTransfer),
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       addImageFiles(imageFiles);
@@ -2495,12 +2741,18 @@ function WorkspaceThreadDetail({
       event.stopPropagation();
       setError("Drop an image file.");
       logBigViewSyncDiagnosticEvent("bigview.image.drop_skip", {
-        agentId: activeAgentId,
-        model: currentTuiModel || "",
+        ...describeImageSupportDiagnostics({
+          activeAgentId,
+          activeAgentStatus,
+          imageInputSupport,
+          modelOptions,
+          selectedModel: currentTuiModel || "",
+          selectedModelOption,
+        }),
         reason: "missing_image_file",
         surface: "thread_detail",
         threadId: thread?.id || "",
-        types: Array.from(event.dataTransfer?.types || []),
+        transfer: describeImageDropTransfer(event.dataTransfer),
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       return;
@@ -2760,12 +3012,21 @@ function WorkspaceThreadDetail({
   ]);
 
   const getComposerDragDiagnosticFields = (event) => ({
+    ...describeImageSupportDiagnostics({
+      activeAgentId,
+      activeAgentStatus,
+      imageInputSupport,
+      modelOptions,
+      selectedModel: currentTuiModel || "",
+      selectedModelOption,
+    }),
     composerSyncKey,
+    environment: describeImageDropEnvironment(),
     hasActiveWorkspaceFile: Boolean(getActiveWorkspaceFileDrag()),
     hasImageTransfer: hasImageFileTransfer(event.dataTransfer),
     hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
     threadId: thread?.id || "",
-    types: Array.from(event.dataTransfer?.types || []),
+    transfer: describeImageDropTransfer(event.dataTransfer),
     workspaceId: workspace?.id || thread?.workspaceId || "",
   });
 

@@ -53,6 +53,145 @@ function cleanMessageText(value, fallback = "") {
   return text || fallback;
 }
 
+const ATTACHMENT_MARKER_PATTERN = /\[(?:image|file)-attached(?:\s+\d+)?\]/i;
+
+function createAttachmentReferencePattern() {
+  return /\[((?:image|file)-attached)(?:\s+(\d+))?\]\s*(.*?)\s*->\s*([\s\S]*?)(?=\n\s*\[(?:image|file)-attached(?:\s+\d+)?\]|\s*$)/gi;
+}
+
+function normalizeAttachmentPathText(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[ \t]*\r?\n[ \t]*/g, "")
+    .replace(/[ \t]+/g, " ");
+}
+
+function normalizeAttachmentEchoText(value, fallback = "") {
+  const text = cleanMessageText(value);
+  if (!text || !ATTACHMENT_MARKER_PATTERN.test(text)) {
+    return text || fallback;
+  }
+
+  const prepared = text
+    .replace(/([^\n])(?=\[(?:image|file)-attached(?:\s+\d+)?\])/gi, "$1\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const pattern = createAttachmentReferencePattern();
+  const attachments = [];
+  let firstAttachmentIndex = -1;
+  let lastAttachmentEnd = 0;
+  let match = pattern.exec(prepared);
+  while (match) {
+    if (firstAttachmentIndex === -1) {
+      firstAttachmentIndex = match.index;
+    }
+    lastAttachmentEnd = pattern.lastIndex;
+
+    const label = String(match[1] || "image-attached").trim().toLowerCase();
+    const index = cleanText(match[2]);
+    const name = cleanText(match[3], index ? `${label}-${index}` : label);
+    const path = normalizeAttachmentPathText(match[4]);
+    const marker = index ? `[${label} ${index}]` : `[${label}]`;
+    attachments.push(`${marker} ${name} -> ${path}`.trim());
+    match = pattern.exec(prepared);
+  }
+
+  if (!attachments.length) {
+    return prepared || fallback;
+  }
+
+  const prefix = cleanMessageText(prepared.slice(0, firstAttachmentIndex));
+  const suffix = cleanMessageText(prepared.slice(lastAttachmentEnd));
+  return [
+    prefix,
+    attachments.join("\n"),
+    suffix,
+  ].filter(Boolean).join("\n\n") || fallback;
+}
+
+function attachmentMessageSignature(value) {
+  const text = normalizeAttachmentEchoText(value);
+  if (!text || !ATTACHMENT_MARKER_PATTERN.test(text)) {
+    return null;
+  }
+
+  const pattern = createAttachmentReferencePattern();
+  const references = [];
+  let attachmentlessText = text;
+  let match = pattern.exec(text);
+  while (match) {
+    const label = String(match[1] || "image-attached").trim().toLowerCase();
+    const path = normalizeAttachmentPathText(match[4]).toLowerCase();
+    const name = cleanText(match[3]).toLowerCase();
+    references.push(`${label}:${path || name}`);
+    attachmentlessText = attachmentlessText.replace(match[0], " ");
+    match = pattern.exec(text);
+  }
+
+  if (!references.length) {
+    return null;
+  }
+
+  return {
+    attachments: references.sort().join("|"),
+    prompt: cleanText(attachmentlessText).toLowerCase(),
+  };
+}
+
+function isPromptTextNearMatch(left, right) {
+  if (left === right || !left || !right) {
+    return true;
+  }
+
+  if (Math.abs(left.length - right.length) > 2) {
+    return false;
+  }
+
+  let leftIndex = 0;
+  let rightIndex = 0;
+  let edits = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    if (left[leftIndex] === right[rightIndex]) {
+      leftIndex += 1;
+      rightIndex += 1;
+      continue;
+    }
+
+    edits += 1;
+    if (edits > 2) {
+      return false;
+    }
+
+    if (left.length > right.length) {
+      leftIndex += 1;
+    } else if (right.length > left.length) {
+      rightIndex += 1;
+    } else {
+      leftIndex += 1;
+      rightIndex += 1;
+    }
+  }
+
+  return edits + (left.length - leftIndex) + (right.length - rightIndex) <= 2;
+}
+
+function areAttachmentMessagesEquivalent(left, right) {
+  const leftSignature = attachmentMessageSignature(left);
+  const rightSignature = attachmentMessageSignature(right);
+  return Boolean(
+    leftSignature
+    && rightSignature
+    && leftSignature.attachments === rightSignature.attachments
+    && isPromptTextNearMatch(leftSignature.prompt, rightSignature.prompt),
+  );
+}
+
+function areThreadMessageTextsEquivalent(left, right) {
+  const leftText = cleanMessageText(left);
+  const rightText = cleanMessageText(right);
+  return leftText === rightText || areAttachmentMessagesEquivalent(leftText, rightText);
+}
+
 function cleanTerminalUiText(value, fallback = "") {
   const stripped = stripLiveViewControlSequences(value);
   const text = cleanLiveViewText(stripped)
@@ -92,10 +231,12 @@ function cleanSubmittedUserMessage(value) {
   }
 
   if (!isTerminalArtifactMessage(value)) {
-    return text;
+    return normalizeAttachmentEchoText(text);
   }
 
-  return promptText && !isTerminalArtifactMessage(promptText) ? promptText : "";
+  return promptText && !isTerminalArtifactMessage(promptText)
+    ? normalizeAttachmentEchoText(promptText)
+    : "";
 }
 
 function isSlashCommandPrompt(value) {
@@ -415,7 +556,10 @@ function normalizeThreadMessage(message) {
     .replace(/[^a-z0-9_-]/g, "-")
     .slice(0, 48);
   const source = cleanText(message.source);
-  const text = cleanMessageText(message.text || message.message);
+  const rawText = message.text || message.message;
+  const text = safeRole === "user"
+    ? normalizeAttachmentEchoText(rawText)
+    : cleanMessageText(rawText);
   const status = cleanText(message.status, "submitted");
   const isTurnCompleteMessage = safeRole === "assistant"
     && (
@@ -544,7 +688,10 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
       || event.id,
   );
   const delta = cleanMessageText(event.delta);
-  const text = cleanMessageText(event.text || event.message);
+  const rawText = event.text || event.message;
+  const text = type === "thread.message.user"
+    ? normalizeAttachmentEchoText(rawText)
+    : cleanMessageText(rawText);
   const title = cleanText(event.title);
   if (
     (!messageId || (isTurnProjectionEventType(type) && !(turnId || messageId)))
@@ -634,15 +781,32 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
     return;
   }
 
-  if (!messagesById.has(normalizedMessage.id)) {
+  const matchingMessageId = messagesById.has(normalizedMessage.id)
+    ? normalizedMessage.id
+    : messageOrder.find((messageId) => {
+      const candidate = messagesById.get(messageId);
+      return candidate
+        && normalizedMessage.role === "user"
+        && candidate.role === normalizedMessage.role
+        && cleanText(candidate.kind, "message") === cleanText(normalizedMessage.kind, "message")
+        && areAttachmentMessagesEquivalent(candidate.text, normalizedMessage.text)
+        && areThreadMessagesSameTurn(
+          candidate,
+          normalizedMessage,
+          normalizedMessage.role === "user" ? 12000 : 5000,
+        );
+    });
+
+  if (!matchingMessageId) {
     messageOrder.push(normalizedMessage.id);
     messagesById.set(normalizedMessage.id, normalizedMessage);
     return;
   }
 
-  messagesById.set(normalizedMessage.id, {
-    ...messagesById.get(normalizedMessage.id),
+  messagesById.set(matchingMessageId, {
+    ...messagesById.get(matchingMessageId),
     ...normalizedMessage,
+    id: matchingMessageId,
   });
 }
 
@@ -968,7 +1132,7 @@ function findMatchingProjectedMessage(projectedMessages, message) {
   return projectedMessages.find((candidate) => (
     candidate.role === role
     && cleanText(candidate.kind, "message") === kind
-    && cleanMessageText(candidate.text) === text
+    && areThreadMessageTextsEquivalent(candidate.text, text)
     && areThreadMessagesSameTurn(candidate, message, role === "user" ? 12000 : 5000)
   )) || null;
 }
@@ -986,7 +1150,7 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
   const lastUserMs = Date.parse(lastUserMessage?.createdAt || "");
   if (
-    lastUserMessage?.text === text
+    areThreadMessageTextsEquivalent(lastUserMessage?.text, text)
     && Number.isFinite(createdMs)
     && Number.isFinite(lastUserMs)
     && Math.abs(createdMs - lastUserMs) < 2500

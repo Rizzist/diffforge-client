@@ -673,6 +673,10 @@ const AGENT_PROVIDERS = [
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
   { id: "opencode", label: "OpenCode", shortLabel: "OpenCode" },
 ];
+const WORKSPACE_AGENT_STARTUP_DEFAULT_MODELS = {
+  claude: "sonnet",
+  codex: "gpt-5.5",
+};
 const WORKSPACE_TERMINAL_ROLE_GENERIC = "generic";
 const WORKSPACE_TERMINAL_ROLE_OPTIONS = [
   { id: "codex", label: "Codex", shortLabel: "CX" },
@@ -745,6 +749,25 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
 
 function getDefaultAgentStatus(providerId) {
   return DEFAULT_AGENT_STATUSES.find((status) => status.id === providerId);
+}
+
+function getAgentStatusReportedModel(status) {
+  return String(
+    status?.activeModel
+      || status?.model
+      || status?.selectedModel
+      || status?.configuredModel
+      || status?.nativeModel
+      || "",
+  ).trim();
+}
+
+function getWorkspaceAgentStartupModel(agentId, agentStatuses = DEFAULT_AGENT_STATUSES) {
+  const normalizedAgentId = String(agentId || "").trim().toLowerCase();
+  const status = (Array.isArray(agentStatuses) ? agentStatuses : []).find((candidate) => (
+    String(candidate?.id || "").trim().toLowerCase() === normalizedAgentId
+  ));
+  return getAgentStatusReportedModel(status) || WORKSPACE_AGENT_STARTUP_DEFAULT_MODELS[normalizedAgentId] || "";
 }
 
 function normalizeCachedAgentStatus(status) {
@@ -4117,7 +4140,7 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const model = String(request.model || "").trim();
+    const requestedModel = String(request.model || "").trim();
 
     if (!text) {
       throw new Error("Write a message before starting a chat.");
@@ -4206,6 +4229,26 @@ export default function App() {
         || existingProviderBinding?.nativeSessionId
         || "",
     ).trim();
+    const existingModel = String(existingProviderBinding?.modelId || "").trim();
+    const startupDefaultModel = getWorkspaceAgentStartupModel(agentId, agentStatuses);
+    const model = requestedModel || existingModel || startupDefaultModel;
+    const modelSource = requestedModel
+      ? "new-chat"
+      : existingModel
+        ? existingProviderBinding?.modelSource || "existing-thread"
+        : model
+          ? "agent-default"
+          : "";
+    logBigViewSyncDiagnosticEvent("bigview.model_state.create_thread_model_resolved", {
+      agentId,
+      existingModel,
+      model,
+      modelSource,
+      providerSessionIdPresent: Boolean(providerSessionId),
+      requestedModel,
+      threadId,
+      workspaceId,
+    });
     const pendingPromptId = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
     const messageCreatedAt = new Date().toISOString();
     const promptDelivery = createWorkspacePromptDelivery(pendingPromptId, {
@@ -4230,7 +4273,7 @@ export default function App() {
       agentId,
       messageCreatedAt,
       model,
-      modelSource: model ? "new-chat" : "",
+      modelSource: model ? modelSource : "",
       nativeSessionId: providerSessionId,
       pendingPromptDeliveryMode: "terminal-confirmed",
       pendingPromptId,
@@ -4259,6 +4302,7 @@ export default function App() {
     };
   }, [
     activatedWorkspace,
+    agentStatuses,
     createWorkspacePromptDelivery,
     defaultWorkingDirectory,
     workspaceSettingsModalId,
@@ -6772,13 +6816,16 @@ export default function App() {
           workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId],
           session.agentId,
         );
+        const providerSessionId = String(providerBinding?.nativeSessionId || "").trim();
+        const storedModel = String(providerBinding?.modelId || "").trim();
+        const model = storedModel || getWorkspaceAgentStartupModel(session.agentId, agentStatuses);
 
         return {
           instanceId: session.instanceId,
-          model: providerBinding?.modelId || "",
+          model,
           paneId: session.paneId,
           provider: session.agentId,
-          providerSessionId: providerBinding?.nativeSessionId || "",
+          providerSessionId,
           threadId: session.threadId || "",
           terminalIndex: session.terminalIndex,
           workspaceId: activatedWorkspace.id,
@@ -6788,6 +6835,7 @@ export default function App() {
     activeAgent,
     activatedWorkspace?.id,
     activatedWorkspaceAgentTerminalEntries,
+    agentStatuses,
     preparedTerminalVersion,
     workspaceThreads,
   ]);

@@ -104,11 +104,12 @@ const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
 const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
-const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const WINDOWS_TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "windows-terminal-diagnostics.jsonl";
 const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
@@ -347,7 +348,9 @@ impl WindowsTerminalDiagnosticState {
     }
 
     fn is_enabled(&self) -> bool {
-        WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || self.enabled.load(Ordering::Relaxed)
+        WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED
+            || (WINDOWS_TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED
+                && self.enabled.load(Ordering::Relaxed))
     }
 }
 
@@ -1572,7 +1575,8 @@ fn windows_terminal_set_diagnostic_logging(
     state: State<'_, WindowsTerminalDiagnosticState>,
     enabled: bool,
 ) -> bool {
-    let resolved_enabled = WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED || enabled;
+    let resolved_enabled = WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED
+        || (WINDOWS_TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED && enabled);
     state.enabled.store(resolved_enabled, Ordering::Relaxed);
 
     if resolved_enabled {

@@ -1,10 +1,11 @@
 import { ChevronLeft } from "@styled-icons/material-rounded/ChevronLeft";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Edit } from "@styled-icons/fa-regular/Edit";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Search } from "@styled-icons/material-rounded/Search";
-import { memo, useEffect } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
@@ -245,6 +246,103 @@ const RailActionButton = styled.button`
   }
 `;
 
+const ThreadSearchPanel = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 0 0 10px;
+`;
+
+const ThreadSearchField = styled.div`
+  display: grid;
+  min-width: 0;
+  height: 31px;
+  grid-template-columns: 18px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 5px 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px;
+  color: rgba(233, 233, 233, 0.78);
+  background: rgba(0, 0, 0, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+
+  &:focus-within {
+    border-color: rgba(255, 255, 255, 0.2);
+    color: var(--thread-fg);
+    background: rgba(0, 0, 0, 0.24);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+`;
+
+const ThreadSearchInput = styled.input`
+  min-width: 0;
+  border: 0;
+  color: var(--thread-fg);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 480;
+  line-height: 1.2;
+  outline: 0;
+
+  &::placeholder {
+    color: rgba(233, 233, 233, 0.42);
+  }
+`;
+
+const ThreadSearchClearButton = styled.button`
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: rgba(233, 233, 233, 0.68);
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    background 130ms ease,
+    color 130ms ease,
+    opacity 130ms ease;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.09);
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    outline: 2px solid rgba(255, 255, 255, 0.22);
+    outline-offset: 1px;
+  }
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+`;
+
+const ThreadSearchSummary = styled.div`
+  min-width: 0;
+  padding: 0 6px;
+  color: rgba(225, 225, 225, 0.48);
+  font-size: 11px;
+  font-weight: 460;
+  line-height: 1.2;
+`;
+
 const WorkspaceGroup = styled.section`
   display: grid;
   min-width: 0;
@@ -331,8 +429,8 @@ const CollapsedRailActionButton = styled.button`
   }
 
   &:disabled {
-    color: var(--thread-muted-soft);
-    opacity: 0.58;
+    color: rgba(233, 233, 233, 0.62);
+    opacity: 1;
     cursor: not-allowed;
   }
 
@@ -340,6 +438,21 @@ const CollapsedRailActionButton = styled.button`
     width: 15px;
     height: 15px;
   }
+`;
+
+const CollapsedThreadsRegion = styled.div`
+  display: grid;
+  min-width: 0;
+  max-height: 0;
+  gap: 8px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    max-height 160ms ease,
+    opacity 140ms ease,
+    visibility 0s linear 140ms;
+  visibility: hidden;
 `;
 
 const CollapsedWorkspaceGroup = styled.section`
@@ -727,6 +840,108 @@ function isThreadVisibleInOverlay(thread, entry) {
   );
 }
 
+function normalizeThreadSearchText(value) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function addThreadSearchPart(parts, value) {
+  const text = normalizeThreadSearchText(value);
+  if (text) {
+    parts.push(text);
+  }
+}
+
+function getThreadSearchText(thread, workspace) {
+  const metadataParts = [];
+  const messageParts = [];
+  const providerBindings = thread?.providerBindings && typeof thread.providerBindings === "object"
+    ? Object.values(thread.providerBindings)
+    : [];
+
+  addThreadSearchPart(metadataParts, workspace?.name);
+  addThreadSearchPart(metadataParts, thread?.id);
+  addThreadSearchPart(metadataParts, thread?.title);
+  addThreadSearchPart(metadataParts, thread?.sessionName);
+  addThreadSearchPart(metadataParts, thread?.currentAgent);
+  addThreadSearchPart(metadataParts, thread?.preferredAgent);
+  addThreadSearchPart(metadataParts, thread?.slotKey);
+  addThreadSearchPart(metadataParts, thread?.status);
+  addThreadSearchPart(metadataParts, thread?.transcriptSessionId);
+  addThreadSearchPart(metadataParts, thread?.pendingPrompt?.text);
+  addThreadSearchPart(metadataParts, thread?.pendingPrompt?.message);
+  addThreadSearchPart(metadataParts, thread?.latestTurn?.state);
+  addThreadSearchPart(metadataParts, thread?.latestTurn?.error);
+  addThreadSearchPart(metadataParts, getWorkspaceThreadLabel(thread));
+
+  providerBindings.forEach((binding) => {
+    addThreadSearchPart(metadataParts, binding?.agentId);
+    addThreadSearchPart(metadataParts, binding?.modelId);
+    addThreadSearchPart(metadataParts, binding?.nativeSessionId);
+    addThreadSearchPart(metadataParts, binding?.nativeSessionTitle);
+    addThreadSearchPart(metadataParts, binding?.status);
+  });
+
+  (Array.isArray(thread?.messages) ? thread.messages : []).forEach((message) => {
+    addThreadSearchPart(messageParts, message?.role);
+    addThreadSearchPart(messageParts, message?.title);
+    addThreadSearchPart(messageParts, message?.text);
+  });
+
+  return {
+    label: normalizeThreadSearchText(getWorkspaceThreadLabel(thread)),
+    message: messageParts.join(" "),
+    metadata: metadataParts.join(" "),
+  };
+}
+
+function getThreadSearchScore(thread, workspace, query) {
+  const normalizedQuery = normalizeThreadSearchText(query);
+  if (!normalizedQuery) {
+    return 0;
+  }
+
+  const searchText = getThreadSearchText(thread, workspace);
+  const haystack = `${searchText.metadata} ${searchText.message}`;
+  if (!haystack) {
+    return 0;
+  }
+
+  const tokens = normalizedQuery.split(" ").filter(Boolean);
+  if (!tokens.every((token) => haystack.includes(token))) {
+    return 0;
+  }
+
+  let score = 100;
+  if (searchText.label === normalizedQuery) {
+    score += 900;
+  } else if (searchText.label.startsWith(normalizedQuery)) {
+    score += 760;
+  } else if (searchText.label.includes(normalizedQuery)) {
+    score += 620;
+  }
+
+  if (searchText.metadata.includes(normalizedQuery)) {
+    score += 360;
+  }
+  if (searchText.message.includes(normalizedQuery)) {
+    score += 180;
+  }
+  if (getWorkspaceThreadIsPinned(thread)) {
+    score += 20;
+  }
+
+  return score;
+}
+
+function countThreadRows(threadGroups) {
+  return (Array.isArray(threadGroups) ? threadGroups : [])
+    .reduce((total, group) => total + (Array.isArray(group?.threads) ? group.threads.length : 0), 0);
+}
+
 function WorkspaceThreadsOverlay({
   agentStatuses,
   composerAttachments,
@@ -753,6 +968,12 @@ function WorkspaceThreadsOverlay({
     : {};
   const railCollapsed = safeViewState.railCollapsed === true;
   const newChatActive = safeViewState.newChatActive === true;
+  const searchInputRef = useRef(null);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const deferredSearchQuery = useDeferredValue(searchQuery);
+  const normalizedSearchQuery = normalizeThreadSearchText(deferredSearchQuery);
+  const searchVisible = searchActive || normalizeThreadSearchText(searchQuery).length > 0;
   const localSelection = {
     threadId: safeViewState.selectedThreadId || selectedThreadId || "",
     workspaceId: safeViewState.selectedWorkspaceId || selectedWorkspaceId || "",
@@ -772,6 +993,10 @@ function WorkspaceThreadsOverlay({
       workspaceId: safeWorkspaceId,
     });
   };
+  const closeSearch = () => {
+    setSearchActive(false);
+    setSearchQuery("");
+  };
 
   useEffect(() => {
     if (!open) {
@@ -781,24 +1006,72 @@ function WorkspaceThreadsOverlay({
     const handleKeyDown = (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        if (searchVisible) {
+          closeSearch();
+          return;
+        }
         onClose?.();
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose, open]);
+  }, [onClose, open, searchVisible]);
 
-  const collapsedThreadGroups = (workspaces || [])
+  useEffect(() => {
+    if (open) {
+      return;
+    }
+
+    closeSearch();
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !searchActive || railCollapsed) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [open, railCollapsed, searchActive]);
+
+  const collapsedThreadGroups = useMemo(() => (workspaces || [])
     .map((workspace) => ({
       threads: getThreadRows(workspaceThreads, workspace.id),
       workspace,
     }))
-    .filter((group) => group.threads.length > 0);
-  const threadGroups = (workspaces || []).map((workspace) => ({
+    .filter((group) => group.threads.length > 0), [workspaceThreads, workspaces]);
+  const threadGroups = useMemo(() => (workspaces || []).map((workspace) => ({
     threads: getThreadRows(workspaceThreads, workspace.id),
     workspace,
-  }));
+  })), [workspaceThreads, workspaces]);
+  const searchedThreadGroups = useMemo(() => {
+    if (!normalizedSearchQuery) {
+      return threadGroups;
+    }
+
+    return threadGroups
+      .map(({ threads, workspace }) => ({
+        threads: threads
+          .map((thread, index) => ({
+            index,
+            score: getThreadSearchScore(thread, workspace, normalizedSearchQuery),
+            thread,
+          }))
+          .filter((result) => result.score > 0)
+          .sort((left, right) => right.score - left.score || left.index - right.index)
+          .map((result) => result.thread),
+        workspace,
+      }))
+      .filter((group) => group.threads.length > 0);
+  }, [normalizedSearchQuery, threadGroups]);
+  const visibleThreadGroups = searchVisible ? searchedThreadGroups : threadGroups;
+  const totalThreadCount = useMemo(() => countThreadRows(threadGroups), [threadGroups]);
+  const visibleThreadCount = useMemo(() => countThreadRows(visibleThreadGroups), [visibleThreadGroups]);
   const hasVisibleThreads = collapsedThreadGroups.length > 0;
   const selectedThreadFromLocal = workspaceThreads?.[localSelection.workspaceId]
     ?.threads?.[localSelection.threadId];
@@ -844,12 +1117,26 @@ function WorkspaceThreadsOverlay({
     onTogglePinnedThread?.(workspaceId, threadId);
   };
   const openNewChat = () => {
+    closeSearch();
     const workspaceId = newChatWorkspace?.id || selectedWorkspaceId || activeWorkspaceId || "";
     commitViewState(workspaceId, {
       newChatActive: true,
       railCollapsed: false,
       selectedWorkspaceId: workspaceId,
     });
+  };
+  const openSearch = () => {
+    setSearchActive(true);
+    const workspaceId = activeWorkspaceId || selectedWorkspaceId || localSelection.workspaceId || "";
+    if (railCollapsed) {
+      commitViewState(workspaceId, {
+        railCollapsed: false,
+      });
+    }
+    window.setTimeout(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }, 0);
   };
   const createChat = async (request) => {
     const result = await onCreateChat?.({
@@ -902,6 +1189,10 @@ function WorkspaceThreadsOverlay({
     open,
   ]);
 
+  const searchSummary = normalizedSearchQuery
+    ? `${visibleThreadCount} ${visibleThreadCount === 1 ? "result" : "results"}`
+    : `${totalThreadCount} ${totalThreadCount === 1 ? "thread" : "threads"}`;
+
   if (!open) {
     return null;
   }
@@ -939,59 +1230,62 @@ function WorkspaceThreadsOverlay({
                 </CollapsedRailActionButton>
                 <CollapsedRailActionButton
                   aria-label="Search"
-                  disabled
+                  data-active={searchVisible ? "true" : "false"}
+                  onClick={openSearch}
                   title="Search"
                   type="button"
                 >
                   <Search aria-hidden="true" />
                 </CollapsedRailActionButton>
               </CollapsedRailActionStack>
-              {collapsedThreadGroups.map(({ threads, workspace }, workspaceIndex) => (
-                <CollapsedWorkspaceGroup key={workspace.id}>
-                  <CollapsedWorkspaceMarker
-                    aria-hidden="true"
-                    data-visible={workspaceIndex > 0 ? "true" : "false"}
-                  >
-                    <span />
-                  </CollapsedWorkspaceMarker>
-                  <CollapsedThreadList>
-                    {threads.map((thread) => {
-                      const isSelected = visibleActiveWorkspaceId === workspace.id
-                        && visibleActiveThreadId === thread.id;
-                      const {
-                        isLive,
-                        isNonSessionActive,
-                        label,
-                        state,
-                        threadViewState,
-                      } = getThreadState(
-                        thread,
-                        workspaceThreads?.[workspace.id],
-                      );
-                      const title = `${workspace.name}: ${label}`;
+              <CollapsedThreadsRegion aria-hidden="true">
+                {collapsedThreadGroups.map(({ threads, workspace }, workspaceIndex) => (
+                  <CollapsedWorkspaceGroup key={workspace.id}>
+                    <CollapsedWorkspaceMarker
+                      aria-hidden="true"
+                      data-visible={workspaceIndex > 0 ? "true" : "false"}
+                    >
+                      <span />
+                    </CollapsedWorkspaceMarker>
+                    <CollapsedThreadList>
+                      {threads.map((thread) => {
+                        const isSelected = visibleActiveWorkspaceId === workspace.id
+                          && visibleActiveThreadId === thread.id;
+                        const {
+                          isLive,
+                          isNonSessionActive,
+                          label,
+                          state,
+                          threadViewState,
+                        } = getThreadState(
+                          thread,
+                          workspaceThreads?.[workspace.id],
+                        );
+                        const title = `${workspace.name}: ${label}`;
 
-                      return (
-                        <CollapsedThreadButton
-                          aria-label={title}
-                          data-selected={isSelected ? "true" : "false"}
-                          key={thread.id}
-                          onClick={() => selectThread(workspace.id, thread.id)}
-                          title={title}
-                          type="button"
-                        >
-                          <TerminalStateDot
-                            aria-hidden="true"
-                            data-live={isLive ? "true" : "false"}
-                            data-nosession={isNonSessionActive ? "true" : "false"}
-                            data-state={state}
-                            data-view-state={threadViewState}
-                          />
-                        </CollapsedThreadButton>
-                      );
-                    })}
-                  </CollapsedThreadList>
-                </CollapsedWorkspaceGroup>
-              ))}
+                        return (
+                          <CollapsedThreadButton
+                            aria-label={title}
+                            data-selected={isSelected ? "true" : "false"}
+                            key={thread.id}
+                            onClick={() => selectThread(workspace.id, thread.id)}
+                            title={title}
+                            type="button"
+                          >
+                            <TerminalStateDot
+                              aria-hidden="true"
+                              data-live={isLive ? "true" : "false"}
+                              data-nosession={isNonSessionActive ? "true" : "false"}
+                              data-state={state}
+                              data-view-state={threadViewState}
+                            />
+                          </CollapsedThreadButton>
+                        );
+                      })}
+                    </CollapsedThreadList>
+                  </CollapsedWorkspaceGroup>
+                ))}
+              </CollapsedThreadsRegion>
             </CollapsedRail>
           ) : (
             <WorkspaceList>
@@ -1005,12 +1299,45 @@ function WorkspaceThreadsOverlay({
                   <Edit aria-hidden="true" />
                   <span>New Chat</span>
                 </RailActionButton>
-                <RailActionButton disabled title="Search" type="button">
+                <RailActionButton
+                  data-active={searchVisible ? "true" : "false"}
+                  onClick={openSearch}
+                  title="Search"
+                  type="button"
+                >
                   <Search aria-hidden="true" />
                   <span>Search</span>
                 </RailActionButton>
               </RailActionStack>
-              {threadGroups.map(({ threads, workspace }) => {
+              {searchVisible ? (
+                <ThreadSearchPanel>
+                  <ThreadSearchField>
+                    <Search aria-hidden="true" />
+                    <ThreadSearchInput
+                      aria-label="Search threads"
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      placeholder="Search threads"
+                      ref={searchInputRef}
+                      spellCheck={false}
+                      type="search"
+                      value={searchQuery}
+                    />
+                    <ThreadSearchClearButton
+                      aria-label="Clear search"
+                      data-visible={searchVisible ? "true" : "false"}
+                      onClick={closeSearch}
+                      title="Clear search"
+                      type="button"
+                    >
+                      <Close aria-hidden="true" />
+                    </ThreadSearchClearButton>
+                  </ThreadSearchField>
+                  <ThreadSearchSummary>{searchSummary}</ThreadSearchSummary>
+                </ThreadSearchPanel>
+              ) : null}
+              {searchVisible && normalizedSearchQuery && visibleThreadCount === 0 ? (
+                <EmptyThreads>No matching threads</EmptyThreads>
+              ) : visibleThreadGroups.map(({ threads, workspace }) => {
                 return (
                   <WorkspaceGroup key={workspace.id}>
                     <WorkspaceTopline>
