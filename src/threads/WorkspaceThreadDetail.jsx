@@ -7,6 +7,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import styled, { keyframes } from "styled-components";
 
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
+import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
@@ -937,6 +938,56 @@ function getStatusModel(status) {
   ).trim();
 }
 
+function getAttachmentLogSummary(attachments) {
+  return (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => ({
+      id: String(attachment?.id || ""),
+      mimeType: String(attachment?.mimeType || ""),
+      name: String(attachment?.name || ""),
+      size: Number(attachment?.size || 0),
+    }))
+    .slice(0, 8);
+}
+
+function getModelThinkingPowerMetadata(agentId, option, model) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const normalizedModel = String(model || option?.value || "").trim().toLowerCase();
+  const explicitValue = String(
+    option?.thinkingPower
+      || option?.reasoningEffort
+      || option?.reasoning_effort
+      || option?.thinkingBudget
+      || option?.thinking_budget
+      || "",
+  ).trim();
+
+  if (explicitValue) {
+    return {
+      source: "model_option",
+      thinkingPower: explicitValue,
+    };
+  }
+
+  if (normalizedAgentId === "codex") {
+    return {
+      source: normalizedModel.includes("spark") ? "codex_spark_default" : "codex_default",
+      thinkingPower: normalizedModel.includes("spark") ? "high" : "medium",
+    };
+  }
+
+  if (normalizedAgentId === "claude") {
+    return {
+      source: "not_configured",
+      thinkingPower: "",
+    };
+  }
+
+  return {
+    source: "unsupported_agent",
+    thinkingPower: "",
+  };
+}
+
 function getModelOptions(agentId, status, binding = null) {
   const normalizedAgentId = normalizeAgentId(agentId);
   const sessionModel = String(binding?.modelId || binding?.model || "").trim();
@@ -1116,14 +1167,46 @@ function NewChatView({
       return;
     }
 
+    logBigViewSyncDiagnosticEvent("bigview.image.add_start", {
+      agentId: activeAgentId,
+      attachmentCountBefore: attachments.length,
+      fileCount: files.length,
+      files: files.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      imageSupportReason: imageInputSupport.reason || "",
+      imageSupportState: imageInputSupport.state || "",
+      imageSupported: Boolean(imageInputSupport.supported),
+      model: selectedModel || "",
+      surface: "new_chat",
+      workspaceId: workspace?.id || "",
+    });
     setError("");
     try {
       const nextAttachments = await Promise.all(files.map(readImageFile));
       setAttachments((currentAttachments) => (
         currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
       ));
+      logBigViewSyncDiagnosticEvent("bigview.image.add_done", {
+        agentId: activeAgentId,
+        attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
+        attachments: getAttachmentLogSummary(nextAttachments),
+        model: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
     } catch (readError) {
       setError(readError?.message || "Unable to attach image.");
+      logBigViewSyncDiagnosticEvent("bigview.image.add_error", {
+        agentId: activeAgentId,
+        fileCount: files.length,
+        message: readError?.message || String(readError || ""),
+        model: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
     }
   };
 
@@ -1144,8 +1227,70 @@ function NewChatView({
     setSending(true);
     setError("");
     try {
-      const imageBlock = await saveImageAttachments(previousAttachments);
+      const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, selectedModel);
+      logBigViewSyncDiagnosticEvent("bigview.submit.start", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        attachments: getAttachmentLogSummary(previousAttachments),
+        draftLength: text.length,
+        imageSupportReason: imageInputSupport.reason || "",
+        imageSupportState: imageInputSupport.state || "",
+        imageSupported: Boolean(imageInputSupport.supported),
+        modelPayload: "",
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        thinkingPower: thinkingPower.thinkingPower,
+        thinkingPowerSource: thinkingPower.source,
+        workspaceId: workspace?.id || "",
+      });
+      if (previousAttachments.length) {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
+          agentId: activeAgentId,
+          attachmentCount: previousAttachments.length,
+          attachments: getAttachmentLogSummary(previousAttachments),
+          selectedModel: selectedModel || "",
+          surface: "new_chat",
+          workspaceId: workspace?.id || "",
+        });
+      }
+      let imageBlock = "";
+      try {
+        imageBlock = await saveImageAttachments(previousAttachments);
+      } catch (saveError) {
+        if (previousAttachments.length) {
+          logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
+            agentId: activeAgentId,
+            attachmentCount: previousAttachments.length,
+            attachments: getAttachmentLogSummary(previousAttachments),
+            message: saveError?.message || String(saveError || ""),
+            selectedModel: selectedModel || "",
+            surface: "new_chat",
+            workspaceId: workspace?.id || "",
+          });
+        }
+        throw saveError;
+      }
+      if (previousAttachments.length) {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
+          agentId: activeAgentId,
+          attachmentCount: previousAttachments.length,
+          imageBlockLength: imageBlock.length,
+          imageBlockPreview: imageBlock.slice(0, 240),
+          selectedModel: selectedModel || "",
+          surface: "new_chat",
+          workspaceId: workspace?.id || "",
+        });
+      }
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
+      logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        imageBlockPresent: Boolean(imageBlock),
+        messageLength: message.length,
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
 
       await onCreateChat?.({
         agentId: activeAgentId,
@@ -1153,12 +1298,27 @@ function NewChatView({
         model: "",
         workspace,
       });
+      logBigViewSyncDiagnosticEvent("bigview.submit.done", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
       setDraft("");
       setAttachments([]);
     } catch (submitError) {
       setDraft(previousDraft);
       setAttachments(previousAttachments);
       setError(submitError?.message || "Unable to start chat.");
+      logBigViewSyncDiagnosticEvent("bigview.submit.error", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        message: submitError?.message || String(submitError || ""),
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
     } finally {
       setSending(false);
     }
@@ -1256,6 +1416,18 @@ function NewChatView({
                       key={option.value || option.label}
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
+                        const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, option, option.value);
+                        logBigViewSyncDiagnosticEvent("bigview.model_change.selected", {
+                          agentId: activeAgentId,
+                          model: option.value || "",
+                          modelLabel: option.label || "",
+                          requestSent: false,
+                          reason: "new_chat_model_selection_only",
+                          surface: "new_chat",
+                          thinkingPower: thinkingPower.thinkingPower,
+                          thinkingPowerSource: thinkingPower.source,
+                          workspaceId: workspace?.id || "",
+                        });
                         setSelectedModel(option.value);
                         setModelMenuOpen(false);
                       }}
@@ -1621,14 +1793,53 @@ function WorkspaceThreadDetail({
       return;
     }
 
+    logBigViewSyncDiagnosticEvent("bigview.image.add_start", {
+      agentId: activeAgentId,
+      attachmentCountBefore: attachments.length,
+      canSubmit,
+      fileCount: files.length,
+      files: files.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      imageSupportReason: imageInputSupport.reason || "",
+      imageSupportState: imageInputSupport.state || "",
+      imageSupported: Boolean(imageInputSupport.supported),
+      model: selectedModel || "",
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     setError("");
     try {
       const nextAttachments = await Promise.all(files.map(readImageFile));
       setAttachments((currentAttachments) => (
         currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
       ));
+      logBigViewSyncDiagnosticEvent("bigview.image.add_done", {
+        agentId: activeAgentId,
+        attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
+        attachments: getAttachmentLogSummary(nextAttachments),
+        hasActiveTerminalBinding,
+        model: selectedModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
     } catch (readError) {
       setError(readError?.message || "Unable to attach image.");
+      logBigViewSyncDiagnosticEvent("bigview.image.add_error", {
+        agentId: activeAgentId,
+        fileCount: files.length,
+        message: readError?.message || String(readError || ""),
+        model: selectedModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
     }
   };
 
@@ -1640,21 +1851,81 @@ function WorkspaceThreadDetail({
 
   const selectModel = (option) => {
     const nextModel = String(option?.value || "").trim();
+    const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, option, nextModel);
+    logBigViewSyncDiagnosticEvent("bigview.model_change.selected", {
+      agentId: activeAgentId,
+      canSubmit,
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      model: nextModel,
+      modelLabel: option?.label || "",
+      surface: "thread_detail",
+      thinkingPower: thinkingPower.thinkingPower,
+      thinkingPowerSource: thinkingPower.source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     setSelectedModel(nextModel);
     setModelMenuOpen(false);
     setError("");
 
     if (!nextModel || !thread || !hasActiveTerminalBinding) {
+      logBigViewSyncDiagnosticEvent("bigview.model_change.skip", {
+        agentId: activeAgentId,
+        hasActiveTerminalBinding,
+        hasModel: Boolean(nextModel),
+        hasThread: Boolean(thread),
+        model: nextModel,
+        reason: !nextModel ? "missing_model" : !thread ? "missing_thread" : "missing_live_terminal_binding",
+        surface: "thread_detail",
+        thinkingPower: thinkingPower.thinkingPower,
+        thinkingPowerSource: thinkingPower.source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
       return;
     }
 
+    logBigViewSyncDiagnosticEvent("bigview.model_change.request", {
+      agentId: activeAgentId,
+      bindingInstanceId: activeTerminalBinding?.instanceId || "",
+      bindingPaneId: activeTerminalBinding?.paneId || "",
+      model: nextModel,
+      modelLabel: option?.label || "",
+      requestIncludesThinkingPower: false,
+      surface: "thread_detail",
+      thinkingPower: thinkingPower.thinkingPower,
+      thinkingPowerSource: thinkingPower.source,
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     Promise.resolve(onSelectModel?.({
       agentId: activeAgentId,
       model: nextModel,
       thread,
       workspace,
-    })).catch((modelError) => {
+    })).then(() => {
+      logBigViewSyncDiagnosticEvent("bigview.model_change.done", {
+        agentId: activeAgentId,
+        model: nextModel,
+        surface: "thread_detail",
+        thinkingPower: thinkingPower.thinkingPower,
+        thinkingPowerSource: thinkingPower.source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+    }).catch((modelError) => {
       setError(modelError?.message || "Unable to change model.");
+      logBigViewSyncDiagnosticEvent("bigview.model_change.error", {
+        agentId: activeAgentId,
+        message: modelError?.message || String(modelError || ""),
+        model: nextModel,
+        surface: "thread_detail",
+        thinkingPower: thinkingPower.thinkingPower,
+        thinkingPowerSource: thinkingPower.source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
     });
   };
 
@@ -1669,8 +1940,80 @@ function WorkspaceThreadDetail({
     setSending(true);
     setError("");
     try {
-      const imageBlock = await saveImageAttachments(previousAttachments);
+      const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, selectedModel);
+      logBigViewSyncDiagnosticEvent("bigview.submit.start", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        attachments: getAttachmentLogSummary(previousAttachments),
+        canSubmit,
+        composerSyncKey,
+        draftLength: text.length,
+        hasActiveTerminalBinding,
+        hasProviderSession,
+        imageSupportReason: imageInputSupport.reason || "",
+        imageSupportState: imageInputSupport.state || "",
+        imageSupported: Boolean(imageInputSupport.supported),
+        modelPayload: "",
+        selectedModel: selectedModel || "",
+        surface: "thread_detail",
+        thinkingPower: thinkingPower.thinkingPower,
+        thinkingPowerSource: thinkingPower.source,
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      if (previousAttachments.length) {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
+          agentId: activeAgentId,
+          attachmentCount: previousAttachments.length,
+          attachments: getAttachmentLogSummary(previousAttachments),
+          selectedModel: selectedModel || "",
+          surface: "thread_detail",
+          threadId: thread?.id || "",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        });
+      }
+      let imageBlock = "";
+      try {
+        imageBlock = await saveImageAttachments(previousAttachments);
+      } catch (saveError) {
+        if (previousAttachments.length) {
+          logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
+            agentId: activeAgentId,
+            attachmentCount: previousAttachments.length,
+            attachments: getAttachmentLogSummary(previousAttachments),
+            message: saveError?.message || String(saveError || ""),
+            selectedModel: selectedModel || "",
+            surface: "thread_detail",
+            threadId: thread?.id || "",
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+        }
+        throw saveError;
+      }
+      if (previousAttachments.length) {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
+          agentId: activeAgentId,
+          attachmentCount: previousAttachments.length,
+          imageBlockLength: imageBlock.length,
+          imageBlockPreview: imageBlock.slice(0, 240),
+          selectedModel: selectedModel || "",
+          surface: "thread_detail",
+          threadId: thread?.id || "",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        });
+      }
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
+      logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        hasActiveTerminalBinding,
+        imageBlockPresent: Boolean(imageBlock),
+        messageLength: message.length,
+        selectedModel: selectedModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
 
       await onSubmitMessage?.({
         message,
@@ -1678,12 +2021,29 @@ function WorkspaceThreadDetail({
         thread,
         workspace,
       });
+      logBigViewSyncDiagnosticEvent("bigview.submit.done", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        selectedModel: selectedModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
       setDraft("");
       setAttachments([]);
     } catch (submitError) {
       setDraft(previousDraft);
       setAttachments(previousAttachments);
       setError(submitError?.message || "Unable to send message.");
+      logBigViewSyncDiagnosticEvent("bigview.submit.error", {
+        agentId: activeAgentId,
+        attachmentCount: previousAttachments.length,
+        message: submitError?.message || String(submitError || ""),
+        selectedModel: selectedModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
     } finally {
       setSending(false);
     }
@@ -1767,6 +2127,19 @@ function WorkspaceThreadDetail({
               const previousDraft = draft;
               const nextDraft = event.target.value;
               setDraft(nextDraft);
+              logBigViewSyncDiagnosticEvent("bigview.draft.input", {
+                agentId: activeAgentId,
+                composerSyncKey,
+                hasActiveTerminalBinding,
+                hasDraftInputHandler: Boolean(onDraftInput),
+                hasProviderSession,
+                nextValueLength: nextDraft.length,
+                previousValueLength: previousDraft.length,
+                selectedModel: selectedModel || "",
+                surface: "thread_detail",
+                threadId: thread?.id || "",
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
               onDraftInput?.({
                 nextValue: nextDraft,
                 previousValue: previousDraft,

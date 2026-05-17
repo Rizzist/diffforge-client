@@ -104,6 +104,8 @@ const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
 const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
+const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
@@ -139,6 +141,7 @@ static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
@@ -1311,6 +1314,10 @@ fn thread_bridge_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE)
 }
 
+fn bigview_sync_diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path(BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE)
+}
+
 fn windows_terminal_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
@@ -1372,6 +1379,36 @@ fn write_thread_bridge_diagnostic_log_entry(entry: Value) {
     }
 
     let lock = THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
+    if !BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = bigview_sync_diagnostic_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
     let Ok(_guard) = lock.lock() else {
         return;
     };
@@ -1505,6 +1542,20 @@ fn terminal_diagnostic_log(
 #[tauri::command]
 fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_thread_bridge_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
+    write_bigview_sync_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
         "source": "frontend",
@@ -2098,6 +2149,7 @@ pub fn run() {
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,
             thread_bridge_diagnostic_log,
+            bigview_sync_diagnostic_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,
             terminal_delete_selection,

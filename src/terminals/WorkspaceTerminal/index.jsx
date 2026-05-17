@@ -354,6 +354,7 @@ import {
   stripLiveViewControlSequences,
 } from "../liveViewSanitizer.js";
 import WorkspaceThreadsOverlay from "../../threads/WorkspaceThreadsOverlay.jsx";
+import { logBigViewSyncDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
 import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
@@ -869,6 +870,16 @@ function WorkspaceTerminal({
   }, []);
 
   const syncWorkspaceThreadComposerInput = useCallback(({ nextValue, previousValue, thread: targetThread, workspace: targetWorkspace }) => {
+    const nextDraft = String(nextValue || "");
+    logBigViewSyncDiagnosticEvent("bigview.draft.sync_received", {
+      agentId: terminalAgentKind,
+      nextValueLength: nextDraft.length,
+      paneId,
+      previousValueLength: String(previousValue || "").length,
+      targetThreadId: targetThread?.id || "",
+      targetWorkspaceId: targetWorkspace?.id || workspace?.id || "",
+      terminalIndex,
+    });
     const {
       binding,
       latestThread,
@@ -881,12 +892,35 @@ function WorkspaceTerminal({
     });
     const syncKey = getThreadComposerSyncKey(latestThread, binding);
 
-    const nextDraft = String(nextValue || "");
+    logBigViewSyncDiagnosticEvent("bigview.draft.target_resolved", {
+      agentId: terminalAgentKind,
+      bindingInstanceId: binding?.instanceId || "",
+      bindingPaneId: binding?.paneId || "",
+      latestThreadId: latestThread?.id || "",
+      nextValueLength: nextDraft.length,
+      paneId,
+      syncKey,
+      targetThreadId: targetThread?.id || "",
+      targetWorkspaceId: targetWorkspace?.id || workspace?.id || "",
+      terminalIndex,
+    });
+
     if (syncKey && latestThread?.id) {
       setThreadComposerDraftValue(syncKey, nextDraft);
     }
 
     if (!binding?.paneId || !binding?.instanceId || !latestThread?.id) {
+      logBigViewSyncDiagnosticEvent("bigview.draft.shared_only", {
+        agentId: terminalAgentKind,
+        hasBinding: Boolean(binding?.paneId && binding?.instanceId),
+        latestThreadId: latestThread?.id || "",
+        nextValueLength: nextDraft.length,
+        paneId,
+        reason: !latestThread?.id ? "missing_thread" : "missing_live_binding",
+        syncKey,
+        targetWorkspaceId: targetWorkspace?.id || workspace?.id || "",
+        terminalIndex,
+      });
       logThreadBridgeDiagnostic("frontend.thread_composer_sync.shared_only", {
         agentId: terminalAgentKind,
         hasBinding: Boolean(binding?.paneId && binding?.instanceId),
@@ -904,22 +938,69 @@ function WorkspaceTerminal({
     const data = buildTerminalComposerDraftInput(previousDraft, nextDraft, forceReplace);
 
     if (!data) {
+      logBigViewSyncDiagnosticEvent("bigview.draft.no_terminal_delta", {
+        agentId: terminalAgentKind,
+        bindingInstanceId: binding.instanceId,
+        bindingPaneId: binding.paneId,
+        forceReplace,
+        latestThreadId: latestThread.id,
+        nextValueLength: nextDraft.length,
+        paneId,
+        previousDraftLength: previousDraft.length,
+        syncKey,
+        terminalIndex,
+      });
       return;
     }
 
+    logBigViewSyncDiagnosticEvent("bigview.draft.write_start", {
+      agentId: terminalAgentKind,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      forceReplace,
+      inputLength: data.length,
+      latestThreadId: latestThread.id,
+      nextValueLength: nextDraft.length,
+      paneId,
+      previousDraftLength: previousDraft.length,
+      syncKey,
+      terminalIndex,
+    });
     queueWorkspaceThreadComposerWrite({
       binding,
       data,
       threadId: latestThread.id,
     }).then(() => {
       threadComposerDirtyKeysRef.current.delete(syncKey);
+      logBigViewSyncDiagnosticEvent("bigview.draft.write_done", {
+        agentId: terminalAgentKind,
+        bindingInstanceId: binding.instanceId,
+        bindingPaneId: binding.paneId,
+        latestThreadId: latestThread.id,
+        nextValueLength: nextDraft.length,
+        paneId,
+        syncKey,
+        terminalIndex,
+      });
     }).catch(() => {
       threadComposerDirtyKeysRef.current.add(syncKey);
+      logBigViewSyncDiagnosticEvent("bigview.draft.write_error", {
+        agentId: terminalAgentKind,
+        bindingInstanceId: binding.instanceId,
+        bindingPaneId: binding.paneId,
+        latestThreadId: latestThread.id,
+        nextValueLength: nextDraft.length,
+        paneId,
+        syncKey,
+        terminalIndex,
+      });
     });
   }, [
     queueWorkspaceThreadComposerWrite,
+    paneId,
     setThreadComposerDraftValue,
     terminalAgentKind,
+    terminalIndex,
     workspace,
     workspaceThreads,
   ]);
@@ -1269,6 +1350,19 @@ function WorkspaceTerminal({
       throw new Error("No active terminal is bound to this thread.");
     }
 
+    const syncKey = getThreadComposerSyncKey(latestThread, binding);
+
+    logBigViewSyncDiagnosticEvent("bigview.submit.terminal_start", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      hasImageAttachmentBlock: text.includes("[image-attached"),
+      latestThreadId: latestThread.id,
+      messageLength: text.length,
+      model: modelId || "",
+      syncKey,
+      workspaceId,
+    });
     logThreadBridgeDiagnostic("frontend.thread_submit.start", {
       agentId,
       bindingInstanceId: binding.instanceId,
@@ -1290,7 +1384,6 @@ function WorkspaceTerminal({
     const promptId = createThreadProjectionToken("prompt");
     const startedAt = new Date().toISOString();
     const turnId = `turn-${promptId}`;
-    const syncKey = getThreadComposerSyncKey(latestThread, binding);
     const previousDraft = threadComposerDraftsRef.current.has(syncKey)
       ? threadComposerDraftsRef.current.get(syncKey)
       : "";
@@ -1311,6 +1404,17 @@ function WorkspaceTerminal({
       throw new Error("This thread cannot send without a live coding-agent TUI.");
     }
 
+    logBigViewSyncDiagnosticEvent("bigview.submit.terminal_sync_start", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      hasImageAttachmentBlock: text.includes("[image-attached"),
+      latestThreadId: latestThread.id,
+      messageLength: text.length,
+      syncDataLength: syncData.length,
+      syncKey,
+      workspaceId,
+    });
     logThreadBridgeDiagnostic("frontend.thread_submit.sync_start", {
       agentId,
       bindingInstanceId: binding.instanceId,
@@ -1350,6 +1454,16 @@ function WorkspaceTerminal({
       });
       throw error;
     }
+    logBigViewSyncDiagnosticEvent("bigview.submit.terminal_sync_done", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      hasImageAttachmentBlock: text.includes("[image-attached"),
+      latestThreadId: latestThread.id,
+      messageLength: text.length,
+      syncKey,
+      workspaceId,
+    });
     logThreadBridgeDiagnostic("frontend.thread_submit.sync_done", {
       agentId,
       bindingInstanceId: binding.instanceId,
@@ -1569,7 +1683,32 @@ function WorkspaceTerminal({
     const agentId = getTerminalAgentKind(targetThread?.currentAgent || terminalAgentKind);
     const providerBinding = getWorkspaceThreadProviderBinding(targetThread, agentId);
     const binding = providerBinding?.terminalBinding || targetThread?.terminalBinding;
+    const thinkingPower = agentId === "codex"
+      ? (nextModel.toLowerCase().includes("spark") ? "high" : "medium")
+      : "";
+    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_received", {
+      agentId,
+      bindingInstanceId: binding?.instanceId || "",
+      bindingPaneId: binding?.paneId || "",
+      hasModel: Boolean(nextModel),
+      model: nextModel,
+      requestIncludesThinkingPower: false,
+      thinkingPower,
+      thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
+      threadId: targetThread?.id || "",
+      workspaceId: targetThread?.workspaceId || workspace?.id || "",
+    });
     if (!nextModel || !binding?.paneId || !binding?.instanceId) {
+      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_error", {
+        agentId,
+        hasBinding: Boolean(binding?.paneId && binding?.instanceId),
+        hasModel: Boolean(nextModel),
+        message: "No active terminal is bound to this thread.",
+        model: nextModel,
+        reason: !nextModel ? "missing_model" : "missing_live_terminal_binding",
+        threadId: targetThread?.id || "",
+        workspaceId: targetThread?.workspaceId || workspace?.id || "",
+      });
       throw new Error("No active terminal is bound to this thread.");
     }
 
@@ -1577,15 +1716,62 @@ function WorkspaceTerminal({
       nextModel.length > 120
       || !nextModel.split("").every((character) => /[A-Za-z0-9._:/-]/.test(character))
     ) {
+      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_error", {
+        agentId,
+        message: "Model id is invalid.",
+        model: nextModel,
+        reason: "invalid_model_id",
+        threadId: targetThread?.id || "",
+        workspaceId: targetThread?.workspaceId || workspace?.id || "",
+      });
       throw new Error("Model id is invalid.");
     }
 
     const command = `/model ${nextModel}`;
-    await invoke("terminal_write", {
-      data: buildTerminalSubmittedInput(command, agentId),
-      instanceId: binding.instanceId,
-      paneId: binding.paneId,
+    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_start", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      commandLength: command.length,
+      model: nextModel,
+      requestIncludesThinkingPower: false,
+      thinkingPower,
+      thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
       threadId: targetThread.id,
+      workspaceId: targetThread.workspaceId || workspace?.id || "",
+    });
+    try {
+      await invoke("terminal_write", {
+        data: buildTerminalSubmittedInput(command, agentId),
+        instanceId: binding.instanceId,
+        paneId: binding.paneId,
+        threadId: targetThread.id,
+      });
+    } catch (error) {
+      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_error", {
+        agentId,
+        bindingInstanceId: binding.instanceId,
+        bindingPaneId: binding.paneId,
+        message: error?.message || String(error || ""),
+        model: nextModel,
+        requestIncludesThinkingPower: false,
+        thinkingPower,
+        thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
+        threadId: targetThread.id,
+        workspaceId: targetThread.workspaceId || workspace?.id || "",
+      });
+      throw error;
+    }
+    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_done", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      model: nextModel,
+      requestIncludesThinkingPower: false,
+      thinkingPower,
+      thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
+      threadId: targetThread.id,
+      workspaceId: targetThread.workspaceId || workspace?.id || "",
     });
     onThreadTerminalLifecycle?.({
       agentId,
