@@ -124,15 +124,6 @@ function processUrlSuggestions(snapshot) {
   )).slice(0, 8);
 }
 
-function localUrlBadge(url) {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
-  } catch {
-    return "Web";
-  }
-}
-
 export default function WebWorkspaceView({
   defaultWorkingDirectory = "",
   rootDirectory = "",
@@ -146,7 +137,6 @@ export default function WebWorkspaceView({
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [processSnapshot, setProcessSnapshot] = useState(null);
-  const [processState, setProcessState] = useState("idle");
   const viewportRef = useRef(null);
   const webviewRef = useRef(null);
   const boundsFrameRef = useRef(0);
@@ -161,7 +151,6 @@ export default function WebWorkspaceView({
   );
   const processRootsKey = processRoots.join("\n");
   const suggestions = useMemo(() => processUrlSuggestions(processSnapshot), [processSnapshot]);
-  const activeBadge = localUrlBadge(currentUrl);
   const suggestionsListId = useMemo(
     () => `workspace-web-url-suggestions-${safeWorkspaceKey(workspaceId)}`,
     [workspaceId],
@@ -393,21 +382,19 @@ export default function WebWorkspaceView({
     }
   }, [getOrCreateWebview, scheduleBoundsUpdate, webviewLabel, workspaceId]);
 
-  const loadProcesses = useCallback(async ({ silent = false } = {}) => {
+  const loadProcesses = useCallback(async () => {
     if (!workspaceId) {
       return;
     }
 
-    setProcessState(silent ? "refreshing" : "loading");
     try {
       const snapshot = await invoke("list_developer_processes", {
         activeWorkspaceRoot: rootDirectory || "",
         workspaceRoots: processRoots,
       });
       setProcessSnapshot(snapshot);
-      setProcessState("idle");
     } catch {
-      setProcessState("idle");
+      // Suggestions are opportunistic; navigation should keep working if port scans fail.
     }
   }, [processRootsKey, rootDirectory, workspaceId]);
 
@@ -431,7 +418,7 @@ export default function WebWorkspaceView({
     sync();
     const intervalId = window.setInterval(() => {
       if (!cancelled && document.visibilityState !== "hidden") {
-        loadProcesses({ silent: true });
+        loadProcesses();
       }
     }, PROCESS_REFRESH_MS);
 
@@ -509,21 +496,12 @@ export default function WebWorkspaceView({
     <WebWorkspaceSurface aria-label="Workspace web view">
       <WebToolbar>
         <WebAddressForm onSubmit={handleSubmit}>
-          <WebToolbarLabel
-            data-state={status}
-            title={
-              processState === "loading" || processState === "refreshing"
-                ? "Scanning workspace ports"
-                : workspace?.name || "Workspace web"
-            }
-          >
-            <span />
-            {isBusy ? "Loading" : status === "error" ? "Needs attention" : activeBadge}
-          </WebToolbarLabel>
           <WebAddressInput
             aria-label="Web view URL"
+            aria-busy={isBusy}
             autoCapitalize="none"
             autoCorrect="off"
+            data-state={status}
             list={hasSuggestions ? suggestionsListId : undefined}
             onChange={(event) => setDraftUrl(event.target.value)}
             placeholder="localhost:5173 or https://example.com"
@@ -594,64 +572,12 @@ const WebToolbar = styled.header`
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
 `;
 
-const WebToolbarLabel = styled.div`
-  display: inline-flex;
-  min-width: 0;
-  max-width: 170px;
-  height: 30px;
-  align-items: center;
-  gap: 7px;
-  padding: 0 10px;
-  border: 1px solid rgba(125, 160, 205, 0.15);
-  border-radius: 7px;
-  box-sizing: border-box;
-  color: #cbd5e1;
-  background: rgba(13, 18, 27, 0.86);
-  overflow: hidden;
-  font-size: 11px;
-  font-weight: 820;
-  line-height: 1;
-  white-space: nowrap;
-
-  span {
-    width: 6px;
-    height: 6px;
-    flex: 0 0 auto;
-    border-radius: 999px;
-    background: #59b38f;
-    box-shadow: 0 0 12px rgba(89, 179, 143, 0.42);
-  }
-
-  &[data-state="loading"] span {
-    background: #eab308;
-    box-shadow: 0 0 12px rgba(234, 179, 8, 0.42);
-  }
-
-  &[data-state="error"] {
-    border-color: rgba(239, 107, 107, 0.34);
-    color: #ffc8c8;
-  }
-
-  &[data-state="error"] span {
-    background: #ef6b6b;
-    box-shadow: 0 0 12px rgba(239, 107, 107, 0.42);
-  }
-`;
-
 const WebAddressForm = styled.form`
   display: grid;
   min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr) 32px 32px;
+  grid-template-columns: minmax(0, 1fr) 32px 32px;
   align-items: center;
   gap: 6px;
-
-  @media (max-width: 720px) {
-    grid-template-columns: minmax(0, 1fr) 32px 32px;
-
-    ${WebToolbarLabel} {
-      display: none;
-    }
-  }
 `;
 
 const WebAddressInput = styled.input`
@@ -676,6 +602,15 @@ const WebAddressInput = styled.input`
   &:focus {
     border-color: rgba(96, 165, 250, 0.56);
     box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.12);
+  }
+
+  &[data-state="loading"] {
+    border-color: rgba(234, 179, 8, 0.36);
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(239, 107, 107, 0.46);
+    color: #ffc8c8;
   }
 `;
 

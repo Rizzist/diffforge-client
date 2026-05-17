@@ -65,6 +65,29 @@ impl Default for SessionSlotOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TaskHistoryInterval {
+    task_id: String,
+    title: String,
+    status: String,
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    assigned_role: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+    history_started_at: Option<String>,
+    history_finished_at: Option<String>,
+}
+
+impl TaskHistoryInterval {
+    fn effective_finished_at<'a>(&'a self, observed_at: &'a str) -> &'a str {
+        self.finished_at
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(observed_at)
+    }
+}
+
 pub fn now_rfc3339() -> String {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -91,6 +114,18 @@ fn resource_keys_overlap(left: &str, right: &str) -> bool {
     !left.is_empty()
         && !right.is_empty()
         && (resource_covers(left, right) || resource_covers(right, left))
+}
+
+fn task_history_intervals_overlap(
+    left: &TaskHistoryInterval,
+    right: &TaskHistoryInterval,
+    observed_at: &str,
+) -> bool {
+    let left_start = left.started_at.as_str();
+    let right_start = right.started_at.as_str();
+    let left_end = left.effective_finished_at(observed_at);
+    let right_end = right.effective_finished_at(observed_at);
+    left_start <= right_end && right_start <= left_end
 }
 
 pub fn api_ok(data: Value) -> Value {
@@ -616,11 +651,14 @@ impl CoordinationKernel {
                     cloud_allow_code_export, cloud_allow_terminal_log_export,
                     cloud_allow_patch_export, cloud_auto_create_tasks,
                     cloud_auto_assign_agents, cloud_auto_spawn_terminals,
-                    cloud_auto_merge, cloud_contract_memory_enabled, policy_json,
+                    cloud_auto_merge, cloud_contract_memory_enabled,
+                    integrator_enabled, integrator_agent_id, integrator_model,
+                    integrator_reasoning_effort, policy_json,
                     created_at, updated_at
                 ) VALUES(?1, ?2, 0, NULL, 'off', 0, 1, 1, 1, 1, 1, 1,
                     'detect_and_reject_patch', 'reject_patch', 'coordination_only', 1, 1,
-                    'local_only', 0, 0, 0, 0, 0, 0, 0, 1, NULL, ?3, ?3)",
+                    'local_only', 0, 0, 0, 0, 0, 0, 0, 1,
+                    0, 'codex', 'gpt-5.5', 'xhigh', NULL, ?3, ?3)",
                 params![REPO_ID, self.paths.repo_path.display().to_string(), now],
             )
             .map_err(|error| format!("Unable to create default repo policy: {error}"))?;
@@ -6519,8 +6557,35 @@ impl CoordinationKernel {
                 },
                 json!({"patch_id": validation.patch_id, "changed_files": validation.changed_files}),
             )?;
+            let concurrent_resolution = self.complete_concurrent_integrator_task(
+                task_id,
+                validation.patch_id.as_deref(),
+                validation.diff_artifact_id.as_deref(),
+            )?;
+            let concurrent_integration = if let Some(patch_id) = validation.patch_id.as_deref() {
+                self.record_concurrent_integration_batch_if_needed(
+                    task_id,
+                    patch_id,
+                    &validation.changed_files,
+                )
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "tracking_failed",
+                        "error": error,
+                    })
+                })
+            } else {
+                json!({
+                    "status": "skipped",
+                    "reason": "patch_id_missing",
+                })
+            };
             let auto_merge = if let Some(patch_id) = validation.patch_id.as_deref() {
-                self.auto_apply_submitted_patch(patch_id)?
+                self.auto_apply_submitted_patch_for_concurrency(
+                    patch_id,
+                    task_id,
+                    &concurrent_integration,
+                )?
             } else {
                 json!({
                     "status": "skipped",
@@ -6551,6 +6616,8 @@ impl CoordinationKernel {
                     "changed_files": validation.changed_files,
                     "diff_artifact_id": validation.diff_artifact_id,
                     "merge_resolution": merge_resolution,
+                    "concurrent_integration": concurrent_integration,
+                    "concurrent_resolution": concurrent_resolution,
                     "auto_merge": auto_merge,
                     "post_submit_task_status": post_submit_status,
                     "parked_intent_count": parked_intent_count,
@@ -6633,7 +6700,1021 @@ impl CoordinationKernel {
         ))
     }
 
+    fn record_concurrent_integration_batch_if_needed(
+        &self,
+        task_id: &str,
+        patch_id: &str,
+        changed_files: &[String],
+    ) -> Result<Value, String> {
+        let policy = self.repo_policy()?;
+        let settings = json!({
+            "integrator_enabled": value_i64(&policy, "integrator_enabled") != 0,
+            "integrator_agent_id": policy["integrator_agent_id"].as_str().unwrap_or("codex"),
+            "integrator_model": policy["integrator_model"].as_str().unwrap_or("gpt-5.5"),
+            "integrator_reasoning_effort": policy["integrator_reasoning_effort"].as_str().unwrap_or("xhigh"),
+        });
+        if settings["integrator_enabled"].as_bool() != Some(true) {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "integrator_disabled",
+                "integrator": settings,
+            }));
+        }
+
+        let observed_at = now_rfc3339();
+        let group = self.concurrent_task_history_group(task_id, &observed_at)?;
+        if group.len() <= 1 {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "no_concurrent_task_history_overlap",
+                "task_id": task_id,
+                "integrator": settings,
+            }));
+        }
+
+        let group_task_ids = group
+            .iter()
+            .map(|interval| interval.task_id.clone())
+            .collect::<HashSet<_>>();
+        let existing_batch_id = self.open_concurrent_batch_for_tasks(&group_task_ids)?;
+        let existing_batch_existed = existing_batch_id.is_some();
+        let integration = self.ensure_integration_worktree()?;
+        let now = now_rfc3339();
+        let reason_json = json!({
+            "kind": "task_history_concurrency",
+            "reason": "coding_task_intervals_overlap",
+            "trigger_task_id": task_id,
+            "trigger_patch_id": patch_id,
+            "trigger_changed_files": changed_files,
+            "observed_at": observed_at,
+            "task_history": group.iter().map(|interval| {
+                json!({
+                    "task_id": interval.task_id,
+                    "title": interval.title,
+                    "status": interval.status,
+                    "agent_id": interval.agent_id,
+                    "session_id": interval.session_id,
+                    "assigned_role": interval.assigned_role,
+                    "started_at": interval.started_at,
+                    "finished_at": interval.finished_at,
+                    "history_started_at": interval.history_started_at,
+                    "history_finished_at": interval.history_finished_at,
+                })
+            }).collect::<Vec<_>>(),
+            "transitive": true,
+            "main_fast_forward_policy": "defer_until_concurrent_batch_resolved",
+            "integrator": settings,
+        });
+        let batch_id = if let Some(batch_id) = existing_batch_id.clone() {
+            self.conn
+                .execute(
+                    "UPDATE integration_batches
+                     SET status=CASE
+                           WHEN status IN ('resolved', 'merged_to_main', 'failed') THEN status
+                           ELSE 'awaiting_peer_submissions'
+                         END,
+                         base_integration_sha=COALESCE(base_integration_sha, ?1),
+                         reason_json=?2,
+                         updated_at=?3
+                     WHERE id=?4",
+                    params![integration.head_sha, reason_json.to_string(), now, batch_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to update concurrent integration batch: {error}")
+                })?;
+            batch_id
+        } else {
+            let batch_id = uuid();
+            self.conn
+                .execute(
+                    "INSERT INTO integration_batches(
+                        id, repo_id, status, strategy, base_integration_sha, target_branch,
+                        merge_job_id, resolver_task_id, reason_json, created_at, updated_at
+                     ) VALUES(?1, ?2, 'awaiting_peer_submissions', 'concurrent_integrator',
+                        ?3, ?4, NULL, NULL, ?5, ?6, ?6)",
+                    params![
+                        batch_id,
+                        REPO_ID,
+                        integration.head_sha,
+                        INTEGRATION_BRANCH,
+                        reason_json.to_string(),
+                        now
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to create concurrent integration batch: {error}")
+                })?;
+            batch_id
+        };
+
+        let mut item_results = Vec::new();
+        for interval in &group {
+            let item = self.upsert_concurrent_integration_batch_item(
+                &batch_id,
+                interval,
+                (interval.task_id == task_id).then_some(patch_id),
+            )?;
+            item_results.push(item);
+        }
+        let submitted_patch_count = item_results
+            .iter()
+            .filter(|item| {
+                item["patch_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+            .count();
+        let auto_apply_mode = if submitted_patch_count == 1 && !existing_batch_existed {
+            "integration_only"
+        } else {
+            "queue_for_integrator"
+        };
+        let auto_apply_reason = if auto_apply_mode == "integration_only" {
+            "first_submitted_patch_in_concurrent_batch"
+        } else {
+            "concurrent_batch_requires_integrator"
+        };
+
+        self.emit_event(
+            if existing_batch_existed {
+                "concurrent_integration_batch_updated"
+            } else {
+                "concurrent_integration_batch_created"
+            },
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "batch_id": batch_id,
+                "trigger_task_id": task_id,
+                "trigger_patch_id": patch_id,
+                "task_ids": group.iter().map(|interval| interval.task_id.clone()).collect::<Vec<_>>(),
+                "items": item_results,
+                "reason": reason_json,
+            }),
+        )?;
+
+        Ok(json!({
+            "status": if existing_batch_existed { "updated" } else { "created" },
+            "batch_id": batch_id,
+            "strategy": "concurrent_integrator",
+            "batch_status": "awaiting_peer_submissions",
+            "submitted_patch_count": submitted_patch_count,
+            "auto_apply": {
+                "mode": auto_apply_mode,
+                "reason": auto_apply_reason,
+                "main_fast_forward_policy": "defer_until_concurrent_batch_resolved"
+            },
+            "task_ids": group.iter().map(|interval| interval.task_id.clone()).collect::<Vec<_>>(),
+            "items": item_results,
+            "integrator": settings,
+        }))
+    }
+
+    fn concurrent_task_history_group(
+        &self,
+        task_id: &str,
+        observed_at: &str,
+    ) -> Result<Vec<TaskHistoryInterval>, String> {
+        let intervals = self.task_history_intervals(observed_at)?;
+        let Some(seed) = intervals
+            .iter()
+            .find(|interval| interval.task_id == task_id)
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut included = HashSet::from([seed.task_id.clone()]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for candidate in &intervals {
+                if included.contains(&candidate.task_id) {
+                    continue;
+                }
+                let overlaps_included = intervals
+                    .iter()
+                    .filter(|interval| included.contains(&interval.task_id))
+                    .any(|interval| {
+                        task_history_intervals_overlap(interval, candidate, observed_at)
+                    });
+                if overlaps_included {
+                    included.insert(candidate.task_id.clone());
+                    changed = true;
+                }
+            }
+        }
+
+        Ok(intervals
+            .into_iter()
+            .filter(|interval| included.contains(&interval.task_id))
+            .collect())
+    }
+
+    fn task_history_intervals(
+        &self,
+        observed_at: &str,
+    ) -> Result<Vec<TaskHistoryInterval>, String> {
+        let rows = self.query_json(
+            "SELECT t.id,
+                    t.title,
+                    t.status,
+                    t.claimed_by_agent_id,
+                    t.claimed_session_id,
+                    t.assigned_role,
+                    t.started_at,
+                    t.finished_at,
+                    t.created_at,
+                    (
+                        SELECT MIN(e.created_at)
+                        FROM events e
+                        WHERE e.task_id=t.id
+                          AND e.event_type IN (
+                            'task_claimed',
+                            'task_resume_requested',
+                            'task_dependencies_satisfied'
+                          )
+                    ) AS history_started_at,
+                    (
+                        SELECT MIN(e.created_at)
+                        FROM events e
+                        WHERE e.task_id=t.id
+                          AND e.event_type IN (
+                            'patch_submitted',
+                            'task_noop_submitted',
+                            'task_stopped',
+                            'task_interrupted',
+                            'task_cancelled',
+                            'merge_succeeded'
+                          )
+                    ) AS history_finished_at
+             FROM tasks t
+             WHERE COALESCE(t.assigned_role, '') NOT IN ('merge_resolution', 'integrator')
+               AND (
+                    COALESCE(t.claimed_session_id, '') <> ''
+                    OR EXISTS(SELECT 1 FROM events e WHERE e.task_id=t.id)
+               )
+             ORDER BY COALESCE(history_started_at, t.started_at, t.created_at) ASC",
+            &[],
+        )?;
+        let intervals = rows
+            .into_iter()
+            .filter_map(|row| {
+                let task_id = row["id"].as_str()?.to_string();
+                let status = row["status"].as_str().unwrap_or("unknown").to_string();
+                let started_at = row["history_started_at"]
+                    .as_str()
+                    .or_else(|| row["started_at"].as_str())
+                    .or_else(|| row["created_at"].as_str())
+                    .unwrap_or(observed_at)
+                    .to_string();
+                let interval_can_close = matches!(
+                    status.as_str(),
+                    "patch_submitted"
+                        | "resolved_patch_submitted"
+                        | "merged"
+                        | "done"
+                        | "completed"
+                        | "cancelled"
+                        | "interrupted"
+                        | "skipped"
+                );
+                let finished_at = if interval_can_close {
+                    row["history_finished_at"]
+                        .as_str()
+                        .or_else(|| row["finished_at"].as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                Some(TaskHistoryInterval {
+                    task_id,
+                    title: row["title"].as_str().unwrap_or("Untitled task").to_string(),
+                    status,
+                    agent_id: row["claimed_by_agent_id"].as_str().map(str::to_string),
+                    session_id: row["claimed_session_id"].as_str().map(str::to_string),
+                    assigned_role: row["assigned_role"].as_str().map(str::to_string),
+                    started_at,
+                    finished_at,
+                    history_started_at: row["history_started_at"].as_str().map(str::to_string),
+                    history_finished_at: row["history_finished_at"].as_str().map(str::to_string),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(intervals)
+    }
+
+    fn open_concurrent_batch_for_tasks(
+        &self,
+        task_ids: &HashSet<String>,
+    ) -> Result<Option<String>, String> {
+        if task_ids.is_empty() {
+            return Ok(None);
+        }
+        let rows = self.query_json(
+            "SELECT b.id AS batch_id, i.task_id
+             FROM integration_batches b
+             JOIN integration_batch_items i ON i.batch_id=b.id
+             WHERE b.strategy='concurrent_integrator'
+               AND b.status IN (
+                    'open_concurrent',
+                    'awaiting_peer_submissions',
+                    'integrator_reviewing'
+               )
+             ORDER BY b.updated_at DESC",
+            &[],
+        )?;
+        Ok(rows.into_iter().find_map(|row| {
+            let task_id = row["task_id"].as_str()?;
+            if task_ids.contains(task_id) {
+                row["batch_id"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        }))
+    }
+
+    fn upsert_concurrent_integration_batch_item(
+        &self,
+        batch_id: &str,
+        interval: &TaskHistoryInterval,
+        trigger_patch_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let patch = if let Some(patch_id) = trigger_patch_id {
+            Some(self.get_patch(patch_id)?)
+        } else {
+            self.latest_patch_for_task(&interval.task_id)?
+        };
+        let patch_id = patch
+            .as_ref()
+            .and_then(|patch| patch["id"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let base_sha = patch.as_ref().and_then(|patch| patch["base_sha"].as_str());
+        let agent_id = patch
+            .as_ref()
+            .and_then(|patch| patch["agent_id"].as_str())
+            .or(interval.agent_id.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let changed_files = if patch_id.is_empty() {
+            Vec::new()
+        } else {
+            self.patch_file_paths(&patch_id)?
+        };
+        let patch_status = patch
+            .as_ref()
+            .and_then(|patch| patch["status"].as_str())
+            .unwrap_or_default();
+        let item_status = if patch_id.is_empty() {
+            "pending_submission"
+        } else if patch_status == "merged" {
+            "applied_to_integration"
+        } else {
+            "queued_for_integrator"
+        };
+        let intent_summary = self.task_intent_summary(&interval.task_id)?;
+        let now = now_rfc3339();
+        let existing_item_id = self
+            .query_json(
+                "SELECT id FROM integration_batch_items
+                 WHERE batch_id=?1 AND task_id=?2
+                 ORDER BY updated_at DESC LIMIT 1",
+                &[&batch_id, &interval.task_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["id"].as_str().map(str::to_string));
+        if let Some(item_id) = existing_item_id.as_deref() {
+            self.conn
+                .execute(
+                    "UPDATE integration_batch_items
+                     SET patch_id=?1,
+                         agent_id=?2,
+                         base_sha=?3,
+                         changed_files_json=?4,
+                         intent_summary=?5,
+                         status=?6,
+                         updated_at=?7
+                     WHERE id=?8",
+                    params![
+                        patch_id,
+                        agent_id,
+                        base_sha,
+                        json!(changed_files).to_string(),
+                        intent_summary,
+                        item_status,
+                        now,
+                        item_id
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to update concurrent integration batch item: {error}")
+                })?;
+        } else {
+            self.conn
+                .execute(
+                    "INSERT INTO integration_batch_items(
+                        id, batch_id, task_id, patch_id, agent_id, base_sha,
+                        changed_files_json, intent_summary, status, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                    params![
+                        uuid(),
+                        batch_id,
+                        interval.task_id,
+                        patch_id,
+                        agent_id,
+                        base_sha,
+                        json!(changed_files).to_string(),
+                        intent_summary,
+                        item_status,
+                        now
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to insert concurrent integration batch item: {error}")
+                })?;
+        }
+        Ok(json!({
+            "task_id": interval.task_id,
+            "patch_id": patch_id,
+            "status": item_status,
+            "agent_id": agent_id,
+            "changed_files": changed_files,
+            "started_at": interval.started_at,
+            "finished_at": interval.finished_at,
+        }))
+    }
+
+    fn latest_patch_for_task(&self, task_id: &str) -> Result<Option<Value>, String> {
+        Ok(self
+            .query_json(
+                "SELECT * FROM patches
+                 WHERE task_id=?1
+                 ORDER BY created_at DESC, updated_at DESC
+                 LIMIT 1",
+                &[&task_id],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    fn task_intent_summary(&self, task_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .query_json(
+                "SELECT title, body FROM tasks WHERE id=?1 LIMIT 1",
+                &[&task_id],
+            )?
+            .into_iter()
+            .next()
+            .map(|task| {
+                let title = task["title"].as_str().unwrap_or("Untitled task");
+                let body = task["body"].as_str().unwrap_or_default();
+                if body.trim().is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title}: {body}")
+                }
+            }))
+    }
+
+    fn auto_apply_submitted_patch_for_concurrency(
+        &self,
+        patch_id: &str,
+        task_id: &str,
+        concurrent_integration: &Value,
+    ) -> Result<Value, String> {
+        let mode = concurrent_integration["auto_apply"]["mode"]
+            .as_str()
+            .unwrap_or_default();
+        match mode {
+            "integration_only" => {
+                let batch_id = concurrent_integration["batch_id"].as_str();
+                self.auto_apply_submitted_patch_with_root_policy(
+                    patch_id,
+                    false,
+                    batch_id,
+                    Some("concurrent_batch_first_patch"),
+                )
+            }
+            "queue_for_integrator" => {
+                let Some(batch_id) = concurrent_integration["batch_id"].as_str() else {
+                    return Ok(json!({
+                        "status": "blocked",
+                        "stage": "concurrent_integrator_queue",
+                        "reason": "batch_id_missing",
+                    }));
+                };
+                self.queue_concurrent_patch_for_integrator(batch_id, task_id, patch_id)
+            }
+            _ => self.auto_apply_submitted_patch(patch_id),
+        }
+    }
+
+    fn queue_concurrent_patch_for_integrator(
+        &self,
+        batch_id: &str,
+        task_id: &str,
+        patch_id: &str,
+    ) -> Result<Value, String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE integration_batch_items
+                 SET status='queued_for_integrator', updated_at=?1
+                 WHERE batch_id=?2 AND task_id=?3",
+                params![now, batch_id, task_id],
+            )
+            .map_err(|error| format!("Unable to mark patch queued for integrator: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE integration_batches
+                 SET status='integrator_reviewing', updated_at=?1
+                 WHERE id=?2
+                   AND status NOT IN ('resolved', 'resolved_patch_submitted', 'merged_to_main', 'failed')",
+                params![now, batch_id],
+            )
+            .map_err(|error| format!("Unable to mark batch integrator_reviewing: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE task_resource_intents
+                 SET status='done', updated_at=?1
+                 WHERE task_id=?2 AND status IN ('planned', 'lease_granted')",
+                params![now, task_id],
+            )
+            .map_err(|error| format!("Unable to mark queued task intents done: {error}"))?;
+        let released_leases = self.release_active_leases_for_task_with_event(
+            task_id,
+            "queued_for_concurrent_integrator",
+            "task_leases_released_after_concurrent_integrator_queue",
+        )?;
+        let integrator = self.ensure_concurrent_integrator_task_for_batch(
+            batch_id,
+            Some(task_id),
+            Some(patch_id),
+        )?;
+        self.emit_event(
+            "concurrent_patch_queued_for_integrator",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "batch_id": batch_id,
+                "patch_id": patch_id,
+                "released_leases": released_leases,
+                "integrator": integrator,
+            }),
+        )?;
+        Ok(json!({
+            "status": "queued_for_integrator",
+            "stage": "concurrent_integrator_queue",
+            "batch_id": batch_id,
+            "patch_id": patch_id,
+            "released_leases": released_leases,
+            "integrator": integrator,
+        }))
+    }
+
+    fn ensure_concurrent_integrator_task_for_batch(
+        &self,
+        batch_id: &str,
+        trigger_task_id: Option<&str>,
+        trigger_patch_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let policy = self.repo_policy()?;
+        if value_i64(&policy, "integrator_enabled") == 0 {
+            return Ok(json!({"status": "skipped", "reason": "integrator_disabled"}));
+        }
+        let configured_agent = policy["integrator_agent_id"]
+            .as_str()
+            .unwrap_or("codex")
+            .trim();
+        let integrator_model = policy["integrator_model"].as_str().unwrap_or("gpt-5.5");
+        let reasoning_effort = policy["integrator_reasoning_effort"]
+            .as_str()
+            .unwrap_or("xhigh");
+        let batch = self.query_one(
+            "SELECT * FROM integration_batches WHERE id=?1",
+            &[&batch_id],
+            "Integration batch does not exist.",
+        )?;
+        if batch["strategy"].as_str() != Some("concurrent_integrator") {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "not_concurrent_integrator_batch",
+                "batch_id": batch_id,
+            }));
+        }
+        let mut existing_task_id = batch["resolver_task_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let items = self.concurrent_integration_batch_items(batch_id)?;
+        let changed_files = concurrent_batch_changed_files(&items);
+        let prompt = concurrent_integrator_prompt(
+            batch_id,
+            trigger_task_id,
+            trigger_patch_id,
+            &items,
+            &changed_files,
+            configured_agent,
+            integrator_model,
+            reasoning_effort,
+        );
+
+        if existing_task_id.is_none() {
+            let task = self.create_task(
+                &format!("Integrate concurrent batch {}", short_id(batch_id)),
+                Some("Concurrent integration review is being initialized by the local coordination kernel."),
+                100,
+                3,
+                None,
+                None,
+                Some("integrator"),
+                Some("Submit one resolved integration patch. Do not call apply_merge."),
+            )?;
+            let task_id = task["id"]
+                .as_str()
+                .ok_or_else(|| "Integrator task response is missing id.".to_string())?
+                .to_string();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET body=?1, parent_task_id=?2, expected_output=?3, updated_at=?4
+                     WHERE id=?5",
+                    params![
+                        prompt,
+                        trigger_task_id,
+                        "Resolved concurrent integration patch submitted through submit_patch; no direct apply_merge.",
+                        now_rfc3339(),
+                        task_id
+                    ],
+                )
+                .map_err(|error| format!("Unable to update integrator task prompt: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE integration_batches
+                     SET resolver_task_id=?1, status='integrator_reviewing', updated_at=?2
+                     WHERE id=?3",
+                    params![task_id, now_rfc3339(), batch_id],
+                )
+                .map_err(|error| format!("Unable to attach integrator task to batch: {error}"))?;
+            existing_task_id = Some(task_id);
+        } else if let Some(task_id) = existing_task_id.as_deref() {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET body=?1, updated_at=?2
+                     WHERE id=?3 AND status NOT IN ('merged', 'done', 'completed', 'cancelled', 'interrupted', 'skipped')",
+                    params![prompt, now_rfc3339(), task_id],
+                )
+                .map_err(|error| format!("Unable to refresh integrator prompt: {error}"))?;
+        }
+
+        let Some(task_id) = existing_task_id else {
+            return Ok(json!({"status": "blocked", "reason": "integrator_task_missing"}));
+        };
+        let integrator_session = self.select_concurrent_integrator_session(configured_agent)?;
+        let Some(session) = integrator_session else {
+            self.emit_event(
+                "concurrent_integrator_waiting_for_session",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "batch_id": batch_id,
+                    "integrator_agent_id": configured_agent,
+                    "model": integrator_model,
+                    "reasoning_effort": reasoning_effort,
+                }),
+            )?;
+            return Ok(json!({
+                "status": "waiting_for_integrator_session",
+                "batch_id": batch_id,
+                "integrator_task_id": task_id,
+                "integrator_agent_id": configured_agent,
+                "model": integrator_model,
+                "reasoning_effort": reasoning_effort,
+            }));
+        };
+
+        let worktree_refresh = self
+            .refresh_concurrent_integrator_session_to_integration(&session, &task_id, batch_id)?;
+        if worktree_refresh["status"].as_str() != Some("refreshed") {
+            self.emit_event(
+                "concurrent_integrator_waiting_for_clean_worktree",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "batch_id": batch_id,
+                    "integrator_agent_id": configured_agent,
+                    "model": integrator_model,
+                    "reasoning_effort": reasoning_effort,
+                    "worktree_refresh": worktree_refresh,
+                }),
+            )?;
+            return Ok(json!({
+                "status": "waiting_for_clean_integrator_worktree",
+                "batch_id": batch_id,
+                "integrator_task_id": task_id,
+                "integrator_agent_id": configured_agent,
+                "model": integrator_model,
+                "reasoning_effort": reasoning_effort,
+                "worktree_refresh": worktree_refresh,
+            }));
+        }
+
+        let agent_id = session["agent_id"]
+            .as_str()
+            .ok_or_else(|| "Integrator session is missing agent_id.".to_string())?;
+        let session_id = session["id"]
+            .as_str()
+            .ok_or_else(|| "Integrator session is missing id.".to_string())?;
+        let task = self.query_one(
+            "SELECT status, claimed_session_id FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Integrator task does not exist.",
+        )?;
+        let claimed_session_id = task["claimed_session_id"].as_str().unwrap_or_default();
+        if claimed_session_id.is_empty() {
+            let claimed = self.claim_task(&task_id, agent_id, session_id)?;
+            if claimed["ok"].as_bool() == Some(false) {
+                return Ok(api_error(
+                    "concurrent_integrator_claim_failed",
+                    "Unable to claim the concurrent integrator task.",
+                    json!({"batch_id": batch_id, "claim": claimed}),
+                ));
+            }
+        }
+
+        let released_prior_leases = self.release_resolver_file_leases(&changed_files, agent_id)?;
+        let mut leases = Vec::new();
+        for path in &changed_files {
+            let lease = self.acquire_lease(
+                &task_id,
+                agent_id,
+                session_id,
+                &path_to_file_resource(path),
+                "write",
+                Some(DEFAULT_LEASE_TTL_SECONDS),
+                Some("concurrent_integrator"),
+            )?;
+            leases.push(lease);
+        }
+        self.emit_event(
+            "concurrent_integrator_task_initialized",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.clone()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "batch_id": batch_id,
+                "changed_files": changed_files,
+                "released_prior_leases": released_prior_leases,
+                "leases": leases,
+                "worktree_refresh": worktree_refresh,
+                "model": integrator_model,
+                "reasoning_effort": reasoning_effort,
+            }),
+        )?;
+        Ok(json!({
+            "status": "initialized",
+            "batch_id": batch_id,
+            "integrator_task_id": task_id,
+            "integrator_agent_id": agent_id,
+            "integrator_session_id": session_id,
+            "changed_files": changed_files,
+            "released_prior_leases": released_prior_leases,
+            "leases": leases,
+            "worktree_refresh": worktree_refresh,
+            "model": integrator_model,
+            "reasoning_effort": reasoning_effort,
+        }))
+    }
+
+    fn select_concurrent_integrator_session(
+        &self,
+        configured_agent: &str,
+    ) -> Result<Option<Value>, String> {
+        let configured = configured_agent.trim();
+        if configured.is_empty() {
+            return Ok(None);
+        }
+        let mut rows = self.query_json(
+            "SELECT s.*, a.name AS agent_name, a.kind AS agent_kind, w.path AS worktree_path
+             FROM agent_sessions s
+             JOIN agents a ON a.id=s.agent_id
+             JOIN worktrees w ON w.id=s.worktree_id
+             WHERE s.status='active'
+               AND s.worktree_id IS NOT NULL
+               AND COALESCE(s.task_id, '')=''
+               AND (
+                    s.agent_id=?1
+                    OR lower(a.kind)=lower(?1)
+                    OR lower(a.name)=lower(?1)
+               )
+             ORDER BY s.updated_at DESC
+             LIMIT 1",
+            &[&configured],
+        )?;
+        Ok(rows.pop())
+    }
+
+    fn refresh_concurrent_integrator_session_to_integration(
+        &self,
+        session: &Value,
+        task_id: &str,
+        batch_id: &str,
+    ) -> Result<Value, String> {
+        let Some(worktree_path) = session["worktree_path"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+        else {
+            return Ok(json!({
+                "status": "blocked",
+                "reason": "integrator_worktree_path_missing",
+            }));
+        };
+        let mut refresh = self.refresh_agent_worktree_from_integration(&worktree_path)?;
+        if let Some(current_sha) = refresh["current_sha"].as_str() {
+            if let Some(worktree_id) = session["worktree_id"].as_str() {
+                let _ = self.conn.execute(
+                    "UPDATE worktrees SET base_sha=?1, current_sha=?1, updated_at=?2 WHERE id=?3",
+                    params![current_sha, now_rfc3339(), worktree_id],
+                );
+            }
+            if let Some(session_id) = session["id"].as_str() {
+                let _ = self.conn.execute(
+                    "UPDATE agent_sessions SET base_git_sha=?1, current_git_sha=?1, updated_at=?2 WHERE id=?3",
+                    params![current_sha, now_rfc3339(), session_id],
+                );
+            }
+        }
+        if let Some(object) = refresh.as_object_mut() {
+            object.insert("batch_id".to_string(), json!(batch_id));
+            object.insert("task_id".to_string(), json!(task_id));
+            object.insert(
+                "worktree_path".to_string(),
+                json!(process_path_text(&worktree_path)),
+            );
+            object.insert("worktree_id".to_string(), session["worktree_id"].clone());
+            object.insert("session_id".to_string(), session["id"].clone());
+        }
+        self.emit_event(
+            "concurrent_integrator_worktree_refreshed",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: session["agent_id"].as_str().map(str::to_string),
+                session_id: session["id"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
+            refresh.clone(),
+        )?;
+        Ok(refresh)
+    }
+
+    fn concurrent_integration_batch_items(&self, batch_id: &str) -> Result<Vec<Value>, String> {
+        self.query_json(
+            "SELECT i.*,
+                    t.title AS task_title,
+                    t.body AS task_body,
+                    t.status AS task_status,
+                    t.started_at AS task_started_at,
+                    t.finished_at AS task_finished_at,
+                    p.status AS patch_status,
+                    p.diff_artifact_id AS diff_artifact_id,
+                    p.diff_hash AS diff_hash,
+                    p.created_at AS patch_created_at
+             FROM integration_batch_items i
+             LEFT JOIN tasks t ON t.id=i.task_id
+             LEFT JOIN patches p ON p.id=i.patch_id
+             WHERE i.batch_id=?1
+             ORDER BY COALESCE(t.started_at, i.created_at) ASC, i.created_at ASC",
+            &[&batch_id],
+        )
+    }
+
+    fn complete_concurrent_integrator_task(
+        &self,
+        task_id: &str,
+        resolved_patch_id: Option<&str>,
+        resolved_diff_artifact_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let rows = self.query_json(
+            "SELECT * FROM integration_batches
+             WHERE resolver_task_id=?1
+               AND strategy='concurrent_integrator'
+               AND status IN ('integrator_reviewing', 'resolved_patch_submitted')
+             ORDER BY updated_at DESC",
+            &[&task_id],
+        )?;
+        if rows.is_empty() {
+            return Ok(Value::Null);
+        }
+        let now = now_rfc3339();
+        let mut completed = Vec::new();
+        for row in rows {
+            let Some(batch_id) = row["id"].as_str() else {
+                continue;
+            };
+            let mut reason = row["reason_json"].clone();
+            if !reason.is_object() {
+                reason = json!({});
+            }
+            if let Some(object) = reason.as_object_mut() {
+                object.insert(
+                    "resolved_patch_id".to_string(),
+                    json!(resolved_patch_id.unwrap_or_default()),
+                );
+                object.insert(
+                    "resolved_diff_artifact_id".to_string(),
+                    json!(resolved_diff_artifact_id.unwrap_or_default()),
+                );
+                object.insert("resolved_at".to_string(), json!(now.clone()));
+            }
+            self.conn
+                .execute(
+                    "UPDATE integration_batches
+                     SET status='resolved_patch_submitted', reason_json=?1, updated_at=?2
+                     WHERE id=?3",
+                    params![reason.to_string(), now, batch_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to update concurrent batch after integrator submit: {error}")
+                })?;
+            self.conn
+                .execute(
+                    "UPDATE integration_batch_items
+                     SET status=CASE
+                           WHEN task_id=?1 THEN 'resolved'
+                           WHEN status='pending_submission' THEN status
+                           ELSE 'preserved'
+                         END,
+                         updated_at=?2
+                     WHERE batch_id=?3",
+                    params![task_id, now, batch_id],
+                )
+                .map_err(|error| {
+                    format!(
+                        "Unable to update concurrent batch items after integrator submit: {error}"
+                    )
+                })?;
+            self.emit_event(
+                "concurrent_integrator_patch_submitted",
+                "agent",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    artifact_id: resolved_diff_artifact_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "batch_id": batch_id,
+                    "resolved_patch_id": resolved_patch_id,
+                    "resolved_diff_artifact_id": resolved_diff_artifact_id,
+                }),
+            )?;
+            completed.push(json!({
+                "batch_id": batch_id,
+                "resolved_patch_id": resolved_patch_id,
+                "resolved_diff_artifact_id": resolved_diff_artifact_id,
+            }));
+        }
+        Ok(json!({"status": "completed", "items": completed}))
+    }
+
     fn auto_apply_submitted_patch(&self, patch_id: &str) -> Result<Value, String> {
+        self.auto_apply_submitted_patch_with_root_policy(patch_id, true, None, None)
+    }
+
+    fn auto_apply_submitted_patch_with_root_policy(
+        &self,
+        patch_id: &str,
+        fast_forward_root: bool,
+        concurrent_batch_id: Option<&str>,
+        root_defer_reason: Option<&str>,
+    ) -> Result<Value, String> {
         if let Some(intent_risk) = self.intent_resolution_risk_for_patch(patch_id)? {
             let resolution = match self.initialize_merge_resolution_inner(
                 patch_id,
@@ -6731,7 +7812,12 @@ impl CoordinationKernel {
                 "merge": queued,
             }));
         };
-        let applied = self.apply_merge(merge_job_id)?;
+        let applied = self.apply_merge_internal(
+            merge_job_id,
+            fast_forward_root,
+            concurrent_batch_id,
+            root_defer_reason,
+        )?;
         let status = if applied["ok"].as_bool() == Some(true) {
             "applied"
         } else {
@@ -8239,6 +9325,16 @@ impl CoordinationKernel {
     }
 
     pub fn apply_merge(&self, merge_job_id: &str) -> Result<Value, String> {
+        self.apply_merge_internal(merge_job_id, true, None, None)
+    }
+
+    fn apply_merge_internal(
+        &self,
+        merge_job_id: &str,
+        fast_forward_root: bool,
+        concurrent_batch_id: Option<&str>,
+        root_defer_reason: Option<&str>,
+    ) -> Result<Value, String> {
         let job = self.get_merge_job(merge_job_id)?;
         let status = job["status"].as_str().unwrap_or_default();
         if !matches!(status, "queued" | "checking") {
@@ -8441,15 +9537,70 @@ impl CoordinationKernel {
                 {
                     let _ = self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID);
                 }
-                let root_fast_forward = self
-                    .fast_forward_repo_root_to_integration()
-                    .unwrap_or_else(|error| {
-                        json!({
-                            "status": "deferred",
-                            "error": error,
-                            "resume_instruction": "Integration commit succeeded, but the visible repo root could not be fast-forwarded automatically.",
+                let root_fast_forward = if fast_forward_root {
+                    self.fast_forward_repo_root_to_integration()
+                        .unwrap_or_else(|error| {
+                            json!({
+                                "status": "deferred",
+                                "error": error,
+                                "resume_instruction": "Integration commit succeeded, but the visible repo root could not be fast-forwarded automatically.",
+                            })
                         })
-                    });
+                } else {
+                    let reason =
+                        root_defer_reason.unwrap_or("root_fast_forward_deferred_by_policy");
+                    let batch_id = concurrent_batch_id.unwrap_or_default();
+                    self.emit_event(
+                        "repo_root_fast_forward_deferred",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs::from_patch(&patch),
+                        json!({
+                            "target_branch": INTEGRATION_BRANCH,
+                            "reason": reason,
+                            "batch_id": batch_id,
+                            "patch_id": patch_id,
+                            "policy": "concurrent_batch_defers_main_until_integrator_resolves",
+                        }),
+                    )?;
+                    json!({
+                        "status": "deferred_concurrent_integration_batch",
+                        "target_branch": INTEGRATION_BRANCH,
+                        "batch_id": batch_id,
+                        "reason": reason,
+                        "resume_instruction": "Patch was committed to diff-forge/integration. Main/root fast-forward is deferred until the concurrent integration batch is resolved.",
+                    })
+                };
+                let concurrent_batch_refresh = if let Some(batch_id) = concurrent_batch_id {
+                    self.mark_concurrent_batch_patch_applied_to_integration(
+                        batch_id,
+                        patch_id,
+                        merge_job_id,
+                        &root_fast_forward,
+                    )
+                    .unwrap_or_else(|error| {
+                        api_error(
+                            "concurrent_batch_update_failed",
+                            "Merge succeeded, but the concurrent batch record could not be updated.",
+                            json!({"batch_id": batch_id, "patch_id": patch_id, "error": error}),
+                        )
+                    })
+                } else if let Some(task_id) = patch["task_id"].as_str() {
+                    self.finish_concurrent_batch_after_integrator_merge(
+                        task_id,
+                        patch_id,
+                        &root_fast_forward,
+                    )
+                    .unwrap_or_else(|error| {
+                        api_error(
+                            "concurrent_batch_finalization_failed",
+                            "Integrator merge succeeded, but the concurrent batch could not be finalized.",
+                            json!({"task_id": task_id, "patch_id": patch_id, "error": error}),
+                        )
+                    })
+                } else {
+                    json!({"status": "skipped", "reason": "patch_missing_task_id"})
+                };
                 let post_merge_schedule = if let Some(task_id) = patch["task_id"].as_str() {
                     self.post_integration_merge_schedule(
                         task_id,
@@ -8474,6 +9625,7 @@ impl CoordinationKernel {
                         "task_status": task_status_after_merge,
                         "cleared_session_task": cleared_session_task,
                         "root_fast_forward": root_fast_forward.clone(),
+                        "concurrent_batch": concurrent_batch_refresh.clone(),
                         "post_merge_schedule": post_merge_schedule.clone(),
                     }),
                 )?;
@@ -8507,6 +9659,7 @@ impl CoordinationKernel {
                     "source_worktree_refresh": source_worktree_refresh,
                     "released_leases": released_leases,
                     "root_fast_forward": root_fast_forward,
+                    "concurrent_batch": concurrent_batch_refresh,
                     "post_merge_schedule": post_merge_schedule,
                     "predicate_dependency_refresh": predicate_dependency_refresh,
                 })))
@@ -8527,6 +9680,134 @@ impl CoordinationKernel {
                 ))
             }
         }
+    }
+
+    fn mark_concurrent_batch_patch_applied_to_integration(
+        &self,
+        batch_id: &str,
+        patch_id: &str,
+        merge_job_id: &str,
+        root_fast_forward: &Value,
+    ) -> Result<Value, String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE integration_batch_items
+                 SET status='applied_to_integration', updated_at=?1
+                 WHERE batch_id=?2 AND patch_id=?3",
+                params![now, batch_id, patch_id],
+            )
+            .map_err(|error| {
+                format!("Unable to mark concurrent patch applied to integration: {error}")
+            })?;
+        self.conn
+            .execute(
+                "UPDATE integration_batches
+                 SET status='awaiting_peer_submissions', updated_at=?1
+                 WHERE id=?2
+                   AND status NOT IN ('integrator_reviewing', 'resolved_patch_submitted', 'merged_to_main', 'failed')",
+                params![now, batch_id],
+            )
+            .map_err(|error| format!("Unable to update concurrent batch after apply: {error}"))?;
+        self.emit_event(
+            "concurrent_patch_applied_to_integration",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "batch_id": batch_id,
+                "patch_id": patch_id,
+                "merge_job_id": merge_job_id,
+                "root_fast_forward": root_fast_forward,
+            }),
+        )?;
+        Ok(json!({
+            "status": "applied_to_integration",
+            "batch_id": batch_id,
+            "patch_id": patch_id,
+            "merge_job_id": merge_job_id,
+        }))
+    }
+
+    fn finish_concurrent_batch_after_integrator_merge(
+        &self,
+        integrator_task_id: &str,
+        resolved_patch_id: &str,
+        root_fast_forward: &Value,
+    ) -> Result<Value, String> {
+        let rows = self.query_json(
+            "SELECT * FROM integration_batches
+             WHERE resolver_task_id=?1
+               AND strategy='concurrent_integrator'
+               AND status IN ('integrator_reviewing', 'resolved_patch_submitted')",
+            &[&integrator_task_id],
+        )?;
+        if rows.is_empty() {
+            return Ok(json!({"status": "skipped", "reason": "not_concurrent_integrator_task"}));
+        }
+        let now = now_rfc3339();
+        let mut finished = Vec::new();
+        for row in rows {
+            let Some(batch_id) = row["id"].as_str() else {
+                continue;
+            };
+            let final_status = if matches!(
+                root_fast_forward["status"].as_str(),
+                Some("fast_forwarded" | "already_current")
+            ) {
+                "merged_to_main"
+            } else {
+                "resolved"
+            };
+            self.conn
+                .execute(
+                    "UPDATE integration_batches
+                     SET status=?1, updated_at=?2
+                     WHERE id=?3",
+                    params![final_status, now, batch_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to finish concurrent integration batch: {error}")
+                })?;
+            self.conn
+                .execute(
+                    "UPDATE integration_batch_items
+                     SET status=CASE
+                           WHEN task_id=?1 THEN 'resolved'
+                           WHEN status IN ('pending_submission', 'queued_for_integrator', 'applied_to_integration', 'preserved') THEN 'preserved'
+                           ELSE status
+                         END,
+                         updated_at=?2
+                     WHERE batch_id=?3",
+                    params![integrator_task_id, now, batch_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to finish concurrent integration batch items: {error}")
+                })?;
+            self.emit_event(
+                "concurrent_integration_batch_finished",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(integrator_task_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "batch_id": batch_id,
+                    "resolved_patch_id": resolved_patch_id,
+                    "status": final_status,
+                    "root_fast_forward": root_fast_forward,
+                }),
+            )?;
+            finished.push(json!({
+                "batch_id": batch_id,
+                "status": final_status,
+            }));
+        }
+        Ok(json!({
+            "status": "finished",
+            "items": finished,
+        }))
     }
 
     fn create_merge_job(
@@ -11385,6 +12666,20 @@ impl CoordinationKernel {
             "merge_resolution_tasks": self.query_json("SELECT * FROM merge_resolution_tasks ORDER BY updated_at DESC LIMIT 200", &[])?,
             "integration_batches": self.query_json("SELECT * FROM integration_batches ORDER BY updated_at DESC LIMIT 200", &[])?,
             "integration_batch_items": self.query_json("SELECT * FROM integration_batch_items ORDER BY updated_at DESC LIMIT 400", &[])?,
+            "concurrent_integration_batches": self.query_json(
+                "SELECT b.*,
+                        COUNT(i.id) AS item_count,
+                        SUM(CASE WHEN i.patch_id IS NOT NULL AND i.patch_id <> '' THEN 1 ELSE 0 END) AS submitted_patch_count,
+                        GROUP_CONCAT(i.task_id) AS task_ids,
+                        GROUP_CONCAT(i.status) AS item_statuses
+                 FROM integration_batches b
+                 LEFT JOIN integration_batch_items i ON i.batch_id=b.id
+                 WHERE b.strategy='concurrent_integrator'
+                 GROUP BY b.id
+                 ORDER BY b.updated_at DESC
+                 LIMIT 100",
+                &[],
+            )?,
             "artifacts": self.query_json("SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 200", &[])?,
             "artifact_storage_logs": self.query_json("SELECT * FROM artifact_storage_logs ORDER BY created_at DESC LIMIT 200", &[])?,
             "approvals": self.query_json("SELECT * FROM approvals ORDER BY created_at DESC LIMIT 200", &[])?,
@@ -13140,6 +14435,10 @@ impl CoordinationKernel {
             "merge_gate_required",
             "unleased_write_policy",
             "merge_requires_clean_target",
+            "integrator_enabled",
+            "integrator_agent_id",
+            "integrator_model",
+            "integrator_reasoning_effort",
         ];
         let hard_gates = [
             "agent_worktree_required",
@@ -13166,6 +14465,23 @@ impl CoordinationKernel {
             if policy != "reject_patch" {
                 return Err(
                     "unleased_write_policy cannot be loosened; use reject_patch.".to_string(),
+                );
+            }
+        }
+        if let Some(agent_id) = patch["integrator_agent_id"].as_str() {
+            if agent_id.trim().is_empty() {
+                return Err("integrator_agent_id cannot be empty.".to_string());
+            }
+        }
+        if let Some(model) = patch["integrator_model"].as_str() {
+            if model.trim().is_empty() {
+                return Err("integrator_model cannot be empty.".to_string());
+            }
+        }
+        if let Some(reasoning) = patch["integrator_reasoning_effort"].as_str() {
+            if !matches!(reasoning, "low" | "medium" | "high" | "xhigh") {
+                return Err(
+                    "integrator_reasoning_effort must be low, medium, high, or xhigh.".to_string(),
                 );
             }
         }
@@ -15564,6 +16880,96 @@ Rules:\n\
     )
 }
 
+fn concurrent_batch_changed_files(items: &[Value]) -> Vec<String> {
+    let mut files = Vec::new();
+    for item in items {
+        if let Some(values) = item["changed_files_json"].as_array() {
+            for value in values {
+                let Some(path) = value.as_str().filter(|path| !path.trim().is_empty()) else {
+                    continue;
+                };
+                let path = path.replace('\\', "/");
+                if !files.iter().any(|existing| existing == &path) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn concurrent_integrator_prompt(
+    batch_id: &str,
+    trigger_task_id: Option<&str>,
+    trigger_patch_id: Option<&str>,
+    items: &[Value],
+    changed_files: &[String],
+    integrator_agent_id: &str,
+    integrator_model: &str,
+    reasoning_effort: &str,
+) -> String {
+    let files = if changed_files.is_empty() {
+        "- none recorded yet".to_string()
+    } else {
+        changed_files
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let item_lines = if items.is_empty() {
+        "- none".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| {
+                let task_id = item["task_id"].as_str().unwrap_or("unknown-task");
+                let patch_id = item["patch_id"].as_str().unwrap_or("");
+                let title = item["task_title"].as_str().unwrap_or("Untitled task");
+                let status = item["status"].as_str().unwrap_or("unknown");
+                let patch_status = item["patch_status"].as_str().unwrap_or("not_submitted");
+                let started_at = item["task_started_at"].as_str().unwrap_or("unknown");
+                let diff_artifact = item["diff_artifact_id"].as_str().unwrap_or("");
+                format!(
+                    "- Task {task_id}: {title}\n  status: {status}; patch: {}; patch_status: {patch_status}; started: {started_at}; diff_artifact: {}",
+                    if patch_id.trim().is_empty() { "pending" } else { patch_id },
+                    if diff_artifact.trim().is_empty() { "none" } else { diff_artifact },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Concurrent integration task initialized by Diff Forge.\n\n\
+Integrator:\n\
+- Agent setting: {integrator_agent_id}\n\
+- Model setting: {integrator_model}\n\
+- Reasoning effort setting: {reasoning_effort}\n\n\
+Batch:\n\
+- Batch: {batch_id}\n\
+- Trigger task: {}\n\
+- Trigger patch: {}\n\n\
+Goal:\n\
+Review the overlapping coding-agent tasks, reconcile their code changes semantically, and submit one resolved integration patch through coordination-kernel.submit_patch. Current diff-forge/integration is the source of truth.\n\n\
+Changed files to inspect and reconcile:\n\
+{files}\n\n\
+Batch items:\n\
+{item_lines}\n\n\
+Rules:\n\
+- Preserve all compatible task intents.\n\
+- Prefer newer task intent only when it clearly supersedes earlier work.\n\
+- Adapt stale code onto current integration instead of reverting accepted changes.\n\
+- Check imports, package files, generated artifacts, schemas, and build/test expectations where relevant.\n\
+- Stay inside files leased to this integrator task unless you acquire more leases.\n\
+- Do not call request_merge or apply_merge.\n\
+- Do not write directly to the shared project root.\n\
+- When finished, call submit_patch for this integrator task.\n",
+        trigger_task_id.unwrap_or("none"),
+        trigger_patch_id.unwrap_or("none"),
+    )
+}
+
 fn safe_id(value: &str) -> String {
     value
         .chars()
@@ -16081,6 +17487,13 @@ mod tests {
             policy["unleased_write_policy"].as_str(),
             Some("reject_patch")
         );
+        assert_eq!(policy["integrator_enabled"].as_i64(), Some(0));
+        assert_eq!(policy["integrator_agent_id"].as_str(), Some("codex"));
+        assert_eq!(policy["integrator_model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            policy["integrator_reasoning_effort"].as_str(),
+            Some("xhigh")
+        );
     }
 
     #[test]
@@ -16171,6 +17584,289 @@ mod tests {
             Some("reject_patch")
         );
         assert_eq!(policy["raw_sql_mcp_allowed"].as_i64(), Some(0));
+
+        let updated = kernel
+            .update_repo_policy(&json!({
+                "integrator_enabled": true,
+                "integrator_agent_id": "codex",
+                "integrator_model": "gpt-5.5",
+                "integrator_reasoning_effort": "xhigh",
+            }))
+            .unwrap();
+        assert_eq!(
+            updated["data"]["integrator_reasoning_effort"].as_str(),
+            Some("xhigh")
+        );
+        assert!(kernel
+            .update_repo_policy(&json!({"integrator_reasoning_effort": "max"}))
+            .is_err());
+        assert!(kernel
+            .update_repo_policy(&json!({"integrator_model": ""}))
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_task_history_records_integration_batch_members() {
+        let repo = init_git_repo("concurrent_batch_members");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"integrator_enabled": true}))
+            .unwrap();
+
+        let session_a = kernel
+            .create_session_for_slot_key(
+                "concurrent-a",
+                "Agent A",
+                "codex",
+                None,
+                None,
+                None,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_a_id = session_a["agentId"].as_str().unwrap();
+        let session_a_id = session_a["id"].as_str().unwrap();
+        let worktree_a_id = session_a["worktreeId"].as_str().unwrap();
+        let task_a = kernel
+            .create_task("Task A", Some("first intent"), 0, 1, None, None, None, None)
+            .unwrap();
+        let task_a_id = task_a["id"].as_str().unwrap();
+        kernel
+            .claim_task(task_a_id, agent_a_id, session_a_id)
+            .unwrap();
+
+        let session_b = kernel
+            .create_session_for_slot_key(
+                "concurrent-b",
+                "Agent B",
+                "codex",
+                None,
+                None,
+                None,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_b_id = session_b["agentId"].as_str().unwrap();
+        let session_b_id = session_b["id"].as_str().unwrap();
+        let task_b = kernel
+            .create_task(
+                "Task B",
+                Some("second intent"),
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_b_id = task_b["id"].as_str().unwrap();
+        kernel
+            .claim_task(task_b_id, agent_b_id, session_b_id)
+            .unwrap();
+
+        let patch_id = uuid();
+        kernel
+            .create_patch_row(
+                &patch_id,
+                task_a_id,
+                agent_a_id,
+                session_a_id,
+                worktree_a_id,
+                Some("HEAD"),
+                None,
+                None,
+                "submitted",
+                1,
+                None,
+                None,
+                Some("task a submitted"),
+            )
+            .unwrap();
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO patch_files(
+                    id, patch_id, path, change_kind, old_hash, new_hash,
+                    lines_added, lines_removed
+                 ) VALUES(?1, ?2, 'src.txt', 'modified', NULL, NULL, NULL, NULL)",
+                params![uuid(), &patch_id],
+            )
+            .unwrap();
+
+        let batch = kernel
+            .record_concurrent_integration_batch_if_needed(
+                task_a_id,
+                &patch_id,
+                &["src.txt".to_string()],
+            )
+            .unwrap();
+        assert_eq!(batch["status"].as_str(), Some("created"));
+        assert_eq!(
+            batch["integrator"]["integrator_model"].as_str(),
+            Some("gpt-5.5")
+        );
+        let batch_id = batch["batch_id"].as_str().unwrap();
+        let items = kernel
+            .query_json(
+                "SELECT task_id, patch_id, status
+                 FROM integration_batch_items
+                 WHERE batch_id=?1
+                 ORDER BY task_id ASC",
+                &[&batch_id],
+            )
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            item["task_id"].as_str() == Some(task_a_id)
+                && item["patch_id"].as_str() == Some(patch_id.as_str())
+                && item["status"].as_str() == Some("queued_for_integrator")
+        }));
+        assert!(items.iter().any(|item| {
+            item["task_id"].as_str() == Some(task_b_id)
+                && item["patch_id"].as_str() == Some("")
+                && item["status"].as_str() == Some("pending_submission")
+        }));
+    }
+
+    #[test]
+    fn concurrent_submit_defers_root_and_queues_later_patch_for_integrator() {
+        let repo = init_git_repo("concurrent_submit_route");
+        fs::write(repo.join("b.txt"), "base b\n").unwrap();
+        run(&repo, "git", &["add", "b.txt"]);
+        run(
+            &repo,
+            "git",
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add b",
+            ],
+        );
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"integrator_enabled": true}))
+            .unwrap();
+
+        let session_a = kernel
+            .create_session_for_slot_key(
+                "route-a", "Agent A", "codex", None, None, None, true, None, None,
+            )
+            .unwrap();
+        let agent_a_id = session_a["agentId"].as_str().unwrap();
+        let session_a_id = session_a["id"].as_str().unwrap();
+        let worktree_a_id = session_a["worktreeId"].as_str().unwrap();
+        let write_root_a = PathBuf::from(session_a["writeRoot"].as_str().unwrap());
+        let task_a = kernel
+            .create_task("Task A", Some("change src"), 0, 1, None, None, None, None)
+            .unwrap();
+        let task_a_id = task_a["id"].as_str().unwrap();
+        kernel
+            .claim_task(task_a_id, agent_a_id, session_a_id)
+            .unwrap();
+        kernel
+            .acquire_lease(
+                task_a_id,
+                agent_a_id,
+                session_a_id,
+                "file:src.txt",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+
+        let session_b = kernel
+            .create_session_for_slot_key(
+                "route-b", "Agent B", "codex", None, None, None, true, None, None,
+            )
+            .unwrap();
+        let agent_b_id = session_b["agentId"].as_str().unwrap();
+        let session_b_id = session_b["id"].as_str().unwrap();
+        let worktree_b_id = session_b["worktreeId"].as_str().unwrap();
+        let write_root_b = PathBuf::from(session_b["writeRoot"].as_str().unwrap());
+        let task_b = kernel
+            .create_task("Task B", Some("change b"), 0, 1, None, None, None, None)
+            .unwrap();
+        let task_b_id = task_b["id"].as_str().unwrap();
+        kernel
+            .claim_task(task_b_id, agent_b_id, session_b_id)
+            .unwrap();
+        kernel
+            .acquire_lease(
+                task_b_id,
+                agent_b_id,
+                session_b_id,
+                "file:b.txt",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+
+        fs::write(write_root_a.join("src.txt"), "changed by a\n").unwrap();
+        fs::write(write_root_b.join("b.txt"), "changed by b\n").unwrap();
+
+        let first = kernel
+            .submit_patch(
+                task_a_id,
+                agent_a_id,
+                session_a_id,
+                Some(worktree_a_id),
+                Some("a done"),
+            )
+            .unwrap();
+        assert_eq!(first["ok"].as_bool(), Some(true));
+        assert_eq!(
+            first["data"]["concurrent_integration"]["auto_apply"]["mode"].as_str(),
+            Some("integration_only")
+        );
+        assert_eq!(
+            first["data"]["auto_merge"]["apply"]["data"]["root_fast_forward"]["status"].as_str(),
+            Some("deferred_concurrent_integration_batch")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("src.txt")).unwrap(),
+            "initial\n"
+        );
+
+        let second = kernel
+            .submit_patch(
+                task_b_id,
+                agent_b_id,
+                session_b_id,
+                Some(worktree_b_id),
+                Some("b done"),
+            )
+            .unwrap();
+        assert_eq!(second["ok"].as_bool(), Some(true));
+        assert_eq!(
+            second["data"]["auto_merge"]["status"].as_str(),
+            Some("queued_for_integrator")
+        );
+        assert_eq!(
+            second["data"]["auto_merge"]["integrator"]["status"].as_str(),
+            Some("initialized")
+        );
+        let batches = kernel
+            .query_json(
+                "SELECT * FROM integration_batches WHERE strategy='concurrent_integrator'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0]["status"].as_str(), Some("integrator_reviewing"));
+        assert!(batches[0]["resolver_task_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
     }
 
     #[test]

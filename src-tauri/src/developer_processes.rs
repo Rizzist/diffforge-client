@@ -141,6 +141,15 @@ struct DockerDeveloperCommandResult {
     stdout: String,
     stderr: String,
     success: bool,
+    duration_ms: u64,
+    target_label: String,
+    target_container_id: String,
+    target_container_name: String,
+    target_compose_project: String,
+    target_compose_service: String,
+    target_compose_working_dir: String,
+    target_compose_config_files: Vec<String>,
+    target_workspace_links: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -152,6 +161,7 @@ struct DockerDeveloperTarget {
     compose_working_dir: String,
     compose_config_files: Vec<String>,
     workspace_linked: bool,
+    workspace_links: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -875,36 +885,69 @@ fn docker_developer_action_blocking(
                         &["restart"],
                     ));
                 } else {
-                    commands.push(run_developer_docker_command(
+                    let result = run_developer_docker_command(
                         "docker",
                         &[String::from("restart"), target.container_id.clone()],
                         None,
-                    ));
+                    );
+                    commands.push(docker_command_result_with_target(result, &target));
                 }
             }
         }
         DockerDeveloperAction::RebuildRelaunch => {
             let compose = docker_compose_command();
-            for target in docker_developer_unique_service_targets(&linked_targets) {
-                if target.is_compose() {
-                    let Some(compose) = compose.as_ref() else {
+            let Some(compose) = compose.as_ref() else {
+                for target in docker_developer_unique_service_targets(&linked_targets) {
+                    if target.is_compose() {
                         skipped.push(format!(
                             "{}: Docker Compose is not available.",
                             target.display_name()
                         ));
-                        continue;
-                    };
-                    commands.push(run_docker_compose_service_command(
-                        compose,
-                        &target,
-                        &["up", "-d", "--build", "--force-recreate"],
-                    ));
-                } else {
+                    } else {
+                        skipped.push(format!(
+                            "{}: standalone containers cannot be rebuilt safely without Compose metadata.",
+                            target.display_name()
+                        ));
+                    }
+                }
+                return docker_developer_action_result(action, linked_targets.len(), commands, skipped);
+            };
+
+            let mut failed_down_projects = HashSet::new();
+            for target in docker_developer_unique_project_targets(&linked_targets) {
+                if !target.is_compose() {
+                    continue;
+                }
+
+                let result = run_docker_compose_project_command(compose, &target, &["down"]);
+                if !result.success {
+                    failed_down_projects.insert(docker_developer_project_key(&target));
+                }
+                commands.push(result);
+            }
+
+            for target in docker_developer_unique_service_targets(&linked_targets) {
+                if !target.is_compose() {
                     skipped.push(format!(
                         "{}: standalone containers cannot be rebuilt safely without Compose metadata.",
                         target.display_name()
                     ));
+                    continue;
                 }
+
+                if failed_down_projects.contains(&docker_developer_project_key(&target)) {
+                    skipped.push(format!(
+                        "{}: rebuild skipped because Docker Compose down failed.",
+                        target.display_name()
+                    ));
+                    continue;
+                }
+
+                commands.push(run_docker_compose_service_command(
+                    compose,
+                    &target,
+                    &["up", "-d", "--build", "--force-recreate"],
+                ));
             }
         }
         DockerDeveloperAction::RemountData => {
@@ -938,10 +981,19 @@ fn docker_developer_action_blocking(
         }
     }
 
+    docker_developer_action_result(action, linked_targets.len(), commands, skipped)
+}
+
+fn docker_developer_action_result(
+    action: DockerDeveloperAction,
+    target_count: usize,
+    commands: Vec<DockerDeveloperCommandResult>,
+    skipped: Vec<String>,
+) -> Result<DockerDeveloperActionResult, String> {
     let succeeded = commands.iter().filter(|command| command.success).count();
     let failed = commands.iter().filter(|command| !command.success).count();
-    let target_count = linked_targets.len();
-    let message = docker_developer_action_message(action, target_count, succeeded, failed, skipped.len());
+    let message =
+        docker_developer_action_message(action, target_count, succeeded, failed, skipped.len());
 
     Ok(DockerDeveloperActionResult {
         action: docker_developer_action_id(action).to_string(),
@@ -1106,12 +1158,13 @@ fn docker_developer_target_from_inspect(
         }
     }
 
-    let workspace_linked = docker_target_matches_workspace(
+    let workspace_links = docker_target_workspace_links(
         &compose_working_dir,
         &compose_config_files,
         &bind_sources,
         workspace_roots,
     );
+    let workspace_linked = !workspace_links.is_empty();
 
     DockerDeveloperTarget {
         container_id,
@@ -1121,6 +1174,7 @@ fn docker_developer_target_from_inspect(
         compose_working_dir,
         compose_config_files,
         workspace_linked,
+        workspace_links,
     }
 }
 
@@ -1128,14 +1182,14 @@ fn docker_label(labels: &Value, key: &str) -> String {
     labels[key].as_str().unwrap_or_default().to_string()
 }
 
-fn docker_target_matches_workspace(
+fn docker_target_workspace_links(
     compose_working_dir: &str,
     compose_config_files: &[String],
     bind_sources: &[String],
     workspace_roots: &[String],
-) -> bool {
+) -> Vec<String> {
     if workspace_roots.is_empty() {
-        return false;
+        return Vec::new();
     }
 
     let mut candidates = Vec::new();
@@ -1145,8 +1199,11 @@ fn docker_target_matches_workspace(
     candidates.extend(compose_config_files.iter().cloned());
     candidates.extend(bind_sources.iter().cloned());
 
-    candidates.iter().any(|candidate| {
-        docker_normalized_path_variants(candidate).iter().any(|normalized| {
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+
+    for candidate in candidates {
+        let matched = docker_normalized_path_variants(&candidate).iter().any(|normalized| {
             workspace_roots.iter().any(|root| {
                 !normalized.is_empty()
                     && !root.is_empty()
@@ -1154,8 +1211,18 @@ fn docker_target_matches_workspace(
                         || normalized.starts_with(&format!("{root}/"))
                         || root.starts_with(&format!("{normalized}/")))
             })
-        })
-    })
+        });
+
+        if matched {
+            let link = clean_process_text(&candidate);
+            let key = normalize_process_text_for_compare(&link);
+            if !link.is_empty() && seen.insert(key) {
+                links.push(link);
+            }
+        }
+    }
+
+    links
 }
 
 fn docker_normalized_path_variants(value: &str) -> Vec<String> {
@@ -1233,6 +1300,18 @@ fn docker_developer_unique_project_targets(
     unique
 }
 
+fn docker_developer_project_key(target: &DockerDeveloperTarget) -> String {
+    if target.is_compose() {
+        return format!(
+            "compose:{}:{}",
+            target.compose_project,
+            target.compose_config_files.join("|")
+        );
+    }
+
+    format!("container:{}", target.container_id)
+}
+
 fn docker_compose_command() -> Option<DockerComposeCommand> {
     let plugin = run_developer_docker_command(
         "docker",
@@ -1266,7 +1345,8 @@ fn run_docker_compose_service_command(
     let cwd = docker_compose_cwd(target);
     let program = docker_compose_program(compose);
 
-    run_developer_docker_command(&program, &args, cwd.as_deref())
+    let result = run_developer_docker_command(&program, &args, cwd.as_deref());
+    docker_command_result_with_target(result, target)
 }
 
 fn run_docker_compose_project_command(
@@ -1279,7 +1359,8 @@ fn run_docker_compose_project_command(
     let cwd = docker_compose_cwd(target);
     let program = docker_compose_program(compose);
 
-    run_developer_docker_command(&program, &args, cwd.as_deref())
+    let result = run_developer_docker_command(&program, &args, cwd.as_deref());
+    docker_command_result_with_target(result, target)
 }
 
 fn docker_compose_program(compose: &DockerComposeCommand) -> String {
@@ -1322,11 +1403,27 @@ fn docker_compose_cwd(target: &DockerDeveloperTarget) -> Option<PathBuf> {
         .and_then(|config_file| Path::new(config_file).parent().map(Path::to_path_buf))
 }
 
+fn docker_command_result_with_target(
+    mut result: DockerDeveloperCommandResult,
+    target: &DockerDeveloperTarget,
+) -> DockerDeveloperCommandResult {
+    result.target_label = target.display_name();
+    result.target_container_id = target.container_id.clone();
+    result.target_container_name = target.container_name.clone();
+    result.target_compose_project = target.compose_project.clone();
+    result.target_compose_service = target.compose_service.clone();
+    result.target_compose_working_dir = target.compose_working_dir.clone();
+    result.target_compose_config_files = target.compose_config_files.clone();
+    result.target_workspace_links = target.workspace_links.clone();
+    result
+}
+
 fn run_developer_docker_command(
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
 ) -> DockerDeveloperCommandResult {
+    let started_at = Instant::now();
     let mut command = Command::new(program);
     command.args(args);
     if let Some(cwd) = cwd {
@@ -1346,6 +1443,15 @@ fn run_developer_docker_command(
             stdout: limit_docker_developer_output(&String::from_utf8_lossy(&output.stdout)),
             stderr: limit_docker_developer_output(&String::from_utf8_lossy(&output.stderr)),
             success: output.status.success(),
+            duration_ms: docker_command_duration_ms(started_at),
+            target_label: String::new(),
+            target_container_id: String::new(),
+            target_container_name: String::new(),
+            target_compose_project: String::new(),
+            target_compose_service: String::new(),
+            target_compose_working_dir: String::new(),
+            target_compose_config_files: Vec::new(),
+            target_workspace_links: Vec::new(),
         },
         Err(error) => DockerDeveloperCommandResult {
             program: program.to_string(),
@@ -1357,12 +1463,34 @@ fn run_developer_docker_command(
             stdout: String::new(),
             stderr: error.to_string(),
             success: false,
+            duration_ms: docker_command_duration_ms(started_at),
+            target_label: String::new(),
+            target_container_id: String::new(),
+            target_container_name: String::new(),
+            target_compose_project: String::new(),
+            target_compose_service: String::new(),
+            target_compose_working_dir: String::new(),
+            target_compose_config_files: Vec::new(),
+            target_workspace_links: Vec::new(),
         },
     }
 }
 
+fn docker_command_duration_ms(started_at: Instant) -> u64 {
+    started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn limit_docker_developer_output(value: &str) -> String {
-    let mut output = clean_process_text(value);
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = normalized
+        .chars()
+        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
     if output.len() > DOCKER_DEVELOPER_OUTPUT_LIMIT {
         output.truncate(DOCKER_DEVELOPER_OUTPUT_LIMIT);
         output.push_str("\n...");

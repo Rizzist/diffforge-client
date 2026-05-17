@@ -135,12 +135,15 @@ export default function McpsWorkspaceView({
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [coordinator, setCoordinator] = useState(null);
+  const [repoPolicy, setRepoPolicy] = useState(null);
+  const [integratorState, setIntegratorState] = useState("idle");
 
   const commandBase = useMemo(() => ({ repoPath }), [repoPath]);
 
   const refresh = useCallback(async () => {
     setError("");
     setCoordinator(null);
+    setRepoPolicy(null);
     if (!repoPath || !workspaceId) {
       setStatus("missing_workspace");
       return;
@@ -148,12 +151,16 @@ export default function McpsWorkspaceView({
 
     setStatus("loading");
     try {
-      const response = await invoke("coordination_get_workspace_mcp_status", {
-        ...commandBase,
-        workspaceId,
-        workspaceName,
-      });
+      const [response, policyResponse] = await Promise.all([
+        invoke("coordination_get_workspace_mcp_status", {
+          ...commandBase,
+          workspaceId,
+          workspaceName,
+        }),
+        invoke("coordination_get_repo_policy", commandBase),
+      ]);
       setCoordinator(unwrapData(response));
+      setRepoPolicy(unwrapData(policyResponse));
       setStatus("ready");
     } catch (caught) {
       setStatus("error");
@@ -164,6 +171,26 @@ export default function McpsWorkspaceView({
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const toggleIntegrator = useCallback(async () => {
+    if (!repoPath || !workspaceId || integratorState === "saving") {
+      return;
+    }
+    const nextEnabled = Number(repoPolicy?.integrator_enabled || 0) === 0;
+    setIntegratorState("saving");
+    setError("");
+    try {
+      const response = await invoke("coordination_update_repo_policy", {
+        ...commandBase,
+        input: { integrator_enabled: nextEnabled },
+      });
+      setRepoPolicy(unwrapData(response));
+      setIntegratorState("idle");
+    } catch (caught) {
+      setIntegratorState("idle");
+      setError(errorMessage(caught));
+    }
+  }, [commandBase, integratorState, repoPath, repoPolicy, workspaceId]);
 
   const isReady = status === "ready" && coordinator;
   const health = coordinator?.health || {};
@@ -176,6 +203,10 @@ export default function McpsWorkspaceView({
   const activeAgentCount = numberValue(clientMountSummary.active_session_count);
   const confirmedAgentCount = numberValue(clientMountSummary.confirmed_session_count);
   const identity = workspaceIdentityState({ health, isReady, status, workspaceId });
+  const integratorEnabled = Number(repoPolicy?.integrator_enabled || 0) !== 0;
+  const integratorAgent = repoPolicy?.integrator_agent_id || "codex";
+  const integratorModel = repoPolicy?.integrator_model || "gpt-5.5";
+  const integratorReasoning = repoPolicy?.integrator_reasoning_effort || "xhigh";
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
@@ -286,6 +317,40 @@ export default function McpsWorkspaceView({
               </McpIdentityStatusLine>
             </McpAccessPanel>
           </McpAccessGrid>
+
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonHubIcon aria-hidden="true" />
+                Concurrent integrator
+              </span>
+              <McpStatusBadge data-state={integratorEnabled ? "enabled" : "planned"}>
+                {integratorEnabled ? "Enabled" : "Disabled"}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            <McpMountList>
+              <McpMountRow>
+                <TerminalAgentDot
+                  aria-hidden="true"
+                  data-agent={normalizeAgentKind(integratorAgent)}
+                  data-slot="0"
+                />
+                <McpMountCopy>
+                  <strong>{agentKindLabel(integratorAgent)}</strong>
+                  <span>{integratorModel} / {integratorReasoning}</span>
+                </McpMountCopy>
+                <McpStatusBadge
+                  as="button"
+                  data-state={integratorEnabled ? "enabled" : "planned"}
+                  disabled={!isReady || integratorState === "saving"}
+                  onClick={toggleIntegrator}
+                  type="button"
+                >
+                  {integratorState === "saving" ? "Saving" : integratorEnabled ? "Disable" : "Enable"}
+                </McpStatusBadge>
+              </McpMountRow>
+            </McpMountList>
+          </McpAccessPanel>
 
           <McpAccessPanel>
             <McpAccessTopline>

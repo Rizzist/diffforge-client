@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   AUDIO_TRANSCRIPTION_RESULT_EVENT,
@@ -15,11 +15,11 @@ import {
   markAudioInputSetupReady,
   prepareWhisperModel,
   publishAudioTranscriptionResult,
+  readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
   readDeepgramApiKey,
   readDeepgramLanguage,
-  readLastAudioTranscriptionResult,
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
   writeAudioTranscriptionProvider,
@@ -182,6 +182,10 @@ import {
   AudioStatePill,
   AudioModeGrid,
   AudioModeButton,
+  AudioGeneralToolbar,
+  AudioProviderPanel,
+  AudioRecorderPanel,
+  AudioRecorderActions,
   AudioDevicePanel,
   AudioDeviceHeader,
   AudioDeviceControls,
@@ -196,8 +200,19 @@ import {
   AudioShortcutCard,
   AudioShortcutKey,
   AudioShortcutActions,
-  AudioResultsPanel,
-  AudioResultLine,
+  AudioTabBar,
+  AudioTabButton,
+  AudioTabPanel,
+  AudioDictionaryPanel,
+  AudioHistoryPanel,
+  AudioHistoryStats,
+  AudioHistoryStatChip,
+  AudioHistoryVirtualList,
+  AudioHistoryListSpacer,
+  AudioHistoryRow,
+  AudioHistoryRowTopline,
+  AudioHistoryProvider,
+  AudioHistoryMeta,
   AudioRuntimeHint,
   AudioProgressPanel,
   AudioProgressTopline,
@@ -364,6 +379,14 @@ const AUDIO_MODIFIER_CODES = new Set([
   "ShiftLeft",
   "ShiftRight",
 ]);
+const AUDIO_SETTINGS_TABS = [
+  { id: "general", label: "General" },
+  { id: "dictionary", label: "Dictionary" },
+  { id: "history", label: "History" },
+];
+const AUDIO_HISTORY_ROW_HEIGHT = 112;
+const AUDIO_HISTORY_VIEWPORT_HEIGHT = 420;
+const AUDIO_HISTORY_OVERSCAN = 5;
 
 function writeAudioWidgetTelemetry(_phase, _fields = {}) {}
 
@@ -683,17 +706,127 @@ function formatShortcutLabel(value) {
     .join(" + ") || "Unset";
 }
 
-function formatResultTime(value) {
+function formatHistoryTimestamp(value) {
   const date = value ? new Date(value) : null;
 
   if (!date || Number.isNaN(date.getTime())) {
-    return "--:--";
+    return "Unknown time";
   }
 
-  return date.toLocaleTimeString([], {
+  const currentYear = new Date().getFullYear();
+
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === currentYear ? {} : { year: "numeric" }),
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatHistoryDuration(audioMs) {
+  const duration = Number(audioMs || 0);
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return "";
+  }
+
+  if (duration < 1000) {
+    return `${Math.round(duration)}ms`;
+  }
+
+  const seconds = duration / 1000;
+  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+}
+
+function formatAudioHistoryTotalDuration(audioMs) {
+  const duration = Number(audioMs || 0);
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return "0m";
+  }
+
+  const totalSeconds = Math.round(duration / 1000);
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function formatInteger(value) {
+  return new Intl.NumberFormat().format(Number(value) || 0);
+}
+
+function formatAudioProviderLabel(provider) {
+  return provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD ? "Deepgram" : "Whisper";
+}
+
+function formatAudioHistoryMeta(entry) {
+  const pieces = [];
+  const source = String(entry?.source || "").trim();
+  const duration = formatHistoryDuration(entry?.audioMs);
+  const wordCount = Number(entry?.wordCount || 0);
+  const language = String(entry?.language || "").trim();
+
+  if (source) {
+    pieces.push(source);
+  }
+  if (duration) {
+    pieces.push(duration);
+  }
+  if (wordCount > 0) {
+    pieces.push(`${formatInteger(wordCount)} ${wordCount === 1 ? "word" : "words"}`);
+  }
+  if (language) {
+    pieces.push(language);
+  }
+
+  return pieces.join(" / ");
+}
+
+function buildAudioHistoryStats(history) {
+  const entries = Array.isArray(history) ? history : [];
+  const total = entries.length;
+  const timedEntries = entries.filter((entry) => Number(entry?.audioMs || 0) > 0);
+  const audioMs = timedEntries.reduce((sum, entry) => sum + Number(entry.audioMs || 0), 0);
+  const timedWords = timedEntries.reduce((sum, entry) => {
+    const entryWordCount = Number(entry?.wordCount || 0);
+
+    if (Number.isFinite(entryWordCount) && entryWordCount > 0) {
+      return sum + entryWordCount;
+    }
+
+    return sum + String(entry?.text || "").split(/\s+/).filter(Boolean).length;
+  }, 0);
+  const averageWpm = audioMs > 0 ? Math.round(timedWords / (audioMs / 60000)) : 0;
+
+  return [
+    { label: "Dictations", value: formatInteger(total) },
+    { label: "Audio time", value: formatAudioHistoryTotalDuration(audioMs) },
+    { label: "Avg WPM", value: averageWpm > 0 ? `${formatInteger(averageWpm)}` : "--" },
+  ];
+}
+
+function buildVisibleAudioHistoryItems(history, scrollTop) {
+  const entries = Array.isArray(history) ? history : [];
+  const startIndex = Math.max(0, Math.floor((Number(scrollTop) || 0) / AUDIO_HISTORY_ROW_HEIGHT) - AUDIO_HISTORY_OVERSCAN);
+  const visibleCount = Math.ceil(AUDIO_HISTORY_VIEWPORT_HEIGHT / AUDIO_HISTORY_ROW_HEIGHT) + (AUDIO_HISTORY_OVERSCAN * 2);
+
+  return entries
+    .slice(startIndex, startIndex + visibleCount)
+    .map((entry, offset) => ({
+      entry,
+      index: startIndex + offset,
+    }));
 }
 
 export default function AudioWorkspaceView({
@@ -710,6 +843,7 @@ export default function AudioWorkspaceView({
   workspace,
 }) {
   const [isUninstallModalOpen, setUninstallModalOpen] = useState(false);
+  const [activeAudioTab, setActiveAudioTab] = useState("general");
   const [audioInputDevices, setAudioInputDevices] = useState([]);
   const [audioInputDeviceId, setAudioInputDeviceId] = useState(readSelectedAudioInputDeviceId);
   const [audioInputState, setAudioInputState] = useState(hasAudioInputSetup() ? "ready" : "needs-access");
@@ -719,7 +853,8 @@ export default function AudioWorkspaceView({
   const [deepgramApiKey, setDeepgramApiKey] = useState(readDeepgramApiKey);
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
-  const [latestAudioResult, setLatestAudioResult] = useState(readLastAudioTranscriptionResult);
+  const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
+  const [historyScrollTop, setHistoryScrollTop] = useState(0);
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
   const [audioShortcutError, setAudioShortcutError] = useState("");
   const [audioShortcutActionState, setAudioShortcutActionState] = useState("idle");
@@ -788,6 +923,12 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
+  const audioHistoryStats = useMemo(() => buildAudioHistoryStats(audioHistory), [audioHistory]);
+  const visibleAudioHistory = useMemo(
+    () => buildVisibleAudioHistoryItems(audioHistory, historyScrollTop),
+    [audioHistory, historyScrollTop],
+  );
+  const audioHistoryListHeight = audioHistory.length * AUDIO_HISTORY_ROW_HEIGHT;
 
   const stopAudioInputPreview = useCallback(async () => {
     audioInputRunRef.current += 1;
@@ -951,6 +1092,10 @@ export default function AudioWorkspaceView({
       writeAutoOpenAudioRecorder(nextValue);
       return nextValue;
     });
+  }, []);
+
+  const handleAudioHistoryScroll = useCallback((event) => {
+    setHistoryScrollTop(event.currentTarget.scrollTop || 0);
   }, []);
 
   const selectAudioMode = useCallback((nextMode) => {
@@ -1146,7 +1291,7 @@ export default function AudioWorkspaceView({
 
     listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, (event) => {
       if (!disposed && event.payload?.text) {
-        setLatestAudioResult(event.payload);
+        setAudioHistory(readAudioTranscriptionHistory());
       }
     })
       .then((nextUnlisten) => {
@@ -1161,7 +1306,7 @@ export default function AudioWorkspaceView({
 
     const handleStorage = (event) => {
       if (event.key?.startsWith?.("diffforge.audio.")) {
-        setLatestAudioResult(readLastAudioTranscriptionResult());
+        setAudioHistory(readAudioTranscriptionHistory());
         setAudioMode(readAudioTranscriptionProvider());
         setDeepgramApiKey(readDeepgramApiKey());
         setDeepgramLanguage(readDeepgramLanguage());
@@ -1199,7 +1344,23 @@ export default function AudioWorkspaceView({
 
   return (
     <AudioWorkspaceSurface aria-label="Workspace audio">
-      <AudioSetupPanel data-installed={installed}>
+      <AudioTabBar role="tablist" aria-label="Audio settings sections">
+        {AUDIO_SETTINGS_TABS.map((tab) => (
+          <AudioTabButton
+            aria-controls={`audio-tabpanel-${tab.id}`}
+            aria-selected={activeAudioTab === tab.id}
+            id={`audio-tab-${tab.id}`}
+            key={tab.id}
+            onClick={() => setActiveAudioTab(tab.id)}
+            role="tab"
+            type="button"
+          >
+            {tab.label}
+          </AudioTabButton>
+        ))}
+      </AudioTabBar>
+
+      <AudioSetupPanel>
         <AudioHeroRow>
           <VaultPlaceholderIcon aria-hidden="true">
             <ButtonMicIcon />
@@ -1214,41 +1375,68 @@ export default function AudioWorkspaceView({
           </AudioStatePill>
         </AudioHeroRow>
 
-        <AudioModeGrid role="group" aria-label="Transcription mode">
-          <AudioModeButton
-            aria-pressed={!isCloudMode}
-            onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
-            type="button"
+        {activeAudioTab === "general" && (
+          <AudioTabPanel
+            aria-labelledby="audio-tab-general"
+            id="audio-tabpanel-general"
+            role="tabpanel"
           >
-            <ButtonMicIcon aria-hidden="true" />
-            <span>
-              <strong>Local</strong>
-              <span>Whisper on this device</span>
-            </span>
-          </AudioModeButton>
-          <AudioModeButton
-            aria-pressed={isCloudMode}
-            onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
-            type="button"
-          >
-            <ButtonHubIcon aria-hidden="true" />
-            <span>
-              <strong>Cloud</strong>
-              <span>Deepgram Nova-3</span>
-            </span>
-          </AudioModeButton>
-        </AudioModeGrid>
+        <AudioGeneralToolbar>
+          <AudioProviderPanel aria-label="Transcription provider">
+            <AudioDeviceHeader>
+              <div>
+                <SettingsLabel>Provider</SettingsLabel>
+                <SettingsHint>{isCloudMode ? "Deepgram Nova-3" : "Local Whisper"}</SettingsHint>
+              </div>
+              <AudioStatePill data-installed={recorderReady}>
+                {audioModeStatusLabel}
+              </AudioStatePill>
+            </AudioDeviceHeader>
+            <AudioModeGrid role="group" aria-label="Transcription mode">
+              <AudioModeButton
+                aria-pressed={!isCloudMode}
+                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
+                type="button"
+              >
+                <ButtonMicIcon aria-hidden="true" />
+                <span>
+                  <strong>Local</strong>
+                  <span>Whisper on this device</span>
+                </span>
+              </AudioModeButton>
+              <AudioModeButton
+                aria-pressed={isCloudMode}
+                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
+                type="button"
+              >
+                <ButtonHubIcon aria-hidden="true" />
+                <span>
+                  <strong>Cloud</strong>
+                  <span>Deepgram Nova-3</span>
+                </span>
+              </AudioModeButton>
+            </AudioModeGrid>
+          </AudioProviderPanel>
 
-        <AudioRecorderOptionRow>
-          <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
-            <span aria-hidden="true" />
-            Auto-open after startup
-          </McpSwitchButton>
-          <RecorderOpenButton disabled={recorderOpenDisabled} onClick={onOpenWidget} type="button">
-            <ButtonMicIcon aria-hidden="true" />
-            <span>{recorderButtonLabel}</span>
-          </RecorderOpenButton>
-        </AudioRecorderOptionRow>
+          <AudioRecorderPanel aria-label="Recorder controls">
+            <AudioDeviceHeader>
+              <div>
+                <SettingsLabel>Recorder</SettingsLabel>
+                <SettingsHint>{recorderOpen ? "Floating recorder is open." : "Floating push-to-talk recorder."}</SettingsHint>
+              </div>
+            </AudioDeviceHeader>
+            <AudioRecorderActions>
+              <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
+                <span aria-hidden="true" />
+                Auto-open
+              </McpSwitchButton>
+              <RecorderOpenButton disabled={recorderOpenDisabled} onClick={onOpenWidget} type="button">
+                <ButtonMicIcon aria-hidden="true" />
+                <span>{recorderButtonLabel}</span>
+              </RecorderOpenButton>
+            </AudioRecorderActions>
+          </AudioRecorderPanel>
+        </AudioGeneralToolbar>
 
         {isCloudMode && (
           <AudioDevicePanel aria-label="Deepgram cloud settings">
@@ -1446,23 +1634,6 @@ export default function AudioWorkspaceView({
           {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
         </AudioDevicePanel>
 
-        <AudioResultsPanel aria-label="Audio results">
-          <AudioDeviceHeader>
-            <div>
-              <PanelKicker>Results</PanelKicker>
-              <SettingsHint>Latest {isCloudMode ? "cloud" : "local"} dictation output</SettingsHint>
-            </div>
-          </AudioDeviceHeader>
-          {latestAudioResult?.text ? (
-            <AudioResultLine>
-              <span>{formatResultTime(latestAudioResult.createdAt)}</span>
-              <strong>{latestAudioResult.text}</strong>
-            </AudioResultLine>
-          ) : (
-            <SettingsHint>No recorder output yet.</SettingsHint>
-          )}
-        </AudioResultsPanel>
-
         {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
           <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
         )}
@@ -1504,6 +1675,65 @@ export default function AudioWorkspaceView({
               </PrimaryDangerButton>
             )}
           </AudioActionRow>
+        )}
+          </AudioTabPanel>
+        )}
+
+        {activeAudioTab === "dictionary" && (
+          <AudioDictionaryPanel
+            aria-labelledby="audio-tab-dictionary"
+            id="audio-tabpanel-dictionary"
+            role="tabpanel"
+          />
+        )}
+
+        {activeAudioTab === "history" && (
+          <AudioHistoryPanel
+            aria-labelledby="audio-tab-history"
+            id="audio-tabpanel-history"
+            role="tabpanel"
+          >
+            <AudioHistoryStats aria-label="Speech to text statistics">
+              {audioHistoryStats.map((stat) => (
+                <AudioHistoryStatChip key={stat.label}>
+                  <span>{stat.label}</span>
+                  <strong>{stat.value}</strong>
+                </AudioHistoryStatChip>
+              ))}
+            </AudioHistoryStats>
+
+            {audioHistory.length ? (
+              <AudioHistoryVirtualList
+                aria-label="Speech to text history"
+                onScroll={handleAudioHistoryScroll}
+                role="list"
+              >
+                <AudioHistoryListSpacer style={{ height: audioHistoryListHeight }}>
+                  {visibleAudioHistory.map(({ entry, index }) => (
+                    <AudioHistoryRow
+                      key={entry.id || `${entry.createdAt}-${index}`}
+                      role="listitem"
+                      style={{
+                        height: AUDIO_HISTORY_ROW_HEIGHT - 8,
+                        transform: `translateY(${index * AUDIO_HISTORY_ROW_HEIGHT}px)`,
+                      }}
+                    >
+                      <AudioHistoryRowTopline>
+                        <span>{formatHistoryTimestamp(entry.createdAt)}</span>
+                        <AudioHistoryProvider data-provider={entry.provider}>
+                          {formatAudioProviderLabel(entry.provider)}
+                        </AudioHistoryProvider>
+                      </AudioHistoryRowTopline>
+                      <strong title={entry.text}>{entry.text}</strong>
+                      <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
+                    </AudioHistoryRow>
+                  ))}
+                </AudioHistoryListSpacer>
+              </AudioHistoryVirtualList>
+            ) : (
+              <SettingsHint>No speech to text history yet.</SettingsHint>
+            )}
+          </AudioHistoryPanel>
         )}
       </AudioSetupPanel>
 
@@ -2046,15 +2276,18 @@ export function AudioWidgetWindow() {
           }
           setMessage("Closing Deepgram stream");
           const realtimeResult = await invoke("stop_deepgram_realtime_transcription");
-          await audioBuffer.finishCapture().catch(() => null);
-          return realtimeResult;
+          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          return {
+            ...(realtimeResult || {}),
+            audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+          };
         })()
         : await (async () => {
           const { wavBuffer, audioMs } = await audioBuffer.finishCapture();
           const { peak, rms } = audioBuffer.getCaptureStats();
           const audioBase64 = arrayBufferToBase64(wavBuffer);
           setMessage("Transcribing locally");
-          return invoke("transcribe_whisper_audio", {
+          const transcriptionResult = await invoke("transcribe_whisper_audio", {
             request: {
               audioBase64,
               audioMs,
@@ -2062,6 +2295,10 @@ export function AudioWidgetWindow() {
               captureRms: rms,
             },
           });
+          return {
+            ...(transcriptionResult || {}),
+            audioMs,
+          };
       })();
       if (recordingRunRef.current !== recordingRunId) {
         return;
@@ -2082,9 +2319,12 @@ export function AudioWidgetWindow() {
       }
 
       await publishAudioTranscriptionResult({
+        audioMs: Number(result?.audioMs || 0),
         createdAt: new Date().toISOString(),
         id: `${Date.now()}`,
-        source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD ? "deepgram-nova-3-live" : "audio-widget",
+        language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD ? readDeepgramLanguage() : "",
+        provider: currentProvider,
+        source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD ? "deepgram-nova-3-live" : "whisper-local",
         text: nextTranscript,
       });
 

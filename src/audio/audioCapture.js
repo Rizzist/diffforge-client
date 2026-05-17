@@ -5,6 +5,7 @@ const AUDIO_INPUT_DEVICE_STORAGE_KEY = "diffforge.audio.inputDeviceId";
 const AUDIO_INPUT_SETUP_STORAGE_KEY = "diffforge.audio.inputSetupReady";
 const AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY = "diffforge.audio.autoOpenRecorder";
 const AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY = "diffforge.audio.lastTranscriptionResult";
+const AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY = "diffforge.audio.transcriptionHistory";
 const AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY = "diffforge.audio.transcriptionProvider";
 const AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY = "diffforge.audio.deepgramApiKey";
 const AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY = "diffforge.audio.deepgramLanguage";
@@ -13,6 +14,7 @@ export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
+const MAX_AUDIO_TRANSCRIPTION_HISTORY_ITEMS = 500;
 const EMPTY_CAPTURE_STATS = {
   bufferMs: 0,
   peak: 0,
@@ -27,6 +29,21 @@ function normalizeAudioTranscriptionProvider(value) {
   return value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
     ? AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
     : AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+}
+
+function inferAudioTranscriptionProvider(value) {
+  const provider = normalizeAudioTranscriptionProvider(value?.provider);
+
+  if (provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+    return provider;
+  }
+
+  const source = String(value?.source || "").toLowerCase();
+  if (source.includes("deepgram") || source.includes("cloud")) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
+  }
+
+  return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
 }
 
 function normalizeDeepgramLanguage(value) {
@@ -180,12 +197,67 @@ function normalizeTranscriptionResult(value) {
     return null;
   }
 
+  const provider = inferAudioTranscriptionProvider(value);
+  const source = typeof value.source === "string" && value.source.trim()
+    ? value.source.trim()
+    : provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+      ? "deepgram-nova-3-live"
+      : "whisper-local";
+  const audioMs = Number(value.audioMs || value.durationMs || 0);
+  const rawLanguage = typeof value.language === "string" ? value.language.trim() : "";
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+
   return {
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
     id: typeof value.id === "string" ? value.id : String(Date.now()),
-    source: typeof value.source === "string" ? value.source : "audio-widget",
+    audioMs: Number.isFinite(audioMs) && audioMs > 0 ? Math.round(audioMs) : 0,
+    language: rawLanguage ? normalizeDeepgramLanguage(rawLanguage) : "",
+    provider,
+    source,
     text,
+    wordCount,
   };
+}
+
+function compareTranscriptionResultCreatedAt(left, right) {
+  const leftTime = new Date(left?.createdAt || 0).getTime();
+  const rightTime = new Date(right?.createdAt || 0).getTime();
+
+  return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+}
+
+function normalizeTranscriptionHistory(value) {
+  const items = Array.isArray(value) ? value : [];
+  const seen = new Set();
+
+  return items
+    .map(normalizeTranscriptionResult)
+    .filter(Boolean)
+    .filter((result) => {
+      const key = result.id || `${result.createdAt}:${result.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    })
+    .sort(compareTranscriptionResultCreatedAt)
+    .slice(0, MAX_AUDIO_TRANSCRIPTION_HISTORY_ITEMS);
+}
+
+function readStoredAudioTranscriptionHistory() {
+  if (!canUseStorage()) {
+    return [];
+  }
+
+  try {
+    return normalizeTranscriptionHistory(
+      JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY) || "[]"),
+    );
+  } catch {
+    return [];
+  }
 }
 
 export function readLastAudioTranscriptionResult() {
@@ -202,6 +274,20 @@ export function readLastAudioTranscriptionResult() {
   }
 }
 
+export function readAudioTranscriptionHistory() {
+  if (!canUseStorage()) {
+    return [];
+  }
+
+  const history = readStoredAudioTranscriptionHistory();
+  if (history.length) {
+    return history;
+  }
+
+  const lastResult = readLastAudioTranscriptionResult();
+  return lastResult ? [lastResult] : [];
+}
+
 export async function publishAudioTranscriptionResult(value) {
   const result = normalizeTranscriptionResult(value);
 
@@ -210,7 +296,15 @@ export async function publishAudioTranscriptionResult(value) {
   }
 
   if (canUseStorage()) {
+    const existingHistory = readStoredAudioTranscriptionHistory();
+    const legacyLastResult = existingHistory.length ? null : readLastAudioTranscriptionResult();
     window.localStorage.setItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY, JSON.stringify(result));
+    const nextHistory = normalizeTranscriptionHistory([
+      result,
+      ...(legacyLastResult ? [legacyLastResult] : []),
+      ...existingHistory,
+    ]);
+    window.localStorage.setItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY, JSON.stringify(nextHistory));
   }
 
   await emit(AUDIO_TRANSCRIPTION_RESULT_EVENT, result).catch(() => {});

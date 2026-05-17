@@ -13,6 +13,9 @@ pub const DEPENDENCY_GRAPH_MIGRATION_VERSION: i64 = 6;
 pub const DEPENDENCY_GRAPH_MIGRATION_NAME: &str = "coordination_kernel_dependency_graph_v2";
 pub const TASK_LIFECYCLE_MIGRATION_VERSION: i64 = 7;
 pub const TASK_LIFECYCLE_MIGRATION_NAME: &str = "coordination_kernel_task_lifecycle_boundaries";
+pub const INTEGRATOR_POLICY_MIGRATION_VERSION: i64 = 8;
+pub const INTEGRATOR_POLICY_MIGRATION_NAME: &str =
+    "coordination_kernel_concurrent_integrator_policy";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -487,6 +490,10 @@ CREATE TABLE IF NOT EXISTS repo_policies(
   cloud_auto_spawn_terminals INTEGER NOT NULL DEFAULT 0,
   cloud_auto_merge INTEGER NOT NULL DEFAULT 0,
   cloud_contract_memory_enabled INTEGER NOT NULL DEFAULT 1,
+  integrator_enabled INTEGER NOT NULL DEFAULT 0,
+  integrator_agent_id TEXT NOT NULL DEFAULT 'codex',
+  integrator_model TEXT NOT NULL DEFAULT 'gpt-5.5',
+  integrator_reasoning_effort TEXT NOT NULL DEFAULT 'xhigh',
   policy_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

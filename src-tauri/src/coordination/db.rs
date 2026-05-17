@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use super::schema::{
     APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME, APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION,
     CREATE_SCHEMA_SQL, DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
-    DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION, MIGRATION_NAME,
+    DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION,
+    INTEGRATOR_POLICY_MIGRATION_NAME, INTEGRATOR_POLICY_MIGRATION_VERSION, MIGRATION_NAME,
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
@@ -300,6 +301,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     }
     diagnostics.push(apply_dependency_graph_migration(connection)?);
     diagnostics.push(apply_task_lifecycle_migration(connection)?);
+    diagnostics.push(apply_integrator_policy_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -476,6 +478,58 @@ fn apply_task_lifecycle_migration(
         connection,
         TASK_LIFECYCLE_MIGRATION_VERSION,
         TASK_LIFECYCLE_MIGRATION_NAME,
+    )?;
+    migration.details.splice(0..0, details);
+    Ok(migration)
+}
+
+fn apply_integrator_policy_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, INTEGRATOR_POLICY_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            INTEGRATOR_POLICY_MIGRATION_VERSION,
+            INTEGRATOR_POLICY_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let mut details = Vec::new();
+    for (table, column, definition) in [
+        (
+            "repo_policies",
+            "integrator_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "repo_policies",
+            "integrator_agent_id",
+            "TEXT NOT NULL DEFAULT 'codex'",
+        ),
+        (
+            "repo_policies",
+            "integrator_model",
+            "TEXT NOT NULL DEFAULT 'gpt-5.5'",
+        ),
+        (
+            "repo_policies",
+            "integrator_reasoning_effort",
+            "TEXT NOT NULL DEFAULT 'xhigh'",
+        ),
+    ] {
+        let added = ensure_column(connection, table, column, definition)?;
+        details.push(format!(
+            "{}.{} {}",
+            table,
+            column,
+            if added { "added" } else { "already_present" }
+        ));
+    }
+    let mut migration = record_migration_if_missing(
+        connection,
+        INTEGRATOR_POLICY_MIGRATION_VERSION,
+        INTEGRATOR_POLICY_MIGRATION_NAME,
     )?;
     migration.details.splice(0..0, details);
     Ok(migration)

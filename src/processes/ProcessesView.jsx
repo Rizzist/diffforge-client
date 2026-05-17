@@ -25,7 +25,7 @@ const HIGH_MEMORY_BYTES = 1024 * 1024 * 1024;
 const DOCKER_ACTIONS = {
   rebuildRelaunch: {
     buttonLabel: "Rebuild",
-    detail: "Rebuild and recreate linked Docker Compose services.",
+    detail: "Bring linked Docker Compose projects down, then rebuild and recreate services.",
     label: "Rebuild/relaunch Docker",
     pendingLabel: "Rebuilding...",
     title: "Rebuild and relaunch",
@@ -458,6 +458,93 @@ function dockerActionConfig(action) {
   return DOCKER_ACTIONS[action] || DOCKER_ACTIONS.relaunch;
 }
 
+function dockerActionLogTitle(action) {
+  const config = dockerActionConfig(action);
+  return `${config.buttonLabel} log`;
+}
+
+function formatDurationMs(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "";
+  }
+  if (ms >= 1000) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(ms)}ms`;
+}
+
+function dockerCommandTargetLabel(command) {
+  return String(
+    command?.targetLabel
+    || [
+      command?.targetComposeProject,
+      command?.targetComposeService,
+    ].filter(Boolean).join("/")
+    || command?.targetContainerName
+    || command?.targetContainerId
+    || "Docker target",
+  ).trim();
+}
+
+function dockerCommandArgText(value) {
+  const text = String(value || "");
+  if (!text) {
+    return "\"\"";
+  }
+  if (/^[a-zA-Z0-9_./:@=+-]+$/.test(text)) {
+    return text;
+  }
+  return JSON.stringify(text);
+}
+
+function dockerCommandLine(command) {
+  return [
+    dockerCommandArgText(command?.program),
+    ...(Array.isArray(command?.args) ? command.args.map(dockerCommandArgText) : []),
+  ].join(" ");
+}
+
+function dockerCommandOutput(command) {
+  const stderr = String(command?.stderr || "").trim();
+  const stdout = String(command?.stdout || "").trim();
+  const parts = [];
+  if (stderr) {
+    parts.push(`stderr\n${stderr}`);
+  }
+  if (stdout) {
+    parts.push(`stdout\n${stdout}`);
+  }
+  return parts.join("\n\n");
+}
+
+function dockerCommandMetaItems(command) {
+  const items = [];
+  const links = Array.isArray(command?.targetWorkspaceLinks)
+    ? command.targetWorkspaceLinks.filter(Boolean)
+    : [];
+  const composeFiles = Array.isArray(command?.targetComposeConfigFiles)
+    ? command.targetComposeConfigFiles.filter(Boolean)
+    : [];
+  const cwd = String(command?.cwd || command?.targetComposeWorkingDir || "").trim();
+  const container = String(command?.targetContainerName || command?.targetContainerId || "").trim();
+
+  for (const link of links) {
+    items.push({ label: "linked path", value: link });
+  }
+  if (cwd) {
+    items.push({ label: "cwd", value: cwd });
+  }
+  for (const file of composeFiles) {
+    items.push({ label: "compose", value: file });
+  }
+  if (container) {
+    items.push({ label: "container", value: container });
+  }
+
+  return items;
+}
+
 function terminalTargetFromProcess(process) {
   if (!process?.terminalOwned || !process.terminalPaneId) {
     return null;
@@ -502,6 +589,72 @@ function ProcessPortBadge({ process }) {
     <ProcessRowPorts title={processPortTitle(process)}>
       {label}
     </ProcessRowPorts>
+  );
+}
+
+function ProcessDockerActionLog({ result }) {
+  const commands = Array.isArray(result?.commands) ? result.commands : [];
+  const skipped = Array.isArray(result?.skipped) ? result.skipped : [];
+
+  if (!commands.length && !skipped.length) {
+    return null;
+  }
+
+  return (
+    <ProcessDockerLogPanel data-state={Number(result?.failed || 0) > 0 ? "error" : "done"}>
+      <ProcessDockerLogHeader>
+        <strong>{dockerActionLogTitle(result?.action)}</strong>
+        <span>
+          {commands.filter((command) => command?.success).length} ok / {Number(result?.failed || 0)} failed
+          {skipped.length ? ` / ${skipped.length} skipped` : ""}
+        </span>
+      </ProcessDockerLogHeader>
+      <ProcessDockerLogList>
+        {commands.map((command, index) => {
+          const output = dockerCommandOutput(command);
+          const metaItems = dockerCommandMetaItems(command);
+          const duration = formatDurationMs(command?.durationMs);
+
+          return (
+            <ProcessDockerLogEntry
+              data-success={command?.success ? "true" : "false"}
+              key={`${command?.program || "docker"}-${index}`}
+            >
+              <ProcessDockerLogEntryTop>
+                <strong>{dockerCommandTargetLabel(command)}</strong>
+                <span>
+                  {command?.success ? "OK" : "Failed"}
+                  {duration ? ` / ${duration}` : ""}
+                  {command?.exitCode !== null && command?.exitCode !== undefined
+                    ? ` / exit ${command.exitCode}`
+                    : ""}
+                </span>
+              </ProcessDockerLogEntryTop>
+              {metaItems.length > 0 && (
+                <ProcessDockerLogMeta>
+                  {metaItems.map((item, itemIndex) => (
+                    <span key={`${item.label}-${item.value}-${itemIndex}`}>
+                      {item.label}: <code>{item.value}</code>
+                    </span>
+                  ))}
+                </ProcessDockerLogMeta>
+              )}
+              <ProcessDockerCommandLine>{dockerCommandLine(command)}</ProcessDockerCommandLine>
+              {output && <ProcessDockerOutput>{output}</ProcessDockerOutput>}
+            </ProcessDockerLogEntry>
+          );
+        })}
+        {skipped.map((item, index) => (
+          <ProcessDockerLogEntry data-success="skipped" key={`skipped-${index}`}>
+            <ProcessDockerLogEntryTop>
+              <strong>Skipped</strong>
+              <span>Not run</span>
+            </ProcessDockerLogEntryTop>
+            <ProcessDockerCommandLine>{item}</ProcessDockerCommandLine>
+          </ProcessDockerLogEntry>
+        ))}
+      </ProcessDockerLogList>
+    </ProcessDockerLogPanel>
   );
 }
 
@@ -599,7 +752,7 @@ export default function ProcessesView({
   const [error, setError] = useState("");
   const [confirmAction, setConfirmAction] = useState(null);
   const [dockerConfirmAction, setDockerConfirmAction] = useState(null);
-  const [dockerActionState, setDockerActionState] = useState({ state: "idle", message: "" });
+  const [dockerActionState, setDockerActionState] = useState({ state: "idle", message: "", result: null });
   const [killState, setKillState] = useState({ state: "idle", message: "" });
   const mountedRef = useRef(false);
   const processOrderCounterRef = useRef(0);
@@ -760,7 +913,7 @@ export default function ProcessesView({
       ...config,
       processLabel: processBlurb(process),
     });
-    setDockerActionState({ state: "idle", message: "" });
+    setDockerActionState({ state: "idle", message: "", result: null });
   }, []);
 
   const confirmDockerAction = useCallback(async () => {
@@ -768,7 +921,7 @@ export default function ProcessesView({
       return;
     }
 
-    setDockerActionState({ state: "running", message: "" });
+    setDockerActionState({ state: "running", message: "", result: null });
 
     try {
       const result = await invoke("docker_developer_action", {
@@ -789,12 +942,14 @@ export default function ProcessesView({
       setDockerActionState({
         state: Number(result?.failed || 0) > 0 ? "error" : "done",
         message: `${result?.message || "Docker action completed."}${skipped}${failure}`.trim(),
+        result,
       });
       await loadProcesses({ silent: true });
     } catch (actionError) {
       setDockerActionState({
         state: "error",
         message: errorMessage(actionError, "Unable to run Docker action."),
+        result: null,
       });
     }
   }, [
@@ -904,6 +1059,9 @@ export default function ProcessesView({
         <ProcessInlineMessage data-state={dockerActionState.state}>
           {dockerActionState.message}
         </ProcessInlineMessage>
+      )}
+      {dockerActionState.result && (
+        <ProcessDockerActionLog result={dockerActionState.result} />
       )}
 
       <ProcessBucketsGrid>
@@ -1096,6 +1254,181 @@ const ProcessInlineMessage = styled.p`
     color: var(--forge-green);
     background: rgba(60, 203, 127, 0.08);
   }
+
+  &[data-state="error"] {
+    border-color: rgba(239, 107, 107, 0.28);
+    color: #ffc8c8;
+    background: rgba(239, 107, 107, 0.08);
+  }
+`;
+
+const ProcessDockerLogPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  max-height: min(250px, 34vh);
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(8, 11, 16, 0.72);
+
+  &[data-state="done"] {
+    border-color: rgba(60, 203, 127, 0.2);
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(239, 107, 107, 0.24);
+  }
+`;
+
+const ProcessDockerLogHeader = styled.header`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--forge-border);
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    flex: 0 0 auto;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 720;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 560px) {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+`;
+
+const ProcessDockerLogList = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  align-content: start;
+  gap: 6px;
+  overflow: auto;
+  padding: 8px;
+`;
+
+const ProcessDockerLogEntry = styled.article`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 7px;
+  background: rgba(21, 27, 35, 0.44);
+
+  &[data-success="true"] {
+    border-color: rgba(60, 203, 127, 0.18);
+  }
+
+  &[data-success="false"] {
+    border-color: rgba(239, 107, 107, 0.26);
+    background: rgba(239, 107, 107, 0.06);
+  }
+
+  &[data-success="skipped"] {
+    border-color: rgba(223, 165, 90, 0.22);
+  }
+`;
+
+const ProcessDockerLogEntryTop = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 12px;
+    font-weight: 780;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    flex: 0 0 auto;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 760;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+`;
+
+const ProcessDockerLogMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 4px;
+
+  span {
+    display: inline-flex;
+    max-width: 100%;
+    min-width: 0;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 5px;
+    border: 1px solid rgba(125, 160, 205, 0.14);
+    border-radius: 6px;
+    color: var(--forge-text-muted);
+    background: rgba(59, 130, 246, 0.045);
+    font-size: 10px;
+    font-weight: 680;
+  }
+
+  code {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--forge-blue-soft);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 10px;
+  }
+`;
+
+const ProcessDockerCommandLine = styled.code`
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #d7dde6;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  line-height: 1.45;
+`;
+
+const ProcessDockerOutput = styled.pre`
+  max-height: 96px;
+  margin: 0;
+  overflow: auto;
+  padding: 7px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 6px;
+  color: #aeb9c8;
+  background: rgba(0, 0, 0, 0.26);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 `;
 
 const ProcessBucketsGrid = styled.div`
