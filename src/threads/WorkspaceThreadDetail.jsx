@@ -7,6 +7,10 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import styled, { keyframes } from "styled-components";
 
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
+import {
+  appendWorkspaceThreadComposerAttachments,
+  removeWorkspaceThreadComposerAttachment,
+} from "../terminals/WorkspaceTerminal/threadRuntime.js";
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import {
   getWorkspaceThreadHasSession,
@@ -461,6 +465,7 @@ const ComposerToolButton = styled.button`
 `;
 
 const ModelMenuWrap = styled.div`
+  display: none;
   position: relative;
   min-width: 0;
 `;
@@ -586,18 +591,27 @@ const AttachmentStrip = styled.div`
 
 const AttachmentChip = styled.span`
   display: inline-flex;
-  max-width: 220px;
-  height: 24px;
+  max-width: 260px;
+  min-height: 44px;
   align-items: center;
   gap: 6px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 0 6px 0 8px;
+  border-radius: 10px;
+  padding: 5px 6px;
   color: var(--thread-fg);
   background: rgba(255, 255, 255, 0.045);
   font-size: 11px;
   line-height: 1;
   user-select: none;
+
+  img {
+    width: 42px;
+    height: 34px;
+    flex: 0 0 auto;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.08);
+    object-fit: cover;
+  }
 
   span {
     min-width: 0;
@@ -625,6 +639,16 @@ const AttachmentChip = styled.span`
     width: 13px;
     height: 13px;
   }
+`;
+
+const AttachmentQueueHint = styled.div`
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+  color: rgba(253, 230, 138, 0.78);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1;
 `;
 
 const HiddenFileInput = styled.input`
@@ -990,7 +1014,15 @@ function getModelThinkingPowerMetadata(agentId, option, model) {
 
 function getModelOptions(agentId, status, binding = null) {
   const normalizedAgentId = normalizeAgentId(agentId);
-  const sessionModel = String(binding?.modelId || binding?.model || "").trim();
+  const sessionModel = String(
+    binding?.modelId
+      || binding?.model
+      || binding?.activeModel
+      || binding?.nativeModel
+      || binding?.selectedModel
+      || binding?.configuredModel
+      || "",
+  ).trim();
   const activeModel = sessionModel || getStatusModel(status);
   const options = [];
 
@@ -1161,6 +1193,28 @@ function NewChatView({
     setModelMenuOpen(false);
   }, [activeAgentId, modelOptions]);
 
+  useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
+      agentId: activeAgentId,
+      attachmentCount: attachments.length,
+      attachments: getAttachmentLogSummary(attachments),
+      imageSupportReason: imageInputSupport.reason || "",
+      imageSupportState: imageInputSupport.state || "",
+      imageSupported: Boolean(imageInputSupport.supported),
+      selectedModel: selectedModel || "",
+      surface: "new_chat",
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    activeAgentId,
+    attachments,
+    imageInputSupport.reason,
+    imageInputSupport.state,
+    imageInputSupport.supported,
+    selectedModel,
+    workspace?.id,
+  ]);
+
   const addImageFiles = async (fileList) => {
     const files = Array.from(fileList || []).slice(0, IMAGE_ATTACHMENT_LIMIT - attachments.length);
     if (!files.length) {
@@ -1211,9 +1265,20 @@ function NewChatView({
   };
 
   const removeAttachment = (attachmentId) => {
-    setAttachments((currentAttachments) => (
-      currentAttachments.filter((attachment) => attachment.id !== attachmentId)
-    ));
+    setAttachments((currentAttachments) => {
+      const removedAttachment = currentAttachments.find((attachment) => attachment.id === attachmentId);
+      const nextAttachments = currentAttachments.filter((attachment) => attachment.id !== attachmentId);
+      logBigViewSyncDiagnosticEvent("bigview.image.remove", {
+        agentId: activeAgentId,
+        attachmentCountAfter: nextAttachments.length,
+        attachmentCountBefore: currentAttachments.length,
+        removedAttachment: getAttachmentLogSummary([removedAttachment])[0] || null,
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        workspaceId: workspace?.id || "",
+      });
+      return nextAttachments;
+    });
   };
 
   const submitNewChat = async () => {
@@ -1569,6 +1634,18 @@ function messagesContainTurnWork(messages, turnId) {
   ));
 }
 
+function isSlashCommandPrompt(value) {
+  return String(value || "").trimStart().startsWith("/");
+}
+
+function getLatestTurnUserMessage(messages, turnId) {
+  const safeTurnId = String(turnId || "").trim();
+  return [...(Array.isArray(messages) ? messages : [])].reverse().find((message) => (
+    message?.role === "user"
+    && (!safeTurnId || message?.turnId === safeTurnId)
+  )) || null;
+}
+
 function buildActivityItems(thread, messages = []) {
   if (!thread) {
     return [];
@@ -1578,6 +1655,12 @@ function buildActivityItems(thread, messages = []) {
   const latestTurn = thread.latestTurn || null;
   const turnState = threadLatestTurnState(thread);
   const isThinking = turnState === "running" || thread.activityStatus === "thinking";
+  const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turnId);
+  const latestTurnIsSlashCommand = isSlashCommandPrompt(latestTurnUserMessage?.text);
+
+  if (latestTurnIsSlashCommand) {
+    return items;
+  }
 
   if (turnState === "running") {
     items.push({
@@ -1632,6 +1715,9 @@ function buildTranscriptItems(messages) {
 function isChatProjectionMessage(message) {
   const kind = String(message?.kind || "").trim().toLowerCase();
   const source = String(message?.source || "").trim().toLowerCase();
+  if (message?.role === "user" && isSlashCommandPrompt(message?.text)) {
+    return false;
+  }
   return kind !== "live_output" && source !== "terminal-live";
 }
 
@@ -1695,6 +1781,7 @@ function ThreadMessage({ message, workspace }) {
 
 function WorkspaceThreadDetail({
   agentStatuses,
+  composerAttachments,
   composerDrafts,
   newChatActive = false,
   onCreateChat,
@@ -1706,7 +1793,6 @@ function WorkspaceThreadDetail({
   workspaceThreadEntry,
 }) {
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState([]);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
@@ -1726,7 +1812,16 @@ function WorkspaceThreadDetail({
     [activeAgentId, agentStatuses],
   );
   const activeProviderBinding = getWorkspaceThreadProviderBinding(thread, activeAgentId);
-  const activeProviderModelId = activeProviderBinding?.modelId || "";
+  const activeProviderModelId = String(
+    activeProviderBinding?.modelId
+      || activeProviderBinding?.model
+      || activeProviderBinding?.activeModel
+      || activeProviderBinding?.nativeModel
+      || activeProviderBinding?.selectedModel
+      || activeProviderBinding?.configuredModel
+      || "",
+  ).trim();
+  const currentTuiModel = activeProviderModelId || getStatusModel(activeAgentStatus);
   const modelOptions = useMemo(
     () => getModelOptions(activeAgentId, activeAgentStatus, { modelId: activeProviderModelId }),
     [activeAgentId, activeAgentStatus, activeProviderModelId],
@@ -1744,17 +1839,20 @@ function WorkspaceThreadDetail({
     activeTerminalBinding?.paneId || "",
   ].join(":");
   const syncedComposerDraft = String(composerDrafts?.[composerSyncKey] || "");
+  const attachments = Array.isArray(composerAttachments?.[composerSyncKey])
+    ? composerAttachments[composerSyncKey]
+    : [];
   const canSubmit = Boolean(thread && (hasActiveTerminalBinding || hasProviderSession));
   const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
-  const selectedModelOption = modelOptions.find((option) => option.value === selectedModel) || modelOptions[0];
+  const selectedModelOption = modelOptions.find((option) => option.value === currentTuiModel) || modelOptions[0];
   const modelButtonLabel = getModelButtonLabel(selectedModelOption);
-  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, selectedModel);
+  const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, currentTuiModel);
   const placeholder = hasActiveTerminalBinding
     ? `Ask ${agentLabel} to work in this thread`
     : hasProviderSession
       ? `Ask ${agentLabel} to resume this thread`
       : `No ${agentLabel} session is available for this thread`;
-  const submitDisabled = sending || !canSubmit || (!draft.trim() && attachments.length === 0);
+  const submitDisabled = sending || !canSubmit || !draft.trim();
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
@@ -1762,8 +1860,85 @@ function WorkspaceThreadDetail({
   }, [activeAgentId, modelOptions, thread?.id]);
 
   useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.draft.local_sync_effect", {
+      agentId: activeAgentId,
+      composerSyncKey,
+      currentDraftLength: draft.length,
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      selectedModel: currentTuiModel || "",
+      syncedComposerDraftLength: syncedComposerDraft.length,
+      threadId: thread?.id || "",
+      willChangeDraft: draft !== syncedComposerDraft,
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     setDraft(syncedComposerDraft);
   }, [composerSyncKey, syncedComposerDraft]);
+
+  useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.model_state.thread_detail", {
+      activeProviderModelId,
+      agentId: activeAgentId,
+      bindingInstanceId: activeTerminalBinding?.instanceId || "",
+      bindingPaneId: activeTerminalBinding?.paneId || "",
+      currentTuiModel: currentTuiModel || "",
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      providerSessionPresent: Boolean(activeProviderBinding?.nativeSessionId),
+      selectedModelState: selectedModel || "",
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+  }, [
+    activeAgentId,
+    activeProviderBinding?.nativeSessionId,
+    activeProviderModelId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    currentTuiModel,
+    hasActiveTerminalBinding,
+    hasProviderSession,
+    selectedModel,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
+    logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
+      agentId: activeAgentId,
+      attachmentCount: attachments.length,
+      attachments: getAttachmentLogSummary(attachments),
+      bindingInstanceId: activeTerminalBinding?.instanceId || "",
+      bindingPaneId: activeTerminalBinding?.paneId || "",
+      composerSyncKey,
+      hasActiveTerminalBinding,
+      hasProviderSession,
+      imageSupportReason: imageInputSupport.reason || "",
+      imageSupportState: imageInputSupport.state || "",
+      imageSupported: Boolean(imageInputSupport.supported),
+      selectedModel: currentTuiModel || "",
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    attachments,
+    composerSyncKey,
+    currentTuiModel,
+    hasActiveTerminalBinding,
+    hasProviderSession,
+    imageInputSupport.reason,
+    imageInputSupport.state,
+    imageInputSupport.supported,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
 
   useLayoutEffect(() => {
     const node = transcriptScrollRef.current;
@@ -1808,7 +1983,7 @@ function WorkspaceThreadDetail({
       imageSupportReason: imageInputSupport.reason || "",
       imageSupportState: imageInputSupport.state || "",
       imageSupported: Boolean(imageInputSupport.supported),
-      model: selectedModel || "",
+      model: currentTuiModel || "",
       surface: "thread_detail",
       threadId: thread?.id || "",
       workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -1816,15 +1991,33 @@ function WorkspaceThreadDetail({
     setError("");
     try {
       const nextAttachments = await Promise.all(files.map(readImageFile));
-      setAttachments((currentAttachments) => (
-        currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
-      ));
+      appendWorkspaceThreadComposerAttachments(composerSyncKey, nextAttachments.map((attachment) => ({
+        ...attachment,
+        source: "bigview_thread_detail",
+        status: "queued",
+      })), {
+        fields: {
+          agentId: activeAgentId,
+          bindingInstanceId: activeTerminalBinding?.instanceId || "",
+          bindingPaneId: activeTerminalBinding?.paneId || "",
+          model: currentTuiModel || "",
+          surface: "thread_detail",
+          threadId: thread?.id || "",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        },
+        maxCount: IMAGE_ATTACHMENT_LIMIT,
+        source: "bigview_thread_detail",
+      });
       logBigViewSyncDiagnosticEvent("bigview.image.add_done", {
         agentId: activeAgentId,
         attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
         attachments: getAttachmentLogSummary(nextAttachments),
         hasActiveTerminalBinding,
-        model: selectedModel || "",
+        model: currentTuiModel || "",
+        queuedOnly: true,
+        sharedDraftLength: draft.length,
+        syncedToSharedAttachments: true,
+        syncKey: composerSyncKey,
         surface: "thread_detail",
         threadId: thread?.id || "",
         workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -1835,7 +2028,7 @@ function WorkspaceThreadDetail({
         agentId: activeAgentId,
         fileCount: files.length,
         message: readError?.message || String(readError || ""),
-        model: selectedModel || "",
+        model: currentTuiModel || "",
         surface: "thread_detail",
         threadId: thread?.id || "",
         workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -1844,9 +2037,20 @@ function WorkspaceThreadDetail({
   };
 
   const removeAttachment = (attachmentId) => {
-    setAttachments((currentAttachments) => (
-      currentAttachments.filter((attachment) => attachment.id !== attachmentId)
-    ));
+    const removedAttachment = attachments.find((attachment) => attachment.id === attachmentId);
+    removeWorkspaceThreadComposerAttachment(composerSyncKey, attachmentId, {
+      fields: {
+        agentId: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instanceId || "",
+        bindingPaneId: activeTerminalBinding?.paneId || "",
+        removedAttachment: getAttachmentLogSummary([removedAttachment])[0] || null,
+        selectedModel: currentTuiModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      },
+      source: "bigview_thread_detail",
+    });
   };
 
   const selectModel = (option) => {
@@ -1931,7 +2135,7 @@ function WorkspaceThreadDetail({
 
   const submitDraft = async () => {
     const text = draft.trim();
-    if ((!text && attachments.length === 0) || !thread || !canSubmit) {
+    if (!text || !thread || !canSubmit) {
       return;
     }
 
@@ -1940,7 +2144,7 @@ function WorkspaceThreadDetail({
     setSending(true);
     setError("");
     try {
-      const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, selectedModel);
+      const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, currentTuiModel);
       logBigViewSyncDiagnosticEvent("bigview.submit.start", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
@@ -1954,7 +2158,7 @@ function WorkspaceThreadDetail({
         imageSupportState: imageInputSupport.state || "",
         imageSupported: Boolean(imageInputSupport.supported),
         modelPayload: "",
-        selectedModel: selectedModel || "",
+        selectedModel: currentTuiModel || "",
         surface: "thread_detail",
         thinkingPower: thinkingPower.thinkingPower,
         thinkingPowerSource: thinkingPower.source,
@@ -1962,54 +2166,26 @@ function WorkspaceThreadDetail({
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       if (previousAttachments.length) {
-        logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
+        logBigViewSyncDiagnosticEvent("bigview.image.submit_held", {
           agentId: activeAgentId,
           attachmentCount: previousAttachments.length,
           attachments: getAttachmentLogSummary(previousAttachments),
-          selectedModel: selectedModel || "",
+          reason: "image_submit_disabled",
+          selectedModel: currentTuiModel || "",
           surface: "thread_detail",
           threadId: thread?.id || "",
           workspaceId: workspace?.id || thread?.workspaceId || "",
         });
       }
-      let imageBlock = "";
-      try {
-        imageBlock = await saveImageAttachments(previousAttachments);
-      } catch (saveError) {
-        if (previousAttachments.length) {
-          logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
-            agentId: activeAgentId,
-            attachmentCount: previousAttachments.length,
-            attachments: getAttachmentLogSummary(previousAttachments),
-            message: saveError?.message || String(saveError || ""),
-            selectedModel: selectedModel || "",
-            surface: "thread_detail",
-            threadId: thread?.id || "",
-            workspaceId: workspace?.id || thread?.workspaceId || "",
-          });
-        }
-        throw saveError;
-      }
-      if (previousAttachments.length) {
-        logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
-          agentId: activeAgentId,
-          attachmentCount: previousAttachments.length,
-          imageBlockLength: imageBlock.length,
-          imageBlockPreview: imageBlock.slice(0, 240),
-          selectedModel: selectedModel || "",
-          surface: "thread_detail",
-          threadId: thread?.id || "",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
-        });
-      }
-      const message = [text, imageBlock].filter(Boolean).join("\n\n");
+      const message = text;
       logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
         hasActiveTerminalBinding,
-        imageBlockPresent: Boolean(imageBlock),
+        imageBlockPresent: false,
+        imagesHeld: previousAttachments.length,
         messageLength: message.length,
-        selectedModel: selectedModel || "",
+        selectedModel: currentTuiModel || "",
         surface: "thread_detail",
         threadId: thread?.id || "",
         workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -2024,22 +2200,20 @@ function WorkspaceThreadDetail({
       logBigViewSyncDiagnosticEvent("bigview.submit.done", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
-        selectedModel: selectedModel || "",
+        selectedModel: currentTuiModel || "",
         surface: "thread_detail",
         threadId: thread?.id || "",
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       setDraft("");
-      setAttachments([]);
     } catch (submitError) {
       setDraft(previousDraft);
-      setAttachments(previousAttachments);
       setError(submitError?.message || "Unable to send message.");
       logBigViewSyncDiagnosticEvent("bigview.submit.error", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
         message: submitError?.message || String(submitError || ""),
-        selectedModel: selectedModel || "",
+        selectedModel: currentTuiModel || "",
         surface: "thread_detail",
         threadId: thread?.id || "",
         workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -2108,7 +2282,9 @@ function WorkspaceThreadDetail({
           <AttachmentStrip>
             {attachments.map((attachment) => (
               <AttachmentChip key={attachment.id} title={attachment.name}>
+                {attachment.dataUrl && <img alt="" draggable={false} src={attachment.dataUrl} />}
                 <span>{attachment.name}</span>
+                <AttachmentQueueHint>queued</AttachmentQueueHint>
                 <button
                   aria-label={`Remove ${attachment.name}`}
                   disabled={sending}
@@ -2135,7 +2311,7 @@ function WorkspaceThreadDetail({
                 hasProviderSession,
                 nextValueLength: nextDraft.length,
                 previousValueLength: previousDraft.length,
-                selectedModel: selectedModel || "",
+                selectedModel: currentTuiModel || "",
                 surface: "thread_detail",
                 threadId: thread?.id || "",
                 workspaceId: workspace?.id || thread?.workspaceId || "",

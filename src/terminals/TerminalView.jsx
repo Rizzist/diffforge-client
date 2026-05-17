@@ -21,12 +21,19 @@ import {
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
+import { logBigViewSyncDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
+import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
 } from "./WorkspaceTerminal.jsx";
+import {
+  appendWorkspaceThreadComposerAttachments,
+  getThreadComposerSyncKey,
+  setWorkspaceThreadComposerDraft,
+} from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
@@ -1090,6 +1097,7 @@ function normalizeTodoQueueImage(value) {
 
   return {
     name: typeof image.name === "string" ? image.name.slice(0, 160) : "",
+    size: Number(image.size || 0),
     src,
     type: typeof image.type === "string" ? image.type.slice(0, 80) : "",
   };
@@ -1136,14 +1144,27 @@ function findTodoAgentStatus(agentStatuses, agentId) {
   )) || null;
 }
 
-function resolveTodoImageInputSupport({ agent, agentStatuses, role }) {
+function getProviderBindingModelId(providerBinding) {
+  return String(
+    providerBinding?.modelId
+      || providerBinding?.model
+      || providerBinding?.activeModel
+      || providerBinding?.nativeModel
+      || providerBinding?.selectedModel
+      || providerBinding?.configuredModel
+      || "",
+  ).trim();
+}
+
+function resolveTodoImageInputSupport({ agent, agentStatuses, providerBinding = null, role }) {
   const roleId = normalizeTodoTerminalAgentId(role || agent?.id);
   const agentId = roleId === "generic" || roleId === "terminal" || roleId === "shell"
     ? roleId
     : normalizeTodoTerminalAgentId(agent?.id || roleId);
   const status = findTodoAgentStatus(agentStatuses, agentId);
   const activeModel = String(
-    status?.activeModel
+    getProviderBindingModelId(providerBinding)
+    || status?.activeModel
     || status?.model
     || status?.selectedModel
     || status?.configuredModel
@@ -1180,6 +1201,34 @@ function getTodoImageMimeType(image) {
     || "";
 }
 
+function getTodoImageLogSummary(images) {
+  return (Array.isArray(images) ? images : [images])
+    .map((image) => normalizeTodoQueueImage(image))
+    .filter(Boolean)
+    .map((image) => ({
+      dataUrlLength: String(image.src || "").length,
+      mimeType: getTodoImageMimeType(image),
+      name: image.name || "",
+      size: Number(image.size || 0),
+    }));
+}
+
+function getTodoQueueItemLogSummary(items) {
+  return (Array.isArray(items) ? items : [items])
+    .map((item) => {
+      const image = getTodoQueueItemImage(item);
+      const note = getTodoQueueItemNote(item);
+      return {
+        hasImage: Boolean(image),
+        hasNote: Boolean(note),
+        id: String(item?.id || ""),
+        image: image ? getTodoImageLogSummary([image])[0] || null : null,
+        noteLength: note ? normalizeTodoQueueMultilineText(note.text).length : 0,
+        textLength: normalizeTodoQueueText(item?.text).length,
+      };
+    });
+}
+
 function todoImageToAttachmentPayload(image, index = 0) {
   const normalized = normalizeTodoQueueImage(image);
   const mimeType = getTodoImageMimeType(normalized);
@@ -1192,6 +1241,24 @@ function todoImageToAttachmentPayload(image, index = 0) {
     dataUrl: normalized.src,
     mimeType,
     name: normalized.name || `todo-image-${index + 1}`,
+  };
+}
+
+function todoImageToComposerAttachment(image, index = 0, source = "tui_todo_drop") {
+  const normalized = normalizeTodoQueueImage(image);
+  const mimeType = getTodoImageMimeType(normalized);
+
+  if (!normalized || !mimeType) {
+    return null;
+  }
+
+  return {
+    dataUrl: normalized.src,
+    mimeType,
+    name: normalized.name || `todo-image-${index + 1}`,
+    size: Number(normalized.size || 0),
+    source,
+    status: "queued",
   };
 }
 
@@ -1235,23 +1302,11 @@ async function saveTodoQueueTextAttachment(note) {
 
 async function prepareTodoTerminalText(item) {
   const text = normalizeTodoQueueText(item?.text);
-  const image = getTodoQueueItemImage(item);
   const note = getTodoQueueItemNote(item);
   const parts = [];
 
   if (text) {
     parts.push(text);
-  }
-
-  if (image) {
-    const savedImages = await saveTodoQueueImageAttachments([image]);
-    const imageBlock = formatSavedTodoImageAttachments(savedImages);
-
-    if (!imageBlock) {
-      throw new Error("Unable to prepare pasted image for terminal.");
-    }
-
-    parts.push(imageBlock);
   }
 
   if (note?.text) {
@@ -1458,11 +1513,32 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     }
 
     event.preventDefault();
+    logBigViewSyncDiagnosticEvent("tui.image.paste_start", {
+      draftLength: normalizeTodoQueueText(draft).length,
+      fileCount: imageFiles.length,
+      files: imageFiles.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      hasNote: Boolean(note),
+      queueItemCount: items.length,
+      surface: "tui_todo_queue",
+      workspaceId,
+    });
     Promise.all(imageFiles.map(readTodoImageFile))
       .then((images) => {
         const normalizedImages = dedupeTodoQueueImages(images);
         if (normalizedImages.length) {
           const createdItems = onSubmitDraft({ images: normalizedImages, note }) || [];
+          logBigViewSyncDiagnosticEvent("tui.image.paste_done", {
+            createdItemCount: createdItems.length,
+            createdItems: getTodoQueueItemLogSummary(createdItems),
+            imageCount: normalizedImages.length,
+            images: getTodoImageLogSummary(normalizedImages),
+            surface: "tui_todo_queue",
+            workspaceId,
+          });
           const firstImageItem = createdItems.find((item) => getTodoQueueItemImage(item)) || createdItems[0];
 
           if (firstImageItem?.id) {
@@ -1472,8 +1548,15 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           }
         }
       })
-      .catch(() => {});
-  }, [onSubmitDraft]);
+      .catch((error) => {
+        logBigViewSyncDiagnosticEvent("tui.image.paste_error", {
+          fileCount: imageFiles.length,
+          message: error?.message || String(error || ""),
+          surface: "tui_todo_queue",
+          workspaceId,
+        });
+      });
+  }, [draft, items.length, onSubmitDraft, workspaceId]);
 
   const handleSubmit = useCallback((event) => {
     event.preventDefault();
@@ -1972,12 +2055,17 @@ function TerminalView({
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
   const getTerminalImageInputSupport = useCallback((terminalIndex) => (
-    resolveTodoImageInputSupport({
+    (() => {
+      const role = getTerminalRole(terminalIndex);
+      const thread = getTerminalThread(terminalIndex);
+      return resolveTodoImageInputSupport({
       agent: getTerminalAgent(terminalIndex),
       agentStatuses,
-      role: getTerminalRole(terminalIndex),
-    })
-  ), [agentStatuses, getTerminalAgent, getTerminalRole]);
+        providerBinding: getWorkspaceThreadProviderBinding(thread, role),
+        role,
+      });
+    })()
+  ), [agentStatuses, getTerminalAgent, getTerminalRole, getTerminalThread]);
   const visibleTerminalPaneIds = useMemo(() => (
     terminalWorkspace
       ? logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
@@ -2206,10 +2294,22 @@ function TerminalView({
       const nextItems = normalizeTodoQueueItems(
         typeof updater === "function" ? updater(currentItems) : updater,
       );
+      const previousImageCount = currentItems.filter((item) => getTodoQueueItemImage(item)).length;
+      const nextImageCount = nextItems.filter((item) => getTodoQueueItemImage(item)).length;
+      if (previousImageCount || nextImageCount) {
+        logBigViewSyncDiagnosticEvent("tui.image.queue_state", {
+          nextImageCount,
+          nextItemCount: nextItems.length,
+          previousImageCount,
+          previousItemCount: currentItems.length,
+          surface: "tui_todo_queue",
+          workspaceId: terminalWorkspace?.id || "",
+        });
+      }
       writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
       return nextItems;
     });
-  }, []);
+  }, [terminalWorkspace?.id]);
 
   const submitTodoQueueDraft = useCallback((options = {}) => {
     const text = normalizeTodoQueueText(todoQueueDraft);
@@ -2229,6 +2329,17 @@ function TerminalView({
       ))
       : [createTodoQueueItem(text, note ? { note } : {})];
 
+    if (images.length) {
+      logBigViewSyncDiagnosticEvent("tui.image.queue_add", {
+        draftLength: text.length,
+        imageCount: images.length,
+        images: getTodoImageLogSummary(images),
+        items: getTodoQueueItemLogSummary(nextItems),
+        notePresent: Boolean(note),
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
     updateTodoQueueItems((currentItems) => currentItems.concat(nextItems));
     setTodoDropError("");
     setTodoQueueDraft("");
@@ -2454,37 +2565,159 @@ function TerminalView({
       const targetRole = Number.isInteger(targetTerminalIndex)
         ? String(getTerminalRole(targetTerminalIndex) || "").toLowerCase()
         : "";
-      const shouldAutoSubmit = !["generic", "terminal", "shell"].includes(targetRole);
+      const image = getTodoQueueItemImage(currentDrag);
+      const shouldAutoSubmit = !image && !["generic", "terminal", "shell"].includes(targetRole);
 
       updateTodoDragState(null);
 
+      logBigViewSyncDiagnosticEvent("tui.image.drop_start", {
+        hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+        item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+        paneId,
+        shouldAutoSubmit,
+        surface: "tui_terminal_grid",
+        targetRole,
+        targetTerminalIndex: targetTerminalIndex ?? "",
+        workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+      });
+
       if (!paneId) {
+        logBigViewSyncDiagnosticEvent("tui.image.drop_skip", {
+          hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+          reason: "missing_pane",
+          surface: "tui_terminal_grid",
+          targetTerminalIndex: targetTerminalIndex ?? "",
+          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+        });
         return;
       }
 
-      const image = getTodoQueueItemImage(currentDrag);
       const imageInputSupport = Number.isInteger(targetTerminalIndex)
         ? getTerminalImageInputSupport(targetTerminalIndex)
         : { supported: false };
 
       if (image && !imageInputSupport.supported) {
         setTodoDropError(getTodoImageUnsupportedDropMessage(imageInputSupport));
+        logBigViewSyncDiagnosticEvent("tui.image.drop_unsupported", {
+          image: getTodoImageLogSummary([image])[0] || null,
+          imageSupportReason: imageInputSupport.reason || "",
+          imageSupportState: imageInputSupport.state || "",
+          paneId,
+          surface: "tui_terminal_grid",
+          targetRole,
+          targetTerminalIndex: targetTerminalIndex ?? "",
+          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+        });
         return;
       }
 
       setActiveTerminalPaneId(paneId);
       prepareTodoTerminalText(currentDrag)
         .then((terminalText) => {
+          const targetThread = Number.isInteger(targetTerminalIndex)
+            ? getTerminalThread(targetTerminalIndex)
+            : null;
+          const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+          const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
+          const syncKey = getThreadComposerSyncKey(targetThread, {
+            ...targetBinding,
+            paneId: targetBinding?.paneId || paneId,
+          });
+          const queuedAttachment = image
+            ? todoImageToComposerAttachment(image, 0, "tui_todo_drop")
+            : null;
+          if (queuedAttachment && syncKey) {
+            appendWorkspaceThreadComposerAttachments(syncKey, [queuedAttachment], {
+              fields: {
+                image: getTodoImageLogSummary([image])[0] || null,
+                paneId,
+                surface: "tui_terminal_grid",
+                targetRole,
+                targetTerminalIndex: targetTerminalIndex ?? "",
+                workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+              },
+              source: "tui_todo_drop",
+            });
+          }
+          if (queuedAttachment && !syncKey) {
+            logBigViewSyncDiagnosticEvent("tui.image.drop_attachment_skip", {
+              image: getTodoImageLogSummary([image])[0] || null,
+              paneId,
+              reason: "missing_sync_key",
+              surface: "tui_terminal_grid",
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+          }
+          if (!terminalText && queuedAttachment) {
+            if (!syncKey) {
+              throw new Error("Unable to queue image because this terminal has no thread composer.");
+            }
+            logBigViewSyncDiagnosticEvent("tui.image.drop_queued_only", {
+              attachmentQueued: Boolean(syncKey),
+              image: getTodoImageLogSummary([image])[0] || null,
+              paneId,
+              shouldAutoSubmit,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+            return { imageOnly: true, syncKey };
+          }
           if (!terminalText) {
             throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
           }
-
+          if (syncKey) {
+            setWorkspaceThreadComposerDraft(syncKey, terminalText);
+          }
+          logBigViewSyncDiagnosticEvent("tui.image.drop_prepared", {
+            attachmentQueued: Boolean(queuedAttachment && syncKey),
+            hasImageAttachmentBlock: false,
+            hasQueuedImage: Boolean(queuedAttachment),
+            paneId,
+            shouldAutoSubmit,
+            sharedDraftSynced: Boolean(syncKey),
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetRole,
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            terminalTextLength: terminalText.length,
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
           return invoke("terminal_write", {
             data: `${terminalText}${shouldAutoSubmit ? "\r" : ""}`,
             paneId,
           });
         })
-        .then(() => {
+        .then((writeResult) => {
+          const targetThread = Number.isInteger(targetTerminalIndex)
+            ? getTerminalThread(targetTerminalIndex)
+            : null;
+          const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+          const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
+          const syncKey = getThreadComposerSyncKey(targetThread, {
+            ...targetBinding,
+            paneId: targetBinding?.paneId || paneId,
+          });
+          if (syncKey && shouldAutoSubmit) {
+            setWorkspaceThreadComposerDraft(syncKey, "");
+          }
+          logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
+            imageOnlyQueued: Boolean(writeResult?.imageOnly),
+            hadQueueItem: Boolean(currentDrag.itemId),
+            hasImage: Boolean(image),
+            paneId,
+            shouldAutoSubmit,
+            sharedDraftCleared: Boolean(syncKey && shouldAutoSubmit),
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetRole,
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
           setTodoDropError("");
           if (currentDrag.itemId) {
             updateTodoQueueItems((currentItems) => (
@@ -2494,6 +2727,16 @@ function TerminalView({
         })
         .catch((error) => {
           setTodoDropError(getTodoDropErrorMessage(error));
+          logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
+            hasImage: Boolean(image),
+            message: error?.message || String(error || ""),
+            paneId,
+            shouldAutoSubmit,
+            surface: "tui_terminal_grid",
+            targetRole,
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
         });
     };
 
@@ -2551,7 +2794,9 @@ function TerminalView({
     getTerminalImageInputSupport,
     getTerminalRole,
     getTerminalPaneId,
+    getTerminalThread,
     logicalTerminalIndexes,
+    terminalWorkspace?.id,
     todoDragActive,
     updateTodoQueueItems,
     updateTodoDragState,

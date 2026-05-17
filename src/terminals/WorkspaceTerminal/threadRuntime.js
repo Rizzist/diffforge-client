@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-import { stripLiveViewControlSequences } from "../liveViewSanitizer.js";
 import { getWorkspaceThreadProviderBinding } from "../../threads/workspaceThreads";
+import { logBigViewSyncDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
 import {
   MAX_WORKSPACE_TERMINAL_COUNT,
   MIN_WORKSPACE_TERMINAL_COUNT,
@@ -158,22 +158,30 @@ export function stripTerminalGeneratedReplyText(value) {
 
 export function isTerminalGeneratedReplyVisibleText(value) {
   const text = String(value || "").trim();
-  return !text
-    || /\\?\]?(?:10|11|12);rgb:[0-9a-fA-F/]+/i.test(text)
-    || /\brgb:[0-9a-fA-F/]+\b/i.test(text);
+  return Boolean(text)
+    && (/\\?\]?(?:10|11|12);rgb:[0-9a-fA-F/]+/i.test(text)
+      || /\brgb:[0-9a-fA-F/]+\b/i.test(text));
 }
 
 export function terminalInputChunkVisibleText(data) {
-  const strippedText = stripTerminalGeneratedReplyText(stripLiveViewControlSequences(data));
+  const rawText = String(data || "");
+  const rawLooksTerminalGenerated = /\\?\]?(?:10|11|12);rgb:[0-9a-fA-F/]+/i.test(rawText)
+    || /\brgb:[0-9a-fA-F/]+\b/i.test(rawText);
+  const strippedText = stripTerminalGeneratedReplyText(rawText);
   const visibleText = strippedText
+    .replace(/(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c)/g, "")
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
-    .replace(/[\u0000-\u001F\u007F]/g, "");
+    .replace(/[\u0000-\u0008\u000b-\u001F\u007F]/g, "");
+
+  if (rawLooksTerminalGenerated && !visibleText.trim()) {
+    return "";
+  }
 
   return isTerminalGeneratedReplyVisibleText(visibleText) ? "" : visibleText;
 }
 
 export function terminalInputChunkHasVisibleText(data) {
-  return terminalInputChunkVisibleText(data).trim().length > 0;
+  return terminalInputChunkVisibleText(data).length > 0;
 }
 
 export function applyTerminalInputChunkToDraft(draft, data) {
@@ -220,6 +228,8 @@ export function isPlainShiftEnterEvent(event) {
 
 const workspaceThreadComposerDraftStore = new Map();
 const workspaceThreadComposerDraftSubscribers = new Set();
+const workspaceThreadComposerAttachmentStore = new Map();
+const workspaceThreadComposerAttachmentSubscribers = new Set();
 
 export function getWorkspaceThreadComposerDraftStore() {
   return workspaceThreadComposerDraftStore;
@@ -227,6 +237,90 @@ export function getWorkspaceThreadComposerDraftStore() {
 
 export function getWorkspaceThreadComposerDraftSnapshot() {
   return Object.fromEntries(workspaceThreadComposerDraftStore.entries());
+}
+
+function getComposerAttachmentLogSummary(attachments) {
+  return (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => ({
+      dataUrlLength: String(attachment?.dataUrl || "").length,
+      id: String(attachment?.id || ""),
+      mimeType: String(attachment?.mimeType || ""),
+      name: String(attachment?.name || ""),
+      savedPathPresent: Boolean(attachment?.savedPath),
+      size: Number(attachment?.size || 0),
+      source: String(attachment?.source || ""),
+      status: String(attachment?.status || ""),
+    }))
+    .slice(0, 12);
+}
+
+function createComposerAttachmentId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `attachment-${crypto.randomUUID()}`;
+  }
+
+  return `attachment-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function normalizeWorkspaceThreadComposerAttachment(attachment, index = 0) {
+  if (!attachment || typeof attachment !== "object") {
+    return null;
+  }
+
+  const dataUrl = String(attachment.dataUrl || attachment.src || attachment.imageDataUrl || "").trim();
+  const savedPath = String(attachment.savedPath || attachment.path || "").trim();
+  const mimeType = String(attachment.mimeType || attachment.type || "").trim()
+    || dataUrl.match(/^data:([^;]+);/i)?.[1]
+    || "";
+  const name = String(attachment.name || `image-${index + 1}`).trim() || `image-${index + 1}`;
+
+  if (!dataUrl && !savedPath) {
+    return null;
+  }
+
+  return {
+    dataUrl,
+    id: String(attachment.id || createComposerAttachmentId()),
+    mimeType,
+    name,
+    savedPath,
+    size: Number(attachment.size || 0),
+    source: String(attachment.source || "unknown"),
+    status: String(attachment.status || "queued"),
+  };
+}
+
+function normalizeWorkspaceThreadComposerAttachments(attachments) {
+  const seenIds = new Set();
+
+  return (Array.isArray(attachments) ? attachments : [])
+    .map(normalizeWorkspaceThreadComposerAttachment)
+    .filter((attachment) => {
+      if (!attachment || seenIds.has(attachment.id)) {
+        return false;
+      }
+
+      seenIds.add(attachment.id);
+      return true;
+    });
+}
+
+export function getWorkspaceThreadComposerAttachmentStore() {
+  return workspaceThreadComposerAttachmentStore;
+}
+
+export function getWorkspaceThreadComposerAttachmentSnapshot() {
+  return Object.fromEntries(
+    Array.from(workspaceThreadComposerAttachmentStore.entries()).map(([key, attachments]) => [
+      key,
+      attachments.slice(),
+    ]),
+  );
+}
+
+export function getWorkspaceThreadComposerAttachments(syncKey) {
+  const key = String(syncKey || "");
+  return key ? (workspaceThreadComposerAttachmentStore.get(key) || []).slice() : [];
 }
 
 function notifyWorkspaceThreadComposerDraftSubscribers() {
@@ -239,6 +333,16 @@ function notifyWorkspaceThreadComposerDraftSubscribers() {
   });
 }
 
+function notifyWorkspaceThreadComposerAttachmentSubscribers() {
+  workspaceThreadComposerAttachmentSubscribers.forEach((listener) => {
+    try {
+      listener();
+    } catch (_) {
+      // Keep one broken subscriber from muting the shared attachment bridge.
+    }
+  });
+}
+
 export function subscribeWorkspaceThreadComposerDrafts(listener) {
   if (typeof listener !== "function") {
     return () => {};
@@ -247,6 +351,17 @@ export function subscribeWorkspaceThreadComposerDrafts(listener) {
   workspaceThreadComposerDraftSubscribers.add(listener);
   return () => {
     workspaceThreadComposerDraftSubscribers.delete(listener);
+  };
+}
+
+export function subscribeWorkspaceThreadComposerAttachments(listener) {
+  if (typeof listener !== "function") {
+    return () => {};
+  }
+
+  workspaceThreadComposerAttachmentSubscribers.add(listener);
+  return () => {
+    workspaceThreadComposerAttachmentSubscribers.delete(listener);
   };
 }
 
@@ -268,6 +383,91 @@ export function setWorkspaceThreadComposerDraft(syncKey, value) {
     workspaceThreadComposerDraftStore.delete(key);
   }
   notifyWorkspaceThreadComposerDraftSubscribers();
+}
+
+export function setWorkspaceThreadComposerAttachments(syncKey, attachments, options = {}) {
+  const key = String(syncKey || "");
+  if (!key) {
+    logBigViewSyncDiagnosticEvent("bigview.image.shared_attachment_set_skip", {
+      reason: "missing_sync_key",
+      source: options.source || "unspecified",
+    });
+    return [];
+  }
+
+  const nextAttachments = normalizeWorkspaceThreadComposerAttachments(attachments);
+  const currentAttachments = workspaceThreadComposerAttachmentStore.get(key) || [];
+  const currentSignature = JSON.stringify(getComposerAttachmentLogSummary(currentAttachments));
+  const nextSignature = JSON.stringify(getComposerAttachmentLogSummary(nextAttachments));
+  const changed = currentSignature !== nextSignature;
+
+  logBigViewSyncDiagnosticEvent("bigview.image.shared_attachment_set", {
+    attachmentCountAfter: nextAttachments.length,
+    attachmentCountBefore: currentAttachments.length,
+    attachments: getComposerAttachmentLogSummary(nextAttachments),
+    changed,
+    reason: options.reason || "",
+    source: options.source || "unspecified",
+    syncKey: key,
+    ...(options.fields || {}),
+  });
+
+  if (!changed) {
+    return nextAttachments;
+  }
+
+  if (nextAttachments.length) {
+    workspaceThreadComposerAttachmentStore.set(key, nextAttachments);
+  } else {
+    workspaceThreadComposerAttachmentStore.delete(key);
+  }
+  notifyWorkspaceThreadComposerAttachmentSubscribers();
+  return nextAttachments;
+}
+
+export function appendWorkspaceThreadComposerAttachments(syncKey, attachments, options = {}) {
+  const key = String(syncKey || "");
+  const currentAttachments = key ? workspaceThreadComposerAttachmentStore.get(key) || [] : [];
+  const incomingAttachments = normalizeWorkspaceThreadComposerAttachments(attachments);
+  const maxCount = Number.isFinite(Number(options.maxCount)) ? Math.max(0, Number(options.maxCount)) : 8;
+  const nextAttachments = currentAttachments.concat(incomingAttachments).slice(0, maxCount);
+
+  logBigViewSyncDiagnosticEvent("bigview.image.shared_attachment_append", {
+    attachmentCountBefore: currentAttachments.length,
+    incomingAttachmentCount: incomingAttachments.length,
+    incomingAttachments: getComposerAttachmentLogSummary(incomingAttachments),
+    maxCount,
+    source: options.source || "unspecified",
+    syncKey: key,
+    ...(options.fields || {}),
+  });
+
+  return setWorkspaceThreadComposerAttachments(key, nextAttachments, {
+    ...options,
+    reason: options.reason || "append",
+  });
+}
+
+export function removeWorkspaceThreadComposerAttachment(syncKey, attachmentId, options = {}) {
+  const key = String(syncKey || "");
+  const safeAttachmentId = String(attachmentId || "");
+  const currentAttachments = key ? workspaceThreadComposerAttachmentStore.get(key) || [] : [];
+  const removedAttachment = currentAttachments.find((attachment) => attachment.id === safeAttachmentId) || null;
+  const nextAttachments = currentAttachments.filter((attachment) => attachment.id !== safeAttachmentId);
+
+  logBigViewSyncDiagnosticEvent("bigview.image.shared_attachment_remove", {
+    attachmentCountAfter: nextAttachments.length,
+    attachmentCountBefore: currentAttachments.length,
+    removedAttachment: getComposerAttachmentLogSummary([removedAttachment])[0] || null,
+    source: options.source || "unspecified",
+    syncKey: key,
+    ...(options.fields || {}),
+  });
+
+  return setWorkspaceThreadComposerAttachments(key, nextAttachments, {
+    ...options,
+    reason: options.reason || "remove",
+  });
 }
 
 export function createThreadProjectionToken(prefix = "projection") {

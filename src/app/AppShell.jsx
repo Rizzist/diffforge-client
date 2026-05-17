@@ -22,6 +22,7 @@ import {
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
+import { logBigViewSyncDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
@@ -6462,6 +6463,34 @@ export default function App() {
         userMessageLength: getThreadDiagnosticTextLength(lifecycleEvent.userMessage || ""),
         workspaceId: lifecycleWorkspaceId,
       });
+      if (
+        lifecycleEvent.type === "model-selected"
+        || lifecycleEvent.type === "opened"
+        || lifecycleEvent.type === "provider-turn-started"
+        || lifecycleEvent.type === "provider-session"
+        || lifecycleEvent.model
+        || lifecycleEvent.modelId
+      ) {
+        const beforeThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        const afterThread = nextThreads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        const beforeProviderBinding = getWorkspaceThreadProviderBinding(beforeThread, lifecycleAgentId);
+        const afterProviderBinding = getWorkspaceThreadProviderBinding(afterThread, lifecycleAgentId);
+        logBigViewSyncDiagnosticEvent("bigview.model_state.lifecycle_apply", {
+          afterModel: afterProviderBinding?.modelId || "",
+          afterProviderSessionPresent: Boolean(afterProviderBinding?.nativeSessionId),
+          agentId: lifecycleAgentId,
+          beforeModel: beforeProviderBinding?.modelId || "",
+          beforeProviderSessionPresent: Boolean(beforeProviderBinding?.nativeSessionId),
+          eventModel: lifecycleEvent.modelId || lifecycleEvent.model || "",
+          eventModelSource: lifecycleEvent.modelSource || "",
+          operation,
+          stateChanged: nextThreads !== threads,
+          terminalIndex: lifecycleEvent.terminalIndex ?? "",
+          threadId: lifecycleThreadId,
+          type: lifecycleEvent.type || "",
+          workspaceId: lifecycleWorkspaceId,
+        });
+      }
       if (lifecycleEvent.type === "provider-session" || lifecycleEvent.type === "opened") {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_session.apply_delta", {
           afterHasSession,
@@ -6779,9 +6808,31 @@ export default function App() {
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
     const batchStartedAt = performance.now();
 
+    logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_start", {
+      launchKey: workspaceAgentLaunchKey,
+      requestCount: preparedWorkspaceTerminalRequests.length,
+      requests: preparedWorkspaceTerminalRequests.map((request) => ({
+        hasProviderSessionId: Boolean(request.providerSessionId),
+        instanceId: request.instanceId || "",
+        model: request.model || "",
+        paneId: request.paneId || "",
+        provider: request.provider || "",
+        terminalIndex: request.terminalIndex ?? "",
+        threadId: request.threadId || "",
+        workspaceId: request.workspaceId || "",
+      })),
+      workspaceId: activatedWorkspace.id,
+    });
+
     invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
       .then((result) => {
         const results = Array.isArray(result?.results) ? result.results : [];
+        logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_result", {
+          launchKey: workspaceAgentLaunchKey,
+          resultCount: results.length,
+          startedCount: results.filter((paneResult) => paneResult?.started).length,
+          workspaceId: activatedWorkspace.id,
+        });
         results.forEach((paneResult) => {
           if (!paneResult?.started) {
             return;
@@ -6794,6 +6845,17 @@ export default function App() {
           if (!request) {
             return;
           }
+
+          logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_pane_started", {
+            hasProviderSessionId: Boolean(request.providerSessionId),
+            instanceId: paneResult.instanceId || request.instanceId || "",
+            model: request.model || "",
+            paneId: paneResult.paneId || request.paneId || "",
+            provider: request.provider || "",
+            terminalIndex: request.terminalIndex ?? "",
+            threadId: request.threadId || "",
+            workspaceId: request.workspaceId || "",
+          });
 
           const terminalLifecycleEvent = {
             agentId: request.provider,
@@ -6813,15 +6875,75 @@ export default function App() {
               : updateWorkspaceActiveTerminal(threads, terminalLifecycleEvent)
           ));
 
-          if (request.model && request.providerSessionId) {
+          const shouldWriteStartupModelRestore = false;
+          if (request.model && request.providerSessionId && shouldWriteStartupModelRestore) {
             const restoreModelCommand = `/model ${request.model}`;
+            logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_write_scheduled", {
+              commandLength: restoreModelCommand.length,
+              delayMs: 650,
+              instanceId: paneResult.instanceId || "",
+              model: request.model || "",
+              paneId: paneResult.paneId || "",
+              provider: request.provider || "",
+              providerSessionIdPresent: Boolean(request.providerSessionId),
+              terminalIndex: request.terminalIndex ?? "",
+              threadId: request.threadId || "",
+              workspaceId: request.workspaceId || "",
+            });
             window.setTimeout(() => {
+              logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_write_start", {
+                commandLength: restoreModelCommand.length,
+                instanceId: paneResult.instanceId || "",
+                model: request.model || "",
+                paneId: paneResult.paneId || "",
+                provider: request.provider || "",
+                terminalIndex: request.terminalIndex ?? "",
+                threadId: request.threadId || "",
+                workspaceId: request.workspaceId || "",
+              });
               invoke("terminal_write", {
                 data: `${restoreModelCommand}\r`,
                 instanceId: paneResult.instanceId,
                 paneId: paneResult.paneId,
-              }).catch(() => {});
+              }).then(() => {
+                logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_write_done", {
+                  instanceId: paneResult.instanceId || "",
+                  model: request.model || "",
+                  paneId: paneResult.paneId || "",
+                  provider: request.provider || "",
+                  terminalIndex: request.terminalIndex ?? "",
+                  threadId: request.threadId || "",
+                  workspaceId: request.workspaceId || "",
+                });
+              }).catch((error) => {
+                logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_write_error", {
+                  instanceId: paneResult.instanceId || "",
+                  message: error?.message || String(error || ""),
+                  model: request.model || "",
+                  paneId: paneResult.paneId || "",
+                  provider: request.provider || "",
+                  terminalIndex: request.terminalIndex ?? "",
+                  threadId: request.threadId || "",
+                  workspaceId: request.workspaceId || "",
+                });
+              });
             }, 650);
+          } else {
+            logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_write_skip", {
+              hasModel: Boolean(request.model),
+              hasProviderSessionId: Boolean(request.providerSessionId),
+              instanceId: paneResult.instanceId || request.instanceId || "",
+              paneId: paneResult.paneId || request.paneId || "",
+              provider: request.provider || "",
+              reason: !request.model
+                ? "missing_model"
+                : !request.providerSessionId
+                  ? "missing_provider_session"
+                  : "startup_model_restore_disabled",
+              terminalIndex: request.terminalIndex ?? "",
+              threadId: request.threadId || "",
+              workspaceId: request.workspaceId || "",
+            });
           }
         });
         workspaceAgentBatchInFlightKeyRef.current = "";
@@ -6837,6 +6959,12 @@ export default function App() {
         setPreparedTerminalVersion((version) => version + 1);
       })
       .catch((error) => {
+        logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_error", {
+          launchKey: workspaceAgentLaunchKey,
+          message: error?.message || String(error || ""),
+          requestCount: preparedWorkspaceTerminalRequests.length,
+          workspaceId: activatedWorkspace.id,
+        });
         workspaceAgentBatchInFlightKeyRef.current = "";
         setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
         setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);

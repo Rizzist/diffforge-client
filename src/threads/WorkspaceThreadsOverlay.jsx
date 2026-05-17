@@ -729,6 +729,7 @@ function isThreadVisibleInOverlay(thread, entry) {
 
 function WorkspaceThreadsOverlay({
   agentStatuses,
+  composerAttachments,
   composerDrafts,
   onArchiveThread,
   onClose,
@@ -1091,6 +1092,7 @@ function WorkspaceThreadsOverlay({
 
         <WorkspaceThreadDetail
           agentStatuses={agentStatuses}
+          composerAttachments={composerAttachments}
           composerDrafts={composerDrafts}
           newChatActive={newChatActive}
           onCreateChat={createChat}

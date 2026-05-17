@@ -98,6 +98,10 @@ function cleanSubmittedUserMessage(value) {
   return promptText && !isTerminalArtifactMessage(promptText) ? promptText : "";
 }
 
+function isSlashCommandPrompt(value) {
+  return String(value || "").trimStart().startsWith("/");
+}
+
 function cleanThreadLabelCandidate(value) {
   const text = cleanTerminalUiText(value);
   return isTerminalArtifactLabel(text) ? "" : limitThreadPromptLabel(text, "");
@@ -971,7 +975,7 @@ function findMatchingProjectedMessage(projectedMessages, message) {
 
 function createSubmittedUserProjectionEvents(thread, event = {}) {
   const text = cleanSubmittedUserMessage(event.userMessage || event.message);
-  if (!text) {
+  if (!text || isSlashCommandPrompt(text)) {
     return [];
   }
 

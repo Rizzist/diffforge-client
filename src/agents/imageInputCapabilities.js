@@ -3,8 +3,8 @@ const IMAGE_INPUT_UNSUPPORTED = "unsupported";
 const IMAGE_INPUT_UNKNOWN = "unknown";
 
 const CODEX_IMAGE_INPUT_MODELS = new Map([
-  ["gpt-5.5", IMAGE_INPUT_UNKNOWN],
-  ["gpt-5.4", IMAGE_INPUT_UNKNOWN],
+  ["gpt-5.5", IMAGE_INPUT_SUPPORTED],
+  ["gpt-5.4", IMAGE_INPUT_SUPPORTED],
   ["gpt-5.3-codex-spark", IMAGE_INPUT_UNSUPPORTED],
   ["gpt-5.2", IMAGE_INPUT_SUPPORTED],
   ["gpt-5.1", IMAGE_INPUT_SUPPORTED],
@@ -90,7 +90,13 @@ function lookupCodexImageInputState(model) {
     return IMAGE_INPUT_SUPPORTED;
   }
 
-  if (normalized === "gpt-5" || normalized.startsWith("gpt-5.1") || normalized.startsWith("gpt-5.2")) {
+  if (
+    normalized === "gpt-5"
+    || normalized.startsWith("gpt-5.1")
+    || normalized.startsWith("gpt-5.2")
+    || normalized.startsWith("gpt-5.4")
+    || normalized.startsWith("gpt-5.5")
+  ) {
     return IMAGE_INPUT_SUPPORTED;
   }
 
@@ -212,4 +218,3 @@ export function getAgentModelImageInputCapability(agentId, model, options = {}) 
     supported: false,
   };
 }
-
