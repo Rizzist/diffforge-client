@@ -6,6 +6,7 @@ import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
+import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
@@ -936,57 +937,6 @@ function getStatusModel(status) {
   ).trim();
 }
 
-function modelLooksImageCapable(model) {
-  const normalized = String(model || "").trim().toLowerCase();
-
-  if (!normalized) {
-    return null;
-  }
-
-  if ([
-    "gpt-3.5",
-    "o1-mini",
-    "o3-mini",
-    "deepseek",
-    "codestral",
-    "devstral",
-    "llama",
-    "qwen-coder",
-    "kimi",
-  ].some((marker) => normalized.includes(marker))) {
-    return false;
-  }
-
-  if ([
-    "gpt-4o",
-    "gpt-4.1",
-    "gpt-5",
-    "claude-3",
-    "claude-opus-4",
-    "claude-sonnet-4",
-    "claude-haiku-4",
-    "sonnet-4",
-    "opus-4",
-    "gemini",
-    "pixtral",
-    "llava",
-    "minicpm-v",
-    "vision",
-    "multimodal",
-    "omni",
-    "qwen-vl",
-    "qwen2-vl",
-    "qwen2.5-vl",
-  ].some((marker) => normalized.includes(marker))
-    || normalized.includes("-vl")
-    || normalized.includes("/vl")
-    || normalized.endsWith(":vl")) {
-    return true;
-  }
-
-  return null;
-}
-
 function getModelOptions(agentId, status, binding = null) {
   const normalizedAgentId = normalizeAgentId(agentId);
   const sessionModel = String(binding?.modelId || binding?.model || "").trim();
@@ -1018,49 +968,11 @@ function getModelOptions(agentId, status, binding = null) {
 
 function getImageInputSupport(agentId, status, selectedModel) {
   const normalizedAgentId = normalizeAgentId(agentId);
-  const statusSupport = String(status?.imageInputSupport || "").trim().toLowerCase();
   const activeModel = String(selectedModel || getStatusModel(status)).trim();
 
-  if (normalizedAgentId === "codex" || normalizedAgentId === "claude") {
-    return {
-      activeModel,
-      reason: status?.imageInputReason || `${AGENT_LABELS[normalizedAgentId]} supports image input.`,
-      supported: true,
-    };
-  }
-
-  if (normalizedAgentId === "opencode") {
-    if (status?.imageInputSupported === true || statusSupport === "supported") {
-      return {
-        activeModel,
-        reason: status?.imageInputReason || "OpenCode is using an image-capable model.",
-        supported: true,
-      };
-    }
-
-    const modelSupport = modelLooksImageCapable(activeModel);
-    if (modelSupport === true) {
-      return {
-        activeModel,
-        reason: `OpenCode is using an image-capable model (${activeModel}).`,
-        supported: true,
-      };
-    }
-
-    return {
-      activeModel,
-      reason: activeModel
-        ? `OpenCode image support is not available for ${activeModel}.`
-        : "OpenCode image input depends on the selected model.",
-      supported: false,
-    };
-  }
-
-  return {
-    activeModel,
-    reason: "This terminal does not accept image input.",
-    supported: false,
-  };
+  return getAgentModelImageInputCapability(normalizedAgentId, activeModel, {
+    agentLabel: AGENT_LABELS[normalizedAgentId] || normalizedAgentId,
+  });
 }
 
 function getVisibleModelLabel(option) {

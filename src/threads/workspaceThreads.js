@@ -1022,7 +1022,9 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   let projectionEvents = ensureThreadProjectionEvents(thread);
   let projectedMessages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
   const events = [];
-  let currentTurnId = cleanText(normalizeThreadLatestTurn(thread?.latestTurn)?.turnId);
+  const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
+  const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
+  let currentTurnId = cleanText(latestTurn?.turnId);
 
   normalizeThreadMessages(incomingMessages).forEach((message) => {
     const eventStartCount = events.length;
@@ -1189,11 +1191,16 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     }
   });
 
-  if (event.turnCompleteSeen === true && currentTurnId && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", currentTurnId)) {
+  const completedTurnId = runningLatestTurnId || currentTurnId;
+  if (
+    event.turnCompleteSeen === true
+    && completedTurnId
+    && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", completedTurnId)
+  ) {
     const completedAt = cleanText(event.latestTimestamp || event.completedAt, nowIso());
     const assistantMessage = [...projectedMessages].reverse().find((message) => (
       message?.role === "assistant"
-      && (!message.turnId || message.turnId === currentTurnId)
+      && (!message.turnId || message.turnId === completedTurnId)
     ));
     events.push({
       agentId,
@@ -1202,14 +1209,14 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       createdAt: completedAt,
       id: [
         "projection-provider-turn-completed",
-        safeKey(currentTurnId, "turn"),
+        safeKey(completedTurnId, "turn"),
         "fallback",
         stableProjectionHash(completedAt),
       ].join("-"),
-      messageId: assistantMessage?.id || currentTurnId,
+      messageId: assistantMessage?.id || completedTurnId,
       source,
       status: "completed",
-      turnId: currentTurnId,
+      turnId: completedTurnId,
       type: "thread.turn.completed",
     });
   }

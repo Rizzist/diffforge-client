@@ -20,6 +20,7 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
+import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import WorkspaceTerminal, {
@@ -124,7 +125,7 @@ const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
 const TODO_QUEUE_NOTE_LINE_THRESHOLD = 6;
 const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
 const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
-const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude", "opencode"]);
+const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude"]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
   { id: "files", label: "Files" },
@@ -1135,64 +1136,12 @@ function findTodoAgentStatus(agentStatuses, agentId) {
   )) || null;
 }
 
-function todoModelLooksImageCapable(model) {
-  const normalized = String(model || "").trim().toLowerCase();
-
-  if (!normalized) {
-    return null;
-  }
-
-  if ([
-    "gpt-3.5",
-    "o1-mini",
-    "o3-mini",
-    "deepseek",
-    "codestral",
-    "devstral",
-    "llama",
-    "qwen-coder",
-    "kimi",
-  ].some((marker) => normalized.includes(marker))) {
-    return false;
-  }
-
-  if ([
-    "gpt-4o",
-    "gpt-4.1",
-    "gpt-5",
-    "claude-3",
-    "claude-opus-4",
-    "claude-sonnet-4",
-    "claude-haiku-4",
-    "sonnet-4",
-    "opus-4",
-    "gemini",
-    "pixtral",
-    "llava",
-    "minicpm-v",
-    "vision",
-    "multimodal",
-    "omni",
-    "qwen-vl",
-    "qwen2-vl",
-    "qwen2.5-vl",
-  ].some((marker) => normalized.includes(marker))
-    || normalized.includes("-vl")
-    || normalized.includes("/vl")
-    || normalized.endsWith(":vl")) {
-    return true;
-  }
-
-  return null;
-}
-
 function resolveTodoImageInputSupport({ agent, agentStatuses, role }) {
   const roleId = normalizeTodoTerminalAgentId(role || agent?.id);
   const agentId = roleId === "generic" || roleId === "terminal" || roleId === "shell"
     ? roleId
     : normalizeTodoTerminalAgentId(agent?.id || roleId);
   const status = findTodoAgentStatus(agentStatuses, agentId);
-  const statusSupport = String(status?.imageInputSupport || "").trim().toLowerCase();
   const activeModel = String(
     status?.activeModel
     || status?.model
@@ -1210,73 +1159,14 @@ function resolveTodoImageInputSupport({ agent, agentStatuses, role }) {
     };
   }
 
-  if (agentId === "codex" || agentId === "claude") {
-    return {
-      activeModel,
-      reason: status?.imageInputReason || `${agent?.label || agentId} supports image input.`,
-      state: "supported",
-      supported: true,
-    };
-  }
-
-  if (agentId === "opencode") {
-    if (status?.imageInputSupported === true || statusSupport === "supported") {
-      return {
-        activeModel,
-        reason: status?.imageInputReason || "OpenCode is using an image-capable model.",
-        state: "supported",
-        supported: true,
-      };
-    }
-
-    if (status?.imageInputSupported === false && statusSupport === "unsupported") {
-      return {
-        activeModel,
-        reason: status?.imageInputReason || "OpenCode is using a text-only model.",
-        state: "unsupported",
-        supported: false,
-      };
-    }
-
-    const modelSupport = todoModelLooksImageCapable(activeModel);
-    if (modelSupport === true) {
-      return {
-        activeModel,
-        reason: `OpenCode is using an image-capable model (${activeModel}).`,
-        state: "supported",
-        supported: true,
-      };
-    }
-    if (modelSupport === false) {
-      return {
-        activeModel,
-        reason: `OpenCode is using a text-only model (${activeModel}).`,
-        state: "unsupported",
-        supported: false,
-      };
-    }
-
-    return {
-      activeModel,
-      reason: activeModel
-        ? `OpenCode image support is unknown for ${activeModel}.`
-        : "OpenCode image input depends on the selected model; no image-capable model was detected.",
-      state: activeModel ? "unknown" : "conditional",
-      supported: false,
-    };
-  }
-
-  return {
-    activeModel,
-    reason: "This terminal does not accept image todos.",
-    state: "unsupported",
-    supported: false,
-  };
+  return getAgentModelImageInputCapability(agentId, activeModel, {
+    agentLabel: agent?.label || agentId,
+  });
 }
 
 function getTodoImageUnsupportedDropMessage(capability) {
   const reason = typeof capability?.reason === "string" ? capability.reason.trim() : "";
-  return reason || "Drop image todos on Codex, Claude, or OpenCode with a vision model.";
+  return reason || "Drop image todos on Codex or Claude with an image-capable model.";
 }
 
 function getTodoImageMimeType(image) {

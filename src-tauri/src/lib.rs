@@ -102,6 +102,7 @@ const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
+const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
@@ -1357,6 +1358,10 @@ fn write_terminal_diagnostic_log_entry(entry: Value) {
 }
 
 fn write_thread_bridge_diagnostic_log_entry(entry: Value) {
+    if !THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED {
+        return;
+    }
+
     let log_path = thread_bridge_diagnostic_log_path();
     let Some(log_dir) = log_path.parent() else {
         return;
