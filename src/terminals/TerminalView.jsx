@@ -43,6 +43,7 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   originY: 0,
   phase: "idle",
 };
+const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 
 const TerminalWorkspaceMain = styled.div`
   width: 100%;
@@ -2612,6 +2613,13 @@ function TerminalView({
       }
 
       setActiveTerminalPaneId(paneId);
+      window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+        detail: {
+          paneId,
+          reason: "todo_dropdown_drop",
+          terminalIndex: targetTerminalIndex,
+        },
+      }));
       prepareTodoTerminalText(currentDrag)
         .then((terminalText) => {
           const targetThread = Number.isInteger(targetTerminalIndex)

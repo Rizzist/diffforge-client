@@ -617,6 +617,7 @@ async function saveTerminalImageAttachments(attachments) {
 }
 
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
+const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const TERMINAL_PATH_LINK_PATTERN = /((?:~\/|\/)[^\s"'`<>()\[\]{}|;,]+(?:\.[A-Za-z0-9]+)(?::\d+)?)/g;
 
 function cleanTerminalPathLink(value) {
@@ -3536,11 +3537,30 @@ function WorkspaceTerminal({
         disposables.push(unlisten);
       })
       .catch(() => {});
+    const handleTerminalFocusRequest = (event) => {
+      const detail = event?.detail || {};
+      if (
+        isDisposed
+        || detail.paneId !== paneId
+        || (
+          detail.instanceId
+          && Number(detail.instanceId) !== Number(terminalInstanceId)
+        )
+      ) {
+        return;
+      }
+
+      activateTerminalPane(detail.reason || "terminal_focus_request");
+      requestTerminalAudioInputTarget(true);
+      focusTerminalKeyboardInput(true);
+    };
+    window.addEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
     disposables.push(() => {
       if (terminalFocusClearTimer) {
         window.clearTimeout(terminalFocusClearTimer);
         terminalFocusClearTimer = 0;
       }
+      window.removeEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
       container.removeEventListener("focusin", markTerminalAudioInputTarget, true);
       container.removeEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
       container.removeEventListener("pointerdown", markTerminalAudioInputTarget, true);
@@ -8412,6 +8432,10 @@ function WorkspaceTerminal({
     if (terminalClosed || terminalClosing) {
       return;
     }
+
+    activateTerminalPane("todo_native_drop");
+    requestTerminalAudioInputTarget(true);
+    focusTerminalKeyboardInput(true);
 
     const prompt = getDraggedTodoPrompt(event.dataTransfer);
     if (!prompt) {
