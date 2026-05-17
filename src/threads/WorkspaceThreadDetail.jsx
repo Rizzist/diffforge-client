@@ -40,8 +40,9 @@ const DetailRoot = styled.main`
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
-  --thread-bg: #1f1f1f;
-  --thread-bg-soft: #242424;
+  --thread-bg: #141414;
+  --thread-composer-bg: #2d2d2d;
+  --thread-bg-soft: #1b1b1b;
   --thread-card: rgba(28, 28, 28, 0.92);
   --thread-card-raised: rgba(34, 34, 34, 0.94);
   --thread-fg: #f4f7fa;
@@ -56,11 +57,7 @@ const DetailRoot = styled.main`
   --thread-blue: #c6c6c6;
   --thread-green: #3ccb7f;
   color: var(--thread-fg);
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.016) 1px, transparent 1px),
-    linear-gradient(180deg, #1f1f1f, #1c1c1c 42%, #1a1a1a);
-  background-size: 86px 86px, 86px 86px, auto;
+  background: var(--thread-bg);
   font-family:
     Inter,
     "Segoe UI Variable",
@@ -85,9 +82,7 @@ const TranscriptScroll = styled.div`
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  background:
-    linear-gradient(180deg, rgba(31, 31, 31, 0.2), rgba(31, 31, 31, 0.58)),
-    transparent;
+  background: var(--thread-bg);
   user-select: text;
   -webkit-user-select: text;
 
@@ -242,7 +237,7 @@ const TranscriptActivityCell = styled.article`
   color: var(--thread-muted);
   font-size: 12px;
   line-height: 1.5;
-  background: rgba(32, 32, 32, 0.56);
+  background: #1b1b1b;
   user-select: text;
   -webkit-user-select: text;
 `;
@@ -338,7 +333,7 @@ const ComposerShell = styled.form`
   gap: 8px;
   margin: 0 auto;
   padding: 0 22px 24px;
-  background: transparent;
+  background: var(--thread-bg);
   user-select: none;
 `;
 
@@ -348,23 +343,18 @@ const ComposerBox = styled.div`
   grid-template-rows: auto minmax(42px, auto) auto;
   position: relative;
   overflow: visible;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid transparent;
   border-radius: 22px;
-  background: var(--thread-bg);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.035),
-    0 -14px 40px rgba(0, 0, 0, 0.26);
+  background: var(--thread-composer-bg);
+  box-shadow: none;
   transition:
     border-color 160ms ease,
     background 160ms ease,
     box-shadow 160ms ease;
 
   &:focus-within {
-    border-color: var(--thread-ring);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.055),
-      0 0 0 1px rgba(255, 255, 255, 0.08),
-      0 -18px 52px rgba(0, 0, 0, 0.32);
+    border-color: transparent;
+    box-shadow: none;
   }
 `;
 
@@ -672,7 +662,7 @@ const SendButton = styled.button`
   border: 0;
   border-radius: 999px;
   color: #1a1a1a;
-  background: #8c8c8c;
+  background: #d8d8d8;
   box-shadow: 0 10px 22px rgba(0, 0, 0, 0.32);
   user-select: none;
   transition:
@@ -681,10 +671,11 @@ const SendButton = styled.button`
     opacity 130ms ease;
 
   &:hover:not(:disabled) {
-    background: #a2a2a2;
+    background: #eeeeee;
   }
 
   &:disabled {
+    background: #8c8c8c;
     opacity: 0.46;
     cursor: not-allowed;
   }
@@ -709,7 +700,8 @@ const NewChatRoot = styled.main`
   padding: 36px 24px;
   overflow-x: hidden;
   overflow-y: auto;
-  --thread-bg: #1f1f1f;
+  --thread-bg: #1b1b1b;
+  --thread-composer-bg: #2d2d2d;
   --thread-card: rgba(32, 32, 32, 0.92);
   --thread-fg: #f4f7fa;
   --thread-muted: #a5a7ad;
@@ -718,11 +710,7 @@ const NewChatRoot = styled.main`
   --thread-accent: rgba(255, 255, 255, 0.07);
   --thread-ring: rgba(255, 255, 255, 0.22);
   color: var(--thread-fg);
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.016) 1px, transparent 1px),
-    linear-gradient(180deg, #1f1f1f, #1c1c1c 42%, #1a1a1a);
-  background-size: 86px 86px, 86px 86px, auto;
+  background: var(--thread-bg);
 `;
 
 const NewChatCenter = styled.form`
@@ -747,15 +735,14 @@ const NewChatBox = styled.div`
   grid-template-rows: minmax(46px, auto) auto;
   position: relative;
   overflow: visible;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid transparent;
   border-radius: 22px;
-  background: var(--thread-bg);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.05),
-    0 22px 56px rgba(0, 0, 0, 0.3);
+  background: var(--thread-composer-bg);
+  box-shadow: none;
 
   &:focus-within {
-    border-color: var(--thread-ring);
+    border-color: transparent;
+    box-shadow: none;
   }
 `;
 
@@ -803,24 +790,116 @@ const NewChatControls = styled.div`
   gap: 8px;
 `;
 
-const NewChatSelect = styled.select`
-  max-width: 190px;
+const NewChatAgentMenuWrap = styled.div`
+  position: relative;
+  min-width: 0;
+`;
+
+const NewChatAgentButton = styled(ComposerToolButton)`
+  max-width: min(172px, 42vw);
   height: 32px;
-  min-width: 112px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  min-width: 116px;
+  justify-content: flex-start;
+  border-color: rgba(255, 255, 255, 0.08);
   border-radius: 8px;
-  padding: 0 28px 0 12px;
+  padding: 0 8px 0 10px;
   color: #e6e6e6;
   background: rgba(255, 255, 255, 0.045);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+
+  &[aria-expanded="true"] {
+    border-color: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.075);
+  }
+
+  span[data-agent-label="true"] {
+    min-width: 0;
+    overflow: hidden;
+    flex: 1 1 auto;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+    flex: 0 0 auto;
+    color: var(--thread-muted-soft);
+  }
+`;
+
+const NewChatAgentStatusDot = styled.span`
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(165, 167, 173, 0.62);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.025);
+
+  &[data-ready="true"] {
+    background: var(--thread-green);
+    box-shadow:
+      0 0 0 3px rgba(60, 203, 127, 0.1),
+      0 0 12px rgba(60, 203, 127, 0.22);
+  }
+`;
+
+const NewChatAgentDropdown = styled(ModelDropdown)`
+  right: auto;
+  left: 0;
+  width: min(238px, calc(100vw - 48px));
+`;
+
+const NewChatAgentOption = styled.button`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 10px 11px;
+  border: 0;
+  color: var(--thread-fg);
+  background: transparent;
+  text-align: left;
   font: inherit;
-  font-size: 11px;
-  font-weight: 650;
-  outline: none;
+  user-select: none;
+
+  &:hover:not(:disabled),
+  &[data-selected="true"] {
+    background: rgba(255, 255, 255, 0.08);
+  }
 
   &:disabled {
-    opacity: 0.5;
+    opacity: 0.48;
     cursor: not-allowed;
   }
+
+  strong,
+  span[data-agent-state="true"] {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: #f2f2f2;
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.2;
+  }
+
+  span[data-agent-state="true"] {
+    color: var(--thread-muted);
+    font-size: 11px;
+    line-height: 1.25;
+  }
+`;
+
+const NewChatAgentOptionText = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
 `;
 
 const NewChatActions = styled(ComposerActions)``;
@@ -880,6 +959,13 @@ const AGENT_LABELS = {
 };
 const IMAGE_ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 const IMAGE_ATTACHMENT_LIMIT = 4;
+const IMAGE_EXTENSION_MIME_TYPES = new Map([
+  ["gif", "image/gif"],
+  ["jpeg", "image/jpeg"],
+  ["jpg", "image/jpeg"],
+  ["png", "image/png"],
+  ["webp", "image/webp"],
+]);
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
 const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za-z0-9_.@ -]+\.[A-Za-z0-9]+(?::\d+)?|[A-Za-z0-9_.@-]+\.(?:cjs|css|html|js|jsx|json|lock|md|mdx|mjs|ps1|py|rs|scss|sh|toml|ts|tsx|txt|yaml|yml)(?::\d+)?)/g;
@@ -922,12 +1008,20 @@ function normalizeAgentId(value) {
 }
 
 function getLiveTerminalBindingForThread(thread, providerBinding, workspaceThreadEntry) {
+  if (!thread) {
+    return null;
+  }
+
   const storedBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
   const terminalIndex = storedBinding?.terminalIndex ?? thread?.terminalIndex;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const terminal = terminalKey ? workspaceThreadEntry?.terminals?.[terminalKey] : null;
+  if (!terminal) {
+    return null;
+  }
+
   if (
-    terminal?.threadId !== thread?.id
+    terminal.threadId !== thread?.id
     || !["active", "starting"].includes(String(terminal.status || "").toLowerCase())
   ) {
     return null;
@@ -1075,9 +1169,28 @@ function getModelButtonLabel(option) {
   return getVisibleModelLabel(option) || "Model";
 }
 
+function inferImageMimeType(file) {
+  const explicitType = String(file?.type || "").trim();
+  if (explicitType.startsWith("image/")) {
+    return explicitType;
+  }
+
+  const extension = String(file?.name || "")
+    .trim()
+    .toLowerCase()
+    .split(".")
+    .pop();
+  return IMAGE_EXTENSION_MIME_TYPES.get(extension) || "";
+}
+
+function isImageFile(file) {
+  return Boolean(file) && Boolean(inferImageMimeType(file));
+}
+
 function readImageFile(file) {
   return new Promise((resolve, reject) => {
-    if (!file || !String(file.type || "").startsWith("image/")) {
+    const mimeType = inferImageMimeType(file);
+    if (!file || !mimeType) {
       reject(new Error("Choose an image file."));
       return;
     }
@@ -1087,7 +1200,7 @@ function readImageFile(file) {
     reader.onload = () => resolve({
       dataUrl: String(reader.result || ""),
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      mimeType: file.type,
+      mimeType,
       name: file.name || "image",
       size: file.size || 0,
     });
@@ -1095,20 +1208,15 @@ function readImageFile(file) {
   });
 }
 
-function getClipboardImageFiles(clipboardData) {
-  const itemFiles = Array.from(clipboardData?.items || [])
-    .filter((item) => item?.kind === "file" && String(item.type || "").startsWith("image/"))
-    .map((item) => item.getAsFile?.())
-    .filter(Boolean);
-  const clipboardFiles = Array.from(clipboardData?.files || [])
-    .filter((file) => String(file?.type || "").startsWith("image/"));
+function dedupeImageFiles(files) {
   const seen = new Set();
 
-  return itemFiles.concat(clipboardFiles)
+  return Array.from(files || [])
+    .filter(isImageFile)
     .filter((file) => {
       const signature = [
-        String(file?.name || "clipboard-image"),
-        String(file?.type || ""),
+        String(file?.name || "image"),
+        inferImageMimeType(file),
         String(file?.size || 0),
         String(file?.lastModified || 0),
       ].join("|");
@@ -1118,6 +1226,41 @@ function getClipboardImageFiles(clipboardData) {
       seen.add(signature);
       return true;
     });
+}
+
+function getClipboardImageFiles(clipboardData) {
+  const itemFiles = Array.from(clipboardData?.items || [])
+    .filter((item) => item?.kind === "file" && (
+      String(item.type || "").startsWith("image/")
+      || isImageFile(item.getAsFile?.())
+    ))
+    .map((item) => item.getAsFile?.())
+    .filter(Boolean);
+  const clipboardFiles = Array.from(clipboardData?.files || [])
+    .filter(isImageFile);
+
+  return dedupeImageFiles(itemFiles.concat(clipboardFiles));
+}
+
+function hasImageFileTransfer(dataTransfer) {
+  return Array.from(dataTransfer?.types || []).some((type) => String(type || "").toLowerCase() === "files")
+    || Array.from(dataTransfer?.items || []).some((item) => (
+      item?.kind === "file"
+      && (
+        String(item.type || "").startsWith("image/")
+        || isImageFile(item.getAsFile?.())
+      )
+    ));
+}
+
+function getDroppedImageFiles(dataTransfer) {
+  const itemFiles = Array.from(dataTransfer?.items || [])
+    .filter((item) => item?.kind === "file")
+    .map((item) => item.getAsFile?.())
+    .filter(Boolean);
+  const transferFiles = Array.from(dataTransfer?.files || []);
+
+  return dedupeImageFiles(itemFiles.concat(transferFiles));
 }
 
 function formatSavedImageAttachments(images, startIndex = 0) {
@@ -1216,11 +1359,11 @@ function NewChatView({
   const [draft, setDraft] = useState("");
   const [agentId, setAgentId] = useState(() => getDefaultNewChatAgentId(agentStatuses));
   const [attachments, setAttachments] = useState([]);
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
-  const composerBoxRef = useRef(null);
   const fileInputRef = useRef(null);
   const agentOptions = useMemo(() => getNewChatAgentOptions(agentStatuses), [agentStatuses]);
   const selectedAgentOption = agentOptions.find((option) => option.id === agentId) || agentOptions[0];
@@ -1247,10 +1390,12 @@ function NewChatView({
       const currentOption = getNewChatAgentOptions(agentStatuses).find((option) => option.id === currentAgentId);
       return currentOption && !currentOption.disabled ? currentAgentId : defaultAgentId;
     });
+    setAgentMenuOpen(false);
   }, [agentStatuses]);
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
+    setAgentMenuOpen(false);
     setModelMenuOpen(false);
   }, [activeAgentId, modelOptions]);
 
@@ -1349,277 +1494,101 @@ function NewChatView({
   };
 
   const handleComposerDragOver = (event) => {
-    if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
+    const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+    const hasImageTransfer = hasImageFileTransfer(event.dataTransfer);
+    const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+    if (!hasImageTransfer && !hasWorkspaceFileTransfer && !activeWorkspaceFile) {
       return;
     }
 
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
+    logBigViewSyncDiagnosticEvent("bigview.image.drag_over", {
+      agentId: activeAgentId,
+      hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+      hasImageTransfer,
+      hasWorkspaceFileTransfer,
+      imageSupportReason: imageInputSupport.reason || "",
+      imageSupportState: imageInputSupport.state || "",
+      imageSupported: Boolean(imageInputSupport.supported),
+      selectedModel: selectedModel || "",
+      surface: "new_chat",
+      types: Array.from(event.dataTransfer?.types || []),
+      workspaceId: workspace?.id || "",
+    });
   };
 
   const handleComposerDrop = (event) => {
-    if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
-    const attachment = workspaceFileToComposerAttachment(workspaceFile, "bigview_fileviewer_drop");
-    if (!attachment || !composerSyncKey) {
-      return;
-    }
-
-    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
-      fields: {
-        agentId: activeAgentId,
-        bindingInstanceId: activeTerminalBinding?.instanceId || "",
-        bindingPaneId: activeTerminalBinding?.paneId || "",
-        relativePath: attachment.relativePath || "",
-        selectedModel: currentTuiModel || "",
-        surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
-      },
-      source: "bigview_fileviewer_drop",
-    });
-  };
-
-  const queueWorkspaceFileForBigView = (workspaceFile, source = "bigview_fileviewer_global_drop") => {
-    const attachment = workspaceFileToComposerAttachment(workspaceFile, source);
-    logFileDragDiagnosticEvent("bigview.global_drop_resolved", {
-      attachmentCreated: Boolean(attachment),
-      composerSyncKey,
-      hasSyncKey: Boolean(composerSyncKey),
-      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
-      source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
-    });
-    if (!attachment || !composerSyncKey) {
-      logFileDragDiagnosticEvent("bigview.global_drop_skip", {
-        attachmentCreated: Boolean(attachment),
-        hasSyncKey: Boolean(composerSyncKey),
-        reason: !attachment ? "missing_attachment" : "missing_sync_key",
-        source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
-      });
-      return false;
-    }
-
-    appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
-      fields: {
-        agentId: activeAgentId,
-        bindingInstanceId: activeTerminalBinding?.instanceId || "",
-        bindingPaneId: activeTerminalBinding?.paneId || "",
-        relativePath: attachment.relativePath || "",
-        selectedModel: currentTuiModel || "",
-        source,
-        surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
-      },
-      source,
-    });
-    logFileDragDiagnosticEvent("bigview.global_attachment_appended", {
-      attachmentName: attachment.name,
-      attachmentPath: attachment.savedPath,
-      composerSyncKey,
-      kind: attachment.kind,
-      relativePath: attachment.relativePath || "",
-      source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
-    });
-    return true;
-  };
-
-  useEffect(() => {
-    const handleWorkspaceFileDragOver = (event) => {
-      if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
-        return;
-      }
-
-      const rect = composerBoxRef.current?.getBoundingClientRect?.();
-      const insideComposer = Boolean(rect)
-        && event.clientX >= rect.left
-        && event.clientX <= rect.right
-        && event.clientY >= rect.top
-        && event.clientY <= rect.bottom;
-      if (!insideComposer) {
-        return;
-      }
-
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
-      logFileDragDiagnosticEvent("bigview.global_drag_over", {
-        composerSyncKey,
-        threadId: thread?.id || "",
-        types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
-      });
-    };
-
-    const handleWorkspaceFileDrop = (event) => {
-      if (!isWorkspaceFileDragTransfer(event.dataTransfer)) {
-        return;
-      }
-
-      const rect = composerBoxRef.current?.getBoundingClientRect?.();
-      const insideComposer = Boolean(rect)
-        && event.clientX >= rect.left
-        && event.clientX <= rect.right
-        && event.clientY >= rect.top
-        && event.clientY <= rect.bottom;
-      if (!insideComposer) {
-        return;
-      }
-
+    const hasFileTransfer = hasImageFileTransfer(event.dataTransfer);
+    const imageFiles = getDroppedImageFiles(event.dataTransfer);
+    if (imageFiles.length) {
       event.preventDefault();
       event.stopPropagation();
-      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
-      logFileDragDiagnosticEvent("bigview.global_drop", {
-        filePresent: Boolean(workspaceFile),
-        relativePath: workspaceFile?.relativePath || "",
-        threadId: thread?.id || "",
+      logBigViewSyncDiagnosticEvent("bigview.image.drop", {
+        agentId: activeAgentId,
+        fileCount: imageFiles.length,
+        files: imageFiles.map((file) => ({
+          mimeType: inferImageMimeType(file),
+          name: String(file?.name || ""),
+          size: Number(file?.size || 0),
+        })),
+        imageSupportReason: imageInputSupport.reason || "",
+        imageSupportState: imageInputSupport.state || "",
+        imageSupported: Boolean(imageInputSupport.supported),
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspaceId: workspace?.id || "",
       });
-      queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_global_drop");
-    };
+      addImageFiles(imageFiles);
+      return;
+    }
 
-    window.addEventListener("dragover", handleWorkspaceFileDragOver, true);
-    window.addEventListener("drop", handleWorkspaceFileDrop, true);
-    return () => {
-      window.removeEventListener("dragover", handleWorkspaceFileDragOver, true);
-      window.removeEventListener("drop", handleWorkspaceFileDrop, true);
-    };
-  }, [
-    activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
-    composerSyncKey,
-    currentTuiModel,
-    thread?.id,
-    thread?.workspaceId,
-    workspace?.id,
-  ]);
-
-  useEffect(() => {
-    const handleWorkspaceFilePointerDrop = (event) => {
-      const detail = event?.detail || {};
-      const workspaceFile = detail.file && typeof detail.file === "object" ? detail.file : null;
-      if (!workspaceFile) {
-        return;
-      }
-
-      const rect = composerBoxRef.current?.getBoundingClientRect?.();
-      const clientX = Number(detail.clientX || 0);
-      const clientY = Number(detail.clientY || 0);
-      const insideComposer = Boolean(rect)
-        && clientX >= rect.left
-        && clientX <= rect.right
-        && clientY >= rect.top
-        && clientY <= rect.bottom;
-      logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
-        composerSyncKey,
-        insideComposer,
-        relativePath: workspaceFile.relativePath || "",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+    const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+    const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
+    if (hasWorkspaceFileTransfer || activeWorkspaceFile) {
+      event.preventDefault();
+      event.stopPropagation();
+      const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer) || activeWorkspaceFile;
+      const attachment = workspaceFileToComposerAttachment(workspaceFile, "bigview_new_chat_fileviewer_drop");
+      logFileDragDiagnosticEvent("bigview.new_chat.drop_received", {
+        attachmentCreated: Boolean(attachment),
+        hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+        hasWorkspaceFileTransfer,
+        relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || "",
       });
-      if (!insideComposer) {
+      if (!attachment) {
+        setError("Drop an image file.");
         return;
       }
 
-      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_pointer_drop")) {
-        detail.handled = true;
-        clearActiveWorkspaceFileDrag();
-      }
-    };
+      setError("");
+      setAttachments((currentAttachments) => (
+        currentAttachments.concat({
+          ...attachment,
+          source: "bigview_new_chat_fileviewer_drop",
+          status: "queued",
+        }).slice(0, IMAGE_ATTACHMENT_LIMIT)
+      ));
+      clearActiveWorkspaceFileDrag();
+      return;
+    }
 
-    window.addEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
-    return () => {
-      window.removeEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
-    };
-  }, [
-    activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
-    composerSyncKey,
-    currentTuiModel,
-    thread?.id,
-    thread?.workspaceId,
-    workspace?.id,
-  ]);
-
-  useEffect(() => {
-    const handleWorkspaceFilePointerDrop = (event) => {
-      const detail = event?.detail || {};
-      const workspaceFile = detail.file && typeof detail.file === "object" ? detail.file : null;
-      if (!workspaceFile) {
-        return;
-      }
-
-      const rect = composerBoxRef.current?.getBoundingClientRect?.();
-      const clientX = Number(detail.clientX || 0);
-      const clientY = Number(detail.clientY || 0);
-      const insideComposer = Boolean(rect)
-        && clientX >= rect.left
-        && clientX <= rect.right
-        && clientY >= rect.top
-        && clientY <= rect.bottom;
-      logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
-        composerSyncKey,
-        insideComposer,
-        relativePath: workspaceFile.relativePath || "",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+    if (hasFileTransfer) {
+      event.preventDefault();
+      event.stopPropagation();
+      setError("Drop an image file.");
+      logBigViewSyncDiagnosticEvent("bigview.image.drop_skip", {
+        agentId: activeAgentId,
+        reason: "missing_image_file",
+        selectedModel: selectedModel || "",
+        surface: "new_chat",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || "",
       });
-      if (!insideComposer) {
-        return;
-      }
-
-      if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_pointer_drop")) {
-        detail.handled = true;
-        clearActiveWorkspaceFileDrag();
-      }
-    };
-
-    window.addEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
-    return () => {
-      window.removeEventListener(WORKSPACE_FILE_POINTER_DROP_EVENT, handleWorkspaceFilePointerDrop);
-    };
-  }, [
-    activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
-    composerSyncKey,
-    currentTuiModel,
-    thread?.id,
-    thread?.workspaceId,
-    workspace?.id,
-  ]);
-
-  const getComposerDragDiagnosticFields = (event) => ({
-    composerSyncKey,
-    hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
-    threadId: thread?.id || "",
-    types: Array.from(event.dataTransfer?.types || []),
-    workspaceId: workspace?.id || thread?.workspaceId || "",
-  });
-
-  const handleComposerRawDragEnterCapture = (event) => {
-    logFileDragDiagnosticEvent("bigview.raw_drag_enter_capture", getComposerDragDiagnosticFields(event));
-  };
-
-  const handleComposerRawDragOverCapture = (event) => {
-    logFileDragDiagnosticEvent("bigview.raw_drag_over_capture", getComposerDragDiagnosticFields(event));
-  };
-
-  const handleComposerRawDropCapture = (event) => {
-    logFileDragDiagnosticEvent("bigview.raw_drop_capture", getComposerDragDiagnosticFields(event));
+    }
   };
 
   const removeAttachment = (attachmentId) => {
@@ -1766,7 +1735,10 @@ function NewChatView({
           ref={fileInputRef}
           type="file"
         />
-        <NewChatBox>
+        <NewChatBox
+          onDragOver={handleComposerDragOver}
+          onDrop={handleComposerDrop}
+        >
           <NewChatInput
             disabled={sending}
             onChange={(event) => setDraft(event.target.value)}
@@ -1776,6 +1748,7 @@ function NewChatView({
                 submitNewChat();
               }
             }}
+            onPaste={handleComposerPaste}
             placeholder={`Ask ${AGENT_LABELS[activeAgentId] || "an agent"} anything`}
             rows={1}
             spellCheck="true"
@@ -1800,18 +1773,69 @@ function NewChatView({
               >
                 <AddPhotoAlternate aria-hidden="true" />
               </NewChatAttachButton>
-              <NewChatSelect
-                aria-label="Coding agent"
-                disabled={sending}
-                onChange={(event) => setAgentId(event.target.value)}
-                value={activeAgentId}
+              <NewChatAgentMenuWrap
+                onBlur={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) {
+                    setAgentMenuOpen(false);
+                  }
+                }}
               >
-                {agentOptions.map((option) => (
-                  <option disabled={option.disabled} key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </NewChatSelect>
+                <NewChatAgentButton
+                  aria-expanded={agentMenuOpen ? "true" : "false"}
+                  aria-haspopup="menu"
+                  aria-label="Coding agent"
+                  disabled={sending}
+                  onClick={() => {
+                    setModelMenuOpen(false);
+                    setAgentMenuOpen((isOpen) => !isOpen);
+                  }}
+                  title={selectedAgentOption?.label || "Agent"}
+                  type="button"
+                >
+                  <NewChatAgentStatusDot
+                    aria-hidden="true"
+                    data-ready={selectedAgentOption?.disabled ? "false" : "true"}
+                  />
+                  <span data-agent-label="true">{selectedAgentOption?.label || "Agent"}</span>
+                  <ExpandMore aria-hidden="true" />
+                </NewChatAgentButton>
+                <NewChatAgentDropdown
+                  aria-label="Coding agent options"
+                  data-open={agentMenuOpen ? "true" : "false"}
+                  role="menu"
+                >
+                  {agentOptions.map((option) => (
+                    <NewChatAgentOption
+                      data-selected={option.id === activeAgentId ? "true" : "false"}
+                      disabled={option.disabled || sending}
+                      key={option.id}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        logBigViewSyncDiagnosticEvent("bigview.agent_change.selected", {
+                          agentId: option.id,
+                          previousAgentId: activeAgentId,
+                          surface: "new_chat",
+                          workspaceId: workspace?.id || "",
+                        });
+                        setAgentId(option.id);
+                        setAgentMenuOpen(false);
+                        setModelMenuOpen(false);
+                      }}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <NewChatAgentStatusDot
+                        aria-hidden="true"
+                        data-ready={option.disabled ? "false" : "true"}
+                      />
+                      <NewChatAgentOptionText>
+                        <strong>{option.label}</strong>
+                        <span data-agent-state="true">{option.disabled ? "Unavailable" : "Ready"}</span>
+                      </NewChatAgentOptionText>
+                    </NewChatAgentOption>
+                  ))}
+                </NewChatAgentDropdown>
+              </NewChatAgentMenuWrap>
             </NewChatControls>
             <NewChatActions>
               <ModelMenuWrap
@@ -2421,8 +2445,9 @@ function WorkspaceThreadDetail({
 
   const handleComposerDragOver = (event) => {
     const activeWorkspaceFile = getActiveWorkspaceFileDrag();
+    const hasImageTransfer = hasImageFileTransfer(event.dataTransfer);
     const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
-    if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
+    if (!hasImageTransfer && !hasWorkspaceFileTransfer && !activeWorkspaceFile) {
       return;
     }
 
@@ -2431,6 +2456,7 @@ function WorkspaceThreadDetail({
     logFileDragDiagnosticEvent("bigview.drag_over", {
       composerSyncKey,
       hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
+      hasImageTransfer,
       hasWorkspaceFileTransfer,
       threadId: thread?.id || "",
       types: Array.from(event.dataTransfer?.types || []),
@@ -2439,6 +2465,47 @@ function WorkspaceThreadDetail({
   };
 
   const handleComposerDrop = (event) => {
+    const hasFileTransfer = hasImageFileTransfer(event.dataTransfer);
+    const imageFiles = getDroppedImageFiles(event.dataTransfer);
+    if (imageFiles.length) {
+      event.preventDefault();
+      event.stopPropagation();
+      logBigViewSyncDiagnosticEvent("bigview.image.drop", {
+        agentId: activeAgentId,
+        fileCount: imageFiles.length,
+        files: imageFiles.map((file) => ({
+          mimeType: inferImageMimeType(file),
+          name: String(file?.name || ""),
+          size: Number(file?.size || 0),
+        })),
+        imageSupportReason: imageInputSupport.reason || "",
+        imageSupportState: imageInputSupport.state || "",
+        imageSupported: Boolean(imageInputSupport.supported),
+        model: currentTuiModel || "",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      addImageFiles(imageFiles);
+      return;
+    }
+    if (hasFileTransfer) {
+      event.preventDefault();
+      event.stopPropagation();
+      setError("Drop an image file.");
+      logBigViewSyncDiagnosticEvent("bigview.image.drop_skip", {
+        agentId: activeAgentId,
+        model: currentTuiModel || "",
+        reason: "missing_image_file",
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        types: Array.from(event.dataTransfer?.types || []),
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      return;
+    }
+
     const activeWorkspaceFile = getActiveWorkspaceFileDrag();
     const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
     if (!hasWorkspaceFileTransfer && !activeWorkspaceFile) {
@@ -2695,6 +2762,7 @@ function WorkspaceThreadDetail({
   const getComposerDragDiagnosticFields = (event) => ({
     composerSyncKey,
     hasActiveWorkspaceFile: Boolean(getActiveWorkspaceFileDrag()),
+    hasImageTransfer: hasImageFileTransfer(event.dataTransfer),
     hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
     threadId: thread?.id || "",
     types: Array.from(event.dataTransfer?.types || []),

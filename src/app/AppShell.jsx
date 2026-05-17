@@ -3139,6 +3139,21 @@ export default function App() {
     }
   }, [refreshAudioModelStatus]);
 
+  const closeAudioWidget = useCallback(async () => {
+    setAudioActionState("closing");
+    setAudioError("");
+
+    try {
+      const visibility = await invoke("hide_audio_widget");
+      setAudioWidgetVisible(Boolean(visibility?.visible));
+      setAudioActionState("idle");
+    } catch (error) {
+      setAudioActionState("error");
+      setAudioError(getErrorMessage(error, "Unable to close the audio widget."));
+      refreshAudioModelStatus();
+    }
+  }, [refreshAudioModelStatus]);
+
   const connectAgent = useCallback(async (provider) => {
     setAgentStatusState("checking");
     setAgentStatusError("");
@@ -7929,6 +7944,7 @@ export default function App() {
                     audioStatusState={audioStatusState}
                     audioWidgetVisible={audioWidgetVisible}
                     onDownloadModel={downloadAudioModel}
+                    onCloseWidget={closeAudioWidget}
                     onOpenWidget={openAudioWidget}
                     onRefreshStatus={refreshAudioModelStatus}
                     onUninstallModel={uninstallAudioModel}

@@ -188,7 +188,6 @@ const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
 const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
 const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
 const AUDIO_REALTIME_TRANSCRIPT_EVENT: &str = "forge-audio-realtime-transcript";
-const AUDIO_VAD_EVENT: &str = "forge-audio-vad-event";
 const MAX_AUDIO_TRANSCRIPT_INSERT_CHARS: usize = 8_000;
 const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-progress";
 const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
@@ -197,12 +196,6 @@ const AUDIO_BUFFER_MAX_SECONDS: f64 = 3.0;
 const AUDIO_CAPTURE_MAX_SECONDS: f64 = 90.0;
 const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
 const AUDIO_STATS_INTERVAL_MS: u64 = 140;
-const AUDIO_VAD_OWNER: &str = "audio-vad";
-const AUDIO_VAD_START_THRESHOLD: f32 = 0.55;
-const AUDIO_VAD_END_THRESHOLD: f32 = 0.35;
-const AUDIO_VAD_MIN_SPEECH_MS: u64 = 250;
-const AUDIO_VAD_MIN_SILENCE_MS: u64 = 800;
-const AUDIO_VAD_SPEECH_PAD_MS: u64 = AUDIO_CAPTURE_PREROLL_MS;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
     OnceLock::new();
@@ -411,7 +404,6 @@ struct AudioState {
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     input_worker: NativeAudioWorker,
     shortcut_manager: AudioShortcutManager,
-    vad_worker: SileroVadWorker,
     whisper_cancel_token: Arc<AtomicU64>,
     whisper_engine: WhisperCliWarmCache,
 }
@@ -1125,49 +1117,6 @@ struct AudioInputStats {
 struct AudioInputCaptureResult {
     audio_base64: String,
     audio_ms: u64,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SileroVadStartRequest {
-    device_id: Option<String>,
-    threshold: Option<f32>,
-    end_threshold: Option<f32>,
-    min_speech_ms: Option<u64>,
-    min_silence_ms: Option<u64>,
-    speech_pad_ms: Option<u64>,
-    max_speech_ms: Option<u64>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SileroVadStatus {
-    active: bool,
-    device_id: String,
-    label: String,
-    sample_rate: u32,
-    threshold: f32,
-    end_threshold: f32,
-    min_speech_ms: u64,
-    min_silence_ms: u64,
-    speech_pad_ms: u64,
-    max_speech_ms: u64,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SileroVadEvent {
-    phase: String,
-    active: bool,
-    speech: bool,
-    segment_id: String,
-    probability: Option<f32>,
-    speech_ms: u64,
-    device_id: String,
-    label: String,
-    sample_rate: u32,
-    created_at_ms: u64,
-    message: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -2080,7 +2029,6 @@ pub fn run() {
             deepgram_stream: Arc::new(Mutex::new(None)),
             input_worker: NativeAudioWorker::new(),
             shortcut_manager: AudioShortcutManager::new(),
-            vad_worker: SileroVadWorker::new(),
             whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
         })
@@ -2166,9 +2114,6 @@ pub fn run() {
             cancel_whisper_transcription,
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
-            start_silero_vad,
-            stop_silero_vad,
-            silero_vad_status,
             audio_shortcuts_status,
             audio_push_to_talk_status,
             open_audio_shortcut_permissions,

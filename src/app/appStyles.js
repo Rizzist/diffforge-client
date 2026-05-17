@@ -2621,7 +2621,7 @@ export const TerminalWorkspaceSurface = styled.section`
       0 0 12px rgba(132, 157, 190, 0.14);
   }
 
-  &[data-threads-view="true"]:not([data-terminal-fullscreen="true"])::after {
+  &[data-threads-view="true"]::after {
     border-width: 0;
     border-color: transparent;
     box-shadow: none;
@@ -5212,11 +5212,12 @@ export const AudioRecorderPanel = styled(AudioProviderPanel)`
 
 export const AudioRecorderActions = styled.div`
   display: grid;
-  grid-template-columns: minmax(112px, 1fr) minmax(148px, auto);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   min-width: 0;
 
   > button {
+    width: 100%;
     min-height: 40px;
     min-width: 0;
     justify-content: center;

@@ -115,11 +115,11 @@ const ThreadRail = styled.aside`
   min-width: 0;
   min-height: 0;
   overflow: visible;
-  border-right: 1px solid rgba(255, 255, 255, 0.07);
+  border-right: 0;
   background-color: #101820;
   background-image: url("/textures/thread-rail-carbon-fiber.png");
   background-repeat: repeat;
-  box-shadow: inset -1px 0 0 rgba(0, 0, 0, 0.42);
+  box-shadow: none;
 `;
 
 const DrawerToggle = styled.button`

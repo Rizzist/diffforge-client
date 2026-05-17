@@ -13,7 +13,7 @@ const AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY = "diffforge.audio.deepgramLanguage";
 export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
 export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
 export const AUDIO_RECORDER_MODE_PUSH_TO_TALK = "push-to-talk";
-export const AUDIO_RECORDER_MODE_VOICE_ACTIVITY = "voice-activity";
+export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
@@ -35,8 +35,8 @@ function normalizeAudioTranscriptionProvider(value) {
 }
 
 function normalizeAudioRecorderMode(value) {
-  return value === AUDIO_RECORDER_MODE_VOICE_ACTIVITY
-    ? AUDIO_RECORDER_MODE_VOICE_ACTIVITY
+  return value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
+    ? AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
     : AUDIO_RECORDER_MODE_PUSH_TO_TALK;
 }
 
