@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -407,6 +408,7 @@ import {
   TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_THROTTLE_MS,
   TERMINAL_SLASH_COMMAND_PROBE_DELAYS_MS,
   TERMINAL_SLASH_COMMAND_PROBE_WINDOW_MS,
+  TERMINAL_STABILITY_RESIZE_PROBE_DELAYS_MS,
   TERMINAL_START_GEOMETRY_POLL_MS,
   TERMINAL_START_GEOMETRY_WAIT_MS,
   TERMINAL_START_LAYOUT_WAIT_MS,
@@ -499,6 +501,7 @@ import {
   getTerminalRoleSwitchOptions,
   getTerminalSubmitSequence,
   getWorkspaceTerminalPaneId,
+  getWorkspaceThreadComposerAttachments,
   getWorkspaceThreadComposerAttachmentSnapshot,
   getWorkspaceThreadComposerDraftSnapshot,
   getWorkspaceThreadComposerDraftStore,
@@ -511,8 +514,10 @@ import {
   isTodoDragTransfer,
   normalizeTerminalDimension,
   normalizeWorkspaceTerminalIndexes,
+  appendWorkspaceThreadComposerAttachments,
   removeWorkspaceThreadComposerAttachment,
   setWorkspaceThreadComposerDraft,
+  setWorkspaceThreadComposerAttachments,
   subscribeWorkspaceThreadComposerAttachments,
   subscribeWorkspaceThreadComposerDrafts,
   terminalInputChunkHasVisibleText,
@@ -532,6 +537,129 @@ export {
   getWorkspaceTerminalPaneId,
   normalizeWorkspaceTerminalIndexes,
 } from "./threadRuntime.js";
+
+function getTerminalClipboardImageFiles(clipboardData) {
+  const itemFiles = Array.from(clipboardData?.items || [])
+    .filter((item) => item?.kind === "file" && String(item.type || "").startsWith("image/"))
+    .map((item) => item.getAsFile?.())
+    .filter(Boolean);
+  const clipboardFiles = Array.from(clipboardData?.files || [])
+    .filter((file) => String(file?.type || "").startsWith("image/"));
+  const seen = new Set();
+
+  return itemFiles.concat(clipboardFiles).filter((file) => {
+    const signature = [
+      String(file?.name || "clipboard-image"),
+      String(file?.type || ""),
+      String(file?.size || 0),
+      String(file?.lastModified || 0),
+    ].join("|");
+    if (!signature || seen.has(signature)) {
+      return false;
+    }
+    seen.add(signature);
+    return true;
+  });
+}
+
+function readTerminalImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !String(file.type || "").startsWith("image/")) {
+      reject(new Error("Choose an image file."));
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to read image."));
+    reader.onload = () => resolve({
+      dataUrl: String(reader.result || ""),
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      mimeType: file.type,
+      name: file.name || "clipboard-image",
+      size: file.size || 0,
+      source: "tui_terminal_clipboard",
+      status: "queued",
+    });
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatSavedTerminalImageAttachments(images) {
+  return (Array.isArray(images) ? images : [])
+    .map((image, index) => {
+      const name = String(image?.name || `image-${index + 1}`).trim();
+      const path = String(image?.path || "").trim();
+      return path ? `[image-attached ${index + 1}] ${name} -> ${path}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function saveTerminalImageAttachments(attachments) {
+  const images = (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => ({
+      dataUrl: attachment.dataUrl,
+      mimeType: attachment.mimeType,
+      name: attachment.name,
+    }))
+    .filter((attachment) => attachment.dataUrl && attachment.mimeType);
+
+  if (!images.length) {
+    return "";
+  }
+
+  const savedImages = await invoke("save_todo_image_attachments", { images });
+  const imageBlock = formatSavedTerminalImageAttachments(savedImages);
+  if (!imageBlock) {
+    throw new Error("Unable to prepare image attachment.");
+  }
+  return imageBlock;
+}
+
+const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
+const TERMINAL_PATH_LINK_PATTERN = /((?:~\/|\/)[^\s"'`<>()\[\]{}|;,]+(?:\.[A-Za-z0-9]+)(?::\d+)?)/g;
+
+function cleanTerminalPathLink(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[.,:;!?]+$/g, "");
+}
+
+function getTerminalPathLinks(lineText) {
+  const text = String(lineText || "");
+  const links = [];
+  TERMINAL_PATH_LINK_PATTERN.lastIndex = 0;
+  let match = TERMINAL_PATH_LINK_PATTERN.exec(text);
+  while (match) {
+    const rawPath = match[1] || "";
+    const cleanPath = cleanTerminalPathLink(rawPath);
+    if (cleanPath) {
+      const startIndex = match.index + match[0].indexOf(rawPath);
+      links.push({
+        path: cleanPath,
+        startIndex,
+        endIndex: startIndex + cleanPath.length,
+      });
+    }
+    match = TERMINAL_PATH_LINK_PATTERN.exec(text);
+  }
+  return links;
+}
+
+function getWorkspaceRelativePathForTerminalLink(path, workspaceRoot) {
+  const cleanPath = String(path || "").replace(/\\/g, "/");
+  const cleanWorkspaceRoot = String(workspaceRoot || "").replace(/\\/g, "/").replace(/\/+$/g, "");
+  if (!cleanPath || !cleanWorkspaceRoot) {
+    return "";
+  }
+  if (cleanPath === cleanWorkspaceRoot) {
+    return "";
+  }
+  if (!cleanPath.startsWith(`${cleanWorkspaceRoot}/`)) {
+    return "";
+  }
+  return cleanPath.slice(cleanWorkspaceRoot.length + 1);
+}
 
 function WorkspaceTerminal({
   agent,
@@ -664,6 +792,48 @@ function WorkspaceTerminal({
   useEffect(() => {
     terminalThreadActivityStatusRef.current = terminalThreadActivityStatus;
   }, [terminalThreadActivityStatus]);
+  const openTerminalPathLink = useCallback((path) => {
+    const cleanPath = cleanTerminalPathLink(path);
+    if (!cleanPath) {
+      return;
+    }
+
+    const relativePath = getWorkspaceRelativePathForTerminalLink(cleanPath, workingDirectory);
+    logBigViewSyncDiagnosticEvent("tui.terminal_link.open", {
+      agentId: terminalAgentKind,
+      instanceId: terminalInstanceIdRef.current || 0,
+      isWorkspaceRelative: Boolean(relativePath),
+      paneId,
+      path: cleanPath,
+      relativePath,
+      terminalIndex,
+      threadId: terminalThreadIdRef.current || "",
+      workspaceId: workspace?.id || "",
+    });
+
+    if (relativePath) {
+      window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
+        detail: {
+          relativePath,
+          workspaceId: workspace?.id || "",
+        },
+      }));
+      return;
+    }
+
+    openPath(cleanPath).catch((error) => {
+      logBigViewSyncDiagnosticEvent("tui.terminal_link.open_error", {
+        agentId: terminalAgentKind,
+        instanceId: terminalInstanceIdRef.current || 0,
+        message: error?.message || String(error || ""),
+        paneId,
+        path: cleanPath,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+    });
+  }, [paneId, terminalAgentKind, terminalIndex, workingDirectory, workspace?.id]);
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
     const terminal = xtermRef.current;
     if (!terminal) {
@@ -1085,6 +1255,91 @@ function WorkspaceTerminal({
     isGenericTerminal,
     paneId,
     terminalClosed,
+    terminalIndex,
+    workspace?.id,
+  ]);
+
+  const queueClipboardImagesForCurrentTerminal = useCallback((event, surface = "tui_terminal") => {
+    const imageFiles = getTerminalClipboardImageFiles(event?.clipboardData);
+    if (!imageFiles.length) {
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopPropagation?.();
+    const syncKey = getCurrentThreadComposerSyncKey();
+    logBigViewSyncDiagnosticEvent("tui.image.paste_start", {
+      agentId: terminalAgentKind,
+      fileCount: imageFiles.length,
+      files: imageFiles.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      paneId,
+      sourceSurface: surface,
+      syncKey,
+      terminalIndex,
+      threadId: terminalThreadIdRef.current || "",
+      workspaceId: workspace?.id || "",
+    });
+    if (!syncKey) {
+      logBigViewSyncDiagnosticEvent("tui.image.paste_skip", {
+        agentId: terminalAgentKind,
+        fileCount: imageFiles.length,
+        paneId,
+        reason: "missing_sync_key",
+        sourceSurface: surface,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      return true;
+    }
+
+    Promise.all(imageFiles.map(readTerminalImageFile))
+      .then((attachments) => {
+        appendWorkspaceThreadComposerAttachments(syncKey, attachments, {
+          fields: {
+            agentId: terminalAgentKind,
+            paneId,
+            sourceSurface: surface,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+          },
+          source: "tui_terminal_clipboard",
+        });
+        logBigViewSyncDiagnosticEvent("tui.image.paste_done", {
+          agentId: terminalAgentKind,
+          attachmentCount: attachments.length,
+          paneId,
+          sourceSurface: surface,
+          syncKey,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      })
+      .catch((error) => {
+        logBigViewSyncDiagnosticEvent("tui.image.paste_error", {
+          agentId: terminalAgentKind,
+          fileCount: imageFiles.length,
+          message: error?.message || String(error || ""),
+          paneId,
+          sourceSurface: surface,
+          syncKey,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      });
+
+    return true;
+  }, [
+    getCurrentThreadComposerSyncKey,
+    paneId,
+    terminalAgentKind,
     terminalIndex,
     workspace?.id,
   ]);
@@ -2600,6 +2855,53 @@ function WorkspaceTerminal({
       }
 
       terminal.open(container);
+      const terminalPathLinkProvider = terminal.registerLinkProvider?.({
+        provideLinks(bufferLineNumber, callback) {
+          try {
+            const maxWrappedRows = 5;
+            const lines = [];
+            for (let offset = 0; offset < maxWrappedRows; offset += 1) {
+              const line = terminal.buffer.active.getLine(bufferLineNumber - 1 + offset);
+              if (!line) {
+                break;
+              }
+              lines.push(line.translateToString(true));
+            }
+
+            const joinedText = lines.join("");
+            const links = getTerminalPathLinks(joinedText)
+              .map((link) => {
+                const startRowOffset = Math.floor(link.startIndex / Math.max(1, terminal.cols));
+                const endRowOffset = Math.floor(Math.max(0, link.endIndex - 1) / Math.max(1, terminal.cols));
+                if (startRowOffset !== 0 || endRowOffset >= lines.length) {
+                  return null;
+                }
+
+                return {
+                  range: {
+                    start: {
+                      x: (link.startIndex % Math.max(1, terminal.cols)) + 1,
+                      y: bufferLineNumber,
+                    },
+                    end: {
+                      x: ((Math.max(0, link.endIndex - 1)) % Math.max(1, terminal.cols)) + 1,
+                      y: bufferLineNumber + endRowOffset,
+                    },
+                  },
+                  text: link.path,
+                  activate: () => openTerminalPathLink(link.path),
+                };
+              })
+              .filter(Boolean);
+            callback(links);
+          } catch {
+            callback([]);
+          }
+        },
+      });
+      if (terminalPathLinkProvider) {
+        disposables.push(terminalPathLinkProvider);
+      }
       terminalRendererOpened = true;
       terminalScrollableElement = container.querySelector(".xterm-scrollable-element");
       syncTerminalPaintBounds("xterm_open");
@@ -6735,6 +7037,66 @@ function WorkspaceTerminal({
             });
           if (data.length > 1) {
           }
+          return terminalInputWriteChain;
+        };
+        const normalizeTerminalComposerObservation = (value) => String(value || "").replace(/\s+/g, "");
+        const getTerminalComposerObservationText = () => {
+          const activeBuffer = terminal?.buffer?.active;
+          if (!activeBuffer) {
+            return "";
+          }
+
+          const lineCount = activeBuffer.length || 0;
+          const startLine = Math.max(0, lineCount - 80);
+          const lines = [];
+          for (let lineIndex = startLine; lineIndex < lineCount; lineIndex += 1) {
+            const line = activeBuffer.getLine(lineIndex);
+            if (line) {
+              lines.push(line.translateToString(true));
+            }
+          }
+          return lines.join("\n");
+        };
+        const waitForTerminalComposerMessageObserved = (expectedMessage, fields = {}) => {
+          const expected = normalizeTerminalComposerObservation(expectedMessage);
+          const expectedNeedle = expected.slice(Math.max(0, expected.length - 96));
+          const startedAt = Date.now();
+          const timeoutMs = 900;
+          const pollMs = 25;
+
+          logBigViewSyncDiagnosticEvent("tui.image.submit_wait_observed_start", {
+            ...fields,
+            expectedLength: expected.length,
+            expectedNeedleLength: expectedNeedle.length,
+            timeoutMs,
+          });
+
+          return new Promise((resolve) => {
+            const poll = () => {
+              const observedText = getTerminalComposerObservationText();
+              const observed = normalizeTerminalComposerObservation(observedText);
+              const matched = Boolean(expectedNeedle) && observed.includes(expectedNeedle);
+              const elapsedMs = Date.now() - startedAt;
+
+              if (matched || elapsedMs >= timeoutMs || isDisposed) {
+                logBigViewSyncDiagnosticEvent("tui.image.submit_wait_observed_done", {
+                  ...fields,
+                  elapsedMs,
+                  expectedLength: expected.length,
+                  expectedNeedleLength: expectedNeedle.length,
+                  matched,
+                  observedLength: observed.length,
+                  timedOut: !matched && elapsedMs >= timeoutMs,
+                });
+                resolve(matched);
+                return;
+              }
+
+              window.setTimeout(poll, pollMs);
+            };
+
+            poll();
+          });
         };
         const flushTerminalInput = (reason) => {
           if (terminalInputFlushTimer) {
@@ -6789,6 +7151,133 @@ function WorkspaceTerminal({
           writeTerminalInputChunk(TERMINAL_SHIFT_ENTER_SEQUENCE, "shift_enter");
           return true;
         };
+        const submitTerminalComposerWithQueuedImages = (submitInput) => {
+          const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
+          const attachments = getWorkspaceThreadComposerAttachments(syncKey);
+          if (!attachments.length) {
+            return false;
+          }
+
+          refreshTerminalComposerDraftFromStore();
+          flushTerminalInput("image_submit_flush_before");
+          const promptText = terminalSubmittedInputText.trim();
+          logBigViewSyncDiagnosticEvent("tui.image.submit_start", {
+            agentId: terminalAgentKind,
+            attachmentCount: attachments.length,
+            hasPromptText: Boolean(promptText),
+            instanceId: terminalInstanceId,
+            paneId,
+            syncKey,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+          });
+          saveTerminalImageAttachments(attachments)
+            .then((imageBlock) => {
+              const message = [promptText, imageBlock].filter(Boolean).join("\n\n");
+              if (!message) {
+                return;
+              }
+
+              const submitSequence = submitInput || getTerminalSubmitSequence(
+                terminalAgentKind,
+                isGenericTerminal,
+              );
+              const syncData = buildTerminalComposerDraftInput(promptText, message, true);
+              terminalSubmittedInputHasText = false;
+              terminalSubmittedInputText = "";
+              setThreadComposerDraftValue(syncKey, message, "tui_image_submit_sync_full");
+              logBigViewSyncDiagnosticEvent("tui.image.submit_sync_start", {
+                agentId: terminalAgentKind,
+                attachmentCount: attachments.length,
+                imageBlockLength: imageBlock.length,
+                instanceId: terminalInstanceId,
+                messageLength: message.length,
+                paneId,
+                promptTextLength: promptText.length,
+                syncDataLength: syncData.length,
+                syncKey,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+              writeTerminalInputChunk(syncData, "image_submit_sync_full")
+                .then(() => {
+                  const waitFields = {
+                    agentId: terminalAgentKind,
+                    attachmentCount: attachments.length,
+                    imageBlockLength: imageBlock.length,
+                    instanceId: terminalInstanceId,
+                    messageLength: message.length,
+                    paneId,
+                    promptTextLength: promptText.length,
+                    syncKey,
+                    terminalIndex,
+                    threadId: terminalThreadIdRef.current || "",
+                    workspaceId: workspace?.id || "",
+                  };
+                  return waitForTerminalComposerMessageObserved(message, waitFields);
+                })
+                .then((observedMatch) => {
+                  logBigViewSyncDiagnosticEvent("tui.image.submit_enter_write", {
+                    agentId: terminalAgentKind,
+                    attachmentCount: attachments.length,
+                    composerObservedBeforeEnter: observedMatch,
+                    instanceId: terminalInstanceId,
+                    paneId,
+                    submitSequenceLength: submitSequence.length,
+                    syncKey,
+                    terminalIndex,
+                    threadId: terminalThreadIdRef.current || "",
+                    workspaceId: workspace?.id || "",
+                  });
+                  return writeTerminalInputChunk(submitSequence, "image_submit_enter");
+                })
+                .then(() => {
+                  syncCurrentTerminalComposerDraft("");
+                  setWorkspaceThreadComposerAttachments(syncKey, [], {
+                    fields: {
+                      agentId: terminalAgentKind,
+                      paneId,
+                      surface: "tui_terminal",
+                      terminalIndex,
+                      threadId: terminalThreadIdRef.current || "",
+                      workspaceId: workspace?.id || "",
+                    },
+                    reason: "tui_submit_done_clear",
+                    source: "tui_terminal",
+                  });
+                  recordSubmittedAgentMessage(terminalInstanceId, message);
+                  logBigViewSyncDiagnosticEvent("tui.image.submit_done", {
+                    agentId: terminalAgentKind,
+                    attachmentCount: attachments.length,
+                    imageBlockLength: imageBlock.length,
+                    instanceId: terminalInstanceId,
+                    messageLength: message.length,
+                    paneId,
+                    syncKey,
+                    terminalIndex,
+                    threadId: terminalThreadIdRef.current || "",
+                    workspaceId: workspace?.id || "",
+                  });
+                });
+            })
+            .catch((error) => {
+              setTerminalError(getErrorMessage(error, "Unable to submit queued image."));
+              logBigViewSyncDiagnosticEvent("tui.image.submit_error", {
+                agentId: terminalAgentKind,
+                attachmentCount: attachments.length,
+                instanceId: terminalInstanceId,
+                message: error?.message || String(error || ""),
+                paneId,
+                syncKey,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+            });
+          return true;
+        };
         disposables.push(terminal.onData((data) => {
           if (isDisposed || parkedPromptRef.current) {
             return;
@@ -6839,6 +7328,9 @@ function WorkspaceTerminal({
           }
           const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
           if (!startupControlReply && !terminalGeneratedReply && isSubmitInput) {
+            if (submitTerminalComposerWithQueuedImages(safeData)) {
+              return;
+            }
             if (terminalSubmittedInputHasText) {
               recordSubmittedAgentMessage(
                 terminalInstanceId,
@@ -7456,7 +7948,7 @@ function WorkspaceTerminal({
       }).catch(() => {});
       terminal.dispose();
     };
-  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, getCurrentThreadComposerSyncKey, isGenericTerminal, onPreparedTerminalChange, onThreadTerminalLifecycle, paneId, recordSubmittedAgentMessage, requestTerminalAudioInputTarget, restartKey, setThreadComposerDraftValue, terminalAgentKind, terminalClosed, terminalIndex, terminalRoleId, terminalScrollStabilityMode, thread?.freshSessionStartedAt, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
+  }, [activateTerminalPane, agent?.id, agent?.label, focusTerminalKeyboardInput, getCurrentThreadComposerSyncKey, isGenericTerminal, onPreparedTerminalChange, onThreadTerminalLifecycle, openTerminalPathLink, paneId, recordSubmittedAgentMessage, requestTerminalAudioInputTarget, restartKey, setThreadComposerDraftValue, terminalAgentKind, terminalClosed, terminalIndex, terminalRoleId, terminalScrollStabilityMode, thread?.freshSessionStartedAt, useNormalizerAgentScrollStability, useWebglRenderer, workingDirectory, workspace?.id]);
 
   useEffect(() => {
     const pendingPrompt = thread?.pendingPrompt;
@@ -8355,6 +8847,7 @@ function WorkspaceTerminal({
       onDragLeave={handleTerminalTodoDragLeave}
       onDragOver={handleTerminalTodoDragOver}
       onDrop={handleTerminalTodoDrop}
+      onPaste={(event) => queueClipboardImagesForCurrentTerminal(event, "xterm_surface")}
       ref={containerRef}
     />
   );
@@ -8478,6 +8971,7 @@ function WorkspaceTerminal({
         onDragLeave={handleTerminalTodoDragLeave}
         onDragOver={handleTerminalTodoDragOver}
         onDrop={handleTerminalTodoDrop}
+        onPasteCapture={(event) => queueClipboardImagesForCurrentTerminal(event, "terminal_frame")}
       >
         {terminalClosed ? (
           <TerminalClosedSurface aria-live="polite" role="status">

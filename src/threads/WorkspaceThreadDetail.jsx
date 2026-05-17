@@ -10,6 +10,7 @@ import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilit
 import {
   appendWorkspaceThreadComposerAttachments,
   removeWorkspaceThreadComposerAttachment,
+  setWorkspaceThreadComposerAttachments,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import {
@@ -1088,6 +1089,31 @@ function readImageFile(file) {
   });
 }
 
+function getClipboardImageFiles(clipboardData) {
+  const itemFiles = Array.from(clipboardData?.items || [])
+    .filter((item) => item?.kind === "file" && String(item.type || "").startsWith("image/"))
+    .map((item) => item.getAsFile?.())
+    .filter(Boolean);
+  const clipboardFiles = Array.from(clipboardData?.files || [])
+    .filter((file) => String(file?.type || "").startsWith("image/"));
+  const seen = new Set();
+
+  return itemFiles.concat(clipboardFiles)
+    .filter((file) => {
+      const signature = [
+        String(file?.name || "clipboard-image"),
+        String(file?.type || ""),
+        String(file?.size || 0),
+        String(file?.lastModified || 0),
+      ].join("|");
+      if (!signature || seen.has(signature)) {
+        return false;
+      }
+      seen.add(signature);
+      return true;
+    });
+}
+
 function formatSavedImageAttachments(images) {
   return (Array.isArray(images) ? images : [])
     .map((image, index) => {
@@ -1262,6 +1288,29 @@ function NewChatView({
         workspaceId: workspace?.id || "",
       });
     }
+  };
+
+  const handleComposerPaste = (event) => {
+    const imageFiles = getClipboardImageFiles(event.clipboardData);
+    if (!imageFiles.length) {
+      return;
+    }
+
+    event.preventDefault();
+    logBigViewSyncDiagnosticEvent("bigview.image.paste_start", {
+      agentId: activeAgentId,
+      attachmentCountBefore: attachments.length,
+      fileCount: imageFiles.length,
+      files: imageFiles.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      model: selectedModel || "",
+      surface: "new_chat",
+      workspaceId: workspace?.id || "",
+    });
+    addImageFiles(imageFiles);
   };
 
   const removeAttachment = (attachmentId) => {
@@ -1852,7 +1901,7 @@ function WorkspaceThreadDetail({
     : hasProviderSession
       ? `Ask ${agentLabel} to resume this thread`
       : `No ${agentLabel} session is available for this thread`;
-  const submitDisabled = sending || !canSubmit || !draft.trim();
+  const submitDisabled = sending || !canSubmit || (!draft.trim() && attachments.length === 0);
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
@@ -2036,6 +2085,30 @@ function WorkspaceThreadDetail({
     }
   };
 
+  const handleComposerPaste = (event) => {
+    const imageFiles = getClipboardImageFiles(event.clipboardData);
+    if (!imageFiles.length) {
+      return;
+    }
+
+    event.preventDefault();
+    logBigViewSyncDiagnosticEvent("bigview.image.paste_start", {
+      agentId: activeAgentId,
+      attachmentCountBefore: attachments.length,
+      fileCount: imageFiles.length,
+      files: imageFiles.map((file) => ({
+        mimeType: String(file?.type || ""),
+        name: String(file?.name || ""),
+        size: Number(file?.size || 0),
+      })),
+      model: currentTuiModel || "",
+      surface: "thread_detail",
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    addImageFiles(imageFiles);
+  };
+
   const removeAttachment = (attachmentId) => {
     const removedAttachment = attachments.find((attachment) => attachment.id === attachmentId);
     removeWorkspaceThreadComposerAttachment(composerSyncKey, attachmentId, {
@@ -2135,7 +2208,7 @@ function WorkspaceThreadDetail({
 
   const submitDraft = async () => {
     const text = draft.trim();
-    if (!text || !thread || !canSubmit) {
+    if ((!text && attachments.length === 0) || !thread || !canSubmit) {
       return;
     }
 
@@ -2166,24 +2239,52 @@ function WorkspaceThreadDetail({
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       if (previousAttachments.length) {
-        logBigViewSyncDiagnosticEvent("bigview.image.submit_held", {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
           agentId: activeAgentId,
           attachmentCount: previousAttachments.length,
           attachments: getAttachmentLogSummary(previousAttachments),
-          reason: "image_submit_disabled",
           selectedModel: currentTuiModel || "",
           surface: "thread_detail",
           threadId: thread?.id || "",
           workspaceId: workspace?.id || thread?.workspaceId || "",
         });
       }
-      const message = text;
+      let imageBlock = "";
+      try {
+        imageBlock = await saveImageAttachments(previousAttachments);
+      } catch (saveError) {
+        if (previousAttachments.length) {
+          logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
+            agentId: activeAgentId,
+            attachmentCount: previousAttachments.length,
+            attachments: getAttachmentLogSummary(previousAttachments),
+            message: saveError?.message || String(saveError || ""),
+            selectedModel: currentTuiModel || "",
+            surface: "thread_detail",
+            threadId: thread?.id || "",
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          });
+        }
+        throw saveError;
+      }
+      if (previousAttachments.length) {
+        logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
+          agentId: activeAgentId,
+          attachmentCount: previousAttachments.length,
+          imageBlockLength: imageBlock.length,
+          imageBlockPreview: imageBlock.slice(0, 240),
+          selectedModel: currentTuiModel || "",
+          surface: "thread_detail",
+          threadId: thread?.id || "",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        });
+      }
+      const message = [text, imageBlock].filter(Boolean).join("\n\n");
       logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
         agentId: activeAgentId,
         attachmentCount: previousAttachments.length,
         hasActiveTerminalBinding,
-        imageBlockPresent: false,
-        imagesHeld: previousAttachments.length,
+        imageBlockPresent: Boolean(imageBlock),
         messageLength: message.length,
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
@@ -2206,6 +2307,16 @@ function WorkspaceThreadDetail({
         workspaceId: workspace?.id || thread?.workspaceId || "",
       });
       setDraft("");
+      setWorkspaceThreadComposerAttachments(composerSyncKey, [], {
+        fields: {
+          agentId: activeAgentId,
+          surface: "thread_detail",
+          threadId: thread?.id || "",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        },
+        reason: "submit_done_clear",
+        source: "bigview_thread_detail",
+      });
     } catch (submitError) {
       setDraft(previousDraft);
       setError(submitError?.message || "Unable to send message.");
@@ -2329,6 +2440,7 @@ function WorkspaceThreadDetail({
                 submitDraft();
               }
             }}
+            onPaste={handleComposerPaste}
             placeholder={placeholder}
             rows={1}
             spellCheck="true"
