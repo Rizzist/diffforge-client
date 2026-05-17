@@ -8042,6 +8042,7 @@ function WorkspaceTerminal({
               onClose={toggleTerminalFullscreen}
               onCreateChat={createWorkspaceThreadChat}
               onArchiveThread={onArchiveWorkspaceThread}
+              onDraftInput={syncWorkspaceThreadComposerInput}
               onSelectModel={changeWorkspaceThreadModel}
               onSelectThread={onSelectWorkspaceThread}
               onSubmitMessage={submitWorkspaceThreadMessage}
