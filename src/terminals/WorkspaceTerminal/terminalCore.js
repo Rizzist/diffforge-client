@@ -37,6 +37,7 @@ export const TERMINAL_INPUT_EVENT = "forge-terminal-input";
 export const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 export const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 export const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
+export const TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT = "diffforge:terminal-submit-diagnostic-snapshot-request";
 export const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 export const WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-archive-terminal-reset";
 export const WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-new-session-terminal-reset";

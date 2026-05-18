@@ -7,6 +7,7 @@ const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
 const MAX_THREAD_PROJECTION_EVENTS = 900;
 const MAX_THREAD_MESSAGES = 360;
 const MAX_THREADS_PER_WORKSPACE = 80;
+const PASTED_LINES_MESSAGE_EQUIVALENCE_MAX_DELTA_MS = 90_000;
 const THREAD_PROMPT_LABEL_MAX_WORDS = 6;
 const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
 const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
@@ -54,6 +55,7 @@ function cleanMessageText(value, fallback = "") {
 }
 
 const ATTACHMENT_MARKER_PATTERN = /\[(?:image|file)-attached(?:\s+\d+)?\]/i;
+const PASTED_LINES_MARKER_PATTERN = /\[pasted-lines(?:\s+(\d+))?\]/i;
 
 function createAttachmentReferencePattern() {
   return /\[((?:image|file)-attached)(?:\s+(\d+))?\]\s*(.*?)\s*->\s*([\s\S]*?)(?=\n\s*\[(?:image|file)-attached(?:\s+\d+)?\]|\s*$)/gi;
@@ -186,10 +188,142 @@ function areAttachmentMessagesEquivalent(left, right) {
   );
 }
 
+function pastedLinesPlaceholderSignature(value) {
+  const text = cleanMessageText(value);
+  const match = PASTED_LINES_MARKER_PATTERN.exec(text);
+  if (!match) {
+    return null;
+  }
+
+  const suffix = text.slice(match.index + match[0].length).trim();
+  if (suffix && !suffix.startsWith("->")) {
+    return null;
+  }
+
+  return {
+    lineCount: cleanText(match[1]),
+    path: suffix.startsWith("->")
+      ? normalizeAttachmentPathText(suffix.slice(2)).toLowerCase()
+      : "",
+    prompt: cleanText(text.slice(0, match.index)).toLowerCase(),
+  };
+}
+
+function isPastedLinesPlaceholderText(value) {
+  return Boolean(pastedLinesPlaceholderSignature(value));
+}
+
+function isPromptPrefixMatch(prompt, value) {
+  const promptText = cleanText(prompt).toLowerCase();
+  const text = cleanText(value).toLowerCase();
+  if (!promptText || !text) {
+    return false;
+  }
+
+  if (text === promptText || text.startsWith(`${promptText} `)) {
+    return true;
+  }
+
+  return isPromptTextNearMatch(promptText, text.slice(0, promptText.length));
+}
+
+function arePastedLinesMessagesEquivalent(left, right, options = {}) {
+  const leftSignature = pastedLinesPlaceholderSignature(left);
+  const rightSignature = pastedLinesPlaceholderSignature(right);
+  if (!leftSignature && !rightSignature) {
+    return false;
+  }
+
+  if (leftSignature && rightSignature) {
+    return Boolean(
+      leftSignature.path
+      && rightSignature.path
+      && leftSignature.path === rightSignature.path,
+    );
+  }
+
+  const placeholder = leftSignature || rightSignature;
+  const bodyText = cleanText(leftSignature ? right : left).toLowerCase();
+  if (!bodyText) {
+    return false;
+  }
+
+  if (placeholder.prompt) {
+    return isPromptPrefixMatch(placeholder.prompt, bodyText);
+  }
+
+  return options.allowEmptyPrompt === true;
+}
+
 function areThreadMessageTextsEquivalent(left, right) {
   const leftText = cleanMessageText(left);
   const rightText = cleanMessageText(right);
-  return leftText === rightText || areAttachmentMessagesEquivalent(leftText, rightText);
+  return (
+    leftText === rightText
+    || areAttachmentMessagesEquivalent(leftText, rightText)
+    || arePastedLinesMessagesEquivalent(leftText, rightText)
+  );
+}
+
+function areThreadMessagesEquivalent(left, right, maxDeltaMs = 5000) {
+  const leftRole = cleanText(left?.role).toLowerCase();
+  const rightRole = cleanText(right?.role).toLowerCase();
+  if (!areThreadMessagesSameTurn(left, right, maxDeltaMs)) {
+    return arePastedLinesThreadMessagesEquivalent(left, right, maxDeltaMs);
+  }
+
+  return (
+    areThreadMessageTextsEquivalent(left?.text, right?.text)
+    || (
+      leftRole === "user"
+      && rightRole === "user"
+      && arePastedLinesMessagesEquivalent(left?.text, right?.text, { allowEmptyPrompt: true })
+    )
+  );
+}
+
+function arePastedLinesThreadMessagesEquivalent(left, right, maxDeltaMs = 5000) {
+  const leftRole = cleanText(left?.role).toLowerCase();
+  const rightRole = cleanText(right?.role).toLowerCase();
+  if (
+    leftRole !== "user"
+    || rightRole !== "user"
+    || !arePastedLinesMessagesEquivalent(left?.text, right?.text, { allowEmptyPrompt: true })
+  ) {
+    return false;
+  }
+
+  const leftTimestamp = threadMessageTimestampMs(left);
+  const rightTimestamp = threadMessageTimestampMs(right);
+  if (!leftTimestamp || !rightTimestamp) {
+    return false;
+  }
+
+  const effectiveMaxDeltaMs = Math.max(
+    Math.max(0, Number(maxDeltaMs) || 0),
+    PASTED_LINES_MESSAGE_EQUIVALENCE_MAX_DELTA_MS,
+  );
+  return Math.abs(leftTimestamp - rightTimestamp) <= effectiveMaxDeltaMs;
+}
+
+function shouldPreferIncomingPastedBody(existingText, incomingText) {
+  return Boolean(
+    isPastedLinesPlaceholderText(existingText)
+    && !isPastedLinesPlaceholderText(incomingText)
+    && arePastedLinesMessagesEquivalent(existingText, incomingText, { allowEmptyPrompt: true }),
+  );
+}
+
+function chooseProjectedMessageText(existingText, incomingText) {
+  if (shouldPreferIncomingPastedBody(existingText, incomingText)) {
+    return cleanMessageText(incomingText);
+  }
+
+  if (shouldPreferIncomingPastedBody(incomingText, existingText)) {
+    return cleanMessageText(existingText);
+  }
+
+  return cleanMessageText(incomingText);
 }
 
 function cleanTerminalUiText(value, fallback = "") {
@@ -789,8 +923,7 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
         && normalizedMessage.role === "user"
         && candidate.role === normalizedMessage.role
         && cleanText(candidate.kind, "message") === cleanText(normalizedMessage.kind, "message")
-        && areAttachmentMessagesEquivalent(candidate.text, normalizedMessage.text)
-        && areThreadMessagesSameTurn(
+        && areThreadMessagesEquivalent(
           candidate,
           normalizedMessage,
           normalizedMessage.role === "user" ? 12000 : 5000,
@@ -803,10 +936,12 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
     return;
   }
 
+  const existingMessage = messagesById.get(matchingMessageId);
   messagesById.set(matchingMessageId, {
-    ...messagesById.get(matchingMessageId),
+    ...existingMessage,
     ...normalizedMessage,
     id: matchingMessageId,
+    text: chooseProjectedMessageText(existingMessage?.text, normalizedMessage.text),
   });
 }
 
@@ -1132,8 +1267,7 @@ function findMatchingProjectedMessage(projectedMessages, message) {
   return projectedMessages.find((candidate) => (
     candidate.role === role
     && cleanText(candidate.kind, "message") === kind
-    && areThreadMessageTextsEquivalent(candidate.text, text)
-    && areThreadMessagesSameTurn(candidate, message, role === "user" ? 12000 : 5000)
+    && areThreadMessagesEquivalent(candidate, message, role === "user" ? 12000 : 5000)
   )) || null;
 }
 
@@ -1148,12 +1282,14 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   const createdAt = cleanText(event.messageCreatedAt, nowIso());
   const createdMs = Date.parse(createdAt);
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-  const lastUserMs = Date.parse(lastUserMessage?.createdAt || "");
   if (
-    areThreadMessageTextsEquivalent(lastUserMessage?.text, text)
-    && Number.isFinite(createdMs)
-    && Number.isFinite(lastUserMs)
-    && Math.abs(createdMs - lastUserMs) < 2500
+    Number.isFinite(createdMs)
+    && areThreadMessagesEquivalent(
+      lastUserMessage,
+      { createdAt, kind: "message", role: "user", text },
+      2500,
+    )
+    && !shouldPreferIncomingPastedBody(lastUserMessage?.text, text)
   ) {
     return [];
   }

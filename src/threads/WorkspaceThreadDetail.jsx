@@ -59,6 +59,7 @@ const thinkingPulse = keyframes`
 `;
 
 const DetailRoot = styled.main`
+  position: relative;
   display: grid;
   min-width: 0;
   min-height: 0;
@@ -283,6 +284,53 @@ const MessageFileLink = styled.button`
 
   html[data-forge-theme="light"] &:hover {
     color: var(--forge-blue-soft);
+  }
+`;
+
+const ThreadDetailTodoDropOverlay = styled.div`
+  position: absolute;
+  inset: 10px;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  border: 1px dotted rgba(138, 216, 255, 0.46);
+  border-radius: 14px;
+  background: rgba(2, 8, 14, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(138, 216, 255, 0.08);
+  pointer-events: none;
+
+  &[data-target="true"] {
+    border: 2px dotted rgba(138, 216, 255, 0.94);
+    background: rgba(2, 8, 14, 0.54);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 173, 124, 0.24),
+      0 0 32px rgba(138, 216, 255, 0.12);
+  }
+
+  &[data-unsupported="true"] {
+    border-color: rgba(255, 112, 112, 0.82);
+    background: rgba(32, 4, 8, 0.58);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 112, 112, 0.2),
+      0 0 32px rgba(255, 112, 112, 0.1);
+  }
+`;
+
+const ThreadDetailTodoDropLabel = styled.div`
+  border: 1px solid rgba(138, 216, 255, 0.3);
+  border-radius: 999px;
+  padding: 8px 12px;
+  color: #e9f8ff;
+  background: linear-gradient(135deg, rgba(6, 16, 26, 0.96), rgba(28, 16, 10, 0.92));
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+
+  &[data-unsupported="true"] {
+    border-color: rgba(255, 112, 112, 0.34);
+    color: #ffe5e5;
+    background: linear-gradient(135deg, rgba(46, 8, 12, 0.96), rgba(28, 10, 10, 0.92));
   }
 `;
 
@@ -3034,6 +3082,9 @@ function WorkspaceThreadDetail({
   onSelectModel,
   onSubmitMessage,
   thread,
+  todoDropActive = false,
+  todoDropTarget = false,
+  todoDropUnsupportedMessage = "",
   workspace,
   workspaceThreadEntry,
 }) {
@@ -3101,6 +3152,12 @@ function WorkspaceThreadDetail({
       ? `Ask ${agentLabel} to resume this thread`
       : `No ${agentLabel} session is available for this thread`;
   const submitDisabled = sending || !canSubmit || (!draft.trim() && attachments.length === 0);
+  const todoDropOverlayVisible = Boolean(todoDropActive && todoDropTarget);
+  const todoDropOverlayTarget = todoDropOverlayVisible;
+  const todoDropOverlayMessage = todoDropOverlayTarget
+    ? String(todoDropUnsupportedMessage || "").trim()
+    : "";
+  const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
@@ -4122,6 +4179,18 @@ function WorkspaceThreadDetail({
             <EmptyThread>Select a thread</EmptyThread>
           </TranscriptInner>
         </TranscriptScroll>
+        {todoDropOverlayVisible && (
+          <ThreadDetailTodoDropOverlay
+            data-target={todoDropOverlayTarget ? "true" : "false"}
+            data-unsupported={todoDropOverlayUnsupported ? "true" : "false"}
+          >
+            {todoDropOverlayTarget && (
+              <ThreadDetailTodoDropLabel data-unsupported={todoDropOverlayUnsupported ? "true" : "false"}>
+                {todoDropOverlayMessage || "Drop here"}
+              </ThreadDetailTodoDropLabel>
+            )}
+          </ThreadDetailTodoDropOverlay>
+        )}
       </DetailRoot>
     );
   }
@@ -4307,6 +4376,18 @@ function WorkspaceThreadDetail({
         </ComposerBox>
         {error ? <ComposerError>{error}</ComposerError> : null}
       </ComposerShell>
+      {todoDropOverlayVisible && (
+        <ThreadDetailTodoDropOverlay
+          data-target={todoDropOverlayTarget ? "true" : "false"}
+          data-unsupported={todoDropOverlayUnsupported ? "true" : "false"}
+        >
+          {todoDropOverlayTarget && (
+            <ThreadDetailTodoDropLabel data-unsupported={todoDropOverlayUnsupported ? "true" : "false"}>
+              {todoDropOverlayMessage || "Drop here"}
+            </ThreadDetailTodoDropLabel>
+          )}
+        </ThreadDetailTodoDropOverlay>
+      )}
     </DetailRoot>
   );
 }

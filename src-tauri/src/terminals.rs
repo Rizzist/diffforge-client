@@ -2400,6 +2400,120 @@ fn terminal_observe_input_gate_submitted_prompt(
     submitted
 }
 
+fn terminal_input_gate_diagnostic_snapshot(gate: &TerminalInputGate) -> Value {
+    let current_line = gate.current_line.as_str();
+    json!({
+        "ansi_csi_active": gate.ansi_csi_active,
+        "ansi_escape_active": gate.ansi_escape_active,
+        "ansi_osc_active": gate.ansi_osc_active,
+        "ansi_osc_escape_pending": gate.ansi_osc_escape_pending,
+        "ansi_ss3_active": gate.ansi_ss3_active,
+        "current_line_len": current_line.len(),
+        "current_line_preview": clean_terminal_diagnostic_log_text(current_line),
+        "current_line_tail": clean_terminal_diagnostic_log_text(
+            &current_line
+                .chars()
+                .rev()
+                .take(180)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+        ),
+        "current_line_user_touched": gate.current_line_user_touched,
+        "trimmed_line_len": current_line.trim().len(),
+    })
+}
+
+fn terminal_write_data_diagnostic(data: &str) -> Value {
+    json!({
+        "contains_enter_sequence": data.contains(TERMINAL_ENTER_SEQUENCE),
+        "contains_enter_sequence_mod1": data.contains(TERMINAL_ENTER_SEQUENCE_MOD1),
+        "contains_shift_enter_sequence": data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE),
+        "data_len": data.len(),
+        "has_backspace": data.contains('\u{8}') || data.contains('\u{7f}'),
+        "has_carriage_return": data.contains('\r'),
+        "has_escape": data.contains('\u{1b}'),
+        "has_line_feed": data.contains('\n'),
+        "is_only_submit": matches!(data, "\r" | "\n"),
+        "preview": clean_terminal_diagnostic_log_text(data),
+        "starts_with_escape": data.starts_with('\u{1b}'),
+    })
+}
+
+fn terminal_input_write_has_prompt_event(
+    prompt_event_id: &Option<String>,
+    prompt_event_text: &Option<String>,
+) -> bool {
+    prompt_event_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || prompt_event_text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn terminal_input_write_diagnostic_kind(
+    data: &str,
+    prompt_event_id: &Option<String>,
+    prompt_event_text: &Option<String>,
+) -> Option<&'static str> {
+    let has_prompt_event = terminal_input_write_has_prompt_event(prompt_event_id, prompt_event_text);
+    if has_prompt_event && matches!(data, "\r" | "\n") {
+        return Some("prompt_submit");
+    }
+    if has_prompt_event {
+        return Some("prompt_event");
+    }
+    if data.contains('\u{15}') {
+        return Some("force_replace_sync");
+    }
+    if data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE) {
+        return Some("shift_enter_sync");
+    }
+    if data.contains("\u{1b}[I") {
+        return Some("focus_in");
+    }
+    if data.contains("\u{1b}[O") {
+        return Some("focus_out");
+    }
+    if matches!(data, "\r" | "\n") {
+        return Some("submit_without_prompt_event");
+    }
+
+    None
+}
+
+fn terminal_input_gate_snapshot_u64(snapshot: &Value, key: &str) -> u64 {
+    snapshot
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn terminal_prompt_observer_not_observed_reason(
+    data: &str,
+    input_gate_before: &Value,
+    input_gate_after: &Value,
+) -> &'static str {
+    if matches!(data, "\r" | "\n")
+        && terminal_input_gate_snapshot_u64(input_gate_before, "trimmed_line_len") == 0
+    {
+        return "submit_with_empty_input_gate";
+    }
+    if data.contains('\r') || data.contains('\n') {
+        return "submit_boundary_without_accepted_prompt";
+    }
+    if data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE) {
+        return "shift_enter_without_submit";
+    }
+    if terminal_input_gate_snapshot_u64(input_gate_after, "trimmed_line_len") > 0 {
+        return "input_buffered_without_submit_boundary";
+    }
+
+    "control_or_empty_input"
+}
+
 fn find_bare_terminal_color_reply_start(data: &str) -> Option<usize> {
     let lower = data.to_ascii_lowercase();
     ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
@@ -2472,10 +2586,13 @@ fn normalize_terminal_enter_sequences_for_pty(data: String) -> String {
 async fn terminal_observe_submitted_prompt(
     instance: &TerminalInstance,
     data: &str,
-) -> Option<String> {
+) -> (Option<String>, Value, Value) {
     let mut gate = instance.input_gate.lock().await;
+    let before = terminal_input_gate_diagnostic_snapshot(&gate);
+    let submitted = terminal_observe_input_gate_submitted_prompt(&mut gate, data);
+    let after = terminal_input_gate_diagnostic_snapshot(&gate);
 
-    terminal_observe_input_gate_submitted_prompt(&mut gate, data)
+    (submitted, before, after)
 }
 
 fn terminal_prompt_task_title(prompt: &str) -> String {
@@ -3993,7 +4110,11 @@ async fn terminal_write_inner(
         return Ok(());
     };
     let _input_guard = instance.input_queue.lock().await;
+    let original_data_diagnostic = terminal_write_data_diagnostic(&data);
     let data = normalize_terminal_enter_sequences_for_pty(data);
+    let normalized_data_diagnostic = terminal_write_data_diagnostic(&data);
+    let input_write_diagnostic_kind =
+        terminal_input_write_diagnostic_kind(&data, &prompt_event_id, &prompt_event_text);
 
     let escape_interrupt_task_id = if data == "\x1b" && instance.coordination.is_some() {
         instance
@@ -4028,7 +4149,33 @@ async fn terminal_write_inner(
         return Ok(());
     }
 
-    write_terminal_input(
+    if let Some(diagnostic_kind) = input_write_diagnostic_kind {
+        let input_gate_before_write = {
+            let gate = instance.input_gate.lock().await;
+            terminal_input_gate_diagnostic_snapshot(&gate)
+        };
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.input_write_start",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "diagnostic_kind": diagnostic_kind,
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "input_gate_before_write": input_gate_before_write,
+                "instance_id": instance.id,
+                "normalized_data": normalized_data_diagnostic.clone(),
+                "original_data": original_data_diagnostic.clone(),
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            },
+        }));
+    }
+
+    let input_write_started_at = Instant::now();
+    let input_write_result = write_terminal_input(
         Some(&app),
         state,
         &pane_id,
@@ -4037,15 +4184,41 @@ async fn terminal_write_inner(
         "terminal.write.skipped_stale_or_missing",
     )
     .await?;
+    let input_write_elapsed_ms = terminal_diagnostic_elapsed_ms(input_write_started_at);
+    if let Some(diagnostic_kind) = input_write_diagnostic_kind {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.input_write_done",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "diagnostic_kind": diagnostic_kind,
+                "elapsed_ms": input_write_elapsed_ms,
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance.id,
+                "normalized_data": normalized_data_diagnostic.clone(),
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+                "wrote": input_write_result,
+            },
+        }));
+    }
 
-    let observed_prompt = terminal_observe_submitted_prompt(&instance, &data).await;
+    let (observed_prompt, input_gate_before, input_gate_after) =
+        terminal_observe_submitted_prompt(&instance, &data).await;
     if let Some(prompt) = observed_prompt {
-        let event_prompt = prompt_event_text
+        let requested_event_prompt = prompt_event_text
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(prompt.as_str())
-            .to_string();
+            .map(str::to_string);
+        let prompt_event_text_matches_observed = requested_event_prompt
+            .as_ref()
+            .map(|value| value == &prompt)
+            .unwrap_or(true);
+        let event_prompt = prompt.clone();
         emit_terminal_prompt_submitted(
             &app,
             &instance,
@@ -4063,9 +4236,18 @@ async fn terminal_write_inner(
                 "data_len": data.len(),
                 "event_prompt_len": event_prompt.len(),
                 "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "input_gate_after": input_gate_after,
+                "input_gate_before": input_gate_before,
                 "instance_id": instance.id,
+                "normalized_data": normalized_data_diagnostic,
                 "observed_prompt_len": prompt.len(),
+                "observer_reason": "submitted_prompt_observed",
+                "original_data": original_data_diagnostic,
                 "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_text_len": requested_event_prompt.as_deref().map(str::len).unwrap_or_default(),
+                "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
+                "submitted_event_prompt_source": "observed_input_gate",
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             },
         }));
@@ -4100,6 +4282,11 @@ async fn terminal_write_inner(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
     {
+        let observer_reason = terminal_prompt_observer_not_observed_reason(
+            &data,
+            &input_gate_before,
+            &input_gate_after,
+        );
         write_thread_bridge_diagnostic_log_entry(json!({
             "ts_ms": current_time_ms(),
             "phase": "backend.bridge.prompt_not_observed",
@@ -4110,7 +4297,37 @@ async fn terminal_write_inner(
                 "data_len": data.len(),
                 "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
                 "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "input_gate_after": input_gate_after,
+                "input_gate_before": input_gate_before,
                 "instance_id": instance.id,
+                "normalized_data": normalized_data_diagnostic,
+                "observer_reason": observer_reason,
+                "original_data": original_data_diagnostic,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            },
+        }));
+    } else if let Some(diagnostic_kind) = input_write_diagnostic_kind {
+        let observer_reason = terminal_prompt_observer_not_observed_reason(
+            &data,
+            &input_gate_before,
+            &input_gate_after,
+        );
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.input_observed_no_submit",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "data_len": data.len(),
+                "diagnostic_kind": diagnostic_kind,
+                "input_gate_after": input_gate_after,
+                "input_gate_before": input_gate_before,
+                "instance_id": instance.id,
+                "normalized_data": normalized_data_diagnostic,
+                "observer_reason": observer_reason,
+                "original_data": original_data_diagnostic,
                 "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             },

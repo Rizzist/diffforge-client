@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import { getWorkspaceThreadProviderBinding } from "../../threads/workspaceThreads";
-import { logBigViewSyncDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
+import {
+  getBigViewTextDiagnosticFields,
+  logBigViewSyncDiagnosticEvent,
+} from "../../threads/bigViewSyncDiagnostics";
 import {
   MAX_WORKSPACE_TERMINAL_COUNT,
   MIN_WORKSPACE_TERMINAL_COUNT,
@@ -12,6 +15,7 @@ import {
   TERMINAL_MIN_COLS,
   TERMINAL_MIN_ROWS,
   TERMINAL_PROMPT_SUBMITTED_EVENT,
+  TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT,
   TODO_DRAG_MIME,
   WORKSPACE_TERMINAL_PANE_PREFIX,
   WORKSPACE_TERMINAL_PRIMARY_COLUMNS,
@@ -622,7 +626,29 @@ export function buildProviderTurnErrorProjectionEvents({
   ];
 }
 
-export const TERMINAL_PROMPT_ACCEPT_RETRY_DELAYS_MS = [2800, 6500];
+export const TERMINAL_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
+export const TERMINAL_PROMPT_ACCEPT_TIMEOUT_MS = 20000;
+export const TERMINAL_CODEX_PROMPT_ACCEPT_TIMEOUT_MS = 75000;
+
+function getPositiveTimeoutMs(value) {
+  const numericValue = Number(value);
+
+  return Number.isFinite(numericValue) && numericValue > 0
+    ? Math.max(3000, numericValue)
+    : 0;
+}
+
+export function getWorkspaceThreadPromptAcceptedTimeoutMs(agentId = "", timeoutMs) {
+  const explicitTimeoutMs = getPositiveTimeoutMs(timeoutMs);
+
+  if (explicitTimeoutMs) {
+    return explicitTimeoutMs;
+  }
+
+  return getTerminalAgentKind(agentId) === "codex"
+    ? TERMINAL_CODEX_PROMPT_ACCEPT_TIMEOUT_MS
+    : TERMINAL_PROMPT_ACCEPT_TIMEOUT_MS;
+}
 
 function delayThreadBridgeMs(delayMs) {
   return new Promise((resolve) => {
@@ -735,7 +761,7 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
   expectedPrompt = "",
   promptId,
   threadId,
-  timeoutMs = 20000,
+  timeoutMs,
   workspaceId = "",
 }) {
   const safeAgentId = getTerminalAgentKind(agentId);
@@ -743,6 +769,7 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
   const safeThreadId = String(threadId || "").trim();
   const safeWorkspaceId = String(workspaceId || "").trim();
   const safeExpectedPrompt = String(expectedPrompt || "").trim();
+  const acceptanceTimeoutMs = getWorkspaceThreadPromptAcceptedTimeoutMs(safeAgentId, timeoutMs);
   let settled = false;
   let timeoutId = 0;
 
@@ -787,6 +814,15 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
     resolveAccepted = resolve;
     rejectAccepted = reject;
     window.addEventListener(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, handlePromptAccepted);
+    logThreadBridgeDiagnostic("frontend.bridge.accept.wait_start", {
+      agentId: safeAgentId,
+      expectedPromptLength: safeExpectedPrompt.length,
+      promptId: safePromptId,
+      threadId: safeThreadId,
+      timeoutMs: acceptanceTimeoutMs,
+      timeoutPolicy: safeAgentId === "codex" ? "codex-late-transcript" : "default",
+      workspaceId: safeWorkspaceId,
+    });
     timeoutId = window.setTimeout(() => {
       if (settled) {
         return;
@@ -798,11 +834,11 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
         expectedPromptLength: safeExpectedPrompt.length,
         promptId: safePromptId,
         threadId: safeThreadId,
-        timeoutMs,
+        timeoutMs: acceptanceTimeoutMs,
         workspaceId: safeWorkspaceId,
       });
       reject(new Error("Timed out waiting for the prompt to appear in the agent session."));
-    }, Math.max(3000, timeoutMs));
+    }, acceptanceTimeoutMs);
   });
 
   return {
@@ -815,6 +851,21 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
     },
     promise,
   };
+}
+
+export function requestTerminalSubmitDiagnosticSnapshot(fields = {}) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const detail = {
+    requestedAtMs: Date.now(),
+    source: "frontend",
+    ...fields,
+  };
+  window.dispatchEvent(new CustomEvent(TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT, {
+    detail,
+  }));
 }
 
 export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
@@ -860,6 +911,20 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
     const currentDraft = String(
       typeof getDraftValue === "function" ? getDraftValue() : "",
     ).trim();
+    logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_state`, {
+      agentId: safeAgentId,
+      bindingInstanceId: binding?.instanceId || "",
+      bindingPaneId: binding?.paneId || "",
+      currentDraft: getBigViewTextDiagnosticFields(currentDraft),
+      draftMatchesExpected: currentDraft === safePrompt,
+      expectedPrompt: getBigViewTextDiagnosticFields(safePrompt),
+      promptId: safePromptId,
+      retryDelayMs,
+      retryIndex: retryIndex + 1,
+      sendPolicy: "terminal-confirmed-and-session-accepted",
+      threadId: safeThreadId,
+      workspaceId,
+    });
     if (currentDraft !== safePrompt) {
       logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_blocked`, {
         agentId: safeAgentId,
@@ -909,6 +974,21 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       threadId: safeThreadId,
       workspaceId,
     });
+    requestTerminalSubmitDiagnosticSnapshot({
+      agentId: safeAgentId,
+      attempt: retryIndex + 1,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      expectedPrompt: safePrompt,
+      expectedPromptLength: safePrompt.length,
+      paneId: binding.paneId,
+      promptId: safePromptId,
+      reason: `${logPrefix}.enter_retry_before_write`,
+      submitSequenceLength: safeSubmitSequence.length,
+      threadId: safeThreadId,
+      workspaceId,
+    });
+    const retryWriteStartedAt = Date.now();
     await invoke("terminal_write", {
       data: safeSubmitSequence,
       instanceId: binding.instanceId,
@@ -916,6 +996,49 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       promptEventId: safePromptId,
       promptEventText: safePrompt,
       threadId: safeThreadId,
+    });
+    logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_write_done`, {
+      agentId: safeAgentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      elapsedMs: Date.now() - retryWriteStartedAt,
+      expectedPromptLength: safePrompt.length,
+      promptId: safePromptId,
+      retryDelayMs,
+      retryIndex: retryIndex + 1,
+      sendPolicy: "terminal-confirmed-and-session-accepted",
+      threadId: safeThreadId,
+      workspaceId,
+    });
+    requestTerminalSubmitDiagnosticSnapshot({
+      agentId: safeAgentId,
+      attempt: retryIndex + 1,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      delayMs: 160,
+      expectedPrompt: safePrompt,
+      expectedPromptLength: safePrompt.length,
+      paneId: binding.paneId,
+      promptId: safePromptId,
+      reason: `${logPrefix}.enter_retry_after_write`,
+      submitSequenceLength: safeSubmitSequence.length,
+      threadId: safeThreadId,
+      workspaceId,
+    });
+    requestTerminalSubmitDiagnosticSnapshot({
+      agentId: safeAgentId,
+      attempt: retryIndex + 1,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      delayMs: 500,
+      expectedPrompt: safePrompt,
+      expectedPromptLength: safePrompt.length,
+      paneId: binding.paneId,
+      promptId: safePromptId,
+      reason: `${logPrefix}.enter_retry_after_write_500ms`,
+      submitSequenceLength: safeSubmitSequence.length,
+      threadId: safeThreadId,
+      workspaceId,
     });
   }
 

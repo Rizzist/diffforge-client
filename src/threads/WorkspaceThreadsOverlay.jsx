@@ -1064,6 +1064,9 @@ function WorkspaceThreadsOverlay({
   open,
   selectedThreadId,
   selectedWorkspaceId,
+  todoDropActive = false,
+  todoDropTarget = false,
+  todoDropUnsupportedMessage = "",
   viewState,
   workspaceThreads,
   workspaces,
@@ -1532,6 +1535,9 @@ function WorkspaceThreadsOverlay({
           onSelectModel={onSelectModel}
           onSubmitMessage={onSubmitMessage}
           thread={newChatActive ? null : activeThread}
+          todoDropActive={todoDropActive}
+          todoDropTarget={todoDropTarget}
+          todoDropUnsupportedMessage={todoDropUnsupportedMessage}
           workspace={newChatActive ? newChatWorkspace : activeWorkspace}
           workspaceThreadEntry={workspaceThreads?.[newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId]}
         />

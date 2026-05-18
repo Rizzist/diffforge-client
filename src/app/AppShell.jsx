@@ -613,6 +613,71 @@ function transcriptHasSubmittedPromptEvidence(messages, event = {}) {
   return transcriptSubmittedPromptIndex(messages, event) >= 0;
 }
 
+function getTranscriptPromptMatchDiagnostics(messages, event = {}) {
+  const expectedRaw = String(
+    event.expectedUserMessage || event.userMessage || event.message || "",
+  ).trim();
+  const expected = normalizeWorkspaceThreadProjectionText(expectedRaw);
+  const expectedHead = expected.slice(0, Math.min(96, expected.length));
+  const expectedTail = expected.slice(Math.max(0, expected.length - 96));
+  const submittedAtMs = workspaceThreadMessageTimestampMs({
+    createdAt: event.messageCreatedAt || event.submittedAt || event.createdAt,
+  });
+  const transcriptMessages = Array.isArray(messages) ? messages : [];
+  const roleCounts = transcriptMessages.reduce((counts, message) => {
+    const role = String(message?.role || "").trim().toLowerCase() || "unknown";
+    counts[role] = (counts[role] || 0) + 1;
+    return counts;
+  }, {});
+  const userMessages = transcriptMessages
+    .map((message, index) => ({ message, index }))
+    .filter(({ message }) => String(message?.role || "").trim().toLowerCase() === "user");
+  const recentUserMessages = userMessages.slice(-8).map(({ message, index }) => {
+    const rawText = String(message?.text || message?.message || "");
+    const normalized = normalizeWorkspaceThreadProjectionText(rawText);
+    const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
+    return {
+      exactNormalizedMatch: Boolean(expected) && normalized === expected,
+      expectedContainsCandidate: Boolean(normalized) && expected.includes(normalized),
+      expectedHeadPresent: Boolean(expectedHead) && normalized.includes(expectedHead),
+      expectedTailPresent: Boolean(expectedTail) && normalized.includes(expectedTail),
+      idPresent: Boolean(message?.id),
+      index,
+      kind: message?.kind || "",
+      normalizedLength: normalized.length,
+      role: message?.role || "",
+      source: message?.source || "",
+      status: message?.status || "",
+      text: getBigViewTextDiagnosticFields(rawText),
+      timestampDeltaMs: submittedAtMs && messageTimestampMs ? messageTimestampMs - submittedAtMs : "",
+      timestampPresent: Boolean(messageTimestampMs),
+      title: getBigViewTextDiagnosticFields(message?.title || ""),
+    };
+  });
+  const recentMessages = transcriptMessages.slice(-8).map((message, offset) => ({
+    idPresent: Boolean(message?.id),
+    index: Math.max(0, transcriptMessages.length - 8) + offset,
+    kind: message?.kind || "",
+    role: message?.role || "",
+    source: message?.source || "",
+    status: message?.status || "",
+    text: getBigViewTextDiagnosticFields(message?.text || message?.message || ""),
+    title: getBigViewTextDiagnosticFields(message?.title || ""),
+  }));
+
+  return {
+    expectedNormalizedLength: expected.length,
+    expectedPrompt: getBigViewTextDiagnosticFields(expectedRaw),
+    matchedIndex: transcriptSubmittedPromptIndex(messages, event),
+    messageCount: transcriptMessages.length,
+    recentMessages,
+    recentUserMessages,
+    roleCounts,
+    submittedAtMsPresent: Boolean(submittedAtMs),
+    userMessageCount: userMessages.length,
+  };
+}
+
 function getWorkspaceThreadDiagnosticSnapshot(workspaceThreads, workspaceId, threadId, agentId = "") {
   const safeWorkspaceId = String(workspaceId || "").trim();
   const safeThreadId = String(threadId || "").trim();
@@ -5874,13 +5939,29 @@ export default function App() {
       }
 
       const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+      const providerSessionId = String(
+        requestedProviderSessionId
+          || thread.transcriptSessionId
+          || providerBinding?.nativeSessionId
+          || "",
+      ).trim();
+      const discoveryCwd = String(
+        requestedCwd
+          || thread.coordination?.worktreePath
+          || requestedRepoPath
+          || "",
+      ).trim();
+      const canDiscoverProviderSession = Boolean(
+        !providerSessionId
+          && expectedUserMessage
+          && (pollUntilTurnComplete || promptEventId)
+      );
       const threadRequiresSessionHydration = (
         thread.transcriptHydrationMode === "session-only"
         || Boolean(thread.freshSessionStartedAt)
       )
-        && !requestedProviderSessionId
-        && !thread.transcriptSessionId
-        && !providerBinding?.nativeSessionId;
+        && !providerSessionId
+        && !canDiscoverProviderSession;
       if (threadRequiresSessionHydration) {
         const elapsedMs = Date.now() - pollStartedAt;
         const shouldContinuePolling = pollUntilTurnComplete
@@ -5922,12 +6003,26 @@ export default function App() {
         }
         return;
       }
-      const providerSessionId = String(
-        requestedProviderSessionId
-          || thread.transcriptSessionId
-          || providerBinding?.nativeSessionId
-          || "",
-      ).trim();
+      if (
+        !providerSessionId
+        && canDiscoverProviderSession
+        && (
+          thread.transcriptHydrationMode === "session-only"
+          || Boolean(thread.freshSessionStartedAt)
+        )
+      ) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_discovery_allowed", {
+          agentId,
+          discoveryCwdPresent: Boolean(discoveryCwd),
+          expectedUserMessagePresent: Boolean(expectedUserMessage),
+          pollUntilTurnComplete,
+          promptEventIdPresent: Boolean(promptEventId),
+          requestKey,
+          threadId,
+          transcriptHydrationMode: thread.transcriptHydrationMode || "",
+          workspaceId,
+        });
+      }
       if (
         providerSessionId
         && workspaceThreadSessionIsArchived(
@@ -5948,17 +6043,6 @@ export default function App() {
         workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
         return;
       }
-      const discoveryCwd = String(
-        requestedCwd
-          || thread.coordination?.worktreePath
-          || requestedRepoPath
-          || "",
-      ).trim();
-      const canDiscoverProviderSession = Boolean(
-        !providerSessionId
-          && expectedUserMessage
-          && (pollUntilTurnComplete || promptEventId)
-      );
       if (!providerSessionId && !canDiscoverProviderSession) {
         const elapsedMs = Date.now() - pollStartedAt;
         const shouldContinuePolling = pollUntilTurnComplete
@@ -6073,6 +6157,23 @@ export default function App() {
             turnCompleteSeen,
             workspaceId,
           });
+          if (expectedUserMessage && !promptAccepted && (agentId === "codex" || promptEventId)) {
+            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch", {
+              agentId,
+              diagnostics: getTranscriptPromptMatchDiagnostics(messages, {
+                expectedUserMessage,
+                matchedBy,
+                messageCreatedAt: expectedMessageCreatedAt,
+              }),
+              matchedBy,
+              pollUntilTurnComplete,
+              promptEventIdPresent: Boolean(promptEventId),
+              requestKey,
+              sessionIdPresent: Boolean(sessionId),
+              threadId,
+              workspaceId,
+            });
+          }
           const sessionMatchedByProviderId = matchedBy === "sessionid";
           const promptDiscoveryAccepted = discoveredByPrompt && promptAccepted;
           if (!sessionMatchedByProviderId && !promptDiscoveryAccepted) {
@@ -6279,7 +6380,10 @@ export default function App() {
             agentId,
             command: transcriptCommand,
             elapsedMs,
+            expectedPrompt: getBigViewTextDiagnosticFields(expectedUserMessage),
             message: error?.message || String(error || ""),
+            providerSessionPresent: Boolean(providerSessionId),
+            promptEventIdPresent: Boolean(promptEventId),
             requestKey,
             shouldContinuePolling,
             threadId,
@@ -6718,6 +6822,15 @@ export default function App() {
     });
 
     const lifecycleHasOutputText = Boolean(lifecycleEvent.outputText || lifecycleEvent.text);
+    const lifecycleTranscriptExpectedUserMessage = String(
+      lifecycleEvent.expectedUserMessage
+        || lifecycleEvent.terminalPrompt
+        || lifecycleEvent.terminalMessage
+        || lifecycleEvent.terminalText
+        || lifecycleEvent.userMessage
+        || lifecycleEvent.message
+        || "",
+    );
     const shouldRequestTranscript = (
       ["claude", "codex", "opencode"].includes(
         lifecycleAgentId,
@@ -6741,7 +6854,7 @@ export default function App() {
         ...lifecycleEvent,
         delayMs: lifecycleEvent.type === "message-submitted" ? 240 : 120,
         expectedMessageCreatedAt: lifecycleEvent.messageCreatedAt || "",
-        expectedUserMessage: lifecycleEvent.userMessage || lifecycleEvent.message || "",
+        expectedUserMessage: lifecycleTranscriptExpectedUserMessage,
         pollStartedAt: Date.now(),
         pollUntilTurnComplete: lifecycleEvent.type === "message-submitted",
       });

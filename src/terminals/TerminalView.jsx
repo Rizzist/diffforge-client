@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 
 import {
   ButtonForgeIcon,
@@ -35,6 +35,8 @@ import WorkspaceTerminal, {
 } from "./WorkspaceTerminal.jsx";
 import {
   buildTerminalComposerDraftInput,
+  getTerminalInputDebugFields,
+  TERMINAL_SHIFT_ENTER_SEQUENCE,
 } from "./WorkspaceTerminal/terminalCore.js";
 import {
   appendWorkspaceThreadComposerAttachments,
@@ -48,6 +50,7 @@ import {
   getThreadComposerSyncKey,
   getWorkspaceThreadComposerDraftStore,
   isWorkspaceFileDragTransfer,
+  requestTerminalSubmitDiagnosticSnapshot,
   setActiveWorkspaceFileDrag,
   setWorkspaceThreadComposerDraft,
   waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
@@ -56,7 +59,9 @@ import {
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
-const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [2800];
+const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
+const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
+const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   originScaleX: 1,
   originScaleY: 1,
@@ -574,6 +579,24 @@ const TodoQueueItemCard = styled.article`
     cursor: grabbing;
   }
 
+  &[data-todo-pending="true"] {
+    cursor: progress;
+    opacity: 0.74;
+  }
+
+  &[data-todo-pending="true"]::before {
+    content: "";
+  }
+
+  &[data-todo-pending="true"]:active {
+    cursor: progress;
+  }
+
+  &[data-todo-pending="true"] [data-todo-delete="true"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+
   &[data-todo-dragging="true"] {
     opacity: 0.42;
     transform: scale(0.985);
@@ -594,6 +617,41 @@ const TodoQueueItemCard = styled.article`
     opacity: 1;
     pointer-events: auto;
     transform: translateY(0);
+  }
+`;
+
+const todoQueuePendingSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
+const TodoQueueItemPendingSpinner = styled.div`
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  z-index: 2;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+
+  animation: ${todoQueuePendingSpin} 850ms linear infinite;
+
+  span {
+    position: absolute;
+    top: 1px;
+    left: 7px;
+    width: 2px;
+    height: 5px;
+    border-radius: 999px;
+    background: #8bb8ff;
+    opacity: calc(0.26 + (var(--todo-spinner-index, 0) * 0.085));
+    transform: rotate(calc(var(--todo-spinner-index, 0) * 45deg)) translateY(-1px);
+    transform-origin: 1px 7px;
+  }
+
+  html[data-forge-theme="light"] & span {
+    background: #0066cc;
   }
 `;
 
@@ -1269,6 +1327,14 @@ function getTodoQueueNoteFromPastedText(value) {
     : null;
 }
 
+function normalizeTodoTerminalPromptPart(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function normalizeTodoQueueImage(value) {
   const image = typeof value === "string"
     ? { src: value }
@@ -1506,13 +1572,13 @@ async function prepareTodoTerminalText(item) {
       const lineCount = Number(savedNote?.lineCount || note.lineCount || getTodoQueueLineCount(note.text));
       const label = getTodoQueuePastedLinesLabel(lineCount);
 
-      parts.push(savedPath ? `${label} -> ${savedPath}` : `${label}\n${note.text}`);
+      parts.push(savedPath ? `${label} -> ${savedPath}` : `${label}: ${note.text}`);
     } catch {
-      parts.push(`${getTodoQueuePastedLinesLabel(note.lineCount || getTodoQueueLineCount(note.text))}\n${note.text}`);
+      parts.push(`${getTodoQueuePastedLinesLabel(note.lineCount || getTodoQueueLineCount(note.text))}: ${note.text}`);
     }
   }
 
-  return parts.filter(Boolean).join("\n\n");
+  return parts.map(normalizeTodoTerminalPromptPart).filter(Boolean).join(" ");
 }
 
 function getTodoClipboardFileSignature(file) {
@@ -1663,6 +1729,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onReorderItem,
   onSubmitDraft,
   onUpdateItem,
+  pendingItems = {},
   rootDirectory = "",
   workspace,
   workspaceError = "",
@@ -1756,14 +1823,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   const beginItemEdit = useCallback((item) => {
     const text = normalizeTodoQueueText(item?.text);
-    if (!item?.id) {
+    if (!item?.id || pendingItems[item.id]) {
       return;
     }
 
     setEditingItemId(item.id);
     setEditingDraft(text);
     skipEditBlurCommitRef.current = false;
-  }, []);
+  }, [pendingItems]);
 
   const clearItemEdit = useCallback(() => {
     setEditingItemId("");
@@ -1836,8 +1903,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       event.button !== 0
       || event.detail > 1
       || editingItemId === item?.id
+      || pendingItems[item?.id]
       || event.target?.closest?.("[data-todo-control='true']")
     ) {
+      if (pendingItems[item?.id]) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
       return;
     }
 
@@ -1875,7 +1947,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       sourceRect,
       workspaceId,
     });
-  }, [editingItemId, onBeginTodoDrag, workspaceId]);
+  }, [editingItemId, onBeginTodoDrag, pendingItems, workspaceId]);
 
   useEffect(() => {
     if (!editingItemId) {
@@ -2061,6 +2133,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                     <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
                       {items.map((item) => {
                         const isEditing = editingItemId === item.id;
+                        const pendingItem = pendingItems[item.id] || null;
+                        const isPending = Boolean(pendingItem);
                         const image = getTodoQueueItemImage(item);
                         const note = getTodoQueueItemNote(item);
                         const hasPreview = Boolean(image || note);
@@ -2070,18 +2144,33 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             data-todo-card="true"
                             data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
                             data-todo-editing={isEditing ? "true" : undefined}
+                            data-todo-pending={isPending ? "true" : undefined}
                             data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
                             key={item.id}
                             onDoubleClick={(event) => {
                               event.preventDefault();
                               event.stopPropagation();
+                              if (isPending) {
+                                return;
+                              }
                               beginItemEdit(item);
                             }}
                             onPointerDown={(event) => handlePointerDown(event, item)}
                             ref={(element) => setTodoItemElement(item.id, element)}
                             role="listitem"
-                            title="Drag into an agent terminal. Double-click to edit."
+                            title={isPending ? "Sending to terminal." : "Drag into an agent terminal. Double-click to edit."}
                           >
+                            {isPending && (
+                              <TodoQueueItemPendingSpinner aria-label="Sending todo" role="img">
+                                {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
+                                  <span
+                                    aria-hidden="true"
+                                    key={spoke}
+                                    style={{ "--todo-spinner-index": spoke }}
+                                  />
+                                ))}
+                              </TodoQueueItemPendingSpinner>
+                            )}
                             <TodoQueueItemContent data-has-preview={hasPreview ? "true" : "false"}>
                               {image && (
                                 <TodoQueueItemImageFrame>
@@ -2094,7 +2183,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   <TodoQueueItemNoteIcon aria-hidden="true" />
                                 </TodoQueueItemNoteFrame>
                               )}
-                              {isEditing ? (
+                              {isEditing && !isPending ? (
                                 <TodoQueueItemEditor
                                   aria-label="Edit todo"
                                   data-todo-control="true"
@@ -2110,7 +2199,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                 <TodoQueueItemText>{item.text}</TodoQueueItemText>
                               )}
                             </TodoQueueItemContent>
-                            {!isEditing && (
+                            {!isEditing && !isPending && (
                               <TodoQueueDeleteButton
                                 aria-label="Delete todo"
                                 data-todo-control="true"
@@ -2215,6 +2304,7 @@ function TerminalView({
   const workspaceFileDragActive = Boolean(workspaceFileDragState);
   const [todoQueueDraft, setTodoQueueDraft] = useState("");
   const [todoQueueItems, setTodoQueueItems] = useState([]);
+  const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const fullscreenTransitionTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
@@ -2224,6 +2314,8 @@ function TerminalView({
   const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
   const todoDragStateRef = useRef(null);
+  const todoQueuePendingItemsRef = useRef({});
+  const todoQueuePendingTimersRef = useRef(new Map());
   const workspaceFileDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
   const todoQueueStorageKey = useMemo(
@@ -2652,6 +2744,122 @@ function TerminalView({
     });
   }, [terminalWorkspace?.id]);
 
+  const replaceTodoQueuePendingItems = useCallback((nextPendingItems) => {
+    const normalizedPendingItems = nextPendingItems && typeof nextPendingItems === "object"
+      ? nextPendingItems
+      : {};
+    todoQueuePendingItemsRef.current = normalizedPendingItems;
+    setTodoQueuePendingItems(normalizedPendingItems);
+  }, []);
+
+  const clearTodoQueueItemPending = useCallback((itemId, reason = "unspecified", fields = {}) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+
+    const timeoutId = todoQueuePendingTimersRef.current.get(safeItemId);
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      todoQueuePendingTimersRef.current.delete(safeItemId);
+    }
+
+    const pendingItem = todoQueuePendingItemsRef.current[safeItemId];
+    if (!pendingItem) {
+      return;
+    }
+
+    logBigViewSyncDiagnosticEvent("tui.text.todo_pending_clear", {
+      elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
+      itemId: safeItemId,
+      reason,
+      surface: "tui_todo_queue",
+      targetRole: pendingItem.targetRole || "",
+      targetTerminalIndex: pendingItem.targetTerminalIndex ?? "",
+      timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
+      ...fields,
+    });
+    const nextPendingItems = { ...todoQueuePendingItemsRef.current };
+    delete nextPendingItems[safeItemId];
+    replaceTodoQueuePendingItems(nextPendingItems);
+  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
+
+  const setTodoQueueItemPending = useCallback((itemId, fields = {}) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+
+    const existingTimeoutId = todoQueuePendingTimersRef.current.get(safeItemId);
+    if (existingTimeoutId) {
+      window.clearTimeout(existingTimeoutId);
+      todoQueuePendingTimersRef.current.delete(safeItemId);
+    }
+
+    const startedAtMs = Date.now();
+    const pendingItem = {
+      itemId: safeItemId,
+      startedAtMs,
+      targetRole: String(fields.targetRole || ""),
+      targetTerminalIndex: fields.targetTerminalIndex ?? "",
+      timeoutAtMs: startedAtMs + TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      workspaceId: String(fields.workspaceId || terminalWorkspace?.id || ""),
+    };
+    const timeoutId = window.setTimeout(() => {
+      const currentPendingItem = todoQueuePendingItemsRef.current[safeItemId];
+      if (!currentPendingItem || Number(currentPendingItem.startedAtMs) !== startedAtMs) {
+        return;
+      }
+
+      logBigViewSyncDiagnosticEvent("tui.text.todo_pending_timeout", {
+        elapsedMs: Date.now() - startedAtMs,
+        itemId: safeItemId,
+        surface: "tui_todo_queue",
+        targetRole: pendingItem.targetRole,
+        targetTerminalIndex: pendingItem.targetTerminalIndex,
+        timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+        workspaceId: pendingItem.workspaceId,
+        ...fields,
+      });
+      todoQueuePendingTimersRef.current.delete(safeItemId);
+      const nextPendingItems = { ...todoQueuePendingItemsRef.current };
+      delete nextPendingItems[safeItemId];
+      replaceTodoQueuePendingItems(nextPendingItems);
+    }, TODO_QUEUE_CONSUME_TIMEOUT_MS);
+
+    todoQueuePendingTimersRef.current.set(safeItemId, timeoutId);
+    logBigViewSyncDiagnosticEvent("tui.text.todo_pending_start", {
+      itemId: safeItemId,
+      surface: "tui_todo_queue",
+      targetRole: pendingItem.targetRole,
+      targetTerminalIndex: pendingItem.targetTerminalIndex,
+      timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      workspaceId: pendingItem.workspaceId,
+      ...fields,
+    });
+    replaceTodoQueuePendingItems({
+      ...todoQueuePendingItemsRef.current,
+      [safeItemId]: pendingItem,
+    });
+  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
+
+  useEffect(() => () => {
+    todoQueuePendingTimersRef.current.forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    todoQueuePendingTimersRef.current.clear();
+    todoQueuePendingItemsRef.current = {};
+  }, []);
+
+  useEffect(() => {
+    todoQueuePendingTimersRef.current.forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    todoQueuePendingTimersRef.current.clear();
+    replaceTodoQueuePendingItems({});
+  }, [replaceTodoQueuePendingItems, todoQueueStorageKey]);
+
   const submitTodoQueueDraft = useCallback((options = {}) => {
     const text = normalizeTodoQueueText(todoQueueDraft);
     const images = dedupeTodoQueueImages(Array.isArray(options.images) ? options.images : [options.image]);
@@ -2688,10 +2896,11 @@ function TerminalView({
   }, [todoQueueDraft, updateTodoQueueItems]);
 
   const removeTodoQueueItem = useCallback((itemId) => {
+    clearTodoQueueItemPending(itemId, "removed");
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
     ));
-  }, [updateTodoQueueItems]);
+  }, [clearTodoQueueItemPending, updateTodoQueueItems]);
 
   const reorderTodoQueueItem = useCallback((itemId, targetIndex) => {
     updateTodoQueueItems((currentItems) => {
@@ -2952,6 +3161,15 @@ function TerminalView({
         return;
       }
 
+      if (currentDrag.itemId) {
+        setTodoQueueItemPending(currentDrag.itemId, {
+          item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+          paneId,
+          targetRole,
+          targetTerminalIndex: targetTerminalIndex ?? "",
+          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+        });
+      }
       setActiveTerminalPaneId(paneId);
       window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
         detail: {
@@ -3093,11 +3311,30 @@ function TerminalView({
 
           const promptId = createThreadProjectionToken("todo-drop-prompt");
           const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
+          const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
+            requestTerminalSubmitDiagnosticSnapshot({
+              agentId: targetRole,
+              delayMs,
+              expectedPrompt: terminalText,
+              expectedPromptLength: terminalText.length,
+              paneId,
+              promptId,
+              reason,
+              syncKey,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              threadId: targetThread.id,
+              workspaceId,
+              ...extraFields,
+            });
+          };
           logBigViewSyncDiagnosticEvent("tui.text.drop_sync_start", {
             agentId: targetRole,
             paneId,
             previousDraftLength: previousDraft.length,
             promptId,
+            syncData: getTerminalInputDebugFields(syncData),
+            syncDataHasForceReplace: syncData.includes("\x15"),
+            syncDataHasShiftEnter: syncData.includes(TERMINAL_SHIFT_ENTER_SEQUENCE),
             syncDataLength: syncData.length,
             syncKey,
             surface: "tui_terminal_grid",
@@ -3106,6 +3343,7 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
+          const syncWriteStartedAt = performance.now();
           if (syncData) {
             await invoke("terminal_write", {
               data: syncData,
@@ -3114,16 +3352,23 @@ function TerminalView({
               threadId: targetThread.id,
             });
           }
+          const syncWriteDurationMs = Math.round(performance.now() - syncWriteStartedAt);
           logBigViewSyncDiagnosticEvent("tui.text.drop_sync_done", {
             agentId: targetRole,
             paneId,
             promptId,
+            syncDataLength: syncData.length,
             syncKey,
+            syncWriteDurationMs,
             surface: "tui_terminal_grid",
             targetTerminalIndex: targetTerminalIndex ?? "",
             threadId: targetThread.id,
             workspaceId,
           });
+          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter");
+          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_80ms", 80);
+          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_300ms", 300);
+          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_900ms", 900);
           const submittedWaiter = await createTerminalPromptSubmittedWaiter({
             agentId: targetRole,
             expectedPrompt: terminalText,
@@ -3138,6 +3383,7 @@ function TerminalView({
             expectedPrompt: terminalText,
             promptId,
             threadId: targetThread.id,
+            timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
             workspaceId,
           });
           try {
@@ -3160,6 +3406,18 @@ function TerminalView({
               promptEventId: promptId,
               promptEventText: terminalText,
               threadId: targetThread.id,
+            });
+            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
+              submitSequenceLength: terminalSubmitSequence.length,
+            });
+            requestDropSubmitSnapshot("tui.text.drop_after_enter_write", 160, {
+              submitSequenceLength: terminalSubmitSequence.length,
+            });
+            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_500ms", 500, {
+              submitSequenceLength: terminalSubmitSequence.length,
+            });
+            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
+              submitSequenceLength: terminalSubmitSequence.length,
             });
             await submittedWaiter.promise;
             logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
@@ -3220,6 +3478,18 @@ function TerminalView({
           } catch (submitError) {
             submittedWaiter.cancel();
             acceptedWaiter.cancel();
+            requestTerminalSubmitDiagnosticSnapshot({
+              agentId: targetRole,
+              expectedPrompt: terminalText,
+              expectedPromptLength: terminalText.length,
+              paneId,
+              promptId,
+              reason: "tui.text.drop_submit_confirm_error_snapshot",
+              syncKey,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              threadId: targetThread.id,
+              workspaceId,
+            });
             logBigViewSyncDiagnosticEvent("tui.text.drop_submit_confirm_error", {
               agentId: targetRole,
               message: submitError?.message || String(submitError || ""),
@@ -3274,6 +3544,7 @@ function TerminalView({
               source: "tui-todo-drop",
               status: "active",
               terminalIndex: targetTerminalIndex,
+              expectedUserMessage: dropResult?.terminalText || "",
               threadId: targetThread.id,
               type: "message-submitted",
               userMessage: threadMessageText,
@@ -3339,12 +3610,25 @@ function TerminalView({
           });
           setTodoDropError("");
           if (currentDrag.itemId) {
+            clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
+              promptId: dropResult?.promptId || "",
+              submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+            });
             updateTodoQueueItems((currentItems) => (
               currentItems.filter((item) => item.id !== currentDrag.itemId)
             ));
           }
         })
         .catch((error) => {
+          if (currentDrag.itemId) {
+            clearTodoQueueItemPending(currentDrag.itemId, "error", {
+              message: error?.message || String(error || ""),
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+            });
+          }
           setTodoDropError(getTodoDropErrorMessage(error));
           logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
             hasImage: Boolean(image),
@@ -3408,6 +3692,7 @@ function TerminalView({
       window.removeEventListener("pointercancel", handlePointerCancel);
     };
   }, [
+    clearTodoQueueItemPending,
     fullscreenActive,
     fullscreenTerminalIndex,
     getTerminalImageInputSupport,
@@ -3415,6 +3700,7 @@ function TerminalView({
     getTerminalPaneId,
     getTerminalThread,
     logicalTerminalIndexes,
+    setTodoQueueItemPending,
     terminalWorkspace?.id,
     todoDragActive,
     updateTodoQueueItems,
@@ -3829,6 +4115,9 @@ function TerminalView({
     hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
   );
+  const todoDragOverDropTarget = Boolean(
+    todoDragActive && Number.isInteger(todoDragState?.targetTerminalIndex),
+  );
   const todoDragImage = getTodoQueueItemImage(todoDragState);
   const todoDragNote = getTodoQueueItemNote(todoDragState);
   const todoDragHasPreview = Boolean(todoDragImage || todoDragNote);
@@ -3837,7 +4126,7 @@ function TerminalView({
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
       data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
       data-terminal-fullscreen-state={fullscreenState}
-      data-todo-dragging={todoDragActive ? "true" : "false"}
+      data-todo-dragging={todoDragOverDropTarget ? "true" : "false"}
       ref={terminalPanelsRef}
       style={fullscreenMotionStyle}
     >
@@ -4069,6 +4358,7 @@ function TerminalView({
                         onReorderItem={reorderTodoQueueItem}
                         onSubmitDraft={submitTodoQueueDraft}
                         onUpdateItem={updateTodoQueueItemText}
+                        pendingItems={todoQueuePendingItems}
                         rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
                         workspace={terminalWorkspace}
                         workspaceError={workspaceError}
