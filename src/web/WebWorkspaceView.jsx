@@ -558,6 +558,10 @@ const WebWorkspaceSurface = styled.section`
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
   background: #05070a;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 `;
 
 const WebToolbar = styled.header`
@@ -570,6 +574,13 @@ const WebToolbar = styled.header`
   border-bottom: 1px solid rgba(142, 153, 171, 0.14);
   background: #06090e;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: var(--forge-border);
+    background: rgba(245, 245, 247, 0.86);
+    box-shadow: none;
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 const WebAddressForm = styled.form`
@@ -612,6 +623,26 @@ const WebAddressInput = styled.input`
     border-color: rgba(239, 107, 107, 0.46);
     color: #ffc8c8;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    border-radius: 999px;
+    color: var(--forge-text);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-state="error"] {
+    color: var(--forge-red);
+  }
 `;
 
 const WebIconButton = styled.button`
@@ -641,6 +672,18 @@ const WebIconButton = styled.button`
     background: rgba(37, 99, 235, 0.28);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-soft);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: var(--forge-surface);
+  }
+
   &:disabled {
     cursor: default;
     opacity: 0.48;
@@ -653,6 +696,10 @@ const WebViewportShell = styled.div`
   min-height: 0;
   overflow: hidden;
   background: #0b0f14;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 `;
 
 const WebNativeViewport = styled.div`
@@ -685,6 +732,15 @@ const WebViewportOverlay = styled.div`
     width: 42px;
     height: 42px;
     color: #718097;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+    background: var(--forge-bg);
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: #a1a1a6;
   }
 
   &[data-visible="true"] {

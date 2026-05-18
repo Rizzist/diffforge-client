@@ -353,6 +353,8 @@ import {
   SettingsHint,
   SettingsIdentityGrid,
   SettingsIdentityItem,
+  AppearanceThemeGrid,
+  AppearanceThemeButton,
   LoginCard,
   LoginPanel,
   SessionPanel,
@@ -379,7 +381,9 @@ import {
   ButtonLoginIcon,
   ButtonBrowserIcon,
   ButtonCloseIcon,
+  ButtonDarkModeIcon,
   ButtonFolderIcon,
+  ButtonLightModeIcon,
   ButtonLogoutIcon,
   ButtonSettingsIcon,
   ButtonForgeIcon,
@@ -444,6 +448,28 @@ const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
+const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
+const APP_THEME_DARK = "dark";
+const APP_THEME_LIGHT = "light";
+const APP_THEME_DEFAULT = APP_THEME_DARK;
+const APP_THEME_META_COLORS = {
+  [APP_THEME_DARK]: "#030508",
+  [APP_THEME_LIGHT]: "#f5f5f7",
+};
+const APP_THEME_OPTIONS = [
+  {
+    detail: "Current preset",
+    icon: "dark",
+    id: APP_THEME_DARK,
+    label: "Dark",
+  },
+  {
+    detail: "Bright preset",
+    icon: "light",
+    id: APP_THEME_LIGHT,
+    label: "Light",
+  },
+];
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
@@ -1815,6 +1841,66 @@ function persistWorkspaceRailCollapsed(collapsed) {
   }
 }
 
+function normalizeAppTheme(value) {
+  const theme = String(value || "").trim().toLowerCase();
+  return theme === APP_THEME_LIGHT ? APP_THEME_LIGHT : APP_THEME_DEFAULT;
+}
+
+function normalizeAppAppearanceSettings(value) {
+  if (typeof value === "string") {
+    return { theme: normalizeAppTheme(value) };
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { theme: APP_THEME_DEFAULT };
+  }
+
+  return {
+    theme: normalizeAppTheme(value.theme),
+  };
+}
+
+function readAppAppearanceSettings() {
+  try {
+    const rawSettings = window.localStorage.getItem(APP_APPEARANCE_STORAGE_KEY);
+    if (!rawSettings) {
+      return { theme: APP_THEME_DEFAULT };
+    }
+
+    return normalizeAppAppearanceSettings(JSON.parse(rawSettings));
+  } catch {
+    return { theme: APP_THEME_DEFAULT };
+  }
+}
+
+function persistAppAppearanceSettings(settings) {
+  try {
+    window.localStorage.setItem(
+      APP_APPEARANCE_STORAGE_KEY,
+      JSON.stringify(normalizeAppAppearanceSettings(settings)),
+    );
+  } catch {
+    // Appearance preferences are cosmetic; the dark default remains usable without persistence.
+  }
+}
+
+function applyForgeThemePreference(theme) {
+  if (typeof document === "undefined") {
+    return normalizeAppTheme(theme);
+  }
+
+  const normalizedTheme = normalizeAppTheme(theme);
+  document.documentElement.dataset.forgeTheme = normalizedTheme;
+  if (document.body) {
+    document.body.dataset.forgeTheme = normalizedTheme;
+  }
+
+  const themeColor = APP_THEME_META_COLORS[normalizedTheme] || APP_THEME_META_COLORS[APP_THEME_DEFAULT];
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor);
+
+  return normalizedTheme;
+}
+
 function findWorkspaceById(workspaces, workspaceId) {
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
 }
@@ -2132,6 +2218,7 @@ export default function App() {
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
+  const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState({});
   const [workspaceTerminalDisplayLayouts, setWorkspaceTerminalDisplayLayouts] = useState({});
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState("");
@@ -2418,6 +2505,10 @@ export default function App() {
   useEffect(() => {
     workspaceLifecycleSettingsRef.current = workspaceLifecycleSettings;
   }, [workspaceLifecycleSettings]);
+
+  useEffect(() => {
+    applyForgeThemePreference(appAppearanceSettings.theme);
+  }, [appAppearanceSettings.theme]);
 
   useEffect(() => {
     if (!agentStatusCacheHitRef.current) {
@@ -2744,6 +2835,21 @@ export default function App() {
 
     updateWorkspaceLifecycleSettings({ defaultWorkspaceId: nextDefaultWorkspaceId });
   }, [updateWorkspaceLifecycleSettings, workspaces]);
+
+  const updateAppTheme = useCallback((theme) => {
+    const nextTheme = normalizeAppTheme(theme);
+
+    setAppAppearanceSettings((settings) => {
+      const nextSettings = normalizeAppAppearanceSettings({
+        ...settings,
+        theme: nextTheme,
+      });
+
+      persistAppAppearanceSettings(nextSettings);
+      applyForgeThemePreference(nextSettings.theme);
+      return nextSettings;
+    });
+  }, []);
 
   const activateWorkspace = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
@@ -5444,6 +5550,7 @@ export default function App() {
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
+  const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const isWorkspaceSettingsDeactivating = Boolean(
     workspaceDeactivationState.isActive
@@ -7584,6 +7691,55 @@ export default function App() {
                       <span>Back</span>
                     </SecondaryButton>
                   </PageHeader>
+
+                  <AccountSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Appearance</PanelKicker>
+                        <PanelHeading>Theme preset</PanelHeading>
+                      </div>
+                      <AgentReadyPill data-tone="blue">
+                        {activeAppTheme === APP_THEME_LIGHT ? (
+                          <ButtonLightModeIcon aria-hidden="true" />
+                        ) : (
+                          <ButtonDarkModeIcon aria-hidden="true" />
+                        )}
+                        <span>{activeAppTheme === APP_THEME_LIGHT ? "Light" : "Dark"}</span>
+                      </AgentReadyPill>
+                    </PanelHeaderRow>
+
+                    <AccountCard data-tone="blue">
+                      <AppearanceThemeGrid aria-label="App theme" role="radiogroup">
+                        {APP_THEME_OPTIONS.map((option) => {
+                          const selected = activeAppTheme === option.id;
+
+                          return (
+                            <AppearanceThemeButton
+                              aria-checked={selected}
+                              aria-label={`${option.label} theme`}
+                              data-selected={selected ? "true" : undefined}
+                              key={option.id}
+                              onClick={() => updateAppTheme(option.id)}
+                              role="radio"
+                              type="button"
+                            >
+                              <span aria-hidden="true">
+                                {option.icon === "light" ? (
+                                  <ButtonLightModeIcon />
+                                ) : (
+                                  <ButtonDarkModeIcon />
+                                )}
+                              </span>
+                              <div>
+                                <strong>{option.label}</strong>
+                                <small>{option.detail}</small>
+                              </div>
+                            </AppearanceThemeButton>
+                          );
+                        })}
+                      </AppearanceThemeGrid>
+                    </AccountCard>
+                  </AccountSettingsPanel>
 
                   <AgentSettingsPanel>
                     <PanelHeaderRow>

@@ -1,3 +1,8 @@
+use notify::{
+    Config as NotifyConfig, Event as NotifyEvent, EventKind as NotifyEventKind,
+    RecommendedWatcher, RecursiveMode, Watcher,
+};
+
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 3;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
@@ -5,11 +10,15 @@ const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
+const CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT: &str = "cloud-mcp-knowledge-graph-cache";
 const CLOUD_MCP_SPEC_GRAPH_SYNC_INTERVAL_MS: u64 = 1_500;
 const CLOUD_MCP_SPEC_GRAPH_ERROR_INTERVAL_MS: u64 = 4_000;
+const CLOUD_MCP_KNOWLEDGE_GRAPH_DEBOUNCE_MS: u64 = 650;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE: &str = "local-ignored-whitelist.json";
+const CLOUD_MCP_KNOWLEDGE_NOTE_LIMIT: usize = 300;
+const CLOUD_MCP_KNOWLEDGE_MAX_NOTE_BYTES: u64 = 384 * 1024;
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -17,6 +26,14 @@ struct CloudMcpState {
     client: reqwest::Client,
     spec_graph_syncs: Arc<Mutex<HashMap<String, u64>>>,
     spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
+    knowledge_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpKnowledgeGraphSyncRuntime>>>,
+}
+
+#[derive(Clone)]
+struct CloudMcpKnowledgeGraphSyncRuntime {
+    generation: u64,
+    stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 struct CloudMcpRuntime {
@@ -85,6 +102,31 @@ struct CloudMcpFileEntry {
     references: Vec<String>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CloudMcpKnowledgePathRef {
+    path: String,
+    kind: String,
+    exists: bool,
+    size: Option<u64>,
+    modified_ms: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CloudMcpKnowledgeNote {
+    id: String,
+    note_path: String,
+    node_type: String,
+    title: String,
+    summary: String,
+    markdown: String,
+    path_refs: Vec<CloudMcpKnowledgePathRef>,
+    outbound_links: Vec<Value>,
+    source: String,
+    metadata: Value,
+}
+
 struct CloudMcpPreparedWorkspace {
     root: PathBuf,
     root_display: String,
@@ -127,6 +169,7 @@ impl CloudMcpState {
             client,
             spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
             spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
+            knowledge_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -3469,6 +3512,1167 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
     Ok(overlay)
 }
 
+fn cloud_mcp_knowledge_dir(root: &Path) -> PathBuf {
+    root.join(".agents").join("knowledge")
+}
+
+fn cloud_mcp_knowledge_cache_dir(root: &Path) -> PathBuf {
+    cloud_mcp_knowledge_dir(root).join(".cache")
+}
+
+fn cloud_mcp_knowledge_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
+    cloud_mcp_knowledge_cache_dir(root).join(format!("{repo_id}.json"))
+}
+
+fn cloud_mcp_knowledge_note_id(repo_id: &str, note_path: &str) -> String {
+    format!(
+        "knowledge-{}",
+        cloud_mcp_short_hash(&format!("{repo_id}:{note_path}"))
+    )
+}
+
+fn cloud_mcp_knowledge_edge_id(repo_id: &str, from: &str, to: &str, kind: &str) -> String {
+    format!(
+        "knowledge-edge-{}",
+        cloud_mcp_short_hash(&format!("{repo_id}:{from}:{to}:{kind}"))
+    )
+}
+
+fn cloud_mcp_normalize_knowledge_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_string_lossy();
+                if value.is_empty() {
+                    continue;
+                }
+                parts.push(value.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            _ => return None,
+        }
+    }
+    let normalized = parts.join("/");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn cloud_mcp_collect_knowledge_note_paths(root: &Path) -> Vec<PathBuf> {
+    let knowledge_dir = cloud_mcp_knowledge_dir(root);
+    let mut queue = VecDeque::new();
+    let mut notes = Vec::new();
+    queue.push_back(knowledge_dir.clone());
+    while let Some(dir) = queue.pop_front() {
+        if notes.len() >= CLOUD_MCP_KNOWLEDGE_NOTE_LIMIT {
+            break;
+        }
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            if notes.len() >= CLOUD_MCP_KNOWLEDGE_NOTE_LIMIT {
+                break;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name == ".cache" || file_name.starts_with('.') && file_name != ".keep" {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                queue.push_back(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                notes.push(path);
+            }
+        }
+    }
+    notes.sort();
+    notes
+}
+
+fn cloud_mcp_default_knowledge_index(root: &Path) -> String {
+    let repo_name = cloud_mcp_repo_display_name(root);
+    let mut important_paths = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|read_dir| read_dir.flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if cloud_mcp_skip_filetree_name(&name) || name == ".agents" {
+                return None;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return None;
+            };
+            if file_type.is_dir() || file_type.is_file() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    important_paths.sort();
+    important_paths.truncate(12);
+    let path_lines = if important_paths.is_empty() {
+        "- Add important folders or files here as this atlas learns the project.".to_string()
+    } else {
+        important_paths
+            .into_iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# {repo_name} Knowledge Atlas\n\n\
+Purpose: terse project map for coding agents and humans.\n\n\
+## Important Paths\n{path_lines}\n\n\
+## Areas\n- Split this note into focused area, system, flow, or data notes when any section grows too large.\n\n\
+## Watch Points\n- Keep notes abstract, coding-related, and grounded in real repo paths.\n"
+    )
+}
+
+fn cloud_mcp_ensure_knowledge_atlas(root: &Path) -> Result<(), String> {
+    let knowledge_dir = cloud_mcp_knowledge_dir(root);
+    fs::create_dir_all(&knowledge_dir).map_err(|error| {
+        format!(
+            "Unable to create knowledge atlas directory {}: {error}",
+            workspace_path_display(&knowledge_dir)
+        )
+    })?;
+    if cloud_mcp_collect_knowledge_note_paths(root).is_empty() {
+        let index_path = knowledge_dir.join("index.md");
+        fs::write(&index_path, cloud_mcp_default_knowledge_index(root)).map_err(|error| {
+            format!(
+                "Unable to create starter knowledge atlas {}: {error}",
+                workspace_path_display(&index_path)
+            )
+        })?;
+    }
+    fs::create_dir_all(cloud_mcp_knowledge_cache_dir(root)).map_err(|error| {
+        format!(
+            "Unable to create knowledge graph cache directory {}: {error}",
+            workspace_path_display(&cloud_mcp_knowledge_cache_dir(root))
+        )
+    })?;
+    Ok(())
+}
+
+fn cloud_mcp_markdown_title(markdown: &str, note_path: &str) -> String {
+    markdown
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            note_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(note_path)
+                .trim_end_matches(".md")
+                .replace(['-', '_'], " ")
+        })
+}
+
+fn cloud_mcp_markdown_summary(markdown: &str) -> String {
+    markdown
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .next()
+        .unwrap_or("Markdown knowledge note.")
+        .trim_start_matches("- ")
+        .chars()
+        .take(220)
+        .collect()
+}
+
+fn cloud_mcp_knowledge_node_type(note_path: &str) -> String {
+    let lower = note_path.to_ascii_lowercase();
+    let node_type = if lower == "index.md" || lower.ends_with("/index.md") {
+        "knowledge_root"
+    } else if lower.starts_with("flows/") || lower.contains("/flows/") {
+        "knowledge_flow"
+    } else if lower.starts_with("areas/") || lower.contains("/areas/") {
+        "knowledge_area"
+    } else if lower.starts_with("systems/") || lower.contains("/systems/") {
+        "knowledge_system"
+    } else if lower.starts_with("data/") || lower.contains("/data/") || lower.contains("database") {
+        "knowledge_data"
+    } else {
+        "knowledge_note"
+    };
+    node_type.to_string()
+}
+
+fn cloud_mcp_markdown_link_targets(markdown: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let bytes = markdown.as_bytes();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b']' && bytes[index + 1] == b'(' {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b')' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                if let Some(target) = markdown.get(start..end) {
+                    targets.push(target.trim().to_string());
+                }
+            }
+            index = end.saturating_add(1);
+        } else if bytes[index] == b'[' && bytes[index + 1] == b'[' {
+            let start = index + 2;
+            let mut end = start;
+            while end + 1 < bytes.len() && !(bytes[end] == b']' && bytes[end + 1] == b']') {
+                end += 1;
+            }
+            if end + 1 < bytes.len() {
+                if let Some(target) = markdown.get(start..end) {
+                    targets.push(target.trim().to_string());
+                }
+            }
+            index = end.saturating_add(2);
+        } else {
+            index += 1;
+        }
+    }
+    targets
+        .into_iter()
+        .map(|target| target.split(['#', '?']).next().unwrap_or("").trim().to_string())
+        .filter(|target| !target.is_empty())
+        .filter(|target| {
+            let lower = target.to_ascii_lowercase();
+            !lower.starts_with("http://")
+                && !lower.starts_with("https://")
+                && !lower.starts_with("mailto:")
+        })
+        .collect()
+}
+
+fn cloud_mcp_markdown_code_spans(markdown: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    let bytes = markdown.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b'`' {
+            end += 1;
+        }
+        if end < bytes.len() {
+            if let Some(span) = markdown.get(start..end) {
+                spans.push(span.trim().to_string());
+            }
+        }
+        index = end.saturating_add(1);
+    }
+    spans
+}
+
+fn cloud_mcp_resolve_knowledge_note_link(current_note: &str, target: &str) -> Option<String> {
+    if target.is_empty() || target.starts_with('#') {
+        return None;
+    }
+    let target = target.trim().trim_matches('/');
+    let target = if target.ends_with(".md") {
+        target.to_string()
+    } else {
+        format!("{target}.md")
+    };
+    let base = Path::new(current_note)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let joined = if target.starts_with('/') {
+        PathBuf::from(target.trim_start_matches('/'))
+    } else {
+        base.join(target)
+    };
+    cloud_mcp_normalize_knowledge_relative_path(&joined)
+}
+
+fn cloud_mcp_knowledge_path_ref_candidate(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .replace('\\', "/");
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("mailto:")
+        || value.starts_with("data:")
+        || value.starts_with("javascript:")
+    {
+        return None;
+    }
+    if value.ends_with(".md") && !value.contains('/') {
+        return None;
+    }
+    let looks_like_path = value.contains('/')
+        || value.starts_with("./")
+        || value.starts_with(".agents/")
+        || value.contains('.')
+            && !value.contains(' ')
+            && value
+                .rsplit('.')
+                .next()
+                .is_some_and(|ext| (1..=8).contains(&ext.len()));
+    if !looks_like_path {
+        return None;
+    }
+    cloud_mcp_normalized_git_path(value.trim_start_matches("./").as_bytes())
+}
+
+fn cloud_mcp_collect_knowledge_path_refs(
+    root: &Path,
+    markdown: &str,
+    note_links: &HashSet<String>,
+) -> Vec<CloudMcpKnowledgePathRef> {
+    let mut candidates = Vec::new();
+    for target in cloud_mcp_markdown_link_targets(markdown) {
+        if let Some(candidate) = cloud_mcp_knowledge_path_ref_candidate(&target) {
+            candidates.push(candidate);
+        }
+    }
+    for span in cloud_mcp_markdown_code_spans(markdown) {
+        if let Some(candidate) = cloud_mcp_knowledge_path_ref_candidate(&span) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|candidate| !note_links.contains(candidate))
+        .take(120)
+        .map(|path| {
+            let absolute = root.join(&path);
+            let metadata = fs::metadata(&absolute).ok();
+            let exists = metadata.is_some();
+            let kind = metadata
+                .as_ref()
+                .map(|metadata| {
+                    if metadata.is_dir() {
+                        "folder"
+                    } else if metadata.is_file() {
+                        "file"
+                    } else {
+                        "path"
+                    }
+                })
+                .unwrap_or("missing")
+                .to_string();
+            let size = metadata.as_ref().filter(|metadata| metadata.is_file()).map(fs::Metadata::len);
+            let modified_ms = metadata.as_ref().and_then(cloud_mcp_modified_ms);
+            CloudMcpKnowledgePathRef {
+                path,
+                kind,
+                exists,
+                size,
+                modified_ms,
+            }
+        })
+        .collect()
+}
+
+fn cloud_mcp_read_knowledge_notes(
+    root: &Path,
+    repo_id: &str,
+) -> Result<Vec<CloudMcpKnowledgeNote>, String> {
+    cloud_mcp_ensure_knowledge_atlas(root)?;
+    let knowledge_dir = cloud_mcp_knowledge_dir(root);
+    let note_paths = cloud_mcp_collect_knowledge_note_paths(root);
+    let known_note_paths = note_paths
+        .iter()
+        .filter_map(|path| {
+            path.strip_prefix(&knowledge_dir)
+                .ok()
+                .and_then(cloud_mcp_normalize_knowledge_relative_path)
+        })
+        .collect::<HashSet<_>>();
+    let mut notes = Vec::new();
+    for path in note_paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.len() > CLOUD_MCP_KNOWLEDGE_MAX_NOTE_BYTES {
+            continue;
+        }
+        let Some(note_path) = path
+            .strip_prefix(&knowledge_dir)
+            .ok()
+            .and_then(cloud_mcp_normalize_knowledge_relative_path)
+        else {
+            continue;
+        };
+        let markdown = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Unable to read knowledge note {}: {error}",
+                workspace_path_display(&path)
+            )
+        })?;
+        let note_links = cloud_mcp_markdown_link_targets(&markdown)
+            .into_iter()
+            .filter_map(|target| cloud_mcp_resolve_knowledge_note_link(&note_path, &target))
+            .filter(|target| known_note_paths.contains(target))
+            .collect::<HashSet<_>>();
+        let outbound_links = note_links
+            .iter()
+            .map(|target| {
+                json!({
+                    "target_path": target,
+                    "target_id": cloud_mcp_knowledge_note_id(repo_id, target),
+                    "kind": "links_to",
+                })
+            })
+            .collect::<Vec<_>>();
+        let path_refs = cloud_mcp_collect_knowledge_path_refs(root, &markdown, &note_links);
+        notes.push(CloudMcpKnowledgeNote {
+            id: cloud_mcp_knowledge_note_id(repo_id, &note_path),
+            note_path: note_path.clone(),
+            node_type: cloud_mcp_knowledge_node_type(&note_path),
+            title: cloud_mcp_markdown_title(&markdown, &note_path),
+            summary: cloud_mcp_markdown_summary(&markdown),
+            markdown,
+            path_refs,
+            outbound_links,
+            source: "rust-diffforge-knowledge".to_string(),
+            metadata: json!({
+                "source": "markdown",
+                "atlas_dir": ".agents/knowledge",
+                "note_path": note_path,
+                "modified_ms": cloud_mcp_modified_ms(&metadata),
+            }),
+        });
+    }
+    notes.sort_by(|left, right| {
+        (left.node_type != "knowledge_root")
+            .cmp(&(right.node_type != "knowledge_root"))
+            .then_with(|| left.note_path.cmp(&right.note_path))
+    });
+    Ok(notes)
+}
+
+fn cloud_mcp_build_knowledge_edges(repo_id: &str, notes: &[CloudMcpKnowledgeNote]) -> Vec<Value> {
+    let mut edges = Vec::new();
+    let mut seen = HashSet::new();
+    let note_by_path = notes
+        .iter()
+        .map(|note| (note.note_path.clone(), note.id.clone()))
+        .collect::<HashMap<_, _>>();
+    for note in notes {
+        for link in &note.outbound_links {
+            let Some(target_id) = link.get("target_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let kind = "links_to";
+            let id = cloud_mcp_knowledge_edge_id(repo_id, &note.id, target_id, kind);
+            if seen.insert(id.clone()) {
+                edges.push(json!({
+                    "id": id,
+                    "from_note_id": note.id,
+                    "to_note_id": target_id,
+                    "edge_kind": kind,
+                    "metadata": {
+                        "source": "markdown_link",
+                        "target_path": link.get("target_path").cloned().unwrap_or(Value::Null),
+                    },
+                }));
+            }
+        }
+    }
+    let root_id = note_by_path.get("index.md").cloned();
+    for note in notes {
+        if note.note_path == "index.md" {
+            continue;
+        }
+        let parent_path = Path::new(&note.note_path)
+            .parent()
+            .and_then(cloud_mcp_normalize_knowledge_relative_path);
+        let parent_id = parent_path
+            .as_deref()
+            .and_then(|parent| note_by_path.get(&format!("{parent}.md")).cloned())
+            .or_else(|| {
+                parent_path
+                    .as_deref()
+                    .and_then(|parent| note_by_path.get(&format!("{parent}/index.md")).cloned())
+            })
+            .or_else(|| root_id.clone());
+        let Some(parent_id) = parent_id else {
+            continue;
+        };
+        if parent_id == note.id {
+            continue;
+        }
+        let kind = "contains";
+        let id = cloud_mcp_knowledge_edge_id(repo_id, &parent_id, &note.id, kind);
+        if seen.insert(id.clone()) {
+            edges.push(json!({
+                "id": id,
+                "from_note_id": parent_id,
+                "to_note_id": note.id,
+                "edge_kind": kind,
+                "metadata": {
+                    "source": "atlas_hierarchy",
+                    "target_path": note.note_path,
+                },
+            }));
+        }
+    }
+    edges
+}
+
+fn cloud_mcp_knowledge_graph_stats(notes: &[Value], edges: &[Value]) -> Value {
+    let missing_paths: usize = notes
+        .iter()
+        .map(|node| node["missing_path_count"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    json!({
+        "notes": notes.len(),
+        "edges": edges.len(),
+        "missing_paths": missing_paths,
+        "root_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_root")).count(),
+        "flow_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_flow")).count(),
+        "area_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_area")).count(),
+    })
+}
+
+fn cloud_mcp_knowledge_hashes(items: &[Value]) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in items {
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            map.insert(id.to_string(), json!(cloud_mcp_short_hash(&item.to_string())));
+        }
+    }
+    Value::Object(map)
+}
+
+fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest) -> Result<Value, String> {
+    let notes = cloud_mcp_read_knowledge_notes(&req.root, &req.repo_id)?;
+    let edges = cloud_mcp_build_knowledge_edges(&req.repo_id, &notes);
+    let nodes = notes
+        .into_iter()
+        .map(|note| {
+            let path_refs = note
+                .path_refs
+                .iter()
+                .map(|path_ref| serde_json::to_value(path_ref).unwrap_or_else(|_| json!({})))
+                .collect::<Vec<_>>();
+            let missing_path_count = path_refs
+                .iter()
+                .filter(|path_ref| path_ref["exists"].as_bool() == Some(false))
+                .count();
+            json!({
+                "id": note.id,
+                "repo_id": req.repo_id,
+                "workspace_id": req.workspace_id,
+                "node_type": note.node_type,
+                "title": note.title,
+                "summary": note.summary,
+                "purpose": note.summary,
+                "note_path": note.note_path,
+                "markdown_path": note.note_path,
+                "markdown": note.markdown,
+                "path_refs": path_refs,
+                "path_ref_count": path_refs.len(),
+                "missing_path_count": missing_path_count,
+                "outbound_links": note.outbound_links,
+                "freshness_state": if missing_path_count > 0 { "missing_path" } else { "fresh" },
+                "knowledge_state": if missing_path_count > 0 { "missing_path" } else { "fresh" },
+                "source": note.source,
+                "metadata": note.metadata,
+            })
+        })
+        .collect::<Vec<_>>();
+    let graph_stats = cloud_mcp_knowledge_graph_stats(&nodes, &edges);
+    let cursor = cloud_mcp_short_hash(&json!({"nodes": nodes, "edges": edges}).to_string());
+    Ok(json!({
+        "kind": "project_knowledge_graph",
+        "version": 1,
+        "repo_id": req.repo_id.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "nodes": nodes,
+        "edges": edges,
+        "graph_stats": graph_stats,
+        "cursor": cursor,
+        "node_hashes": cloud_mcp_knowledge_hashes(&nodes),
+        "edge_hashes": cloud_mcp_knowledge_hashes(&edges),
+        "graph_stats_hash": cloud_mcp_short_hash(&graph_stats.to_string()),
+        "source_of_truth": {
+            "kind": "markdown_knowledge_atlas",
+            "directory": ".agents/knowledge",
+            "local_first": true,
+            "spec_edges_encoded": false,
+        },
+    }))
+}
+
+fn cloud_mcp_knowledge_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
+    json!({
+        "kind": "project_knowledge_graph",
+        "version": 1,
+        "repo_id": req.repo_id.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "nodes": [],
+        "edges": [],
+        "graph_stats": {},
+    })
+}
+
+fn cloud_mcp_knowledge_graph_snapshot_from_data(
+    req: &CloudMcpSpecGraphSyncRequest,
+    data: Value,
+    cache_path: &Path,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
+    let nodes = data.get("nodes").cloned().unwrap_or_else(|| json!([]));
+    let edges = data.get("edges").cloned().unwrap_or_else(|| json!([]));
+    let graph_stats = data.get("graph_stats").cloned().unwrap_or_else(|| json!({}));
+    let cursor = data
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| cloud_mcp_short_hash(&json!({"nodes": nodes, "edges": edges}).to_string()));
+    let node_hashes = data
+        .get("node_hashes")
+        .cloned()
+        .unwrap_or_else(|| cloud_mcp_knowledge_hashes(nodes.as_array().map(Vec::as_slice).unwrap_or(&[])));
+    let edge_hashes = data
+        .get("edge_hashes")
+        .cloned()
+        .unwrap_or_else(|| cloud_mcp_knowledge_hashes(edges.as_array().map(Vec::as_slice).unwrap_or(&[])));
+    let graph_stats_hash = data
+        .get("graph_stats_hash")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| cloud_mcp_short_hash(&graph_stats.to_string()));
+    json!({
+        "ok": true,
+        "repoId": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "repoName": repo_name.clone(),
+        "displayRoot": display_root.clone(),
+        "workspaceDisplay": {
+            "repoName": repo_name,
+            "displayRoot": display_root,
+            "repoPath": req.root_display.clone(),
+        },
+        "workspaceId": req.workspace_id.clone(),
+        "workspaceName": req.workspace_name.clone(),
+        "cachePath": workspace_path_display(cache_path),
+        "syncState": sync_state,
+        "syncError": sync_error,
+        "lastSyncedMs": cloud_mcp_now_ms(),
+        "cursor": cursor,
+        "nodeHashes": node_hashes,
+        "edgeHashes": edge_hashes,
+        "graphStatsHash": graph_stats_hash,
+        "knowledgeGraph": data.clone(),
+        "knowledgeNodes": nodes,
+        "knowledgeEdges": edges,
+        "graphStats": graph_stats,
+        "sourceOfTruth": {
+            "kind": "knowledge_graph",
+            "repo_id": req.repo_id.clone(),
+            "markdown_directory": ".agents/knowledge",
+            "cached_under_agents": true,
+        },
+        "raw": data
+    })
+}
+
+fn cloud_mcp_stamp_knowledge_graph_snapshot(
+    mut snapshot: Value,
+    req: &CloudMcpSpecGraphSyncRequest,
+    cache_path: &Path,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    if !snapshot.is_object() {
+        snapshot = cloud_mcp_knowledge_graph_snapshot_from_data(
+            req,
+            cloud_mcp_knowledge_graph_empty_raw(req),
+            cache_path,
+            sync_state,
+            sync_error,
+        );
+    }
+    if let Some(object) = snapshot.as_object_mut() {
+        let repo_name = cloud_mcp_repo_display_name(&req.root);
+        let display_root = cloud_mcp_repo_display_root(&req.root);
+        object.insert("ok".to_string(), json!(true));
+        object.insert("repoId".to_string(), json!(req.repo_id.clone()));
+        object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+        object.insert("repoName".to_string(), json!(repo_name.clone()));
+        object.insert("displayRoot".to_string(), json!(display_root.clone()));
+        object.insert("workspaceDisplay".to_string(), json!({
+            "repoName": repo_name,
+            "displayRoot": display_root,
+            "repoPath": req.root_display.clone(),
+        }));
+        object.insert("workspaceId".to_string(), json!(req.workspace_id.clone()));
+        object.insert("workspaceName".to_string(), json!(req.workspace_name.clone()));
+        object.insert("cachePath".to_string(), json!(workspace_path_display(cache_path)));
+        object.insert("syncState".to_string(), json!(sync_state));
+        object.insert("syncError".to_string(), json!(sync_error));
+        object.insert("sourceOfTruth".to_string(), json!({
+            "kind": "knowledge_graph",
+            "repo_id": req.repo_id.clone(),
+            "markdown_directory": ".agents/knowledge",
+            "cached_under_agents": true,
+        }));
+    }
+    snapshot
+}
+
+fn cloud_mcp_read_knowledge_graph_cache(
+    req: &CloudMcpSpecGraphSyncRequest,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
+    let snapshot = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| {
+            cloud_mcp_build_local_knowledge_graph_data(req)
+                .map(|data| {
+                    cloud_mcp_knowledge_graph_snapshot_from_data(
+                        req,
+                        data,
+                        &cache_path,
+                        "local",
+                        "",
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    cloud_mcp_knowledge_graph_snapshot_from_data(
+                        req,
+                        cloud_mcp_knowledge_graph_empty_raw(req),
+                        &cache_path,
+                        "empty",
+                        "",
+                    )
+                })
+        });
+    cloud_mcp_stamp_knowledge_graph_snapshot(snapshot, req, &cache_path, sync_state, sync_error)
+}
+
+fn cloud_mcp_write_knowledge_graph_cache(
+    req: &CloudMcpSpecGraphSyncRequest,
+    snapshot: &Value,
+) -> Result<(), String> {
+    let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create Knowledge Graph cache directory {}: {error}",
+                workspace_path_display(parent)
+            )
+        })?;
+    }
+    let body = serde_json::to_vec_pretty(snapshot)
+        .map_err(|error| format!("Unable to encode Knowledge Graph cache: {error}"))?;
+    fs::write(&cache_path, body).map_err(|error| {
+        format!(
+            "Unable to write Knowledge Graph cache {}: {error}",
+            workspace_path_display(&cache_path)
+        )
+    })
+}
+
+async fn cloud_mcp_push_knowledge_snapshot(
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+    data: &Value,
+) -> Result<Value, String> {
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
+    let payload = json!({
+        "source": "rust-diffforge-knowledge",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id.clone(),
+        "repo_name": repo_name,
+        "display_root": display_root,
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "repo_path": req.root_display.clone(),
+        "workspace_root": req.root_display.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "workspace_name": req.workspace_name.clone(),
+        "notes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
+        "edges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_post_event_endpoint(state, "knowledge_snapshot", &payload).await
+}
+
+async fn cloud_mcp_fetch_full_knowledge_graph_data(
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+) -> Result<Value, String> {
+    cloud_mcp_connected_or_connect(state).await?;
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
+    let payload = json!({
+        "source": "rust-diffforge-knowledge-graph",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id.clone(),
+        "repo_name": repo_name,
+        "display_root": display_root,
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "repo_path": req.root_display.clone(),
+        "workspace_root": req.root_display.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "workspace_name": req.workspace_name.clone(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response = cloud_mcp_post_json_endpoint(state, "/v1/knowledge/graph", &payload).await?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
+async fn cloud_mcp_sync_knowledge_graph_once(
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+) -> Result<(Value, bool), String> {
+    let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
+    let current_cache = cloud_mcp_read_knowledge_graph_cache(req, "syncing", "");
+    let local_data = cloud_mcp_build_local_knowledge_graph_data(req)?;
+    let local_snapshot =
+        cloud_mcp_knowledge_graph_snapshot_from_data(req, local_data.clone(), &cache_path, "local", "");
+    cloud_mcp_write_knowledge_graph_cache(req, &local_snapshot)?;
+
+    let next_snapshot = match cloud_mcp_connected_or_connect(state).await {
+        Ok(_) => {
+            cloud_mcp_push_knowledge_snapshot(state, req, &local_data).await?;
+            let data = cloud_mcp_fetch_full_knowledge_graph_data(state, req).await?;
+            cloud_mcp_knowledge_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
+        }
+        Err(error) => {
+            let mut snapshot = local_snapshot;
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("syncState".to_string(), json!("local"));
+                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+            }
+            snapshot
+        }
+    };
+    let changed = current_cache.get("cursor").and_then(Value::as_str)
+        != next_snapshot.get("cursor").and_then(Value::as_str)
+        || current_cache.get("syncState").and_then(Value::as_str) == Some("error");
+    cloud_mcp_write_knowledge_graph_cache(req, &next_snapshot)?;
+    Ok((next_snapshot, changed))
+}
+
+fn cloud_mcp_emit_knowledge_graph_snapshot(app: &AppHandle, snapshot: Value) {
+    let _ = app.emit(CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT, snapshot);
+}
+
+fn cloud_mcp_knowledge_cache_path_is_inside(root: &Path, path: &Path) -> bool {
+    let cache_dir = cloud_mcp_knowledge_cache_dir(root);
+    path.starts_with(cache_dir)
+}
+
+fn cloud_mcp_knowledge_event_should_sync(root: &Path, event: &NotifyEvent) -> bool {
+    match event.kind {
+        NotifyEventKind::Any
+        | NotifyEventKind::Create(_)
+        | NotifyEventKind::Modify(_)
+        | NotifyEventKind::Remove(_) => {}
+        _ => return false,
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| !cloud_mcp_knowledge_cache_path_is_inside(root, path))
+}
+
+fn cloud_mcp_existing_watch_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent.exists() && parent.is_dir() {
+            return Some(parent.to_path_buf());
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn cloud_mcp_knowledge_watch_targets(
+    req: &CloudMcpSpecGraphSyncRequest,
+    snapshot: &Value,
+) -> HashMap<PathBuf, bool> {
+    let mut targets = HashMap::new();
+    let mut insert_target = |path: PathBuf, recursive: bool| {
+        let path = workspace_path_for_process(&path);
+        targets
+            .entry(path)
+            .and_modify(|existing| *existing = *existing || recursive)
+            .or_insert(recursive);
+    };
+    insert_target(cloud_mcp_knowledge_dir(&req.root), true);
+
+    let nodes = snapshot
+        .get("knowledgeNodes")
+        .or_else(|| snapshot.get("raw").and_then(|raw| raw.get("nodes")))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for node in nodes {
+        let path_refs = node
+            .get("path_refs")
+            .or_else(|| node.get("pathRefs"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for path_ref in path_refs {
+            let Some(relative_path) = path_ref.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let absolute = req.root.join(relative_path);
+            if absolute.exists() {
+                insert_target(absolute.clone(), absolute.is_dir());
+            } else if let Some(parent) = cloud_mcp_existing_watch_parent(&absolute) {
+                insert_target(parent, false);
+            }
+        }
+    }
+    targets
+}
+
+fn cloud_mcp_reconfigure_knowledge_watcher(
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashMap<PathBuf, bool>,
+    desired: HashMap<PathBuf, bool>,
+) {
+    let stale_paths = watched
+        .keys()
+        .filter(|path| !desired.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in stale_paths {
+        let _ = watcher.unwatch(&path);
+        watched.remove(&path);
+    }
+
+    for (path, recursive) in desired {
+        if watched.get(&path).copied() == Some(recursive) {
+            continue;
+        }
+        if watched.contains_key(&path) {
+            let _ = watcher.unwatch(&path);
+            watched.remove(&path);
+        }
+        let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        if watcher.watch(&path, mode).is_ok() {
+            watched.insert(path, recursive);
+        }
+    }
+}
+
+async fn cloud_mcp_sync_knowledge_graph_and_rewatch(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    req: &CloudMcpSpecGraphSyncRequest,
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashMap<PathBuf, bool>,
+    emit_even_if_unchanged: bool,
+) {
+    match cloud_mcp_sync_knowledge_graph_once(state, req).await {
+        Ok((snapshot, changed)) => {
+            let desired = cloud_mcp_knowledge_watch_targets(req, &snapshot);
+            cloud_mcp_reconfigure_knowledge_watcher(watcher, watched, desired);
+            if emit_even_if_unchanged || changed {
+                cloud_mcp_emit_knowledge_graph_snapshot(app, snapshot);
+            }
+        }
+        Err(error) => {
+            let snapshot = cloud_mcp_read_knowledge_graph_cache(
+                req,
+                "error",
+                &clean_terminal_telemetry_text(&error),
+            );
+            let desired = cloud_mcp_knowledge_watch_targets(req, &snapshot);
+            cloud_mcp_reconfigure_knowledge_watcher(watcher, watched, desired);
+            let _ = cloud_mcp_write_knowledge_graph_cache(req, &snapshot);
+            cloud_mcp_emit_knowledge_graph_snapshot(app, snapshot);
+        }
+    }
+}
+
+async fn cloud_mcp_knowledge_graph_watch_loop(
+    app: AppHandle,
+    state: CloudMcpState,
+    req: CloudMcpSpecGraphSyncRequest,
+    generation: u64,
+    stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<Result<NotifyEvent, notify::Error>>(256);
+    let mut watcher = match RecommendedWatcher::new(
+        move |event| {
+            let _ = event_tx.blocking_send(event);
+        },
+        NotifyConfig::default(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let snapshot = cloud_mcp_read_knowledge_graph_cache(
+                &req,
+                "error",
+                &format!("Unable to start Knowledge Graph file watcher: {error}"),
+            );
+            cloud_mcp_emit_knowledge_graph_snapshot(&app, snapshot);
+            let mut syncs = state.knowledge_graph_syncs.lock().await;
+            let should_remove = syncs
+                .get(&req.repo_id)
+                .map(|runtime| runtime.generation == generation)
+                .unwrap_or(false);
+            if should_remove {
+                syncs.remove(&req.repo_id);
+            }
+            return;
+        }
+    };
+    let mut watched = HashMap::new();
+    let initial_snapshot = cloud_mcp_read_knowledge_graph_cache(&req, "syncing", "");
+    cloud_mcp_reconfigure_knowledge_watcher(
+        &mut watcher,
+        &mut watched,
+        cloud_mcp_knowledge_watch_targets(&req, &initial_snapshot),
+    );
+    cloud_mcp_sync_knowledge_graph_and_rewatch(&app, &state, &req, &mut watcher, &mut watched, true)
+        .await;
+
+    while !crate::app_shutdown_requested() {
+        let wake_signal = wake.notified();
+        tokio::pin!(wake_signal);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let still_active = {
+            let syncs = state.knowledge_graph_syncs.lock().await;
+            syncs
+                .get(&req.repo_id)
+                .map(|runtime| {
+                    runtime.generation == generation && !runtime.stop.load(Ordering::SeqCst)
+                })
+                .unwrap_or(false)
+        };
+        if !still_active {
+            break;
+        }
+
+        let event_result = tokio::select! {
+            _ = &mut wake_signal => break,
+            event_result = event_rx.recv() => event_result,
+        };
+        let Some(event_result) = event_result else {
+            break;
+        };
+        match event_result {
+            Ok(event) if cloud_mcp_knowledge_event_should_sync(&req.root, &event) => {
+                let debounce_wake_signal = wake.notified();
+                tokio::pin!(debounce_wake_signal);
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(CLOUD_MCP_KNOWLEDGE_GRAPH_DEBOUNCE_MS)) => {}
+                    _ = &mut debounce_wake_signal => break,
+                }
+                while let Ok(next_event_result) = event_rx.try_recv() {
+                    match next_event_result {
+                        Ok(next_event) => {
+                            let _ = cloud_mcp_knowledge_event_should_sync(&req.root, &next_event);
+                        }
+                        Err(error) => {
+                            let snapshot = cloud_mcp_read_knowledge_graph_cache(
+                                &req,
+                                "error",
+                                &format!("Knowledge Graph file watcher failed: {error}"),
+                            );
+                            cloud_mcp_emit_knowledge_graph_snapshot(&app, snapshot);
+                        }
+                    }
+                }
+                cloud_mcp_sync_knowledge_graph_and_rewatch(
+                    &app,
+                    &state,
+                    &req,
+                    &mut watcher,
+                    &mut watched,
+                    false,
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let snapshot = cloud_mcp_read_knowledge_graph_cache(
+                    &req,
+                    "error",
+                    &format!("Knowledge Graph file watcher failed: {error}"),
+                );
+                cloud_mcp_emit_knowledge_graph_snapshot(&app, snapshot);
+            }
+        }
+    }
+
+    let mut syncs = state.knowledge_graph_syncs.lock().await;
+    let should_remove = syncs
+        .get(&req.repo_id)
+        .map(|runtime| runtime.generation == generation)
+        .unwrap_or(false);
+    if should_remove {
+        syncs.remove(&req.repo_id);
+    }
+}
+
+async fn cloud_mcp_stop_all_knowledge_graph_syncs(state: &CloudMcpState) -> usize {
+    let runtimes = {
+        let mut syncs = state.knowledge_graph_syncs.lock().await;
+        syncs.drain().map(|(_, runtime)| runtime).collect::<Vec<_>>()
+    };
+    let stopped = runtimes.len();
+    for runtime in runtimes {
+        runtime.stop.store(true, Ordering::SeqCst);
+        runtime.wake.notify_waiters();
+    }
+    stopped
+}
+
 fn cloud_mcp_spec_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
     json!({
         "kind": "project_spec_graph",
@@ -4241,6 +5445,136 @@ async fn cloud_mcp_stop_spec_graph_sync(
         "repoPath": req.root_display.clone(),
         "stopped": stopped,
     }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_cached_knowledge_graph(
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    Ok(cloud_mcp_read_knowledge_graph_cache(&req, "local", ""))
+}
+
+#[tauri::command]
+async fn cloud_mcp_start_knowledge_graph_sync(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let requested_generation = cloud_mcp_now_ms();
+    let requested_stop = Arc::new(AtomicBool::new(false));
+    let requested_wake = Arc::new(tokio::sync::Notify::new());
+    let mut active_generation = requested_generation;
+    let mut should_spawn = false;
+    {
+        let mut syncs = state.knowledge_graph_syncs.lock().await;
+        if let Some(existing_runtime) = syncs
+            .get(&req.repo_id)
+            .filter(|runtime| !runtime.stop.load(Ordering::SeqCst))
+        {
+            active_generation = existing_runtime.generation;
+        } else {
+            syncs.insert(
+                req.repo_id.clone(),
+                CloudMcpKnowledgeGraphSyncRuntime {
+                    generation: requested_generation,
+                    stop: Arc::clone(&requested_stop),
+                    wake: Arc::clone(&requested_wake),
+                },
+            );
+            should_spawn = true;
+        }
+    }
+    let mut cached = cloud_mcp_read_knowledge_graph_cache(&req, "syncing", "");
+    if let Some(object) = cached.as_object_mut() {
+        object.insert("syncGeneration".to_string(), json!(active_generation));
+    }
+    if should_spawn {
+        let app_for_task = app.clone();
+        let state_for_task = state.inner().clone();
+        let req_for_task = req.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_knowledge_graph_watch_loop(
+                app_for_task,
+                state_for_task,
+                req_for_task,
+                requested_generation,
+                requested_stop,
+                requested_wake,
+            )
+            .await;
+        });
+    }
+    Ok(cached)
+}
+
+#[tauri::command]
+async fn cloud_mcp_stop_knowledge_graph_sync(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    sync_generation: Option<u64>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, None, None);
+    let mut syncs = state.knowledge_graph_syncs.lock().await;
+    let removed = if sync_generation
+        .map(|generation| {
+            syncs
+                .get(&req.repo_id)
+                .map(|runtime| runtime.generation == generation)
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+    {
+        syncs.remove(&req.repo_id)
+    } else {
+        None
+    };
+    let stopped = removed.is_some();
+    if let Some(runtime) = removed {
+        runtime.stop.store(true, Ordering::SeqCst);
+        runtime.wake.notify_waiters();
+    }
+    Ok(json!({
+        "ok": true,
+        "repoId": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "stopped": stopped,
+    }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_knowledge_graph(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
+    let local_data = cloud_mcp_build_local_knowledge_graph_data(&req)?;
+    let local_snapshot =
+        cloud_mcp_knowledge_graph_snapshot_from_data(&req, local_data.clone(), &cache_path, "local", "");
+    let snapshot = match cloud_mcp_connected_or_connect(state.inner()).await {
+        Ok(_) => {
+            cloud_mcp_push_knowledge_snapshot(state.inner(), &req, &local_data).await?;
+            let data = cloud_mcp_fetch_full_knowledge_graph_data(state.inner(), &req).await?;
+            cloud_mcp_knowledge_graph_snapshot_from_data(&req, data, &cache_path, "ready", "")
+        }
+        Err(error) => {
+            let mut snapshot = local_snapshot;
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+            }
+            snapshot
+        }
+    };
+    let _ = cloud_mcp_write_knowledge_graph_cache(&req, &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]

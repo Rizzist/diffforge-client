@@ -232,6 +232,8 @@ export default function XyflowGraphRenderer({
   selectedNodeId,
   onSelect,
   state,
+  emptyLabel = "No spec graph nodes yet.",
+  layoutLabel = "Laying out spec graph...",
 }) {
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState([]);
@@ -291,11 +293,11 @@ export default function XyflowGraphRenderer({
 
   if (!nodes.length) {
     const isSyncing = ["loading", "syncing"].includes(state);
-    return <EmptyState>{isSyncing ? "Syncing spec graph..." : "No spec graph nodes yet."}</EmptyState>;
+    return <EmptyState>{isSyncing ? "Syncing graph..." : emptyLabel}</EmptyState>;
   }
 
   if (layoutPending) {
-    return <EmptyState>Laying out spec graph...</EmptyState>;
+    return <EmptyState>{layoutLabel}</EmptyState>;
   }
 
   return (
@@ -421,6 +423,10 @@ const FlowFrame = styled.div`
     background: rgba(3, 6, 11, 0.62);
   }
 
+  html[data-forge-theme="light"] & .react-flow {
+    background: #ffffff;
+  }
+
   .react-flow__node {
     transition: transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
@@ -454,6 +460,16 @@ const FlowFrame = styled.div`
     background: rgba(13, 17, 23, 0.92);
     border-bottom-color: rgba(230, 236, 245, 0.08);
     color: rgba(219, 231, 247, 0.82);
+  }
+
+  html[data-forge-theme="light"] & .react-flow__controls {
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+
+  html[data-forge-theme="light"] & .react-flow__controls-button {
+    background: #fafafc;
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    color: #333333;
   }
 `;
 
@@ -578,6 +594,19 @@ const FlowNodeCard = styled.button`
     border-color: ${({ $sourceTone, $statusTone }) => $sourceTone || $statusTone || "#38bdf8"};
     transform: scale(1.025);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: ${({ $active, $sourceTone, $statusTone }) => (
+      $active ? ($statusTone || "#0066cc") : colorWithAlpha($sourceTone || $statusTone || "#0066cc", "33")
+    )};
+    background: #ffffff;
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: ${({ $sourceTone, $statusTone }) => $sourceTone || $statusTone || "#0066cc"};
+    transform: scale(1.015);
+  }
 `;
 
 const SourceAccent = styled.span`
@@ -655,6 +684,14 @@ const NodeKindLabel = styled.span`
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: ${({ $kind, $noSpec, $statusTone }) => {
+      if ($noSpec) return "#7a7a7a";
+      if ($kind === "workspace") return "#0a7f45";
+      return $statusTone || "#0066cc";
+    }};
+  }
 `;
 
 const NodeSourceChip = styled.span`
@@ -672,6 +709,12 @@ const NodeSourceChip = styled.span`
   padding: 1px 4px;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    background: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#0066cc", "12")};
+    border-color: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#0066cc", "44")};
+    color: ${({ $sourceTone }) => $sourceTone || "#0066cc"};
+  }
 `;
 
 const NodeTitle = styled.div`
@@ -698,6 +741,10 @@ const NodeTitle = styled.div`
     return 3;
   }};
   word-break: break-word;
+
+  html[data-forge-theme="light"] & {
+    color: ${({ $noSpec }) => ($noSpec ? "#7a7a7a" : "#1d1d1f")};
+  }
 `;
 
 const NodePath = styled.div`
@@ -711,6 +758,10 @@ const NodePath = styled.div`
   text-overflow: ellipsis;
   white-space: nowrap;
   z-index: 2;
+
+  html[data-forge-theme="light"] & {
+    color: #7a7a7a;
+  }
 `;
 
 const AgentCountBadge = styled.span`
@@ -730,6 +781,12 @@ const AgentCountBadge = styled.span`
   right: -7px;
   top: -7px;
   z-index: 3;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.1);
+    color: #1d1d1f;
+  }
 `;
 
 const OutOfSpecBadge = styled.span`
@@ -749,6 +806,12 @@ const OutOfSpecBadge = styled.span`
   position: absolute;
   top: -7px;
   z-index: 3;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(139, 90, 0, 0.08);
+    border-color: rgba(139, 90, 0, 0.22);
+    color: #5c4100;
+  }
 `;
 
 const ActiveAgentOrbit = styled.span`

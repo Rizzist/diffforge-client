@@ -62,6 +62,25 @@ const DetailRoot = styled.main`
   --thread-composer-font-size: 12px;
   color: var(--thread-fg);
   background: var(--thread-bg);
+
+  html[data-forge-theme="light"] & {
+    --thread-bg: #f5f5f7;
+    --thread-composer-bg: #ffffff;
+    --thread-bg-soft: #ffffff;
+    --thread-card: #ffffff;
+    --thread-card-raised: #fafafc;
+    --thread-fg: #1d1d1f;
+    --thread-muted: #7a7a7a;
+    --thread-muted-soft: rgba(122, 122, 122, 0.64);
+    --thread-border: rgba(0, 0, 0, 0.08);
+    --thread-border-strong: rgba(0, 0, 0, 0.14);
+    --thread-accent: rgba(0, 0, 0, 0.045);
+    --thread-secondary: #fafafc;
+    --thread-ring: rgba(0, 113, 227, 0.28);
+    --thread-ember: #0066cc;
+    --thread-blue: #0066cc;
+    --thread-green: #0a7f45;
+  }
   font-family:
     Inter,
     "Segoe UI Variable",
@@ -722,6 +741,18 @@ const NewChatRoot = styled.main`
   --thread-ring: rgba(255, 255, 255, 0.22);
   color: var(--thread-fg);
   background: var(--thread-bg);
+
+  html[data-forge-theme="light"] & {
+    --thread-bg: #f5f5f7;
+    --thread-composer-bg: #ffffff;
+    --thread-card: #ffffff;
+    --thread-fg: #1d1d1f;
+    --thread-muted: #7a7a7a;
+    --thread-muted-soft: rgba(122, 122, 122, 0.64);
+    --thread-border: rgba(0, 0, 0, 0.08);
+    --thread-accent: rgba(0, 0, 0, 0.045);
+    --thread-ring: rgba(0, 113, 227, 0.28);
+  }
 `;
 
 const NewChatCenter = styled.form`

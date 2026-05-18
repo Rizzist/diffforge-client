@@ -12,6 +12,8 @@ export default function GraphRendererHost({
   onSelect,
   state,
   rendererPreference = "xyflow",
+  emptyLabel,
+  layoutLabel,
 }) {
   const [layout, setLayout] = useState(() => new Map());
   const [layoutPending, setLayoutPending] = useState(false);
@@ -47,6 +49,8 @@ export default function GraphRendererHost({
     selectedNodeId,
     onSelect,
     state,
+    emptyLabel,
+    layoutLabel,
   };
 
   if (THREE_RENDERER_ENABLED && rendererPreference === "three") {

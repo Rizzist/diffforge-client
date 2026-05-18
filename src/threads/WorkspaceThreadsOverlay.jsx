@@ -69,6 +69,24 @@ const OverlayRoot = styled.div`
   --thread-ember: #dfa55a;
   --thread-green: #3ccb7f;
   --thread-red: #ef6b6b;
+  --thread-rail-bg: #101820;
+  --thread-rail-image: url("/textures/thread-rail-carbon-fiber.png");
+  --thread-rail-fg: #e9e9e9;
+  --thread-rail-fg-soft: rgba(233, 233, 233, 0.72);
+  --thread-rail-icon: rgba(233, 233, 233, 0.78);
+  --thread-rail-icon-soft: rgba(233, 233, 233, 0.68);
+  --thread-rail-muted: rgba(225, 225, 225, 0.52);
+  --thread-rail-muted-soft: rgba(225, 225, 225, 0.48);
+  --thread-rail-placeholder: rgba(233, 233, 233, 0.42);
+  --thread-rail-search-border: rgba(255, 255, 255, 0.1);
+  --thread-rail-search-bg: rgba(0, 0, 0, 0.18);
+  --thread-rail-search-focus-border: rgba(255, 255, 255, 0.2);
+  --thread-rail-search-focus-bg: rgba(0, 0, 0, 0.24);
+  --thread-rail-row-fg: rgba(236, 236, 236, 0.86);
+  --thread-rail-row-hover: rgba(255, 255, 255, 0.075);
+  --thread-rail-row-selected: rgba(255, 255, 255, 0.105);
+  --thread-rail-row-selected-hover: rgba(255, 255, 255, 0.13);
+  --thread-rail-action-hover: rgba(255, 255, 255, 0.095);
   color: var(--thread-fg);
   background:
     linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
@@ -79,6 +97,44 @@ const OverlayRoot = styled.div`
   backdrop-filter: blur(10px);
   pointer-events: auto;
   user-select: text;
+
+  html[data-forge-theme="light"] & {
+    --thread-bg: #f5f5f7;
+    --thread-bg-soft: #ffffff;
+    --thread-card: #ffffff;
+    --thread-fg: #1d1d1f;
+    --thread-muted: #7a7a7a;
+    --thread-muted-soft: rgba(122, 122, 122, 0.64);
+    --thread-border: rgba(0, 0, 0, 0.08);
+    --thread-accent: rgba(0, 0, 0, 0.045);
+    --thread-accent-strong: rgba(0, 0, 0, 0.08);
+    --thread-primary: rgba(0, 102, 204, 0.09);
+    --thread-primary-hover: rgba(0, 102, 204, 0.13);
+    --thread-blue: #0066cc;
+    --thread-ember: #0066cc;
+    --thread-green: #0a7f45;
+    --thread-red: #b42318;
+    --thread-rail-bg: #f1ead2;
+    --thread-rail-image: url("/textures/thread-rail-carbon-fiber-light.png");
+    --thread-rail-fg: rgba(45, 38, 24, 0.9);
+    --thread-rail-fg-soft: rgba(68, 55, 28, 0.66);
+    --thread-rail-icon: rgba(62, 52, 35, 0.68);
+    --thread-rail-icon-soft: rgba(62, 52, 35, 0.56);
+    --thread-rail-muted: rgba(92, 75, 41, 0.62);
+    --thread-rail-muted-soft: rgba(92, 75, 41, 0.54);
+    --thread-rail-placeholder: rgba(72, 60, 42, 0.44);
+    --thread-rail-search-border: rgba(128, 95, 24, 0.16);
+    --thread-rail-search-bg: rgba(255, 255, 255, 0.34);
+    --thread-rail-search-focus-border: rgba(150, 112, 28, 0.3);
+    --thread-rail-search-focus-bg: rgba(255, 255, 255, 0.5);
+    --thread-rail-row-fg: rgba(47, 40, 28, 0.82);
+    --thread-rail-row-hover: rgba(132, 100, 31, 0.1);
+    --thread-rail-row-selected: rgba(132, 100, 31, 0.17);
+    --thread-rail-row-selected-hover: rgba(132, 100, 31, 0.22);
+    --thread-rail-action-hover: rgba(132, 100, 31, 0.12);
+    background: rgba(245, 245, 247, 0.88);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 const OverlayPanel = styled.section`
@@ -117,8 +173,8 @@ const ThreadRail = styled.aside`
   min-height: 0;
   overflow: visible;
   border-right: 0;
-  background-color: #101820;
-  background-image: url("/textures/thread-rail-carbon-fiber.png");
+  background-color: var(--thread-rail-bg);
+  background-image: var(--thread-rail-image);
   background-repeat: repeat;
   box-shadow: none;
 `;
@@ -156,6 +212,21 @@ const DrawerToggle = styled.button`
   &:focus-visible {
     outline: 2px solid rgba(255, 255, 255, 0.22);
     outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(128, 95, 24, 0.16);
+    color: var(--thread-rail-fg);
+    background: rgba(255, 255, 255, 0.72);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.6),
+      0 10px 22px rgba(88, 66, 22, 0.16);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(128, 95, 24, 0.24);
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.88);
   }
 
   svg {
@@ -205,7 +276,7 @@ const RailActionButton = styled.button`
   padding: 0 8px;
   border: 1px solid transparent;
   border-radius: 10px;
-  color: #e9e9e9;
+  color: var(--thread-rail-fg);
   background: transparent;
   text-align: left;
   font: inherit;
@@ -219,12 +290,12 @@ const RailActionButton = styled.button`
   &[data-active="true"] {
     color: var(--thread-fg);
     border-color: transparent;
-    background: rgba(255, 255, 255, 0.095);
+    background: var(--thread-rail-action-hover);
     opacity: 1;
   }
 
   &:disabled {
-    color: rgba(233, 233, 233, 0.72);
+    color: var(--thread-rail-fg-soft);
     opacity: 1;
     cursor: not-allowed;
   }
@@ -261,16 +332,16 @@ const ThreadSearchField = styled.div`
   align-items: center;
   gap: 5px;
   padding: 0 5px 0 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--thread-rail-search-border);
   border-radius: 9px;
-  color: rgba(233, 233, 233, 0.78);
-  background: rgba(0, 0, 0, 0.18);
+  color: var(--thread-rail-icon);
+  background: var(--thread-rail-search-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
 
   &:focus-within {
-    border-color: rgba(255, 255, 255, 0.2);
+    border-color: var(--thread-rail-search-focus-border);
     color: var(--thread-fg);
-    background: rgba(0, 0, 0, 0.24);
+    background: var(--thread-rail-search-focus-bg);
   }
 
   svg {
@@ -291,7 +362,7 @@ const ThreadSearchInput = styled.input`
   outline: 0;
 
   &::placeholder {
-    color: rgba(233, 233, 233, 0.42);
+    color: var(--thread-rail-placeholder);
   }
 `;
 
@@ -303,7 +374,7 @@ const ThreadSearchClearButton = styled.button`
   padding: 0;
   border: 0;
   border-radius: 7px;
-  color: rgba(233, 233, 233, 0.68);
+  color: var(--thread-rail-icon-soft);
   background: transparent;
   opacity: 0;
   pointer-events: none;
@@ -319,7 +390,7 @@ const ThreadSearchClearButton = styled.button`
 
   &:hover {
     color: var(--thread-fg);
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--thread-rail-action-hover);
   }
 
   &:focus-visible {
@@ -337,7 +408,7 @@ const ThreadSearchClearButton = styled.button`
 const ThreadSearchSummary = styled.div`
   min-width: 0;
   padding: 0 6px;
-  color: rgba(225, 225, 225, 0.48);
+  color: var(--thread-rail-muted-soft);
   font-size: 11px;
   font-weight: 460;
   line-height: 1.2;
@@ -352,7 +423,7 @@ const WorkspaceGroup = styled.section`
 const WorkspaceTopline = styled.div`
   min-width: 0;
   padding: 0 5px;
-  color: rgba(225, 225, 225, 0.52);
+  color: var(--thread-rail-muted);
   font-size: 11px;
   font-weight: 460;
   letter-spacing: 0;
@@ -392,8 +463,8 @@ const CollapsedRail = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 28px 8px 10px;
-  background-color: #101820;
-  background-image: url("/textures/thread-rail-carbon-fiber.png");
+  background-color: var(--thread-rail-bg);
+  background-image: var(--thread-rail-image);
   background-repeat: repeat;
 `;
 
@@ -413,7 +484,7 @@ const CollapsedRailActionButton = styled.button`
   padding: 0;
   border: 1px solid transparent;
   border-radius: 10px;
-  color: #e9e9e9;
+  color: var(--thread-rail-fg);
   background: transparent;
   opacity: 1;
   transition:
@@ -424,12 +495,12 @@ const CollapsedRailActionButton = styled.button`
   &:hover:not(:disabled),
   &[data-active="true"] {
     color: var(--thread-fg);
-    background: rgba(255, 255, 255, 0.095);
+    background: var(--thread-rail-action-hover);
     opacity: 1;
   }
 
   &:disabled {
-    color: rgba(233, 233, 233, 0.62);
+    color: var(--thread-rail-fg-soft);
     opacity: 1;
     cursor: not-allowed;
   }
@@ -489,19 +560,19 @@ const CollapsedThreadButton = styled.button`
   padding: 0;
   border: 1px solid transparent;
   border-radius: 8px;
-  color: var(--thread-muted);
+  color: var(--thread-rail-muted);
   background: transparent;
   transition:
     background 130ms ease,
     border-color 130ms ease;
 
   &[data-selected="true"] {
-    border-color: rgba(255, 255, 255, 0.16);
-    background: var(--thread-primary);
+    border-color: transparent;
+    background: var(--thread-rail-row-selected);
   }
 
   &:hover {
-    background: var(--thread-accent);
+    background: var(--thread-rail-row-hover);
   }
 
   &:focus-visible {
@@ -521,7 +592,7 @@ const ThreadRow = styled.div`
   padding: 0 4px 0 7px;
   border: 1px solid transparent;
   border-radius: 8px;
-  color: rgba(236, 236, 236, 0.86);
+  color: var(--thread-rail-row-fg);
   background: transparent;
   font: inherit;
   text-align: left;
@@ -533,17 +604,17 @@ const ThreadRow = styled.div`
   &[data-selected="true"] {
     border-color: transparent;
     color: var(--thread-fg);
-    background: rgba(255, 255, 255, 0.105);
+    background: var(--thread-rail-row-selected);
   }
 
   &:hover {
     color: var(--thread-fg);
     border-color: transparent;
-    background: rgba(255, 255, 255, 0.075);
+    background: var(--thread-rail-row-hover);
   }
 
   &[data-selected="true"]:hover {
-    background: rgba(255, 255, 255, 0.13);
+    background: var(--thread-rail-row-selected-hover);
   }
 `;
 

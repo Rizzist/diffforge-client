@@ -669,6 +669,70 @@ const TERMINAL_STARTUP_DEFAULT_MODELS = {
   claude: "sonnet",
   codex: "gpt-5.5",
 };
+const FORGE_LIGHT_THEME_ID = "light";
+const TERMINAL_DARK_THEME = {
+  background: TERMINAL_THEME_BACKGROUND,
+  foreground: "#e8eef8",
+  cursor: "#ff9a3d",
+  cursorAccent: "#030508",
+  selectionBackground: "#2f80ff55",
+  black: "#030508",
+  brightBlack: "#687386",
+  blue: "#62a0ff",
+  brightBlue: "#8bb9ff",
+  cyan: "#6fd7ff",
+  brightCyan: "#a7e8ff",
+  green: "#7ee787",
+  brightGreen: "#9dffad",
+  magenta: "#d2a8ff",
+  brightMagenta: "#e1c7ff",
+  red: "#ff6b6b",
+  brightRed: "#ff9a9a",
+  white: "#e8eef8",
+  brightWhite: "#ffffff",
+  yellow: "#ffb269",
+  brightYellow: "#ffd08a",
+  scrollbarSliderBackground: "rgba(172, 185, 207, 0.46)",
+  scrollbarSliderHoverBackground: "rgba(192, 204, 224, 0.62)",
+  scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
+};
+const TERMINAL_LIGHT_THEME = {
+  background: "#ffffff",
+  foreground: "#1d1d1f",
+  cursor: "#0066cc",
+  cursorAccent: "#ffffff",
+  selectionBackground: "#0066cc26",
+  black: "#1d1d1f",
+  brightBlack: "#7a7a7a",
+  blue: "#0066cc",
+  brightBlue: "#0071e3",
+  cyan: "#0066cc",
+  brightCyan: "#0071e3",
+  green: "#0a7f45",
+  brightGreen: "#0a7f45",
+  magenta: "#5e5ce6",
+  brightMagenta: "#5e5ce6",
+  red: "#b42318",
+  brightRed: "#d92d20",
+  white: "#f5f5f7",
+  brightWhite: "#ffffff",
+  yellow: "#8b5a00",
+  brightYellow: "#8b5a00",
+  scrollbarSliderBackground: "rgba(0, 102, 204, 0.24)",
+  scrollbarSliderHoverBackground: "rgba(0, 102, 204, 0.34)",
+  scrollbarSliderActiveBackground: "rgba(0, 102, 204, 0.46)",
+};
+
+function getCurrentForgeThemeId() {
+  if (typeof document === "undefined") {
+    return "";
+  }
+  return document.documentElement?.dataset?.forgeTheme || "";
+}
+
+function getTerminalThemeForForgeTheme(themeId = getCurrentForgeThemeId()) {
+  return themeId === FORGE_LIGHT_THEME_ID ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME;
+}
 
 function getTerminalStartupDefaultModel(agentKind) {
   return TERMINAL_STARTUP_DEFAULT_MODELS[String(agentKind || "").trim().toLowerCase()] || "";
@@ -808,6 +872,32 @@ function WorkspaceTerminal({
     () => false,
     [],
   );
+  const applyCurrentTerminalTheme = useCallback(() => {
+    const terminal = xtermRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    terminal.options.theme = getTerminalThemeForForgeTheme();
+    if (typeof terminal.refresh === "function") {
+      terminal.refresh(0, Math.max(0, terminal.rows - 1));
+    }
+  }, []);
+  useEffect(() => {
+    applyCurrentTerminalTheme();
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") {
+      return undefined;
+    }
+
+    const root = document.documentElement;
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.some((mutation) => mutation.attributeName === "data-forge-theme")) {
+        applyCurrentTerminalTheme();
+      }
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ["data-forge-theme"] });
+    return () => observer.disconnect();
+  }, [applyCurrentTerminalTheme]);
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -2804,32 +2894,7 @@ function WorkspaceTerminal({
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
       smoothScrollDuration: 0,
       ...(TERMINAL_IS_WINDOWS_HOST ? { windowsPty: buildWindowsPtyOptions() } : {}),
-      theme: {
-        background: TERMINAL_THEME_BACKGROUND,
-        foreground: "#e8eef8",
-        cursor: "#ff9a3d",
-        cursorAccent: "#030508",
-        selectionBackground: "#2f80ff55",
-        black: "#030508",
-        brightBlack: "#687386",
-        blue: "#62a0ff",
-        brightBlue: "#8bb9ff",
-        cyan: "#6fd7ff",
-        brightCyan: "#a7e8ff",
-        green: "#7ee787",
-        brightGreen: "#9dffad",
-        magenta: "#d2a8ff",
-        brightMagenta: "#e1c7ff",
-        red: "#ff6b6b",
-        brightRed: "#ff9a9a",
-        white: "#e8eef8",
-        brightWhite: "#ffffff",
-        yellow: "#ffb269",
-        brightYellow: "#ffd08a",
-        scrollbarSliderBackground: "rgba(172, 185, 207, 0.46)",
-        scrollbarSliderHoverBackground: "rgba(192, 204, 224, 0.62)",
-        scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
-      },
+      theme: getTerminalThemeForForgeTheme(),
     });
     xtermRef.current = terminal;
 

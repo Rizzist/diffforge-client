@@ -6,6 +6,11 @@ import styled from "styled-components";
 import { createWorkspaceDisplayIdentity } from "../workspace/workspaceDisplayIdentity.js";
 import GraphRendererHost from "./renderers/GraphRendererHost.jsx";
 import {
+  knowledgeNodeTypeLabel,
+  normalizeKnowledgeSnapshot,
+  relatedKnowledgeNodes,
+} from "./knowledgeGraphCore.js";
+import {
   field,
   freshnessLabel,
   graphRootNode,
@@ -21,6 +26,7 @@ import {
 } from "./specGraphCore.js";
 
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
+const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
 
 export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
@@ -43,14 +49,26 @@ export default function SpecGraphWorkspaceView({
   const [localIgnoredState, setLocalIgnoredState] = useState("idle");
   const [localIgnoredError, setLocalIgnoredError] = useState("");
   const [viewMode, setViewMode] = useState("graph");
+  const [graphKind, setGraphKind] = useState("specs");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedHistoryNodeId, setSelectedHistoryNodeId] = useState("");
+  const [knowledgeSnapshot, setKnowledgeSnapshot] = useState(null);
+  const [knowledgeError, setKnowledgeError] = useState("");
+  const [knowledgeState, setKnowledgeState] = useState("idle");
+  const [selectedKnowledgeNodeId, setSelectedKnowledgeNodeId] = useState("");
 
   const applySnapshot = useCallback((next) => {
     if (!next || typeof next !== "object") return;
     setSnapshot(next);
     setError(text(next.syncError || next.sync_error));
     setState(text(next.syncState || next.sync_state, "ready"));
+  }, []);
+
+  const applyKnowledgeSnapshot = useCallback((next) => {
+    if (!next || typeof next !== "object") return;
+    setKnowledgeSnapshot(next);
+    setKnowledgeError(text(next.syncError || next.sync_error));
+    setKnowledgeState(text(next.syncState || next.sync_state, "ready"));
   }, []);
 
   const loadLocalIgnoredOverlay = useCallback(() => {
@@ -124,6 +142,69 @@ export default function SpecGraphWorkspaceView({
   }, [applySnapshot, repoPath, workspaceId, workspaceName]);
 
   useEffect(() => {
+    if (!repoPath || !workspaceId) return undefined;
+    let cancelled = false;
+    let unlistenCache = null;
+    let syncGeneration = null;
+
+    setKnowledgeState((current) => (current === "idle" ? "loading" : current));
+
+    invoke("cloud_mcp_get_cached_knowledge_graph", {
+      repoPath,
+      workspaceId,
+      workspaceName: workspaceName || null,
+    })
+      .then((next) => {
+        if (!cancelled) applyKnowledgeSnapshot(next);
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setKnowledgeError(nextError?.message || String(nextError));
+          setKnowledgeState("error");
+        }
+      });
+
+    listen(KNOWLEDGE_GRAPH_CACHE_EVENT, (event) => {
+      const next = event?.payload;
+      if (!next || next.repoPath !== repoPath) return;
+      applyKnowledgeSnapshot(next);
+    }).then((nextUnlisten) => {
+      if (cancelled) {
+        nextUnlisten();
+        return;
+      }
+      unlistenCache = nextUnlisten;
+    });
+
+    invoke("cloud_mcp_start_knowledge_graph_sync", {
+      repoPath,
+      workspaceId,
+      workspaceName: workspaceName || null,
+    })
+      .then((next) => {
+        syncGeneration = Number(next?.syncGeneration) || null;
+        if (!cancelled) applyKnowledgeSnapshot(next);
+        if (cancelled && syncGeneration) {
+          invoke("cloud_mcp_stop_knowledge_graph_sync", { repoPath, syncGeneration }).catch(() => {});
+        }
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setKnowledgeError(nextError?.message || String(nextError));
+          setKnowledgeState("error");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (typeof unlistenCache === "function") unlistenCache();
+      if (syncGeneration) {
+        invoke("cloud_mcp_stop_knowledge_graph_sync", { repoPath, syncGeneration }).catch(() => {});
+      }
+    };
+  }, [applyKnowledgeSnapshot, repoPath, workspaceId, workspaceName]);
+
+  useEffect(() => {
     if (showLocalIgnored) loadLocalIgnoredOverlay();
   }, [loadLocalIgnoredOverlay, showLocalIgnored]);
 
@@ -137,7 +218,16 @@ export default function SpecGraphWorkspaceView({
     }),
     [baseSpecGraph, localIgnoredOverlay, showLocalIgnored, workspaceDisplayIdentity],
   );
+  const knowledgeGraph = useMemo(
+    () => normalizeKnowledgeSnapshot(knowledgeSnapshot, { workspaceDisplayIdentity }),
+    [knowledgeSnapshot, workspaceDisplayIdentity],
+  );
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
+  const selectedKnowledgeNode = selectedFallback(knowledgeGraph.nodes, selectedKnowledgeNodeId);
+  const selectedKnowledgeRelations = useMemo(
+    () => relatedKnowledgeNodes(knowledgeGraph, selectedKnowledgeNode?.id),
+    [knowledgeGraph, selectedKnowledgeNode?.id],
+  );
   const taskHistory = specGraph.taskHistory || { tasks: [] };
   const historyTasks = Array.isArray(taskHistory.tasks) ? taskHistory.tasks : [];
   const selectedTask = historyTasks.find((task) => task.task_id === selectedTaskId) || historyTasks[0] || null;
@@ -154,6 +244,16 @@ export default function SpecGraphWorkspaceView({
       setSelectedNodeId(root?.id || specGraph.nodes[0].id);
     }
   }, [specGraph.edges, specGraph.nodes, selectedNodeId]);
+
+  useEffect(() => {
+    if (
+      knowledgeGraph.nodes.length
+      && !knowledgeGraph.nodes.some((node) => node.id === selectedKnowledgeNodeId)
+    ) {
+      const root = graphRootNode(knowledgeGraph.nodes, knowledgeGraph.edges);
+      setSelectedKnowledgeNodeId(root?.id || knowledgeGraph.nodes[0].id);
+    }
+  }, [knowledgeGraph.edges, knowledgeGraph.nodes, selectedKnowledgeNodeId]);
 
   useEffect(() => {
     if (!historyTasks.length) {
@@ -181,44 +281,100 @@ export default function SpecGraphWorkspaceView({
     <SpecGraphSurface aria-label={`${workspace?.name || "Workspace"} Spec Graph`} data-state={state}>
       {error && <SpecGraphError>{error}</SpecGraphError>}
       {localIgnoredError && <SpecGraphError>{localIgnoredError}</SpecGraphError>}
+      {knowledgeError && graphKind === "knowledge" && <SpecGraphError>{knowledgeError}</SpecGraphError>}
 
       <SpecGraphToolbar>
-        <ViewToggleGroup aria-label="Spec Graph view mode">
+        {graphKind === "specs" ? (
+          <>
+            <ViewToggleGroup aria-label="Spec Graph view mode">
+              <ViewToggleButton
+                type="button"
+                data-active={viewMode === "graph" ? "true" : "false"}
+                onClick={() => setViewMode("graph")}
+              >
+                Graph
+              </ViewToggleButton>
+              <ViewToggleButton
+                type="button"
+                data-active={viewMode === "history" ? "true" : "false"}
+                onClick={() => setViewMode("history")}
+              >
+                History
+              </ViewToggleButton>
+            </ViewToggleGroup>
+            <LocalIgnoredToggle
+              type="button"
+              data-active={showLocalIgnored ? "true" : "false"}
+              onClick={() => {
+                setShowLocalIgnored((current) => !current);
+              }}
+            >
+              {showLocalIgnored ? "Hide local ignored" : "Show local ignored"}
+            </LocalIgnoredToggle>
+            <LocalIgnoredHint>
+              {localIgnoredState === "loading"
+                ? "checking local cache"
+                : showLocalIgnored
+                  ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
+                  : "local only, not synced"}
+            </LocalIgnoredHint>
+          </>
+        ) : (
+          <KnowledgeToolbarSummary>
+            <span>{knowledgeGraph.nodes.length} notes</span>
+            <span>{knowledgeGraph.edges.length} links</span>
+            {Number(knowledgeGraph.graphStats?.missing_paths || 0) > 0 && (
+              <span data-state="missing">{knowledgeGraph.graphStats.missing_paths} missing paths</span>
+            )}
+            <span data-state={knowledgeState}>{knowledgeState}</span>
+          </KnowledgeToolbarSummary>
+        )}
+        <ToolbarSpacer />
+        <ViewToggleGroup aria-label="Graph source">
           <ViewToggleButton
             type="button"
-            data-active={viewMode === "graph" ? "true" : "false"}
-            onClick={() => setViewMode("graph")}
+            data-active={graphKind === "specs" ? "true" : "false"}
+            onClick={() => setGraphKind("specs")}
           >
-            Graph
+            Specs
           </ViewToggleButton>
           <ViewToggleButton
             type="button"
-            data-active={viewMode === "history" ? "true" : "false"}
-            onClick={() => setViewMode("history")}
+            data-active={graphKind === "knowledge" ? "true" : "false"}
+            onClick={() => setGraphKind("knowledge")}
           >
-            History
+            Knowledge
           </ViewToggleButton>
         </ViewToggleGroup>
-        <LocalIgnoredToggle
-          type="button"
-          data-active={showLocalIgnored ? "true" : "false"}
-          onClick={() => {
-            setShowLocalIgnored((current) => !current);
-          }}
-        >
-          {showLocalIgnored ? "Hide local ignored" : "Show local ignored"}
-        </LocalIgnoredToggle>
-        <LocalIgnoredHint>
-          {localIgnoredState === "loading"
-            ? "checking local cache"
-            : showLocalIgnored
-              ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
-              : "local only, not synced"}
-        </LocalIgnoredHint>
       </SpecGraphToolbar>
 
-      <SpecGraphShell>
-        {viewMode === "history" ? (
+      {graphKind === "knowledge" ? (
+        <KnowledgeGraphShell>
+          <KnowledgeOutline
+            nodes={knowledgeGraph.nodes}
+            selectedNodeId={selectedKnowledgeNode?.id}
+            onSelect={setSelectedKnowledgeNodeId}
+          />
+          <SpecGraphMain>
+            <GraphRendererHost
+              nodes={knowledgeGraph.nodes}
+              edges={knowledgeGraph.edges}
+              selectedNodeId={selectedKnowledgeNode?.id}
+              onSelect={setSelectedKnowledgeNodeId}
+              state={knowledgeState}
+              emptyLabel="No knowledge notes indexed yet."
+              layoutLabel="Laying out knowledge graph..."
+            />
+          </SpecGraphMain>
+          <KnowledgeInspector
+            graph={knowledgeGraph}
+            node={selectedKnowledgeNode}
+            relations={selectedKnowledgeRelations}
+          />
+        </KnowledgeGraphShell>
+      ) : (
+        <SpecGraphShell>
+          {viewMode === "history" ? (
           <>
             <TaskHistoryMain
               tasks={historyTasks}
@@ -243,9 +399,159 @@ export default function SpecGraphWorkspaceView({
 
             <SpecInspector node={selectedNode} />
           </>
-        )}
-      </SpecGraphShell>
+          )}
+        </SpecGraphShell>
+      )}
     </SpecGraphSurface>
+  );
+}
+
+function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
+  const visibleNodes = Array.isArray(nodes) ? nodes : [];
+  if (!visibleNodes.length) {
+    return (
+      <KnowledgeOutlinePanel>
+        <KnowledgeOutlineEmpty>No knowledge notes indexed yet.</KnowledgeOutlineEmpty>
+      </KnowledgeOutlinePanel>
+    );
+  }
+
+  return (
+    <KnowledgeOutlinePanel>
+      <KnowledgePanelHeader>
+        <span>Atlas</span>
+        <small>.agents/knowledge</small>
+      </KnowledgePanelHeader>
+      <KnowledgeOutlineList>
+        {visibleNodes.map((node) => (
+          <KnowledgeOutlineButton
+            key={node.id}
+            type="button"
+            data-active={node.id === selectedNodeId ? "true" : "false"}
+            onClick={() => onSelect(node.id)}
+          >
+            <span>{node.display_title || node.title}</span>
+            <small>{knowledgeNodeTypeLabel(node)} · {node.note_path}</small>
+          </KnowledgeOutlineButton>
+        ))}
+      </KnowledgeOutlineList>
+    </KnowledgeOutlinePanel>
+  );
+}
+
+function KnowledgeInspector({ graph, node, relations }) {
+  if (!node) {
+    return (
+      <Inspector>
+        <InspectorEmpty>Select a knowledge note.</InspectorEmpty>
+      </Inspector>
+    );
+  }
+
+  const pathRefs = Array.isArray(node.path_refs) ? node.path_refs : [];
+  const outbound = relations?.outbound || [];
+  const backlinks = relations?.backlinks || [];
+
+  return (
+    <Inspector>
+      <InspectorHeader>
+        <h2>{node.display_title || node.title}</h2>
+        <InspectorFacts>
+          <span>{knowledgeNodeTypeLabel(node)}</span>
+          <span data-state={node.freshness_state}>{node.knowledge_state || node.freshness_state}</span>
+          <span>{pathRefs.length} paths</span>
+          {Number(node.missing_path_count || 0) > 0 && (
+            <span data-state="out_of_spec">{node.missing_path_count} missing</span>
+          )}
+        </InspectorFacts>
+      </InspectorHeader>
+      <MarkdownPane>
+        <KnowledgeMarkdownBlock markdown={node.markdown} />
+        <KnowledgeLinkSection title="Outbound" items={outbound} empty="No linked notes." />
+        <KnowledgeLinkSection title="Backlinks" items={backlinks} empty="No backlinks." />
+        <KnowledgePathSection paths={pathRefs} />
+        <KnowledgeStatsSection graph={graph} />
+      </MarkdownPane>
+    </Inspector>
+  );
+}
+
+function KnowledgeMarkdownBlock({ markdown }) {
+  const lines = text(markdown, "No note content.").split(/\r?\n/);
+  return (
+    <KnowledgeSection>
+      <h3>Note</h3>
+      <KnowledgeMarkdown>
+        {lines.map((line, index) => {
+          const trimmed = line.trim();
+          if (!trimmed) return <br key={`line-${index}`} />;
+          if (trimmed.startsWith("# ")) return <strong key={`line-${index}`}>{trimmed.replace(/^#\s+/, "")}</strong>;
+          if (trimmed.startsWith("## ")) return <b key={`line-${index}`}>{trimmed.replace(/^##\s+/, "")}</b>;
+          return <p key={`line-${index}`}>{trimmed}</p>;
+        })}
+      </KnowledgeMarkdown>
+    </KnowledgeSection>
+  );
+}
+
+function KnowledgeLinkSection({ title, items, empty }) {
+  const visibleItems = Array.isArray(items) ? items : [];
+  return (
+    <KnowledgeSection>
+      <h3>{title}</h3>
+      {visibleItems.length ? (
+        <KnowledgeMiniList>
+          {visibleItems.map(({ edge, node }, index) => (
+            <li key={`${edge.id}-${node.id}-${index}`}>
+              <span>{node.display_title || node.title}</span>
+              <small>{edge.kind || "links_to"} · {node.note_path}</small>
+            </li>
+          ))}
+        </KnowledgeMiniList>
+      ) : (
+        <SpecObjectsEmpty>{empty}</SpecObjectsEmpty>
+      )}
+    </KnowledgeSection>
+  );
+}
+
+function KnowledgePathSection({ paths }) {
+  const visiblePaths = Array.isArray(paths) ? paths : [];
+  return (
+    <KnowledgeSection>
+      <h3>Related Paths</h3>
+      {visiblePaths.length ? (
+        <KnowledgePathList>
+          {visiblePaths.map((pathRef, index) => {
+            const path = text(field(pathRef, "path"), "unknown path");
+            const exists = field(pathRef, "exists") !== false;
+            return (
+              <li key={`${path}-${index}`} data-missing={exists ? "false" : "true"}>
+                <span>{path}</span>
+                <small>{text(field(pathRef, "kind"), exists ? "path" : "missing")}</small>
+              </li>
+            );
+          })}
+        </KnowledgePathList>
+      ) : (
+        <SpecObjectsEmpty>No file or folder anchors recorded.</SpecObjectsEmpty>
+      )}
+    </KnowledgeSection>
+  );
+}
+
+function KnowledgeStatsSection({ graph }) {
+  const stats = graph?.graphStats || {};
+  return (
+    <KnowledgeSection>
+      <h3>Atlas Stats</h3>
+      <KnowledgeStatsGrid>
+        <span><strong>{graph?.nodes?.length || 0}</strong> notes</span>
+        <span><strong>{graph?.edges?.length || 0}</strong> links</span>
+        <span><strong>{Number(stats.flow_notes || 0)}</strong> flows</span>
+        <span><strong>{Number(stats.area_notes || 0)}</strong> areas</span>
+      </KnowledgeStatsGrid>
+    </KnowledgeSection>
   );
 }
 
@@ -817,6 +1123,25 @@ const SpecGraphSurface = styled.section`
   display: flex;
   flex-direction: column;
   gap: 10px;
+
+  html[data-forge-theme="light"] & {
+    --history-bg: #ffffff;
+    --history-panel: #ffffff;
+    --history-panel-soft: #fafafc;
+    --history-panel-muted: #f5f5f7;
+    --history-border: rgba(0, 0, 0, 0.08);
+    --history-border-strong: rgba(0, 0, 0, 0.14);
+    --history-text: #1d1d1f;
+    --history-muted: #7a7a7a;
+    --history-subtle: #a1a1a6;
+    --history-blue: #0066cc;
+    --history-green: #0a7f45;
+    --history-amber: #8b5a00;
+    --history-orange: #8b5a00;
+    --history-red: #b42318;
+    background: var(--forge-bg);
+    color: var(--forge-text);
+  }
 `;
 
 const SpecGraphError = styled.div`
@@ -863,6 +1188,41 @@ const ViewToggleButton = styled.button`
   }
 `;
 
+const ToolbarSpacer = styled.div`
+  flex: 1;
+`;
+
+const KnowledgeToolbarSummary = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 7px;
+  min-width: 0;
+
+  span {
+    border: 1px solid var(--history-border);
+    border-radius: 999px;
+    color: var(--history-muted);
+    font-size: 10px;
+    font-weight: 760;
+    line-height: 1;
+    padding: 6px 9px;
+    text-transform: uppercase;
+  }
+
+  span[data-state="ready"],
+  span[data-state="fresh"],
+  span[data-state="local"] {
+    border-color: rgba(138, 168, 146, 0.3);
+    color: var(--history-green);
+  }
+
+  span[data-state="missing"],
+  span[data-state="error"] {
+    border-color: rgba(185, 135, 109, 0.34);
+    color: var(--history-orange);
+  }
+`;
+
 const LocalIgnoredToggle = styled.button`
   background: rgba(15, 23, 42, 0.88);
   border: 1px solid rgba(148, 163, 184, 0.32);
@@ -904,6 +1264,30 @@ const SpecGraphShell = styled.div`
   min-height: 0;
   flex: 1;
   overflow: hidden;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(360px, 1fr) minmax(260px, 40%);
+  }
+`;
+
+const KnowledgeGraphShell = styled.div`
+  align-items: stretch;
+  display: grid;
+  grid-template-columns: minmax(210px, 250px) minmax(0, 1fr) minmax(280px, 34%);
+  gap: 10px;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+
+  @media (max-width: 1100px) {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 38%);
+    > aside:first-child {
+      display: none;
+    }
+  }
 
   @media (max-width: 900px) {
     grid-template-columns: 1fr;
@@ -1430,6 +1814,86 @@ const HistoryNodeEmpty = styled.div`
   padding: 10px 2px 0;
 `;
 
+const KnowledgeOutlinePanel = styled.aside`
+  border: 1px solid var(--history-border);
+  border-radius: 8px;
+  background: var(--history-bg);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const KnowledgePanelHeader = styled.header`
+  border-bottom: 1px solid var(--history-border);
+  display: grid;
+  gap: 2px;
+  padding: 11px 12px;
+
+  span {
+    color: var(--history-text);
+    font-size: 12px;
+    font-weight: 780;
+  }
+
+  small {
+    color: var(--history-subtle);
+    font-size: 10px;
+    font-weight: 680;
+  }
+`;
+
+const KnowledgeOutlineList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+`;
+
+const KnowledgeOutlineButton = styled.button`
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  background: var(--history-panel);
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  text-align: left;
+  transition: border-color 160ms ease, background 160ms ease;
+
+  span {
+    color: var(--history-text);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.28;
+    overflow-wrap: anywhere;
+  }
+
+  small {
+    color: var(--history-subtle);
+    font-size: 9.5px;
+    font-weight: 620;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+  }
+
+  &[data-active="true"] {
+    border-color: var(--history-border-strong);
+    background: var(--history-panel-soft);
+    box-shadow: inset 2px 0 0 var(--history-blue);
+  }
+`;
+
+const KnowledgeOutlineEmpty = styled.div`
+  color: var(--history-muted);
+  font-size: 12px;
+  font-weight: 620;
+  padding: 14px;
+`;
+
 const Inspector = styled.aside`
   border: 1px solid var(--history-border);
   border-radius: 8px;
@@ -1526,6 +1990,97 @@ const SpecObjectsSection = styled.section`
     letter-spacing: 0.06em;
     margin: 0 0 8px;
     text-transform: uppercase;
+  }
+`;
+
+const KnowledgeSection = styled(SpecObjectsSection)``;
+
+const KnowledgeMarkdown = styled.div`
+  display: grid;
+  gap: 7px;
+
+  strong,
+  b {
+    color: var(--history-text);
+    display: block;
+    font-size: 12px;
+    font-weight: 760;
+    line-height: 1.35;
+  }
+
+  b {
+    color: var(--history-blue);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  p {
+    color: var(--history-muted);
+    font-size: 11.5px;
+    font-weight: 560;
+    line-height: 1.48;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const KnowledgeMiniList = styled.ul`
+  display: grid;
+  gap: 7px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+
+  li {
+    border: 1px solid var(--history-border);
+    border-radius: 7px;
+    background: var(--history-panel);
+    display: grid;
+    gap: 4px;
+    padding: 9px;
+  }
+
+  span {
+    color: var(--history-text);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  small {
+    color: var(--history-subtle);
+    font-size: 10px;
+    font-weight: 620;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const KnowledgePathList = styled(KnowledgeMiniList)`
+  li[data-missing="true"] {
+    border-color: rgba(185, 135, 109, 0.34);
+    background: rgba(67, 40, 24, 0.2);
+  }
+`;
+
+const KnowledgeStatsGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+
+  span {
+    border: 1px solid var(--history-border);
+    border-radius: 7px;
+    background: var(--history-panel);
+    color: var(--history-muted);
+    font-size: 10.5px;
+    font-weight: 650;
+    padding: 9px;
+  }
+
+  strong {
+    color: var(--history-text);
+    font-size: 13px;
+    margin-right: 4px;
   }
 `;
 

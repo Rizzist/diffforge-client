@@ -59,6 +59,10 @@ const TerminalWorkspaceMain = styled.div`
   min-height: 0;
   display: flex;
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f5f7;
+  }
 `;
 
 const TerminalPanelAnchor = styled.div`
@@ -69,6 +73,10 @@ const TerminalPanelAnchor = styled.div`
   min-height: 0;
   background: #020304;
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 
   &[data-terminal-drag-placeholder="true"]::after {
     position: absolute;
@@ -88,6 +96,10 @@ const TerminalSurfaceLayer = styled.div`
   overflow: visible;
   background: #020304;
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 `;
 
 const TerminalSurfaceSlot = styled.div`
@@ -109,6 +121,10 @@ const TerminalSurfaceSlot = styled.div`
     filter 140ms ease,
     opacity 140ms ease;
   will-change: width, height, transform;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 
   &[data-terminal-hidden="true"] {
     visibility: hidden;
@@ -161,6 +177,12 @@ const TodoQueueSurface = styled.aside`
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
     rgba(5, 8, 13, 0.96);
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(0, 0, 0, 0.08);
+    color: #1d1d1f;
+    background: #f5f5f7;
+  }
 `;
 
 const OrchestratorTopNav = styled.div`
@@ -169,6 +191,12 @@ const OrchestratorTopNav = styled.div`
   min-height: 40px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background: rgba(2, 4, 8, 0.44);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background: rgba(245, 245, 247, 0.86);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 const OrchestratorTopButton = styled.button`
@@ -208,6 +236,17 @@ const OrchestratorTopButton = styled.button`
     color: #f7fafc;
     background: rgba(47, 128, 255, 0.16);
   }
+
+  html[data-forge-theme="light"] & {
+    border-right-color: rgba(0, 0, 0, 0.07);
+    color: #333333;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:not(:disabled):hover {
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 const OrchestratorView = styled.div`
@@ -225,6 +264,11 @@ const OrchestratorVoiceArea = styled.div`
   background:
     radial-gradient(circle at center, rgba(98, 160, 255, 0.14), transparent 62%),
     rgba(2, 4, 8, 0.26);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background: #ffffff;
+  }
 `;
 
 const OrchestratorVoiceButton = styled.button`
@@ -257,6 +301,17 @@ const OrchestratorVoiceButton = styled.button`
   &:active {
     transform: scale(0.98);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.2);
+    background: #fafafc;
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.34);
+    box-shadow: none;
+  }
 `;
 
 const OrchestratorVoiceLogo = styled.img.attrs({
@@ -275,6 +330,10 @@ const OrchestratorSectionTabs = styled.div`
   grid-template-columns: 1fr 1fr;
   min-height: 38px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+  }
 `;
 
 const OrchestratorSectionButton = styled.button`
@@ -306,6 +365,18 @@ const OrchestratorSectionButton = styled.button`
     color: #f7fafc;
     background: rgba(47, 128, 255, 0.16);
   }
+
+  html[data-forge-theme="light"] & {
+    border-right-color: rgba(0, 0, 0, 0.07);
+    color: #7a7a7a;
+    background: #fafafc;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover {
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 const OrchestratorContent = styled.div`
@@ -325,6 +396,11 @@ const OrchestratorHistoryView = styled.div`
   background: rgba(2, 4, 8, 0.76);
   font-size: 12px;
   font-weight: 720;
+
+  html[data-forge-theme="light"] & {
+    color: #7a7a7a;
+    background: #ffffff;
+  }
 `;
 
 const WorkspaceToolSurface = styled.div`
@@ -346,6 +422,10 @@ const WorkspaceToolSurface = styled.div`
 
   &[data-tool="files"] {
     background: var(--files-vscode-editor, #030405);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
   }
 `;
 
@@ -395,6 +475,20 @@ const TodoQueueTextArea = styled.textarea`
       0 0 0 1px rgba(98, 160, 255, 0.12),
       0 0 22px rgba(47, 128, 255, 0.08);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #7a7a7a;
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    background: #ffffff;
+    box-shadow: inset 0 0 0 1px rgba(0, 102, 204, 0.2);
+  }
 `;
 
 const TodoQueueList = styled.div`
@@ -440,6 +534,18 @@ const TodoQueueItemCard = styled.article`
 
   &:hover {
     background: rgba(47, 128, 255, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    color: #0066cc;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 102, 204, 0.06);
   }
 
   &:active {
@@ -491,6 +597,11 @@ const TodoQueueItemImageFrame = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
   background: rgba(2, 4, 8, 0.34);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #fafafc;
+  }
 `;
 
 const TodoQueueItemImage = styled.img.attrs({ draggable: false })`
@@ -515,6 +626,11 @@ const TodoQueueItemNoteFrame = styled.div`
   background:
     linear-gradient(180deg, rgba(98, 160, 255, 0.12), rgba(255, 255, 255, 0.025)),
     rgba(2, 4, 8, 0.34);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #fafafc;
+  }
 `;
 
 const TodoQueueItemNoteTitle = styled.div`
@@ -526,6 +642,10 @@ const TodoQueueItemNoteTitle = styled.div`
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
 `;
 
 const TodoQueueItemNoteIcon = styled.div`
@@ -538,6 +658,12 @@ const TodoQueueItemNoteIcon = styled.div`
   border-radius: 5px;
   background: rgba(13, 17, 23, 0.7);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: #ffffff;
+    box-shadow: none;
+  }
 
   &::before {
     position: absolute;
@@ -573,6 +699,10 @@ const TodoQueueItemText = styled.p`
   font-size: 12px;
   font-weight: 690;
   line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
 `;
 
 const TodoQueueItemEditor = styled.textarea`
@@ -589,6 +719,10 @@ const TodoQueueItemEditor = styled.textarea`
   font-weight: 690;
   line-height: 1.45;
   font-family: inherit;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
 `;
 
 const TodoQueueDraftBullet = styled.span`
@@ -605,6 +739,10 @@ const TodoQueueDraftBullet = styled.span`
 
   &::before {
     content: "\\2022";
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0066cc;
   }
 `;
 
@@ -636,6 +774,11 @@ const TodoQueueDeleteButton = styled.button`
     border-color: rgba(239, 107, 107, 0.34);
     background: rgba(239, 107, 107, 0.16);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.08);
+  }
 `;
 
 const TodoQueueError = styled.div`
@@ -652,6 +795,12 @@ const TodoQueueError = styled.div`
   font-size: 11px;
   font-weight: 720;
   line-height: 1.4;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(180, 35, 24, 0.2);
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.08);
+  }
 `;
 
 const TodoDragPreview = styled.div`
@@ -678,6 +827,13 @@ const TodoDragPreview = styled.div`
   pointer-events: none;
   transform: translate3d(var(--todo-drag-x, 0px), var(--todo-drag-y, 0px), 0);
   will-change: transform;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.28);
+    color: #1d1d1f;
+    background: #ffffff;
+    box-shadow: none;
+  }
 `;
 
 const TodoDragPreviewText = styled.div`

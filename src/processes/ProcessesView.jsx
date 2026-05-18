@@ -1166,6 +1166,10 @@ const ProcessSurface = styled.section`
     rgba(13, 17, 23, 0.18);
   background-size: 72px 72px, 72px 72px, auto;
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
+
   @media (max-width: 760px) {
     padding: 12px;
   }
@@ -1214,6 +1218,10 @@ const ProcessMetric = styled.span`
   border-radius: 8px;
   background: rgba(21, 27, 35, 0.56);
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
   span {
     color: var(--forge-text-muted);
     font-size: 10px;
@@ -1260,6 +1268,10 @@ const ProcessInlineMessage = styled.p`
     color: #ffc8c8;
     background: rgba(239, 107, 107, 0.08);
   }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 const ProcessDockerLogPanel = styled.section`
@@ -1271,6 +1283,10 @@ const ProcessDockerLogPanel = styled.section`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(8, 11, 16, 0.72);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 
   &[data-state="done"] {
     border-color: rgba(60, 203, 127, 0.2);
@@ -1333,6 +1349,11 @@ const ProcessDockerLogEntry = styled.article`
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 7px;
   background: rgba(21, 27, 35, 0.44);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 
   &[data-success="true"] {
     border-color: rgba(60, 203, 127, 0.18);
@@ -1413,6 +1434,10 @@ const ProcessDockerCommandLine = styled.code`
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 10px;
   line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-soft);
+  }
 `;
 
 const ProcessDockerOutput = styled.pre`
@@ -1429,6 +1454,12 @@ const ProcessDockerOutput = styled.pre`
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-soft);
+    background: var(--forge-surface);
+  }
 `;
 
 const ProcessBucketsGrid = styled.div`
@@ -1491,6 +1522,15 @@ const ProcessBucketRow = styled.div`
   &:hover,
   &:focus-within {
     background: rgba(230, 236, 245, 0.045);
+  }
+
+  html[data-forge-theme="light"] &[data-hot="true"] {
+    background: rgba(0, 102, 204, 0.04);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-within {
+    background: rgba(0, 102, 204, 0.06);
   }
 `;
 
@@ -1641,6 +1681,18 @@ const ProcessDockerActionButton = styled.button`
     background: rgba(255, 255, 255, 0.1);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: var(--forge-surface);
+  }
+
   &[data-danger="true"]:hover:not(:disabled) {
     border-color: rgba(239, 107, 107, 0.42);
     color: #ffc8c8;
@@ -1683,6 +1735,18 @@ const ProcessRowStopButton = styled.button`
     background: rgba(255, 255, 255, 0.12);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(180, 35, 24, 0.24);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.08);
+  }
+
   &:disabled {
     opacity: 0.22;
     cursor: default;
@@ -1698,6 +1762,11 @@ const ProcessConfirmOverlay = styled.div`
   padding: 16px;
   background: rgba(3, 5, 8, 0.54);
   backdrop-filter: blur(10px);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(245, 245, 247, 0.76);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 const ProcessConfirmDialog = styled.section`
@@ -1711,6 +1780,11 @@ const ProcessConfirmDialog = styled.section`
     linear-gradient(180deg, rgba(244, 247, 250, 0.04), rgba(244, 247, 250, 0.012)),
     rgba(13, 17, 23, 0.98);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 `;
 
 const ProcessConfirmActions = styled.div`

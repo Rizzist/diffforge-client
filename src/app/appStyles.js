@@ -11,6 +11,7 @@ import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
 import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
+import { DarkMode } from "@styled-icons/material-rounded/DarkMode";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { FolderOpen } from "@styled-icons/material-rounded/FolderOpen";
@@ -20,6 +21,7 @@ import { Hub } from "@styled-icons/material-rounded/Hub";
 import { Key } from "@styled-icons/material-rounded/Key";
 import { KeyboardDoubleArrowLeft } from "@styled-icons/material-rounded/KeyboardDoubleArrowLeft";
 import { KeyboardDoubleArrowRight } from "@styled-icons/material-rounded/KeyboardDoubleArrowRight";
+import { LightMode } from "@styled-icons/material-rounded/LightMode";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
 import { Memory } from "@styled-icons/material-rounded/Memory";
@@ -39,6 +41,7 @@ export const VIEW_TRANSITION_MS = 170;
 export const AUTH_TILE_SIZE = 40;
 
 const TERMINAL_THEME_BACKGROUND = "#020304";
+const TERMINAL_THEME_BACKGROUND_LIGHT = "#ffffff";
 const TERMINAL_PANE_MIN_WIDTH_PX = 180;
 const TERMINAL_PANE_MIN_HEIGHT_PX = 96;
 const FILES_VSCODE_THEME_VARS = `
@@ -57,6 +60,24 @@ const FILES_VSCODE_THEME_VARS = `
   --files-vscode-text-muted: #7f8793;
   --files-vscode-blue: #4fa3ff;
   --files-vscode-focus: #3c8fdc;
+
+  html[data-forge-theme="light"] & {
+    --files-vscode-activity: #f5f5f7;
+    --files-vscode-sidebar: #f5f5f7;
+    --files-vscode-editor: #ffffff;
+    --files-vscode-editor-gutter: #fafafc;
+    --files-vscode-tab: #f5f5f7;
+    --files-vscode-tab-active: #ffffff;
+    --files-vscode-border: #e0e0e0;
+    --files-vscode-border-subtle: #ededf0;
+    --files-vscode-hover: rgba(0, 0, 0, 0.045);
+    --files-vscode-selection: rgba(0, 102, 204, 0.16);
+    --files-vscode-selection-inactive: rgba(0, 0, 0, 0.055);
+    --files-vscode-text: #1d1d1f;
+    --files-vscode-text-muted: #7a7a7a;
+    --files-vscode-blue: #0066cc;
+    --files-vscode-focus: #0071e3;
+  }
 `;
 
 export const GlobalStyle = createGlobalStyle`
@@ -80,9 +101,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
     --forge-red: #ef6b6b;
+    --forge-color-scheme: dark;
     color: var(--forge-text);
     background: var(--forge-bg);
-    color-scheme: dark;
+    color-scheme: var(--forge-color-scheme, dark);
     font-family:
       "Segoe UI Variable",
       Inter,
@@ -94,6 +116,82 @@ export const GlobalStyle = createGlobalStyle`
       sans-serif;
     font-synthesis: none;
     text-rendering: optimizeLegibility;
+  }
+
+  html[data-forge-theme="dark"] {
+    --forge-bg: #07090d;
+    --forge-bg-deep: #020304;
+    --forge-surface: #0d1117;
+    --forge-surface-raised: #11161d;
+    --forge-surface-control: #151b23;
+    --forge-surface-hover: rgba(230, 236, 245, 0.055);
+    --forge-surface-selected: rgba(125, 160, 205, 0.12);
+    --forge-border: rgba(230, 236, 245, 0.1);
+    --forge-border-strong: rgba(230, 236, 245, 0.16);
+    --forge-text: #f4f7fa;
+    --forge-text-soft: #b6c0cc;
+    --forge-text-muted: #7a8493;
+    --forge-text-disabled: #505966;
+    --forge-blue: #3b82f6;
+    --forge-blue-soft: #7db0ff;
+    --forge-amber: #dfa55a;
+    --forge-ember: #d97935;
+    --forge-green: #3ccb7f;
+    --forge-red: #ef6b6b;
+    --forge-color-scheme: dark;
+  }
+
+  html[data-forge-theme="light"] {
+    --forge-bg: #f5f5f7;
+    --forge-bg-deep: #ffffff;
+    --forge-surface: #ffffff;
+    --forge-surface-raised: #ffffff;
+    --forge-surface-control: #fafafc;
+    --forge-surface-hover: rgba(0, 0, 0, 0.045);
+    --forge-surface-selected: rgba(0, 102, 204, 0.1);
+    --forge-border: rgba(0, 0, 0, 0.08);
+    --forge-border-strong: rgba(0, 0, 0, 0.14);
+    --forge-text: #1d1d1f;
+    --forge-text-soft: #333333;
+    --forge-text-muted: #7a7a7a;
+    --forge-text-disabled: #a1a1a6;
+    --forge-blue: #0066cc;
+    --forge-blue-soft: #0071e3;
+    --forge-amber: #8b5a00;
+    --forge-ember: #0066cc;
+    --forge-green: #0a7f45;
+    --forge-red: #b42318;
+    --forge-color-scheme: light;
+    --forge-light-canvas: #ffffff;
+    --forge-light-parchment: #f5f5f7;
+    --forge-light-pearl: #fafafc;
+    --forge-light-hairline: #e0e0e0;
+    --forge-light-ink: #1d1d1f;
+    --forge-light-muted: #7a7a7a;
+    --forge-light-dark-tile: #272729;
+  }
+
+  html[data-forge-theme="light"] * {
+    scrollbar-color: rgba(0, 102, 204, 0.34) rgba(245, 245, 247, 0.9);
+  }
+
+  html[data-forge-theme="light"] *::-webkit-scrollbar-track {
+    background: #f5f5f7;
+  }
+
+  html[data-forge-theme="light"] *::-webkit-scrollbar-thumb {
+    border-color: #f5f5f7;
+    background: #d2d2d7;
+    background-clip: padding-box;
+  }
+
+  html[data-forge-theme="light"] *::-webkit-scrollbar-thumb:hover {
+    background: #b8b8bd;
+    background-clip: padding-box;
+  }
+
+  html[data-forge-theme="light"] *::-webkit-scrollbar-corner {
+    background: #f5f5f7;
   }
 
   * {
@@ -144,6 +242,10 @@ export const GlobalStyle = createGlobalStyle`
     background:
       linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(7, 9, 13, 0) 36rem),
       var(--forge-bg);
+  }
+
+  html[data-forge-theme="light"] body {
+    background: var(--forge-bg);
   }
 
   html[data-window-platform="macos"],
@@ -207,6 +309,11 @@ export const AppFrame = styled.div`
     border-radius: 12px;
     box-shadow: 0 18px 60px rgba(0, 0, 0, 0.36);
     overflow: hidden;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="macos"][data-window-expanded="false"] {
+    border-color: var(--forge-border);
+    box-shadow: none;
   }
 `;
 
@@ -308,6 +415,12 @@ export const WindowTitleBar = styled.header`
   &[data-platform="macos"] {
     grid-template-columns: auto minmax(0, 1fr);
   }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: var(--forge-border);
+    color: var(--forge-text);
+    background: var(--forge-bg);
+  }
 `;
 
 export const WindowTitle = styled.div`
@@ -334,6 +447,10 @@ export const WindowTitle = styled.div`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
   }
 
   ${WindowTitleBar}[data-platform="macos"] & {
@@ -379,7 +496,21 @@ export const WindowControlButton = styled.button`
     background: rgba(255, 255, 255, 0.09);
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-text);
+    background: rgba(0, 0, 0, 0.055);
+  }
+
   &[data-variant="close"]:hover {
+    color: #ffffff;
+    background: #d83b32;
+  }
+
+  html[data-forge-theme="light"] &[data-variant="close"]:hover {
     color: #ffffff;
     background: #d83b32;
   }
@@ -394,8 +525,16 @@ export const WindowControlButton = styled.button`
     box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.12);
   }
 
+  html[data-forge-theme="light"] &[data-platform="macos"] {
+    color: rgba(0, 0, 0, 0.64);
+  }
+
   &[data-platform="macos"][data-action="close"] {
     order: 1;
+    background: #ff5f57;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="macos"][data-action="close"]:hover {
     background: #ff5f57;
   }
 
@@ -404,8 +543,16 @@ export const WindowControlButton = styled.button`
     background: #ffbd2e;
   }
 
+  html[data-forge-theme="light"] &[data-platform="macos"][data-action="minimize"]:hover {
+    background: #ffbd2e;
+  }
+
   &[data-platform="macos"][data-action="maximize"] {
     order: 3;
+    background: #28c840;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="macos"][data-action="maximize"]:hover {
     background: #28c840;
   }
 
@@ -438,20 +585,34 @@ export const WindowControlButton = styled.button`
     color: #c9d2dc;
   }
 
+  html[data-forge-theme="light"] &[data-platform="linux"] {
+    color: var(--forge-text-muted);
+  }
+
   &[data-platform="linux"]:hover {
     color: #ffffff;
     background: rgba(230, 236, 245, 0.08);
   }
 
+  html[data-forge-theme="light"] &[data-platform="linux"]:hover {
+    color: var(--forge-text);
+    background: rgba(0, 0, 0, 0.055);
+  }
+
   &[data-platform="linux"][data-variant="close"]:hover {
     background: rgba(216, 59, 50, 0.86);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="linux"][data-variant="close"]:hover {
+    color: #ffffff;
+    background: #d83b32;
   }
 `;
 
 export const AppContent = styled.div`
   min-height: 0;
   overflow: auto;
-  background: #000000;
+  background: var(--forge-bg);
 `;
 
 export const workspaceCloseSpin = keyframes`
@@ -474,6 +635,11 @@ export const WorkspaceCloseOverlay = styled.div`
     linear-gradient(135deg, rgba(255, 122, 24, 0.12), rgba(3, 5, 8, 0) 42%),
     rgba(3, 5, 8, 0.9);
   backdrop-filter: blur(18px);
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: rgba(245, 245, 247, 0.86);
+  }
 `;
 
 export const WorkspaceClosePanel = styled.section`
@@ -489,6 +655,12 @@ export const WorkspaceClosePanel = styled.section`
     linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02)),
     rgba(8, 13, 20, 0.96);
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.56);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 `;
 
 export const WorkspaceCloseSpinner = styled.div`
@@ -499,6 +671,12 @@ export const WorkspaceCloseSpinner = styled.div`
   border-right-color: #ff9a3d;
   border-radius: 50%;
   animation: ${workspaceCloseSpin} 760ms linear infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.18);
+    border-top-color: var(--forge-blue);
+    border-right-color: var(--forge-blue-soft);
+  }
 `;
 
 export const WorkspaceCloseTitle = styled.h2`
@@ -508,6 +686,10 @@ export const WorkspaceCloseTitle = styled.h2`
   font-weight: 900;
   line-height: 1.2;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const WorkspaceCloseDetail = styled.p`
@@ -518,6 +700,10 @@ export const WorkspaceCloseDetail = styled.p`
   font-weight: 700;
   line-height: 1.48;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const WorkspaceCloseCounter = styled.p`
@@ -531,6 +717,12 @@ export const WorkspaceCloseCounter = styled.p`
   font-weight: 900;
   line-height: 1.25;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.18);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 export const WorkspaceCloseProgressTrack = styled.div`
@@ -539,6 +731,10 @@ export const WorkspaceCloseProgressTrack = styled.div`
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.08);
+  }
 `;
 
 export const WorkspaceCloseProgressBar = styled.div`
@@ -547,6 +743,10 @@ export const WorkspaceCloseProgressBar = styled.div`
   border-radius: inherit;
   background: linear-gradient(90deg, #62a0ff, #ff9a3d);
   transition: width 180ms ease;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-blue);
+  }
 `;
 
 export const splashPulse = keyframes`
@@ -753,6 +953,17 @@ export const SplashScreen = styled.main`
       inset: 12px;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: var(--forge-bg);
+    background-size: auto;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    border-color: var(--forge-border);
+    background: rgba(255, 255, 255, 0.72);
+  }
 `;
 
 export const AmbientPanel = styled.div`
@@ -801,6 +1012,18 @@ export const AmbientPanel = styled.div`
     color: rgba(255, 154, 61, 0.56);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: rgba(255, 255, 255, 0.74);
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] & span,
+  html[data-forge-theme="light"] & p:last-child {
+    color: var(--forge-blue);
+  }
+
   @media (max-width: 980px) {
     display: none;
   }
@@ -827,6 +1050,10 @@ export const SplashLogo = styled.img`
     drop-shadow(0 0 28px rgba(255, 122, 24, 0.28));
   animation: ${splashPulse} 2.8s ease-in-out infinite;
 
+  html[data-forge-theme="light"] & {
+    filter: none;
+  }
+
   @media (max-width: 760px) {
     width: clamp(112px, 24vh, 184px);
     height: clamp(112px, 24vh, 184px);
@@ -842,6 +1069,11 @@ export const SplashTitle = styled.h1`
   line-height: 1;
   text-shadow: 0 0 24px rgba(47, 128, 255, 0.22);
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    text-shadow: none;
+  }
+
   @media (max-width: 760px) {
     font-size: 42px;
   }
@@ -853,6 +1085,10 @@ export const SplashTagline = styled.p`
   font-size: clamp(15px, 2.2vw, 19px);
   font-weight: 650;
   line-height: 1.5;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 
   @media (max-width: 760px) {
     font-size: 16px;
@@ -871,6 +1107,12 @@ export const LoadingTrack = styled.div`
     inset 0 0 12px rgba(255, 255, 255, 0.12),
     0 0 18px rgba(47, 128, 255, 0.28);
 
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.24);
+    background: rgba(0, 102, 204, 0.14);
+    box-shadow: none;
+  }
+
   &[data-state="offline"] {
     border-color: rgba(255, 107, 107, 0.42);
     background:
@@ -879,6 +1121,12 @@ export const LoadingTrack = styled.div`
     box-shadow:
       inset 0 0 12px rgba(255, 255, 255, 0.07),
       0 0 18px rgba(255, 107, 107, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-state="offline"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    background: rgba(180, 35, 24, 0.08);
+    box-shadow: none;
   }
 `;
 
@@ -897,6 +1145,11 @@ export const LoadingFill = styled.div`
     0 0 14px rgba(255, 122, 24, 0.62),
     0 0 18px rgba(255, 154, 61, 0.4);
   animation: ${loadingOrangeSweep} 1.55s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-blue);
+    box-shadow: none;
+  }
 `;
 
 export const LoadingText = styled.p`
@@ -904,6 +1157,10 @@ export const LoadingText = styled.p`
   color: #d1d8e2;
   font-size: 16px;
   font-weight: 720;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const LoadingDetail = styled.p`
@@ -912,6 +1169,10 @@ export const LoadingDetail = styled.p`
   font-size: 13px;
   font-weight: 620;
   line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const LaunchStatusPanel = styled.div`
@@ -929,11 +1190,22 @@ export const LaunchStatusPanel = styled.div`
   text-align: left;
   box-shadow: 0 20px 54px rgba(0, 0, 0, 0.22);
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
+
   &[data-state="offline"] {
     border-color: rgba(255, 107, 107, 0.32);
     background:
       linear-gradient(145deg, rgba(255, 107, 107, 0.12), rgba(255, 122, 24, 0.08)),
       rgba(6, 9, 16, 0.78);
+  }
+
+  html[data-forge-theme="light"] &[data-state="offline"] {
+    border-color: rgba(180, 35, 24, 0.2);
+    background: var(--forge-surface);
   }
 
   &[data-state="update"],
@@ -942,6 +1214,12 @@ export const LaunchStatusPanel = styled.div`
     background:
       linear-gradient(145deg, rgba(255, 122, 24, 0.12), rgba(47, 128, 255, 0.07)),
       rgba(6, 9, 16, 0.78);
+  }
+
+  html[data-forge-theme="light"] &[data-state="update"],
+  html[data-forge-theme="light"] &[data-state="warning"] {
+    border-color: rgba(0, 102, 204, 0.2);
+    background: var(--forge-surface);
   }
 
   @media (max-width: 520px) {
@@ -961,10 +1239,22 @@ export const LaunchStatusIcon = styled.span`
   color: #62a0ff;
   background: rgba(47, 128, 255, 0.14);
 
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
   &[data-state="offline"] {
     border-color: rgba(255, 107, 107, 0.4);
     color: #ffb1b1;
     background: rgba(255, 107, 107, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-state="offline"] {
+    border-color: rgba(180, 35, 24, 0.2);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.08);
   }
 
   &[data-state="update"],
@@ -972,6 +1262,13 @@ export const LaunchStatusIcon = styled.span`
     border-color: rgba(255, 122, 24, 0.42);
     color: #ffb269;
     background: rgba(255, 122, 24, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-state="update"],
+  html[data-forge-theme="light"] &[data-state="warning"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
   }
 `;
 
@@ -1011,6 +1308,10 @@ export const LoginScreen = styled.main`
   isolation: isolate;
   overflow: hidden;
   background: #030508;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 `;
 
 export const LoginLayout = styled.div`
@@ -1076,6 +1377,32 @@ export const SquareField = styled.div`
     --square-overlay-bottom: rgba(0, 0, 0, 0.52);
     --square-pulse-bg: rgba(104, 110, 120, 0.72);
     --square-pulse-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+  }
+
+  html[data-forge-theme="light"] & {
+    --square-field-bg: #f5f5f7;
+    --square-grid-x: rgba(0, 0, 0, 0.04);
+    --square-grid-y: rgba(0, 0, 0, 0.035);
+    --square-overlay-left: rgba(245, 245, 247, 0.78);
+    --square-overlay-mid: rgba(245, 245, 247, 0.2);
+    --square-overlay-right: rgba(245, 245, 247, 0.74);
+    --square-overlay-top: rgba(245, 245, 247, 0.16);
+    --square-overlay-bottom: rgba(245, 245, 247, 0.7);
+    --square-pulse-bg: rgba(255, 255, 255, 0.82);
+    --square-pulse-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="quiet"] {
+    --square-field-bg: #ffffff;
+    --square-grid-x: rgba(0, 0, 0, 0.032);
+    --square-grid-y: rgba(0, 0, 0, 0.028);
+    --square-overlay-left: rgba(255, 255, 255, 0.8);
+    --square-overlay-mid: rgba(255, 255, 255, 0.18);
+    --square-overlay-right: rgba(255, 255, 255, 0.76);
+    --square-overlay-top: rgba(255, 255, 255, 0.16);
+    --square-overlay-bottom: rgba(255, 255, 255, 0.72);
+    --square-pulse-bg: rgba(0, 102, 204, 0.08);
+    --square-pulse-shadow: inset 0 0 0 1px rgba(0, 102, 204, 0.06);
   }
 
   &::after {
@@ -1151,6 +1478,16 @@ export const BrandMark = styled.a`
       drop-shadow(0 0 10px rgba(47, 128, 255, 0.28))
       drop-shadow(0 0 12px rgba(255, 122, 24, 0.18));
   }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & img {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    filter: none;
+  }
 `;
 
 export const IntroCopy = styled.div`
@@ -1176,6 +1513,10 @@ export const Headline = styled.h1`
   letter-spacing: 0;
   line-height: 0.98;
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
+
   @media (max-width: 860px) {
     font-size: clamp(40px, 13vw, 58px);
   }
@@ -1193,6 +1534,10 @@ export const Lede = styled.p`
   font-size: clamp(15px, 2vw, 18px);
   line-height: 1.62;
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+
   @media (max-height: 720px) and (min-width: 861px) {
     line-height: 1.45;
   }
@@ -1206,6 +1551,10 @@ export const IntroFeatureList = styled.ul`
   padding: 20px 0 0;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
   list-style: none;
+
+  html[data-forge-theme="light"] & {
+    border-top-color: var(--forge-border);
+  }
 
   @media (max-height: 720px) and (min-width: 861px) {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1224,6 +1573,10 @@ export const IntroFeature = styled.li`
   font-weight: 720;
   line-height: 1.5;
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-soft);
+  }
+
   span {
     width: 8px;
     height: 8px;
@@ -1238,6 +1591,10 @@ export const IntroFeature = styled.li`
 
   &[data-tone="orange"] span {
     background: #ff7a18;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="orange"] span {
+    background: var(--forge-blue);
   }
 
   @media (max-height: 720px) and (min-width: 861px) {
@@ -1262,6 +1619,12 @@ export const ApiStatus = styled.div`
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.24);
   animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 180ms both;
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: rgba(255, 255, 255, 0.82);
+    box-shadow: none;
+  }
+
   @media (max-width: 860px) {
     grid-template-columns: 1fr;
   }
@@ -1275,6 +1638,10 @@ export const StatusSummary = styled.div`
   color: #eef4f8;
   font-size: 14px;
   font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const StatusBadge = styled.span`
@@ -1296,6 +1663,18 @@ export const StatusBadge = styled.span`
   ${ApiStatus}[data-state="offline"] & {
     background: rgba(255, 107, 107, 0.16);
     border-color: rgba(255, 107, 107, 0.42);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(0, 102, 204, 0.2);
+  }
+
+  html[data-forge-theme="light"] ${ApiStatus}[data-state="offline"] & {
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.08);
+    border-color: rgba(180, 35, 24, 0.2);
   }
 `;
 
@@ -1355,6 +1734,19 @@ export const StatusButton = styled.button`
     opacity: 0.68;
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.34);
+    background: rgba(0, 102, 204, 0.12);
+    transform: translateY(-1px);
+  }
+
   @media (max-width: 860px) {
     width: 100%;
   }
@@ -1367,6 +1759,10 @@ export const ApiBase = styled.p`
   color: #8f9aa5;
   font-size: 12px;
   font-weight: 700;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const PricingScreen = styled.main`
@@ -1382,6 +1778,11 @@ export const PricingScreen = styled.main`
     linear-gradient(315deg, rgba(255, 122, 24, 0.13), rgba(3, 5, 8, 0) 36%),
     #030508;
   animation: ${shellReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: var(--forge-bg);
+  }
 
   @media (max-width: 900px) {
     grid-template-columns: 1fr;
@@ -1409,6 +1810,10 @@ export const PricingTitle = styled.h1`
   font-weight: 900;
   letter-spacing: 0;
   line-height: 0.98;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const PricingText = styled.p`
@@ -1417,6 +1822,10 @@ export const PricingText = styled.p`
   color: #a7b2c2;
   font-size: 17px;
   line-height: 1.72;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const PricingActions = styled.div`
@@ -1458,6 +1867,17 @@ export const PricingPlanCard = styled.article`
       rgba(17, 22, 27, 0.92);
     box-shadow: 0 28px 80px rgba(47, 128, 255, 0.12);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &[data-featured="true"] {
+    border-color: rgba(0, 102, 204, 0.34);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 `;
 
 export const PlanEyebrow = styled.p`
@@ -1467,6 +1887,10 @@ export const PlanEyebrow = styled.p`
   font-weight: 900;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-blue);
+  }
 `;
 
 export const PlanPrice = styled.h2`
@@ -1477,10 +1901,18 @@ export const PlanPrice = styled.h2`
   letter-spacing: 0;
   line-height: 0.95;
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
+
   span {
     color: #8f9aa5;
     font-size: 18px;
     font-weight: 760;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--forge-text-muted);
   }
 `;
 
@@ -1489,6 +1921,10 @@ export const PlanDescription = styled.p`
   color: #bdc6ce;
   font-size: 14px;
   line-height: 1.62;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const PlanFeatureList = styled.ul`
@@ -1506,6 +1942,10 @@ export const PlanFeatureList = styled.ul`
     line-height: 1.5;
   }
 
+  html[data-forge-theme="light"] & li {
+    color: var(--forge-text-soft);
+  }
+
   li::before {
     position: absolute;
     top: 0.55em;
@@ -1516,6 +1956,10 @@ export const PlanFeatureList = styled.ul`
     background: #62a0ff;
     content: "";
   }
+
+  html[data-forge-theme="light"] & li::before {
+    background: var(--forge-blue);
+  }
 `;
 
 export const AuthenticatedWorkspaceFrame = styled.div`
@@ -1525,7 +1969,7 @@ export const AuthenticatedWorkspaceFrame = styled.div`
   height: calc(100vh - ${TITLE_BAR_HEIGHT});
   min-height: 0;
   overflow: hidden;
-  background: #030508;
+  background: var(--forge-bg);
 
   @media (max-width: 760px) {
     height: auto;
@@ -1561,6 +2005,10 @@ export const DashboardShell = styled.main`
     var(--forge-bg);
   background-size: 76px 76px, 76px 76px, auto;
   animation: ${shellReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 
   &[data-startup="true"] {
     pointer-events: none;
@@ -1603,6 +2051,12 @@ export const WorkspaceRail = styled.aside`
   transition:
     padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
     gap 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  html[data-forge-theme="light"] & {
+    border-right-color: var(--forge-border);
+    background: rgba(245, 245, 247, 0.88);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 
   &[data-collapsed="true"] {
     gap: 7px;
@@ -1720,6 +2174,20 @@ export const RailCollapseButton = styled.button`
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.045),
       0 0 18px rgba(47, 128, 255, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: var(--forge-surface-control);
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.28);
+    color: var(--forge-blue);
+    background: var(--forge-surface);
+    box-shadow: none;
   }
 
   &:active {
@@ -1855,6 +2323,42 @@ export const WorkspaceButton = styled.button`
     --workspace-card-status-border: rgba(125, 176, 255, 0.42);
     --workspace-card-hover-bg: rgba(125, 160, 205, 0.055);
     --workspace-card-hover-border: rgba(125, 160, 205, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    --workspace-card-text: #333333;
+    --workspace-card-muted: #7a7a7a;
+    --workspace-card-status: rgba(0, 0, 0, 0.2);
+    --workspace-card-status-border: rgba(0, 0, 0, 0.12);
+    --workspace-card-hover-bg: rgba(0, 0, 0, 0.035);
+    --workspace-card-hover-border: rgba(0, 0, 0, 0.08);
+    --workspace-card-selected-bg: rgba(0, 102, 204, 0.08);
+    --workspace-card-selected-border: rgba(0, 102, 204, 0.2);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="closed"] {
+    --workspace-card-text: #555555;
+    --workspace-card-muted: #8b8b90;
+    --workspace-card-status: rgba(0, 0, 0, 0.16);
+    --workspace-card-status-border: rgba(0, 0, 0, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="activating"] {
+    --workspace-card-text: #5c4100;
+    --workspace-card-muted: #8b5a00;
+    --workspace-card-status: #8b5a00;
+    --workspace-card-status-border: rgba(139, 90, 0, 0.28);
+    --workspace-card-hover-bg: rgba(139, 90, 0, 0.06);
+    --workspace-card-hover-border: rgba(139, 90, 0, 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="activated"] {
+    --workspace-card-text: #1d1d1f;
+    --workspace-card-muted: #5f6f85;
+    --workspace-card-status: var(--forge-blue);
+    --workspace-card-status-border: rgba(0, 102, 204, 0.34);
+    --workspace-card-hover-bg: rgba(0, 102, 204, 0.06);
+    --workspace-card-hover-border: rgba(0, 102, 204, 0.18);
   }
 
   &:hover,
@@ -2058,6 +2562,16 @@ export const WorkspaceSettingsButton = styled.button`
     background: #090a0c;
   }
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: var(--forge-surface-control);
+  }
+
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:focus-within & {
     opacity: 1;
@@ -2162,6 +2676,10 @@ export const RailFooter = styled.div`
   transition:
     gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(245, 245, 247, 0.68);
+  }
 `;
 
 export const RailGlobalActions = styled.div`
@@ -2181,6 +2699,11 @@ export const RailGlobalActions = styled.div`
     margin-top: 6px;
     padding: 3px;
     border-color: rgba(230, 236, 245, 0.075);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
   }
 `;
 
@@ -2268,6 +2791,36 @@ export const RailActionButton = styled.button`
     color: var(--forge-blue-soft);
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-soft);
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.28);
+    background: rgba(0, 102, 204, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"]::before {
+    background: var(--forge-blue);
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] svg,
+  html[data-forge-theme="light"] &:hover svg {
+    color: var(--forge-blue);
+  }
+
   &[data-scope="global"] {
     min-height: 34px;
     padding-left: 8px;
@@ -2296,6 +2849,32 @@ export const RailActionButton = styled.button`
     color: #c7d0dc;
   }
 
+  html[data-forge-theme="light"] &[data-scope="global"] {
+    color: var(--forge-text-soft);
+    background: transparent;
+  }
+
+  html[data-forge-theme="light"] &[data-scope="global"] svg {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &[data-scope="global"]:hover,
+  html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.3);
+    background: rgba(0, 102, 204, 0.11);
+  }
+
+  html[data-forge-theme="light"] &[data-scope="global"]:hover svg,
+  html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] svg {
+    color: var(--forge-blue);
+  }
+
   &[data-variant="signout"] {
     color: #9b9fa8;
     background: transparent;
@@ -2303,6 +2882,14 @@ export const RailActionButton = styled.button`
 
   &[data-variant="signout"] svg {
     color: #a68e91;
+  }
+
+  html[data-forge-theme="light"] &[data-variant="signout"] {
+    color: var(--forge-text-soft);
+  }
+
+  html[data-forge-theme="light"] &[data-variant="signout"] svg {
+    color: var(--forge-text-muted);
   }
 
   &[data-variant="signout"]:hover {
@@ -2313,6 +2900,16 @@ export const RailActionButton = styled.button`
 
   &[data-variant="signout"]:hover svg {
     color: #d7a4a4;
+  }
+
+  html[data-forge-theme="light"] &[data-variant="signout"]:hover {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-variant="signout"]:hover svg {
+    color: var(--forge-red);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
@@ -2476,6 +3073,10 @@ export const WorkspaceIdleSurface = styled(BlankWorkspace)`
   &::after {
     display: none;
   }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 `;
 
 export const WorkspaceIdlePanel = styled.div`
@@ -2486,6 +3087,10 @@ export const WorkspaceIdlePanel = styled.div`
   gap: 10px;
   color: #e8eef8;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const WorkspaceIdleLogo = styled.img`
@@ -2495,6 +3100,12 @@ export const WorkspaceIdleLogo = styled.img`
   border-radius: 8px;
   background: rgba(3, 5, 8, 0.72);
   box-shadow: 0 18px 70px rgba(0, 0, 0, 0.34);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 `;
 
 export const WorkspaceIdleTitle = styled.h2`
@@ -2503,6 +3114,10 @@ export const WorkspaceIdleTitle = styled.h2`
   font-size: clamp(20px, 3vw, 34px);
   font-weight: 900;
   letter-spacing: 0;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const WorkspaceIdleDetail = styled.p`
@@ -2512,6 +3127,10 @@ export const WorkspaceIdleDetail = styled.p`
   font-size: 13px;
   font-weight: 760;
   line-height: 1.55;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const ForgeWorkspace = styled.section`
@@ -2527,6 +3146,10 @@ export const ForgeWorkspace = styled.section`
     radial-gradient(circle at 84% 10%, rgba(47, 128, 255, 0.12), transparent 16rem),
     rgba(3, 5, 8, 0.18);
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 
   &[data-motion="exiting"] {
     animation: ${panelExit} ${VIEW_TRANSITION_MS}ms ease both;
@@ -2561,6 +3184,10 @@ export const TerminalWorkspaceSurface = styled.section`
     opacity 180ms ease,
     box-shadow 180ms ease;
 
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
   &[data-terminal-fullscreen="true"] {
     --terminal-focus-outline-inset: 1px;
 
@@ -2583,6 +3210,11 @@ export const TerminalWorkspaceSurface = styled.section`
     transform: translate3d(0, 0, 0) scale(1, 1);
     transform-origin: top left;
     will-change: transform, opacity;
+  }
+
+  html[data-forge-theme="light"] &[data-terminal-fullscreen="true"] {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+    box-shadow: none;
   }
 
   &[data-threads-view="true"][data-terminal-fullscreen="true"] {
@@ -2638,12 +3270,20 @@ export const WorkspaceTerminalPanels = styled.div`
   overflow: hidden;
   background: ${TERMINAL_THEME_BACKGROUND};
 
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
   ${TerminalWorkspaceSurface} {
     min-height: 0;
   }
 
   &[data-terminal-fullscreen="true"] {
     background: ${TERMINAL_THEME_BACKGROUND};
+  }
+
+  html[data-forge-theme="light"] &[data-terminal-fullscreen="true"] {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
   &[data-terminal-dragging="true"],
@@ -2678,6 +3318,14 @@ export const ResizePanelGroup = styled(Group)`
   &[data-surface="files"] {
     background: var(--files-vscode-editor, #030405);
   }
+
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
+  html[data-forge-theme="light"] &[data-surface="files"] {
+    background: var(--files-vscode-editor, #ffffff);
+  }
 `;
 
 export const ResizePanel = styled(Panel)`
@@ -2688,6 +3336,14 @@ export const ResizePanel = styled(Panel)`
 
   &[data-surface="files"] {
     background: var(--files-vscode-editor, #030405);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
+  html[data-forge-theme="light"] &[data-surface="files"] {
+    background: var(--files-vscode-editor, #ffffff);
   }
 
   &[data-terminal-row="true"],
@@ -2834,6 +3490,10 @@ export const TerminalFrame = styled.section`
   border-radius: 0;
   background: ${TERMINAL_THEME_BACKGROUND};
   box-shadow: none;
+
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
 
   &[data-state="error"] {
     border-color: rgba(255, 107, 107, 0.36);
@@ -3027,6 +3687,15 @@ export const XtermSurface = styled.div`
   --terminal-native-scrollbar-glass-edge: rgba(255, 255, 255, 0.14);
   --terminal-native-scrollbar-glass-shade: rgba(7, 11, 18, 0.18);
 
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+    --terminal-native-scrollbar-thumb: rgba(0, 102, 204, 0.22);
+    --terminal-native-scrollbar-thumb-hover: rgba(0, 102, 204, 0.32);
+    --terminal-native-scrollbar-thumb-active: rgba(0, 102, 204, 0.42);
+    --terminal-native-scrollbar-glass-edge: rgba(0, 102, 204, 0.08);
+    --terminal-native-scrollbar-glass-shade: rgba(255, 255, 255, 0);
+  }
+
   &::after {
     content: "";
     position: absolute;
@@ -3039,6 +3708,10 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND};
   }
 
+  html[data-forge-theme="light"] &::after {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
   .xterm {
     position: relative;
     z-index: 1;
@@ -3048,11 +3721,22 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND} !important;
   }
 
+  html[data-forge-theme="light"] & .xterm {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT} !important;
+  }
+
   .xterm-viewport,
   .xterm-scroll-area,
   .xterm-scrollable-element,
   .xterm-screen {
     background: ${TERMINAL_THEME_BACKGROUND} !important;
+  }
+
+  html[data-forge-theme="light"] & .xterm-viewport,
+  html[data-forge-theme="light"] & .xterm-scroll-area,
+  html[data-forge-theme="light"] & .xterm-scrollable-element,
+  html[data-forge-theme="light"] & .xterm-screen {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT} !important;
   }
 
   .xterm-viewport {
@@ -3172,6 +3856,10 @@ export const TerminalClosedSurface = styled.div`
     linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     #020304;
   background-size: 68px 68px, 68px 68px, auto;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-light-dark-tile);
+  }
 `;
 
 export const TerminalClosedLabel = styled.span`
@@ -3555,6 +4243,14 @@ export const TerminalCloseButton = styled(TerminalRestartButton)`
     color: #fff;
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    color: var(--forge-text);
+  }
+
   &:disabled {
     opacity: 0.28;
   }
@@ -3572,6 +4268,11 @@ export const TerminalEmptyPanel = styled.section`
   background:
     radial-gradient(circle at 85% 12%, rgba(255, 122, 24, 0.12), transparent 16rem),
     rgba(13, 20, 31, 0.86);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
 `;
 
 export const TerminalEmptyActions = styled.div`
@@ -3609,6 +4310,11 @@ export const TerminalAgentRow = styled.div`
   border-radius: 8px;
   background: rgba(6, 9, 16, 0.72);
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
+
   strong {
     display: block;
     color: #f7f9ff;
@@ -3633,6 +4339,18 @@ export const TerminalAgentRow = styled.div`
 
   &[data-tone="needsAuth"] {
     border-color: rgba(255, 122, 24, 0.3);
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="needsAuth"] {
+    border-color: rgba(0, 102, 204, 0.22);
   }
 `;
 
@@ -3722,6 +4440,10 @@ export const FileIconButton = styled.button`
     background: var(--files-vscode-hover);
   }
 
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    color: var(--files-vscode-text);
+  }
+
   &:focus-visible {
     outline: 1px solid var(--files-vscode-focus);
     outline-offset: -1px;
@@ -3800,6 +4522,10 @@ export const FileTreeButton = styled.button`
   &:hover {
     color: #ffffff;
     background: var(--files-vscode-hover);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--files-vscode-text);
   }
 
   &[data-selected="true"] {
@@ -4392,6 +5118,65 @@ export const HighlightedCodeBlock = styled.pre`
   .token.namespace {
     opacity: 0.78;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
+
+  html[data-forge-theme="light"] & .token.comment,
+  html[data-forge-theme="light"] & .token.prolog,
+  html[data-forge-theme="light"] & .token.doctype,
+  html[data-forge-theme="light"] & .token.cdata {
+    color: #6e6e73;
+  }
+
+  html[data-forge-theme="light"] & .token.punctuation,
+  html[data-forge-theme="light"] & .token.operator,
+  html[data-forge-theme="light"] & .token.entity,
+  html[data-forge-theme="light"] & .token.url,
+  html[data-forge-theme="light"] & .language-css .token.string,
+  html[data-forge-theme="light"] & .style .token.string {
+    color: #1d1d1f;
+  }
+
+  html[data-forge-theme="light"] & .token.property,
+  html[data-forge-theme="light"] & .token.attr-name,
+  html[data-forge-theme="light"] & .token.parameter,
+  html[data-forge-theme="light"] & .token.variable,
+  html[data-forge-theme="light"] & .token.function,
+  html[data-forge-theme="light"] & .token.title,
+  html[data-forge-theme="light"] & .token.section {
+    color: #0066cc;
+  }
+
+  html[data-forge-theme="light"] & .token.tag,
+  html[data-forge-theme="light"] & .token.selector,
+  html[data-forge-theme="light"] & .token.keyword,
+  html[data-forge-theme="light"] & .token.atrule {
+    color: #7a3e9d;
+  }
+
+  html[data-forge-theme="light"] & .token.boolean,
+  html[data-forge-theme="light"] & .token.number,
+  html[data-forge-theme="light"] & .token.constant,
+  html[data-forge-theme="light"] & .token.regex,
+  html[data-forge-theme="light"] & .token.important {
+    color: #8b5a00;
+  }
+
+  html[data-forge-theme="light"] & .token.string,
+  html[data-forge-theme="light"] & .token.char,
+  html[data-forge-theme="light"] & .token.attr-value,
+  html[data-forge-theme="light"] & .token.template-string,
+  html[data-forge-theme="light"] & .token.symbol,
+  html[data-forge-theme="light"] & .token.builtin,
+  html[data-forge-theme="light"] & .token.inserted {
+    color: #0a7f45;
+  }
+
+  html[data-forge-theme="light"] & .token.deleted {
+    color: #b42318;
+  }
 `;
 
 export const InlineReviewSurface = styled.div`
@@ -4419,6 +5204,10 @@ export const InlineReviewCodeBlock = styled.div`
   font-size: 13px;
   line-height: 1.5;
   tab-size: 2;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
 `;
 
 export const InlineReviewLine = styled.div`
@@ -4428,6 +5217,10 @@ export const InlineReviewLine = styled.div`
   grid-template-columns: 54px 18px minmax(max-content, 1fr);
   align-items: stretch;
   color: #d4d4d4;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
 
   &[data-tone="added"] {
     background: rgba(46, 160, 67, 0.18);
@@ -4678,6 +5471,10 @@ export const DiffCodeBlock = styled.pre`
   tab-size: 2;
   white-space: pre;
 
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
+
   &[data-mode="diff"] {
     min-height: 100%;
   }
@@ -4692,14 +5489,29 @@ export const DiffLine = styled.div`
     background: rgba(46, 160, 67, 0.18);
   }
 
+  html[data-forge-theme="light"] &[data-tone="added"] {
+    color: #0a7f45;
+    background: rgba(10, 127, 69, 0.08);
+  }
+
   &[data-tone="removed"] {
     color: #ffd0d0;
     background: rgba(248, 81, 73, 0.16);
   }
 
+  html[data-forge-theme="light"] &[data-tone="removed"] {
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.07);
+  }
+
   &[data-tone="hunk"] {
     color: #9cdcfe;
     background: rgba(47, 128, 255, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="hunk"] {
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
   }
 
   &[data-tone="header"],
@@ -4767,6 +5579,10 @@ export const VaultWorkspaceSurface = styled.section`
     rgba(13, 17, 23, 0.18);
   background-size: 68px 68px, 68px 68px, auto;
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
+
   &[data-layout="operational"] {
     place-items: stretch;
     align-content: start;
@@ -4783,6 +5599,10 @@ export const VaultWorkspaceSurface = styled.section`
     background: #000000;
     background-size: auto;
   }
+
+  html[data-forge-theme="light"] &[data-layout="blank"] {
+    background: var(--forge-bg);
+  }
 `;
 
 export const VaultPlaceholderPanel = styled.section`
@@ -4796,6 +5616,10 @@ export const VaultPlaceholderPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.035), rgba(244, 247, 250, 0.012)),
     rgba(17, 22, 29, 0.92);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const VaultPlaceholderIcon = styled.span`
@@ -5080,6 +5904,10 @@ export const VaultEmptyNote = styled.p`
   font-size: 12px;
   font-weight: 650;
   line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
@@ -5102,6 +5930,10 @@ export const AudioSetupPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(17, 22, 29, 0.86);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const AudioHeroRow = styled.div`
@@ -5204,6 +6036,11 @@ export const AudioProviderPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.024), rgba(244, 247, 250, 0.006)),
     rgba(13, 17, 23, 0.55);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AudioRecorderPanel = styled(AudioProviderPanel)`
@@ -5293,6 +6130,23 @@ export const AudioModeButton = styled.button`
     font-weight: 650;
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-soft);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.18);
+    color: var(--forge-text);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] & > svg {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: var(--forge-surface-control);
+  }
+
   &[aria-pressed="true"] {
     border-color: rgba(95, 156, 255, 0.62);
     color: #dceaff;
@@ -5308,6 +6162,19 @@ export const AudioModeButton = styled.button`
     border-color: rgba(95, 156, 255, 0.42);
     color: #8bb9ff;
     background: rgba(59, 130, 246, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[aria-pressed="true"] {
+    border-color: rgba(0, 102, 204, 0.3);
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.09);
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &[aria-pressed="true"] > svg {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
   }
 `;
 
@@ -5350,6 +6217,17 @@ export const AudioCloudInput = styled.input`
     border-color: rgba(125, 160, 205, 0.44);
     outline: none;
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
   }
 `;
 
@@ -5405,6 +6283,16 @@ export const AudioDeviceSelect = styled.select`
     border-color: rgba(125, 160, 205, 0.44);
     outline: none;
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
   }
 
   &:disabled {
@@ -5529,6 +6417,10 @@ export const AudioShortcutCard = styled.div`
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
   > span {
     color: var(--forge-text-muted);
     font-size: 11px;
@@ -5567,6 +6459,18 @@ export const AudioShortcutKey = styled.kbd`
     color: #ffd396;
     background: rgba(223, 165, 90, 0.09);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-capturing="true"] {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 export const AudioShortcutActions = styled.div`
@@ -5596,6 +6500,10 @@ export const AudioTabBar = styled.div`
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.006)),
     rgba(7, 9, 13, 0.66);
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
   @media (max-width: 520px) {
     grid-template-columns: 1fr;
   }
@@ -5622,6 +6530,15 @@ export const AudioTabButton = styled.button`
     background: rgba(244, 247, 250, 0.04);
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.06);
+  }
+
   &[aria-selected="true"] {
     border-color: rgba(95, 156, 255, 0.48);
     color: #dceaff;
@@ -5631,6 +6548,13 @@ export const AudioTabButton = styled.button`
     box-shadow:
       0 0 0 1px rgba(95, 156, 255, 0.12) inset,
       0 8px 20px rgba(59, 130, 246, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[aria-selected="true"] {
+    border-color: rgba(0, 102, 204, 0.3);
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.09);
+    box-shadow: none;
   }
 `;
 
@@ -5649,6 +6573,11 @@ export const AudioDictionaryPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
     rgba(13, 17, 23, 0.58);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AudioHistoryPanel = styled.section`
@@ -5696,6 +6625,14 @@ export const AudioHistoryStatChip = styled.div`
     font-weight: 800;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--forge-text-muted);
   }
 `;
 
@@ -6007,6 +6944,10 @@ export const AudioWidgetShell = styled.main`
     opacity: var(--audio-widget-underpaint-opacity);
   }
 
+  html[data-forge-theme="light"] &::before {
+    background: #ffffff;
+  }
+
   &::after {
     z-index: 1;
     border: 1px solid rgba(230, 236, 245, 0.13);
@@ -6017,6 +6958,12 @@ export const AudioWidgetShell = styled.main`
       0 1px 0 rgba(255, 255, 255, 0.07) inset,
       0 -18px 32px rgba(0, 0, 0, 0.18) inset;
     opacity: var(--audio-widget-surface-opacity);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
   }
 
   &[data-focus="true"] {
@@ -6406,6 +7353,10 @@ export const AudioWidgetActions = styled.div`
     background: rgba(21, 27, 35, 0.82);
     -webkit-app-region: no-drag;
 
+    html[data-forge-theme="light"] & {
+      background: var(--forge-surface-control);
+    }
+
     &:hover {
       color: var(--forge-text);
       border-color: rgba(125, 160, 205, 0.34);
@@ -6440,6 +7391,10 @@ export const McpWorkspaceSurface = styled.section`
     linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
     rgba(13, 17, 23, 0.18);
   background-size: 68px 68px, 68px 68px, auto;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
 `;
 
 export const McpHeaderPanel = styled.section`
@@ -6452,6 +7407,10 @@ export const McpHeaderPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(17, 22, 29, 0.86);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const McpTitleRow = styled.div`
@@ -6553,6 +7512,10 @@ export const McpMetricPill = styled.span`
     color: #ffb4b4;
     background: rgba(239, 107, 107, 0.1);
   }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const McpStatsGrid = styled.div`
@@ -6590,6 +7553,10 @@ export const McpRegistryPanel = styled.aside`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.72);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const McpPanelTopline = styled.div`
@@ -6684,6 +7651,11 @@ export const McpServerIcon = styled.span`
     color: var(--forge-text-muted);
     background: rgba(21, 27, 35, 0.72);
   }
+
+  html[data-forge-theme="light"] &,
+  html[data-forge-theme="light"] &[data-state="planned"] {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const McpServerCopy = styled.span`
@@ -6739,6 +7711,11 @@ export const McpStatusBadge = styled.span`
     color: #ffb4b4;
     background: rgba(239, 107, 107, 0.1);
   }
+
+  html[data-forge-theme="light"] &,
+  html[data-forge-theme="light"] &[data-state="planned"] {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const McpEditorPanel = styled.section`
@@ -6754,6 +7731,10 @@ export const McpEditorPanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(17, 22, 29, 0.78);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const McpEditorHeader = styled.div`
@@ -6811,6 +7792,10 @@ export const McpSwitchButton = styled.button`
   &[aria-pressed="true"] > span::after {
     background: var(--forge-blue-soft);
     transform: translateX(12px);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
   }
 
   &:disabled {
@@ -7201,6 +8186,10 @@ export const WorkspaceSetupPanel = styled.form`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(17, 22, 29, 0.92);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const SetupHeader = styled.div`
@@ -7252,6 +8241,11 @@ export const WorkspaceSettingsOverlay = styled.div`
     rgba(7, 9, 13, 0.72);
   backdrop-filter: blur(14px);
   animation: ${panelEnter} 160ms ease both;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(245, 245, 247, 0.76);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 export const WorkspaceSettingsDialog = styled.aside`
@@ -7273,6 +8267,11 @@ export const WorkspaceSettingsDialog = styled.aside`
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
   animation: ${panelEnter} 190ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
+
   @media (max-width: 620px) {
     width: 100%;
     max-height: 100%;
@@ -7292,6 +8291,11 @@ export const WorkspaceSettingsBusyOverlay = styled.div`
     linear-gradient(180deg, rgba(3, 5, 8, 0.18), rgba(3, 5, 8, 0.38)),
     rgba(3, 5, 8, 0.44);
   backdrop-filter: blur(7px);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(245, 245, 247, 0.62);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
 `;
 
 export const WorkspaceSettingsBusyPanel = styled.section`
@@ -7307,6 +8311,12 @@ export const WorkspaceSettingsBusyPanel = styled.section`
     linear-gradient(180deg, rgba(98, 160, 255, 0.08), rgba(255, 122, 24, 0.035)),
     rgba(8, 13, 20, 0.96);
   box-shadow: 0 26px 82px rgba(0, 0, 0, 0.55);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 `;
 
 export const WorkspaceSettingsDialogHeader = styled.header`
@@ -7452,6 +8462,10 @@ export const WorkspaceSettingsMetaPill = styled.span`
     text-transform: none;
     white-space: nowrap;
   }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const WorkspaceModalCloseButton = styled.button`
@@ -7473,6 +8487,15 @@ export const WorkspaceModalCloseButton = styled.button`
     border-color: rgba(239, 107, 107, 0.38);
     color: #ffc8c8;
     background: rgba(239, 107, 107, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.08);
   }
 
   &:disabled {
@@ -7556,6 +8579,11 @@ export const WorkspaceSettingsSection = styled.section`
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.008)),
     rgba(13, 17, 23, 0.62);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const WorkspaceSettingsSummary = styled.div`
@@ -7672,6 +8700,16 @@ export const TerminalCountButton = styled.button`
     transform: translateY(-1px);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: var(--forge-surface-control);
+  }
+
   &[data-selected="true"] {
     border-color: rgba(98, 160, 255, 0.55);
     color: #ffffff;
@@ -7679,6 +8717,13 @@ export const TerminalCountButton = styled.button`
       linear-gradient(180deg, rgba(47, 128, 255, 0.18), rgba(255, 122, 24, 0.055)),
       rgba(13, 17, 23, 0.92);
     box-shadow: inset 0 0 0 1px rgba(98, 160, 255, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(0, 102, 204, 0.32);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+    box-shadow: none;
   }
 
   &:disabled {
@@ -7727,6 +8772,14 @@ export const TerminalLayoutPreview = styled.div`
     linear-gradient(180deg, rgba(230, 236, 245, 0.028) 1px, transparent 1px),
     #020304;
   background-size: 14px 14px, 14px 14px, auto;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background:
+      linear-gradient(90deg, rgba(0, 0, 0, 0.04) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(0, 0, 0, 0.035) 1px, transparent 1px),
+      var(--forge-surface-control);
+  }
 `;
 
 export const TerminalLayoutPreviewRow = styled.div`
@@ -7764,6 +8817,12 @@ export const TerminalLayoutPreviewCell = styled.span`
     background: rgba(255, 122, 24, 0.18);
   }
 
+  html[data-forge-theme="light"] &[data-slot="orange"],
+  html[data-forge-theme="light"] &[data-slot="claude"] {
+    border-color: rgba(0, 102, 204, 0.2);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
   &[data-slot="opencode"] {
     border-color: rgba(67, 229, 176, 0.34);
     background: rgba(37, 211, 154, 0.17);
@@ -7784,6 +8843,11 @@ export const TerminalRoleSwitch = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 999px;
   background: rgba(7, 9, 13, 0.58);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const TerminalRoleSwitchButton = styled.button`
@@ -7817,6 +8881,13 @@ export const TerminalRoleSwitchButton = styled.button`
   &[data-role="claude"][data-selected="true"] {
     border-color: rgba(255, 154, 61, 0.34);
     background: rgba(255, 122, 24, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"],
+  html[data-forge-theme="light"] &[data-role="claude"][data-selected="true"] {
+    color: var(--forge-blue);
+    border-color: rgba(0, 102, 204, 0.24);
+    background: rgba(0, 102, 204, 0.08);
   }
 
   &[data-role="generic"][data-selected="true"] {
@@ -7856,6 +8927,12 @@ export const TerminalRestartDropdown = styled.div`
     linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
     rgb(7, 9, 13);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
 
   &[data-open="false"] {
     display: none;
@@ -7900,10 +8977,23 @@ export const TerminalRestartOption = styled.button`
     outline: none;
   }
 
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: var(--forge-text);
+    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
   &[data-role="claude"]:hover,
   &[data-role="claude"]:focus-visible {
     border-color: rgba(255, 154, 61, 0.26);
     background: rgba(255, 122, 24, 0.11);
+  }
+
+  html[data-forge-theme="light"] &[data-role="claude"]:hover,
+  html[data-forge-theme="light"] &[data-role="claude"]:focus-visible {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(0, 102, 204, 0.08);
   }
 
   &[data-role="generic"]:hover,
@@ -7924,9 +9014,20 @@ export const TerminalRestartOption = styled.button`
     background: rgba(98, 160, 255, 0.1);
   }
 
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    color: var(--forge-blue);
+    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
   &[data-role="claude"][data-selected="true"] {
     border-color: rgba(255, 154, 61, 0.26);
     background: rgba(255, 122, 24, 0.11);
+  }
+
+  html[data-forge-theme="light"] &[data-role="claude"][data-selected="true"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(0, 102, 204, 0.08);
   }
 
   &[data-role="generic"][data-selected="true"] {
@@ -7972,6 +9073,11 @@ export const TerminalRoleSliderRow = styled.label`
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.42);
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
   > span {
     display: flex;
     min-width: 0;
@@ -8008,6 +9114,10 @@ export const TerminalRoleSliderRow = styled.label`
     background: rgba(255, 122, 24, 0.16);
   }
 
+  html[data-forge-theme="light"] &[data-role="claude"] em {
+    background: rgba(0, 102, 204, 0.12);
+  }
+
   &[data-role="generic"] em {
     background: rgba(143, 157, 183, 0.14);
   }
@@ -8030,6 +9140,10 @@ export const TerminalRoleRange = styled.input`
     accent-color: #ff9d48;
   }
 
+  html[data-forge-theme="light"] &[data-role="claude"] {
+    accent-color: var(--forge-blue);
+  }
+
   &[data-role="generic"] {
     accent-color: #8f9db7;
   }
@@ -8047,6 +9161,11 @@ export const TerminalRoleCard = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.42);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
 `;
 
 export const TerminalRoleButtonGroup = styled.div`
@@ -8083,6 +9202,13 @@ export const TerminalRoleButton = styled.button`
   &[data-role="claude"][data-selected="true"] {
     border-color: rgba(255, 154, 61, 0.34);
     background: rgba(255, 122, 24, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"],
+  html[data-forge-theme="light"] &[data-role="claude"][data-selected="true"] {
+    color: var(--forge-blue);
+    border-color: rgba(0, 102, 204, 0.24);
+    background: rgba(0, 102, 204, 0.08);
   }
 
   &[data-role="generic"][data-selected="true"] {
@@ -8188,6 +9314,11 @@ export const AgentSettingsPanel = styled.section`
     rgba(17, 22, 29, 0.8);
   box-shadow: inset 0 1px 0 rgba(244, 247, 250, 0.04);
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+    box-shadow: none;
+  }
+
   &::before {
     display: none;
   }
@@ -8235,6 +9366,10 @@ export const AgentReadyPill = styled.div`
     color: var(--forge-amber);
     background: rgba(223, 165, 90, 0.08);
   }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AgentCardGrid = styled.div`
@@ -8280,6 +9415,14 @@ export const AgentCard = styled.section`
     background:
       linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
       rgba(17, 22, 29, 0.88);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: var(--forge-surface-control);
   }
 
   &[data-tone="ready"] {
@@ -8369,6 +9512,10 @@ export const AgentInstallPanel = styled.div`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(21, 27, 35, 0.42);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AgentInstallTopline = styled.div`
@@ -8432,6 +9579,10 @@ export const AgentInstallCommand = styled.code`
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 `;
 
 export const AgentPermissionHint = styled.p`
@@ -8566,6 +9717,10 @@ export const SettingsPage = styled.section`
   background-size: 72px 72px, 72px 72px, auto;
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-bg);
+  }
+
   ${DashboardTitle} {
     margin-top: 3px;
     font-size: 20px;
@@ -8611,6 +9766,10 @@ export const AccountCard = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(17, 22, 29, 0.78);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 
   &[data-tone="blue"] {
     border-color: rgba(125, 160, 205, 0.18);
@@ -8701,6 +9860,10 @@ export const SettingsIdentityItem = styled.div`
   border-radius: 8px;
   background: rgba(21, 27, 35, 0.5);
 
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+
   span {
     color: var(--forge-text-muted);
     font-size: 11px;
@@ -8720,6 +9883,118 @@ export const SettingsIdentityItem = styled.div`
   }
 `;
 
+export const AppearanceThemeGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AppearanceThemeButton = styled.button`
+  display: grid;
+  min-width: 0;
+  min-height: 72px;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(21, 27, 35, 0.56);
+  text-align: left;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease,
+    color 160ms ease;
+
+  &:hover {
+    border-color: var(--forge-border-strong);
+    color: var(--forge-text);
+    background:
+      linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
+      rgba(21, 27, 35, 0.72);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(59, 130, 246, 0.38);
+    color: var(--forge-text);
+    background:
+      linear-gradient(180deg, rgba(59, 130, 246, 0.12), rgba(59, 130, 246, 0.045)),
+      rgba(21, 27, 35, 0.82);
+    box-shadow:
+      inset 0 0 0 1px rgba(125, 160, 205, 0.12),
+      0 0 18px rgba(59, 130, 246, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(0, 102, 204, 0.34);
+    background: rgba(0, 102, 204, 0.08);
+    box-shadow: none;
+  }
+
+  > span {
+    display: grid;
+    width: 36px;
+    height: 36px;
+    place-items: center;
+    border: 1px solid var(--forge-border);
+    border-radius: 8px;
+    color: var(--forge-text-muted);
+    background: rgba(230, 236, 245, 0.04);
+  }
+
+  &[data-selected="true"] > span {
+    border-color: rgba(59, 130, 246, 0.34);
+    color: var(--forge-blue-soft);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  strong,
+  small {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: inherit;
+    font-size: 13px;
+    font-weight: 760;
+    line-height: 1.25;
+  }
+
+  small {
+    margin-top: 4px;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1.35;
+  }
+`;
+
 export const LoginCard = styled.section`
   position: relative;
   z-index: 1;
@@ -8733,6 +10008,12 @@ export const LoginCard = styled.section`
     rgba(10, 15, 23, 0.88);
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.46);
   animation: ${sideReveal} 320ms cubic-bezier(0.2, 0.8, 0.2, 1) 110ms both;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: rgba(255, 255, 255, 0.9);
+    box-shadow: none;
+  }
 
   @media (max-width: 860px) {
     padding: 24px;
@@ -8774,6 +10055,19 @@ export const LoginCardBadge = styled.span`
     color: #ff9a3d;
     background: rgba(255, 122, 24, 0.14);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="waiting"],
+  html[data-forge-theme="light"] &[data-state="exchanging"] {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 export const LoginIconWrap = styled.span`
@@ -8795,12 +10089,25 @@ export const LoginIconWrap = styled.span`
   ${LoginPanel}:hover & {
     transform: translateY(-1px) scale(1.02);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+    box-shadow: none;
+  }
 `;
 
 export const SuccessBadge = styled(LoginIconWrap)`
   border-color: rgba(255, 122, 24, 0.42);
   color: #ff9a3d;
   background: rgba(255, 122, 24, 0.14);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 export const SessionTitle = styled.h2`
@@ -8809,6 +10116,10 @@ export const SessionTitle = styled.h2`
   font-size: clamp(21px, 3.5vh, 24px);
   font-weight: 820;
   letter-spacing: 0;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
 `;
 
 export const SessionText = styled.p`
@@ -8817,6 +10128,10 @@ export const SessionText = styled.p`
   color: #a7b2c2;
   font-size: 15px;
   line-height: 1.55;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 export const AuthStepRail = styled.div`
@@ -8826,6 +10141,11 @@ export const AuthStepRail = styled.div`
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.22);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const AuthStep = styled.div`
@@ -8839,6 +10159,10 @@ export const AuthStep = styled.div`
   font-weight: 800;
   opacity: 0;
   animation: ${panelEnter} 240ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 
   &:nth-child(1) {
     animation-delay: 170ms;
@@ -8864,14 +10188,30 @@ export const AuthStep = styled.div`
     font-size: 11px;
   }
 
+  html[data-forge-theme="light"] & span {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
+    background: var(--forge-surface);
+  }
+
   &[data-active="true"] {
     color: #f7f9ff;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: var(--forge-text);
   }
 
   &[data-active="true"] span {
     border-color: rgba(47, 128, 255, 0.42);
     color: #62a0ff;
     background: rgba(47, 128, 255, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] span {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
   }
 `;
 
@@ -8899,6 +10239,24 @@ export const PrimaryButton = styled.button`
     transform: translateY(-1px);
   }
 
+  html[data-forge-theme="light"] & {
+    border-color: transparent;
+    border-radius: 999px;
+    background: var(--forge-blue);
+    box-shadow: none;
+    font-weight: 400;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: var(--forge-blue-soft);
+    box-shadow: none;
+    transform: none;
+  }
+
+  html[data-forge-theme="light"] &:active:not(:disabled) {
+    transform: scale(0.95);
+  }
+
   &:disabled {
     opacity: 0.7;
   }
@@ -8920,6 +10278,18 @@ export const SecondaryButton = styled(PrimaryButton)`
     border-color: rgba(125, 160, 205, 0.34);
     background: var(--forge-surface-hover);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    color: var(--forge-text-soft);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 0, 0, 0.12);
+    color: var(--forge-text);
+    background: var(--forge-surface);
+  }
 `;
 
 export const PrimaryDangerButton = styled(SecondaryButton)`
@@ -8929,6 +10299,17 @@ export const PrimaryDangerButton = styled(SecondaryButton)`
   &:hover:not(:disabled) {
     border-color: rgba(239, 107, 107, 0.48);
     background: rgba(239, 107, 107, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(180, 35, 24, 0.2);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.06);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(180, 35, 24, 0.32);
+    background: rgba(180, 35, 24, 0.09);
   }
 `;
 
@@ -8941,6 +10322,12 @@ export const FormMessage = styled.p`
   background: ${({ $state }) => ($state === "error" ? "rgba(239, 107, 107, 0.12)" : "transparent")};
   font-size: 14px;
   line-height: 1.55;
+
+  html[data-forge-theme="light"] & {
+    border-color: ${({ $state }) => ($state === "error" ? "rgba(180, 35, 24, 0.2)" : 0)};
+    color: ${({ $state }) => ($state === "error" ? "var(--forge-red)" : "var(--forge-text-soft)")};
+    background: ${({ $state }) => ($state === "error" ? "rgba(180, 35, 24, 0.06)" : "transparent")};
+  }
 `;
 
 export const buttonIconSize = `
@@ -9015,6 +10402,10 @@ export const ButtonDeleteIcon = styled(DeleteOutline)`
   ${buttonIconSize}
 `;
 
+export const ButtonDarkModeIcon = styled(DarkMode)`
+  ${buttonIconSize}
+`;
+
 export const ButtonFolderIcon = styled(FolderOpen)`
   ${buttonIconSize}
 `;
@@ -9044,6 +10435,10 @@ export const ButtonTerminalIcon = styled(TerminalIcon)`
 `;
 
 export const ButtonKeyIcon = styled(Key)`
+  ${buttonIconSize}
+`;
+
+export const ButtonLightModeIcon = styled(LightMode)`
   ${buttonIconSize}
 `;
 
