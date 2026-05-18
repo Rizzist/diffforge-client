@@ -1246,12 +1246,37 @@ const LocalIgnoredToggle = styled.button`
     color: #fef3c7;
     transform: translateY(-1px);
   }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.045),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(0, 102, 204, 0.32);
+    color: var(--forge-blue);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 102, 204, 0.06);
+    border-color: rgba(0, 102, 204, 0.38);
+    color: var(--forge-blue-soft);
+  }
 `;
 
 const LocalIgnoredHint = styled.span`
   color: rgba(148, 163, 184, 0.78);
   font-size: 11px;
   font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
 
 const SpecGraphShell = styled.div`

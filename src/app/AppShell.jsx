@@ -297,6 +297,9 @@ import {
   CrashRecoveryActions,
   WorkspaceSettingsForm,
   WorkspaceSettingsInput,
+  WorkspaceSettingsSelect,
+  WorkspaceSettingsSelectIcon,
+  WorkspaceSettingsSelectShell,
   RootDirectoryInput,
   WorkspaceSettingsTopGrid,
   WorkspaceRootChooser,
@@ -7686,7 +7689,7 @@ export default function App() {
                       <DashboardTitle>Desktop settings</DashboardTitle>
                       <PageSubline>Terminal providers and verified account state for this device.</PageSubline>
                     </div>
-                    <SecondaryButton onClick={() => showView(DEFAULT_WORKSPACE_VIEW)} type="button">
+                    <SecondaryButton data-padding="wide" onClick={() => showView(DEFAULT_WORKSPACE_VIEW)} type="button">
                       <ConnectedIcon aria-hidden="true" />
                       <span>Back</span>
                     </SecondaryButton>
@@ -7956,18 +7959,20 @@ export default function App() {
                         <div>
                           <SetupField>
                             <SettingsLabel>Auto-activate</SettingsLabel>
-                            <WorkspaceSettingsInput
-                              as="select"
-                              onChange={(event) => setDefaultWorkspace(event.target.value, "settings_page")}
-                              value={workspaceLifecycleSettings.defaultWorkspaceId}
-                            >
-                              <option value="">No auto-activate workspace</option>
-                              {workspaces.map((workspace) => (
-                                <option key={workspace.id} value={workspace.id}>
-                                  {workspace.name}
-                                </option>
-                              ))}
-                            </WorkspaceSettingsInput>
+                            <WorkspaceSettingsSelectShell>
+                              <WorkspaceSettingsSelect
+                                onChange={(event) => setDefaultWorkspace(event.target.value, "settings_page")}
+                                value={workspaceLifecycleSettings.defaultWorkspaceId}
+                              >
+                                <option value="">No auto-activate workspace</option>
+                                {workspaces.map((workspace) => (
+                                  <option key={workspace.id} value={workspace.id}>
+                                    {workspace.name}
+                                  </option>
+                                ))}
+                              </WorkspaceSettingsSelect>
+                              <WorkspaceSettingsSelectIcon aria-hidden="true" />
+                            </WorkspaceSettingsSelectShell>
                             <SettingsHint>
                               {defaultWorkspace
                                 ? `${defaultWorkspace.name} activates when the desktop workspace opens.`
@@ -8040,9 +8045,9 @@ export default function App() {
                           <SettingsValue>{displayName}</SettingsValue>
                           <SettingsHint>Server-returned desktop session user.</SettingsHint>
                         </div>
-                        <AgentReadyPill data-tone={connectedAgentCount > 0 ? "blue" : "orange"}>
-                          <ButtonBotIcon aria-hidden="true" />
-                          <span>{connectedAgentCount}/2 ready</span>
+                        <AgentReadyPill data-tone={userIsPaid ? "blue" : "orange"}>
+                          <ButtonCheckIcon aria-hidden="true" />
+                          <span>{planLabel} plan</span>
                         </AgentReadyPill>
                       </AccountCardHeader>
 

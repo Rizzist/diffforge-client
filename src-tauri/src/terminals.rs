@@ -434,6 +434,65 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     report
 }
 
+fn terminal_metadata_is_opencode(metadata: &TerminalInstanceMetadata) -> bool {
+    let agent_id = metadata.agent_id.trim().to_ascii_lowercase();
+    let agent_kind = metadata.agent_kind.trim().to_ascii_lowercase();
+
+    agent_id.contains("opencode") || agent_kind.contains("opencode")
+}
+
+#[cfg(not(windows))]
+fn terminal_process_matches_opencode(process: &sysinfo::Process) -> bool {
+    let name = clean_process_text(&process.name().to_string_lossy()).to_ascii_lowercase();
+    let command = process_command_text(process.cmd()).to_ascii_lowercase();
+    let executable = process
+        .exe()
+        .map(process_path_display)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    name.contains("opencode") || command.contains("opencode") || executable.contains("opencode")
+}
+
+#[cfg(not(windows))]
+fn signal_opencode_theme_refresh(root_pid: u32) -> Result<Vec<u32>, String> {
+    let mut system = SysSystem::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        developer_process_refresh_kind(),
+    );
+
+    let child_map = developer_child_map(&system);
+    let candidates = developer_process_tree_child_first(root_pid, &child_map);
+    let mut signaled = Vec::new();
+    let mut failed = Vec::new();
+
+    for candidate in candidates {
+        let Some(process) = system.process(SysPid::from_u32(candidate)) else {
+            continue;
+        };
+        if !terminal_process_matches_opencode(process) {
+            continue;
+        }
+        match process.kill_with(sysinfo::Signal::User2) {
+            Some(true) => signaled.push(candidate),
+            _ => failed.push(candidate),
+        }
+    }
+
+    if signaled.is_empty() && !failed.is_empty() {
+        return Err("Unable to refresh OpenCode terminal theme.".to_string());
+    }
+
+    Ok(signaled)
+}
+
+#[cfg(windows)]
+fn signal_opencode_theme_refresh(_root_pid: u32) -> Result<Vec<u32>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(not(windows))]
 fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     let mut report = TerminalKillReport {
@@ -1529,46 +1588,37 @@ async fn terminal_open(
             return Err(error);
         };
 
+        let launch_provider_id = provider_for_coordination
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                if kind == "console" {
+                    "codex"
+                } else {
+                    kind.as_str()
+                }
+            });
         let launch_args = terminal_args_with_codex_mcp_identity(
-            provider_for_coordination
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if kind == "console" {
-                        "codex"
-                    } else {
-                        kind.as_str()
-                    }
-                }),
+            launch_provider_id,
             &args,
             terminal_coordination.as_ref(),
             &pane_id,
             instance_id,
         );
-        validate_terminal_agent_launch_args_for_platform(
-            provider_for_coordination
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if kind == "console" {
-                        "codex"
-                    } else {
-                        kind.as_str()
-                    }
-                }),
-            &launch_args,
-        )?;
+        validate_terminal_agent_launch_args_for_platform(launch_provider_id, &launch_args)?;
         let coordination_env_vars = terminal_coordination
             .as_ref()
             .map(|coordination| coordination.env_vars.as_slice())
             .unwrap_or(&[]);
+        let launch_env_vars =
+            terminal_env_vars_with_opencode_tui_config(launch_provider_id, coordination_env_vars)?;
 
         let warm_pty = match create_agent_terminal_pty(
             size,
             &command_path,
             &launch_args,
             &process_working_directory,
-            coordination_env_vars,
+            &launch_env_vars,
             None,
         ) {
             Ok(warm_pty) => warm_pty,
@@ -1876,15 +1926,18 @@ async fn terminal_start_agent(
         instance.id,
     );
     validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)?;
+    let coordination_env_vars = instance
+        .coordination
+        .as_ref()
+        .map(|coordination| coordination.env_vars.as_slice())
+        .unwrap_or(&[]);
+    let launch_env_vars =
+        terminal_env_vars_with_opencode_tui_config(definition.id, coordination_env_vars)?;
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
         &launch_args,
         instance.working_directory.as_ref(),
-        instance
-            .coordination
-            .as_ref()
-            .map(|coordination| coordination.env_vars.as_slice())
-            .unwrap_or(&[]),
+        &launch_env_vars,
     );
 
     if input.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -2069,15 +2122,30 @@ async fn start_terminal_agent_in_prepared_pty(
                 message: error,
             };
         }
+        let coordination_env_vars = instance
+            .coordination
+            .as_ref()
+            .map(|coordination| coordination.env_vars.as_slice())
+            .unwrap_or(&[]);
+        let launch_env_vars =
+            match terminal_env_vars_with_opencode_tui_config(definition.id, coordination_env_vars)
+            {
+                Ok(env_vars) => env_vars,
+                Err(error) => {
+                    return TerminalStartAgentPaneResult {
+                        pane_id,
+                        instance_id: Some(instance.id),
+                        started: false,
+                        skipped: false,
+                        message: error,
+                    };
+                }
+            };
         let input = terminal_agent_start_input_with_env_in_directory(
             &command_path,
             &launch_args,
             instance.working_directory.as_ref(),
-            instance
-                .coordination
-                .as_ref()
-                .map(|coordination| coordination.env_vars.as_slice())
-                .unwrap_or(&[]),
+            &launch_env_vars,
         );
 
         if input.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -4079,6 +4147,37 @@ async fn terminal_write(
 }
 
 #[tauri::command]
+async fn terminal_refresh_theme(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+) -> Result<bool, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        return Ok(false);
+    };
+
+    if !terminal_metadata_is_opencode(&instance.metadata) {
+        return Ok(false);
+    }
+
+    if !*instance.agent_started.lock().await {
+        return Ok(false);
+    }
+
+    let root_pid = {
+        let child = instance.child.lock().await;
+        child.as_ref().and_then(|child| child.process_id())
+    };
+    let Some(root_pid) = root_pid.filter(|pid| *pid > 0) else {
+        return Ok(false);
+    };
+
+    Ok(!signal_opencode_theme_refresh(root_pid)?.is_empty())
+}
+
+#[tauri::command]
 async fn terminal_delete_selection(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -4852,6 +4951,48 @@ mod terminal_tests {
         );
 
         assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
+    }
+
+    #[test]
+    fn opencode_launch_env_uses_system_tui_theme_config() {
+        let env_vars = terminal_env_vars_with_opencode_tui_config(
+            "opencode",
+            &[
+                ("COORDINATION_ENABLED".to_string(), "1".to_string()),
+                (
+                    OPENCODE_TUI_CONFIG_ENV.to_string(),
+                    "/tmp/user-opencode-tui.json".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1"));
+        let config_paths = env_vars
+            .iter()
+            .filter_map(|(key, value)| (key == OPENCODE_TUI_CONFIG_ENV).then_some(value))
+            .collect::<Vec<_>>();
+        assert_eq!(config_paths.len(), 1);
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(config_paths[0]).unwrap()).unwrap();
+        assert_eq!(config["$schema"].as_str(), Some("https://opencode.ai/tui.json"));
+        assert_eq!(config["theme"].as_str(), Some(OPENCODE_TUI_SYSTEM_THEME));
+    }
+
+    #[test]
+    fn non_opencode_launch_env_does_not_add_tui_config() {
+        let env_vars = terminal_env_vars_with_opencode_tui_config(
+            "codex",
+            &[("COORDINATION_ENABLED".to_string(), "1".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            env_vars,
+            vec![("COORDINATION_ENABLED".to_string(), "1".to_string())]
+        );
     }
 
     #[cfg(windows)]

@@ -698,6 +698,24 @@ const ThreadPinButton = styled.button`
     background: rgba(84, 68, 34, 0.98);
   }
 
+  html[data-forge-theme="light"] & {
+    color: var(--thread-rail-muted);
+    background: rgba(255, 255, 255, 0.88);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
+  html[data-forge-theme="light"] ${ThreadRow}[data-pinned="true"] & {
+    color: var(--thread-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--thread-blue);
+    background: rgba(0, 102, 204, 0.1);
+  }
+
   &:focus-visible {
     opacity: 1;
     outline: 2px solid rgba(242, 194, 78, 0.48);
@@ -747,6 +765,19 @@ const ThreadArchiveButton = styled.button`
   &:hover {
     color: #ffd6d6;
     background: rgba(239, 107, 107, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--thread-rail-muted);
+    background: rgba(255, 255, 255, 0.88);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--thread-red);
+    background: rgba(180, 35, 24, 0.08);
   }
 
   &:focus-visible {

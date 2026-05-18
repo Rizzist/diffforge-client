@@ -273,29 +273,30 @@ const OrchestratorVoiceArea = styled.div`
 
 const OrchestratorVoiceButton = styled.button`
   display: grid;
-  width: 74px;
-  height: 74px;
+  position: relative;
+  box-sizing: border-box;
+  width: 58px;
+  height: 58px;
+  padding: 0;
   place-items: center;
-  border: 1px solid rgba(138, 216, 255, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 999px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.015)),
-    rgba(5, 10, 18, 0.92);
-  box-shadow:
-    0 14px 34px rgba(0, 0, 0, 0.32),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  background: #000000;
+  box-shadow: 0 0 0 4px rgba(244, 247, 250, 0.1);
+  cursor: pointer;
+  line-height: 0;
   outline: none;
+  overflow: hidden;
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease,
     transform 150ms ease;
+  appearance: none;
+  -webkit-appearance: none;
 
   &:hover {
-    border-color: rgba(138, 216, 255, 0.46);
-    box-shadow:
-      0 16px 38px rgba(0, 0, 0, 0.36),
-      0 0 22px rgba(47, 128, 255, 0.12),
-      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    border-color: rgba(138, 216, 255, 0.26);
+    box-shadow: 0 0 0 4px rgba(125, 176, 255, 0.16);
   }
 
   &:active {
@@ -303,14 +304,14 @@ const OrchestratorVoiceButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.2);
-    background: #fafafc;
-    box-shadow: none;
+    border-color: rgba(255, 255, 255, 0.16);
+    background: #000000;
+    box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.08);
   }
 
   html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.34);
-    box-shadow: none;
+    border-color: rgba(255, 255, 255, 0.22);
+    box-shadow: 0 0 0 4px rgba(0, 102, 204, 0.12);
   }
 `;
 
@@ -319,10 +320,17 @@ const OrchestratorVoiceLogo = styled.img.attrs({
   draggable: false,
   src: "/logo.webp",
 })`
-  width: 48px;
-  height: 48px;
-  object-fit: contain;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: #000000;
+  object-fit: cover;
+  object-position: center;
+  position: relative;
+  z-index: 1;
   user-select: none;
+  -webkit-user-drag: none;
 `;
 
 const OrchestratorSectionTabs = styled.div`

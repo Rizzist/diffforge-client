@@ -198,6 +198,19 @@ const MessageBody = styled.div`
     box-shadow: none;
   }
 
+  article[data-message-role="user"] & ${MessageText} {
+    color: inherit;
+  }
+
+  html[data-forge-theme="light"] article[data-message-role="user"] & {
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    color: #1d1d1f;
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.045),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
   article[data-message-role="assistant"] & {
     width: 100%;
     padding: 2px 3px;
@@ -217,6 +230,11 @@ const MessageInlineCode = styled.code`
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.92em;
   font-weight: 620;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 const MessageFileLink = styled.button`
@@ -237,6 +255,10 @@ const MessageFileLink = styled.button`
     color: #f2f2f2;
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-blue-soft);
   }
 `;
 
@@ -270,6 +292,15 @@ const TranscriptActivityCell = styled.article`
   background: #1b1b1b;
   user-select: text;
   -webkit-user-select: text;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--thread-border);
+    color: #3a3a3c;
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.045),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
 `;
 
 const TranscriptActivityHeader = styled.div`
@@ -289,6 +320,11 @@ const TranscriptActivityTitle = styled.div`
   white-space: nowrap;
   user-select: text;
   -webkit-user-select: text;
+
+  html[data-forge-theme="light"] & {
+    color: #4b4b50;
+    font-weight: 620;
+  }
 `;
 
 const TranscriptActivityStatus = styled.span`
@@ -300,6 +336,11 @@ const TranscriptActivityStatus = styled.span`
   text-transform: uppercase;
   user-select: text;
   -webkit-user-select: text;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-amber);
+    font-weight: 700;
+  }
 `;
 
 const TranscriptActivityBody = styled.pre`
@@ -320,6 +361,28 @@ const TranscriptActivityBody = styled.pre`
   overflow-wrap: anywhere;
   user-select: text;
   -webkit-user-select: text;
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(0, 0, 0, 0.12);
+    color: #515154;
+  }
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(170, 170, 170, 0.18);
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.18);
+  }
 `;
 
 const ActivityCell = styled.article`

@@ -5976,6 +5976,12 @@ export const AudioHeroRow = styled.div`
     }
   }
 
+  html[data-forge-theme="light"] & ${VaultPlaceholderIcon} {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.055);
+  }
+
   @media (max-width: 680px) {
     grid-template-columns: 36px minmax(0, 1fr);
 
@@ -6241,6 +6247,12 @@ export const AudioDevicePanel = styled.section`
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
     rgba(13, 17, 23, 0.58);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88);
+  }
 `;
 
 export const AudioDeviceHeader = styled.div`
@@ -6270,14 +6282,33 @@ export const AudioDeviceControls = styled.div`
 export const AudioDeviceSelect = styled.select`
   min-width: 0;
   min-height: 36px;
-  padding: 0 10px;
+  padding: 0 34px 0 10px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(21, 27, 35, 0.78);
+  background-color: rgba(21, 27, 35, 0.78);
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.012));
+  background-position: right 10px center, 0 0;
+  background-repeat: no-repeat, repeat;
+  background-size: 16px 16px, auto;
+  color-scheme: dark;
+  cursor: pointer;
   font-size: 12px;
   font-weight: 700;
   text-transform: none;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &::-ms-expand {
+    display: none;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 160, 205, 0.32);
+    background-color: rgba(24, 31, 42, 0.84);
+  }
 
   &:focus {
     border-color: rgba(125, 160, 205, 0.44);
@@ -6287,12 +6318,33 @@ export const AudioDeviceSelect = styled.select`
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
-    background: var(--forge-surface);
+    background-color: var(--forge-surface);
+    background-image:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 250, 252, 0.96));
+    color-scheme: light;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.22);
+    background-color: var(--forge-surface-control);
   }
 
   html[data-forge-theme="light"] &:focus {
     border-color: var(--forge-blue-soft);
     box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
+
+  option,
+  optgroup {
+    color: #f4f7fa;
+    background: #0d1117;
+  }
+
+  html[data-forge-theme="light"] option,
+  html[data-forge-theme="light"] optgroup {
+    color: #1d1d1f;
+    background: #ffffff;
   }
 
   &:disabled {
@@ -6370,6 +6422,24 @@ export const AudioInputMeter = styled.div`
     box-shadow:
       0 0 7px rgba(125, 176, 255, 0.06),
       0 1px 0 rgba(255, 255, 255, 0.08) inset;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background:
+      linear-gradient(90deg, rgba(0, 102, 204, 0.055) 0 1px, transparent 1px 10px),
+      #ffffff;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  html[data-forge-theme="light"] & span {
+    background: rgba(0, 0, 0, 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] span {
+    box-shadow:
+      0 0 9px rgba(10, 127, 69, 0.12),
+      0 1px 0 rgba(255, 255, 255, 0.55) inset;
   }
 `;
 
@@ -6608,6 +6678,14 @@ export const AudioHistoryStatChip = styled.div`
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
     rgba(13, 17, 23, 0.66);
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.035),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
   span {
     color: var(--forge-text-muted);
     font-size: 11px;
@@ -6641,8 +6719,12 @@ export const AudioHistoryVirtualList = styled.div`
   min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding-right: 3px;
+  padding: 3px 3px 3px 0;
   border-radius: 8px;
+
+  html[data-forge-theme="light"] & {
+    scrollbar-color: rgba(0, 102, 204, 0.26) rgba(245, 245, 247, 0.9);
+  }
 `;
 
 export const AudioHistoryListSpacer = styled.div`
@@ -6663,6 +6745,14 @@ export const AudioHistoryRow = styled.div`
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
 
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.04),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  }
+
   > strong {
     display: -webkit-box;
     min-width: 0;
@@ -6675,6 +6765,10 @@ export const AudioHistoryRow = styled.div`
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: normal;
+  }
+
+  html[data-forge-theme="light"] & > strong {
+    color: var(--forge-text);
   }
 `;
 
@@ -6720,6 +6814,18 @@ export const AudioHistoryProvider = styled.span`
     color: var(--forge-green);
     background: rgba(75, 212, 170, 0.08);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[data-provider="cloud"] {
+    border-color: rgba(10, 127, 69, 0.2);
+    color: var(--forge-green);
+    background: rgba(10, 127, 69, 0.07);
+  }
 `;
 
 export const AudioHistoryMeta = styled.p`
@@ -6743,6 +6849,10 @@ export const AudioPathBlock = styled.div`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.58);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 
   span {
     color: var(--forge-text-muted);
@@ -6782,6 +6892,12 @@ export const AudioRuntimeHint = styled.p`
   font-weight: 650;
   line-height: 1.45;
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(139, 90, 0, 0.2);
+    color: var(--forge-amber);
+    background: rgba(139, 90, 0, 0.07);
+  }
 `;
 
 export const AudioProgressPanel = styled.div`
@@ -6791,6 +6907,11 @@ export const AudioProgressPanel = styled.div`
   border: 1px solid rgba(125, 160, 205, 0.22);
   border-radius: 8px;
   background: rgba(125, 160, 205, 0.07);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    background: rgba(0, 102, 204, 0.055);
+  }
 `;
 
 export const AudioProgressTopline = styled.div`
@@ -6816,6 +6937,10 @@ export const AudioProgressTrack = styled.div`
   overflow: hidden;
   border-radius: 999px;
   background: rgba(230, 236, 245, 0.08);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.08);
+  }
 `;
 
 export const AudioProgressBar = styled.div`
@@ -7451,6 +7576,12 @@ export const McpTitleRow = styled.div`
     }
   }
 
+  html[data-forge-theme="light"] & ${VaultPlaceholderIcon} {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.055);
+  }
+
   button {
     min-height: 36px;
   }
@@ -7514,7 +7645,21 @@ export const McpMetricPill = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    background: var(--forge-surface-control);
+    border-color: rgba(0, 0, 0, 0.1);
+    color: var(--forge-text-muted);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-state="enabled"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.07);
   }
 `;
 
@@ -7556,6 +7701,7 @@ export const McpRegistryPanel = styled.aside`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
   }
 `;
 
@@ -7620,8 +7766,18 @@ export const McpServerButton = styled.button`
     background: var(--forge-surface-selected);
   }
 
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.16);
+    background: rgba(0, 102, 204, 0.06);
+  }
+
   &[data-active="true"]::before {
     background: var(--forge-blue-soft);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"]::before {
+    background: var(--forge-blue);
   }
 `;
 
@@ -7654,7 +7810,15 @@ export const McpServerIcon = styled.span`
 
   html[data-forge-theme="light"] &,
   html[data-forge-theme="light"] &[data-state="planned"] {
+    border-color: var(--forge-border);
+    color: var(--forge-text-muted);
     background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-state="enabled"] {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
   }
 `;
 
@@ -7714,7 +7878,22 @@ export const McpStatusBadge = styled.span`
 
   html[data-forge-theme="light"] &,
   html[data-forge-theme="light"] &[data-state="planned"] {
-    background: var(--forge-surface-control);
+    border-color: rgba(0, 0, 0, 0.12);
+    color: var(--forge-text-muted);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-state="enabled"] {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.06);
   }
 `;
 
@@ -7734,6 +7913,7 @@ export const McpEditorPanel = styled.section`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
   }
 `;
 
@@ -7795,7 +7975,18 @@ export const McpSwitchButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
     background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[aria-pressed="true"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[aria-pressed="true"] > span::after {
+    background: var(--forge-blue);
   }
 
   &:disabled {
@@ -7840,6 +8031,16 @@ export const McpInput = styled.input`
     outline: none;
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
 `;
 
 export const McpTextarea = styled.textarea`
@@ -7864,6 +8065,16 @@ export const McpTextarea = styled.textarea`
     border-color: rgba(125, 160, 205, 0.44);
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
 `;
 
 export const McpJsonTextarea = styled(McpTextarea)`
@@ -7878,6 +8089,10 @@ export const McpTransportTabs = styled.div`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.46);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 
   @media (max-width: 620px) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -7899,6 +8114,13 @@ export const McpTransportButton = styled.button`
     border-color: rgba(125, 160, 205, 0.28);
     color: var(--forge-text);
     background: var(--forge-surface-selected);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: var(--forge-text);
+    background: rgba(0, 102, 204, 0.07);
   }
 `;
 
@@ -7922,6 +8144,12 @@ export const McpAccessPanel = styled.section`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(21, 27, 35, 0.42);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
 `;
 
 export const McpAccessTopline = styled.div`
@@ -7945,6 +8173,10 @@ export const McpAccessTopline = styled.div`
     width: 16px;
     height: 16px;
     color: var(--forge-blue-soft);
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: var(--forge-blue);
   }
 `;
 
@@ -7972,6 +8204,13 @@ export const McpToolChip = styled.span`
   font-size: 11px;
   font-weight: 760;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: var(--forge-text-soft);
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.035);
+  }
 `;
 
 export const McpInlineActions = styled.span`
@@ -7987,6 +8226,10 @@ export const McpInlineActions = styled.span`
     background: rgba(21, 27, 35, 0.72);
     font-size: 10px;
     font-weight: 900;
+
+    html[data-forge-theme="light"] & {
+      background: var(--forge-surface);
+    }
   }
 
   button:hover {
@@ -8011,6 +8254,10 @@ export const McpCheckRow = styled.label`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(13, 17, 23, 0.58);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
 
   input {
     width: 16px;
@@ -8054,6 +8301,10 @@ export const McpEmptyAccess = styled.p`
   background: rgba(21, 27, 35, 0.48);
   font-size: 12px;
   font-weight: 650;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 `;
 
 export const McpIdentityStatusLine = styled.div`
@@ -8088,6 +8339,22 @@ export const McpIdentityStatusLine = styled.div`
     color: #ffb4b4;
     background: rgba(239, 107, 107, 0.1);
   }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-state="enabled"] {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.06);
+  }
 `;
 
 export const McpMountList = styled.div`
@@ -8110,6 +8377,14 @@ export const McpMountRow = styled.div`
 
   ${TerminalAgentDot} {
     justify-self: center;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.035),
+      inset 0 1px 0 rgba(255, 255, 255, 0.95);
   }
 `;
 
@@ -8216,6 +8491,47 @@ export const SetupInput = styled.input`
     border-color: rgba(125, 160, 205, 0.44);
     outline: none;
     box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+
+  &::placeholder {
+    color: var(--forge-text-muted);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.72;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.13);
+    color: #1d1d1f;
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.045),
+      inset 0 1px 0 rgba(255, 255, 255, 0.98);
+    color-scheme: light;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow:
+      0 0 0 3px rgba(0, 113, 227, 0.16),
+      0 1px 2px rgba(0, 0, 0, 0.045),
+      inset 0 1px 0 rgba(255, 255, 255, 1);
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #8e8e93;
+  }
+
+  html[data-forge-theme="light"] &:disabled {
+    color: #8e8e93;
+    background: #f5f5f7;
   }
 `;
 
@@ -8520,6 +8836,137 @@ export const WorkspaceSettingsInput = styled(SetupInput)`
   font-size: 13px;
 `;
 
+export const WorkspaceSettingsSelect = styled(WorkspaceSettingsInput).attrs({ as: "select" })`
+  min-height: 40px;
+  padding: 0 38px 0 12px;
+  border-color: rgba(125, 160, 205, 0.24);
+  color: #f4f7fa;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.016)),
+    rgba(12, 17, 24, 0.96);
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  color-scheme: dark;
+  cursor: pointer;
+  font-weight: 720;
+  line-height: 1;
+  text-overflow: ellipsis;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    box-shadow 160ms ease,
+    color 160ms ease;
+  white-space: nowrap;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &::-ms-expand {
+    display: none;
+  }
+
+  &:hover {
+    border-color: rgba(125, 160, 205, 0.38);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
+      rgba(16, 22, 31, 0.98);
+    box-shadow:
+      0 12px 28px rgba(0, 0, 0, 0.22),
+      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  }
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.62);
+    outline: none;
+    box-shadow:
+      0 0 0 3px rgba(125, 160, 205, 0.14),
+      0 12px 28px rgba(0, 0, 0, 0.22),
+      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  }
+
+  option,
+  optgroup {
+    color: #f4f7fa;
+    background: #0d1117;
+    background-image: none;
+  }
+
+  option[value=""] {
+    color: #b6c0cc;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.13);
+    color: #1d1d1f;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 250, 252, 0.96)),
+      #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.06),
+      inset 0 1px 0 rgba(255, 255, 255, 0.98);
+    color-scheme: light;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.28);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 1), rgba(245, 245, 247, 0.98)),
+      #fafafc;
+    box-shadow:
+      0 2px 6px rgba(0, 0, 0, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 1);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow:
+      0 0 0 3px rgba(0, 113, 227, 0.16),
+      0 2px 6px rgba(0, 0, 0, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 1);
+  }
+
+  html[data-forge-theme="light"] option,
+  html[data-forge-theme="light"] optgroup {
+    color: #1d1d1f;
+    background: #ffffff;
+    background-image: none;
+  }
+
+  html[data-forge-theme="light"] option[value=""] {
+    color: #6e6e73;
+  }
+`;
+
+export const WorkspaceSettingsSelectShell = styled.div`
+  position: relative;
+  width: 100%;
+  min-width: 0;
+`;
+
+export const WorkspaceSettingsSelectIcon = styled(ExpandMore)`
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  width: 22px;
+  height: 22px;
+  color: #b6c0cc;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: color 160ms ease;
+
+  ${WorkspaceSettingsSelectShell}:hover & {
+    color: #d4dbe4;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0066cc;
+  }
+
+  html[data-forge-theme="light"] ${WorkspaceSettingsSelectShell}:hover & {
+    color: #0057b8;
+  }
+`;
+
 export const WorkspaceNumberInput = styled(WorkspaceSettingsInput)`
   width: 100%;
 `;
@@ -8535,6 +8982,11 @@ export const RootDirectoryInput = styled(WorkspaceSettingsInput)`
   &[readonly] {
     color: var(--forge-text-soft);
     cursor: default;
+  }
+
+  html[data-forge-theme="light"] &[readonly] {
+    color: #3a3a3c;
+    background: #ffffff;
   }
 `;
 
@@ -10273,6 +10725,10 @@ export const SecondaryButton = styled(PrimaryButton)`
   border: 1px solid var(--forge-border);
   color: var(--forge-text);
   background: rgba(21, 27, 35, 0.76);
+
+  &[data-padding="wide"] {
+    padding-inline: 18px;
+  }
 
   &:hover:not(:disabled) {
     border-color: rgba(125, 160, 205, 0.34);

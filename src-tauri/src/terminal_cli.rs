@@ -997,10 +997,64 @@ fn default_terminal_working_directory() -> PathBuf {
 const TERMINAL_EMULATION_TERM: &str = "xterm-256color";
 const TERMINAL_EMULATION_COLORTERM: &str = "truecolor";
 const TERMINAL_EMULATION_FORCE_COLOR: &str = "1";
+const OPENCODE_TUI_CONFIG_ENV: &str = "OPENCODE_TUI_CONFIG";
+const OPENCODE_TUI_SYSTEM_THEME: &str = "system";
 #[cfg(windows)]
 const TERMINAL_EMULATION_PROGRAM: &str = "vscode";
 #[cfg(not(windows))]
 const TERMINAL_EMULATION_PROGRAM: &str = "DiffForge";
+
+fn diffforge_opencode_tui_config_path() -> PathBuf {
+    env::temp_dir()
+        .join("diffforge-opencode")
+        .join("tui-system.json")
+}
+
+fn ensure_diffforge_opencode_tui_config() -> Result<PathBuf, String> {
+    let path = diffforge_opencode_tui_config_path();
+    let Some(parent) = path.parent() else {
+        return Err("Unable to prepare OpenCode TUI config path.".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to prepare OpenCode TUI config directory: {error}"))?;
+
+    let config = json!({
+        "$schema": "https://opencode.ai/tui.json",
+        "theme": OPENCODE_TUI_SYSTEM_THEME
+    });
+    let body = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&config).unwrap_or_else(|_| config.to_string())
+    );
+    if fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
+        fs::write(&path, body)
+            .map_err(|error| format!("Unable to write OpenCode TUI config: {error}"))?;
+    }
+    Ok(path)
+}
+
+fn terminal_env_vars_with_opencode_tui_config(
+    provider_id: &str,
+    env_vars: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    let mut next = env_vars.to_vec();
+    if !provider_id
+        .trim()
+        .to_ascii_lowercase()
+        .contains("opencode")
+    {
+        return Ok(next);
+    }
+
+    next.retain(|(key, _)| key != OPENCODE_TUI_CONFIG_ENV);
+    next.push((
+        OPENCODE_TUI_CONFIG_ENV.to_string(),
+        ensure_diffforge_opencode_tui_config()?
+            .to_string_lossy()
+            .to_string(),
+    ));
+    Ok(next)
+}
 
 fn apply_terminal_emulation_env(command: &mut CommandBuilder) {
     command.env("TERM", TERMINAL_EMULATION_TERM);

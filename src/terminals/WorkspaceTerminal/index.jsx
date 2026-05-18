@@ -839,6 +839,8 @@ function WorkspaceTerminal({
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupProbeCountRef = useRef(0);
   const terminalClosingRef = useRef(false);
+  const terminalThemeRefreshTimerRef = useRef(0);
+  const lastTerminalThemeRefreshKeyRef = useRef("");
   const preserveCoordinationOnNextCleanupRef = useRef(false);
   const preserveCoordinationOnNextOpenRef = useRef(false);
   const forceFreshSessionOnNextOpenRef = useRef(false);
@@ -931,6 +933,70 @@ function WorkspaceTerminal({
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
     : `${agent?.label || "Agent"} terminal`;
+  const scheduleOpenCodeTerminalThemeRefresh = useCallback((themeId = getCurrentForgeThemeId()) => {
+    if (isGenericTerminal || terminalAgentKind !== "opencode") {
+      return;
+    }
+
+    const instanceId = terminalInstanceIdRef.current || 0;
+    if (!paneId || !instanceId) {
+      return;
+    }
+
+    const refreshKey = `${paneId}:${instanceId}:${themeId || ""}`;
+    if (lastTerminalThemeRefreshKeyRef.current === refreshKey) {
+      return;
+    }
+    lastTerminalThemeRefreshKeyRef.current = refreshKey;
+
+    if (terminalThemeRefreshTimerRef.current) {
+      window.clearTimeout(terminalThemeRefreshTimerRef.current);
+    }
+    terminalThemeRefreshTimerRef.current = window.setTimeout(() => {
+      terminalThemeRefreshTimerRef.current = 0;
+      invoke("terminal_refresh_theme", {
+        paneId,
+        instanceId,
+      }).catch((error) => {
+        logTerminalDiagnosticEvent("frontend.opencode_theme_refresh.error", {
+          agentId: terminalAgentKind,
+          instanceId,
+          message: error?.message || String(error || ""),
+          paneId,
+          terminalIndex,
+          themeId: themeId || "",
+          workspaceId: workspace?.id || "",
+        });
+      });
+    }, 120);
+  }, [isGenericTerminal, paneId, terminalAgentKind, terminalIndex, workspace?.id]);
+  useEffect(() => {
+    if (isGenericTerminal || terminalAgentKind !== "opencode") {
+      return undefined;
+    }
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") {
+      return undefined;
+    }
+
+    const root = document.documentElement;
+    const refresh = () => {
+      scheduleOpenCodeTerminalThemeRefresh(root?.dataset?.forgeTheme || "");
+    };
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.some((mutation) => mutation.attributeName === "data-forge-theme")) {
+        refresh();
+      }
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ["data-forge-theme"] });
+    refresh();
+    return () => {
+      observer.disconnect();
+      if (terminalThemeRefreshTimerRef.current) {
+        window.clearTimeout(terminalThemeRefreshTimerRef.current);
+        terminalThemeRefreshTimerRef.current = 0;
+      }
+    };
+  }, [isGenericTerminal, scheduleOpenCodeTerminalThemeRefresh, terminalAgentKind]);
   useEffect(() => {
     terminalThreadIdRef.current = terminalThreadId;
     terminalThreadSlotKeyRef.current = terminalThreadSlotKey;
