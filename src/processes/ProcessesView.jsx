@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 
 import {
   ButtonBotIcon,
@@ -22,6 +22,7 @@ import {
 const PROCESS_REFRESH_MS = 6500;
 const HIGH_CPU_PERCENT = 65;
 const HIGH_MEMORY_BYTES = 1024 * 1024 * 1024;
+const PROCESS_BUSY_SPINNER_SEGMENTS = Array.from({ length: 8 }, (_, index) => index);
 const DOCKER_ACTIONS = {
   rebuildRelaunch: {
     buttonLabel: "Rebuild",
@@ -528,9 +529,11 @@ function dockerCommandMetaItems(command) {
     : [];
   const cwd = String(command?.cwd || command?.targetComposeWorkingDir || "").trim();
   const container = String(command?.targetContainerName || command?.targetContainerId || "").trim();
+  const image = String(command?.targetContainerImage || "").trim();
 
   for (const link of links) {
-    items.push({ label: "linked path", value: link });
+    const isSignal = /^[a-z ]+:\s+\S/i.test(link) && !/^[a-zA-Z]:[\\/]/.test(link);
+    items.push({ label: isSignal ? "linked signal" : "linked path", value: link });
   }
   if (cwd) {
     items.push({ label: "cwd", value: cwd });
@@ -540,6 +543,9 @@ function dockerCommandMetaItems(command) {
   }
   if (container) {
     items.push({ label: "container", value: container });
+  }
+  if (image) {
+    items.push({ label: "image", value: image });
   }
 
   return items;
@@ -577,6 +583,16 @@ function GroupIcon({ hint }) {
     return <ButtonCodeIcon aria-hidden="true" />;
   }
   return <ButtonProcessIcon aria-hidden="true" />;
+}
+
+function ProcessBusySpinner() {
+  return (
+    <ProcessRowBusySpinner aria-hidden="true">
+      {PROCESS_BUSY_SPINNER_SEGMENTS.map((segment) => (
+        <span key={segment} style={{ "--segment": segment }} />
+      ))}
+    </ProcessRowBusySpinner>
+  );
 }
 
 function ProcessPortBadge({ process }) {
@@ -658,6 +674,14 @@ function ProcessDockerActionLog({ result }) {
   );
 }
 
+function isDockerRowBusy(bucketId, process, dockerActionState) {
+  if (bucketId !== "docker" || dockerActionState?.state !== "running") {
+    return false;
+  }
+  const targetProcessKey = String(dockerActionState?.targetProcessKey || "");
+  return !targetProcessKey || targetProcessKey === processStableKey(process);
+}
+
 function ProcessBucket({
   bucket,
   dockerActionState,
@@ -671,73 +695,77 @@ function ProcessBucket({
   return (
     <ProcessBucketPanel aria-label={bucket.label} data-kind={bucket.id}>
       <ProcessBucketList aria-label={bucket.label} role="list">
-        {bucket.processes.map((process) => (
-          <ProcessBucketRow
-            data-hot={isHighUsage(process) ? "true" : "false"}
-            key={processStableKey(process)}
-            role="listitem"
-            title={processCommandPreview(process)}
-          >
-            <ProcessRowIcon data-kind={process.groupKind || bucket.id}>
-              <GroupIcon hint={process.iconHint} />
-            </ProcessRowIcon>
-            <ProcessRowMain>
-              <span>{processBlurb(process)}</span>
-            </ProcessRowMain>
-            <ProcessPortBadge process={process} />
-            <ProcessRowUsage>
-              <span>{formatBytes(process.memoryBytes)}</span>
-              <strong>{formatCpu(process.cpuPercent)}</strong>
-            </ProcessRowUsage>
-            <ProcessRowActions>
-              {bucket.id === "docker" && (
-                <>
-                  <ProcessDockerActionButton
-                    aria-label={DOCKER_ACTIONS.relaunch.title}
-                    disabled={dockerActionState?.state === "running"}
-                    onClick={() => onDockerAction("relaunch", process)}
-                    title={DOCKER_ACTIONS.relaunch.title}
-                    type="button"
-                  >
-                    <ButtonRefreshIcon aria-hidden="true" />
-                  </ProcessDockerActionButton>
-                  <ProcessDockerActionButton
-                    aria-label={DOCKER_ACTIONS.rebuildRelaunch.title}
-                    disabled={dockerActionState?.state === "running"}
-                    onClick={() => onDockerAction("rebuildRelaunch", process)}
-                    title={DOCKER_ACTIONS.rebuildRelaunch.title}
-                    type="button"
-                  >
-                    <ButtonCodeIcon aria-hidden="true" />
-                  </ProcessDockerActionButton>
-                  <ProcessDockerActionButton
-                    aria-label={DOCKER_ACTIONS.remountData.title}
-                    data-danger="true"
-                    disabled={dockerActionState?.state === "running"}
-                    onClick={() => onDockerAction("remountData", process)}
-                    title={DOCKER_ACTIONS.remountData.title}
-                    type="button"
-                  >
-                    <ButtonHubIcon aria-hidden="true" />
-                  </ProcessDockerActionButton>
-                </>
-              )}
-              <ProcessRowStopButton
-                aria-label={processStopLabel(process)}
-                disabled={!process.killable}
-                onClick={() => {
-                  if (process.killable) {
-                    onStopProcess(process);
-                  }
-                }}
-                title={processStopLabel(process)}
-                type="button"
-              >
-                <ButtonDeleteIcon aria-hidden="true" />
-              </ProcessRowStopButton>
-            </ProcessRowActions>
-          </ProcessBucketRow>
-        ))}
+        {bucket.processes.map((process) => {
+          const dockerBusy = isDockerRowBusy(bucket.id, process, dockerActionState);
+          return (
+            <ProcessBucketRow
+              data-docker-busy={dockerBusy ? "true" : "false"}
+              data-hot={isHighUsage(process) ? "true" : "false"}
+              key={processStableKey(process)}
+              role="listitem"
+              title={processCommandPreview(process)}
+            >
+              <ProcessRowIcon data-busy={dockerBusy ? "true" : "false"} data-kind={process.groupKind || bucket.id}>
+                {dockerBusy ? <ProcessBusySpinner /> : <GroupIcon hint={process.iconHint} />}
+              </ProcessRowIcon>
+              <ProcessRowMain>
+                <span>{processBlurb(process)}</span>
+              </ProcessRowMain>
+              <ProcessPortBadge process={process} />
+              <ProcessRowUsage>
+                <span>{formatBytes(process.memoryBytes)}</span>
+                <strong>{formatCpu(process.cpuPercent)}</strong>
+              </ProcessRowUsage>
+              <ProcessRowActions>
+                {bucket.id === "docker" && (
+                  <>
+                    <ProcessDockerActionButton
+                      aria-label={DOCKER_ACTIONS.relaunch.title}
+                      disabled={dockerActionState?.state === "running"}
+                      onClick={() => onDockerAction("relaunch", process)}
+                      title={DOCKER_ACTIONS.relaunch.title}
+                      type="button"
+                    >
+                      <ButtonRefreshIcon aria-hidden="true" />
+                    </ProcessDockerActionButton>
+                    <ProcessDockerActionButton
+                      aria-label={DOCKER_ACTIONS.rebuildRelaunch.title}
+                      disabled={dockerActionState?.state === "running"}
+                      onClick={() => onDockerAction("rebuildRelaunch", process)}
+                      title={DOCKER_ACTIONS.rebuildRelaunch.title}
+                      type="button"
+                    >
+                      <ButtonCodeIcon aria-hidden="true" />
+                    </ProcessDockerActionButton>
+                    <ProcessDockerActionButton
+                      aria-label={DOCKER_ACTIONS.remountData.title}
+                      data-danger="true"
+                      disabled={dockerActionState?.state === "running"}
+                      onClick={() => onDockerAction("remountData", process)}
+                      title={DOCKER_ACTIONS.remountData.title}
+                      type="button"
+                    >
+                      <ButtonHubIcon aria-hidden="true" />
+                    </ProcessDockerActionButton>
+                  </>
+                )}
+                <ProcessRowStopButton
+                  aria-label={processStopLabel(process)}
+                  disabled={!process.killable}
+                  onClick={() => {
+                    if (process.killable) {
+                      onStopProcess(process);
+                    }
+                  }}
+                  title={processStopLabel(process)}
+                  type="button"
+                >
+                  <ButtonDeleteIcon aria-hidden="true" />
+                </ProcessRowStopButton>
+              </ProcessRowActions>
+            </ProcessBucketRow>
+          );
+        })}
       </ProcessBucketList>
     </ProcessBucketPanel>
   );
@@ -752,7 +780,12 @@ export default function ProcessesView({
   const [error, setError] = useState("");
   const [confirmAction, setConfirmAction] = useState(null);
   const [dockerConfirmAction, setDockerConfirmAction] = useState(null);
-  const [dockerActionState, setDockerActionState] = useState({ state: "idle", message: "", result: null });
+  const [dockerActionState, setDockerActionState] = useState({
+    message: "",
+    result: null,
+    state: "idle",
+    targetProcessKey: "",
+  });
   const [killState, setKillState] = useState({ state: "idle", message: "" });
   const mountedRef = useRef(false);
   const processOrderCounterRef = useRef(0);
@@ -911,9 +944,10 @@ export default function ProcessesView({
     setDockerConfirmAction({
       action,
       ...config,
-      processLabel: processBlurb(process),
+      processLabel: process ? processBlurb(process) : "Workspace Docker targets",
+      targetProcessKey: process ? processStableKey(process) : "",
     });
-    setDockerActionState({ state: "idle", message: "", result: null });
+    setDockerActionState({ state: "idle", message: "", result: null, targetProcessKey: "" });
   }, []);
 
   const confirmDockerAction = useCallback(async () => {
@@ -921,7 +955,12 @@ export default function ProcessesView({
       return;
     }
 
-    setDockerActionState({ state: "running", message: "", result: null });
+    setDockerActionState({
+      state: "running",
+      message: "",
+      result: null,
+      targetProcessKey: dockerConfirmAction.targetProcessKey || "",
+    });
 
     try {
       const result = await invoke("docker_developer_action", {
@@ -943,6 +982,7 @@ export default function ProcessesView({
         state: Number(result?.failed || 0) > 0 ? "error" : "done",
         message: `${result?.message || "Docker action completed."}${skipped}${failure}`.trim(),
         result,
+        targetProcessKey: "",
       });
       await loadProcesses({ silent: true });
     } catch (actionError) {
@@ -950,6 +990,7 @@ export default function ProcessesView({
         state: "error",
         message: errorMessage(actionError, "Unable to run Docker action."),
         result: null,
+        targetProcessKey: "",
       });
     }
   }, [
@@ -1042,6 +1083,22 @@ export default function ProcessesView({
             <span>Memory</span>
             <strong>{formatBytes(totalMemoryBytes)}</strong>
           </ProcessMetric>
+          <SecondaryButton
+            disabled={dockerActionState.state === "running"}
+            onClick={() => beginDockerAction("relaunch", null)}
+            type="button"
+          >
+            <ButtonRefreshIcon aria-hidden="true" />
+            <span>{dockerActionState.state === "running" ? "Running..." : "Relaunch"}</span>
+          </SecondaryButton>
+          <SecondaryButton
+            disabled={dockerActionState.state === "running"}
+            onClick={() => beginDockerAction("rebuildRelaunch", null)}
+            type="button"
+          >
+            <ButtonCodeIcon aria-hidden="true" />
+            <span>Rebuild</span>
+          </SecondaryButton>
           <SecondaryButton disabled={refreshState === "loading"} onClick={() => loadProcesses()} type="button">
             <ButtonRefreshIcon aria-hidden="true" />
             <span>{refreshState === "loading" ? "Refreshing..." : "Refresh"}</span>
@@ -1501,6 +1558,17 @@ const ProcessBucketList = styled.div`
   padding: 0;
 `;
 
+const processBusyPulse = keyframes`
+  0%,
+  20% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0.2;
+  }
+`;
+
 const ProcessBucketRow = styled.div`
   position: relative;
   display: grid;
@@ -1563,6 +1631,39 @@ const ProcessRowIcon = styled.span`
   &[data-kind="node"] {
     color: var(--forge-blue-soft);
     background: rgba(59, 130, 246, 0.1);
+  }
+
+  &[data-busy="true"] {
+    color: #ffffff;
+    background: transparent;
+  }
+
+  html[data-forge-theme="light"] &[data-busy="true"] {
+    color: #111111;
+  }
+`;
+
+const ProcessRowBusySpinner = styled.span`
+  position: relative;
+  display: block;
+  width: 18px;
+  height: 18px;
+  color: currentColor;
+
+  span {
+    position: absolute;
+    top: 1px;
+    left: 50%;
+    width: 3px;
+    height: 6px;
+    margin-left: -1.5px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.2;
+    transform: rotate(calc(var(--segment) * 45deg));
+    transform-origin: 1.5px 8px;
+    animation: ${processBusyPulse} 900ms linear infinite;
+    animation-delay: calc(var(--segment) * -112.5ms);
   }
 `;
 

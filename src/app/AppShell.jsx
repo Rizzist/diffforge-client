@@ -22,7 +22,10 @@ import {
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
-import { logBigViewSyncDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
+import {
+  getBigViewTextDiagnosticFields,
+  logBigViewSyncDiagnosticEvent,
+} from "../threads/bigViewSyncDiagnostics";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
@@ -6398,6 +6401,9 @@ export default function App() {
       transcriptHydrationMode: lifecycleEvent.transcriptHydrationMode || "",
       type: lifecycleEvent.type || "",
       userMessageLength: getThreadDiagnosticTextLength(lifecycleEvent.userMessage || ""),
+      userMessageText: getBigViewTextDiagnosticFields(
+        lifecycleEvent.userMessage || lifecycleEvent.message || "",
+      ),
       workspaceId: lifecycleWorkspaceId,
       snapshot: getWorkspaceThreadDiagnosticSnapshot(
         workspaceThreadsRef.current,
@@ -6461,6 +6467,9 @@ export default function App() {
         threadId: lifecycleThreadId,
         type: lifecycleEvent.type || "",
         userMessageLength: getThreadDiagnosticTextLength(
+          lifecycleEvent.userMessage || lifecycleEvent.message || "",
+        ),
+        userMessageText: getBigViewTextDiagnosticFields(
           lifecycleEvent.userMessage || lifecycleEvent.message || "",
         ),
         userProjectionEventCount: userProjectionEvents.length,
@@ -6630,6 +6639,9 @@ export default function App() {
         threadId: lifecycleThreadId,
         type: lifecycleEvent.type || "",
         userMessageLength: getThreadDiagnosticTextLength(lifecycleEvent.userMessage || ""),
+        userMessageText: getBigViewTextDiagnosticFields(
+          lifecycleEvent.userMessage || lifecycleEvent.message || "",
+        ),
         workspaceId: lifecycleWorkspaceId,
       });
       if (
@@ -6786,6 +6798,7 @@ export default function App() {
         providerSessionPresent: Boolean(submittedProviderSessionId),
         promptEventIdPresent: Boolean(payload.promptEventId),
         promptLength: userMessage.length,
+        promptText: getBigViewTextDiagnosticFields(userMessage),
         source: "terminal-prompt-submitted",
         terminalIndex: payload.terminalIndex ?? "",
         threadId: payload.threadId || "",

@@ -1,9 +1,28 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { AddPhotoAlternate } from "@styled-icons/material-rounded/AddPhotoAlternate";
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import Prism from "prismjs";
+import "prismjs/components/prism-markup";
+import "prismjs/components/prism-css";
+import "prismjs/components/prism-javascript";
+import "prismjs/components/prism-jsx";
+import "prismjs/components/prism-typescript";
+import "prismjs/components/prism-tsx";
+import "prismjs/components/prism-json";
+import "prismjs/components/prism-rust";
+import "prismjs/components/prism-toml";
+import "prismjs/components/prism-bash";
+import "prismjs/components/prism-powershell";
+import "prismjs/components/prism-python";
+import "prismjs/components/prism-yaml";
+import "prismjs/components/prism-markdown";
+import "prismjs/components/prism-diff";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import styled, { keyframes } from "styled-components";
 
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
@@ -18,7 +37,11 @@ import {
   WORKSPACE_FILE_POINTER_DROP_EVENT,
   workspaceFileToComposerAttachment,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
-import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "./bigViewSyncDiagnostics";
+import {
+  getBigViewTextDiagnosticFields,
+  logBigViewSyncDiagnosticEvent,
+  logFileDragDiagnosticEvent,
+} from "./bigViewSyncDiagnostics";
 import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
@@ -62,6 +85,7 @@ const DetailRoot = styled.main`
   --thread-composer-font-size: 12px;
   color: var(--thread-fg);
   background: var(--thread-bg);
+  outline: none;
 
   html[data-forge-theme="light"] & {
     --thread-bg: #f5f5f7;
@@ -259,6 +283,194 @@ const MessageFileLink = styled.button`
 
   html[data-forge-theme="light"] &:hover {
     color: var(--forge-blue-soft);
+  }
+`;
+
+const AssistantMarkdownBody = styled.div`
+  min-width: 0;
+  color: var(--thread-fg);
+  font-size: var(--thread-detail-font-size);
+  font-weight: 470;
+  letter-spacing: 0;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+
+  > :first-child {
+    margin-top: 0;
+  }
+
+  > :last-child {
+    margin-bottom: 0;
+  }
+
+  p {
+    margin: 0 0 10px;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    margin: 16px 0 8px;
+    color: var(--thread-fg);
+    font-weight: 680;
+    letter-spacing: 0;
+    line-height: 1.25;
+  }
+
+  h1 {
+    font-size: 1.22em;
+  }
+
+  h2 {
+    font-size: 1.13em;
+  }
+
+  h3,
+  h4 {
+    font-size: 1.04em;
+  }
+
+  ul,
+  ol {
+    margin: 6px 0 12px;
+    padding-left: 21px;
+  }
+
+  li {
+    margin: 3px 0;
+    padding-left: 2px;
+  }
+
+  li > p {
+    margin: 0;
+  }
+
+  li > p + p {
+    margin-top: 7px;
+  }
+
+  blockquote {
+    margin: 12px 0;
+    border-left: 2px solid var(--thread-border-strong);
+    padding: 1px 0 1px 12px;
+    color: var(--thread-muted);
+  }
+
+  a {
+    color: var(--thread-blue);
+    font-weight: 560;
+    text-decoration: none;
+  }
+
+  a:hover {
+    color: #f2f2f2;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & a:hover {
+    color: var(--forge-blue-soft);
+  }
+
+  code {
+    border-radius: 6px;
+    padding: 1px 5px 2px;
+    color: #f8fafc;
+    background: rgba(255, 255, 255, 0.11);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.92em;
+    font-weight: 620;
+  }
+
+  html[data-forge-theme="light"] & code {
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  pre {
+    max-width: 100%;
+    margin: 12px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border: 1px solid var(--thread-border);
+    border-radius: 8px;
+    padding: 11px 12px;
+    background: rgba(255, 255, 255, 0.045);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: var(--thread-detail-small-font-size);
+    line-height: 1.55;
+    white-space: pre;
+  }
+
+  html[data-forge-theme="light"] & pre {
+    background: rgba(0, 0, 0, 0.035);
+  }
+
+  pre code {
+    display: block;
+    min-width: max-content;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-weight: 500;
+    white-space: pre;
+    overflow-wrap: normal;
+  }
+
+  .thread-markdown-table-wrap {
+    max-width: 100%;
+    margin: 12px 0;
+    overflow-x: auto;
+    border: 1px solid var(--thread-border);
+    border-radius: 8px;
+  }
+
+  table {
+    width: 100%;
+    min-width: 420px;
+    border-collapse: collapse;
+    font-size: var(--thread-detail-small-font-size);
+    line-height: 1.45;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid var(--thread-border);
+    padding: 7px 9px;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.055);
+    font-weight: 680;
+  }
+
+  html[data-forge-theme="light"] & th {
+    background: rgba(0, 0, 0, 0.035);
+  }
+
+  tr:last-child td {
+    border-bottom: 0;
+  }
+
+  hr {
+    height: 1px;
+    margin: 16px 0;
+    border: 0;
+    background: var(--thread-border);
+  }
+
+  input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    margin: 0 6px 0 -18px;
+    vertical-align: -2px;
   }
 `;
 
@@ -804,6 +1016,7 @@ const NewChatRoot = styled.main`
   --thread-ring: rgba(255, 255, 255, 0.22);
   color: var(--thread-fg);
   background: var(--thread-bg);
+  outline: none;
 
   html[data-forge-theme="light"] & {
     --thread-bg: #f5f5f7;
@@ -1075,6 +1288,25 @@ const IMAGE_EXTENSION_MIME_TYPES = new Map([
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
 const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za-z0-9_.@ -]+\.[A-Za-z0-9]+(?::\d+)?|[A-Za-z0-9_.@-]+\.(?:cjs|css|html|js|jsx|json|lock|md|mdx|mjs|ps1|py|rs|scss|sh|toml|ts|tsx|txt|yaml|yml)(?::\d+)?)/g;
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+const PRISM_LANGUAGE_ALIASES = new Map([
+  ["cjs", "javascript"],
+  ["html", "markup"],
+  ["js", "javascript"],
+  ["jsx", "jsx"],
+  ["md", "markdown"],
+  ["mdx", "markdown"],
+  ["mjs", "javascript"],
+  ["ps", "powershell"],
+  ["ps1", "powershell"],
+  ["py", "python"],
+  ["rs", "rust"],
+  ["shell", "bash"],
+  ["sh", "bash"],
+  ["ts", "typescript"],
+  ["tsx", "tsx"],
+  ["yml", "yaml"],
+]);
 const MODEL_OPTIONS = {
   claude: [
     { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
@@ -1356,6 +1588,30 @@ function getClipboardImageFiles(clipboardData) {
   return dedupeImageFiles(itemFiles.concat(clipboardFiles));
 }
 
+function getPasteTargetElement(target) {
+  if (!target || typeof target !== "object") {
+    return null;
+  }
+
+  if (typeof target.closest === "function") {
+    return target;
+  }
+
+  return target.parentElement || null;
+}
+
+function isEditablePasteTarget(target) {
+  const element = getPasteTargetElement(target);
+  return Boolean(element?.closest?.("textarea,input,[contenteditable='true'],[contenteditable='plaintext-only']"));
+}
+
+function isInteractivePasteTarget(target) {
+  const element = getPasteTargetElement(target);
+  return Boolean(element?.closest?.(
+    "textarea,input,select,button,a,[role='button'],[role='menuitem'],[contenteditable='true'],[contenteditable='plaintext-only']",
+  ));
+}
+
 function hasImageFileTransfer(dataTransfer) {
   return Array.from(dataTransfer?.types || []).some((type) => String(type || "").toLowerCase() === "files")
     || Array.from(dataTransfer?.items || []).some((item) => (
@@ -1570,6 +1826,8 @@ function NewChatView({
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const newChatRootRef = useRef(null);
+  const newChatInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const agentOptions = useMemo(() => getNewChatAgentOptions(agentStatuses), [agentStatuses]);
   const selectedAgentOption = agentOptions.find((option) => option.id === agentId) || agentOptions[0];
@@ -1702,6 +1960,16 @@ function NewChatView({
 
   const handleComposerPaste = (event) => {
     const imageFiles = getClipboardImageFiles(event.clipboardData);
+    const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
+    logBigViewSyncDiagnosticEvent("bigview.text.paste_observed", {
+      agentId: activeAgentId,
+      clipboardTypes: Array.from(event.clipboardData?.types || []),
+      hasImageFiles: imageFiles.length > 0,
+      model: effectiveSelectedModel || "",
+      surface: "new_chat",
+      text: getBigViewTextDiagnosticFields(clipboardText),
+      workspaceId: workspace?.id || "",
+    });
     if (!imageFiles.length) {
       return;
     }
@@ -1717,6 +1985,118 @@ function NewChatView({
       workspaceId: workspace?.id || "",
     });
     addImageFiles(imageFiles);
+  };
+
+  const appendPlainTextPasteToNewChat = (clipboardText, source = "bigview_new_chat_window_paste") => {
+    const pastedText = String(clipboardText || "");
+    if (!pastedText || sending) {
+      logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_skip", {
+        agentId: activeAgentId,
+        disabled: Boolean(sending),
+        model: effectiveSelectedModel || "",
+        reason: !pastedText ? "empty_text" : "composer_unavailable",
+        source,
+        surface: "new_chat",
+        text: getBigViewTextDiagnosticFields(pastedText),
+        workspaceId: workspace?.id || "",
+      });
+      return false;
+    }
+
+    const previousDraft = draft;
+    const nextDraft = `${previousDraft}${pastedText}`;
+    setError("");
+    setDraft(nextDraft);
+    window.setTimeout(() => {
+      newChatInputRef.current?.focus?.();
+    }, 0);
+    logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_insert", {
+      agentId: activeAgentId,
+      model: effectiveSelectedModel || "",
+      nextValueLength: nextDraft.length,
+      previousValueLength: previousDraft.length,
+      source,
+      surface: "new_chat",
+      text: getBigViewTextDiagnosticFields(pastedText),
+      workspaceId: workspace?.id || "",
+    });
+    return true;
+  };
+
+  useEffect(() => {
+    const handleWindowPasteCapture = (event) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      const root = newChatRootRef.current;
+      if (!root) {
+        return;
+      }
+
+      const targetElement = getPasteTargetElement(event.target);
+      const activeElement = getPasteTargetElement(document.activeElement);
+      const targetInsideNewChat = Boolean(targetElement && root.contains(targetElement));
+      const activeInsideNewChat = Boolean(activeElement && root.contains(activeElement));
+      const targetIsNewChatInput = targetElement === newChatInputRef.current;
+      const targetIsEditable = isEditablePasteTarget(targetElement);
+      const targetIsInteractive = isInteractivePasteTarget(targetElement);
+      const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
+      const imageFiles = getClipboardImageFiles(event.clipboardData);
+
+      if (!clipboardText && !imageFiles.length) {
+        return;
+      }
+
+      logBigViewSyncDiagnosticEvent("bigview.text.window_paste_observed", {
+        agentId: activeAgentId,
+        activeInsideNewChat,
+        clipboardTypes: Array.from(event.clipboardData?.types || []),
+        hasImageFiles: imageFiles.length > 0,
+        model: effectiveSelectedModel || "",
+        surface: "new_chat",
+        targetInsideNewChat,
+        targetIsEditable,
+        targetIsInteractive,
+        targetIsNewChatInput,
+        text: getBigViewTextDiagnosticFields(clipboardText),
+        workspaceId: workspace?.id || "",
+      });
+
+      if (
+        imageFiles.length
+        || targetIsNewChatInput
+        || targetIsEditable
+        || targetIsInteractive
+        || (!targetInsideNewChat && !activeInsideNewChat)
+      ) {
+        return;
+      }
+
+      if (appendPlainTextPasteToNewChat(clipboardText)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+
+    window.addEventListener("paste", handleWindowPasteCapture, true);
+    return () => {
+      window.removeEventListener("paste", handleWindowPasteCapture, true);
+    };
+  }, [
+    activeAgentId,
+    draft,
+    effectiveSelectedModel,
+    sending,
+    workspace?.id,
+  ]);
+
+  const handleNewChatRootClick = (event) => {
+    if (isInteractivePasteTarget(event.target)) {
+      return;
+    }
+
+    newChatRootRef.current?.focus?.({ preventScroll: true });
   };
 
   const handleComposerDragEnter = (event) => {
@@ -1786,6 +2166,16 @@ function NewChatView({
       hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
       surface: "new_chat",
       transfer: describeImageDropTransfer(event.dataTransfer),
+      workspaceId: workspace?.id || "",
+    });
+    logBigViewSyncDiagnosticEvent("bigview.text.drop_observed", {
+      agentId: activeAgentId,
+      dataTransferTypes: Array.from(event.dataTransfer?.types || []),
+      hasImageTransfer: imageFiles.length > 0,
+      hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
+      model: effectiveSelectedModel || "",
+      surface: "new_chat",
+      text: getBigViewTextDiagnosticFields(event.dataTransfer?.getData?.("text/plain") || ""),
       workspaceId: workspace?.id || "",
     });
     if (imageFiles.length) {
@@ -1958,6 +2348,7 @@ function NewChatView({
         attachmentCount: previousAttachments.length,
         imageBlockPresent: Boolean(imageBlock),
         messageLength: message.length,
+        messageText: getBigViewTextDiagnosticFields(message),
         selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
         workspaceId: workspace?.id || "",
@@ -1996,7 +2387,12 @@ function NewChatView({
   };
 
   return (
-    <NewChatRoot aria-label="New chat">
+    <NewChatRoot
+      aria-label="New chat"
+      onClick={handleNewChatRootClick}
+      ref={newChatRootRef}
+      tabIndex={-1}
+    >
       <NewChatCenter
         onSubmit={(event) => {
           event.preventDefault();
@@ -2030,6 +2426,7 @@ function NewChatView({
             }}
             onPaste={handleComposerPaste}
             placeholder={`Ask ${AGENT_LABELS[activeAgentId] || "an agent"} anything`}
+            ref={newChatInputRef}
             rows={1}
             spellCheck="true"
             value={draft}
@@ -2206,6 +2603,7 @@ function NewChatView({
 function cleanFileReference(value) {
   return String(value || "")
     .trim()
+    .replace(/^\.\//, "")
     .replace(/^["'`(]+|["'`).,;:]+$/g, "")
     .replace(/\\/g, "/")
     .replace(/:\d+$/, "");
@@ -2256,6 +2654,193 @@ function renderPlainMessageSegment(segment, keyPrefix, workspace) {
   return parts.map((part, index) => (
     typeof part === "string" ? <span key={`${keyPrefix}-text-${index}`}>{part}</span> : part
   ));
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function getMarkdownCodeLanguage(className) {
+  const match = String(className || "").match(/(?:^|\s)language-([A-Za-z0-9_-]+)/);
+  const language = String(match?.[1] || "").trim().toLowerCase();
+  return PRISM_LANGUAGE_ALIASES.get(language) || language;
+}
+
+function getHighlightedMarkdownCode(content, language) {
+  const grammar = Prism.languages[language];
+  if (!grammar) {
+    return escapeHtml(content);
+  }
+
+  try {
+    return Prism.highlight(content || " ", grammar, language);
+  } catch {
+    return escapeHtml(content);
+  }
+}
+
+function decodeMarkdownHref(value) {
+  const href = String(value || "").trim();
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    return href;
+  }
+}
+
+function hasMarkdownLinkProtocol(value) {
+  return /^[a-z][a-z0-9+.-]*:/i.test(String(value || "").trim());
+}
+
+function isExternalMarkdownLink(value) {
+  return /^(?:https?:|mailto:|tel:)/i.test(String(value || "").trim());
+}
+
+function getSafeMarkdownHref(value) {
+  const target = String(value || "").trim();
+  if (!target) {
+    return undefined;
+  }
+
+  if (target.startsWith("#") || isExternalMarkdownLink(target) || !hasMarkdownLinkProtocol(target)) {
+    return target;
+  }
+
+  return undefined;
+}
+
+function openMarkdownLink(event, href, workspace) {
+  const target = String(href || "").trim();
+  if (!target || target.startsWith("#")) {
+    return;
+  }
+
+  event.preventDefault();
+  if (isExternalMarkdownLink(target)) {
+    openUrl(target).catch(() => {
+      if (typeof window !== "undefined") {
+        window.open(target, "_blank", "noopener,noreferrer");
+      }
+    });
+    return;
+  }
+
+  if (hasMarkdownLinkProtocol(target)) {
+    return;
+  }
+
+  openWorkspaceFile(workspace, decodeMarkdownHref(target));
+}
+
+function renderMarkdownChildrenWithFileLinks(children, workspace, keyPrefix) {
+  return Children.toArray(children).flatMap((child, index) => {
+    if (typeof child === "string") {
+      return renderPlainMessageSegment(child, `${keyPrefix}-${index}`, workspace);
+    }
+
+    return child;
+  });
+}
+
+function createAssistantMarkdownComponents(workspace) {
+  const renderTextChildren = (children, keyPrefix) => (
+    renderMarkdownChildrenWithFileLinks(children, workspace, keyPrefix)
+  );
+
+  return {
+    a({ node: _node, children, href, ...props }) {
+      const safeHref = getSafeMarkdownHref(href);
+      return (
+        <a
+          {...props}
+          href={safeHref}
+          onClick={(event) => openMarkdownLink(event, safeHref, workspace)}
+          rel={isExternalMarkdownLink(safeHref) ? "noreferrer" : undefined}
+          target={isExternalMarkdownLink(safeHref) ? "_blank" : undefined}
+        >
+          {children}
+        </a>
+      );
+    },
+    code({ node: _node, children, className, ...props }) {
+      const code = String(children || "").replace(/\n$/, "");
+      const language = getMarkdownCodeLanguage(className);
+      if (!language) {
+        return (
+          <code {...props} className={className}>
+            {children}
+          </code>
+        );
+      }
+
+      return (
+        <code
+          {...props}
+          className={className}
+          data-language={language}
+          dangerouslySetInnerHTML={{
+            __html: getHighlightedMarkdownCode(code, language),
+          }}
+        />
+      );
+    },
+    del({ node: _node, children, ...props }) {
+      return <del {...props}>{renderTextChildren(children, "del")}</del>;
+    },
+    em({ node: _node, children, ...props }) {
+      return <em {...props}>{renderTextChildren(children, "em")}</em>;
+    },
+    h1({ node: _node, children, ...props }) {
+      return <h1 {...props}>{renderTextChildren(children, "h1")}</h1>;
+    },
+    h2({ node: _node, children, ...props }) {
+      return <h2 {...props}>{renderTextChildren(children, "h2")}</h2>;
+    },
+    h3({ node: _node, children, ...props }) {
+      return <h3 {...props}>{renderTextChildren(children, "h3")}</h3>;
+    },
+    h4({ node: _node, children, ...props }) {
+      return <h4 {...props}>{renderTextChildren(children, "h4")}</h4>;
+    },
+    li({ node: _node, children, ...props }) {
+      return <li {...props}>{renderTextChildren(children, "li")}</li>;
+    },
+    p({ node: _node, children, ...props }) {
+      return <p {...props}>{renderTextChildren(children, "p")}</p>;
+    },
+    strong({ node: _node, children, ...props }) {
+      return <strong {...props}>{renderTextChildren(children, "strong")}</strong>;
+    },
+    table({ node: _node, children, ...props }) {
+      return (
+        <div className="thread-markdown-table-wrap">
+          <table {...props}>{children}</table>
+        </div>
+      );
+    },
+    td({ node: _node, children, ...props }) {
+      return <td {...props}>{renderTextChildren(children, "td")}</td>;
+    },
+    th({ node: _node, children, ...props }) {
+      return <th {...props}>{renderTextChildren(children, "th")}</th>;
+    },
+  };
+}
+
+function AssistantMarkdownContent({ message, workspace }) {
+  const text = String(message?.text || "");
+  const components = useMemo(() => createAssistantMarkdownComponents(workspace), [workspace]);
+
+  return (
+    <AssistantMarkdownBody>
+      <ReactMarkdown components={components} remarkPlugins={MARKDOWN_REMARK_PLUGINS}>
+        {text}
+      </ReactMarkdown>
+    </AssistantMarkdownBody>
+  );
 }
 
 function MessageTextContent({ message, workspace }) {
@@ -2417,9 +3002,7 @@ function ThreadMessage({ message, workspace }) {
       <AssistantCell data-message-role="assistant">
         <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
         <MessageBody>
-          <MessageText>
-            <MessageTextContent message={message} workspace={workspace} />
-          </MessageText>
+          <AssistantMarkdownContent message={message} workspace={workspace} />
         </MessageBody>
       </AssistantCell>
     );
@@ -2459,7 +3042,9 @@ function WorkspaceThreadDetail({
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const detailRootRef = useRef(null);
   const composerBoxRef = useRef(null);
+  const composerInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
   const messages = Array.isArray(thread?.messages)
@@ -2737,6 +3322,18 @@ function WorkspaceThreadDetail({
 
   const handleComposerPaste = (event) => {
     const imageFiles = getClipboardImageFiles(event.clipboardData);
+    const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
+    logBigViewSyncDiagnosticEvent("bigview.text.paste_observed", {
+      agentId: activeAgentId,
+      clipboardTypes: Array.from(event.clipboardData?.types || []),
+      composerSyncKey,
+      hasImageFiles: imageFiles.length > 0,
+      model: currentTuiModel || "",
+      surface: "thread_detail",
+      text: getBigViewTextDiagnosticFields(clipboardText),
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
     if (!imageFiles.length) {
       return;
     }
@@ -2753,6 +3350,139 @@ function WorkspaceThreadDetail({
       workspaceId: workspace?.id || thread?.workspaceId || "",
     });
     addImageFiles(imageFiles);
+  };
+
+  const appendPlainTextPasteToComposer = (clipboardText, source = "bigview_thread_detail_window_paste") => {
+    const pastedText = String(clipboardText || "");
+    if (!pastedText || sending || !canSubmit) {
+      logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_skip", {
+        agentId: activeAgentId,
+        canSubmit,
+        composerSyncKey,
+        disabled: Boolean(sending || !canSubmit),
+        model: currentTuiModel || "",
+        reason: !pastedText ? "empty_text" : "composer_unavailable",
+        source,
+        surface: "thread_detail",
+        text: getBigViewTextDiagnosticFields(pastedText),
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+      return false;
+    }
+
+    const previousDraft = draft;
+    const nextDraft = `${previousDraft}${pastedText}`;
+    setError("");
+    setDraft(nextDraft);
+    onDraftInput?.({
+      nextValue: nextDraft,
+      previousValue: previousDraft,
+      thread,
+      workspace,
+    });
+    window.setTimeout(() => {
+      composerInputRef.current?.focus?.();
+    }, 0);
+    logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_insert", {
+      agentId: activeAgentId,
+      composerSyncKey,
+      model: currentTuiModel || "",
+      nextValueLength: nextDraft.length,
+      previousValueLength: previousDraft.length,
+      source,
+      surface: "thread_detail",
+      text: getBigViewTextDiagnosticFields(pastedText),
+      threadId: thread?.id || "",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    return true;
+  };
+
+  useEffect(() => {
+    const handleWindowPasteCapture = (event) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      const root = detailRootRef.current;
+      if (!root) {
+        return;
+      }
+
+      const targetElement = getPasteTargetElement(event.target);
+      const activeElement = getPasteTargetElement(document.activeElement);
+      const targetInsideDetail = Boolean(targetElement && root.contains(targetElement));
+      const activeInsideDetail = Boolean(activeElement && root.contains(activeElement));
+      const targetInsideComposer = Boolean(
+        targetElement && composerBoxRef.current?.contains?.(targetElement),
+      );
+      const targetIsComposerInput = targetElement === composerInputRef.current;
+      const targetIsEditable = isEditablePasteTarget(targetElement);
+      const targetIsInteractive = isInteractivePasteTarget(targetElement);
+      const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
+      const imageFiles = getClipboardImageFiles(event.clipboardData);
+
+      if (!clipboardText && !imageFiles.length) {
+        return;
+      }
+
+      logBigViewSyncDiagnosticEvent("bigview.text.window_paste_observed", {
+        agentId: activeAgentId,
+        activeInsideDetail,
+        clipboardTypes: Array.from(event.clipboardData?.types || []),
+        composerSyncKey,
+        hasImageFiles: imageFiles.length > 0,
+        model: currentTuiModel || "",
+        surface: "thread_detail",
+        targetInsideComposer,
+        targetInsideDetail,
+        targetIsComposerInput,
+        targetIsEditable,
+        targetIsInteractive,
+        text: getBigViewTextDiagnosticFields(clipboardText),
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+
+      if (
+        imageFiles.length
+        || targetIsComposerInput
+        || targetIsEditable
+        || targetIsInteractive
+        || (!targetInsideComposer && !targetInsideDetail && !activeInsideDetail)
+      ) {
+        return;
+      }
+
+      if (appendPlainTextPasteToComposer(clipboardText)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+
+    window.addEventListener("paste", handleWindowPasteCapture, true);
+    return () => {
+      window.removeEventListener("paste", handleWindowPasteCapture, true);
+    };
+  }, [
+    activeAgentId,
+    canSubmit,
+    composerSyncKey,
+    currentTuiModel,
+    draft,
+    onDraftInput,
+    sending,
+    thread,
+    workspace,
+  ]);
+
+  const handleDetailRootClick = (event) => {
+    if (isInteractivePasteTarget(event.target)) {
+      return;
+    }
+
+    detailRootRef.current?.focus?.({ preventScroll: true });
   };
 
   const handleComposerDragOver = (event) => {
@@ -2806,6 +3536,18 @@ function WorkspaceThreadDetail({
       surface: "thread_detail",
       threadId: thread?.id || "",
       transfer: describeImageDropTransfer(event.dataTransfer),
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    logBigViewSyncDiagnosticEvent("bigview.text.drop_observed", {
+      agentId: activeAgentId,
+      composerSyncKey,
+      dataTransferTypes: Array.from(event.dataTransfer?.types || []),
+      hasImageTransfer: imageFiles.length > 0,
+      hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
+      model: currentTuiModel || "",
+      surface: "thread_detail",
+      text: getBigViewTextDiagnosticFields(event.dataTransfer?.getData?.("text/plain") || ""),
+      threadId: thread?.id || "",
       workspaceId: workspace?.id || thread?.workspaceId || "",
     });
     if (imageFiles.length) {
@@ -3313,6 +4055,7 @@ function WorkspaceThreadDetail({
         hasActiveTerminalBinding,
         imageBlockPresent: Boolean(imageBlock),
         messageLength: message.length,
+        messageText: getBigViewTextDiagnosticFields(message),
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
         threadId: thread?.id || "",
@@ -3373,7 +4116,7 @@ function WorkspaceThreadDetail({
 
   if (!thread) {
     return (
-      <DetailRoot>
+      <DetailRoot ref={detailRootRef} onClick={handleDetailRootClick} tabIndex={-1}>
         <TranscriptScroll>
           <TranscriptInner>
             <EmptyThread>Select a thread</EmptyThread>
@@ -3384,7 +4127,12 @@ function WorkspaceThreadDetail({
   }
 
   return (
-    <DetailRoot aria-label={getWorkspaceThreadLabel(thread)}>
+    <DetailRoot
+      aria-label={getWorkspaceThreadLabel(thread)}
+      onClick={handleDetailRootClick}
+      ref={detailRootRef}
+      tabIndex={-1}
+    >
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
           {transcriptItems.map((item) => (
@@ -3476,6 +4224,7 @@ function WorkspaceThreadDetail({
             }}
             onPaste={handleComposerPaste}
             placeholder={placeholder}
+            ref={composerInputRef}
             rows={1}
             spellCheck="true"
             value={draft}

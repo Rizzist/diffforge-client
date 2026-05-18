@@ -355,7 +355,11 @@ import {
   stripLiveViewControlSequences,
 } from "../liveViewSanitizer.js";
 import WorkspaceThreadsOverlay from "../../threads/WorkspaceThreadsOverlay.jsx";
-import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "../../threads/bigViewSyncDiagnostics";
+import {
+  getBigViewTextDiagnosticFields,
+  logBigViewSyncDiagnosticEvent,
+  logFileDragDiagnosticEvent,
+} from "../../threads/bigViewSyncDiagnostics";
 import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
@@ -1098,6 +1102,7 @@ function WorkspaceTerminal({
         instanceId,
         paneId,
         reason: "generic_terminal",
+        rawText: getBigViewTextDiagnosticFields(userMessage),
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
@@ -1113,6 +1118,8 @@ function WorkspaceTerminal({
         paneId,
         promptLength: safeUserMessage.length,
         reason: "slash_command",
+        rawText: getBigViewTextDiagnosticFields(userMessage),
+        visibleText: getBigViewTextDiagnosticFields(safeUserMessage),
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
@@ -1124,6 +1131,7 @@ function WorkspaceTerminal({
         instanceId,
         paneId,
         reason: "empty_visible_text",
+        rawText: getBigViewTextDiagnosticFields(userMessage),
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
@@ -1136,6 +1144,8 @@ function WorkspaceTerminal({
       instanceId,
       paneId,
       promptLength: safeUserMessage.length,
+      rawText: getBigViewTextDiagnosticFields(userMessage),
+      visibleText: getBigViewTextDiagnosticFields(safeUserMessage),
       slotKey: terminalThreadSlotKeyRef.current,
       terminalIndex,
       threadId: terminalThreadIdRef.current || "",
@@ -1199,7 +1209,9 @@ function WorkspaceTerminal({
     logBigViewSyncDiagnosticEvent("bigview.draft.store_set", {
       changed: currentValue !== nextValue,
       currentValueLength: currentValue.length,
+      currentText: getBigViewTextDiagnosticFields(currentValue),
       nextValueLength: nextValue.length,
+      nextText: getBigViewTextDiagnosticFields(nextValue),
       reason,
       syncKey: key,
     });
@@ -1300,8 +1312,10 @@ function WorkspaceTerminal({
     logBigViewSyncDiagnosticEvent("bigview.draft.sync_received", {
       agentId: terminalAgentKind,
       nextValueLength: nextDraft.length,
+      nextText: getBigViewTextDiagnosticFields(nextDraft),
       paneId,
       previousValueLength: String(previousValue || "").length,
+      previousText: getBigViewTextDiagnosticFields(previousValue || ""),
       targetThreadId: targetThread?.id || "",
       targetWorkspaceId: targetWorkspace?.id || workspace?.id || "",
       terminalIndex,
@@ -1324,6 +1338,7 @@ function WorkspaceTerminal({
       bindingPaneId: binding?.paneId || "",
       latestThreadId: latestThread?.id || "",
       nextValueLength: nextDraft.length,
+      nextText: getBigViewTextDiagnosticFields(nextDraft),
       paneId,
       syncKey,
       targetThreadId: targetThread?.id || "",
@@ -1340,6 +1355,7 @@ function WorkspaceTerminal({
         hasBinding: Boolean(binding?.paneId && binding?.instanceId),
         latestThreadId: latestThread?.id || "",
         nextValueLength: nextDraft.length,
+        nextText: getBigViewTextDiagnosticFields(nextDraft),
         paneId,
         reason: !latestThread?.id ? "missing_thread" : "missing_live_binding",
         syncKey,
@@ -1390,8 +1406,10 @@ function WorkspaceTerminal({
       inputLength: data.length,
       latestThreadId: latestThread.id,
       nextValueLength: nextDraft.length,
+      nextText: getBigViewTextDiagnosticFields(nextDraft),
       paneId,
       previousDraftLength: previousDraft.length,
+      previousText: getBigViewTextDiagnosticFields(previousDraft),
       syncKey,
       terminalIndex,
     });
@@ -1473,7 +1491,20 @@ function WorkspaceTerminal({
 
   const queueClipboardImagesForCurrentTerminal = useCallback((event, surface = "tui_terminal") => {
     const imageFiles = getTerminalClipboardImageFiles(event?.clipboardData);
+    const clipboardText = String(event?.clipboardData?.getData?.("text/plain") || "");
     if (!imageFiles.length) {
+      if (clipboardText || Array.from(event?.clipboardData?.types || []).includes("text/plain")) {
+        logBigViewSyncDiagnosticEvent("tui.text.paste_observed", {
+          agentId: terminalAgentKind,
+          clipboardTypes: Array.from(event?.clipboardData?.types || []),
+          paneId,
+          sourceSurface: surface,
+          terminalIndex,
+          text: getBigViewTextDiagnosticFields(clipboardText),
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      }
       return false;
     }
 
@@ -7530,23 +7561,84 @@ function WorkspaceTerminal({
             });
           }
 
+          const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
+          const visibleInputText = terminalGeneratedReply
+            ? ""
+            : terminalInputChunkVisibleText(safeData);
+          const traceTextInputChunk = !startupControlReply
+            && !terminalGeneratedReply
+            && (
+              safeData.length > 1
+              || isSubmitInput
+              || visibleInputText.length > 80
+              || safeData.includes("\x1b[200~")
+              || safeData.includes("\x1b[201~")
+            );
+
+          if (traceTextInputChunk) {
+            logBigViewSyncDiagnosticEvent("tui.text.input_chunk_received", {
+              agentId: terminalAgentKind,
+              draftBefore: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
+              hadDraftBefore: terminalSubmittedInputHasText,
+              inputDebug: getTerminalInputDebugFields(safeData),
+              instanceId: terminalInstanceId,
+              isSubmitInput,
+              paneId,
+              rawText: getBigViewTextDiagnosticFields(safeData),
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              visibleText: getBigViewTextDiagnosticFields(visibleInputText),
+              workspaceId: workspace?.id || "",
+            });
+          }
+
           if (!startupControlReply && !terminalGeneratedReply && terminalInputChunkHasVisibleText(safeData)) {
             refreshTerminalComposerDraftFromStore();
             terminalSubmittedInputHasText = true;
           }
           if (!startupControlReply && !terminalGeneratedReply) {
             refreshTerminalComposerDraftFromStore();
+            const draftBeforeApply = terminalSubmittedInputText;
             terminalSubmittedInputText = applyTerminalInputChunkToDraft(
               terminalSubmittedInputText,
               safeData,
             );
             syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+            if (traceTextInputChunk) {
+              logBigViewSyncDiagnosticEvent("tui.text.input_chunk_applied", {
+                agentId: terminalAgentKind,
+                draftAfter: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
+                draftBefore: getBigViewTextDiagnosticFields(draftBeforeApply),
+                hadDraftAfter: terminalSubmittedInputHasText,
+                inputDebug: getTerminalInputDebugFields(safeData),
+                instanceId: terminalInstanceId,
+                isSubmitInput,
+                paneId,
+                rawText: getBigViewTextDiagnosticFields(safeData),
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                visibleText: getBigViewTextDiagnosticFields(visibleInputText),
+                workspaceId: workspace?.id || "",
+              });
+            }
           }
-          const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
           if (!startupControlReply && !terminalGeneratedReply && isSubmitInput) {
             if (submitTerminalComposerWithQueuedImages(safeData)) {
               return;
             }
+            logBigViewSyncDiagnosticEvent("tui.text.submit_boundary", {
+              agentId: terminalAgentKind,
+              draftAtSubmit: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
+              hasQueuedPromptForRecord: terminalSubmittedInputHasText,
+              inputDebug: getTerminalInputDebugFields(safeData),
+              instanceId: terminalInstanceId,
+              paneId,
+              rawText: getBigViewTextDiagnosticFields(safeData),
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              visibleText: getBigViewTextDiagnosticFields(visibleInputText),
+              workspaceId: workspace?.id || "",
+            });
             if (terminalSubmittedInputHasText) {
               recordSubmittedAgentMessage(
                 terminalInstanceId,
@@ -7556,6 +7648,14 @@ function WorkspaceTerminal({
             terminalSubmittedInputHasText = false;
             terminalSubmittedInputText = "";
             syncCurrentTerminalComposerDraft("");
+            logBigViewSyncDiagnosticEvent("tui.text.submit_boundary_cleared", {
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
           }
 
           if (safeData.startsWith("\x1b")) {
@@ -8723,13 +8823,38 @@ function WorkspaceTerminal({
       });
     }
 
+    const droppedPlainText = String(event.dataTransfer?.getData?.("text/plain") || "");
     const prompt = getDraggedTodoPrompt(event.dataTransfer);
+    logBigViewSyncDiagnosticEvent("tui.text.native_drop_received", {
+      agentId: terminalAgentKind,
+      dataTransferTypes: Array.from(event.dataTransfer?.types || []),
+      instanceId: terminalInstanceIdRef.current || "",
+      isGenericTerminal,
+      paneId,
+      plainText: getBigViewTextDiagnosticFields(droppedPlainText),
+      promptText: getBigViewTextDiagnosticFields(prompt),
+      terminalIndex,
+      threadId: terminalThreadIdRef.current || "",
+      workspaceId: workspace?.id || "",
+    });
     if (!prompt) {
       logBigViewSyncDiagnosticEvent("tui.image.native_drop_skip", {
         agentId: terminalAgentKind,
         instanceId: terminalInstanceIdRef.current || "",
         isGenericTerminal,
         paneId,
+        reason: "missing_prompt",
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.text.native_drop_skip", {
+        agentId: terminalAgentKind,
+        dataTransferTypes: Array.from(event.dataTransfer?.types || []),
+        instanceId: terminalInstanceIdRef.current || "",
+        isGenericTerminal,
+        paneId,
+        plainText: getBigViewTextDiagnosticFields(droppedPlainText),
         reason: "missing_prompt",
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
@@ -8746,6 +8871,19 @@ function WorkspaceTerminal({
       isGenericTerminal,
       paneId,
       promptLength: prompt.length,
+      terminalIndex,
+      threadId: terminalThreadIdRef.current || "",
+      workspaceId: workspace?.id || "",
+    });
+    logBigViewSyncDiagnosticEvent("tui.text.native_drop_write_start", {
+      agentId: terminalAgentKind,
+      instanceId: terminalInstanceIdRef.current || "",
+      isGenericTerminal,
+      paneId,
+      promptText: getBigViewTextDiagnosticFields(prompt),
+      submittedInput: getBigViewTextDiagnosticFields(
+        buildTerminalSubmittedInput(prompt, terminalAgentKind, isGenericTerminal),
+      ),
       terminalIndex,
       threadId: terminalThreadIdRef.current || "",
       workspaceId: workspace?.id || "",
@@ -8770,6 +8908,15 @@ function WorkspaceTerminal({
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
       });
+      logBigViewSyncDiagnosticEvent("tui.text.native_drop_write_done", {
+        agentId: terminalAgentKind,
+        instanceId: terminalInstanceIdRef.current || "",
+        paneId,
+        promptText: getBigViewTextDiagnosticFields(prompt),
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
     } catch (error) {
       setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
       logBigViewSyncDiagnosticEvent("tui.image.native_drop_write_error", {
@@ -8779,6 +8926,16 @@ function WorkspaceTerminal({
         message: error?.message || String(error || ""),
         paneId,
         promptLength: prompt.length,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.text.native_drop_write_error", {
+        agentId: terminalAgentKind,
+        instanceId: terminalInstanceIdRef.current || "",
+        message: error?.message || String(error || ""),
+        paneId,
+        promptText: getBigViewTextDiagnosticFields(prompt),
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",

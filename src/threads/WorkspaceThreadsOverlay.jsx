@@ -71,6 +71,7 @@ const OverlayRoot = styled.div`
   --thread-red: #ef6b6b;
   --thread-rail-bg: #101820;
   --thread-rail-image: url("/textures/thread-rail-carbon-fiber.png");
+  --thread-rail-image-size: 64px 64px;
   --thread-rail-fg: #e9e9e9;
   --thread-rail-fg-soft: rgba(233, 233, 233, 0.72);
   --thread-rail-icon: rgba(233, 233, 233, 0.78);
@@ -176,6 +177,7 @@ const ThreadRail = styled.aside`
   background-color: var(--thread-rail-bg);
   background-image: var(--thread-rail-image);
   background-repeat: repeat;
+  background-size: var(--thread-rail-image-size);
   box-shadow: none;
 `;
 
@@ -466,6 +468,7 @@ const CollapsedRail = styled.div`
   background-color: var(--thread-rail-bg);
   background-image: var(--thread-rail-image);
   background-repeat: repeat;
+  background-size: var(--thread-rail-image-size);
 `;
 
 const CollapsedRailActionStack = styled.div`

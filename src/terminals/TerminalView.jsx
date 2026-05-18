@@ -21,7 +21,11 @@ import {
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
-import { logBigViewSyncDiagnosticEvent, logFileDragDiagnosticEvent } from "../threads/bigViewSyncDiagnostics";
+import {
+  getBigViewTextDiagnosticFields,
+  logBigViewSyncDiagnosticEvent,
+  logFileDragDiagnosticEvent,
+} from "../threads/bigViewSyncDiagnostics";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
@@ -30,19 +34,29 @@ import WorkspaceTerminal, {
   getWorkspaceTerminalPaneId,
 } from "./WorkspaceTerminal.jsx";
 import {
+  buildTerminalComposerDraftInput,
+} from "./WorkspaceTerminal/terminalCore.js";
+import {
   appendWorkspaceThreadComposerAttachments,
   clearActiveWorkspaceFileDrag,
+  createTerminalPromptSubmittedWaiter,
+  createThreadProjectionToken,
+  createWorkspaceThreadPromptAcceptedWaiter,
   getActiveWorkspaceFileDrag,
   getDraggedWorkspaceFile,
+  getTerminalSubmitSequence,
   getThreadComposerSyncKey,
+  getWorkspaceThreadComposerDraftStore,
   isWorkspaceFileDragTransfer,
   setActiveWorkspaceFileDrag,
   setWorkspaceThreadComposerDraft,
+  waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
   WORKSPACE_FILE_POINTER_DROP_EVENT,
   workspaceFileToComposerAttachment,
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
+const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [2800];
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   originScaleX: 1,
   originScaleY: 1,
@@ -1303,6 +1317,10 @@ function getTodoQueueItemTerminalText(item) {
   }
 
   return text || note?.text || "";
+}
+
+function getTodoQueueItemThreadMessageText(item, fallback = "") {
+  return getTodoQueueItemTerminalText(item) || String(fallback || "");
 }
 
 function normalizeTodoTerminalAgentId(value) {
@@ -2943,7 +2961,8 @@ function TerminalView({
         },
       }));
       prepareTodoTerminalText(currentDrag)
-        .then((terminalText) => {
+        .then(async (terminalText) => {
+          const threadMessageText = getTodoQueueItemThreadMessageText(currentDrag, terminalText);
           const targetThread = Number.isInteger(targetTerminalIndex)
             ? getTerminalThread(targetTerminalIndex)
             : null;
@@ -2993,12 +3012,47 @@ function TerminalView({
               surface: "tui_terminal_grid",
               targetRole,
               targetTerminalIndex: targetTerminalIndex ?? "",
+              text: getBigViewTextDiagnosticFields(threadMessageText),
               workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
             });
-            return { imageOnly: true, syncKey };
+            return {
+              imageOnly: true,
+              syncKey,
+              targetBinding,
+              targetThread,
+              terminalText,
+              threadMessageText,
+            };
           }
           if (!terminalText) {
             throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
+          }
+          const workspaceId = targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "";
+          const previousDraft = syncKey
+            ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+            : "";
+          const terminalSubmitSequence = getTerminalSubmitSequence(targetRole, false);
+          const shouldConfirmAutoSubmit = Boolean(
+            shouldAutoSubmit
+              && !image
+              && terminalSubmitSequence
+              && targetThread?.id,
+          );
+          if (shouldAutoSubmit && !shouldConfirmAutoSubmit) {
+            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_blocked", {
+              hasSubmitSequence: Boolean(terminalSubmitSequence),
+              hasTargetThread: Boolean(targetThread?.id),
+              paneId,
+              reason: !terminalSubmitSequence
+                ? "missing_submit_sequence"
+                : "missing_thread",
+              surface: "tui_terminal_grid",
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              terminalText: getBigViewTextDiagnosticFields(terminalText),
+              workspaceId,
+            });
+            throw new Error("Unable to confirm this todo submission for the selected terminal.");
           }
           if (syncKey) {
             setWorkspaceThreadComposerDraft(syncKey, terminalText);
@@ -3010,33 +3064,265 @@ function TerminalView({
             paneId,
             shouldAutoSubmit,
             sharedDraftSynced: Boolean(syncKey),
+            submitConfirmationRequired: shouldConfirmAutoSubmit,
             syncKey,
             surface: "tui_terminal_grid",
             targetRole,
             targetTerminalIndex: targetTerminalIndex ?? "",
+            terminalText: getBigViewTextDiagnosticFields(terminalText),
             terminalTextLength: terminalText.length,
-            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
+            workspaceId,
           });
-          return invoke("terminal_write", {
-            data: `${terminalText}${shouldAutoSubmit ? "\r" : ""}`,
+          if (!shouldConfirmAutoSubmit) {
+            return invoke("terminal_write", {
+              data: terminalText,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              threadId: targetThread?.id || "",
+            }).then((writeResult) => ({
+              confirmedSubmit: false,
+              syncKey,
+              targetBinding,
+              targetThread,
+              terminalText,
+              threadMessageText,
+              writeResult,
+            }));
+          }
+
+          const promptId = createThreadProjectionToken("todo-drop-prompt");
+          const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
+          logBigViewSyncDiagnosticEvent("tui.text.drop_sync_start", {
+            agentId: targetRole,
             paneId,
+            previousDraftLength: previousDraft.length,
+            promptId,
+            syncDataLength: syncData.length,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            terminalText: getBigViewTextDiagnosticFields(terminalText),
+            threadId: targetThread.id,
+            workspaceId,
           });
+          if (syncData) {
+            await invoke("terminal_write", {
+              data: syncData,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              threadId: targetThread.id,
+            });
+          }
+          logBigViewSyncDiagnosticEvent("tui.text.drop_sync_done", {
+            agentId: targetRole,
+            paneId,
+            promptId,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          const submittedWaiter = await createTerminalPromptSubmittedWaiter({
+            agentId: targetRole,
+            expectedPrompt: terminalText,
+            instanceId: targetBinding?.instanceId,
+            paneId,
+            promptId,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
+            agentId: targetRole,
+            expectedPrompt: terminalText,
+            promptId,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          try {
+            logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
+              agentId: targetRole,
+              paneId,
+              promptId,
+              submitSequenceLength: terminalSubmitSequence.length,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              terminalText: getBigViewTextDiagnosticFields(terminalText),
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            const writeResult = await invoke("terminal_write", {
+              data: terminalSubmitSequence,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              promptEventId: promptId,
+              promptEventText: terminalText,
+              threadId: targetThread.id,
+            });
+            await submittedWaiter.promise;
+            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
+              agentId: targetRole,
+              paneId,
+              promptId,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            const acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
+              acceptedWaiter,
+              agentId: targetRole,
+              binding: {
+                instanceId: targetBinding?.instanceId,
+                paneId,
+                terminalIndex: targetTerminalIndex,
+              },
+              expectedPrompt: terminalText,
+              getDraftValue: () => (
+                syncKey
+                  ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+                  : terminalText
+              ),
+              isGenericTerminal: false,
+              logPrefix: "frontend.todo_drop",
+              promptId,
+              retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
+              submitSequence: terminalSubmitSequence,
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
+              acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+              agentId: targetRole,
+              paneId,
+              promptId,
+              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            return {
+              acceptedDetail,
+              confirmedSubmit: true,
+              promptId,
+              syncKey,
+              targetBinding,
+              targetThread,
+              terminalText,
+              threadMessageText,
+              writeResult,
+            };
+          } catch (submitError) {
+            submittedWaiter.cancel();
+            acceptedWaiter.cancel();
+            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_confirm_error", {
+              agentId: targetRole,
+              message: submitError?.message || String(submitError || ""),
+              paneId,
+              promptId,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            throw submitError;
+          }
         })
-        .then((writeResult) => {
-          const targetThread = Number.isInteger(targetTerminalIndex)
+        .then((dropResult) => {
+          const writeResult = dropResult?.writeResult || null;
+          const targetThread = dropResult?.targetThread || (Number.isInteger(targetTerminalIndex)
             ? getTerminalThread(targetTerminalIndex)
-            : null;
-          const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
-          const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
-          const syncKey = getThreadComposerSyncKey(targetThread, {
+            : null);
+          const targetProviderBinding = dropResult?.targetBinding
+            ? null
+            : getWorkspaceThreadProviderBinding(targetThread, targetRole);
+          const targetBinding = dropResult?.targetBinding
+            || targetProviderBinding?.terminalBinding
+            || targetThread?.terminalBinding
+            || null;
+          const syncKey = dropResult?.syncKey || getThreadComposerSyncKey(targetThread, {
             ...targetBinding,
             paneId: targetBinding?.paneId || paneId,
           });
+          const threadMessageText = String(dropResult?.threadMessageText || "");
+          const shouldDispatchThreadMessage = Boolean(
+            dropResult?.confirmedSubmit
+              && shouldAutoSubmit
+              && !image
+              && threadMessageText.trim()
+              && targetThread?.id
+              && targetRole
+              && targetRole !== "generic"
+              && targetRole !== "terminal"
+              && targetRole !== "shell"
+              && onThreadTerminalLifecycle,
+          );
+          if (shouldDispatchThreadMessage) {
+            onThreadTerminalLifecycle?.({
+              agentId: targetRole,
+              instanceId: targetBinding?.instanceId || "",
+              messageSource: "tui-todo-drop",
+              paneId,
+              repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+              slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
+              source: "tui-todo-drop",
+              status: "active",
+              terminalIndex: targetTerminalIndex,
+              threadId: targetThread.id,
+              type: "message-submitted",
+              userMessage: threadMessageText,
+              workspaceId: targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "",
+              workspaceName: terminalWorkspace?.name || "",
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_dispatched", {
+              agentId: targetRole,
+              paneId,
+              source: "tui-todo-drop",
+              surface: "tui_terminal_grid",
+              syncKey,
+              submitConfirmed: true,
+              promptId: dropResult?.promptId || "",
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
+              threadId: targetThread.id,
+              threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
+              workspaceId: targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+          } else if (shouldAutoSubmit && !image) {
+            logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_skip", {
+              confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
+              hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
+              hasTargetThread: Boolean(targetThread?.id),
+              hasThreadMessageText: Boolean(threadMessageText.trim()),
+              paneId,
+              promptId: dropResult?.promptId || "",
+              reason: !dropResult?.confirmedSubmit
+                ? "submit_not_confirmed"
+                : !threadMessageText.trim()
+                ? "empty_message"
+                : !targetThread?.id
+                  ? "missing_thread"
+                  : !onThreadTerminalLifecycle
+                    ? "missing_lifecycle_handler"
+                    : "unsupported_target_role",
+              source: "tui-todo-drop",
+              surface: "tui_terminal_grid",
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+          }
           if (syncKey && shouldAutoSubmit) {
             setWorkspaceThreadComposerDraft(syncKey, "");
           }
           logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
-            imageOnlyQueued: Boolean(writeResult?.imageOnly),
+            imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
             hadQueueItem: Boolean(currentDrag.itemId),
             hasImage: Boolean(image),
             paneId,
@@ -3044,8 +3330,11 @@ function TerminalView({
             sharedDraftCleared: Boolean(syncKey && shouldAutoSubmit),
             syncKey,
             surface: "tui_terminal_grid",
+            submitConfirmed: Boolean(dropResult?.confirmedSubmit),
             targetRole,
             targetTerminalIndex: targetTerminalIndex ?? "",
+            terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
+            threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
             workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
           });
           setTodoDropError("");

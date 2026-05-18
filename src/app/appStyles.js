@@ -6433,13 +6433,30 @@ export const AudioInputMeter = styled.div`
   }
 
   html[data-forge-theme="light"] & span {
-    background: rgba(0, 0, 0, 0.16);
+    background: rgba(74, 88, 107, 0.24);
   }
 
   html[data-forge-theme="light"] &[data-active="true"] span {
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.82), transparent 54%),
+      linear-gradient(
+        180deg,
+        hsl(var(--bar-hue, 190) 94% 48% / 0.98),
+        rgba(18, 170, 120, 0.9) 54%,
+        rgba(221, 112, 31, 0.86)
+      );
     box-shadow:
-      0 0 9px rgba(10, 127, 69, 0.12),
+      0 0 10px hsl(var(--bar-hue, 190) 88% 46% / 0.18),
+      0 0 14px rgba(18, 170, 120, 0.12),
       0 1px 0 rgba(255, 255, 255, 0.55) inset;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"][data-signal="quiet"] span {
+    opacity: 0.66;
+    filter: saturate(0.74) brightness(0.96);
+    box-shadow:
+      0 0 8px hsl(var(--bar-hue, 190) 82% 46% / 0.12),
+      0 1px 0 rgba(255, 255, 255, 0.5) inset;
   }
 `;
 

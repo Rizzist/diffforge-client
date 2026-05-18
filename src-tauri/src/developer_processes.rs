@@ -145,6 +145,7 @@ struct DockerDeveloperCommandResult {
     target_label: String,
     target_container_id: String,
     target_container_name: String,
+    target_container_image: String,
     target_compose_project: String,
     target_compose_service: String,
     target_compose_working_dir: String,
@@ -156,12 +157,21 @@ struct DockerDeveloperCommandResult {
 struct DockerDeveloperTarget {
     container_id: String,
     container_name: String,
+    container_image: String,
     compose_project: String,
     compose_service: String,
     compose_working_dir: String,
     compose_config_files: Vec<String>,
     workspace_linked: bool,
     workspace_links: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DockerComposeLsProject {
+    #[serde(default, rename = "Name")]
+    name: String,
+    #[serde(default, rename = "ConfigFiles")]
+    config_files: String,
 }
 
 #[derive(Clone, Copy)]
@@ -847,10 +857,12 @@ fn docker_developer_action_blocking(
     let action = parse_docker_developer_action(action)?;
     let workspace_roots = normalize_process_roots(workspace_roots, None);
     let targets = discover_docker_developer_targets(&workspace_roots)?;
-    let linked_targets = targets
-        .into_iter()
-        .filter(|target| target.workspace_linked)
-        .collect::<Vec<_>>();
+    let linked_targets = docker_developer_unique_service_targets(
+        &targets
+            .into_iter()
+            .filter(|target| target.workspace_linked)
+            .collect::<Vec<_>>(),
+    );
 
     if linked_targets.is_empty() {
         return Ok(DockerDeveloperActionResult {
@@ -860,7 +872,7 @@ fn docker_developer_action_blocking(
             failed: 0,
             skipped: Vec::new(),
             commands: Vec::new(),
-            message: "No workspace-linked Docker containers were found.".to_string(),
+            message: "No workspace-linked Docker targets were found.".to_string(),
         });
     }
 
@@ -871,7 +883,7 @@ fn docker_developer_action_blocking(
         DockerDeveloperAction::Relaunch => {
             let compose = docker_compose_command();
             for target in docker_developer_unique_service_targets(&linked_targets) {
-                if target.is_compose() {
+                if target.is_compose_project() {
                     let Some(compose) = compose.as_ref() else {
                         skipped.push(format!(
                             "{}: Docker Compose is not available.",
@@ -879,11 +891,12 @@ fn docker_developer_action_blocking(
                         ));
                         continue;
                     };
-                    commands.push(run_docker_compose_service_command(
-                        compose,
-                        &target,
-                        &["restart"],
-                    ));
+                    let result = if target.container_id.is_empty() {
+                        run_docker_compose_target_command(compose, &target, &["up", "-d"])
+                    } else {
+                        run_docker_compose_target_command(compose, &target, &["restart"])
+                    };
+                    commands.push(result);
                 } else {
                     let result = run_developer_docker_command(
                         "docker",
@@ -898,7 +911,7 @@ fn docker_developer_action_blocking(
             let compose = docker_compose_command();
             let Some(compose) = compose.as_ref() else {
                 for target in docker_developer_unique_service_targets(&linked_targets) {
-                    if target.is_compose() {
+                    if target.is_compose_project() {
                         skipped.push(format!(
                             "{}: Docker Compose is not available.",
                             target.display_name()
@@ -915,7 +928,7 @@ fn docker_developer_action_blocking(
 
             let mut failed_down_projects = HashSet::new();
             for target in docker_developer_unique_project_targets(&linked_targets) {
-                if !target.is_compose() {
+                if !target.is_compose_project() {
                     continue;
                 }
 
@@ -927,7 +940,7 @@ fn docker_developer_action_blocking(
             }
 
             for target in docker_developer_unique_service_targets(&linked_targets) {
-                if !target.is_compose() {
+                if !target.is_compose_project() {
                     skipped.push(format!(
                         "{}: standalone containers cannot be rebuilt safely without Compose metadata.",
                         target.display_name()
@@ -943,7 +956,7 @@ fn docker_developer_action_blocking(
                     continue;
                 }
 
-                commands.push(run_docker_compose_service_command(
+                commands.push(run_docker_compose_target_command(
                     compose,
                     &target,
                     &["up", "-d", "--build", "--force-recreate"],
@@ -953,7 +966,7 @@ fn docker_developer_action_blocking(
         DockerDeveloperAction::RemountData => {
             let compose = docker_compose_command();
             for target in docker_developer_unique_project_targets(&linked_targets) {
-                if !target.is_compose() {
+                if !target.is_compose_project() {
                     skipped.push(format!(
                         "{}: standalone containers cannot be recreated safely for a clean data remount.",
                         target.display_name()
@@ -1007,16 +1020,50 @@ fn docker_developer_action_result(
 }
 
 impl DockerDeveloperTarget {
-    fn is_compose(&self) -> bool {
-        !self.compose_project.is_empty() && !self.compose_service.is_empty()
+    fn has_compose_service(&self) -> bool {
+        !self.compose_service.is_empty()
+    }
+
+    fn is_compose_project(&self) -> bool {
+        !self.compose_project.is_empty()
+            || !self.compose_config_files.is_empty()
+            || !self.compose_working_dir.is_empty()
     }
 
     fn display_name(&self) -> String {
-        if self.is_compose() {
-            return format!("{}/{}", self.compose_project, self.compose_service);
+        if !self.container_name.is_empty()
+            && (!self.compose_project.is_empty() || !self.compose_service.is_empty())
+        {
+            let compose_label = [self.compose_project.as_str(), self.compose_service.as_str()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !compose_label.is_empty() && compose_label != self.container_name {
+                return format!("{} / {}", self.container_name, compose_label);
+            }
         }
         if !self.container_name.is_empty() {
             return self.container_name.clone();
+        }
+        if !self.compose_project.is_empty() && !self.compose_service.is_empty() {
+            return format!("{}/{}", self.compose_project, self.compose_service);
+        }
+        if !self.compose_project.is_empty() {
+            return self.compose_project.clone();
+        }
+        if !self.compose_service.is_empty() {
+            return self.compose_service.clone();
+        }
+        if let Some(config_file) = self.compose_config_files.first() {
+            if let Some(parent) = Path::new(config_file).parent() {
+                if let Some(name) = parent.file_name().and_then(|value| value.to_str()) {
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+            }
+            return config_file.clone();
         }
         self.container_id.clone()
     }
@@ -1106,8 +1153,14 @@ fn discover_docker_developer_targets(
         let Some(container) = value.as_array().and_then(|items| items.first()) else {
             continue;
         };
-        targets.push(docker_developer_target_from_inspect(container, workspace_roots));
+        docker_developer_push_unique_target(
+            &mut targets,
+            docker_developer_target_from_inspect(container, workspace_roots),
+        );
     }
+
+    discover_docker_compose_project_targets(workspace_roots, &mut targets);
+    discover_workspace_compose_file_targets(workspace_roots, &mut targets);
 
     Ok(targets)
 }
@@ -1127,16 +1180,19 @@ fn docker_developer_target_from_inspect(
         .unwrap_or_default()
         .trim_start_matches('/')
         .to_string();
+    let container_image = container["Config"]["Image"]
+        .as_str()
+        .or_else(|| container["Image"].as_str())
+        .unwrap_or_default()
+        .to_string();
     let labels = &container["Config"]["Labels"];
     let compose_project = docker_label(labels, "com.docker.compose.project");
     let compose_service = docker_label(labels, "com.docker.compose.service");
     let compose_working_dir = docker_label(labels, "com.docker.compose.project.working_dir");
-    let compose_config_files = docker_label(labels, "com.docker.compose.project.config_files")
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let compose_config_files = docker_split_compose_config_files(&docker_label(
+        labels,
+        "com.docker.compose.project.config_files",
+    ));
 
     let mut bind_sources = Vec::new();
     let mut named_volumes = Vec::new();
@@ -1158,10 +1214,17 @@ fn docker_developer_target_from_inspect(
         }
     }
 
+    let identifier_candidates = docker_target_identifier_candidates(
+        &container_name,
+        &container_image,
+        &compose_project,
+        &compose_service,
+    );
     let workspace_links = docker_target_workspace_links(
         &compose_working_dir,
         &compose_config_files,
         &bind_sources,
+        &identifier_candidates,
         workspace_roots,
     );
     let workspace_linked = !workspace_links.is_empty();
@@ -1169,6 +1232,7 @@ fn docker_developer_target_from_inspect(
     DockerDeveloperTarget {
         container_id,
         container_name,
+        container_image,
         compose_project,
         compose_service,
         compose_working_dir,
@@ -1178,14 +1242,299 @@ fn docker_developer_target_from_inspect(
     }
 }
 
+fn discover_docker_compose_project_targets(
+    workspace_roots: &[String],
+    targets: &mut Vec<DockerDeveloperTarget>,
+) {
+    let Some(compose) = docker_compose_command() else {
+        return;
+    };
+    let mut args = Vec::new();
+    if matches!(compose, DockerComposeCommand::Plugin) {
+        args.push("compose".to_string());
+    }
+    args.extend([
+        "ls".to_string(),
+        "-a".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]);
+
+    let result = run_developer_docker_command(&docker_compose_program(&compose), &args, None);
+    if !result.success {
+        return;
+    }
+
+    let Ok(projects) = serde_json::from_str::<Vec<DockerComposeLsProject>>(&result.stdout) else {
+        return;
+    };
+
+    for project in projects {
+        let config_files = docker_split_compose_config_files(&project.config_files);
+        if config_files.is_empty() {
+            continue;
+        }
+        let working_dir = docker_compose_working_dir_from_config_files(&config_files);
+        let services =
+            docker_compose_services_for_project(&compose, &project.name, &working_dir, &config_files);
+
+        if services.is_empty() {
+            docker_developer_push_unique_target(
+                targets,
+                docker_developer_compose_target(
+                    project.name,
+                    String::new(),
+                    working_dir,
+                    config_files,
+                    workspace_roots,
+                ),
+            );
+            continue;
+        }
+
+        for service in services {
+            docker_developer_push_unique_target(
+                targets,
+                docker_developer_compose_target(
+                    project.name.clone(),
+                    service,
+                    working_dir.clone(),
+                    config_files.clone(),
+                    workspace_roots,
+                ),
+            );
+        }
+    }
+}
+
+fn discover_workspace_compose_file_targets(
+    workspace_roots: &[String],
+    targets: &mut Vec<DockerDeveloperTarget>,
+) {
+    if workspace_roots.is_empty() {
+        return;
+    }
+    let Some(compose) = docker_compose_command() else {
+        return;
+    };
+
+    for root in workspace_roots {
+        let config_files = docker_compose_files_in_directory(root);
+        if config_files.is_empty() {
+            continue;
+        }
+        let working_dir = docker_compose_working_dir_from_config_files(&config_files);
+        let services = docker_compose_services_for_project(&compose, "", &working_dir, &config_files);
+
+        if services.is_empty() {
+            docker_developer_push_unique_target(
+                targets,
+                docker_developer_compose_target(
+                    String::new(),
+                    String::new(),
+                    working_dir,
+                    config_files,
+                    workspace_roots,
+                ),
+            );
+            continue;
+        }
+
+        for service in services {
+            docker_developer_push_unique_target(
+                targets,
+                docker_developer_compose_target(
+                    String::new(),
+                    service,
+                    working_dir.clone(),
+                    config_files.clone(),
+                    workspace_roots,
+                ),
+            );
+        }
+    }
+}
+
+fn docker_developer_compose_target(
+    compose_project: String,
+    compose_service: String,
+    compose_working_dir: String,
+    compose_config_files: Vec<String>,
+    workspace_roots: &[String],
+) -> DockerDeveloperTarget {
+    let identifier_candidates =
+        docker_target_identifier_candidates("", "", &compose_project, &compose_service);
+    let workspace_links = docker_target_workspace_links(
+        &compose_working_dir,
+        &compose_config_files,
+        &[],
+        &identifier_candidates,
+        workspace_roots,
+    );
+    let workspace_linked = !workspace_links.is_empty();
+
+    DockerDeveloperTarget {
+        container_id: String::new(),
+        container_name: String::new(),
+        container_image: String::new(),
+        compose_project,
+        compose_service,
+        compose_working_dir,
+        compose_config_files,
+        workspace_linked,
+        workspace_links,
+    }
+}
+
+fn docker_developer_push_unique_target(
+    targets: &mut Vec<DockerDeveloperTarget>,
+    target: DockerDeveloperTarget,
+) {
+    let key = docker_developer_target_identity(&target);
+    if targets
+        .iter()
+        .any(|existing| docker_developer_target_identity(existing) == key)
+    {
+        return;
+    }
+    targets.push(target);
+}
+
+fn docker_developer_target_identity(target: &DockerDeveloperTarget) -> String {
+    if target.is_compose_project() {
+        return format!(
+            "compose:{}:{}:{}:{}",
+            target.compose_project,
+            target.compose_service,
+            target.compose_working_dir,
+            target.compose_config_files.join("|")
+        );
+    }
+    format!("container:{}", target.container_id)
+}
+
 fn docker_label(labels: &Value, key: &str) -> String {
     labels[key].as_str().unwrap_or_default().to_string()
+}
+
+fn docker_target_identifier_candidates(
+    container_name: &str,
+    container_image: &str,
+    compose_project: &str,
+    compose_service: &str,
+) -> Vec<(String, String)> {
+    [
+        ("container", container_name),
+        ("image", container_image),
+        ("compose project", compose_project),
+        ("compose service", compose_service),
+    ]
+    .into_iter()
+    .filter_map(|(kind, value)| {
+        let value = clean_process_text(value);
+        (!value.is_empty()).then(|| (kind.to_string(), value))
+    })
+    .collect()
+}
+
+fn docker_split_compose_config_files(value: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| {
+            let key = normalize_process_text_for_compare(item);
+            if seen.insert(key) {
+                Some(item.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn docker_compose_working_dir_from_config_files(config_files: &[String]) -> String {
+    config_files
+        .first()
+        .and_then(|config_file| Path::new(config_file).parent().map(Path::to_path_buf))
+        .map(|path| fs::canonicalize(&path).unwrap_or(path))
+        .map(|path| process_path_display(&path))
+        .unwrap_or_default()
+}
+
+fn docker_compose_files_in_directory(root: &str) -> Vec<String> {
+    let root_path = PathBuf::from(root);
+    for name in [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+    ] {
+        let candidate = root_path.join(name);
+        if candidate.is_file() {
+            let resolved = fs::canonicalize(&candidate).unwrap_or(candidate);
+            return vec![process_path_display(&resolved)];
+        }
+    }
+
+    Vec::new()
+}
+
+fn docker_compose_services_for_project(
+    compose: &DockerComposeCommand,
+    compose_project: &str,
+    compose_working_dir: &str,
+    compose_config_files: &[String],
+) -> Vec<String> {
+    if compose_config_files.is_empty() {
+        return Vec::new();
+    }
+
+    let target = DockerDeveloperTarget {
+        container_id: String::new(),
+        container_name: String::new(),
+        container_image: String::new(),
+        compose_project: compose_project.to_string(),
+        compose_service: String::new(),
+        compose_working_dir: compose_working_dir.to_string(),
+        compose_config_files: compose_config_files.to_vec(),
+        workspace_linked: false,
+        workspace_links: Vec::new(),
+    };
+    let mut args = docker_compose_base_args(compose, &target);
+    args.extend(["config".to_string(), "--services".to_string()]);
+    let cwd = docker_compose_cwd(&target);
+    let result = run_developer_docker_command(
+        &docker_compose_program(compose),
+        &args,
+        cwd.as_deref(),
+    );
+    if !result.success {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    result
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|service| !service.is_empty())
+        .filter_map(|service| {
+            if seen.insert(service.to_string()) {
+                Some(service.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn docker_target_workspace_links(
     compose_working_dir: &str,
     compose_config_files: &[String],
     bind_sources: &[String],
+    identifier_candidates: &[(String, String)],
     workspace_roots: &[String],
 ) -> Vec<String> {
     if workspace_roots.is_empty() {
@@ -1204,13 +1553,9 @@ fn docker_target_workspace_links(
 
     for candidate in candidates {
         let matched = docker_normalized_path_variants(&candidate).iter().any(|normalized| {
-            workspace_roots.iter().any(|root| {
-                !normalized.is_empty()
-                    && !root.is_empty()
-                    && (normalized == root
-                        || normalized.starts_with(&format!("{root}/"))
-                        || root.starts_with(&format!("{normalized}/")))
-            })
+            workspace_roots
+                .iter()
+                .any(|root| docker_path_matches_workspace_root(normalized, root))
         });
 
         if matched {
@@ -1222,7 +1567,128 @@ fn docker_target_workspace_links(
         }
     }
 
+    for (kind, value) in identifier_candidates {
+        if docker_identifier_matches_workspace_roots(value, workspace_roots) {
+            let link = format!("{kind}: {}", clean_process_text(value));
+            let key = normalize_process_text_for_compare(&link);
+            if seen.insert(key) {
+                links.push(link);
+            }
+        }
+    }
+
     links
+}
+
+fn docker_path_matches_workspace_root(candidate: &str, root: &str) -> bool {
+    if candidate.is_empty() || root.is_empty() {
+        return false;
+    }
+
+    candidate == root
+        || candidate.starts_with(&format!("{root}/"))
+        || root.starts_with(&format!("{candidate}/"))
+        || docker_paths_are_workspace_family_siblings(candidate, root)
+}
+
+fn docker_identifier_matches_workspace_roots(identifier: &str, workspace_roots: &[String]) -> bool {
+    let identifier_variants = docker_identifier_variants(identifier);
+    if identifier_variants.is_empty() {
+        return false;
+    }
+
+    workspace_roots.iter().any(|root| {
+        let root_variants = docker_workspace_identifier_variants(root);
+        root_variants.iter().any(|root_variant| {
+            identifier_variants.iter().any(|identifier_variant| {
+                docker_identifier_variant_matches_workspace(identifier_variant, root_variant)
+            })
+        })
+    })
+}
+
+fn docker_identifier_variant_matches_workspace(identifier: &str, workspace: &str) -> bool {
+    if identifier.is_empty() || workspace.is_empty() {
+        return false;
+    }
+    if workspace.len() >= 3
+        && (identifier == workspace
+            || identifier.starts_with(&format!("{workspace}-"))
+            || identifier.ends_with(&format!("-{workspace}"))
+            || identifier.contains(&format!("-{workspace}-")))
+    {
+        return true;
+    }
+    if identifier.len() >= 4
+        && (workspace.starts_with(&format!("{identifier}-"))
+            || workspace.ends_with(&format!("-{identifier}"))
+            || workspace.contains(&format!("-{identifier}-")))
+    {
+        return true;
+    }
+
+    let identifier_tokens = docker_identifier_tokens(identifier);
+    let workspace_tokens = docker_identifier_tokens(workspace);
+    identifier_tokens
+        .iter()
+        .any(|token| token.len() >= 4 && workspace_tokens.contains(token))
+}
+
+fn docker_workspace_identifier_variants(root: &str) -> Vec<String> {
+    docker_identifier_variants(&docker_path_leaf(root))
+}
+
+fn docker_identifier_variants(value: &str) -> Vec<String> {
+    let trimmed = value.trim().trim_start_matches('/').trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let without_digest = trimmed.split('@').next().unwrap_or(trimmed);
+    let mut candidates = vec![without_digest.to_string()];
+    if let Some(last) = without_digest.rsplit('/').next() {
+        candidates.push(last.to_string());
+    }
+
+    let mut variants = Vec::new();
+    for candidate in candidates {
+        let without_tag = docker_identifier_without_tag(&candidate);
+        for value in [candidate, without_tag] {
+            let slug = docker_identifier_slug(&value);
+            if !slug.is_empty() && !variants.contains(&slug) {
+                variants.push(slug);
+            }
+        }
+    }
+
+    variants
+}
+
+fn docker_identifier_without_tag(value: &str) -> String {
+    let Some((before, after)) = value.rsplit_once(':') else {
+        return value.to_string();
+    };
+    if before.is_empty() || after.contains('/') {
+        return value.to_string();
+    }
+    before.to_string()
+}
+
+fn docker_identifier_slug(value: &str) -> String {
+    docker_identifier_token_list(value).join("-")
+}
+
+fn docker_identifier_tokens(value: &str) -> HashSet<String> {
+    docker_identifier_token_list(value).into_iter().collect()
+}
+
+fn docker_identifier_token_list(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() >= 2)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 fn docker_normalized_path_variants(value: &str) -> Vec<String> {
@@ -1230,25 +1696,107 @@ fn docker_normalized_path_variants(value: &str) -> Vec<String> {
     let mut variants = vec![normalized.clone()];
     let text = normalized.trim_start_matches('/');
 
-    for prefix in ["run/desktop/mnt/host/", "host_mnt/"] {
+    for prefix in ["run/desktop/mnt/host/", "host_mnt/", "mnt/"] {
         let Some(rest) = text.strip_prefix(prefix) else {
             continue;
         };
         let mut parts = rest.splitn(2, '/');
-        let drive = parts.next().unwrap_or_default();
-        if drive.len() == 1 && drive.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        let first_part = parts.next().unwrap_or_default();
+        if first_part.len() == 1 && first_part.chars().all(|ch| ch.is_ascii_alphabetic()) {
             let path = parts.next().unwrap_or_default();
             variants.push(normalize_process_text_for_compare(&format!(
                 "{}:/{}",
-                drive,
+                first_part,
                 path
             )));
+        } else if !first_part.is_empty() {
+            variants.push(normalize_process_text_for_compare(&format!("/{rest}")));
         }
     }
 
     variants.sort();
     variants.dedup();
     variants
+}
+
+fn docker_paths_are_workspace_family_siblings(candidate: &str, root: &str) -> bool {
+    let candidate_dir = docker_workspace_scope_directory(candidate);
+    let root_dir = docker_workspace_scope_directory(root);
+    if candidate_dir.is_empty() || root_dir.is_empty() || candidate_dir == root_dir {
+        return false;
+    }
+
+    let Some(candidate_parent) = docker_path_parent(&candidate_dir) else {
+        return false;
+    };
+    let Some(root_parent) = docker_path_parent(&root_dir) else {
+        return false;
+    };
+    if candidate_parent != root_parent || docker_path_depth(&candidate_parent) < 3 {
+        return false;
+    }
+
+    let candidate_leaf = docker_path_leaf(&candidate_dir);
+    let root_leaf = docker_path_leaf(&root_dir);
+    if candidate_leaf.is_empty() || root_leaf.is_empty() {
+        return false;
+    }
+
+    let candidate_tokens = docker_workspace_name_tokens(&candidate_leaf);
+    let root_tokens = docker_workspace_name_tokens(&root_leaf);
+    candidate_tokens
+        .iter()
+        .any(|token| root_tokens.contains(token))
+}
+
+fn docker_workspace_scope_directory(value: &str) -> String {
+    let text = value.trim().trim_end_matches('/');
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let leaf = docker_path_leaf(text);
+    if docker_compose_file_name_matches(&leaf) {
+        return docker_path_parent(text).unwrap_or_default();
+    }
+
+    text.to_string()
+}
+
+fn docker_compose_file_name_matches(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml"
+    )
+}
+
+fn docker_path_parent(value: &str) -> Option<String> {
+    let text = value.trim().trim_end_matches('/');
+    let index = text.rfind('/')?;
+    (index > 0).then(|| text[..index].to_string())
+}
+
+fn docker_path_leaf(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn docker_path_depth(value: &str) -> usize {
+    value.split('/').filter(|part| !part.is_empty()).count()
+}
+
+fn docker_workspace_name_tokens(value: &str) -> HashSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 fn docker_developer_unique_service_targets(
@@ -1258,11 +1806,12 @@ fn docker_developer_unique_service_targets(
     let mut unique = Vec::new();
 
     for target in targets {
-        let key = if target.is_compose() {
+        let key = if target.is_compose_project() {
             format!(
-                "compose:{}:{}:{}",
+                "compose:{}:{}:{}:{}",
                 target.compose_project,
                 target.compose_service,
+                target.compose_working_dir,
                 target.compose_config_files.join("|")
             )
         } else {
@@ -1283,10 +1832,11 @@ fn docker_developer_unique_project_targets(
     let mut unique = Vec::new();
 
     for target in targets {
-        let key = if target.is_compose() {
+        let key = if target.is_compose_project() {
             format!(
-                "compose:{}:{}",
+                "compose:{}:{}:{}",
                 target.compose_project,
+                target.compose_working_dir,
                 target.compose_config_files.join("|")
             )
         } else {
@@ -1301,10 +1851,11 @@ fn docker_developer_unique_project_targets(
 }
 
 fn docker_developer_project_key(target: &DockerDeveloperTarget) -> String {
-    if target.is_compose() {
+    if target.is_compose_project() {
         return format!(
-            "compose:{}:{}",
+            "compose:{}:{}:{}",
             target.compose_project,
+            target.compose_working_dir,
             target.compose_config_files.join("|")
         );
     }
@@ -1347,6 +1898,18 @@ fn run_docker_compose_service_command(
 
     let result = run_developer_docker_command(&program, &args, cwd.as_deref());
     docker_command_result_with_target(result, target)
+}
+
+fn run_docker_compose_target_command(
+    compose: &DockerComposeCommand,
+    target: &DockerDeveloperTarget,
+    action_args: &[&str],
+) -> DockerDeveloperCommandResult {
+    if target.has_compose_service() {
+        run_docker_compose_service_command(compose, target, action_args)
+    } else {
+        run_docker_compose_project_command(compose, target, action_args)
+    }
 }
 
 fn run_docker_compose_project_command(
@@ -1410,6 +1973,7 @@ fn docker_command_result_with_target(
     result.target_label = target.display_name();
     result.target_container_id = target.container_id.clone();
     result.target_container_name = target.container_name.clone();
+    result.target_container_image = target.container_image.clone();
     result.target_compose_project = target.compose_project.clone();
     result.target_compose_service = target.compose_service.clone();
     result.target_compose_working_dir = target.compose_working_dir.clone();
@@ -1447,6 +2011,7 @@ fn run_developer_docker_command(
             target_label: String::new(),
             target_container_id: String::new(),
             target_container_name: String::new(),
+            target_container_image: String::new(),
             target_compose_project: String::new(),
             target_compose_service: String::new(),
             target_compose_working_dir: String::new(),
@@ -1467,6 +2032,7 @@ fn run_developer_docker_command(
             target_label: String::new(),
             target_container_id: String::new(),
             target_container_name: String::new(),
+            target_container_image: String::new(),
             target_compose_project: String::new(),
             target_compose_service: String::new(),
             target_compose_working_dir: String::new(),
@@ -2259,4 +2825,85 @@ fn process_name_matches(name: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
         .any(|candidate| normalized == candidate.trim_end_matches(".exe"))
+}
+
+#[cfg(test)]
+mod developer_process_docker_tests {
+    use super::*;
+
+    #[test]
+    fn docker_workspace_links_match_related_compose_sibling_project() {
+        let workspace_root = normalize_process_text_for_compare(
+            r"C:\Users\dev\projects\inventory-ui",
+        );
+        let compose_file =
+            r"C:\Users\dev\projects\inventory-api\docker-compose.yml"
+                .to_string();
+
+        let links = docker_target_workspace_links(
+            r"C:\Users\dev\projects\inventory-api",
+            &[compose_file.clone()],
+            &[],
+            &[],
+            &[workspace_root],
+        );
+
+        assert!(links.iter().any(|link| link == &compose_file));
+    }
+
+    #[test]
+    fn docker_workspace_links_reject_unrelated_sibling_project() {
+        let workspace_root = normalize_process_text_for_compare(
+            r"C:\Users\dev\projects\inventory-ui",
+        );
+
+        let links = docker_target_workspace_links(
+            r"C:\Users\dev\projects\redis",
+            &[r"C:\Users\dev\projects\redis\docker-compose.yml".to_string()],
+            &[],
+            &[],
+            &[workspace_root],
+        );
+
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn docker_workspace_links_match_container_and_image_names() {
+        let workspace_root = normalize_process_text_for_compare("/srv/checkouts/payments-api");
+        let identifiers = docker_target_identifier_candidates(
+            "payments-api-1",
+            "ghcr.io/example/payments-api:dev",
+            "",
+            "",
+        );
+
+        let links = docker_target_workspace_links("", &[], &[], &identifiers, &[workspace_root]);
+
+        assert!(links
+            .iter()
+            .any(|link| link == "container: payments-api-1"));
+        assert!(links
+            .iter()
+            .any(|link| link == "image: ghcr.io/example/payments-api:dev"));
+    }
+
+    #[test]
+    fn docker_path_variants_include_desktop_host_mounts() {
+        let windows_variants = docker_normalized_path_variants(
+            "/run/desktop/mnt/host/c/Users/dev/projects/inventory-api",
+        );
+        let mac_variants = docker_normalized_path_variants("/host_mnt/Users/dev/projects/inventory-api");
+
+        assert!(windows_variants.iter().any(|variant| {
+            variant
+                .to_ascii_lowercase()
+                .ends_with("/users/dev/projects/inventory-api")
+        }));
+        assert!(mac_variants.iter().any(|variant| {
+            variant
+                .to_ascii_lowercase()
+                .ends_with("/users/dev/projects/inventory-api")
+        }));
+    }
 }
