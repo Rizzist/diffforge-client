@@ -7,6 +7,7 @@ import { CheckCircle } from "@styled-icons/material-rounded/CheckCircle";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudDone } from "@styled-icons/material-rounded/CloudDone";
 import { Code } from "@styled-icons/material-rounded/Code";
+import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
@@ -6023,7 +6024,7 @@ export const AudioStatusGrid = styled(VaultStatusGrid)`
 
 export const AudioGeneralToolbar = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.42fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   min-width: 0;
 
@@ -6812,6 +6813,14 @@ export const AudioHistoryRowTopline = styled.div`
   }
 `;
 
+export const AudioHistoryRowActions = styled.div`
+  display: inline-flex;
+  min-width: max-content;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+`;
+
 export const AudioHistoryProvider = styled.span`
   display: inline-flex;
   min-height: 22px;
@@ -6839,6 +6848,63 @@ export const AudioHistoryProvider = styled.span`
   }
 
   html[data-forge-theme="light"] &[data-provider="cloud"] {
+    border-color: rgba(10, 127, 69, 0.2);
+    color: var(--forge-green);
+    background: rgba(10, 127, 69, 0.07);
+  }
+`;
+
+export const AudioHistoryCopyButton = styled.button`
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid rgba(125, 160, 205, 0.22);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.64);
+  font-size: 10px;
+  font-weight: 780;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+  }
+
+  &:hover {
+    border-color: rgba(125, 160, 205, 0.36);
+    color: var(--forge-text);
+    background: rgba(125, 160, 205, 0.12);
+  }
+
+  &[data-copied="true"] {
+    border-color: rgba(60, 203, 127, 0.3);
+    color: var(--forge-green);
+    background: rgba(60, 203, 127, 0.09);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.14);
+    color: var(--forge-text-soft);
+    background: rgba(0, 102, 204, 0.045);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.24);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-copied="true"] {
     border-color: rgba(10, 127, 69, 0.2);
     color: var(--forge-green);
     background: rgba(10, 127, 69, 0.07);
@@ -7086,8 +7152,9 @@ export const AudioWidgetShell = styled.main`
     opacity: var(--audio-widget-underpaint-opacity);
   }
 
-  html[data-forge-theme="light"] &::before {
-    background: #ffffff;
+  html[data-forge-theme="light"] &::before,
+  &[data-theme="light"]::before {
+    background: #fbfbfd;
   }
 
   &::after {
@@ -7102,10 +7169,15 @@ export const AudioWidgetShell = styled.main`
     opacity: var(--audio-widget-surface-opacity);
   }
 
-  html[data-forge-theme="light"] &::after {
-    border-color: var(--forge-border);
-    background: var(--forge-surface);
-    box-shadow: none;
+  html[data-forge-theme="light"] &::after,
+  &[data-theme="light"]::after {
+    border-color: rgba(0, 0, 0, 0.08);
+    background:
+      radial-gradient(circle at 16% 0%, rgba(0, 102, 204, 0.1), transparent 36%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.97));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.96) inset,
+      0 -16px 26px rgba(0, 0, 0, 0.035) inset;
   }
 
   &[data-focus="true"] {
@@ -7113,6 +7185,13 @@ export const AudioWidgetShell = styled.main`
     --audio-widget-surface-opacity: 1;
     box-shadow:
       0 18px 44px rgba(0, 0, 0, 0.34);
+  }
+
+  &[data-theme="light"][data-focus="true"],
+  html[data-forge-theme="light"] &[data-focus="true"] {
+    box-shadow:
+      0 16px 36px rgba(29, 29, 31, 0.14),
+      0 2px 10px rgba(29, 29, 31, 0.08);
   }
 
   &[data-opening="true"] {
@@ -7241,6 +7320,26 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
       0 6px 16px rgba(0, 0, 0, 0.2);
   }
 
+  html[data-forge-theme="light"] &,
+  html[data-audio-widget-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.14);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 247, 250, 0.96));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.98) inset,
+      0 -8px 16px rgba(0, 0, 0, 0.035) inset,
+      0 8px 18px rgba(29, 29, 31, 0.12),
+      0 0 0 4px rgba(0, 102, 204, 0.035);
+  }
+
+  html[data-forge-theme="light"] &[data-size="focus"],
+  html[data-audio-widget-theme="light"] &[data-size="focus"] {
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.98) inset,
+      0 -8px 15px rgba(0, 0, 0, 0.03) inset,
+      0 6px 14px rgba(29, 29, 31, 0.1);
+  }
+
   &[data-hidden="true"] {
     opacity: 0;
   }
@@ -7357,6 +7456,86 @@ export const AudioWidgetMeter = styled.div`
         rgba(217, 121, 53, 0.72)
       );
   }
+
+  html[data-forge-theme="light"] &,
+  html[data-audio-widget-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.075);
+    background:
+      linear-gradient(90deg, rgba(0, 102, 204, 0.055) 0 1px, transparent 1px 9px),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(250, 250, 252, 0.9));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.9) inset,
+      0 -8px 16px rgba(0, 0, 0, 0.025) inset;
+  }
+
+  html[data-forge-theme="light"] & span,
+  html[data-audio-widget-theme="light"] & span {
+    background:
+      linear-gradient(180deg, rgba(95, 108, 130, 0.72), rgba(138, 149, 166, 0.46));
+    opacity: 0.7;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] span,
+  html[data-audio-widget-theme="light"] &[data-active="true"] span {
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.86), transparent 54%),
+      linear-gradient(
+        180deg,
+        hsl(var(--bar-hue, 208) 94% 48% / 0.98),
+        hsl(var(--bar-hue, 208) 86% 42% / 0.86) 54%,
+        rgba(221, 112, 31, 0.86)
+      );
+    box-shadow:
+      0 0 9px hsl(var(--bar-hue, 208) 82% 46% / 0.16),
+      0 1px 0 rgba(255, 255, 255, 0.58) inset;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"][data-signal="quiet"] span,
+  html[data-audio-widget-theme="light"] &[data-active="true"][data-signal="quiet"] span {
+    opacity: 0.66;
+    filter: saturate(0.74) brightness(0.98);
+    box-shadow:
+      0 0 8px hsl(var(--bar-hue, 208) 78% 46% / 0.12),
+      0 1px 0 rgba(255, 255, 255, 0.5) inset;
+  }
+
+  html[data-forge-theme="light"] &[data-prominent="true"],
+  html[data-audio-widget-theme="light"] &[data-prominent="true"] {
+    border-color: rgba(0, 0, 0, 0.075);
+    background:
+      linear-gradient(90deg, rgba(0, 102, 204, 0.05) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 18% 0%, rgba(0, 102, 204, 0.08), transparent 42%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(246, 247, 250, 0.88));
+  }
+
+  html[data-forge-theme="light"] &[data-prominent="true"] span,
+  html[data-audio-widget-theme="light"] &[data-prominent="true"] span {
+    box-shadow:
+      0 0 10px hsl(var(--bar-hue, 208) 80% 45% / 0.16),
+      0 0 14px rgba(221, 112, 31, 0.06),
+      0 1px 0 rgba(255, 255, 255, 0.58) inset;
+  }
+
+  html[data-forge-theme="light"] &[data-processing="true"],
+  html[data-audio-widget-theme="light"] &[data-processing="true"] {
+    border-color: rgba(0, 102, 204, 0.13);
+    background:
+      linear-gradient(90deg, rgba(221, 112, 31, 0.045) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 12% 0%, rgba(221, 112, 31, 0.08), transparent 40%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(246, 247, 250, 0.9));
+  }
+
+  html[data-forge-theme="light"] &[data-processing="true"] span,
+  html[data-audio-widget-theme="light"] &[data-processing="true"] span {
+    background:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.84), transparent 54%),
+      linear-gradient(
+        180deg,
+        hsl(var(--bar-hue, 198) 92% 46% / 0.98),
+        hsl(var(--bar-hue, 198) 86% 42% / 0.82) 52%,
+        rgba(221, 112, 31, 0.78)
+      );
+  }
 `;
 
 export const AudioWidgetLoader = styled.div`
@@ -7409,6 +7588,31 @@ export const AudioWidgetLoader = styled.div`
     box-shadow:
       0 0 14px rgba(125, 176, 255, 0.28),
       0 0 18px rgba(217, 121, 53, 0.14);
+  }
+
+  html[data-forge-theme="light"] &,
+  html[data-audio-widget-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 247, 250, 0.96));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.96) inset,
+      0 8px 18px rgba(29, 29, 31, 0.1);
+  }
+
+  html[data-forge-theme="light"] &::before,
+  html[data-audio-widget-theme="light"] &::before {
+    border-color: rgba(0, 0, 0, 0.08);
+    border-top-color: var(--forge-blue);
+    border-right-color: rgba(221, 112, 31, 0.88);
+  }
+
+  html[data-forge-theme="light"] &::after,
+  html[data-audio-widget-theme="light"] &::after {
+    background: var(--forge-blue);
+    box-shadow:
+      0 0 12px rgba(0, 102, 204, 0.26),
+      0 0 16px rgba(221, 112, 31, 0.1);
   }
 `;
 
@@ -10868,6 +11072,10 @@ export const ButtonBrowserIcon = styled(OpenInBrowser)`
 `;
 
 export const ButtonCloseIcon = styled(Close)`
+  ${buttonIconSize}
+`;
+
+export const ButtonCopyIcon = styled(ContentCopy)`
   ${buttonIconSize}
 `;
 

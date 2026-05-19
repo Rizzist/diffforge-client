@@ -9,6 +9,7 @@
     <script>
       (() => {
         const APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
+        const AUDIO_WIDGET_THEME_STORAGE_KEY = "diffforge.audio.widgetTheme";
         const THEME_DEFAULT = "dark";
         const THEME_META_COLORS = {
           dark: "#030508",
@@ -20,8 +21,11 @@
         };
 
         try {
-          const rawSettings = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-          const settings = rawSettings ? JSON.parse(rawSettings) : null;
+          const isAudioWidget = window.location.hash === "#/audio-widget";
+          const rawSettings = isAudioWidget
+            ? window.localStorage.getItem(AUDIO_WIDGET_THEME_STORAGE_KEY)
+            : window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
+          const settings = rawSettings && !isAudioWidget ? JSON.parse(rawSettings) : rawSettings;
           const theme = normalizeTheme(
             typeof settings === "string" ? settings : settings && settings.theme,
           );
@@ -30,12 +34,17 @@
             "content",
             THEME_META_COLORS[theme] || THEME_META_COLORS[THEME_DEFAULT],
           );
+
+          if (isAudioWidget) {
+            document.documentElement.dataset.audioWidget = "true";
+            document.documentElement.dataset.audioWidgetTheme = theme;
+          }
         } catch {
           document.documentElement.dataset.forgeTheme = THEME_DEFAULT;
-        }
-
-        if (window.location.hash === "#/audio-widget") {
-          document.documentElement.dataset.audioWidget = "true";
+          if (window.location.hash === "#/audio-widget") {
+            document.documentElement.dataset.audioWidget = "true";
+            document.documentElement.dataset.audioWidgetTheme = THEME_DEFAULT;
+          }
         }
       })();
     </script>

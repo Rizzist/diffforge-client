@@ -113,6 +113,16 @@ function isBlankAtlasRoot(node) {
   return !summary && (!notePath || notePath === ".agents/knowledge");
 }
 
+function markdownText(value) {
+  if (value === undefined || value === null) return "";
+  return String(value)
+    .replace(/\r\n?/g, "\n")
+    .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, " ")
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .trim();
+}
+
 function knowledgeRootRank(node) {
   const notePath = text(node?.note_path || node?.path || node?.markdown_path).toLowerCase();
   const nodeKey = text(node?.node_key || node?.metadata?.node_key).toLowerCase();
@@ -164,7 +174,7 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const knowledgeType = text(field(raw, "node_type", "nodeType", "type"), "knowledge_note");
   const title = text(field(raw, "title"), notePath || "Knowledge note");
   const syntheticRoot = raw?.synthetic_root === true || metadata?.synthetic_root === true;
-  const rawMarkdown = text(field(raw, "markdown", "body", "content"));
+  const rawMarkdown = markdownText(field(raw, "markdown", "body", "content"));
   const isRoot = knowledgeType === "knowledge_root" || knowledgeType === "repo_root";
   const blankRoot = isRoot && !rawMarkdown;
   const summary = text(field(raw, "summary", "description", "purpose", "standard_capsule", "standardCapsule"), syntheticRoot || blankRoot ? "" : "Markdown knowledge note.");
@@ -177,6 +187,10 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const nodeType = isRoot ? "workspace" : "concept";
   const freshnessState = knowledgeFreshness(rawState);
   const displayPath = notePath || workspaceRelativePath(notePath, displayIdentity) || "";
+  const fallbackMarkdown = markdownText(field(raw, "standard_capsule", "standardCapsule"));
+  const markdown = syntheticRoot || blankRoot
+    ? rawMarkdown
+    : rawMarkdown || fallbackMarkdown || summary;
 
   return {
     ...raw,
@@ -192,7 +206,7 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
     path: notePath,
     summary,
     purpose: summary,
-    markdown: syntheticRoot || blankRoot ? rawMarkdown : text(field(raw, "markdown", "body", "content", "standard_capsule", "standardCapsule"), summary),
+    markdown,
     markdown_path: notePath,
     path_refs: pathRefs,
     path_ref_count: Number(field(raw, "path_ref_count", "pathRefCount")) || pathRefs.length,

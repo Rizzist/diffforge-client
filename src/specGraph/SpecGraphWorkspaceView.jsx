@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -579,44 +580,50 @@ function KnowledgeOutlineNode({
   const children = (childrenByParent.get(node.id) || []).filter((child) => !nextAncestorIds.has(child.id));
   const hasChildren = children.length > 0;
   const expanded = expandedIds.has(node.id);
-  const label = knowledgeNodeTypeLabel(node);
-  const notePath = knowledgeOutlineNodePath(node);
 
   return (
     <KnowledgeOutlineNodeBlock>
-      <KnowledgeOutlineRow $depth={depth}>
-        <KnowledgeOutlineDisclosure
-          type="button"
-          aria-label={expanded ? "Collapse concept" : "Expand concept"}
-          disabled={!hasChildren}
-          onClick={() => hasChildren && onToggle(node.id)}
-        >
-          {hasChildren ? (expanded ? "-" : "+") : ""}
-        </KnowledgeOutlineDisclosure>
+      <KnowledgeOutlineRow $depth={depth} data-active={node.id === selectedNodeId ? "true" : "false"}>
         <KnowledgeOutlineButton
           type="button"
           data-active={node.id === selectedNodeId ? "true" : "false"}
           onClick={() => onSelect(node.id)}
         >
-          <span>{node.display_title || node.title || "Knowledge concept"}</span>
-          <small>{label}{notePath ? ` - ${notePath}` : ""}</small>
+          <KnowledgeOutlineText>
+            <span>{node.display_title || node.title || "Knowledge concept"}</span>
+          </KnowledgeOutlineText>
         </KnowledgeOutlineButton>
+        <KnowledgeOutlineDisclosure
+          type="button"
+          aria-label={expanded ? "Collapse concept" : "Expand concept"}
+          data-expanded={expanded ? "true" : "false"}
+          disabled={!hasChildren}
+          onClick={() => hasChildren && onToggle(node.id)}
+        >
+          {hasChildren ? <KnowledgeDisclosureIcon aria-hidden="true" /> : null}
+        </KnowledgeOutlineDisclosure>
       </KnowledgeOutlineRow>
-      {hasChildren && expanded ? (
-        <KnowledgeOutlineChildren>
-          {children.map((child) => (
-            <KnowledgeOutlineNode
-              key={child.id}
-              node={child}
-              depth={depth + 1}
-              childrenByParent={childrenByParent}
-              expandedIds={expandedIds}
-              selectedNodeId={selectedNodeId}
-              onSelect={onSelect}
-              onToggle={onToggle}
-              ancestorIds={nextAncestorIds}
-            />
-          ))}
+      {hasChildren ? (
+        <KnowledgeOutlineChildren
+          $depth={depth}
+          data-expanded={expanded ? "true" : "false"}
+          aria-hidden={expanded ? undefined : "true"}
+        >
+          <KnowledgeOutlineChildrenInner>
+            {children.map((child) => (
+              <KnowledgeOutlineNode
+                key={child.id}
+                node={child}
+                depth={depth + 1}
+                childrenByParent={childrenByParent}
+                expandedIds={expandedIds}
+                selectedNodeId={selectedNodeId}
+                onSelect={onSelect}
+                onToggle={onToggle}
+                ancestorIds={nextAncestorIds}
+              />
+            ))}
+          </KnowledgeOutlineChildrenInner>
         </KnowledgeOutlineChildren>
       ) : null}
     </KnowledgeOutlineNodeBlock>
@@ -633,25 +640,32 @@ function KnowledgeOutline({ nodes, edges, selectedNodeId, onSelect }) {
     return [outline.rootNode];
   }, [hideRootItem, outline.childrenByParent, outline.rootNode]);
   const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const [userCollapsedIds, setUserCollapsedIds] = useState(() => new Set());
 
   useEffect(() => {
     setExpandedIds((current) => {
       const next = new Set(current);
-      if (outline.rootNode?.id) next.add(outline.rootNode.id);
+      if (outline.rootNode?.id && !userCollapsedIds.has(outline.rootNode.id)) next.add(outline.rootNode.id);
       for (const id of selectedKnowledgePath(outline.parentById, selectedNodeId)) {
-        next.add(id);
+        if (!userCollapsedIds.has(id)) next.add(id);
       }
       return next;
     });
-  }, [outline.parentById, outline.rootNode?.id, selectedNodeId]);
+  }, [outline.parentById, outline.rootNode?.id, selectedNodeId, userCollapsedIds]);
 
   const toggleExpanded = useCallback((nodeId) => {
     setExpandedIds((current) => {
       const next = new Set(current);
       if (next.has(nodeId)) {
         next.delete(nodeId);
+        setUserCollapsedIds((collapsed) => new Set(collapsed).add(nodeId));
       } else {
         next.add(nodeId);
+        setUserCollapsedIds((collapsed) => {
+          const nextCollapsed = new Set(collapsed);
+          nextCollapsed.delete(nodeId);
+          return nextCollapsed;
+        });
       }
       return next;
     });
@@ -694,18 +708,104 @@ function KnowledgeOutline({ nodes, edges, selectedNodeId, onSelect }) {
   );
 }
 
-const knowledgeMarkdownComponents = {
-  table(props) {
-    const tableProps = { ...props };
-    delete tableProps.node;
+function isExternalKnowledgeMarkdownHref(value) {
+  return /^(?:https?:|mailto:|tel:)/i.test(String(value || "").trim());
+}
 
-    return (
-      <div className="knowledge-markdown-table-wrap">
-        <table {...tableProps} />
-      </div>
-    );
-  },
-};
+function decodeKnowledgeMarkdownHref(value) {
+  const href = String(value || "").trim();
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    return href;
+  }
+}
+
+function normalizeKnowledgeMarkdownTarget(value) {
+  return decodeKnowledgeMarkdownHref(value)
+    .replace(/\\/g, "/")
+    .replace(/^\.agents\/knowledge\//i, "")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "")
+    .replace(/\.md$/i, "")
+    .toLowerCase();
+}
+
+function findKnowledgeNodeForMarkdownTarget(graph, target) {
+  const normalizedTarget = normalizeKnowledgeMarkdownTarget(target);
+  if (!normalizedTarget) return null;
+  return (graph?.nodes || []).find((node) => {
+    const candidates = [
+      node.note_path,
+      node.markdown_path,
+      node.path,
+      node.title,
+      node.display_title,
+      node.displayTitle,
+    ];
+    return candidates.some((candidate) => normalizeKnowledgeMarkdownTarget(candidate) === normalizedTarget);
+  }) || null;
+}
+
+function openKnowledgeMarkdownLink(event, href, graph, onSelect) {
+  const target = String(href || "").trim();
+  if (!target || target.startsWith("#") || isExternalKnowledgeMarkdownHref(target)) {
+    return;
+  }
+
+  const linkedNode = findKnowledgeNodeForMarkdownTarget(graph, target);
+  if (!linkedNode) return;
+  event.preventDefault();
+  onSelect?.(linkedNode.id);
+}
+
+function escapeKnowledgeMarkdownLabel(value) {
+  return String(value || "").replace(/([\\\]])/g, "\\$1");
+}
+
+function escapeKnowledgeMarkdownDestination(value) {
+  return String(value || "")
+    .replace(/[<>\r\n]/g, "")
+    .trim();
+}
+
+function renderKnowledgeWikilinks(source) {
+  return String(source || "").replace(/\[\[([^\]\n]+?)\]\]/g, (match, body) => {
+    const [rawTarget, ...labelParts] = String(body || "").split("|");
+    const target = escapeKnowledgeMarkdownDestination(rawTarget);
+    if (!target) return match;
+    const label = escapeKnowledgeMarkdownLabel(labelParts.join("|").trim() || target);
+    return `[${label}](<${target}>)`;
+  });
+}
+
+function createKnowledgeMarkdownComponents(graph, onSelect) {
+  return {
+    a({ node: _node, href, children, ...props }) {
+      return (
+        <a
+          {...props}
+          href={href}
+          onClick={(event) => openKnowledgeMarkdownLink(event, href, graph, onSelect)}
+          rel={isExternalKnowledgeMarkdownHref(href) ? "noreferrer" : undefined}
+          target={isExternalKnowledgeMarkdownHref(href) ? "_blank" : undefined}
+        >
+          {children}
+        </a>
+      );
+    },
+    table(props) {
+      const tableProps = { ...props };
+      delete tableProps.node;
+
+      return (
+        <div className="knowledge-markdown-table-wrap">
+          <table {...tableProps} />
+        </div>
+      );
+    },
+  };
+}
 
 function KnowledgeInspector({ graph, node, relations, onSelect }) {
   if (!node) {
@@ -735,7 +835,7 @@ function KnowledgeInspector({ graph, node, relations, onSelect }) {
         </KnowledgeMetricRow>
       </KnowledgeInspectorHeader>
       <MarkdownPane>
-        <KnowledgeMarkdownBlock markdown={markdown} node={node} />
+        <KnowledgeMarkdownBlock markdown={markdown} node={node} graph={graph} onSelect={onSelect} />
         <KnowledgeRelationsPanel>
           <KnowledgeRelationSection
             title="Outgoing"
@@ -762,13 +862,15 @@ function KnowledgeInspector({ graph, node, relations, onSelect }) {
   );
 }
 
-function KnowledgeMarkdownBlock({ markdown, node }) {
+function KnowledgeMarkdownBlock({ markdown, node, graph, onSelect }) {
   const source = normalizeKnowledgeMarkdownSource(markdown, node);
+  const renderedSource = useMemo(() => renderKnowledgeWikilinks(source), [source]);
+  const components = useMemo(() => createKnowledgeMarkdownComponents(graph, onSelect), [graph, onSelect]);
   if (!source) return <InspectorEmpty>No markdown content for this note yet.</InspectorEmpty>;
   return (
     <KnowledgeMarkdown>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={knowledgeMarkdownComponents}>
-        {source}
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        {renderedSource}
       </ReactMarkdown>
     </KnowledgeMarkdown>
   );
@@ -2318,128 +2420,281 @@ const HistoryNodeEmpty = styled.div`
 `;
 
 const KnowledgeOutlinePanel = styled.aside`
-  border: 1px solid var(--history-border);
+  border: 1px solid rgba(139, 151, 166, 0.12);
   border-radius: 8px;
-  background: var(--history-bg);
+  background: rgba(7, 10, 15, 0.88);
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #fbfbfc;
+  }
 `;
 
 const KnowledgePanelHeader = styled.header`
-  border-bottom: 1px solid var(--history-border);
   display: grid;
   gap: 2px;
-  padding: 11px 12px;
+  padding: 10px 12px 5px;
 
   span {
-    color: var(--history-text);
-    font-size: 12px;
-    font-weight: 780;
+    color: rgba(226, 232, 240, 0.88);
+    font-size: 12.5px;
+    font-weight: 720;
+    line-height: 1.2;
   }
 
   small {
-    color: var(--history-subtle);
+    color: rgba(148, 163, 184, 0.7);
     font-size: 10px;
-    font-weight: 680;
+    font-weight: 620;
+    line-height: 1.2;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #1d1d1f;
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: #6e6e73;
   }
 `;
 
 const KnowledgeOutlineList = styled.div`
   display: grid;
   align-content: flex-start;
-  gap: 3px;
+  gap: 1px;
   min-height: 0;
   overflow: auto;
-  padding: 8px;
+  padding: 4px 6px 10px;
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.14);
+  }
 `;
 
 const KnowledgeOutlineNodeBlock = styled.div`
   display: grid;
-  gap: 2px;
+  gap: 0;
 `;
 
 const KnowledgeOutlineRow = styled.div`
   align-items: center;
-  display: flex;
-  gap: 4px;
-  padding-left: ${({ $depth = 0 }) => Math.min($depth, 8) * 13}px;
+  border-radius: 5px;
+  display: grid;
+  gap: 1px;
+  grid-template-columns: minmax(0, 1fr) 20px;
+  min-width: 0;
+  padding-left: ${({ $depth = 0 }) => 5 + Math.min($depth, 8) * 14}px;
+  padding-right: 2px;
+  transition: background 120ms ease;
+
+  &:hover {
+    background: rgba(148, 163, 184, 0.045);
+  }
+
+  &[data-active="true"] {
+    background: rgba(148, 163, 184, 0.072);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 0, 0, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    background: rgba(0, 102, 204, 0.08);
+  }
 `;
 
 const KnowledgeOutlineDisclosure = styled.button`
   align-items: center;
   background: transparent;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 4px;
-  color: var(--history-subtle);
+  color: rgba(148, 163, 184, 0.72);
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 18px;
-  font-size: 12px;
-  font-weight: 760;
-  height: 22px;
+  height: 23px;
   justify-content: center;
   padding: 0;
+  width: 20px;
   transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 
+  svg {
+    transform: rotate(-90deg);
+    transition: transform 130ms ease;
+  }
+
+  &[data-expanded="true"] svg {
+    transform: rotate(0deg);
+  }
+
   &:hover:not(:disabled) {
-    background: var(--history-panel);
-    border-color: var(--history-border);
-    color: var(--history-text);
+    background: rgba(148, 163, 184, 0.1);
+    color: rgba(226, 232, 240, 0.92);
   }
 
   &:disabled {
     cursor: default;
-    opacity: 0.28;
+    opacity: 0;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #7a7a7a;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.06);
+    color: #1d1d1f;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    svg {
+      transition: none;
+    }
   }
 `;
 
 const KnowledgeOutlineButton = styled.button`
-  border: 1px solid transparent;
-  border-radius: 6px;
+  align-items: center;
+  border: 0;
+  border-radius: 0;
   background: transparent;
   color: inherit;
   cursor: pointer;
   display: grid;
-  flex: 1 1 auto;
-  gap: 3px;
-  padding: 7px 8px;
+  min-width: 0;
+  padding: 4px 5px 4px 4px;
   text-align: left;
-  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+  transition: color 140ms ease;
 
   &:hover {
-    border-color: var(--history-border);
-    background: var(--history-panel);
+    color: rgba(248, 250, 252, 0.96);
   }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #1d1d1f;
+  }
+`;
+
+const KnowledgeOutlineText = styled.span`
+  display: grid;
+  min-width: 0;
 
   span {
-    color: var(--history-text);
-    font-size: 10.5px;
-    font-weight: 700;
-    line-height: 1.28;
-    overflow-wrap: anywhere;
+    color: rgba(226, 232, 240, 0.86);
+    font-size: 11px;
+    font-weight: 590;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  small {
-    color: var(--history-subtle);
-    font-size: 9px;
-    font-weight: 620;
-    line-height: 1.3;
-    overflow-wrap: anywhere;
+  html[data-forge-theme="light"] & span {
+    color: #242428;
   }
 
-  &[data-active="true"] {
-    border-color: var(--history-border-strong);
-    background: var(--history-panel-soft);
-    box-shadow: inset 2px 0 0 var(--history-blue);
+  @media (min-width: 1600px) and (min-height: 820px) {
+    span {
+      font-size: 11.5px;
+    }
   }
+
+  @media (min-width: 1920px) and (min-height: 980px) {
+    span {
+      font-size: 12px;
+    }
+  }
+`;
+
+const KnowledgeDisclosureIcon = styled(ExpandMore)`
+  height: 16px;
+  width: 16px;
 `;
 
 const KnowledgeOutlineChildren = styled.div`
   display: grid;
-  gap: 2px;
+  grid-template-rows: 0fr;
+  min-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  position: relative;
+  transform: translateY(-2px);
+  visibility: hidden;
+  transition:
+    grid-template-rows 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 140ms ease,
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 180ms;
+
+  &[data-expanded="true"] {
+    grid-template-rows: 1fr;
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+    visibility: visible;
+    transition:
+      grid-template-rows 190ms cubic-bezier(0.16, 1, 0.3, 1),
+      opacity 150ms ease,
+      transform 190ms cubic-bezier(0.16, 1, 0.3, 1),
+      visibility 0s linear 0s;
+  }
+
+  &::before {
+    background: rgba(148, 163, 184, 0.16);
+    border-radius: 999px;
+    bottom: 4px;
+    content: "";
+    left: ${({ $depth = 0 }) => 16 + Math.min($depth, 8) * 14}px;
+    opacity: 0;
+    position: absolute;
+    top: 1px;
+    transition: opacity 150ms ease;
+    width: 1px;
+  }
+
+  &[data-expanded="true"]::before {
+    opacity: 1;
+    transition-delay: 40ms;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background: rgba(0, 0, 0, 0.12);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+    transform: none;
+
+    &::before {
+      transition: none;
+    }
+  }
+`;
+
+const KnowledgeOutlineChildrenInner = styled.div`
+  display: grid;
+  gap: 1px;
+  min-height: 0;
+  overflow: hidden;
 `;
 
 const KnowledgeOutlineEmpty = styled.div`

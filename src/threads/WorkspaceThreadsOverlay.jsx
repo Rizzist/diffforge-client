@@ -142,7 +142,8 @@ const OverlayPanel = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(188px, 220px) minmax(0, 1fr);
+  --thread-rail-expanded-width: clamp(136px, calc(9vw + 28px), 220px);
+  grid-template-columns: var(--thread-rail-expanded-width) minmax(0, 1fr);
   overflow: hidden;
   border: 0;
   border-radius: 0;
@@ -158,7 +159,7 @@ const OverlayPanel = styled.section`
   }
 
   @media (max-width: 760px) {
-    grid-template-columns: minmax(180px, 58vw) minmax(0, 1fr);
+    --thread-rail-expanded-width: clamp(124px, 38vw, 168px);
 
     &[data-rail-collapsed="true"] {
       grid-template-columns: 48px minmax(0, 1fr);
@@ -246,6 +247,11 @@ const WorkspaceList = styled.div`
   overflow-y: auto;
   padding: 26px 12px 16px;
   background: transparent;
+
+  @media (max-width: 1180px) {
+    gap: 10px;
+    padding-inline: 8px;
+  }
 
   &::-webkit-scrollbar {
     width: 6px;

@@ -2,8 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { AddPhotoAlternate } from "@styled-icons/material-rounded/AddPhotoAlternate";
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
+import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
+import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Prism from "prismjs";
 import "prismjs/components/prism-markup";
@@ -179,10 +182,11 @@ const EmptyThread = styled.div`
 `;
 
 const UserCell = styled.article`
-  display: flex;
+  display: grid;
+  width: 100%;
   min-width: 0;
-  justify-content: flex-end;
-  padding: 2px 0 18px;
+  justify-items: end;
+  padding: 2px 0 26px;
   color: var(--thread-fg);
   font-size: var(--thread-detail-font-size);
   line-height: 1.6;
@@ -214,7 +218,9 @@ const MessageBody = styled.div`
   gap: 7px;
 
   article[data-message-role="user"] & {
-    max-width: min(78%, 520px);
+    box-sizing: border-box;
+    width: 100%;
+    max-width: none;
     border: 0;
     border-radius: 18px;
     padding: 11px 14px 12px;
@@ -243,6 +249,109 @@ const MessageBody = styled.div`
 
   article[data-message-role="activity"] & {
     width: 100%;
+  }
+`;
+
+const AssistantBlock = styled.article`
+  position: relative;
+  display: grid;
+  min-width: 0;
+  gap: 0;
+  padding: 2px 0 24px;
+  color: var(--thread-fg);
+  font-size: var(--thread-detail-font-size);
+  line-height: 1.6;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
+const ChatMessageFrame = styled.div`
+  position: relative;
+  display: grid;
+  min-width: 0;
+
+  article[data-message-role="assistant"] & {
+    width: 100%;
+  }
+
+  article[data-message-role="user"] & {
+    width: fit-content;
+    max-width: min(78%, 520px);
+    justify-self: end;
+  }
+`;
+
+const MessageCopyButton = styled.button`
+  position: absolute;
+  bottom: -24px;
+  left: 3px;
+  z-index: 3;
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--thread-muted);
+  background: transparent;
+  box-shadow: none;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    background 130ms ease,
+    color 130ms ease,
+    opacity 130ms ease;
+
+  ${ChatMessageFrame}:hover &,
+  ${ChatMessageFrame}:focus-within &,
+  ${AssistantBlock}:hover &,
+  ${AssistantBlock}:focus-within &,
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  ${AssistantBlock} > & {
+    bottom: 0;
+    left: 3px;
+  }
+
+  article[data-message-role="user"] & {
+    right: 10px;
+    left: auto;
+  }
+
+  &[data-copied="true"] {
+    color: var(--thread-green);
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    background: var(--thread-accent);
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #626268;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--thread-blue);
+    background: var(--thread-accent);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
   }
 `;
 
@@ -525,7 +634,7 @@ const AssistantMarkdownBody = styled.div`
 const AssistantCell = styled.article`
   display: block;
   min-width: 0;
-  padding: 2px 0 20px;
+  padding: 2px 0 7px;
   color: var(--thread-fg);
   font-size: var(--thread-detail-font-size);
   line-height: 1.6;
@@ -541,40 +650,97 @@ const AssistantPrefix = styled.span`
 const TranscriptActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
-  gap: 10px;
-  margin: 0 0 18px;
+  gap: 8px;
+  margin: 3px 0 9px;
   border: 1px solid var(--thread-border);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 8px 11px;
   color: var(--thread-muted);
   font-size: var(--thread-detail-font-size);
   line-height: 1.5;
-  background: #1b1b1b;
+  background: rgba(255, 255, 255, 0.018);
   user-select: text;
   -webkit-user-select: text;
 
   html[data-forge-theme="light"] & {
     border-color: var(--thread-border);
     color: #3a3a3c;
-    background: #ffffff;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.045),
-      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+    background: rgba(255, 255, 255, 0.64);
   }
 `;
 
-const TranscriptActivityHeader = styled.div`
+const TranscriptActivityContent = styled.div`
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px;
+`;
+
+const TranscriptActivityIcon = styled.span`
+  display: grid;
+  width: 16px;
+  height: 22px;
+  place-items: center;
+  color: var(--thread-muted-soft);
+  user-select: none;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--thread-muted);
+  }
+`;
+
+const TranscriptActivityHeader = styled.button`
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 22px;
+  grid-template-columns: minmax(0, 1fr) auto 18px;
   align-items: center;
   gap: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--thread-muted);
+  background: transparent;
+  font: inherit;
+  line-height: 1.4;
+  text-align: left;
+  transition: color 130ms ease;
+
+  &:not(:disabled) {
+    cursor: pointer;
+  }
+
+  &[data-nested="true"] {
+    grid-template-columns: minmax(0, 1fr) 18px;
+    min-height: 21px;
+    color: var(--thread-muted-soft);
+    font-size: var(--thread-detail-small-font-size);
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+  }
+
+  &:disabled {
+    color: var(--thread-muted-soft);
+    cursor: default;
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 2px;
+  }
 `;
 
 const TranscriptActivityTitle = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: var(--thread-muted);
+  color: currentColor;
   font-weight: 520;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -582,35 +748,109 @@ const TranscriptActivityTitle = styled.div`
   -webkit-user-select: text;
 
   html[data-forge-theme="light"] & {
-    color: #4b4b50;
     font-weight: 620;
   }
 `;
 
 const TranscriptActivityStatus = styled.span`
   min-width: 0;
-  color: rgba(223, 165, 90, 0.82);
+  color: var(--thread-muted-soft);
   font-size: var(--thread-detail-mini-font-size);
-  font-weight: 520;
+  font-weight: 480;
   line-height: 1;
-  text-transform: uppercase;
+  text-transform: none;
   user-select: text;
   -webkit-user-select: text;
 
   html[data-forge-theme="light"] & {
-    color: var(--forge-amber);
-    font-weight: 700;
+    color: var(--thread-muted);
+    font-weight: 560;
   }
 `;
 
-const TranscriptActivityBody = styled.pre`
-  max-height: 290px;
+const TranscriptActivityToggle = styled.span`
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  color: currentColor;
+  background: transparent;
+  pointer-events: none;
+
+  svg {
+    width: 15px;
+    height: 15px;
+    transform: rotate(0deg);
+    transition: transform 130ms ease;
+  }
+
+  &[data-expanded="true"] svg {
+    transform: rotate(180deg);
+  }
+`;
+
+const TranscriptActivityList = styled.div`
+  display: grid;
   min-width: 0;
-  margin: 6px 0 0;
+  gap: 1px;
+  padding: 1px 0 0;
+`;
+
+const TranscriptActivityTool = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+`;
+
+const TranscriptActivityDisclosure = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  visibility: hidden;
+  transition:
+    grid-template-rows 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 140ms ease,
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 180ms;
+
+  &[data-expanded="true"] {
+    grid-template-rows: 1fr;
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+    visibility: visible;
+    transition:
+      grid-template-rows 190ms cubic-bezier(0.16, 1, 0.3, 1),
+      opacity 150ms ease,
+      transform 190ms cubic-bezier(0.16, 1, 0.3, 1),
+      visibility 0s linear 0s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+    transform: none;
+  }
+`;
+
+const TranscriptActivityDisclosureInner = styled.div`
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const TranscriptActivityBody = styled.pre`
+  max-height: 260px;
+  min-width: 0;
+  margin: 2px 0 6px;
   overflow-x: hidden;
   overflow-y: auto;
-  border-left: 1px solid rgba(255, 255, 255, 0.12);
-  padding: 2px 0 2px 12px;
+  border: 0;
+  padding: 2px 0 2px 18px;
   color: var(--thread-muted);
   background: transparent;
   font: inherit;
@@ -623,7 +863,6 @@ const TranscriptActivityBody = styled.pre`
   -webkit-user-select: text;
 
   html[data-forge-theme="light"] & {
-    border-left-color: rgba(0, 0, 0, 0.12);
     color: #515154;
   }
 
@@ -2999,12 +3238,155 @@ function getToolCallLabel(message) {
   return firstLine || title || "Tool call";
 }
 
+function isActivityMessage(message) {
+  return message?.role === "activity";
+}
+
 function buildTranscriptItems(messages) {
-  return (Array.isArray(messages) ? messages : []).map((message, index) => ({
-    id: message?.id || `message-${index}`,
-    message,
-    type: "message",
-  }));
+  const items = [];
+  let assistantBlock = null;
+  let activityGroup = [];
+
+  const flushActivityGroup = () => {
+    if (!activityGroup.length) {
+      return;
+    }
+
+    const firstMessage = activityGroup[0];
+    const lastMessage = activityGroup[activityGroup.length - 1];
+    assistantBlock?.items.push({
+      id: `activity-group-${firstMessage?.id || items.length}-${lastMessage?.id || activityGroup.length}`,
+      messages: activityGroup,
+      type: "activity-group",
+    });
+    activityGroup = [];
+  };
+
+  const ensureAssistantBlock = (message, fallbackIndex) => {
+    if (!assistantBlock) {
+      assistantBlock = {
+        id: `assistant-block-${message?.id || fallbackIndex || items.length}`,
+        items: [],
+        type: "assistant-block",
+      };
+    }
+
+    return assistantBlock;
+  };
+
+  const flushAssistantBlock = () => {
+    if (!assistantBlock) {
+      return;
+    }
+
+    flushActivityGroup();
+    if (assistantBlock.items.length) {
+      items.push(assistantBlock);
+    }
+    assistantBlock = null;
+  };
+
+  (Array.isArray(messages) ? messages : []).forEach((message, index) => {
+    if (isActivityMessage(message)) {
+      ensureAssistantBlock(message, index);
+      activityGroup.push(message);
+      return;
+    }
+
+    if (message?.role === "assistant") {
+      const block = ensureAssistantBlock(message, index);
+      flushActivityGroup();
+      block.items.push({
+        id: message?.id || `message-${index}`,
+        message,
+        type: "message",
+      });
+      return;
+    }
+
+    flushAssistantBlock();
+    items.push({
+      id: message?.id || `message-${index}`,
+      message,
+      type: "message",
+    });
+  });
+
+  flushAssistantBlock();
+  return items;
+}
+
+function getMessageCopyText(message) {
+  const text = String(message?.text || "");
+  if (text) {
+    return text;
+  }
+
+  return String(message?.title || "").trim();
+}
+
+function getActivityCopyText(message) {
+  const label = getToolCallLabel(message);
+  const status = getActivityStatusLabel(message);
+  const body = String(message?.text || "").trim();
+  return [
+    [label, status ? `(${status})` : ""].filter(Boolean).join(" "),
+    body,
+  ].filter(Boolean).join("\n");
+}
+
+function getAssistantBlockCopyText(items) {
+  const copyParts = [];
+
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    if (item?.type === "message" && item?.message?.role === "assistant") {
+      const text = getMessageCopyText(item.message);
+      if (text) {
+        copyParts.push(text);
+      }
+      return;
+    }
+
+    if (item?.type === "activity-group") {
+      const activityParts = (Array.isArray(item.messages) ? item.messages : []).map((message) => {
+        const text = getActivityCopyText(message);
+        return text ? `Tool call:\n${text}` : "";
+      }).filter(Boolean);
+
+      if (activityParts.length) {
+        copyParts.push(activityParts.join("\n\n"));
+      }
+    }
+  });
+
+  return copyParts.join("\n\n").trim();
+}
+
+async function copyTextToClipboard(text) {
+  const safeText = String(text || "");
+  if (!safeText || typeof window === "undefined") {
+    return false;
+  }
+
+  if (window.navigator?.clipboard?.writeText) {
+    await window.navigator.clipboard.writeText(safeText);
+    return true;
+  }
+
+  const textarea = window.document.createElement("textarea");
+  textarea.value = safeText;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  window.document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    return window.document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
 }
 
 function isChatProjectionMessage(message) {
@@ -3016,7 +3398,22 @@ function isChatProjectionMessage(message) {
   return kind !== "live_output" && source !== "terminal-live";
 }
 
-function ActivityMessage({ message }) {
+function getActivityStatusLabel(message) {
+  return String(message?.status || "").trim();
+}
+
+function getActivityGroupStatus(messages) {
+  const statuses = (Array.isArray(messages) ? messages : [])
+    .map(getActivityStatusLabel)
+    .filter(Boolean);
+  const normalizedStatuses = new Set(statuses.map((status) => status.toLowerCase()));
+
+  return normalizedStatuses.size === 1 ? statuses[0] : "";
+}
+
+function ActivityToolRow({ message }) {
+  const [expanded, setExpanded] = useState(false);
+
   if (!message) {
     return null;
   }
@@ -3025,50 +3422,209 @@ function ActivityMessage({ message }) {
   const status = String(message.status || "").trim();
   const body = String(message.text || "").trim();
   const kind = String(message.kind || "activity").trim().toLowerCase();
+  const hasBody = Boolean(body);
 
   return (
-    <TranscriptActivityCell data-kind={kind} data-message-role="activity" data-status={status || "complete"}>
-      <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
-      <div>
-        <TranscriptActivityHeader>
+    <TranscriptActivityTool data-kind={kind} data-status={status || "complete"}>
+      <TranscriptActivityHeader
+        aria-expanded={hasBody ? expanded : undefined}
+        aria-label={hasBody ? `${expanded ? "Collapse" : "Expand"} ${label}` : label}
+        data-expanded={expanded ? "true" : "false"}
+        data-nested="true"
+        disabled={!hasBody}
+        onClick={() => {
+          if (hasBody) {
+            setExpanded((value) => !value);
+          }
+        }}
+        title={label}
+        type="button"
+      >
+        <TranscriptActivityTitle title={label}>{label}</TranscriptActivityTitle>
+        <TranscriptActivityToggle data-expanded={expanded ? "true" : "false"}>
+          {hasBody ? <ExpandMore aria-hidden="true" /> : null}
+        </TranscriptActivityToggle>
+      </TranscriptActivityHeader>
+      {hasBody ? (
+        <TranscriptActivityDisclosure
+          aria-hidden={expanded ? "false" : "true"}
+          data-expanded={expanded ? "true" : "false"}
+        >
+          <TranscriptActivityDisclosureInner>
+            <TranscriptActivityBody>{body}</TranscriptActivityBody>
+          </TranscriptActivityDisclosureInner>
+        </TranscriptActivityDisclosure>
+      ) : null}
+    </TranscriptActivityTool>
+  );
+}
+
+function ActivityMessage({ message, messages }) {
+  const [expanded, setExpanded] = useState(false);
+  const groupMessages = Array.isArray(messages) && messages.length
+    ? messages
+    : message
+      ? [message]
+      : [];
+
+  if (!groupMessages.length) {
+    return null;
+  }
+
+  const activityCount = groupMessages.length;
+  const label = `${activityCount} ${activityCount === 1 ? "tool call" : "tool calls"}`;
+  const status = getActivityGroupStatus(groupMessages);
+
+  return (
+    <TranscriptActivityCell data-message-role="activity" data-status={status || "complete"}>
+      <TranscriptActivityIcon aria-hidden="true">
+        <Terminal />
+      </TranscriptActivityIcon>
+      <TranscriptActivityContent>
+        <TranscriptActivityHeader
+          aria-expanded={expanded}
+          aria-label={expanded ? "Collapse tool calls" : "Expand tool calls"}
+          data-expanded={expanded ? "true" : "false"}
+          onClick={() => setExpanded((value) => !value)}
+          title={label}
+          type="button"
+        >
           <TranscriptActivityTitle title={label}>{label}</TranscriptActivityTitle>
           {status ? <TranscriptActivityStatus>{status}</TranscriptActivityStatus> : null}
+          <TranscriptActivityToggle data-expanded={expanded ? "true" : "false"}>
+            <ExpandMore aria-hidden="true" />
+          </TranscriptActivityToggle>
         </TranscriptActivityHeader>
-        {body ? <TranscriptActivityBody>{body}</TranscriptActivityBody> : null}
-      </div>
+        <TranscriptActivityDisclosure
+          aria-hidden={expanded ? "false" : "true"}
+          data-expanded={expanded ? "true" : "false"}
+        >
+          <TranscriptActivityDisclosureInner>
+            <TranscriptActivityList>
+              {groupMessages.map((activityMessage, index) => (
+                <ActivityToolRow
+                  key={activityMessage?.id || `activity-${index}`}
+                  message={activityMessage}
+                />
+              ))}
+            </TranscriptActivityList>
+          </TranscriptActivityDisclosureInner>
+        </TranscriptActivityDisclosure>
+      </TranscriptActivityContent>
     </TranscriptActivityCell>
   );
 }
 
-function ThreadMessage({ message, workspace }) {
+function ThreadMessage({
+  copyAlwaysVisible = false,
+  isCopied = false,
+  message,
+  messageId,
+  onCopyMessage,
+  showCopy = true,
+  workspace,
+}) {
   if (!message) {
     return null;
   }
+
+  const copyText = getMessageCopyText(message);
+  const canCopy = showCopy && Boolean(copyText);
+  const copyTitle = isCopied ? "Copied" : "Copy";
+  const copyButton = canCopy ? (
+    <MessageCopyButton
+      aria-label={copyTitle}
+      data-copied={isCopied ? "true" : "false"}
+      data-visible={copyAlwaysVisible ? "true" : "false"}
+      onClick={(event) => {
+        event.stopPropagation();
+        onCopyMessage?.(messageId, copyText);
+      }}
+      title={copyTitle}
+      type="button"
+    >
+      {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+    </MessageCopyButton>
+  ) : null;
 
   if (message.role === "assistant") {
     return (
       <AssistantCell data-message-role="assistant">
         <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
-        <MessageBody>
-          <AssistantMarkdownContent message={message} workspace={workspace} />
-        </MessageBody>
+        <ChatMessageFrame>
+          {copyButton}
+          <MessageBody>
+            <AssistantMarkdownContent message={message} workspace={workspace} />
+          </MessageBody>
+        </ChatMessageFrame>
       </AssistantCell>
     );
   }
 
   if (message.role === "activity") {
-    return <ActivityMessage message={message} />;
+    return <ActivityMessage messages={[message]} />;
   }
 
   return (
     <UserCell data-message-role="user">
       <UserPrefix aria-hidden="true">{"\u203a"}</UserPrefix>
-      <MessageBody>
-        <MessageText>
-          <MessageTextContent message={message} workspace={workspace} />
-        </MessageText>
-      </MessageBody>
+      <ChatMessageFrame>
+        {copyButton}
+        <MessageBody>
+          <MessageText>
+            <MessageTextContent message={message} workspace={workspace} />
+          </MessageText>
+        </MessageBody>
+      </ChatMessageFrame>
     </UserCell>
+  );
+}
+
+function AssistantResponseBlock({
+  copyAlwaysVisible = false,
+  isCopied = false,
+  item,
+  onCopyMessage,
+  workspace,
+}) {
+  const copyText = getAssistantBlockCopyText(item?.items);
+  const canCopy = Boolean(copyText);
+  const copyTitle = isCopied ? "Copied" : "Copy";
+
+  return (
+    <AssistantBlock data-message-role="assistant">
+      {item?.items?.map((blockItem) => (
+        blockItem.type === "activity-group" ? (
+          <ActivityMessage
+            key={blockItem.id}
+            messages={blockItem.messages}
+          />
+        ) : (
+          <ThreadMessage
+            key={blockItem.id}
+            message={blockItem.message}
+            messageId={blockItem.id}
+            showCopy={false}
+            workspace={workspace}
+          />
+        )
+      ))}
+      {canCopy ? (
+        <MessageCopyButton
+          aria-label={copyTitle}
+          data-copied={isCopied ? "true" : "false"}
+          data-visible={copyAlwaysVisible ? "true" : "false"}
+          onClick={(event) => {
+            event.stopPropagation();
+            onCopyMessage?.(item.id, copyText);
+          }}
+          title={copyTitle}
+          type="button"
+        >
+          {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+        </MessageCopyButton>
+      ) : null}
+    </AssistantBlock>
   );
 }
 
@@ -3093,16 +3649,28 @@ function WorkspaceThreadDetail({
   const [selectedModel, setSelectedModel] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [copiedMessageId, setCopiedMessageId] = useState("");
   const detailRootRef = useRef(null);
   const composerBoxRef = useRef(null);
   const composerInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
+  const copyResetTimeoutRef = useRef(null);
   const messages = Array.isArray(thread?.messages)
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
   const activityItems = useMemo(() => buildActivityItems(thread, messages), [messages, thread]);
+  const latestAssistantBlockId = useMemo(() => {
+    for (let index = transcriptItems.length - 1; index >= 0; index -= 1) {
+      const item = transcriptItems[index];
+      if (item?.type === "assistant-block") {
+        return item.id;
+      }
+    }
+
+    return "";
+  }, [transcriptItems]);
   const latestMessage = messages[messages.length - 1] || null;
   const latestActivity = activityItems[activityItems.length - 1] || null;
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
@@ -3163,6 +3731,38 @@ function WorkspaceThreadDetail({
     setSelectedModel(modelOptions[0]?.value || "");
     setModelMenuOpen(false);
   }, [activeAgentId, modelOptions, thread?.id]);
+
+  useEffect(() => () => {
+    if (copyResetTimeoutRef.current) {
+      window.clearTimeout(copyResetTimeoutRef.current);
+    }
+  }, []);
+
+  const handleCopyMessage = async (messageId, text) => {
+    const safeMessageId = String(messageId || "");
+    if (!safeMessageId || !String(text || "")) {
+      return;
+    }
+
+    try {
+      const copied = await copyTextToClipboard(text);
+      if (!copied) {
+        return;
+      }
+
+      setCopiedMessageId(safeMessageId);
+      if (copyResetTimeoutRef.current) {
+        window.clearTimeout(copyResetTimeoutRef.current);
+      }
+      copyResetTimeoutRef.current = window.setTimeout(() => {
+        setCopiedMessageId((currentMessageId) => (
+          currentMessageId === safeMessageId ? "" : currentMessageId
+        ));
+      }, 1400);
+    } catch (copyError) {
+      console.warn("Unable to copy thread message", copyError);
+    }
+  };
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.draft.local_sync_effect", {
@@ -4205,7 +4805,30 @@ function WorkspaceThreadDetail({
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
           {transcriptItems.map((item) => (
-            <ThreadMessage key={item.id} message={item.message} workspace={workspace} />
+            item.type === "assistant-block" ? (
+              <AssistantResponseBlock
+                copyAlwaysVisible={item.id === latestAssistantBlockId}
+                isCopied={copiedMessageId === item.id}
+                item={item}
+                key={item.id}
+                onCopyMessage={handleCopyMessage}
+                workspace={workspace}
+              />
+            ) : item.type === "activity-group" ? (
+              <ActivityMessage
+                key={item.id}
+                messages={item.messages}
+              />
+            ) : (
+              <ThreadMessage
+                isCopied={copiedMessageId === item.id}
+                key={item.id}
+                message={item.message}
+                messageId={item.id}
+                onCopyMessage={handleCopyMessage}
+                workspace={workspace}
+              />
+            )
           ))}
 
           {activityItems.map((item) => (

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo } from "react";
 import {
   BaseEdge,
   Background,
@@ -9,7 +9,9 @@ import {
   ReactFlow,
   getStraightPath,
   useEdgesState,
+  useNodesInitialized,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 import styled from "styled-components";
 import "@xyflow/react/dist/style.css";
@@ -50,14 +52,15 @@ const LIGHT_READABLE_TONES = {
   "#64748b": "#475569",
 };
 const KNOWLEDGE_NODE_DIMENSIONS = {
-  root: { width: 150, height: 86 },
-  concept: { width: 138, height: 76 },
+  root: { width: 170, height: 96 },
+  concept: { width: 158, height: 88 },
 };
-const KNOWLEDGE_DOT_CENTER = { x: 0.5, y: 0.54 };
+const KNOWLEDGE_DOT_CENTER = { x: 0.5, y: 0.58 };
 const KNOWLEDGE_DOT_RADIUS = {
-  root: 11,
-  concept: 7,
+  root: 17,
+  concept: 11,
 };
+const VIEWPORT_FIT_DELAYS = [90, 240];
 
 const EDGE_ANCHORS = [
   { id: "top-left", position: Position.Top, x: 0.24, y: 0 },
@@ -189,8 +192,8 @@ function flowEdgeStyle(edge, sourceNode, targetNode, variant) {
   if (variant === "knowledge") {
     return {
       stroke: flowEdgeColor(edge, sourceNode, targetNode, variant),
-      strokeWidth: isKnowledgeCrossLink(edge, variant) ? 0.9 : 1.35,
-      opacity: isKnowledgeCrossLink(edge, variant) ? 0.52 : 0.72,
+      strokeWidth: isKnowledgeCrossLink(edge, variant) ? 1.05 : 1.55,
+      opacity: isKnowledgeCrossLink(edge, variant) ? 0.5 : 0.7,
     };
   }
   if (isKnowledgeCrossLink(edge, variant)) {
@@ -414,6 +417,25 @@ function edgeHandleStyle(anchor, node, variant) {
   return style;
 }
 
+function viewportFitPadding(variant) {
+  return variant === "knowledge" ? 0.14 : 0.18;
+}
+
+function graphViewportKey(nodes, edges, layout, variant) {
+  const nodeKey = (nodes || [])
+    .map((node) => {
+      const position = layout.get(node.id) || { x: 0, y: 0 };
+      return `${node.id}@${Math.round(position.x)},${Math.round(position.y)}`;
+    })
+    .sort()
+    .join("|");
+  const edgeKey = (edges || [])
+    .map((edge) => `${edge.from || ""}->${edge.to || ""}:${edge.kind || ""}`)
+    .sort()
+    .join("|");
+  return `${variant || "spec"}::${nodeKey}::${edgeKey}`;
+}
+
 export default function XyflowGraphRenderer({
   nodes,
   edges,
@@ -428,17 +450,18 @@ export default function XyflowGraphRenderer({
 }) {
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState([]);
-  const flowInstanceRef = useRef(null);
-  const lastFitTopologyRef = useRef("");
   const nodeTypes = useMemo(() => ({ specGraphNode: SpecGraphNode }), []);
   const edgeTypes = useMemo(() => ({ knowledgeStraight: KnowledgeStraightEdge }), []);
   const activeLayout = layout || EMPTY_LAYOUT;
+  const viewportKey = useMemo(
+    () => graphViewportKey(nodes, edges, activeLayout, variant),
+    [activeLayout, edges, nodes, variant],
+  );
 
   useEffect(() => {
     if (!nodes.length) {
       setFlowNodes([]);
       setFlowEdges([]);
-      lastFitTopologyRef.current = "";
       return;
     }
 
@@ -446,13 +469,6 @@ export default function XyflowGraphRenderer({
       return;
     }
 
-    const topologyKey = [
-      nodes.map((node) => node.id).filter(Boolean).sort().join("|"),
-      edges
-        .map((edge) => `${edge.from || ""}->${edge.to || ""}:${edge.kind || ""}`)
-        .sort()
-        .join("|"),
-    ].join(":");
     const flowLayout = new Map();
     nodes.forEach((node) => {
       const position = activeLayout.get(node.id) || { x: 0, y: 0 };
@@ -492,12 +508,6 @@ export default function XyflowGraphRenderer({
     });
     setFlowNodes(nextNodes);
     setFlowEdges(toFlowEdges(edges, nodes, flowLayout, null, variant));
-    if (topologyKey !== lastFitTopologyRef.current) {
-      lastFitTopologyRef.current = topologyKey;
-      window.requestAnimationFrame(() => {
-        flowInstanceRef.current?.fitView({ padding: variant === "knowledge" ? 0.1 : 0.18, duration: 360 });
-      });
-    }
   }, [activeLayout, edges, layoutPending, nodes, onSelect, selectedNodeId, setFlowEdges, setFlowNodes, variant]);
 
   useEffect(() => {
@@ -519,6 +529,10 @@ export default function XyflowGraphRenderer({
     return <EmptyState>{layoutLabel}</EmptyState>;
   }
 
+  if (!flowNodes.length) {
+    return <EmptyState>{layoutLabel}</EmptyState>;
+  }
+
   return (
     <FlowFrame $variant={variant}>
       <ReactFlow
@@ -528,12 +542,7 @@ export default function XyflowGraphRenderer({
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
-        onInit={(instance) => {
-          flowInstanceRef.current = instance;
-        }}
         onNodeClick={(_, node) => onSelect(node.id)}
-        fitView
-        fitViewOptions={{ padding: variant === "knowledge" ? 0.1 : 0.18, duration: 360 }}
         minZoom={0.18}
         maxZoom={1.8}
         elevateEdgesOnSelect={false}
@@ -543,11 +552,45 @@ export default function XyflowGraphRenderer({
         proOptions={{ hideAttribution: true }}
         zIndexMode="manual"
       >
+        <ViewportFitController fitKey={viewportKey} variant={variant} />
         <Background color="rgba(148, 163, 184, 0.08)" gap={28} size={1} />
         <Controls showInteractive={false} />
       </ReactFlow>
     </FlowFrame>
   );
+}
+
+function ViewportFitController({ fitKey, variant }) {
+  const reactFlow = useReactFlow();
+  const nodesInitialized = useNodesInitialized();
+
+  useEffect(() => {
+    if (!fitKey || !nodesInitialized) return undefined;
+
+    let cancelled = false;
+    let secondFrame = 0;
+    const timeouts = [];
+    const fit = () => {
+      if (cancelled) return;
+      reactFlow.fitView({ padding: viewportFitPadding(variant), duration: 0 });
+    };
+
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(fit);
+    });
+    VIEWPORT_FIT_DELAYS.forEach((delay) => {
+      timeouts.push(window.setTimeout(fit, delay));
+    });
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+      timeouts.forEach((timeout) => window.clearTimeout(timeout));
+    };
+  }, [fitKey, nodesInitialized, reactFlow, variant]);
+
+  return null;
 }
 
 function SpecGraphNode({ data, selected }) {
@@ -899,18 +942,18 @@ const KnowledgeFlowNodeButton = styled.button`
 const KnowledgeNodeLabel = styled.span`
   color: rgba(203, 213, 225, 0.74);
   display: -webkit-box;
-  font-size: 10.5px;
-  font-weight: 560;
+  font-size: 12px;
+  font-weight: 590;
   left: 50%;
   letter-spacing: 0;
-  line-height: 1.16;
-  max-width: 136px;
+  line-height: 1.18;
+  max-width: 164px;
   overflow: hidden;
   pointer-events: none;
   position: absolute;
   text-align: center;
   text-shadow: 0 1px 7px rgba(0, 0, 0, 0.72);
-  top: 0;
+  top: 1px;
   transform: translateX(-50%);
   width: max-content;
   z-index: 2;
@@ -932,17 +975,17 @@ const KnowledgeNodeDot = styled.span`
       ? "0 0 0 5px rgba(148, 163, 184, 0.14), 0 0 22px rgba(226, 232, 240, 0.26)"
       : "0 0 0 3px rgba(148, 163, 184, 0.07), 0 0 14px rgba(148, 163, 184, 0.12)"
   )};
-  height: ${({ $root }) => ($root ? "22px" : "14px")};
+  height: ${({ $root }) => ($root ? "34px" : "22px")};
   left: 50%;
   position: absolute;
-  top: 54%;
+  top: 58%;
   transform: translate(-50%, -50%);
   transition:
     background 160ms ease,
     border-color 160ms ease,
     box-shadow 160ms ease,
     transform 160ms ease;
-  width: ${({ $root }) => ($root ? "22px" : "14px")};
+  width: ${({ $root }) => ($root ? "34px" : "22px")};
   z-index: 1;
 
   ${KnowledgeFlowNodeButton}:hover & {

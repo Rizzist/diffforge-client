@@ -37,12 +37,52 @@ const RADIAL_LAYOUT_PROFILES = {
   },
 };
 
+const KNOWLEDGE_FORCE_PROFILE = {
+  iterations: 280,
+  linkDistance: 118,
+  rootLinkDistance: 132,
+  crossLinkDistance: 104,
+  linkStrength: 0.055,
+  rootLinkStrength: 0.046,
+  repulsion: 5400,
+  collisionPadding: 28,
+  centerStrength: 0.012,
+  rootCenterStrength: 0.11,
+  anchorStrength: 0.006,
+  velocityDecay: 0.72,
+  minDistance: 34,
+};
+
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
 function setNodeCenter(layout, node, center) {
   const dimensions = dimensionsForNode(node);
   layout.set(node.id, {
     x: center.x - dimensions.width / 2,
     y: center.y - dimensions.height / 2,
   });
+}
+
+function isKnowledgeRootNode(node) {
+  const type = String(node?.knowledge_node_type || node?.node_type || "").toLowerCase();
+  return Boolean(node?.is_root)
+    || type === "workspace"
+    || type === "repo_root"
+    || type === "knowledge_root";
+}
+
+function stableHash(value) {
+  const source = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function stableUnit(value) {
+  return stableHash(value) / 0xffffffff;
 }
 
 function centerFor(layout, node) {
@@ -167,6 +207,227 @@ function sortedChildren(children, nodeById) {
     return (kindRank[leftKind] ?? 4) - (kindRank[rightKind] ?? 4)
       || (left?.title || "").localeCompare(right?.title || "");
   });
+}
+
+function normalizeKnowledgeLinks(nodes, edges) {
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const seen = new Set();
+  return edges
+    .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to) && edge.from !== edge.to)
+    .map((edge) => {
+      const pairKey = [edge.from, edge.to].sort().join("<->");
+      const directedKey = `${edge.from}->${edge.to}:${edge.kind || ""}`;
+      return { edge, pairKey, directedKey };
+    })
+    .filter(({ directedKey }) => {
+      if (seen.has(directedKey)) return false;
+      seen.add(directedKey);
+      return true;
+    });
+}
+
+function knowledgeNodeRadius(node) {
+  const dimensions = dimensionsForNode(node);
+  return Math.max(dimensions.width, dimensions.height) * (isKnowledgeRootNode(node) ? 0.24 : 0.2);
+}
+
+function applyKnowledgeAntiLinearity(simNodes) {
+  if (simNodes.length < 3) return;
+
+  const xs = simNodes.map((node) => node.x);
+  const ys = simNodes.map((node) => node.y);
+  const width = Math.max(...xs) - Math.min(...xs);
+  const height = Math.max(...ys) - Math.min(...ys);
+  const shortSide = Math.min(width, height);
+  const longSide = Math.max(width, height);
+  if (longSide < 1 || shortSide / longSide > 0.36) return;
+
+  const vertical = width < height;
+  simNodes.forEach((node, index) => {
+    if (node.root) return;
+    const wave = ((index % 2) ? -1 : 1) * (44 + (index % 3) * 14);
+    const jitter = (stableUnit(node.id) - 0.5) * 30;
+    if (vertical) {
+      node.x += wave + jitter;
+    } else {
+      node.y += wave + jitter;
+    }
+  });
+}
+
+function compactKnowledgeLayout(simNodes) {
+  if (!simNodes.length) return;
+
+  const centroid = simNodes.reduce(
+    (acc, node) => ({ x: acc.x + node.x, y: acc.y + node.y }),
+    { x: 0, y: 0 },
+  );
+  centroid.x /= simNodes.length;
+  centroid.y /= simNodes.length;
+
+  simNodes.forEach((node) => {
+    node.x -= centroid.x;
+    node.y -= centroid.y;
+  });
+}
+
+export function knowledgeForceLayout(nodes, edges) {
+  if (!nodes.length) return new Map();
+
+  const root = nodes.find(isKnowledgeRootNode) || graphRootNode(nodes, edges) || nodes[0];
+  const links = normalizeKnowledgeLinks(nodes, edges);
+  const degreeById = new Map(nodes.map((node) => [node.id, 0]));
+  links.forEach(({ edge }) => {
+    degreeById.set(edge.from, (degreeById.get(edge.from) || 0) + 1);
+    degreeById.set(edge.to, (degreeById.get(edge.to) || 0) + 1);
+  });
+
+  const orderedNodes = [...nodes].sort((left, right) => {
+    if (left.id === root.id) return -1;
+    if (right.id === root.id) return 1;
+    return (degreeById.get(right.id) || 0) - (degreeById.get(left.id) || 0)
+      || String(left.title || left.id).localeCompare(String(right.title || right.id));
+  });
+
+  const simNodes = orderedNodes.map((node, index) => {
+    if (node.id === root.id) {
+      return {
+        node,
+        id: node.id,
+        root: true,
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        anchorX: 0,
+        anchorY: 0,
+      };
+    }
+
+    const ring = Math.floor((index - 1) / 8);
+    const radius = 92 + ring * 48 + stableUnit(`${node.id}:radius`) * 18;
+    const angle = -Math.PI / 2 + (index - 1) * GOLDEN_ANGLE + stableUnit(node.id) * 0.68;
+    return {
+      node,
+      id: node.id,
+      root: false,
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+      vx: 0,
+      vy: 0,
+      anchorX: Math.cos(angle) * radius,
+      anchorY: Math.sin(angle) * radius,
+    };
+  });
+
+  const simById = new Map(simNodes.map((node) => [node.id, node]));
+  const pairCounts = new Map();
+  links.forEach(({ pairKey }) => {
+    pairCounts.set(pairKey, (pairCounts.get(pairKey) || 0) + 1);
+  });
+
+  for (let tick = 0; tick < KNOWLEDGE_FORCE_PROFILE.iterations; tick += 1) {
+    const progress = tick / Math.max(1, KNOWLEDGE_FORCE_PROFILE.iterations - 1);
+    const alpha = 1 - progress;
+
+    links.forEach(({ edge, pairKey }) => {
+      const source = simById.get(edge.from);
+      const target = simById.get(edge.to);
+      if (!source || !target) return;
+
+      let dx = target.x - source.x;
+      let dy = target.y - source.y;
+      let distance = Math.hypot(dx, dy);
+      if (distance < 0.001) {
+        const angle = stableUnit(`${edge.id || pairKey}:link`) * Math.PI * 2;
+        dx = Math.cos(angle) * 0.001;
+        dy = Math.sin(angle) * 0.001;
+        distance = 0.001;
+      }
+
+      const touchesRoot = source.root || target.root;
+      const crossLink = !isContainmentEdge(edge);
+      const parallelBonus = Math.min(16, Math.max(0, (pairCounts.get(pairKey) || 1) - 1) * 5);
+      const targetDistance = (touchesRoot
+        ? KNOWLEDGE_FORCE_PROFILE.rootLinkDistance
+        : crossLink
+          ? KNOWLEDGE_FORCE_PROFILE.crossLinkDistance
+          : KNOWLEDGE_FORCE_PROFILE.linkDistance) - parallelBonus;
+      const strength = (touchesRoot
+        ? KNOWLEDGE_FORCE_PROFILE.rootLinkStrength
+        : KNOWLEDGE_FORCE_PROFILE.linkStrength) * alpha;
+      const force = (distance - targetDistance) * strength;
+      const fx = (dx / distance) * force;
+      const fy = (dy / distance) * force;
+
+      if (!source.root) {
+        source.vx += fx;
+        source.vy += fy;
+      }
+      if (!target.root) {
+        target.vx -= fx;
+        target.vy -= fy;
+      }
+    });
+
+    for (let leftIndex = 0; leftIndex < simNodes.length; leftIndex += 1) {
+      const left = simNodes[leftIndex];
+      for (let rightIndex = leftIndex + 1; rightIndex < simNodes.length; rightIndex += 1) {
+        const right = simNodes[rightIndex];
+        let dx = right.x - left.x;
+        let dy = right.y - left.y;
+        let distance = Math.hypot(dx, dy);
+        if (distance < 0.001) {
+          const angle = stableUnit(`${left.id}:${right.id}:repel`) * Math.PI * 2;
+          dx = Math.cos(angle) * 0.001;
+          dy = Math.sin(angle) * 0.001;
+          distance = 0.001;
+        }
+
+        const minimum = knowledgeNodeRadius(left.node) + knowledgeNodeRadius(right.node) + KNOWLEDGE_FORCE_PROFILE.collisionPadding;
+        const collisionForce = distance < minimum ? (minimum - distance) * 0.16 : 0;
+        const chargeForce = KNOWLEDGE_FORCE_PROFILE.repulsion / Math.max(distance * distance, KNOWLEDGE_FORCE_PROFILE.minDistance ** 2);
+        const force = (chargeForce + collisionForce) * alpha;
+        const fx = (dx / distance) * force;
+        const fy = (dy / distance) * force;
+
+        if (!left.root) {
+          left.vx -= fx;
+          left.vy -= fy;
+        }
+        if (!right.root) {
+          right.vx += fx;
+          right.vy += fy;
+        }
+      }
+    }
+
+    simNodes.forEach((simNode) => {
+      if (simNode.root) {
+        simNode.vx += -simNode.x * KNOWLEDGE_FORCE_PROFILE.rootCenterStrength * alpha;
+        simNode.vy += -simNode.y * KNOWLEDGE_FORCE_PROFILE.rootCenterStrength * alpha;
+      } else {
+        simNode.vx += -simNode.x * KNOWLEDGE_FORCE_PROFILE.centerStrength * alpha;
+        simNode.vy += -simNode.y * KNOWLEDGE_FORCE_PROFILE.centerStrength * alpha;
+        simNode.vx += (simNode.anchorX - simNode.x) * KNOWLEDGE_FORCE_PROFILE.anchorStrength * alpha;
+        simNode.vy += (simNode.anchorY - simNode.y) * KNOWLEDGE_FORCE_PROFILE.anchorStrength * alpha;
+      }
+
+      simNode.vx *= KNOWLEDGE_FORCE_PROFILE.velocityDecay;
+      simNode.vy *= KNOWLEDGE_FORCE_PROFILE.velocityDecay;
+      simNode.x += simNode.vx;
+      simNode.y += simNode.vy;
+    });
+  }
+
+  applyKnowledgeAntiLinearity(simNodes);
+  compactKnowledgeLayout(simNodes);
+
+  const layout = new Map();
+  simNodes.forEach((simNode) => {
+    setNodeCenter(layout, simNode.node, { x: simNode.x, y: simNode.y });
+  });
+  return layout;
 }
 
 export function radialHierarchyLayout(nodes, edges, options = {}) {
@@ -308,6 +569,9 @@ export async function elkFallbackLayout(nodes, edges) {
 
 export async function layoutSpecGraph(nodes, edges, options = {}) {
   if (!nodes.length) return new Map();
+  if (options.variant === "knowledge") {
+    return knowledgeForceLayout(nodes, edges);
+  }
   if (edges.some(isContainmentEdge) || nodes.some((node) => isWorkspaceNodeType(node.node_type))) {
     return radialHierarchyLayout(nodes, edges, options);
   }

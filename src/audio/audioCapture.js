@@ -5,6 +5,7 @@ const AUDIO_INPUT_DEVICE_STORAGE_KEY = "diffforge.audio.inputDeviceId";
 const AUDIO_INPUT_SETUP_STORAGE_KEY = "diffforge.audio.inputSetupReady";
 const AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY = "diffforge.audio.autoOpenRecorder";
 const AUDIO_RECORDER_MODE_STORAGE_KEY = "diffforge.audio.recorderMode";
+export const AUDIO_WIDGET_THEME_STORAGE_KEY = "diffforge.audio.widgetTheme";
 const AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY = "diffforge.audio.lastTranscriptionResult";
 const AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY = "diffforge.audio.transcriptionHistory";
 const AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY = "diffforge.audio.transcriptionProvider";
@@ -14,6 +15,8 @@ export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
 export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
 export const AUDIO_RECORDER_MODE_PUSH_TO_TALK = "push-to-talk";
 export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
+export const AUDIO_WIDGET_THEME_DARK = "dark";
+export const AUDIO_WIDGET_THEME_LIGHT = "light";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
@@ -38,6 +41,10 @@ function normalizeAudioRecorderMode(value) {
   return value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
     ? AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
     : AUDIO_RECORDER_MODE_PUSH_TO_TALK;
+}
+
+export function normalizeAudioWidgetTheme(value) {
+  return value === AUDIO_WIDGET_THEME_LIGHT ? AUDIO_WIDGET_THEME_LIGHT : AUDIO_WIDGET_THEME_DARK;
 }
 
 function inferAudioTranscriptionProvider(value) {
@@ -135,6 +142,20 @@ export function readAudioRecorderMode() {
 export function writeAudioRecorderMode(mode) {
   if (canUseStorage()) {
     window.localStorage.setItem(AUDIO_RECORDER_MODE_STORAGE_KEY, normalizeAudioRecorderMode(mode));
+  }
+}
+
+export function readAudioWidgetTheme() {
+  if (!canUseStorage()) {
+    return AUDIO_WIDGET_THEME_DARK;
+  }
+
+  return normalizeAudioWidgetTheme(window.localStorage.getItem(AUDIO_WIDGET_THEME_STORAGE_KEY));
+}
+
+export function writeAudioWidgetTheme(theme) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_WIDGET_THEME_STORAGE_KEY, normalizeAudioWidgetTheme(theme));
   }
 }
 

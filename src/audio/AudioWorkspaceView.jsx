@@ -9,18 +9,23 @@ import {
   AUDIO_RECORDER_MODE_TOGGLE_TO_TALK,
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
   AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
+  AUDIO_WIDGET_THEME_DARK,
+  AUDIO_WIDGET_THEME_LIGHT,
+  AUDIO_WIDGET_THEME_STORAGE_KEY,
   arrayBufferToBase64,
   formatAudioPercent,
   getAudioInputErrorMessage,
   hasAudioInputSetup,
   listAudioInputDevices,
   markAudioInputSetupReady,
+  normalizeAudioWidgetTheme,
   prepareWhisperModel,
   publishAudioTranscriptionResult,
   readAudioRecorderMode,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
+  readAudioWidgetTheme,
   readDeepgramApiKey,
   readDeepgramLanguage,
   readSelectedAudioInputDeviceId,
@@ -28,6 +33,7 @@ import {
   writeAudioRecorderMode,
   writeAudioTranscriptionProvider,
   writeAutoOpenAudioRecorder,
+  writeAudioWidgetTheme,
   writeDeepgramApiKey,
   writeDeepgramLanguage,
   writeSelectedAudioInputDeviceId,
@@ -215,7 +221,9 @@ import {
   AudioHistoryListSpacer,
   AudioHistoryRow,
   AudioHistoryRowTopline,
+  AudioHistoryRowActions,
   AudioHistoryProvider,
+  AudioHistoryCopyButton,
   AudioHistoryMeta,
   AudioRuntimeHint,
   AudioProgressPanel,
@@ -335,8 +343,11 @@ import {
   ButtonLoginIcon,
   ButtonBrowserIcon,
   ButtonCloseIcon,
+  ButtonCopyIcon,
   ButtonDeleteIcon,
+  ButtonDarkModeIcon,
   ButtonFolderIcon,
+  ButtonLightModeIcon,
   ButtonLogoutIcon,
   ButtonSettingsIcon,
   ButtonForgeIcon,
@@ -388,7 +399,25 @@ const AUDIO_SETTINGS_TABS = [
   { id: "dictionary", label: "Dictionary" },
   { id: "history", label: "History" },
 ];
-const AUDIO_HISTORY_ROW_HEIGHT = 112;
+const AUDIO_WIDGET_THEME_META_COLORS = {
+  [AUDIO_WIDGET_THEME_DARK]: "#030508",
+  [AUDIO_WIDGET_THEME_LIGHT]: "#f5f5f7",
+};
+const AUDIO_WIDGET_THEME_OPTIONS = [
+  {
+    detail: "Dark floating recorder",
+    icon: "dark",
+    id: AUDIO_WIDGET_THEME_DARK,
+    label: "Dark",
+  },
+  {
+    detail: "Light floating recorder",
+    icon: "light",
+    id: AUDIO_WIDGET_THEME_LIGHT,
+    label: "Light",
+  },
+];
+const AUDIO_HISTORY_ROW_HEIGHT = 124;
 const AUDIO_HISTORY_VIEWPORT_HEIGHT = 420;
 const AUDIO_HISTORY_OVERSCAN = 5;
 
@@ -530,6 +559,63 @@ function notifyAudioSettingsChanged(reason) {
     reason,
     createdAt: new Date().toISOString(),
   }).catch(() => {});
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) {
+    return false;
+  }
+
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to the DOM copy path for webviews that block Clipboard API writes.
+    }
+  }
+
+  if (typeof document === "undefined" || !document.body) {
+    return false;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    return Boolean(document.execCommand("copy"));
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+  }
+}
+
+function applyAudioWidgetThemePreference(theme) {
+  if (typeof document === "undefined") {
+    return normalizeAudioWidgetTheme(theme);
+  }
+
+  const normalizedTheme = normalizeAudioWidgetTheme(theme);
+  document.documentElement.dataset.forgeTheme = normalizedTheme;
+  document.documentElement.dataset.audioWidgetTheme = normalizedTheme;
+  if (document.body) {
+    document.body.dataset.forgeTheme = normalizedTheme;
+    document.body.dataset.audioWidgetTheme = normalizedTheme;
+  }
+
+  const themeColor = AUDIO_WIDGET_THEME_META_COLORS[normalizedTheme]
+    || AUDIO_WIDGET_THEME_META_COLORS[AUDIO_WIDGET_THEME_DARK];
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor);
+
+  return normalizedTheme;
 }
 
 function defaultPushToTalkShortcut() {
@@ -797,6 +883,10 @@ function formatAudioHistoryMeta(entry) {
   return pieces.join(" / ");
 }
 
+function getAudioHistoryEntryKey(entry, index = 0) {
+  return entry?.id || `${entry?.createdAt || "audio-history"}-${index}`;
+}
+
 function buildAudioHistoryStats(history) {
   const entries = Array.isArray(history) ? history : [];
   const total = entries.length;
@@ -859,8 +949,10 @@ export default function AudioWorkspaceView({
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
+  const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [historyScrollTop, setHistoryScrollTop] = useState(0);
+  const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
   const [audioShortcutError, setAudioShortcutError] = useState("");
   const [audioShortcutActionState, setAudioShortcutActionState] = useState("idle");
@@ -871,6 +963,7 @@ export default function AudioWorkspaceView({
   const audioInputAutoWarmSuppressedRef = useRef(false);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
+  const copiedAudioHistoryTimerRef = useRef(0);
   const isCloudMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const deepgramReady = Boolean(deepgramApiKey.trim());
   const installed = Boolean(audioModelStatus?.installed);
@@ -899,6 +992,7 @@ export default function AudioWorkspaceView({
     : isToggleRecorderMode
       ? "Press the recorder shortcut to start, then press again to submit."
       : "Hold the recorder shortcut to record, then release to submit.";
+  const audioWidgetThemeLabel = audioWidgetTheme === AUDIO_WIDGET_THEME_LIGHT ? "Light" : "Dark";
   const canUninstall = Boolean(audioModelStatus?.managedAssetsInstalled || audioModelStatus?.modelInstalled);
   const downloadPercent = audioDownloadProgress?.percent;
   const installLabel = audioModelStatus?.runtimeInstallable === false ? "Install model" : "Install Whisper";
@@ -1118,8 +1212,39 @@ export default function AudioWorkspaceView({
     notifyAudioSettingsChanged("recorder-mode");
   }, []);
 
+  const updateAudioWidgetTheme = useCallback((nextTheme) => {
+    const normalizedTheme = normalizeAudioWidgetTheme(nextTheme);
+    setAudioWidgetTheme(normalizedTheme);
+    writeAudioWidgetTheme(normalizedTheme);
+    notifyAudioSettingsChanged("widget-theme");
+  }, []);
+
   const handleAudioHistoryScroll = useCallback((event) => {
     setHistoryScrollTop(event.currentTarget.scrollTop || 0);
+  }, []);
+
+  const copyAudioHistoryPrompt = useCallback(async (entry, index) => {
+    const text = String(entry?.text || "").trim();
+    if (!text) {
+      return;
+    }
+
+    const copied = await copyTextToClipboard(text);
+    if (!copied) {
+      return;
+    }
+
+    const entryKey = getAudioHistoryEntryKey(entry, index);
+    setCopiedAudioHistoryId(entryKey);
+
+    if (copiedAudioHistoryTimerRef.current) {
+      window.clearTimeout(copiedAudioHistoryTimerRef.current);
+    }
+
+    copiedAudioHistoryTimerRef.current = window.setTimeout(() => {
+      copiedAudioHistoryTimerRef.current = 0;
+      setCopiedAudioHistoryId((currentId) => (currentId === entryKey ? "" : currentId));
+    }, 1600);
   }, []);
 
   const selectAudioMode = useCallback((nextMode) => {
@@ -1332,6 +1457,7 @@ export default function AudioWorkspaceView({
       if (event.key?.startsWith?.("diffforge.audio.")) {
         setAudioHistory(readAudioTranscriptionHistory());
         setRecorderMode(readAudioRecorderMode());
+        setAudioWidgetTheme(readAudioWidgetTheme());
         setAudioMode(readAudioTranscriptionProvider());
         setDeepgramApiKey(readDeepgramApiKey());
         setDeepgramLanguage(readDeepgramLanguage());
@@ -1348,6 +1474,10 @@ export default function AudioWorkspaceView({
   }, []);
 
   useEffect(() => () => {
+    if (copiedAudioHistoryTimerRef.current) {
+      window.clearTimeout(copiedAudioHistoryTimerRef.current);
+      copiedAudioHistoryTimerRef.current = 0;
+    }
     audioInputRunRef.current += 1;
     const audioInputPreview = audioInputPreviewRef.current;
     audioInputPreviewRef.current = null;
@@ -1449,6 +1579,9 @@ export default function AudioWorkspaceView({
                 <SettingsLabel>Recorder</SettingsLabel>
                 <SettingsHint>{recorderHint}</SettingsHint>
               </div>
+              <AudioStatePill data-installed="true">
+                {audioWidgetThemeLabel}
+              </AudioStatePill>
             </AudioDeviceHeader>
             <AudioRecorderActions>
               <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
@@ -1464,6 +1597,29 @@ export default function AudioWorkspaceView({
                 <span>{recorderButtonLabel}</span>
               </RecorderOpenButton>
             </AudioRecorderActions>
+            <AudioCloudField as="div">
+              Widget theme
+              <AudioModeGrid role="group" aria-label="Floating recorder theme">
+                {AUDIO_WIDGET_THEME_OPTIONS.map((option) => (
+                  <AudioModeButton
+                    aria-pressed={audioWidgetTheme === option.id}
+                    key={option.id}
+                    onClick={() => updateAudioWidgetTheme(option.id)}
+                    type="button"
+                  >
+                    {option.icon === "light" ? (
+                      <ButtonLightModeIcon aria-hidden="true" />
+                    ) : (
+                      <ButtonDarkModeIcon aria-hidden="true" />
+                    )}
+                    <span>
+                      <strong>{option.label}</strong>
+                      <span>{option.detail}</span>
+                    </span>
+                  </AudioModeButton>
+                ))}
+              </AudioModeGrid>
+            </AudioCloudField>
           </AudioRecorderPanel>
         </AudioGeneralToolbar>
 
@@ -1761,25 +1917,46 @@ export default function AudioWorkspaceView({
                 role="list"
               >
                 <AudioHistoryListSpacer style={{ height: audioHistoryListHeight }}>
-                  {visibleAudioHistory.map(({ entry, index }) => (
-                    <AudioHistoryRow
-                      key={entry.id || `${entry.createdAt}-${index}`}
-                      role="listitem"
-                      style={{
-                        height: AUDIO_HISTORY_ROW_HEIGHT - 8,
-                        transform: `translateY(${index * AUDIO_HISTORY_ROW_HEIGHT}px)`,
-                      }}
-                    >
-                      <AudioHistoryRowTopline>
-                        <span>{formatHistoryTimestamp(entry.createdAt)}</span>
-                        <AudioHistoryProvider data-provider={entry.provider}>
-                          {formatAudioProviderLabel(entry.provider)}
-                        </AudioHistoryProvider>
-                      </AudioHistoryRowTopline>
-                      <strong title={entry.text}>{entry.text}</strong>
-                      <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
-                    </AudioHistoryRow>
-                  ))}
+                  {visibleAudioHistory.map(({ entry, index }) => {
+                    const entryKey = getAudioHistoryEntryKey(entry, index);
+                    const copied = copiedAudioHistoryId === entryKey;
+
+                    return (
+                      <AudioHistoryRow
+                        key={entryKey}
+                        role="listitem"
+                        style={{
+                          height: AUDIO_HISTORY_ROW_HEIGHT - 8,
+                          transform: `translateY(${index * AUDIO_HISTORY_ROW_HEIGHT}px)`,
+                        }}
+                      >
+                        <AudioHistoryRowTopline>
+                          <span>{formatHistoryTimestamp(entry.createdAt)}</span>
+                          <AudioHistoryRowActions>
+                            <AudioHistoryProvider data-provider={entry.provider}>
+                              {formatAudioProviderLabel(entry.provider)}
+                            </AudioHistoryProvider>
+                            <AudioHistoryCopyButton
+                              aria-label="Copy previous prompt"
+                              data-copied={copied ? "true" : undefined}
+                              onClick={() => copyAudioHistoryPrompt(entry, index)}
+                              title="Copy previous prompt"
+                              type="button"
+                            >
+                              {copied ? (
+                                <ButtonCheckIcon aria-hidden="true" />
+                              ) : (
+                                <ButtonCopyIcon aria-hidden="true" />
+                              )}
+                              <span>{copied ? "Copied" : "Copy"}</span>
+                            </AudioHistoryCopyButton>
+                          </AudioHistoryRowActions>
+                        </AudioHistoryRowTopline>
+                        <strong title={entry.text}>{entry.text}</strong>
+                        <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
+                      </AudioHistoryRow>
+                    );
+                  })}
                 </AudioHistoryListSpacer>
               </AudioHistoryVirtualList>
             ) : (
@@ -1856,6 +2033,7 @@ export function AudioWidgetWindow() {
   const [shortcutStatus, setShortcutStatus] = useState(fallbackShortcutStatus);
   const [realtimeTranscript, setRealtimeTranscript] = useState("");
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
+  const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -1876,6 +2054,10 @@ export function AudioWidgetWindow() {
     recorderModeRef.current = recorderMode;
   }, [recorderMode]);
 
+  useEffect(() => {
+    applyAudioWidgetThemePreference(audioWidgetTheme);
+  }, [audioWidgetTheme]);
+
   const setWidgetFrameMode = useCallback((nextMode) => {
     widgetFrameModeRef.current = nextMode;
     setWidgetFrameModeState(nextMode);
@@ -1886,10 +2068,12 @@ export function AudioWidgetWindow() {
     const currentRecorderMode = readAudioRecorderMode();
     const currentApiKey = readDeepgramApiKey();
     const currentLanguage = readDeepgramLanguage();
+    const currentWidgetTheme = readAudioWidgetTheme();
     const hasSetup = hasAudioInputSetup();
 
     setTranscriptionProvider(currentProvider);
     setRecorderMode(currentRecorderMode);
+    setAudioWidgetTheme(currentWidgetTheme);
     setDeepgramApiKey(currentApiKey);
     setDeepgramLanguage(currentLanguage);
     setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
@@ -2108,8 +2292,10 @@ export function AudioWidgetWindow() {
     const currentRecorderMode = readAudioRecorderMode();
     const currentApiKey = readDeepgramApiKey();
     const currentLanguage = readDeepgramLanguage();
+    const currentWidgetTheme = readAudioWidgetTheme();
     setTranscriptionProvider(currentProvider);
     setRecorderMode(currentRecorderMode);
+    setAudioWidgetTheme(currentWidgetTheme);
     setDeepgramApiKey(currentApiKey);
     setDeepgramLanguage(currentLanguage);
     widgetStateRef.current = "checking";
@@ -2575,15 +2761,25 @@ export function AudioWidgetWindow() {
       }, 0);
     };
 
-    const syncAudioSettings = () => {
+    const syncAudioSettings = (event) => {
+      const reason = event?.payload?.reason || "";
       setRecorderMode(readAudioRecorderMode());
+      setAudioWidgetTheme(readAudioWidgetTheme());
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());
-      refreshAudioSettings();
+
+      if (reason !== "widget-theme") {
+        refreshAudioSettings();
+      }
     };
 
     const handleStorage = (event) => {
+      if (event.key === AUDIO_WIDGET_THEME_STORAGE_KEY) {
+        setAudioWidgetTheme(readAudioWidgetTheme());
+        return;
+      }
+
       if (event.key?.startsWith?.("diffforge.audio.")) {
         syncAudioSettings();
       }
@@ -2706,13 +2902,17 @@ export function AudioWidgetWindow() {
 
   useEffect(() => {
     document.documentElement.dataset.audioWidget = "true";
+    document.documentElement.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(audioWidgetTheme);
     document.body.dataset.audioWidget = "true";
+    document.body.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(audioWidgetTheme);
 
     return () => {
       delete document.documentElement.dataset.audioWidget;
+      delete document.documentElement.dataset.audioWidgetTheme;
       delete document.body.dataset.audioWidget;
+      delete document.body.dataset.audioWidgetTheme;
     };
-  }, []);
+  }, [audioWidgetTheme]);
 
   const widgetPushToTalkShortcut = shortcutStatus?.pushToTalk?.shortcut || defaultPushToTalkShortcut();
   const widgetCancelShortcut = shortcutStatus?.cancel?.shortcut || "Escape";
@@ -2899,6 +3099,7 @@ export function AudioWidgetWindow() {
         data-handoff={isCompactHandoff ? "true" : undefined}
         data-opening={isOpeningFocus ? "true" : undefined}
         data-state={widgetState}
+        data-theme={audioWidgetTheme}
         onMouseDown={dragWidget}
       >
         <AudioWidgetFocusStage
