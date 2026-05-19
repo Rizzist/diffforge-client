@@ -67,8 +67,7 @@ function isKnowledgeRootNode(node) {
   const type = String(node?.knowledge_node_type || node?.node_type || "").toLowerCase();
   return Boolean(node?.is_root)
     || type === "workspace"
-    || type === "repo_root"
-    || type === "knowledge_root";
+    || type === "repo_root";
 }
 
 function stableHash(value) {

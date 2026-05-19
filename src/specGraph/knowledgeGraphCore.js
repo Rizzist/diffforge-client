@@ -47,7 +47,7 @@ function knowledgeFreshness(value) {
 }
 
 function displayTitle(title, notePath, nodeType, displayIdentity) {
-  if (nodeType === "knowledge_root" || nodeType === "repo_root") {
+  if (nodeType === "repo_root") {
     return displayIdentity?.repoName
       ? `${displayIdentity.repoName} knowledge`
       : getWorkspacePathDisplayLabel(title, { fallback: "Knowledge atlas", includeChildPath: false });
@@ -56,7 +56,7 @@ function displayTitle(title, notePath, nodeType, displayIdentity) {
 }
 
 function knowledgeNodeSortKey(node) {
-  const rootRank = node?.knowledge_node_type === "knowledge_root" || node?.knowledge_node_type === "repo_root" ? "0" : "1";
+  const rootRank = node?.knowledge_node_type === "repo_root" ? "0" : "1";
   return [
     rootRank,
     text(node?.note_path || node?.path || node?.markdown_path).toLowerCase(),
@@ -99,18 +99,7 @@ function dedupeKnowledgeEdges(edges) {
 }
 
 function isKnowledgeRootNode(node) {
-  return node?.knowledge_node_type === "knowledge_root" || node?.knowledge_node_type === "repo_root";
-}
-
-function isSyntheticKnowledgeRoot(node) {
-  return node?.synthetic_root === true || node?.metadata?.synthetic_root === true;
-}
-
-function isBlankAtlasRoot(node) {
-  if (!isKnowledgeRootNode(node)) return false;
-  const notePath = text(node?.note_path || node?.path || node?.markdown_path).toLowerCase();
-  const summary = text(node?.summary || node?.purpose || node?.markdown);
-  return !summary && (!notePath || notePath === ".agents/knowledge");
+  return node?.knowledge_node_type === "repo_root";
 }
 
 function markdownText(value) {
@@ -123,64 +112,19 @@ function markdownText(value) {
     .trim();
 }
 
-function knowledgeRootRank(node) {
-  const notePath = text(node?.note_path || node?.path || node?.markdown_path).toLowerCase();
-  const nodeKey = text(node?.node_key || node?.metadata?.node_key).toLowerCase();
-  const type = text(node?.knowledge_node_type || node?.node_type).toLowerCase();
-  let score = 0;
-  if (type === "repo_root") score += 1000;
-  if (nodeKey === "repo_root") score += 800;
-  if (notePath === "index.md") score += 600;
-  if (node?.metadata?.server_authored === true || node?.server_authored === true) score += 300;
-  if (text(node?.markdown || node?.summary || node?.purpose)) score += 120;
-  if (isSyntheticKnowledgeRoot(node)) score -= 1200;
-  if (isBlankAtlasRoot(node)) score -= 900;
-  return score;
-}
-
-function collapseKnowledgeRoots(nodes, edges) {
-  const roots = nodes.filter(isKnowledgeRootNode);
-  if (roots.length <= 1) {
-    return { nodes, edges };
-  }
-
-  const canonicalRoot = [...roots].sort((left, right) => (
-    knowledgeRootRank(right) - knowledgeRootRank(left)
-      || knowledgeNodeSortKey(left).localeCompare(knowledgeNodeSortKey(right))
-  ))[0];
-  const duplicateRootIds = new Set(roots
-    .filter((node) => node.id !== canonicalRoot.id)
-    .map((node) => node.id));
-  const nextNodes = nodes.filter((node) => !duplicateRootIds.has(node.id));
-  const nextEdges = edges
-    .map((edge) => ({
-      ...edge,
-      from: duplicateRootIds.has(edge.from) ? canonicalRoot.id : edge.from,
-      to: duplicateRootIds.has(edge.to) ? canonicalRoot.id : edge.to,
-      metadata: {
-        ...edge.metadata,
-        redirected_duplicate_root: duplicateRootIds.has(edge.from) || duplicateRootIds.has(edge.to) || undefined,
-      },
-    }))
-    .filter((edge) => edge.from !== edge.to);
-
-  return { nodes: nextNodes, edges: nextEdges };
-}
-
 function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const metadata = jsonObject(field(raw, "metadata", "metadata_json", "metadataJson"));
   const id = text(field(raw, "id", "node_id", "nodeId"), `knowledge-${index}`);
   const notePath = text(field(raw, "note_path", "notePath", "markdown_path", "markdownPath", "path"));
   const knowledgeType = text(field(raw, "node_type", "nodeType", "type"), "knowledge_note");
   const title = text(field(raw, "title"), notePath || "Knowledge note");
-  const syntheticRoot = raw?.synthetic_root === true || metadata?.synthetic_root === true;
   const rawMarkdown = markdownText(field(raw, "markdown", "body", "content"));
-  const isRoot = knowledgeType === "knowledge_root" || knowledgeType === "repo_root";
+  const isRoot = knowledgeType === "repo_root";
   const blankRoot = isRoot && !rawMarkdown;
-  const summary = text(field(raw, "summary", "description", "purpose", "standard_capsule", "standardCapsule"), syntheticRoot || blankRoot ? "" : "Markdown knowledge note.");
+  const summary = text(field(raw, "summary", "description", "purpose", "standard_capsule", "standardCapsule"), blankRoot ? "" : "Markdown knowledge note.");
   const rawState = text(
     field(raw, "knowledge_state", "knowledgeState", "freshness_state", "freshnessState"),
-    syntheticRoot || blankRoot ? "no_spec" : "fresh",
+    blankRoot ? "no_spec" : "fresh",
   );
   const pathRefs = jsonArray(field(raw, "path_refs", "pathRefs"));
   const outboundLinks = jsonArray(field(raw, "outbound_links", "outboundLinks"));
@@ -188,7 +132,7 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const freshnessState = knowledgeFreshness(rawState);
   const displayPath = notePath || workspaceRelativePath(notePath, displayIdentity) || "";
   const fallbackMarkdown = markdownText(field(raw, "standard_capsule", "standardCapsule"));
-  const markdown = syntheticRoot || blankRoot
+  const markdown = blankRoot
     ? rawMarkdown
     : rawMarkdown || fallbackMarkdown || summary;
 
@@ -215,41 +159,12 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
     freshness_state: freshnessState,
     knowledge_state: rawState,
     spec_state: freshnessState,
-    has_active_specs: !(syntheticRoot || blankRoot),
-    active_specs: syntheticRoot || blankRoot ? [] : [{ id: `${id}-knowledge`, status: "active", statement: summary }],
+    has_active_specs: !blankRoot,
+    active_specs: blankRoot ? [] : [{ id: `${id}-knowledge`, status: "active", statement: summary }],
     active_agent_count: 0,
     active_agents: [],
     metadata,
   };
-}
-
-function syntheticKnowledgeRoot(snapshot, matrix, displayIdentity) {
-  const repoId = text(
-    field(snapshot, "repoId", "repo_id") || field(matrix, "repo_id", "repoId"),
-    "local",
-  );
-  const repoName = displayIdentity?.repoName || text(field(snapshot, "repoName", "workspaceName"), "Workspace");
-
-  return normalizeKnowledgeNode({
-    id: `knowledge-root-${repoId}`,
-    node_type: "repo_root",
-    title: `${repoName} knowledge`,
-    summary: "",
-    purpose: "",
-    note_path: ".agents/knowledge",
-    markdown_path: "",
-    markdown: "",
-    path_refs: [],
-    outbound_links: [],
-    freshness_state: "fresh",
-    knowledge_state: "fresh",
-    synthetic_root: true,
-    metadata: {
-      synthetic_root: true,
-      source: "knowledge_graph_root",
-      atlas_dir: ".agents/knowledge",
-    },
-  }, -1, displayIdentity);
 }
 
 export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
@@ -266,9 +181,7 @@ export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
   const normalizedNodes = sourceNodes
     .map((node, index) => normalizeKnowledgeNode(node, index, displayIdentity))
     .sort(compareKnowledgeNodes);
-  const hasRoot = normalizedNodes.some(isKnowledgeRootNode);
-  const rootNode = hasRoot ? null : syntheticKnowledgeRoot(snapshot, matrix, displayIdentity);
-  let nodes = rootNode ? [rootNode, ...normalizedNodes] : normalizedNodes;
+  let nodes = normalizedNodes;
   const sourceEdges = Array.isArray(snapshot?.knowledgeEdges)
     ? snapshot.knowledgeEdges
     : Array.isArray(matrix?.edges)
@@ -289,9 +202,6 @@ export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
       };
     })
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to) && edge.from !== edge.to);
-  const collapsed = collapseKnowledgeRoots(nodes, edges);
-  nodes = collapsed.nodes;
-  edges = collapsed.edges;
   const activeNodeIds = new Set(nodes.map((node) => node.id));
   edges = edges.filter((edge) => activeNodeIds.has(edge.from) && activeNodeIds.has(edge.to));
   const currentRootNode = nodes.find(isKnowledgeRootNode);
@@ -312,7 +222,6 @@ export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
           metadata: {
             source: "knowledge_graph_root",
             containment: true,
-            synthetic_root: isSyntheticKnowledgeRoot(currentRootNode),
           },
         });
       });
@@ -331,7 +240,6 @@ export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
 export function knowledgeNodeTypeLabel(node) {
   switch (node?.knowledge_node_type) {
     case "repo_root":
-    case "knowledge_root":
       return "root";
     default:
       return "concept";

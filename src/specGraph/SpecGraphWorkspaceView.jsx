@@ -292,7 +292,6 @@ function isKnowledgeOutlineRoot(node) {
   return Boolean(node?.is_root)
     || nodeType === "workspace"
     || nodeType === "repo_root"
-    || nodeType === "knowledge_root"
     || notePath === "index.md";
 }
 
@@ -754,7 +753,7 @@ function suggestedKnowledgeNodes(graph, node, relations) {
   const activeKeywords = knowledgeKeywordsFor(node);
   if (!activeKeywords.size) return [];
   return (graph?.nodes || [])
-    .filter((candidate) => !relationIds.has(candidate.id) && !["knowledge_root", "repo_root"].includes(candidate.knowledge_node_type))
+    .filter((candidate) => !relationIds.has(candidate.id) && candidate.knowledge_node_type !== "repo_root")
     .map((candidate) => {
       const candidateKeywords = knowledgeKeywordsFor(candidate);
       let score = 0;

@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -655,7 +655,56 @@ async function saveTerminalImageAttachments(attachments) {
 
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
-const TERMINAL_PATH_LINK_PATTERN = /((?:~\/|\/)[^\s"'`<>()\[\]{}|;,]+(?:\.[A-Za-z0-9]+)(?::\d+)?)/g;
+const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
+const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
+const TERMINAL_QUOTED_PATH_LINK_PATTERN = /(["'`])((?:(?:[A-Za-z]:[\\/])|(?:\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/])|(?:\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/)|(?:~[A-Za-z0-9_.-]*[\\/])|(?:\/)|(?:\.{1,2}[\\/]))(?:(?!\1).)*?\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)\1/g;
+const TERMINAL_PATH_LINK_PATTERN = /((?:[A-Za-z]:[\\/]|\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/]|\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/|~[A-Za-z0-9_.-]*[\\/]|\/|\.{1,2}[\\/])(?:[^\s"'`<>()\[\]{}|;,]+[\\/])*[^\s"'`<>()\[\]{}|;,]*\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)/g;
+const TERMINAL_BARE_FILE_LINK_PATTERN = /(^|[\s"'`(<[{])([A-Za-z0-9_.-]*[A-Za-z0-9_-]\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)(?=$|[\s"'`)>}\],;!?])/g;
+const TERMINAL_BARE_FILE_EXTENSIONS = new Set([
+  "astro",
+  "c",
+  "cc",
+  "cfg",
+  "conf",
+  "cpp",
+  "cs",
+  "css",
+  "csv",
+  "cxx",
+  "env",
+  "go",
+  "h",
+  "hpp",
+  "htm",
+  "html",
+  "java",
+  "js",
+  "json",
+  "jsx",
+  "lock",
+  "log",
+  "lua",
+  "md",
+  "mdx",
+  "mjs",
+  "php",
+  "ps1",
+  "py",
+  "rb",
+  "rs",
+  "scss",
+  "sh",
+  "sql",
+  "svelte",
+  "toml",
+  "ts",
+  "tsx",
+  "txt",
+  "vue",
+  "xml",
+  "yaml",
+  "yml",
+]);
 const TODO_DROP_OVERLAY_UNSUPPORTED_STYLE = {
   border: "2px dotted rgba(248, 113, 113, 0.96)",
   background: "rgba(45, 8, 13, 0.62)",
@@ -743,31 +792,150 @@ function getTerminalStartupDefaultModel(agentKind) {
   return TERMINAL_STARTUP_DEFAULT_MODELS[String(agentKind || "").trim().toLowerCase()] || "";
 }
 
+function cleanTerminalUrlLink(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[.,;!?]+$/g, "");
+}
+
 function cleanTerminalPathLink(value) {
   return String(value || "")
     .trim()
-    .replace(/[.,:;!?]+$/g, "");
+    .replace(/^["'`(]+|["'`).,;!?]+$/g, "");
+}
+
+function getTerminalPathOpenTarget(value) {
+  return cleanTerminalPathLink(value).replace(/:\d+(?::\d+)?$/g, "");
+}
+
+function isTerminalUrlLink(value) {
+  return /^(?:https?:|mailto:|tel:)/i.test(String(value || "").trim());
+}
+
+function isTerminalFileUrlLink(value) {
+  return /^file:/i.test(String(value || "").trim());
+}
+
+function getTerminalPathFromFileUrl(value) {
+  const raw = cleanTerminalUrlLink(value);
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "file:") {
+      return "";
+    }
+
+    const decodedPath = decodeURIComponent(url.pathname || "");
+    const pathWithoutWindowsLeadingSlash = decodedPath.replace(/^\/([A-Za-z]:[\\/])/, "$1");
+    return url.host ? `//${url.host}${pathWithoutWindowsLeadingSlash}` : pathWithoutWindowsLeadingSlash;
+  } catch {
+    return raw.replace(/^file:\/+/i, "");
+  }
+}
+
+function isTerminalAbsolutePathLink(value) {
+  return /^(?:[A-Za-z]:[\\/]|\\\\|\/\/|\/|~[A-Za-z0-9_.-]*[\\/])/.test(String(value || "").trim());
+}
+
+function isTerminalRelativePathLink(value) {
+  const cleanPath = String(value || "").trim();
+  return Boolean(cleanPath)
+    && !isTerminalAbsolutePathLink(cleanPath)
+    && !/^[a-z][a-z0-9+.-]*:/i.test(cleanPath);
+}
+
+function isLikelyTerminalBareFileLink(value) {
+  const cleanPath = getTerminalPathOpenTarget(value);
+  const fileName = cleanPath.split(/[\\/]/).filter(Boolean).pop() || "";
+  const extension = fileName.includes(".") ? fileName.split(".").pop().toLowerCase() : "";
+  return TERMINAL_BARE_FILE_EXTENSIONS.has(extension);
+}
+
+function addTerminalLinkCandidate(candidates, rawPath, startIndex, kind = "path") {
+  const cleanPath = kind === "url" || kind === "file-url"
+    ? cleanTerminalUrlLink(rawPath)
+    : cleanTerminalPathLink(rawPath);
+  if (!cleanPath) {
+    return;
+  }
+
+  candidates.push({
+    kind,
+    path: cleanPath,
+    startIndex,
+    endIndex: startIndex + cleanPath.length,
+  });
+}
+
+function getNormalizedTerminalLinkCandidates(candidates) {
+  const sortedCandidates = [...candidates].sort((first, second) => {
+    if (first.startIndex !== second.startIndex) {
+      return first.startIndex - second.startIndex;
+    }
+    return second.endIndex - first.endIndex;
+  });
+  const links = [];
+
+  sortedCandidates.forEach((candidate) => {
+    const overlapsExistingLink = links.some((link) => (
+      candidate.startIndex < link.endIndex && candidate.endIndex > link.startIndex
+    ));
+    if (!overlapsExistingLink) {
+      links.push(candidate);
+    }
+  });
+
+  return links;
 }
 
 function getTerminalPathLinks(lineText) {
   const text = String(lineText || "");
-  const links = [];
+  const candidates = [];
+
+  TERMINAL_URL_LINK_PATTERN.lastIndex = 0;
+  let match = TERMINAL_URL_LINK_PATTERN.exec(text);
+  while (match) {
+    addTerminalLinkCandidate(candidates, match[1] || "", match.index, "url");
+    match = TERMINAL_URL_LINK_PATTERN.exec(text);
+  }
+
+  TERMINAL_FILE_URL_LINK_PATTERN.lastIndex = 0;
+  match = TERMINAL_FILE_URL_LINK_PATTERN.exec(text);
+  while (match) {
+    addTerminalLinkCandidate(candidates, match[1] || "", match.index, "file-url");
+    match = TERMINAL_FILE_URL_LINK_PATTERN.exec(text);
+  }
+
+  TERMINAL_QUOTED_PATH_LINK_PATTERN.lastIndex = 0;
+  match = TERMINAL_QUOTED_PATH_LINK_PATTERN.exec(text);
+  while (match) {
+    const rawPath = match[2] || "";
+    addTerminalLinkCandidate(candidates, rawPath, match.index + match[0].indexOf(rawPath), "path");
+    match = TERMINAL_QUOTED_PATH_LINK_PATTERN.exec(text);
+  }
+
   TERMINAL_PATH_LINK_PATTERN.lastIndex = 0;
-  let match = TERMINAL_PATH_LINK_PATTERN.exec(text);
+  match = TERMINAL_PATH_LINK_PATTERN.exec(text);
   while (match) {
     const rawPath = match[1] || "";
-    const cleanPath = cleanTerminalPathLink(rawPath);
-    if (cleanPath) {
-      const startIndex = match.index + match[0].indexOf(rawPath);
-      links.push({
-        path: cleanPath,
-        startIndex,
-        endIndex: startIndex + cleanPath.length,
-      });
-    }
+    addTerminalLinkCandidate(candidates, rawPath, match.index + match[0].indexOf(rawPath), "path");
     match = TERMINAL_PATH_LINK_PATTERN.exec(text);
   }
-  return links;
+
+  TERMINAL_BARE_FILE_LINK_PATTERN.lastIndex = 0;
+  match = TERMINAL_BARE_FILE_LINK_PATTERN.exec(text);
+  while (match) {
+    const rawPath = match[2] || "";
+    if (isLikelyTerminalBareFileLink(rawPath)) {
+      addTerminalLinkCandidate(candidates, rawPath, match.index + match[0].indexOf(rawPath), "path");
+    }
+    match = TERMINAL_BARE_FILE_LINK_PATTERN.exec(text);
+  }
+
+  return getNormalizedTerminalLinkCandidates(candidates);
 }
 
 function getWorkspaceRelativePathForTerminalLink(path, workspaceRoot) {
@@ -779,10 +947,49 @@ function getWorkspaceRelativePathForTerminalLink(path, workspaceRoot) {
   if (cleanPath === cleanWorkspaceRoot) {
     return "";
   }
-  if (!cleanPath.startsWith(`${cleanWorkspaceRoot}/`)) {
+  const compareCaseInsensitive = /^[A-Za-z]:\//.test(cleanPath)
+    || /^[A-Za-z]:\//.test(cleanWorkspaceRoot)
+    || cleanPath.startsWith("//")
+    || cleanWorkspaceRoot.startsWith("//");
+  const comparePath = compareCaseInsensitive ? cleanPath.toLowerCase() : cleanPath;
+  const compareWorkspaceRoot = compareCaseInsensitive ? cleanWorkspaceRoot.toLowerCase() : cleanWorkspaceRoot;
+  if (comparePath === compareWorkspaceRoot) {
+    return "";
+  }
+  if (!comparePath.startsWith(`${compareWorkspaceRoot}/`)) {
     return "";
   }
   return cleanPath.slice(cleanWorkspaceRoot.length + 1);
+}
+
+function getWorkspaceRelativePathForTerminalRelativeLink(path) {
+  if (!isTerminalRelativePathLink(path)) {
+    return "";
+  }
+
+  const cleanPath = getTerminalPathOpenTarget(path)
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/");
+  const parts = cleanPath.split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "..")) {
+    return "";
+  }
+  return parts.join("/");
+}
+
+function resolveTerminalRelativePathLink(path, workspaceRoot) {
+  const cleanPath = getTerminalPathOpenTarget(path);
+  if (!isTerminalRelativePathLink(cleanPath) || !workspaceRoot) {
+    return cleanPath;
+  }
+
+  const root = String(workspaceRoot || "").replace(/[\\/]+$/g, "");
+  const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  const relativePath = cleanPath
+    .replace(/^[.][\\/]+/, "")
+    .replace(/[\\/]+/g, separator);
+  return `${root}${separator}${relativePath}`;
 }
 
 function WorkspaceTerminal({
@@ -1009,19 +1216,64 @@ function WorkspaceTerminal({
   useEffect(() => {
     terminalThreadActivityStatusRef.current = terminalThreadActivityStatus;
   }, [terminalThreadActivityStatus]);
-  const openTerminalPathLink = useCallback((path) => {
-    const cleanPath = cleanTerminalPathLink(path);
+  const openTerminalPathLink = useCallback((path, kind = "path") => {
+    const linkKind = kind || (isTerminalUrlLink(path) ? "url" : "path");
+    const cleanLink = linkKind === "url" || linkKind === "file-url"
+      ? cleanTerminalUrlLink(path)
+      : cleanTerminalPathLink(path);
+    if (!cleanLink) {
+      return;
+    }
+
+    if (linkKind === "url" && !isTerminalFileUrlLink(cleanLink)) {
+      logBigViewSyncDiagnosticEvent("tui.terminal_link.open", {
+        agentId: terminalAgentKind,
+        instanceId: terminalInstanceIdRef.current || 0,
+        isWorkspaceRelative: false,
+        linkKind,
+        paneId,
+        path: cleanLink,
+        relativePath: "",
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+
+      openUrl(cleanLink).catch((error) => {
+        logBigViewSyncDiagnosticEvent("tui.terminal_link.open_error", {
+          agentId: terminalAgentKind,
+          instanceId: terminalInstanceIdRef.current || 0,
+          linkKind,
+          message: error?.message || String(error || ""),
+          paneId,
+          path: cleanLink,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      });
+      return;
+    }
+
+    const cleanPath = isTerminalFileUrlLink(cleanLink)
+      ? getTerminalPathOpenTarget(getTerminalPathFromFileUrl(cleanLink))
+      : getTerminalPathOpenTarget(cleanLink);
     if (!cleanPath) {
       return;
     }
 
-    const relativePath = getWorkspaceRelativePathForTerminalLink(cleanPath, workingDirectory);
+    const openTarget = resolveTerminalRelativePathLink(cleanPath, workingDirectory);
+    const relativePath = getWorkspaceRelativePathForTerminalLink(cleanPath, workingDirectory)
+      || getWorkspaceRelativePathForTerminalLink(openTarget, workingDirectory)
+      || getWorkspaceRelativePathForTerminalRelativeLink(cleanPath);
     logBigViewSyncDiagnosticEvent("tui.terminal_link.open", {
       agentId: terminalAgentKind,
       instanceId: terminalInstanceIdRef.current || 0,
       isWorkspaceRelative: Boolean(relativePath),
+      linkKind,
+      openTarget,
       paneId,
-      path: cleanPath,
+      path: cleanLink,
       relativePath,
       terminalIndex,
       threadId: terminalThreadIdRef.current || "",
@@ -1029,22 +1281,28 @@ function WorkspaceTerminal({
     });
 
     if (relativePath) {
-      window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
+      const workspaceOpenEvent = new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
+        cancelable: true,
         detail: {
           relativePath,
           workspaceId: workspace?.id || "",
         },
-      }));
-      return;
+      });
+      window.dispatchEvent(workspaceOpenEvent);
+      if (workspaceOpenEvent.defaultPrevented) {
+        return;
+      }
     }
 
-    openPath(cleanPath).catch((error) => {
+    openPath(openTarget).catch((error) => {
       logBigViewSyncDiagnosticEvent("tui.terminal_link.open_error", {
         agentId: terminalAgentKind,
         instanceId: terminalInstanceIdRef.current || 0,
+        linkKind,
         message: error?.message || String(error || ""),
+        openTarget,
         paneId,
-        path: cleanPath,
+        path: cleanLink,
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
@@ -3126,7 +3384,7 @@ function WorkspaceTerminal({
                     },
                   },
                   text: link.path,
-                  activate: () => openTerminalPathLink(link.path),
+                  activate: () => openTerminalPathLink(link.path, link.kind),
                 };
               })
               .filter(Boolean);

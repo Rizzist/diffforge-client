@@ -4352,14 +4352,6 @@ fn cloud_mcp_materialize_knowledge_graph_mirror(repo_root: &Path, data: &Value) 
         .cloned()
         .unwrap_or_default()
     {
-        let synthetic_root = node
-            .get("metadata")
-            .and_then(|metadata| metadata.get("synthetic_root"))
-            .and_then(Value::as_bool)
-            == Some(true);
-        if synthetic_root {
-            continue;
-        }
         let raw_path = node
             .get("note_path")
             .or_else(|| node.get("notePath"))
@@ -4605,6 +4597,39 @@ fn cloud_mcp_knowledge_note_id(repo_id: &str, note_path: &str) -> String {
     )
 }
 
+fn cloud_mcp_knowledge_node_key(note_path: &str) -> String {
+    if note_path.replace('\\', "/") == "index.md" {
+        return "repo_root".to_string();
+    }
+    let stem = note_path
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(note_path)
+        .trim_end_matches(".md")
+        .to_string();
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in stem.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    format!(
+        "concept.{}",
+        if slug.is_empty() {
+            "project-context"
+        } else {
+            slug
+        }
+    )
+}
+
 fn cloud_mcp_knowledge_edge_id(repo_id: &str, from: &str, to: &str, kind: &str) -> String {
     format!(
         "knowledge-edge-{}",
@@ -4691,8 +4716,8 @@ fn cloud_mcp_ensure_knowledge_atlas(root: &Path) -> Result<(), String> {
             workspace_path_display(&knowledge_dir)
         ));
     }
-    if cloud_mcp_collect_knowledge_note_paths(root).is_empty() {
-        let index_path = cloud_mcp_safe_knowledge_target(&knowledge_dir, Path::new("index.md"))?;
+    let index_path = cloud_mcp_safe_knowledge_target(&knowledge_dir, Path::new("index.md"))?;
+    if !index_path.exists() {
         fs::write(&index_path, "").map_err(|error| {
             format!(
                 "Unable to create empty knowledge atlas root {}: {error}",
@@ -4714,88 +4739,6 @@ fn cloud_mcp_ensure_knowledge_atlas(root: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn cloud_mcp_is_legacy_starter_knowledge_index(note_path: &str, markdown: &str) -> bool {
-    if note_path.replace('\\', "/").to_ascii_lowercase() != "index.md" {
-        return false;
-    }
-
-    let lines = markdown
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if lines.len() < 7 {
-        return false;
-    }
-
-    let Some(title) = lines.first() else {
-        return false;
-    };
-    if !title.starts_with("# ") || !title.ends_with(" Knowledge Atlas") {
-        return false;
-    }
-
-    let mut index = 1;
-    if lines.get(index) != Some(&"Purpose: terse project map for coding agents and humans.") {
-        return false;
-    }
-    index += 1;
-
-    if lines.get(index) != Some(&"## Important Paths") {
-        return false;
-    }
-    index += 1;
-
-    let mut path_line_count = 0;
-    while let Some(line) = lines.get(index) {
-        if *line == "## Areas" {
-            break;
-        }
-        if !line.starts_with("- ") {
-            return false;
-        }
-        path_line_count += 1;
-        index += 1;
-    }
-    if path_line_count == 0 {
-        return false;
-    }
-
-    if lines.get(index) != Some(&"## Areas") {
-        return false;
-    }
-    index += 1;
-
-    if lines.get(index)
-        != Some(&"- Split this note into focused area, system, flow, or data notes when any section grows too large.")
-    {
-        return false;
-    }
-    index += 1;
-
-    if lines.get(index) != Some(&"## Watch Points") {
-        return false;
-    }
-    index += 1;
-
-    if lines.get(index) != Some(&"- Keep notes abstract, coding-related, and grounded in real repo paths.") {
-        return false;
-    }
-    index += 1;
-
-    index == lines.len()
-}
-
-fn cloud_mcp_is_legacy_starter_knowledge_node(node: &Value) -> bool {
-    let note_path = node
-        .get("note_path")
-        .or_else(|| node.get("markdown_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let markdown = node.get("markdown").and_then(Value::as_str).unwrap_or("");
-    cloud_mcp_is_legacy_starter_knowledge_index(note_path, markdown)
 }
 
 fn cloud_mcp_markdown_title(markdown: &str, note_path: &str) -> String {
@@ -4831,7 +4774,7 @@ fn cloud_mcp_markdown_summary(markdown: &str) -> String {
 fn cloud_mcp_knowledge_node_type(note_path: &str) -> String {
     let lower = note_path.to_ascii_lowercase();
     let node_type = if lower == "index.md" || lower.ends_with("/index.md") {
-        "knowledge_root"
+        "repo_root"
     } else if lower.starts_with("flows/") || lower.contains("/flows/") {
         "knowledge_flow"
     } else if lower.starts_with("areas/") || lower.contains("/areas/") {
@@ -5060,9 +5003,6 @@ fn cloud_mcp_read_knowledge_notes(
                 workspace_path_display(&path)
             )
         })?;
-        if cloud_mcp_is_legacy_starter_knowledge_index(&note_path, &markdown) {
-            continue;
-        }
         let note_links = cloud_mcp_markdown_link_targets(&markdown)
             .into_iter()
             .filter_map(|target| cloud_mcp_resolve_knowledge_note_link(&note_path, &target))
@@ -5107,8 +5047,8 @@ fn cloud_mcp_read_knowledge_notes(
         });
     }
     notes.sort_by(|left, right| {
-        (left.node_type != "knowledge_root")
-            .cmp(&(right.node_type != "knowledge_root"))
+        (left.node_type != "repo_root")
+            .cmp(&(right.node_type != "repo_root"))
             .then_with(|| left.note_path.cmp(&right.note_path))
     });
     Ok(notes)
@@ -5192,7 +5132,7 @@ fn cloud_mcp_knowledge_graph_stats(notes: &[Value], edges: &[Value]) -> Value {
         "notes": notes.len(),
         "edges": edges.len(),
         "missing_paths": missing_paths,
-        "root_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_root")).count(),
+        "root_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("repo_root")).count(),
         "flow_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_flow")).count(),
         "area_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_area")).count(),
     })
@@ -5208,18 +5148,19 @@ fn cloud_mcp_knowledge_hashes(items: &[Value]) -> Value {
     Value::Object(map)
 }
 
-fn cloud_mcp_synthetic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest) -> Value {
+fn cloud_mcp_programmatic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest) -> Value {
     let repo_name = cloud_mcp_repo_display_name(&req.root);
     json!({
-        "id": format!("knowledge-root-{}", req.repo_id),
+        "id": cloud_mcp_knowledge_note_id(&req.repo_id, "index.md"),
         "repo_id": req.repo_id.clone(),
         "workspace_id": req.workspace_id.clone(),
-        "node_type": "knowledge_root",
-        "title": format!("{repo_name} atlas"),
+        "node_key": "repo_root",
+        "node_type": "repo_root",
+        "title": format!("{repo_name} knowledge"),
         "summary": "",
         "purpose": "",
-        "note_path": ".agents/knowledge",
-        "markdown_path": "",
+        "note_path": "index.md",
+        "markdown_path": "index.md",
         "markdown": "",
         "path_refs": [],
         "path_ref_count": 0,
@@ -5227,84 +5168,13 @@ fn cloud_mcp_synthetic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest) -
         "outbound_links": [],
         "freshness_state": "no_spec",
         "knowledge_state": "no_spec",
-        "source": "rust-diffforge-knowledge-root",
+        "source": "rust-diffforge-programmatic-knowledge-root",
         "metadata": {
-            "synthetic_root": true,
             "source": "knowledge_graph_root",
             "atlas_dir": ".agents/knowledge",
+            "markdown_mirror_path": ".agents/knowledge/index.md",
         },
     })
-}
-
-fn cloud_mcp_knowledge_node_is_root(node: &Value) -> bool {
-    node.get("node_type").and_then(Value::as_str) == Some("knowledge_root")
-        || node
-            .get("metadata")
-            .and_then(|metadata| metadata.get("synthetic_root"))
-            .and_then(Value::as_bool)
-            == Some(true)
-}
-
-fn cloud_mcp_knowledge_edge_kind(edge: &Value) -> &str {
-    edge.get("edge_kind")
-        .or_else(|| edge.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-}
-
-fn cloud_mcp_knowledge_edge_target(edge: &Value) -> Option<&str> {
-    edge.get("to_node_id")
-        .or_else(|| edge.get("to_note_id"))
-        .or_else(|| edge.get("to"))
-        .or_else(|| edge.get("target"))
-        .and_then(Value::as_str)
-}
-
-fn cloud_mcp_add_synthetic_knowledge_root(
-    req: &CloudMcpSpecGraphSyncRequest,
-    nodes: &mut Vec<Value>,
-    edges: &mut Vec<Value>,
-) {
-    if nodes.iter().any(cloud_mcp_knowledge_node_is_root) {
-        return;
-    }
-
-    let root = cloud_mcp_synthetic_knowledge_root_node(req);
-    let Some(root_id) = root.get("id").and_then(Value::as_str).map(str::to_string) else {
-        return;
-    };
-    let incoming_containment = edges
-        .iter()
-        .filter(|edge| cloud_mcp_knowledge_edge_kind(edge) == "contains")
-        .filter_map(cloud_mcp_knowledge_edge_target)
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-    let root_edges = nodes
-        .iter()
-        .filter_map(|node| {
-            let node_id = node.get("id").and_then(Value::as_str)?;
-            if node_id == root_id || incoming_containment.contains(node_id) {
-                return None;
-            }
-            Some(json!({
-                "id": cloud_mcp_knowledge_edge_id(&req.repo_id, &root_id, node_id, "contains"),
-                "from_note_id": root_id.clone(),
-                "to_note_id": node_id,
-                "from": root_id.clone(),
-                "to": node_id,
-                "edge_kind": "contains",
-                "kind": "contains",
-                "metadata": {
-                    "source": "knowledge_graph_root",
-                    "containment": true,
-                    "synthetic_root": true,
-                },
-            }))
-        })
-        .collect::<Vec<_>>();
-
-    nodes.insert(0, root);
-    edges.splice(0..0, root_edges);
 }
 
 fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest) -> Result<Value, String> {
@@ -5326,6 +5196,7 @@ fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest
                 "id": note.id,
                 "repo_id": req.repo_id,
                 "workspace_id": req.workspace_id,
+                "node_key": cloud_mcp_knowledge_node_key(&note.note_path),
                 "node_type": note.node_type,
                 "title": note.title,
                 "summary": note.summary,
@@ -5381,9 +5252,8 @@ fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest
 }
 
 fn cloud_mcp_knowledge_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    cloud_mcp_add_synthetic_knowledge_root(req, &mut nodes, &mut edges);
+    let nodes = vec![cloud_mcp_programmatic_knowledge_root_node(req)];
+    let edges: Vec<Value> = Vec::new();
     json!({
         "kind": "project_knowledge_graph",
         "version": 1,
@@ -5404,25 +5274,16 @@ fn cloud_mcp_knowledge_graph_snapshot_from_data(
 ) -> Value {
     let repo_name = cloud_mcp_repo_display_name(&req.root);
     let display_root = cloud_mcp_repo_display_root(&req.root);
-    let mut nodes = data
+    let nodes = data
         .get("nodes")
         .and_then(Value::as_array)
-        .map(|raw_nodes| {
-            raw_nodes
-                .iter()
-                .filter(|node| !cloud_mcp_is_legacy_starter_knowledge_node(node))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .map(Value::Array)
-        .and_then(|value| value.as_array().cloned())
+        .cloned()
         .unwrap_or_default();
-    let mut edges = data
+    let edges = data
         .get("edges")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    cloud_mcp_add_synthetic_knowledge_root(req, &mut nodes, &mut edges);
     let nodes = Value::Array(nodes);
     let edges = Value::Array(edges);
     let mut normalized_data = data.clone();

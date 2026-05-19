@@ -1463,6 +1463,7 @@ export default function FilesWorkspaceView({
         name: getExplorerFileName(relativePath),
         relativePath,
       });
+      event.preventDefault?.();
     };
 
     window.addEventListener(WORKSPACE_FILE_OPEN_EVENT, handleWorkspaceFileOpen);

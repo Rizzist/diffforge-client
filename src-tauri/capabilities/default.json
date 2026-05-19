@@ -27,20 +27,42 @@
     "core:webview:allow-webview-show",
     "deep-link:default",
     "dialog:allow-open",
+    "opener:default",
     {
-      "identifier": "opener:allow-open-url",
+      "identifier": "opener:allow-open-path",
       "allow": [
         {
-          "url": "https://diffforge.ai/desktop/login*"
+          "path": "$HOME/**"
         },
         {
-          "url": "https://diffforge.ai/pricing*"
+          "path": "$DESKTOP/**"
         },
         {
-          "url": "https://github.com/openai/codex/releases*"
+          "path": "$DOCUMENT/**"
         },
         {
-          "url": "https://code.claude.com/docs/en/quickstart*"
+          "path": "$DOWNLOAD/**"
+        },
+        {
+          "path": "$PICTURE/**"
+        },
+        {
+          "path": "$VIDEO/**"
+        },
+        {
+          "path": "$AUDIO/**"
+        },
+        {
+          "path": "$TEMP/**"
+        },
+        {
+          "path": "$APP/**"
+        },
+        {
+          "path": "$RESOURCE/**"
+        },
+        {
+          "path": "/**"
         }
       ]
     }
