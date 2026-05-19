@@ -3667,6 +3667,67 @@ fn cloud_mcp_knowledge_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("knowledge")
 }
 
+fn cloud_mcp_prune_legacy_knowledge_page_notes(knowledge_dir: &Path) {
+    let mut queue = VecDeque::new();
+    queue.push_back(knowledge_dir.to_path_buf());
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some(".cache") {
+                    queue.push_back(path);
+                }
+                continue;
+            }
+            if !cloud_mcp_is_legacy_knowledge_page_note(knowledge_dir, &path) {
+                continue;
+            }
+            let Ok(markdown) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if cloud_mcp_markdown_looks_like_generated_page_note(&markdown) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+fn cloud_mcp_is_legacy_knowledge_page_note(knowledge_dir: &Path, path: &Path) -> bool {
+    let Some(relative_path) = path
+        .strip_prefix(knowledge_dir)
+        .ok()
+        .and_then(cloud_mcp_normalize_knowledge_relative_path)
+    else {
+        return false;
+    };
+    let relative = relative_path.replace('\\', "/").to_lowercase();
+    if relative == "index.md" {
+        return false;
+    }
+    if relative.starts_with("areas/") && relative.ends_with(".md") {
+        return true;
+    }
+    relative.ends_with("-html.md")
+        || relative.ends_with("-page.md")
+        || relative.ends_with("-jsx.md")
+        || relative.ends_with("-tsx.md")
+        || relative.ends_with("-js.md")
+        || relative.ends_with("-ts.md")
+        || relative.ends_with("-rs.md")
+        || relative.ends_with("-py.md")
+}
+
+fn cloud_mcp_markdown_looks_like_generated_page_note(markdown: &str) -> bool {
+    let lower = markdown.to_lowercase();
+    lower.contains("## entry point")
+        || lower.contains("## page structure")
+        || lower.contains("## content flow")
+        || lower.contains("## maintenance")
+}
+
 fn cloud_mcp_knowledge_authoring_result(response: &Value) -> Option<&Value> {
     response
         .pointer("/data/knowledge_authoring")
@@ -3729,6 +3790,17 @@ fn cloud_mcp_apply_knowledge_authoring_result(
             "error": format!("Unable to create knowledge atlas directory {}: {error}", workspace_path_display(&knowledge_dir)),
         });
     }
+    let index_path = knowledge_dir.join("index.md");
+    if !index_path.exists() {
+        if let Err(error) = fs::write(&index_path, "") {
+            return json!({
+                "ok": false,
+                "applied": false,
+                "error": format!("Unable to create empty knowledge atlas index {}: {error}", workspace_path_display(&index_path)),
+            });
+        }
+    }
+    cloud_mcp_prune_legacy_knowledge_page_notes(&knowledge_dir);
 
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
@@ -3743,6 +3815,10 @@ fn cloud_mcp_apply_knowledge_authoring_result(
             skipped.push(json!({"path": raw_path, "reason": "invalid_note_path"}));
             continue;
         };
+        if relative_path.to_string_lossy().replace('\\', "/") == "index.md" {
+            skipped.push(json!({"path": raw_path, "reason": "index_md_is_empty_anchor"}));
+            continue;
+        }
         let markdown = note["markdown"].as_str().unwrap_or_default().trim();
         if markdown.is_empty() {
             skipped.push(json!({"path": raw_path, "reason": "empty_markdown"}));

@@ -487,6 +487,51 @@ export default function SpecGraphWorkspaceView({
   );
 }
 
+const KNOWLEDGE_OUTLINE_GROUP_ORDER = [
+  { key: "areas", label: "Areas" },
+  { key: "flows", label: "Flows" },
+  { key: "systems", label: "Systems" },
+  { key: "data", label: "Data" },
+  { key: "decisions", label: "Decisions" },
+  { key: "notes", label: "Notes" },
+];
+
+function knowledgeOutlineNodePath(node) {
+  return String(node?.note_path || node?.path || node?.markdown_path || "").replace(/\\/g, "/");
+}
+
+function knowledgeOutlineGroupKey(node) {
+  const notePath = knowledgeOutlineNodePath(node).toLowerCase();
+  const nodeType = String(node?.knowledge_node_type || node?.node_type || "").toLowerCase();
+  if (node?.is_root || nodeType === "workspace" || notePath === "index.md") return "root";
+  if (notePath.startsWith("areas/") || nodeType.includes("area")) return "areas";
+  if (notePath.startsWith("flows/") || nodeType.includes("flow")) return "flows";
+  if (notePath.startsWith("systems/") || nodeType.includes("system")) return "systems";
+  if (notePath.startsWith("data/") || nodeType.includes("data")) return "data";
+  if (notePath.startsWith("decisions/") || nodeType.includes("decision")) return "decisions";
+  return "notes";
+}
+
+function knowledgeOutlineGroups(nodes) {
+  const buckets = new Map(KNOWLEDGE_OUTLINE_GROUP_ORDER.map((group) => [group.key, []]));
+  for (const node of nodes) {
+    const groupKey = knowledgeOutlineGroupKey(node);
+    if (groupKey === "root") continue;
+    const bucket = buckets.get(groupKey) || buckets.get("notes");
+    bucket.push(node);
+  }
+  return KNOWLEDGE_OUTLINE_GROUP_ORDER
+    .map((group) => ({
+      ...group,
+      nodes: (buckets.get(group.key) || []).sort((left, right) => {
+        const leftPath = knowledgeOutlineNodePath(left);
+        const rightPath = knowledgeOutlineNodePath(right);
+        return leftPath.localeCompare(rightPath) || String(left.id).localeCompare(String(right.id));
+      }),
+    }))
+    .filter((group) => group.nodes.length > 0);
+}
+
 function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
   const visibleNodes = Array.isArray(nodes) ? nodes : [];
   if (!visibleNodes.length) {
@@ -497,6 +542,9 @@ function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
     );
   }
 
+  const rootNode = visibleNodes.find((node) => knowledgeOutlineGroupKey(node) === "root");
+  const groups = knowledgeOutlineGroups(visibleNodes);
+
   return (
     <KnowledgeOutlinePanel>
       <KnowledgePanelHeader>
@@ -504,16 +552,34 @@ function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
         <small>.agents/knowledge</small>
       </KnowledgePanelHeader>
       <KnowledgeOutlineList>
-        {visibleNodes.map((node) => (
+        {rootNode ? (
           <KnowledgeOutlineButton
-            key={node.id}
             type="button"
-            data-active={node.id === selectedNodeId ? "true" : "false"}
-            onClick={() => onSelect(node.id)}
+            data-active={rootNode.id === selectedNodeId ? "true" : "false"}
+            onClick={() => onSelect(rootNode.id)}
           >
-            <span>{node.display_title || node.title}</span>
-            <small>{knowledgeNodeTypeLabel(node)} · {node.note_path}</small>
+            <span>{rootNode.display_title || rootNode.title || "Atlas index"}</span>
+            <small>root - index.md</small>
           </KnowledgeOutlineButton>
+        ) : null}
+        {groups.map((group) => (
+          <KnowledgeOutlineGroup key={group.key}>
+            <KnowledgeOutlineGroupTitle>
+              <span>{group.label}</span>
+              <small>{group.nodes.length}</small>
+            </KnowledgeOutlineGroupTitle>
+            {group.nodes.map((node) => (
+              <KnowledgeOutlineButton
+                key={node.id}
+                type="button"
+                data-active={node.id === selectedNodeId ? "true" : "false"}
+                onClick={() => onSelect(node.id)}
+              >
+                <span>{node.display_title || node.title}</span>
+                <small>{knowledgeOutlineNodePath(node) || knowledgeNodeTypeLabel(node)}</small>
+              </KnowledgeOutlineButton>
+            ))}
+          </KnowledgeOutlineGroup>
         ))}
       </KnowledgeOutlineList>
     </KnowledgeOutlinePanel>
@@ -2139,27 +2205,59 @@ const KnowledgePanelHeader = styled.header`
 
 const KnowledgeOutlineList = styled.div`
   display: grid;
-  gap: 6px;
+  align-content: flex-start;
+  gap: 8px;
   min-height: 0;
   overflow: auto;
-  padding: 10px;
+  padding: 8px;
+`;
+
+const KnowledgeOutlineGroup = styled.section`
+  display: grid;
+  gap: 3px;
+`;
+
+const KnowledgeOutlineGroupTitle = styled.div`
+  align-items: center;
+  color: var(--history-subtle);
+  display: flex;
+  font-size: 9px;
+  font-weight: 820;
+  justify-content: space-between;
+  letter-spacing: 0.08em;
+  padding: 7px 7px 3px;
+  text-transform: uppercase;
+
+  small {
+    border: 1px solid var(--history-border);
+    border-radius: 999px;
+    color: var(--history-muted);
+    font-size: 8px;
+    line-height: 1;
+    padding: 2px 5px;
+  }
 `;
 
 const KnowledgeOutlineButton = styled.button`
-  border: 1px solid var(--history-border);
-  border-radius: 7px;
-  background: var(--history-panel);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
   color: inherit;
   cursor: pointer;
   display: grid;
-  gap: 4px;
-  padding: 9px;
+  gap: 3px;
+  padding: 7px 8px;
   text-align: left;
-  transition: border-color 160ms ease, background 160ms ease;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+
+  &:hover {
+    border-color: var(--history-border);
+    background: var(--history-panel);
+  }
 
   span {
     color: var(--history-text);
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 700;
     line-height: 1.28;
     overflow-wrap: anywhere;
@@ -2167,7 +2265,7 @@ const KnowledgeOutlineButton = styled.button`
 
   small {
     color: var(--history-subtle);
-    font-size: 9.5px;
+    font-size: 9px;
     font-weight: 620;
     line-height: 1.3;
     overflow-wrap: anywhere;
