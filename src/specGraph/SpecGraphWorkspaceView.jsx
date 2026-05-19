@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
 import ReactMarkdown from "react-markdown";
@@ -28,88 +27,15 @@ import {
   text,
 } from "./specGraphCore.js";
 
-const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
-const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
-
-function normalizeGraphEventPath(value) {
-  return String(value || "")
-    .replace(/\\/g, "/")
-    .replace(/\/+$/, "")
-    .toLowerCase();
-}
-
-function graphEventMatchesWorkspace(snapshot, repoPath, workspaceId) {
-  if (!snapshot || typeof snapshot !== "object") return false;
-  const snapshotWorkspaceId = text(
-    snapshot.workspaceId
-      || snapshot.workspace_id
-      || snapshot.raw?.workspace_id
-      || snapshot.specGraph?.workspace_id
-      || snapshot.knowledgeGraph?.workspace_id,
-  );
-  if (workspaceId && snapshotWorkspaceId && snapshotWorkspaceId === workspaceId) {
-    return true;
-  }
-
-  const snapshotRepoPath = text(snapshot.repoPath || snapshot.repo_path || snapshot.raw?.repo_path);
-  return Boolean(repoPath)
-    && normalizeGraphEventPath(snapshotRepoPath) === normalizeGraphEventPath(repoPath);
-}
-
-function stableGraphValue(value) {
-  if (Array.isArray(value)) {
-    return value
-      .map(stableGraphValue)
-      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-  }
-  if (!value || typeof value !== "object") return value;
-  return Object.keys(value)
-    .sort()
-    .reduce((next, key) => {
-      next[key] = stableGraphValue(value[key]);
-      return next;
-    }, {});
-}
-
-function graphSnapshotSignature(snapshot) {
-  if (!snapshot || typeof snapshot !== "object") return "";
-  const graph = snapshot.specGraph || snapshot.knowledgeGraph || snapshot.raw || {};
-  const nodes = Array.isArray(snapshot.specNodes)
-    ? snapshot.specNodes
-    : Array.isArray(snapshot.knowledgeNodes)
-      ? snapshot.knowledgeNodes
-      : Array.isArray(graph.nodes)
-        ? graph.nodes
-        : [];
-  const edges = Array.isArray(snapshot.specEdges)
-    ? snapshot.specEdges
-    : Array.isArray(snapshot.knowledgeEdges)
-      ? snapshot.knowledgeEdges
-      : Array.isArray(graph.edges)
-        ? graph.edges
-        : [];
-  const nodeSignatures = nodes
-    .map((node) => JSON.stringify(stableGraphValue(node)))
-    .sort();
-  const edgeSignatures = edges
-    .map((edge) => JSON.stringify(stableGraphValue(edge)))
-    .sort();
-  return JSON.stringify({
-    repoId: snapshot.repoId || snapshot.repo_id || graph.repo_id || graph.repoId || "",
-    workspaceId: snapshot.workspaceId || snapshot.workspace_id || graph.workspace_id || graph.workspaceId || "",
-    syncState: snapshot.syncState || snapshot.sync_state || "",
-    syncError: snapshot.syncError || snapshot.sync_error || "",
-    graphStats: stableGraphValue(snapshot.graphStats || graph.graph_stats || graph.graphStats || {}),
-    agentWork: stableGraphValue(snapshot.agentWork || graph.agent_work || graph.agentWork || {}),
-    taskHistory: stableGraphValue(snapshot.taskHistory || graph.task_history || graph.taskHistory || {}),
-    nodes: nodeSignatures,
-    edges: edgeSignatures,
-  });
-}
-
 export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
+  knowledgeGraphError = "",
+  knowledgeGraphSnapshot = null,
+  knowledgeGraphState = "idle",
   rootDirectory,
+  specGraphError = "",
+  specGraphSnapshot = null,
+  specGraphState = "idle",
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
@@ -119,9 +45,6 @@ export default function SpecGraphWorkspaceView({
     () => createWorkspaceDisplayIdentity(repoPath, workspaceName || "Workspace"),
     [repoPath, workspaceName],
   );
-  const [snapshot, setSnapshot] = useState(null);
-  const [error, setError] = useState("");
-  const [state, setState] = useState("idle");
   const [selectedNodeId, setSelectedNodeId] = useState("");
   const [showLocalIgnored, setShowLocalIgnored] = useState(false);
   const [localIgnoredOverlay, setLocalIgnoredOverlay] = useState(null);
@@ -131,26 +54,13 @@ export default function SpecGraphWorkspaceView({
   const [graphKind, setGraphKind] = useState("specs");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedHistoryNodeId, setSelectedHistoryNodeId] = useState("");
-  const [knowledgeSnapshot, setKnowledgeSnapshot] = useState(null);
-  const [knowledgeError, setKnowledgeError] = useState("");
-  const [knowledgeState, setKnowledgeState] = useState("idle");
   const [selectedKnowledgeNodeId, setSelectedKnowledgeNodeId] = useState("");
-
-  const applySnapshot = useCallback((next) => {
-    if (!next || typeof next !== "object") return;
-    const nextSignature = graphSnapshotSignature(next);
-    setSnapshot((current) => (graphSnapshotSignature(current) === nextSignature ? current : next));
-    setError(text(next.syncError || next.sync_error));
-    setState(text(next.syncState || next.sync_state, "ready"));
-  }, []);
-
-  const applyKnowledgeSnapshot = useCallback((next) => {
-    if (!next || typeof next !== "object") return;
-    const nextSignature = graphSnapshotSignature(next);
-    setKnowledgeSnapshot((current) => (graphSnapshotSignature(current) === nextSignature ? current : next));
-    setKnowledgeError(text(next.syncError || next.sync_error));
-    setKnowledgeState(text(next.syncState || next.sync_state, "ready"));
-  }, []);
+  const snapshot = specGraphSnapshot;
+  const error = specGraphError;
+  const state = specGraphState;
+  const knowledgeSnapshot = knowledgeGraphSnapshot;
+  const knowledgeError = knowledgeGraphError;
+  const knowledgeState = knowledgeGraphState;
 
   const loadLocalIgnoredOverlay = useCallback(() => {
     if (!repoPath || !workspaceId) return;
@@ -166,124 +76,6 @@ export default function SpecGraphWorkspaceView({
         setLocalIgnoredState("error");
       });
   }, [repoPath, workspaceId]);
-
-  useEffect(() => {
-    if (!repoPath || !workspaceId) return undefined;
-    let cancelled = false;
-    let unlistenCache = null;
-
-    setState((current) => (current === "idle" ? "loading" : current));
-
-    invoke("cloud_mcp_get_cached_spec_graph", {
-      repoPath,
-      workspaceId,
-      workspaceName: workspaceName || null,
-    })
-      .then((next) => {
-        if (!cancelled) applySnapshot(next);
-      })
-      .catch((nextError) => {
-        if (!cancelled) {
-          setError(nextError?.message || String(nextError));
-          setState("error");
-        }
-      });
-
-    listen(SPEC_GRAPH_CACHE_EVENT, (event) => {
-      const next = event?.payload;
-      if (!graphEventMatchesWorkspace(next, repoPath, workspaceId)) return;
-      applySnapshot(next);
-    }).then((nextUnlisten) => {
-      if (cancelled) {
-        nextUnlisten();
-        return;
-      }
-      unlistenCache = nextUnlisten;
-    });
-
-    invoke("cloud_mcp_start_spec_graph_sync", {
-      repoPath,
-      workspaceId,
-      workspaceName: workspaceName || null,
-    })
-      .then((next) => {
-        if (!cancelled) applySnapshot(next);
-      })
-      .catch((nextError) => {
-        if (!cancelled) {
-          setError(nextError?.message || String(nextError));
-          setState("error");
-        }
-      });
-
-    return () => {
-      cancelled = true;
-      if (typeof unlistenCache === "function") unlistenCache();
-    };
-  }, [applySnapshot, repoPath, workspaceId, workspaceName]);
-
-  useEffect(() => {
-    if (!repoPath || !workspaceId) return undefined;
-    let cancelled = false;
-    let unlistenCache = null;
-    let syncGeneration = null;
-
-    setKnowledgeState((current) => (current === "idle" ? "loading" : current));
-
-    invoke("cloud_mcp_get_cached_knowledge_graph", {
-      repoPath,
-      workspaceId,
-      workspaceName: workspaceName || null,
-    })
-      .then((next) => {
-        if (!cancelled) applyKnowledgeSnapshot(next);
-      })
-      .catch((nextError) => {
-        if (!cancelled) {
-          setKnowledgeError(nextError?.message || String(nextError));
-          setKnowledgeState("error");
-        }
-      });
-
-    listen(KNOWLEDGE_GRAPH_CACHE_EVENT, (event) => {
-      const next = event?.payload;
-      if (!graphEventMatchesWorkspace(next, repoPath, workspaceId)) return;
-      applyKnowledgeSnapshot(next);
-    }).then((nextUnlisten) => {
-      if (cancelled) {
-        nextUnlisten();
-        return;
-      }
-      unlistenCache = nextUnlisten;
-    });
-
-    invoke("cloud_mcp_start_knowledge_graph_sync", {
-      repoPath,
-      workspaceId,
-      workspaceName: workspaceName || null,
-    })
-      .then((next) => {
-        syncGeneration = Number(next?.syncGeneration) || null;
-        if (!cancelled) applyKnowledgeSnapshot(next);
-        if (cancelled && syncGeneration) {
-          invoke("cloud_mcp_stop_knowledge_graph_sync", { repoPath, syncGeneration }).catch(() => {});
-        }
-      })
-      .catch((nextError) => {
-        if (!cancelled) {
-          setKnowledgeError(nextError?.message || String(nextError));
-          setKnowledgeState("error");
-        }
-      });
-
-    return () => {
-      cancelled = true;
-      if (typeof unlistenCache === "function") unlistenCache();
-      if (syncGeneration) {
-        invoke("cloud_mcp_stop_knowledge_graph_sync", { repoPath, syncGeneration }).catch(() => {});
-      }
-    };
-  }, [applyKnowledgeSnapshot, repoPath, workspaceId, workspaceName]);
 
   useEffect(() => {
     if (showLocalIgnored) loadLocalIgnoredOverlay();

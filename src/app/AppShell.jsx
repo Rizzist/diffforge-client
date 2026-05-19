@@ -446,6 +446,8 @@ const WINDOW_RESIZE_EDGES = [
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
+const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
+const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
 const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
@@ -1976,6 +1978,64 @@ function findWorkspaceById(workspaces, workspaceId) {
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
 }
 
+function graphText(value, fallback = "") {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  const normalized = String(value).trim();
+  return normalized || fallback;
+}
+
+function normalizeGraphWorkspacePath(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+function graphSnapshotBody(snapshot) {
+  return snapshot?.specGraph || snapshot?.knowledgeGraph || snapshot?.raw || {};
+}
+
+function graphSnapshotWorkspaceId(snapshot) {
+  const graph = graphSnapshotBody(snapshot);
+  return graphText(
+    snapshot?.workspaceId
+      || snapshot?.workspace_id
+      || graph?.workspace_id
+      || graph?.workspaceId,
+  );
+}
+
+function graphSnapshotRepoPath(snapshot) {
+  const graph = graphSnapshotBody(snapshot);
+  return graphText(snapshot?.repoPath || snapshot?.repo_path || graph?.repo_path || graph?.repoPath);
+}
+
+function graphSnapshotSyncState(snapshot, fallback = "idle") {
+  return graphText(snapshot?.syncState || snapshot?.sync_state, fallback);
+}
+
+function graphSnapshotSyncError(snapshot) {
+  return graphText(snapshot?.syncError || snapshot?.sync_error);
+}
+
+function workspaceGraphStateKey(repoPath, workspaceId) {
+  const normalizedWorkspaceId = graphText(workspaceId);
+  const normalizedRepoPath = normalizeGraphWorkspacePath(repoPath);
+  if (!normalizedWorkspaceId && !normalizedRepoPath) {
+    return "";
+  }
+  return `${normalizedWorkspaceId}::${normalizedRepoPath}`;
+}
+
+function workspaceGraphSnapshotKey(snapshot) {
+  return workspaceGraphStateKey(
+    graphSnapshotRepoPath(snapshot),
+    graphSnapshotWorkspaceId(snapshot),
+  );
+}
+
 function getWorkspaceRailInitials(name) {
   const parts = String(name || "Workspace")
     .trim()
@@ -2278,6 +2338,7 @@ export default function App() {
   const [audioDownloadProgress, setAudioDownloadProgress] = useState(null);
   const [audioWidgetVisible, setAudioWidgetVisible] = useState(false);
   const [workspaces, setWorkspaces] = useState([]);
+  const [workspaceGraphState, setWorkspaceGraphState] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceError, setWorkspaceError] = useState("");
@@ -2351,9 +2412,93 @@ export default function App() {
   );
   const workspaceCloseAllowNativeRef = useRef(false);
 
+  const setWorkspaceGraphStatus = useCallback((repoPath, workspaceId, statusPatch) => {
+    const key = workspaceGraphStateKey(repoPath, workspaceId);
+    if (!key) return;
+    setWorkspaceGraphState((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] || {}),
+        repoPath,
+        workspaceId,
+        ...statusPatch,
+      },
+    }));
+  }, []);
+
+  const applyWorkspaceGraphSnapshot = useCallback((kind, repoPath, workspaceId, snapshot) => {
+    if (!snapshot || typeof snapshot !== "object") return;
+    const snapshotRepoPath = graphSnapshotRepoPath(snapshot);
+    const snapshotWorkspaceId = graphSnapshotWorkspaceId(snapshot);
+    const key = workspaceGraphStateKey(
+      repoPath || snapshotRepoPath,
+      workspaceId || snapshotWorkspaceId,
+    ) || workspaceGraphSnapshotKey(snapshot);
+    if (!key) return;
+
+    const snapshotKey = kind === "knowledge" ? "knowledgeSnapshot" : "specSnapshot";
+    const stateKey = kind === "knowledge" ? "knowledgeState" : "specState";
+    const errorKey = kind === "knowledge" ? "knowledgeError" : "specError";
+    const updatedAtKey = kind === "knowledge" ? "knowledgeUpdatedAt" : "specUpdatedAt";
+    const fallbackState = kind === "knowledge" ? "local" : "empty";
+
+    setWorkspaceGraphState((current) => {
+      const keysToUpdate = new Set([key]);
+      const eventRepoPath = normalizeGraphWorkspacePath(snapshotRepoPath);
+      if (!repoPath && !workspaceId && eventRepoPath) {
+        Object.entries(current).forEach(([entryKey, entry]) => {
+          if (normalizeGraphWorkspacePath(entry?.repoPath) === eventRepoPath) {
+            keysToUpdate.add(entryKey);
+          }
+        });
+      }
+
+      const next = { ...current };
+      keysToUpdate.forEach((entryKey) => {
+        const previous = current[entryKey] || {};
+        next[entryKey] = {
+          ...previous,
+          repoPath: repoPath || previous.repoPath || snapshotRepoPath,
+          workspaceId: workspaceId || previous.workspaceId || snapshotWorkspaceId,
+          [snapshotKey]: snapshot,
+          [stateKey]: graphSnapshotSyncState(snapshot, fallbackState),
+          [errorKey]: graphSnapshotSyncError(snapshot),
+          [updatedAtKey]: Date.now(),
+        };
+      });
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     clearWorkspaceThreadsBrowserPersistence();
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners = [];
+
+    const attach = (eventName, kind) => {
+      listen(eventName, (event) => {
+        if (disposed) return;
+        applyWorkspaceGraphSnapshot(kind, "", "", event?.payload);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlisteners.push(unlisten);
+      });
+    };
+
+    attach(SPEC_GRAPH_CACHE_EVENT, "spec");
+    attach(KNOWLEDGE_GRAPH_CACHE_EVENT, "knowledge");
+
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [applyWorkspaceGraphSnapshot]);
 
   useEffect(() => {
     const targets = getWorkspaceThreadStoreTargets(
@@ -5629,8 +5774,8 @@ export default function App() {
       && workspaceDeactivationState.workspaceId === selectedWorkspace.id,
   );
   const isWorkspaceSettingsBusy = workspaceSettingsState === "saving" || isWorkspaceSettingsDeactivating;
-  const selectedWorkspaceIdForSpecSync = selectedWorkspace?.id || "";
-  const selectedWorkspaceNameForSpecSync = selectedWorkspace?.name || "";
+  const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
+  const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
 
   useEffect(() => {
     if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
@@ -5642,41 +5787,133 @@ export default function App() {
   }, [activeView, hasSelectedWorkspace, showView]);
 
   useEffect(() => {
-    const repoPath = selectedWorkspaceFileRoot;
-    if (!repoPath || !selectedWorkspaceIdForSpecSync) {
+    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
+    if (!repoPath || !activatedWorkspaceIdForGraphSync) {
       return undefined;
     }
 
     let cancelled = false;
-    let syncGeneration = null;
-    const stopSync = () => {
-      if (!syncGeneration) return;
-      invoke("cloud_mcp_stop_spec_graph_sync", { repoPath, syncGeneration }).catch(() => {});
+    let specSyncGeneration = null;
+    let knowledgeSyncGeneration = null;
+    const workspaceId = activatedWorkspaceIdForGraphSync;
+    const workspaceName = activatedWorkspaceNameForGraphSync || null;
+    const stopSyncs = () => {
+      if (specSyncGeneration) {
+        invoke("cloud_mcp_stop_spec_graph_sync", {
+          repoPath,
+          syncGeneration: specSyncGeneration,
+        }).catch(() => {});
+      }
+      if (knowledgeSyncGeneration) {
+        invoke("cloud_mcp_stop_knowledge_graph_sync", {
+          repoPath,
+          syncGeneration: knowledgeSyncGeneration,
+        }).catch(() => {});
+      }
     };
+
+    setWorkspaceGraphStatus(repoPath, workspaceId, {
+      specState: "loading",
+      specError: "",
+      knowledgeState: "loading",
+      knowledgeError: "",
+    });
+
+    invoke("cloud_mcp_get_cached_spec_graph", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then((result) => {
+        if (!cancelled) applyWorkspaceGraphSnapshot("spec", repoPath, workspaceId, result);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setWorkspaceGraphStatus(repoPath, workspaceId, {
+            specState: "error",
+            specError: getErrorMessage(error, "Unable to load cached Spec Graph."),
+          });
+        }
+      });
+
+    invoke("cloud_mcp_get_cached_knowledge_graph", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then((result) => {
+        if (!cancelled) applyWorkspaceGraphSnapshot("knowledge", repoPath, workspaceId, result);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setWorkspaceGraphStatus(repoPath, workspaceId, {
+            knowledgeState: "error",
+            knowledgeError: getErrorMessage(error, "Unable to load cached Knowledge Graph."),
+          });
+        }
+      });
 
     invoke("cloud_mcp_start_spec_graph_sync", {
       repoPath,
-      workspaceId: selectedWorkspaceIdForSpecSync || null,
-      workspaceName: selectedWorkspaceNameForSpecSync || null,
+      workspaceId,
+      workspaceName,
     })
       .then((result) => {
-        syncGeneration = Number(result?.syncGeneration) || null;
+        specSyncGeneration = Number(result?.syncGeneration) || null;
+        if (!cancelled) applyWorkspaceGraphSnapshot("spec", repoPath, workspaceId, result);
         if (cancelled) {
-          stopSync();
+          stopSyncs();
         }
       })
       .catch((error) => {
+        if (!cancelled) {
+          setWorkspaceGraphStatus(repoPath, workspaceId, {
+            specState: "error",
+            specError: getErrorMessage(error, "Unable to start Spec Graph sync."),
+          });
+        }
+      });
+
+    invoke("cloud_mcp_start_knowledge_graph_sync", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then((result) => {
+        knowledgeSyncGeneration = Number(result?.syncGeneration) || null;
+        if (!cancelled) applyWorkspaceGraphSnapshot("knowledge", repoPath, workspaceId, result);
+        if (cancelled) {
+          stopSyncs();
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setWorkspaceGraphStatus(repoPath, workspaceId, {
+            knowledgeState: "error",
+            knowledgeError: getErrorMessage(error, "Unable to start Knowledge Graph sync."),
+          });
+        }
       });
 
     return () => {
       cancelled = true;
-      stopSync();
+      stopSyncs();
     };
   }, [
-    selectedWorkspaceFileRoot,
-    selectedWorkspaceIdForSpecSync,
-    selectedWorkspaceNameForSpecSync,
+    activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceNameForGraphSync,
+    activatedWorkspaceTerminalWorkingDirectory,
+    applyWorkspaceGraphSnapshot,
+    setWorkspaceGraphStatus,
   ]);
+
+  const selectedWorkspaceGraphStateKey = workspaceGraphStateKey(
+    selectedWorkspaceFileRoot,
+    selectedWorkspace?.id || "",
+  );
+  const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
+    ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
+    : {};
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
@@ -8243,7 +8480,13 @@ export default function App() {
                   {selectedWorkspace ? (
                     <SpecGraphWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
+                      knowledgeGraphError={selectedWorkspaceGraphState.knowledgeError || ""}
+                      knowledgeGraphSnapshot={selectedWorkspaceGraphState.knowledgeSnapshot || null}
+                      knowledgeGraphState={selectedWorkspaceGraphState.knowledgeState || "idle"}
                       rootDirectory={selectedWorkspaceFileRoot}
+                      specGraphError={selectedWorkspaceGraphState.specError || ""}
+                      specGraphSnapshot={selectedWorkspaceGraphState.specSnapshot || null}
+                      specGraphState={selectedWorkspaceGraphState.specState || "idle"}
                       workspace={selectedWorkspace}
                     />
                   ) : (

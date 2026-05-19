@@ -36,7 +36,6 @@ struct CloudMcpSpecGraphSyncRuntime {
     generation: u64,
     stop: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
-    request_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -5564,6 +5563,39 @@ fn cloud_mcp_read_knowledge_graph_cache(
     cloud_mcp_stamp_knowledge_graph_snapshot(snapshot, req, &cache_path, sync_state, sync_error)
 }
 
+fn cloud_mcp_read_knowledge_graph_cache_preserving_state(
+    req: &CloudMcpSpecGraphSyncRequest,
+    fallback_sync_state: &str,
+    fallback_sync_error: &str,
+) -> Value {
+    let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
+    let Some(snapshot) = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return cloud_mcp_read_knowledge_graph_cache(req, fallback_sync_state, fallback_sync_error);
+    };
+
+    let sync_state = snapshot
+        .get("syncState")
+        .or_else(|| snapshot.get("sync_state"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_sync_state)
+        .to_string();
+    let sync_error = snapshot
+        .get("syncError")
+        .or_else(|| snapshot.get("sync_error"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_sync_error)
+        .to_string();
+
+    cloud_mcp_stamp_knowledge_graph_snapshot(snapshot, req, &cache_path, &sync_state, &sync_error)
+}
+
 fn cloud_mcp_write_knowledge_graph_cache(
     req: &CloudMcpSpecGraphSyncRequest,
     snapshot: &Value,
@@ -7009,7 +7041,6 @@ async fn cloud_mcp_start_spec_graph_sync(
     let requested_request_wake = Arc::new(tokio::sync::Notify::new());
     let mut active_generation = requested_generation;
     let mut should_spawn = false;
-    let mut existing_request_wake = None;
     {
         let mut syncs = state.spec_graph_syncs.lock().await;
         if let Some(existing_runtime) = syncs
@@ -7017,7 +7048,6 @@ async fn cloud_mcp_start_spec_graph_sync(
             .filter(|runtime| !runtime.stop.load(Ordering::SeqCst))
         {
             active_generation = existing_runtime.generation;
-            existing_request_wake = Some(Arc::clone(&existing_runtime.request_wake));
         } else {
             syncs.insert(
                 req.repo_id.clone(),
@@ -7025,18 +7055,14 @@ async fn cloud_mcp_start_spec_graph_sync(
                     generation: requested_generation,
                     stop: Arc::clone(&requested_stop),
                     wake: Arc::clone(&requested_wake),
-                    request_wake: Arc::clone(&requested_request_wake),
                 },
             );
             should_spawn = true;
         }
     }
-    {
+    if should_spawn {
         let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
         requests.insert(req.repo_id.clone(), requested_generation);
-    }
-    if let Some(request_wake) = existing_request_wake {
-        request_wake.notify_waiters();
     }
     let mut cached = if should_spawn {
         cloud_mcp_read_spec_graph_cache(&req, "syncing", "")
@@ -7107,7 +7133,9 @@ async fn cloud_mcp_get_cached_knowledge_graph(
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
-    Ok(cloud_mcp_read_knowledge_graph_cache(&req, "local", ""))
+    Ok(cloud_mcp_read_knowledge_graph_cache_preserving_state(
+        &req, "local", "",
+    ))
 }
 
 #[tauri::command]
@@ -7143,7 +7171,11 @@ async fn cloud_mcp_start_knowledge_graph_sync(
             should_spawn = true;
         }
     }
-    let mut cached = cloud_mcp_read_knowledge_graph_cache(&req, "syncing", "");
+    let mut cached = if should_spawn {
+        cloud_mcp_read_knowledge_graph_cache(&req, "syncing", "")
+    } else {
+        cloud_mcp_read_knowledge_graph_cache_preserving_state(&req, "syncing", "")
+    };
     if let Some(object) = cached.as_object_mut() {
         object.insert("syncGeneration".to_string(), json!(active_generation));
     }
