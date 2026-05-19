@@ -30,6 +30,9 @@ function jsonObject(value) {
 
 function knowledgeFreshness(value) {
   switch (text(value).toLowerCase()) {
+    case "no_spec":
+    case "empty":
+      return "no_spec";
     case "stale":
     case "maybe_stale":
       return "behind_code";
@@ -52,14 +55,63 @@ function displayTitle(title, notePath, nodeType, displayIdentity) {
   return title || notePath || "Knowledge note";
 }
 
+function knowledgeNodeSortKey(node) {
+  const rootRank = node?.knowledge_node_type === "knowledge_root" ? "0" : "1";
+  return [
+    rootRank,
+    text(node?.note_path || node?.path || node?.markdown_path).toLowerCase(),
+    text(node?.display_title || node?.displayTitle || node?.title).toLowerCase(),
+    text(node?.id).toLowerCase(),
+  ].join("|");
+}
+
+function compareKnowledgeNodes(left, right) {
+  return knowledgeNodeSortKey(left).localeCompare(knowledgeNodeSortKey(right));
+}
+
+function knowledgeEdgeSortKey(edge) {
+  const kindRank = edge?.kind === "contains" || edge?.metadata?.containment === true ? "0" : "1";
+  return [
+    kindRank,
+    text(edge?.from).toLowerCase(),
+    text(edge?.kind).toLowerCase(),
+    text(edge?.to).toLowerCase(),
+    text(edge?.id).toLowerCase(),
+  ].join("|");
+}
+
+function compareKnowledgeEdges(left, right) {
+  return knowledgeEdgeSortKey(left).localeCompare(knowledgeEdgeSortKey(right));
+}
+
+function dedupeKnowledgeEdges(edges) {
+  const byKey = new Map();
+  for (const edge of edges || []) {
+    const key = [
+      text(edge?.from),
+      text(edge?.to),
+      text(edge?.kind),
+      edge?.metadata?.containment === true ? "containment" : "",
+    ].join("|");
+    if (!byKey.has(key)) byKey.set(key, edge);
+  }
+  return [...byKey.values()];
+}
+
 function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const metadata = jsonObject(field(raw, "metadata", "metadata_json", "metadataJson"));
   const id = text(field(raw, "id", "node_id", "nodeId"), `knowledge-${index}`);
   const notePath = text(field(raw, "note_path", "notePath", "markdown_path", "markdownPath", "path"));
   const knowledgeType = text(field(raw, "node_type", "nodeType", "type"), "knowledge_note");
   const title = text(field(raw, "title"), notePath || "Knowledge note");
-  const summary = text(field(raw, "summary", "description", "purpose"), "Markdown knowledge note.");
-  const rawState = text(field(raw, "knowledge_state", "knowledgeState", "freshness_state", "freshnessState"), "fresh");
+  const syntheticRoot = raw?.synthetic_root === true || metadata?.synthetic_root === true;
+  const rawMarkdown = text(field(raw, "markdown", "body", "content"));
+  const blankRoot = knowledgeType === "knowledge_root" && !rawMarkdown;
+  const summary = text(field(raw, "summary", "description", "purpose"), syntheticRoot || blankRoot ? "" : "Markdown knowledge note.");
+  const rawState = text(
+    field(raw, "knowledge_state", "knowledgeState", "freshness_state", "freshnessState"),
+    syntheticRoot || blankRoot ? "no_spec" : "fresh",
+  );
   const pathRefs = jsonArray(field(raw, "path_refs", "pathRefs"));
   const outboundLinks = jsonArray(field(raw, "outbound_links", "outboundLinks"));
   const nodeType = knowledgeType === "knowledge_root" ? "workspace" : "concept";
@@ -80,7 +132,7 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
     path: notePath,
     summary,
     purpose: summary,
-    markdown: text(field(raw, "markdown", "body", "content"), summary),
+    markdown: syntheticRoot || blankRoot ? rawMarkdown : text(field(raw, "markdown", "body", "content"), summary),
     markdown_path: notePath,
     path_refs: pathRefs,
     path_ref_count: Number(field(raw, "path_ref_count", "pathRefCount")) || pathRefs.length,
@@ -89,12 +141,41 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
     freshness_state: freshnessState,
     knowledge_state: rawState,
     spec_state: freshnessState,
-    has_active_specs: true,
-    active_specs: [{ id: `${id}-knowledge`, status: "active", statement: summary }],
+    has_active_specs: !(syntheticRoot || blankRoot),
+    active_specs: syntheticRoot || blankRoot ? [] : [{ id: `${id}-knowledge`, status: "active", statement: summary }],
     active_agent_count: 0,
     active_agents: [],
     metadata,
   };
+}
+
+function syntheticKnowledgeRoot(snapshot, matrix, displayIdentity) {
+  const repoId = text(
+    field(snapshot, "repoId", "repo_id") || field(matrix, "repo_id", "repoId"),
+    "local",
+  );
+  const repoName = displayIdentity?.repoName || text(field(snapshot, "repoName", "workspaceName"), "Workspace");
+
+  return normalizeKnowledgeNode({
+    id: `knowledge-root-${repoId}`,
+    node_type: "knowledge_root",
+    title: `${repoName} atlas`,
+    summary: "",
+    purpose: "",
+    note_path: ".agents/knowledge",
+    markdown_path: "",
+    markdown: "",
+    path_refs: [],
+    outbound_links: [],
+    freshness_state: "no_spec",
+    knowledge_state: "no_spec",
+    synthetic_root: true,
+    metadata: {
+      synthetic_root: true,
+      source: "knowledge_graph_root",
+      atlas_dir: ".agents/knowledge",
+    },
+  }, -1, displayIdentity);
 }
 
 export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
@@ -108,22 +189,55 @@ export function normalizeKnowledgeSnapshot(snapshot, options = {}) {
     : Array.isArray(matrix?.nodes)
       ? matrix.nodes
       : [];
-  const nodes = sourceNodes.map((node, index) => normalizeKnowledgeNode(node, index, displayIdentity));
+  const normalizedNodes = sourceNodes
+    .map((node, index) => normalizeKnowledgeNode(node, index, displayIdentity))
+    .sort(compareKnowledgeNodes);
+  const hasRoot = normalizedNodes.some((node) => node.knowledge_node_type === "knowledge_root");
+  const rootNode = hasRoot ? null : syntheticKnowledgeRoot(snapshot, matrix, displayIdentity);
+  const nodes = rootNode ? [rootNode, ...normalizedNodes] : normalizedNodes;
   const sourceEdges = Array.isArray(snapshot?.knowledgeEdges)
     ? snapshot.knowledgeEdges
     : Array.isArray(matrix?.edges)
       ? matrix.edges
       : [];
   const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges = sourceEdges
-    .map((edge, index) => ({
-      id: text(field(edge, "id"), `knowledge-edge-${index}`),
-      from: text(field(edge, "from_node_id", "fromNoteId", "from_note_id", "from", "source")),
-      to: text(field(edge, "to_node_id", "toNoteId", "to_note_id", "to", "target")),
-      kind: text(field(edge, "edge_kind", "edgeKind", "kind"), "links_to"),
-      metadata: jsonObject(field(edge, "metadata", "metadata_json", "metadataJson")),
-    }))
+  let edges = sourceEdges
+    .map((edge) => {
+      const from = text(field(edge, "from_node_id", "fromNoteId", "from_note_id", "from", "source"));
+      const to = text(field(edge, "to_node_id", "toNoteId", "to_note_id", "to", "target"));
+      const kind = text(field(edge, "edge_kind", "edgeKind", "kind"), "links_to");
+      return {
+        id: text(field(edge, "id"), `knowledge-edge-${from}-${kind}-${to}`),
+        from,
+        to,
+        kind,
+        metadata: jsonObject(field(edge, "metadata", "metadata_json", "metadataJson")),
+      };
+    })
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+  if (rootNode) {
+    const containmentTargets = new Set(
+      edges
+        .filter((edge) => edge.kind === "contains" || edge.metadata?.containment === true)
+        .map((edge) => edge.to),
+    );
+    nodes
+      .filter((node) => node.id !== rootNode.id && !containmentTargets.has(node.id))
+      .forEach((node) => {
+        edges.unshift({
+          id: `knowledge-root-edge-${rootNode.id}-${node.id}`,
+          from: rootNode.id,
+          to: node.id,
+          kind: "contains",
+          metadata: {
+            source: "knowledge_graph_root",
+            containment: true,
+            synthetic_root: true,
+          },
+        });
+      });
+  }
+  edges = dedupeKnowledgeEdges(edges).sort(compareKnowledgeEdges);
 
   return {
     matrix,
@@ -153,15 +267,18 @@ export function knowledgeNodeTypeLabel(node) {
 
 export function relatedKnowledgeNodes(graph, nodeId) {
   const nodesById = new Map((graph?.nodes || []).map((node) => [node.id, node]));
-  const outbound = [];
-  const backlinks = [];
+  const outboundById = new Map();
+  const backlinksById = new Map();
   for (const edge of graph?.edges || []) {
     if (edge.from === nodeId && nodesById.has(edge.to)) {
-      outbound.push({ edge, node: nodesById.get(edge.to) });
+      if (!outboundById.has(edge.to)) outboundById.set(edge.to, { edge, node: nodesById.get(edge.to) });
     }
     if (edge.to === nodeId && nodesById.has(edge.from)) {
-      backlinks.push({ edge, node: nodesById.get(edge.from) });
+      if (!backlinksById.has(edge.from)) backlinksById.set(edge.from, { edge, node: nodesById.get(edge.from) });
     }
   }
+  const compareRelated = (left, right) => compareKnowledgeNodes(left.node, right.node);
+  const outbound = [...outboundById.values()].sort(compareRelated);
+  const backlinks = [...backlinksById.values()].sort(compareRelated);
   return { outbound, backlinks };
 }

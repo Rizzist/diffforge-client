@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 import { createWorkspaceDisplayIdentity } from "../workspace/workspaceDisplayIdentity.js";
 import GraphRendererHost from "./renderers/GraphRendererHost.jsx";
@@ -27,6 +29,82 @@ import {
 
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
+
+function normalizeGraphEventPath(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+function graphEventMatchesWorkspace(snapshot, repoPath, workspaceId) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  const snapshotWorkspaceId = text(
+    snapshot.workspaceId
+      || snapshot.workspace_id
+      || snapshot.raw?.workspace_id
+      || snapshot.specGraph?.workspace_id
+      || snapshot.knowledgeGraph?.workspace_id,
+  );
+  if (workspaceId && snapshotWorkspaceId && snapshotWorkspaceId === workspaceId) {
+    return true;
+  }
+
+  const snapshotRepoPath = text(snapshot.repoPath || snapshot.repo_path || snapshot.raw?.repo_path);
+  return Boolean(repoPath)
+    && normalizeGraphEventPath(snapshotRepoPath) === normalizeGraphEventPath(repoPath);
+}
+
+function stableGraphValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(stableGraphValue)
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.keys(value)
+    .sort()
+    .reduce((next, key) => {
+      next[key] = stableGraphValue(value[key]);
+      return next;
+    }, {});
+}
+
+function graphSnapshotSignature(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  const graph = snapshot.specGraph || snapshot.knowledgeGraph || snapshot.raw || {};
+  const nodes = Array.isArray(snapshot.specNodes)
+    ? snapshot.specNodes
+    : Array.isArray(snapshot.knowledgeNodes)
+      ? snapshot.knowledgeNodes
+      : Array.isArray(graph.nodes)
+        ? graph.nodes
+        : [];
+  const edges = Array.isArray(snapshot.specEdges)
+    ? snapshot.specEdges
+    : Array.isArray(snapshot.knowledgeEdges)
+      ? snapshot.knowledgeEdges
+      : Array.isArray(graph.edges)
+        ? graph.edges
+        : [];
+  const nodeSignatures = nodes
+    .map((node) => JSON.stringify(stableGraphValue(node)))
+    .sort();
+  const edgeSignatures = edges
+    .map((edge) => JSON.stringify(stableGraphValue(edge)))
+    .sort();
+  return JSON.stringify({
+    repoId: snapshot.repoId || snapshot.repo_id || graph.repo_id || graph.repoId || "",
+    workspaceId: snapshot.workspaceId || snapshot.workspace_id || graph.workspace_id || graph.workspaceId || "",
+    syncState: snapshot.syncState || snapshot.sync_state || "",
+    syncError: snapshot.syncError || snapshot.sync_error || "",
+    graphStats: stableGraphValue(snapshot.graphStats || graph.graph_stats || graph.graphStats || {}),
+    agentWork: stableGraphValue(snapshot.agentWork || graph.agent_work || graph.agentWork || {}),
+    taskHistory: stableGraphValue(snapshot.taskHistory || graph.task_history || graph.taskHistory || {}),
+    nodes: nodeSignatures,
+    edges: edgeSignatures,
+  });
+}
 
 export default function SpecGraphWorkspaceView({
   defaultWorkingDirectory,
@@ -59,14 +137,16 @@ export default function SpecGraphWorkspaceView({
 
   const applySnapshot = useCallback((next) => {
     if (!next || typeof next !== "object") return;
-    setSnapshot(next);
+    const nextSignature = graphSnapshotSignature(next);
+    setSnapshot((current) => (graphSnapshotSignature(current) === nextSignature ? current : next));
     setError(text(next.syncError || next.sync_error));
     setState(text(next.syncState || next.sync_state, "ready"));
   }, []);
 
   const applyKnowledgeSnapshot = useCallback((next) => {
     if (!next || typeof next !== "object") return;
-    setKnowledgeSnapshot(next);
+    const nextSignature = graphSnapshotSignature(next);
+    setKnowledgeSnapshot((current) => (graphSnapshotSignature(current) === nextSignature ? current : next));
     setKnowledgeError(text(next.syncError || next.sync_error));
     setKnowledgeState(text(next.syncState || next.sync_state, "ready"));
   }, []);
@@ -110,7 +190,7 @@ export default function SpecGraphWorkspaceView({
 
     listen(SPEC_GRAPH_CACHE_EVENT, (event) => {
       const next = event?.payload;
-      if (!next || next.repoPath !== repoPath) return;
+      if (!graphEventMatchesWorkspace(next, repoPath, workspaceId)) return;
       applySnapshot(next);
     }).then((nextUnlisten) => {
       if (cancelled) {
@@ -166,7 +246,7 @@ export default function SpecGraphWorkspaceView({
 
     listen(KNOWLEDGE_GRAPH_CACHE_EVENT, (event) => {
       const next = event?.payload;
-      if (!next || next.repoPath !== repoPath) return;
+      if (!graphEventMatchesWorkspace(next, repoPath, workspaceId)) return;
       applyKnowledgeSnapshot(next);
     }).then((nextUnlisten) => {
       if (cancelled) {
@@ -370,6 +450,7 @@ export default function SpecGraphWorkspaceView({
             graph={knowledgeGraph}
             node={selectedKnowledgeNode}
             relations={selectedKnowledgeRelations}
+            onSelect={setSelectedKnowledgeNodeId}
           />
         </KnowledgeGraphShell>
       ) : (
@@ -439,7 +520,20 @@ function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
   );
 }
 
-function KnowledgeInspector({ graph, node, relations }) {
+const knowledgeMarkdownComponents = {
+  table(props) {
+    const tableProps = { ...props };
+    delete tableProps.node;
+
+    return (
+      <div className="knowledge-markdown-table-wrap">
+        <table {...tableProps} />
+      </div>
+    );
+  },
+};
+
+function KnowledgeInspector({ graph, node, relations, onSelect }) {
   if (!node) {
     return (
       <Inspector>
@@ -447,51 +541,166 @@ function KnowledgeInspector({ graph, node, relations }) {
       </Inspector>
     );
   }
-
-  const pathRefs = Array.isArray(node.path_refs) ? node.path_refs : [];
-  const outbound = relations?.outbound || [];
-  const backlinks = relations?.backlinks || [];
+  const markdown = normalizeKnowledgeMarkdownSource(node.markdown);
+  const outbound = Array.isArray(relations?.outbound) ? relations.outbound : [];
+  const backlinks = Array.isArray(relations?.backlinks) ? relations.backlinks : [];
+  const suggested = suggestedKnowledgeNodes(graph, node, relations);
+  const wordCount = knowledgeWordCount(markdown);
 
   return (
     <Inspector>
-      <InspectorHeader>
-        <h2>{node.display_title || node.title}</h2>
-        <InspectorFacts>
-          <span>{knowledgeNodeTypeLabel(node)}</span>
-          <span data-state={node.freshness_state}>{node.knowledge_state || node.freshness_state}</span>
-          <span>{pathRefs.length} paths</span>
-          {Number(node.missing_path_count || 0) > 0 && (
-            <span data-state="out_of_spec">{node.missing_path_count} missing</span>
-          )}
-        </InspectorFacts>
-      </InspectorHeader>
+      <KnowledgeInspectorHeader>
+        <span>Inspector</span>
+        <h2>{text(node.display_title || node.displayTitle || node.title, "Knowledge note")}</h2>
+        <small>{text(node.note_path || node.path || node.markdown_path, ".agents/knowledge")}</small>
+        <KnowledgeMetricRow>
+          <strong>{wordCount.toLocaleString()} <em>words</em></strong>
+          <strong>{outbound.length} <em>out</em></strong>
+          <strong>{backlinks.length} <em>back</em></strong>
+          <strong>{knowledgeNodeTypeLabel(node)}</strong>
+        </KnowledgeMetricRow>
+      </KnowledgeInspectorHeader>
       <MarkdownPane>
-        <KnowledgeMarkdownBlock markdown={node.markdown} />
-        <KnowledgeLinkSection title="Outbound" items={outbound} empty="No linked notes." />
-        <KnowledgeLinkSection title="Backlinks" items={backlinks} empty="No backlinks." />
-        <KnowledgePathSection paths={pathRefs} />
-        <KnowledgeStatsSection graph={graph} />
+        <KnowledgeMarkdownBlock markdown={markdown} />
+        <KnowledgeRelationsPanel>
+          <KnowledgeRelationSection
+            title="Outgoing"
+            items={outbound}
+            empty="No outgoing links."
+            onSelect={onSelect}
+          />
+          <KnowledgeRelationSection
+            title="Backlinks"
+            items={backlinks}
+            empty="No backlinks yet."
+            onSelect={onSelect}
+          />
+          <KnowledgeRelationSection
+            title="Suggested"
+            items={suggested}
+            empty="No suggested notes yet."
+            onSelect={onSelect}
+            suggested
+          />
+        </KnowledgeRelationsPanel>
       </MarkdownPane>
     </Inspector>
   );
 }
 
 function KnowledgeMarkdownBlock({ markdown }) {
-  const lines = text(markdown, "No note content.").split(/\r?\n/);
+  const source = normalizeKnowledgeMarkdownSource(markdown);
+  if (!source) return <InspectorEmpty>No markdown content for this note yet.</InspectorEmpty>;
   return (
-    <KnowledgeSection>
-      <h3>Note</h3>
-      <KnowledgeMarkdown>
-        {lines.map((line, index) => {
-          const trimmed = line.trim();
-          if (!trimmed) return <br key={`line-${index}`} />;
-          if (trimmed.startsWith("# ")) return <strong key={`line-${index}`}>{trimmed.replace(/^#\s+/, "")}</strong>;
-          if (trimmed.startsWith("## ")) return <b key={`line-${index}`}>{trimmed.replace(/^##\s+/, "")}</b>;
-          return <p key={`line-${index}`}>{trimmed}</p>;
-        })}
-      </KnowledgeMarkdown>
-    </KnowledgeSection>
+    <KnowledgeMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={knowledgeMarkdownComponents}>
+        {source}
+      </ReactMarkdown>
+    </KnowledgeMarkdown>
   );
+}
+
+function normalizeKnowledgeMarkdownSource(markdown) {
+  const source = text(markdown).trim();
+  if (!source) return "";
+  return source
+    .split(/\r?\n/)
+    .map((line) => {
+      const expanded = line.replace(
+        /\s+-\s+(?=(?:`|\.{0,2}\/|areas\/|flows\/|systems\/|data\/|notes\/|[A-Za-z0-9_.-]+\.md:))/g,
+        "\n- ",
+      );
+      if (!/^#{1,6}\s/.test(expanded) || !expanded.includes("\n- ")) return expanded;
+      const parts = expanded.split(/\n(?=- )/);
+      return [parts[0].trim(), "", ...parts.slice(1)].join("\n");
+    })
+    .join("\n");
+}
+
+function knowledgeWordCount(markdown) {
+  const plainText = text(markdown)
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/[#*_~>\-[\]()`]/g, " ");
+  return (plainText.match(/[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?/g) || []).length;
+}
+
+function knowledgeKeywordsFor(node) {
+  const pathRefs = Array.isArray(node?.path_refs) ? node.path_refs : [];
+  const raw = [
+    node?.display_title,
+    node?.displayTitle,
+    node?.title,
+    node?.note_path,
+    node?.summary,
+    ...pathRefs,
+  ].join(" ");
+  return new Set(
+    raw
+      .toLowerCase()
+      .replace(/[`"'()[\]{}.,:;/\\_-]/g, " ")
+      .split(/\s+/)
+      .map((word) => word.trim())
+      .filter((word) => word.length >= 4),
+  );
+}
+
+function suggestedKnowledgeNodes(graph, node, relations) {
+  const relationIds = new Set([
+    node?.id,
+    ...(relations?.outbound || []).map((item) => item.node?.id),
+    ...(relations?.backlinks || []).map((item) => item.node?.id),
+  ].filter(Boolean));
+  const activeKeywords = knowledgeKeywordsFor(node);
+  if (!activeKeywords.size) return [];
+  return (graph?.nodes || [])
+    .filter((candidate) => !relationIds.has(candidate.id) && candidate.knowledge_node_type !== "knowledge_root")
+    .map((candidate) => {
+      const candidateKeywords = knowledgeKeywordsFor(candidate);
+      let score = 0;
+      candidateKeywords.forEach((keyword) => {
+        if (activeKeywords.has(keyword)) score += 1;
+      });
+      return { edge: { id: `suggested-${node.id}-${candidate.id}`, kind: "suggested", metadata: { score } }, node: candidate, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || text(left.node.title).localeCompare(text(right.node.title)))
+    .slice(0, 5);
+}
+
+function KnowledgeRelationSection({ title, items, empty, onSelect, suggested = false }) {
+  const visibleItems = Array.isArray(items) ? items : [];
+  return (
+    <KnowledgeRelationGroup>
+      <h3>{title} <span>{visibleItems.length}</span></h3>
+      {visibleItems.length ? (
+        <KnowledgeRelationList>
+          {visibleItems.map(({ edge, node }, index) => (
+            <li key={`${edge.id}-${node.id}-${index}`}>
+              <KnowledgeRelationButton type="button" onClick={() => onSelect?.(node.id)}>
+                <span>{text(node.display_title || node.displayTitle || node.title, "Knowledge note")}</span>
+                <small>
+                  {suggested
+                    ? suggestedKeywordsForDisplay(node).join(" · ")
+                    : text(node.note_path || node.path || node.markdown_path)}
+                </small>
+              </KnowledgeRelationButton>
+            </li>
+          ))}
+        </KnowledgeRelationList>
+      ) : (
+        <KnowledgeRelationEmpty>{empty}</KnowledgeRelationEmpty>
+      )}
+    </KnowledgeRelationGroup>
+  );
+}
+
+function suggestedKeywordsForDisplay(node) {
+  const pathRefs = Array.isArray(node?.path_refs) ? node.path_refs : [];
+  const fallback = text(node.note_path || node.path || node.title)
+    .split(/[\\/._-]+/)
+    .filter((part) => part.length >= 4);
+  return [...pathRefs, ...fallback].slice(0, 4);
 }
 
 function KnowledgeLinkSection({ title, items, empty }) {
@@ -1005,6 +1214,7 @@ function SpecInspector({ node }) {
   }
 
   const specHistory = splitSpecHistory(node.active_specs, node.superseded_specs);
+  const activeAgentCount = Number(node.active_agent_count) || 0;
 
   return (
     <Inspector>
@@ -1016,14 +1226,18 @@ function SpecInspector({ node }) {
           {isLocalOnlyNode(node) && <span data-state="local_only">local only</span>}
           {isLeasedFileNode(node) && <span data-state="leased">leased</span>}
           {isWorktreeFileNode(node) && <span data-state="worktree">isolated</span>}
-          <span>{node.active_agent_count} {node.active_agent_count === 1 ? "agent" : "agents"}</span>
           {(Number(node.out_of_spec_count || node.notification_count) || 0) > 0 && (
             <span data-state="out_of_spec">out of spec: {Number(node.out_of_spec_count || node.notification_count) || 0}</span>
           )}
         </InspectorFacts>
       </InspectorHeader>
       <MarkdownPane>
-        <SpecObjectList title="Active Specs" specs={specHistory.active} empty="No active specs recorded yet." />
+        <SpecObjectList
+          title="Active Specs"
+          specs={specHistory.active}
+          empty="No active specs recorded yet."
+          activeAgentCount={activeAgentCount}
+        />
         <SpecObjectList
           title="Superseded History"
           specs={specHistory.historical}
@@ -1035,7 +1249,7 @@ function SpecInspector({ node }) {
   );
 }
 
-function SpecObjectList({ title, specs, empty, historical = false }) {
+function SpecObjectList({ title, specs, empty, historical = false, activeAgentCount = null }) {
   const visibleSpecs = Array.isArray(specs) ? specs : [];
   const [expandedPriorSpecs, setExpandedPriorSpecs] = useState({});
   const togglePriorSpecs = useCallback((specKey) => {
@@ -1047,7 +1261,14 @@ function SpecObjectList({ title, specs, empty, historical = false }) {
 
   return (
     <SpecObjectsSection>
-      <h3>{title}</h3>
+      <h3>
+        <span>{title}</span>
+        {activeAgentCount !== null && (
+          <SpecObjectsHeadingBadge>
+            {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
+          </SpecObjectsHeadingBadge>
+        )}
+      </h3>
       {visibleSpecs.length ? (
         visibleSpecs.map((spec, index) => {
           const specKey = field(spec, "id") || `${title}-${index}`;
@@ -1150,6 +1371,12 @@ const SpecGraphError = styled.div`
   background: rgba(127, 29, 29, 0.22);
   color: #fecaca;
   padding: 10px;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(180, 35, 24, 0.2);
+    background: rgba(180, 35, 24, 0.08);
+    color: var(--history-red);
+  }
 `;
 
 const SpecGraphToolbar = styled.div`
@@ -1328,6 +1555,11 @@ const SpecGraphMain = styled.main`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--history-border-strong);
+    background: #ffffff;
+  }
 `;
 
 const HistoryMain = styled.main`
@@ -1435,6 +1667,17 @@ const HistoryTaskCard = styled.article`
     border-color: rgba(139, 151, 166, 0.12);
     background: rgba(13, 18, 24, 0.82);
     opacity: 0.76;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.26);
+    background: #ffffff;
+    box-shadow: inset 2px 0 0 var(--history-blue), 0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-rolled-back="true"]:not([data-active="true"]) {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #fafafc;
   }
 `;
 
@@ -1633,6 +1876,11 @@ const HistoryNodeList = styled.div`
   gap: 5px;
   padding: 8px 12px 12px;
   background: rgba(8, 12, 16, 0.48);
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(0, 0, 0, 0.08);
+    background: #f5f5f7;
+  }
 `;
 
 const HistoryNodeButton = styled.button`
@@ -1660,6 +1908,21 @@ const HistoryNodeButton = styled.button`
 
   &[data-created="true"] {
     box-shadow: inset 2px 0 0 var(--history-green);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: #fdfdff;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.3);
+    background: rgba(0, 102, 204, 0.06);
   }
 `;
 
@@ -1753,6 +2016,11 @@ const GraphDeltaHeading = styled.div`
     font-weight: 760;
     letter-spacing: 0.07em;
     text-transform: uppercase;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background: #eeeeef;
   }
 `;
 
@@ -1929,6 +2197,11 @@ const Inspector = styled.aside`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--history-border-strong);
+    background: #ffffff;
+  }
 `;
 
 const InspectorHeader = styled.header`
@@ -1996,6 +2269,106 @@ const InspectorFacts = styled.div`
     border-color: rgba(136, 165, 200, 0.36);
     color: var(--history-blue);
   }
+
+  span[data-state="local_only"],
+  span[data-state="leased"] {
+    border-color: rgba(139, 90, 0, 0.26);
+    color: var(--history-amber);
+  }
+`;
+
+const KnowledgeInspectorHeader = styled.header`
+  border-bottom: 1px solid var(--history-border);
+  background:
+    radial-gradient(circle at 12% 0%, rgba(136, 165, 200, 0.09), transparent 38%),
+    rgba(7, 12, 19, 0.4);
+  flex-shrink: 0;
+  padding: 18px 22px 16px;
+
+  > span {
+    color: var(--history-subtle);
+    display: block;
+    font-size: 10px;
+    font-weight: 740;
+    letter-spacing: 0.08em;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+  }
+
+  h2 {
+    color: rgba(248, 250, 252, 0.94);
+    font-size: 20px;
+    font-weight: 680;
+    letter-spacing: -0.026em;
+    line-height: 1.18;
+    margin: 0;
+  }
+
+  small {
+    color: rgba(148, 163, 184, 0.76);
+    display: block;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.45;
+    margin-top: 7px;
+    overflow-wrap: anywhere;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      radial-gradient(circle at 12% 0%, rgba(0, 102, 204, 0.07), transparent 40%),
+      #ffffff;
+  }
+
+  html[data-forge-theme="light"] & h2 {
+    color: rgba(29, 29, 31, 0.94);
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: rgba(90, 96, 108, 0.82);
+  }
+`;
+
+const KnowledgeMetricRow = styled.div`
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  margin-top: 14px;
+
+  strong {
+    align-items: baseline;
+    color: rgba(226, 232, 240, 0.9);
+    display: inline-flex;
+    font-size: 12px;
+    font-weight: 650;
+    gap: 4px;
+    line-height: 1;
+    padding: 0 12px;
+  }
+
+  strong:first-child {
+    padding-left: 0;
+  }
+
+  strong + strong {
+    border-left: 1px solid rgba(148, 163, 184, 0.16);
+  }
+
+  em {
+    color: rgba(148, 163, 184, 0.74);
+    font-style: normal;
+    font-weight: 560;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: rgba(29, 29, 31, 0.84);
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: rgba(90, 96, 108, 0.72);
+  }
 `;
 
 const MarkdownPane = styled.div`
@@ -2009,44 +2382,344 @@ const SpecObjectsSection = styled.section`
   padding: 12px;
 
   h3 {
+    align-items: center;
     color: var(--history-muted);
+    display: flex;
     font-size: 10px;
     font-weight: 740;
+    gap: 8px;
     letter-spacing: 0.06em;
     margin: 0 0 8px;
     text-transform: uppercase;
   }
 `;
 
+const SpecObjectsHeadingBadge = styled.span`
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  color: var(--history-muted);
+  font-size: 10px;
+  font-weight: 680;
+  letter-spacing: 0;
+  line-height: 1;
+  margin-left: auto;
+  padding: 5px 8px;
+  text-transform: lowercase;
+`;
+
 const KnowledgeSection = styled(SpecObjectsSection)``;
 
 const KnowledgeMarkdown = styled.div`
-  display: grid;
-  gap: 7px;
+  min-width: 0;
+  width: min(100%, 68ch);
+  margin: 0 auto;
+  padding: 28px 28px 46px;
+  color: rgba(226, 232, 240, 0.82);
+  font-family: ui-sans-serif, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-size: 13.5px;
+  font-weight: 430;
+  letter-spacing: -0.003em;
+  line-height: 1.72;
+  overflow-wrap: break-word;
+  user-select: text;
+  -webkit-user-select: text;
 
-  strong,
-  b {
-    color: var(--history-text);
-    display: block;
-    font-size: 12px;
-    font-weight: 760;
-    line-height: 1.35;
+  > :first-child {
+    margin-top: 0;
   }
 
-  b {
-    color: var(--history-blue);
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+  > :last-child {
+    margin-bottom: 0;
   }
 
   p {
-    color: var(--history-muted);
-    font-size: 11.5px;
-    font-weight: 560;
-    line-height: 1.48;
+    margin: 0 0 14px;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    color: rgba(248, 250, 252, 0.94);
+    font-weight: 660;
+    letter-spacing: -0.015em;
+    line-height: 1.28;
+  }
+
+  h1 {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.13);
+    font-size: 1.5em;
+    margin: 0 0 18px;
+    padding-bottom: 12px;
+  }
+
+  h2 {
+    font-size: 1.2em;
+    margin: 28px 0 10px;
+  }
+
+  h3,
+  h4 {
+    font-size: 1.05em;
+    margin: 22px 0 8px;
+  }
+
+  ul,
+  ol {
+    margin: 8px 0 18px;
+    padding-left: 1.35em;
+  }
+
+  li {
+    color: rgba(226, 232, 240, 0.78);
+    margin: 6px 0;
+    padding-left: 4px;
+  }
+
+  li::marker {
+    color: rgba(148, 163, 184, 0.58);
+  }
+
+  li > p {
     margin: 0;
+  }
+
+  li > p + p {
+    margin-top: 7px;
+  }
+
+  blockquote {
+    margin: 16px 0;
+    border-left: 2px solid rgba(148, 163, 184, 0.3);
+    padding: 2px 0 2px 14px;
+    color: rgba(203, 213, 225, 0.68);
+  }
+
+  a {
+    color: rgba(147, 197, 253, 0.88);
+    font-weight: 520;
+    text-decoration: none;
+  }
+
+  a:hover {
+    color: var(--history-text);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  code {
+    border-radius: 5px;
+    padding: 0.12em 0.38em 0.16em;
+    color: rgba(203, 213, 225, 0.9);
+    background: rgba(148, 163, 184, 0.1);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.88em;
+    font-weight: 500;
+  }
+
+  pre {
+    max-width: 100%;
+    margin: 16px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 10px;
+    padding: 13px 14px;
+    background: rgba(15, 23, 42, 0.46);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    line-height: 1.58;
+    white-space: pre;
+  }
+
+  pre code {
+    display: block;
+    min-width: max-content;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-weight: 500;
+    white-space: pre;
+    overflow-wrap: normal;
+  }
+
+  .knowledge-markdown-table-wrap {
+    max-width: 100%;
+    margin: 16px 0;
+    overflow-x: auto;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 10px;
+  }
+
+  table {
+    width: 100%;
+    min-width: 420px;
+    border-collapse: collapse;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    color: rgba(248, 250, 252, 0.9);
+    background: rgba(148, 163, 184, 0.08);
+    font-weight: 620;
+  }
+
+  tr:last-child td {
+    border-bottom: 0;
+  }
+
+  hr {
+    height: 1px;
+    margin: 22px 0;
+    border: 0;
+    background: rgba(148, 163, 184, 0.14);
+  }
+
+  strong {
+    color: rgba(248, 250, 252, 0.9);
+    font-weight: 620;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(29, 29, 31, 0.78);
+  }
+
+  html[data-forge-theme="light"] & h1,
+  html[data-forge-theme="light"] & h2,
+  html[data-forge-theme="light"] & h3,
+  html[data-forge-theme="light"] & h4,
+  html[data-forge-theme="light"] & strong {
+    color: rgba(29, 29, 31, 0.94);
+  }
+
+  html[data-forge-theme="light"] & li {
+    color: rgba(29, 29, 31, 0.76);
+  }
+
+  html[data-forge-theme="light"] & code {
+    color: rgba(0, 102, 204, 0.92);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] & pre,
+  html[data-forge-theme="light"] & .knowledge-markdown-table-wrap {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(0, 0, 0, 0.028);
+  }
+`;
+
+const KnowledgeRelationsPanel = styled.div`
+  border-top: 1px solid rgba(148, 163, 184, 0.13);
+  display: grid;
+  gap: 22px;
+  margin: 0 auto;
+  padding: 22px 28px 34px;
+  width: min(100%, 68ch);
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(0, 0, 0, 0.08);
+  }
+`;
+
+const KnowledgeRelationGroup = styled.section`
+  h3 {
+    align-items: center;
+    color: rgba(226, 232, 240, 0.78);
+    display: flex;
+    font-size: 12px;
+    font-weight: 650;
+    gap: 8px;
+    letter-spacing: -0.01em;
+    margin: 0 0 10px;
+  }
+
+  h3 span {
+    color: rgba(148, 163, 184, 0.7);
+    font-size: 11px;
+    font-weight: 560;
+  }
+
+  html[data-forge-theme="light"] & h3 {
+    color: rgba(29, 29, 31, 0.78);
+  }
+
+  html[data-forge-theme="light"] & h3 span {
+    color: rgba(90, 96, 108, 0.72);
+  }
+`;
+
+const KnowledgeRelationList = styled.ul`
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+`;
+
+const KnowledgeRelationButton = styled.button`
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+  padding: 7px 8px;
+  text-align: left;
+  transition: background 140ms ease;
+  width: 100%;
+
+  &:hover {
+    background: rgba(148, 163, 184, 0.08);
+  }
+
+  span {
+    color: rgba(226, 232, 240, 0.82);
+    font-size: 13px;
+    font-weight: 560;
+    line-height: 1.32;
     overflow-wrap: anywhere;
+  }
+
+  small {
+    color: rgba(148, 163, 184, 0.66);
+    font-size: 11.5px;
+    font-weight: 480;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 0, 0, 0.045);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: rgba(29, 29, 31, 0.82);
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: rgba(90, 96, 108, 0.7);
+  }
+`;
+
+const KnowledgeRelationEmpty = styled.div`
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 8px;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(90, 96, 108, 0.68);
   }
 `;
 
@@ -2121,6 +2794,11 @@ const HistoryDetailCard = styled.article`
     border-color: rgba(139, 151, 166, 0.14);
     background: rgba(13, 18, 24, 0.82);
     opacity: 0.74;
+  }
+
+  html[data-forge-theme="light"] &[data-rolled-back="true"] {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: #fafafc;
   }
 
   p {
@@ -2250,6 +2928,19 @@ const SpecObjectCard = styled.article`
     line-height: 1.4;
     margin-top: 7px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: ${({ $historical }) => ($historical ? "rgba(0, 0, 0, 0.1)" : "rgba(10, 127, 69, 0.24)")};
+    background: ${({ $historical }) => ($historical ? "#fafafc" : "rgba(10, 127, 69, 0.09)")};
+  }
+
+  html[data-forge-theme="light"] & p {
+    color: ${({ $historical }) => ($historical ? "var(--history-muted)" : "var(--history-text)")};
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: var(--history-amber);
+  }
 `;
 
 const PriorSpecsButton = styled.button`
@@ -2275,6 +2966,18 @@ const PriorSpecsButton = styled.button`
   svg {
     transform: ${({ $expanded }) => ($expanded ? "rotate(-90deg)" : "rotate(0deg)")};
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(10, 127, 69, 0.24);
+    background: rgba(10, 127, 69, 0.08);
+    color: var(--history-green);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(10, 127, 69, 0.34);
+    background: rgba(10, 127, 69, 0.12);
+    color: var(--history-green);
+  }
 `;
 
 const PriorSpecsIcon = styled(KeyboardArrowLeft)`
@@ -2289,6 +2992,10 @@ const PriorSpecsList = styled.div`
   gap: 7px;
   margin-top: 8px;
   padding-left: 9px;
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(10, 127, 69, 0.24);
+  }
 `;
 
 const PriorSpecItem = styled.div`
@@ -2319,12 +3026,33 @@ const PriorSpecItem = styled.div`
   small {
     color: rgba(251, 191, 36, 0.74);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--history-muted);
+  }
+
+  html[data-forge-theme="light"] & p {
+    color: var(--history-text);
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: var(--history-amber);
+  }
 `;
 
 const SpecObjectsEmpty = styled.div`
   color: rgba(219, 231, 247, 0.38);
   font-size: 11px;
   font-weight: 650;
+
+  html[data-forge-theme="light"] & {
+    color: var(--history-muted);
+  }
 `;
 
 const InspectorEmpty = styled.div`
@@ -2332,4 +3060,8 @@ const InspectorEmpty = styled.div`
   font-size: 12px;
   font-weight: 680;
   padding: 14px;
+
+  html[data-forge-theme="light"] & {
+    color: var(--history-muted);
+  }
 `;

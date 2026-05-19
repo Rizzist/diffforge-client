@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   Controls,
@@ -32,6 +32,21 @@ const KIND_TONES = {
   file: "#60a5fa",
   abstract: "#c084fc",
 };
+const LIGHT_READABLE_TONES = {
+  "#22c55e": "#0a7f45",
+  "#34d399": "#047857",
+  "#38bdf8": "#0066cc",
+  "#60a5fa": "#0066cc",
+  "#2dd4bf": "#0f766e",
+  "#a78bfa": "#6d28d9",
+  "#c084fc": "#7e22ce",
+  "#f59e0b": "#8b5a00",
+  "#fbbf24": "#8b5a00",
+  "#fb923c": "#9a3412",
+  "#fb7185": "#b42318",
+  "#94a3b8": "#64748b",
+  "#64748b": "#475569",
+};
 
 const EDGE_ANCHORS = [
   { id: "top-left", position: Position.Top, x: 0.24, y: 0 },
@@ -50,6 +65,11 @@ const EDGE_ANCHORS = [
 
 function colorWithAlpha(color, alpha) {
   return color?.startsWith("#") ? `${color}${alpha}` : color;
+}
+
+function lightReadableTone(color, fallback = "#0066cc") {
+  const key = typeof color === "string" ? color.trim().toLowerCase() : "";
+  return LIGHT_READABLE_TONES[key] || color || fallback;
 }
 
 function kindTone(kind) {
@@ -72,22 +92,48 @@ function sourceLabel(sourceState) {
 }
 
 function flowEdgeColor(edge, sourceNode, targetNode) {
+  if ([sourceNode, targetNode].some((node) => node && isNoSpecNode(node))) {
+    return isContainmentEdge(edge) ? "rgba(100, 116, 139, 0.38)" : "rgba(100, 116, 139, 0.46)";
+  }
   if (isContainmentEdge(edge)) {
     return "rgba(148, 163, 184, 0.58)";
   }
   const abstractNode = [sourceNode, targetNode].find((node) => nodeKind(node) === "abstract");
-  if (abstractNode) return colorWithAlpha(nodeTone(abstractNode), "cc");
+  if (abstractNode) return colorWithAlpha(nodeTone(abstractNode), "8f");
   return colorWithAlpha(nodeSourceTone(targetNode || sourceNode), "cc");
 }
 
 function flowEdgeStyle(edge, sourceNode, targetNode) {
   const abstractLink = !isContainmentEdge(edge)
     && [sourceNode, targetNode].some((node) => nodeKind(node) === "abstract");
+  const mutedLink = [sourceNode, targetNode].some((node) => node && isNoSpecNode(node));
   return {
     stroke: flowEdgeColor(edge, sourceNode, targetNode),
-    strokeWidth: isContainmentEdge(edge) ? 2.1 : 2.7,
-    strokeDasharray: abstractLink ? "6 7" : undefined,
+    strokeWidth: mutedLink ? 1.7 : (abstractLink ? 1.9 : (isContainmentEdge(edge) ? 2.1 : 2.7)),
+    strokeDasharray: abstractLink ? "4 8" : undefined,
+    opacity: abstractLink ? 0.64 : undefined,
   };
+}
+
+function edgeTouchesNode(edge, nodeId) {
+  return Boolean(nodeId) && (edge.from === nodeId || edge.to === nodeId);
+}
+
+function edgeTouchesAbstract(edge, sourceNode, targetNode) {
+  return !isContainmentEdge(edge)
+    && [sourceNode, targetNode].some((node) => nodeKind(node) === "abstract");
+}
+
+function nodeFocusClassName(nodeId, hoveredNodeId, hoveredNeighborIds) {
+  if (!hoveredNodeId) return "";
+  if (nodeId === hoveredNodeId) return "df-node-hovered";
+  if (hoveredNeighborIds.has(nodeId)) return "df-node-connected";
+  return "df-node-dimmed";
+}
+
+function edgeFocusClassName(edge, hoveredNodeId) {
+  if (!hoveredNodeId) return "";
+  return edgeTouchesNode(edge, hoveredNodeId) ? "df-edge-highlighted" : "df-edge-dimmed";
 }
 
 function prefixedHandleId(type, anchorId) {
@@ -182,12 +228,13 @@ function closestEdgeHandles(edge, nodeById, layout) {
   };
 }
 
-function toFlowEdges(edges, nodes, layout) {
+function toFlowEdges(edges, nodes, layout, hoveredNodeId) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   return edges.map((edge) => {
     const sourceNode = nodeById.get(edge.from);
     const targetNode = nodeById.get(edge.to);
     const color = flowEdgeColor(edge, sourceNode, targetNode);
+    const focused = edgeTouchesNode(edge, hoveredNodeId);
     return {
       id: edge.id,
       source: edge.from,
@@ -195,7 +242,11 @@ function toFlowEdges(edges, nodes, layout) {
       ...closestEdgeHandles(edge, nodeById, layout),
       type: isContainmentEdge(edge) ? "straight" : "bezier",
       animated: !isContainmentEdge(edge),
-      zIndex: 0,
+      className: [
+        edgeTouchesAbstract(edge, sourceNode, targetNode) ? "df-edge-abstract" : "",
+        edgeFocusClassName(edge, hoveredNodeId),
+      ].filter(Boolean).join(" "),
+      zIndex: focused ? 4 : 0,
       interactionWidth: 18,
       markerEnd: {
         type: MarkerType.ArrowClosed,
@@ -243,14 +294,24 @@ export default function XyflowGraphRenderer({
   const activeLayout = layout || EMPTY_LAYOUT;
 
   useEffect(() => {
-    if (!nodes.length || layoutPending) {
+    if (!nodes.length) {
       setFlowNodes([]);
       setFlowEdges([]);
-      if (!nodes.length) lastFitTopologyRef.current = "";
+      lastFitTopologyRef.current = "";
       return;
     }
 
-    const topologyKey = `${nodes.map((node) => node.id).join("|")}:${edges.map((edge) => edge.id).join("|")}`;
+    if (layoutPending) {
+      return;
+    }
+
+    const topologyKey = [
+      nodes.map((node) => node.id).filter(Boolean).sort().join("|"),
+      edges
+        .map((edge) => `${edge.from || ""}->${edge.to || ""}:${edge.kind || ""}`)
+        .sort()
+        .join("|"),
+    ].join(":");
     const nextNodes = nodes.map((node) => {
       const dimensions = dimensionsForNode(node);
       return {
@@ -258,10 +319,11 @@ export default function XyflowGraphRenderer({
         type: "specGraphNode",
         position: activeLayout.get(node.id) || { x: 0, y: 0 },
         zIndex: 10,
+        className: "",
         data: {
           node,
           onSelect,
-          selected: false,
+          selected: node.id === selectedNodeId,
         },
         draggable: false,
         selectable: true,
@@ -272,14 +334,14 @@ export default function XyflowGraphRenderer({
       };
     });
     setFlowNodes(nextNodes);
-    setFlowEdges(toFlowEdges(edges, nodes, activeLayout));
+    setFlowEdges(toFlowEdges(edges, nodes, activeLayout, null));
     if (topologyKey !== lastFitTopologyRef.current) {
       lastFitTopologyRef.current = topologyKey;
       window.requestAnimationFrame(() => {
         flowInstanceRef.current?.fitView({ padding: 0.18, duration: 360 });
       });
     }
-  }, [activeLayout, edges, layoutPending, nodes, onSelect, setFlowEdges, setFlowNodes]);
+  }, [activeLayout, edges, layoutPending, nodes, onSelect, selectedNodeId, setFlowEdges, setFlowNodes]);
 
   useEffect(() => {
     setFlowNodes((current) => current.map((node) => ({
@@ -296,7 +358,7 @@ export default function XyflowGraphRenderer({
     return <EmptyState>{isSyncing ? "Syncing graph..." : emptyLabel}</EmptyState>;
   }
 
-  if (layoutPending) {
+  if (layoutPending && !flowNodes.length) {
     return <EmptyState>{layoutLabel}</EmptyState>;
   }
 
@@ -366,6 +428,7 @@ function SpecGraphNode({ data, selected }) {
       <SourceAccent
         aria-hidden="true"
         $kind={kind}
+        $noSpec={noSpec}
         $sourceState={sourceState}
         $sourceTone={sourceTone}
       />
@@ -404,7 +467,7 @@ function SpecGraphNode({ data, selected }) {
         <NodeKindLabel $kind={kind} $noSpec={noSpec} $statusTone={statusTone}>
           {noSpec ? "no spec" : kind}
         </NodeKindLabel>
-        {source && kind !== "folder" && (
+        {source && kind !== "folder" && !noSpec && (
           <NodeSourceChip $sourceTone={sourceTone}>{source}</NodeSourceChip>
         )}
       </NodeMetaRow>
@@ -427,8 +490,36 @@ const FlowFrame = styled.div`
     background: #ffffff;
   }
 
+  html[data-forge-theme="light"] & .react-flow__node.df-node-connected {
+    opacity: 0.86;
+  }
+
+  html[data-forge-theme="light"] & .react-flow__node.df-node-dimmed {
+    opacity: 0.34;
+  }
+
   .react-flow__node {
-    transition: transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    transition:
+      filter 180ms ease,
+      opacity 180ms ease,
+      transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .react-flow__node.df-node-hovered {
+    filter: saturate(1.08);
+    opacity: 1;
+    z-index: 12 !important;
+  }
+
+  .react-flow__node.df-node-connected {
+    filter: saturate(0.95);
+    opacity: 0.78;
+    z-index: 11 !important;
+  }
+
+  .react-flow__node.df-node-dimmed {
+    filter: grayscale(0.42) saturate(0.48);
+    opacity: 0.24;
   }
 
   .react-flow__edges {
@@ -440,13 +531,58 @@ const FlowFrame = styled.div`
   }
 
   .react-flow__edge {
+    opacity: 1;
+    transition: opacity 180ms ease;
     z-index: 1 !important;
   }
 
   .react-flow__edge-path {
-    transition: stroke 180ms ease, stroke-width 180ms ease;
+    transition:
+      filter 180ms ease,
+      opacity 180ms ease,
+      stroke 180ms ease,
+      stroke-width 180ms ease;
     filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.45));
     stroke-linecap: round;
+  }
+
+  .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) {
+    opacity: 0.62;
+  }
+
+  .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) .react-flow__edge-path {
+    filter: drop-shadow(0 0 4px rgba(125, 211, 252, 0.18));
+  }
+
+  .react-flow__edge.df-edge-highlighted {
+    opacity: 1;
+    z-index: 6 !important;
+  }
+
+  .react-flow__edge.df-edge-highlighted .react-flow__edge-path {
+    filter: drop-shadow(0 0 10px rgba(45, 212, 191, 0.5));
+    opacity: 1 !important;
+    stroke-width: 3.25px !important;
+  }
+
+  .react-flow__edge.df-edge-dimmed {
+    opacity: 0.12;
+  }
+
+  .react-flow__edge.df-edge-dimmed .react-flow__edge-path {
+    filter: none;
+  }
+
+  html[data-forge-theme="light"] & .react-flow__edge-path {
+    filter: none;
+  }
+
+  html[data-forge-theme="light"] & .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) {
+    opacity: 0.74;
+  }
+
+  html[data-forge-theme="light"] & .react-flow__edge.df-edge-dimmed {
+    opacity: 0.18;
   }
 
   .react-flow__controls {
@@ -475,8 +611,10 @@ const FlowFrame = styled.div`
 
 const FlowNodeCard = styled.button`
   align-items: center;
-  border: ${({ $active, $kind, $kindTone, $sourceState, $sourceTone, $statusTone }) => {
+  border: ${({ $active, $kind, $kindTone, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+    if ($active && $noSpec) return "1px solid rgba(148, 163, 184, 0.5)";
     if ($active) return `1.5px solid ${$statusTone || "#38bdf8"}`;
+    if ($noSpec) return "1px solid rgba(100, 116, 139, 0.32)";
     if ($sourceState === "lease") return `1.5px dashed ${$sourceTone || "#f59e0b"}`;
     if ($sourceState === "local") return `1.2px dotted ${$sourceTone || "#94a3b8"}`;
     if ($sourceState === "worktree") return `1.2px solid ${colorWithAlpha($sourceTone || "#38bdf8", "cc")}`;
@@ -492,7 +630,7 @@ const FlowNodeCard = styled.button`
   }};
   background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
     if ($noSpec) {
-      return "linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.98))";
+      return "rgba(15, 23, 42, 0.64)";
     }
     if ($kind === "abstract") {
       return `
@@ -507,6 +645,9 @@ const FlowNodeCard = styled.button`
     `;
   }};
   box-shadow: ${({ $active, $live, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+    if ($active && $noSpec) {
+      return "0 0 0 2px rgba(100, 116, 139, 0.14), 0 10px 24px rgba(0, 0, 0, 0.18)";
+    }
     if ($active) {
       return `0 0 0 2px ${colorWithAlpha($statusTone || "#38bdf8", "55")}, 0 0 0 5px ${colorWithAlpha($sourceTone || "#38bdf8", "22")}, 0 18px 44px rgba(0, 0, 0, 0.34)`;
     }
@@ -517,7 +658,7 @@ const FlowNodeCard = styled.button`
       return `0 0 0 1px ${colorWithAlpha($sourceTone || "#38bdf8", "33")}, 0 0 24px ${colorWithAlpha($sourceTone || "#38bdf8", "1f")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
     }
     if ($live) return `0 0 0 1px ${colorWithAlpha($sourceTone || "#34d399", "33")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
-    if ($noSpec) return "0 9px 22px rgba(0, 0, 0, 0.2)";
+    if ($noSpec) return "0 8px 18px rgba(0, 0, 0, 0.14)";
     return "0 12px 30px rgba(0, 0, 0, 0.2)";
   }};
   color: inherit;
@@ -528,7 +669,10 @@ const FlowNodeCard = styled.button`
   height: 100%;
   justify-content: center;
   min-width: 0;
-  opacity: ${({ $sourceState }) => ($sourceState === "local" ? 0.76 : 1)};
+  opacity: ${({ $active, $noSpec, $sourceState }) => {
+    if ($noSpec) return $active ? 0.86 : 0.7;
+    return $sourceState === "local" ? 0.76 : 1;
+  }};
   outline: none;
   overflow: visible;
   padding: ${({ $kind }) => {
@@ -544,9 +688,13 @@ const FlowNodeCard = styled.button`
   &::before {
     background: ${({ $kind, $kindTone, $noSpec }) => {
       if ($kind !== "folder") return "transparent";
-      return $noSpec ? "rgba(100, 116, 139, 0.92)" : colorWithAlpha($kindTone || "#a78bfa", "88");
+      return $noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($kindTone || "#a78bfa", "88");
     }};
-    border: ${({ $kind, $sourceTone }) => ($kind === "folder" ? `1px solid ${colorWithAlpha($sourceTone || "#22c55e", "aa")}` : "0")};
+    border: ${({ $kind, $noSpec, $sourceTone }) => (
+      $kind === "folder"
+        ? `1px solid ${$noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($sourceTone || "#22c55e", "aa")}`
+        : "0"
+    )};
     border-bottom: 0;
     border-radius: 8px 8px 3px 3px;
     content: "";
@@ -564,10 +712,10 @@ const FlowNodeCard = styled.button`
     pointer-events: none;
     position: absolute;
     z-index: 1;
-    ${({ $kind, $kindTone, $sourceTone }) => {
+    ${({ $kind, $kindTone, $noSpec, $sourceTone }) => {
       if ($kind === "file") {
         return `
-          background: ${colorWithAlpha($sourceTone || "#22c55e", "cc")};
+          background: ${$noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($sourceTone || "#22c55e", "cc")};
           clip-path: polygon(100% 0, 0 0, 100% 100%);
           height: 14px;
           right: 0;
@@ -590,22 +738,59 @@ const FlowNodeCard = styled.button`
     }}
   }
 
-  &:hover {
-    border-color: ${({ $sourceTone, $statusTone }) => $sourceTone || $statusTone || "#38bdf8"};
-    transform: scale(1.025);
+  html[data-forge-theme="light"] & {
+    border-color: ${({ $active, $noSpec, $sourceTone, $statusTone }) => (
+      $active
+        ? lightReadableTone($noSpec ? "#64748b" : ($statusTone || $sourceTone))
+        : colorWithAlpha(lightReadableTone($noSpec ? "#64748b" : ($sourceTone || $statusTone)), "40")
+    )};
+    background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+      if ($noSpec) return "#f8fafc";
+      if ($kind === "abstract") {
+        return `linear-gradient(135deg, ${colorWithAlpha(lightReadableTone($kindTone, "#7e22ce"), "12")}, #ffffff 58%)`;
+      }
+      return `linear-gradient(180deg, #ffffff, ${colorWithAlpha(lightReadableTone($statusTone || "#0066cc"), "08")})`;
+    }};
+    box-shadow: ${({ $active, $noSpec, $sourceTone, $statusTone }) => (
+      $active
+        ? `0 0 0 2px ${colorWithAlpha(lightReadableTone($noSpec ? "#64748b" : ($statusTone || $sourceTone)), "24")}, 0 1px 2px rgba(0, 0, 0, 0.06)`
+        : "0 1px 2px rgba(0, 0, 0, 0.05)"
+    )};
+    opacity: ${({ $active, $noSpec, $sourceState }) => {
+      if ($noSpec) return $active ? 0.94 : 0.82;
+      return $sourceState === "local" ? 0.84 : 1;
+    }};
   }
 
-  html[data-forge-theme="light"] & {
-    border-color: ${({ $active, $sourceTone, $statusTone }) => (
-      $active ? ($statusTone || "#0066cc") : colorWithAlpha($sourceTone || $statusTone || "#0066cc", "33")
+  html[data-forge-theme="light"] &::before {
+    background: ${({ $kind, $kindTone, $noSpec }) => {
+      if ($kind !== "folder") return "transparent";
+      return $noSpec ? "#94a3b8" : colorWithAlpha(lightReadableTone($kindTone || "#7e22ce"), "66");
+    }};
+    border-color: ${({ $noSpec, $sourceTone }) => (
+      $noSpec ? "#94a3b8" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "99")
     )};
-    background: #ffffff;
-    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &::after {
+    ${({ $kind, $kindTone, $noSpec, $sourceTone }) => {
+      if ($kind === "file") {
+        return `background: ${$noSpec ? "#94a3b8" : lightReadableTone($sourceTone || "#0a7f45")};`;
+      }
+      if ($kind === "abstract") {
+        return `
+          background: #ffffff;
+          border-color: ${colorWithAlpha(lightReadableTone($kindTone || "#7e22ce"), "aa")};
+        `;
+      }
+      return "";
+    }}
   }
 
   html[data-forge-theme="light"] &:hover {
-    border-color: ${({ $sourceTone, $statusTone }) => $sourceTone || $statusTone || "#0066cc"};
-    transform: scale(1.015);
+    border-color: ${({ $noSpec, $sourceTone, $statusTone }) => (
+      lightReadableTone($noSpec ? "#64748b" : ($sourceTone || $statusTone), "#0066cc")
+    )};
   }
 `;
 
@@ -613,19 +798,19 @@ const SourceAccent = styled.span`
   pointer-events: none;
   position: absolute;
   z-index: 1;
-  ${({ $kind, $sourceState, $sourceTone }) => {
+  ${({ $kind, $noSpec, $sourceState, $sourceTone }) => {
     if ($sourceState === "unknown") return "display: none;";
     if ($kind === "workspace") {
       return `
         background: transparent;
-        border: 1.5px solid ${colorWithAlpha($sourceTone || "#22c55e", "88")};
+        border: 1px solid ${$noSpec ? "rgba(100, 116, 139, 0.36)" : colorWithAlpha($sourceTone || "#22c55e", "88")};
         border-radius: 999px;
         inset: 8px;
       `;
     }
     if ($kind === "folder") {
       return `
-        background: ${colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        background: ${$noSpec ? "rgba(100, 116, 139, 0.44)" : colorWithAlpha($sourceTone || "#22c55e", "d9")};
         border-radius: 999px;
         bottom: 6px;
         height: 3px;
@@ -635,7 +820,7 @@ const SourceAccent = styled.span`
     }
     if ($kind === "file") {
       return `
-        background: ${colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        background: ${$noSpec ? "rgba(100, 116, 139, 0.44)" : colorWithAlpha($sourceTone || "#22c55e", "d9")};
         border-radius: 0 999px 999px 0;
         bottom: 13px;
         left: 0;
@@ -644,7 +829,7 @@ const SourceAccent = styled.span`
       `;
     }
     return `
-      background: ${colorWithAlpha($sourceTone || "#94a3b8", "b8")};
+      background: ${$noSpec ? "rgba(100, 116, 139, 0.42)" : colorWithAlpha($sourceTone || "#94a3b8", "b8")};
       border-radius: 999px;
       bottom: 10px;
       height: 2px;
@@ -653,6 +838,16 @@ const SourceAccent = styled.span`
       width: 24px;
     `;
   }}
+
+  html[data-forge-theme="light"] & {
+    ${({ $kind, $noSpec, $sourceState, $sourceTone }) => {
+      if ($sourceState === "unknown") return "";
+      if ($kind === "workspace") {
+        return `border-color: ${$noSpec ? "rgba(100, 116, 139, 0.42)" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "88")};`;
+      }
+      return `background: ${$noSpec ? "rgba(100, 116, 139, 0.58)" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "d9")};`;
+    }}
+  }
 `;
 
 const NodeMetaRow = styled.div`
@@ -668,7 +863,7 @@ const NodeMetaRow = styled.div`
 
 const NodeKindLabel = styled.span`
   color: ${({ $kind, $noSpec, $statusTone }) => {
-    if ($noSpec) return "rgba(226, 232, 240, 0.62)";
+    if ($noSpec) return "rgba(203, 213, 225, 0.5)";
     if ($kind === "workspace") return "rgba(167, 243, 208, 0.84)";
     return colorWithAlpha($statusTone || "#e2e8f0", "cc");
   }};
@@ -687,9 +882,9 @@ const NodeKindLabel = styled.span`
 
   html[data-forge-theme="light"] & {
     color: ${({ $kind, $noSpec, $statusTone }) => {
-      if ($noSpec) return "#7a7a7a";
-      if ($kind === "workspace") return "#0a7f45";
-      return $statusTone || "#0066cc";
+      if ($noSpec) return "#64748b";
+      if ($kind === "workspace") return "#047857";
+      return lightReadableTone($statusTone || "#0066cc");
     }};
   }
 `;
@@ -711,14 +906,14 @@ const NodeSourceChip = styled.span`
   white-space: nowrap;
 
   html[data-forge-theme="light"] & {
-    background: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#0066cc", "12")};
-    border-color: ${({ $sourceTone }) => colorWithAlpha($sourceTone || "#0066cc", "44")};
-    color: ${({ $sourceTone }) => $sourceTone || "#0066cc"};
+    background: ${({ $sourceTone }) => colorWithAlpha(lightReadableTone($sourceTone || "#0066cc"), "12")};
+    border-color: ${({ $sourceTone }) => colorWithAlpha(lightReadableTone($sourceTone || "#0066cc"), "44")};
+    color: ${({ $sourceTone }) => lightReadableTone($sourceTone || "#0066cc")};
   }
 `;
 
 const NodeTitle = styled.div`
-  color: ${({ $noSpec }) => ($noSpec ? "rgba(238, 245, 255, 0.78)" : "var(--forge-text-soft, #eef5ff)")};
+  color: ${({ $noSpec }) => ($noSpec ? "rgba(226, 232, 240, 0.68)" : "var(--forge-text-soft, #eef5ff)")};
   display: -webkit-box;
   font-size: ${({ $kind }) => {
     if ($kind === "workspace") return "14px";
@@ -743,7 +938,7 @@ const NodeTitle = styled.div`
   word-break: break-word;
 
   html[data-forge-theme="light"] & {
-    color: ${({ $noSpec }) => ($noSpec ? "#7a7a7a" : "#1d1d1f")};
+    color: ${({ $noSpec }) => ($noSpec ? "#5f6673" : "#1d1d1f")};
   }
 `;
 
@@ -760,7 +955,7 @@ const NodePath = styled.div`
   z-index: 2;
 
   html[data-forge-theme="light"] & {
-    color: #7a7a7a;
+    color: #6e6e73;
   }
 `;
 
@@ -858,4 +1053,8 @@ const EmptyState = styled.div`
   font-size: 12px;
   font-weight: 680;
   padding: 14px;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
 `;
