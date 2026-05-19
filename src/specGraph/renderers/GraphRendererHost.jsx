@@ -5,7 +5,7 @@ import XyflowGraphRenderer from "./XyflowGraphRenderer.jsx";
 
 const THREE_RENDERER_ENABLED = false;
 
-function graphTopologyKey(nodes, edges) {
+function graphTopologyKey(nodes, edges, variant) {
   const nodeKey = (nodes || [])
     .map((node) => node.id)
     .filter(Boolean)
@@ -15,7 +15,7 @@ function graphTopologyKey(nodes, edges) {
     .map((edge) => `${edge.from || ""}->${edge.to || ""}:${edge.kind || ""}`)
     .sort()
     .join("|");
-  return `${nodeKey}::${edgeKey}`;
+  return `${variant || "spec"}::${nodeKey}::${edgeKey}`;
 }
 
 export default function GraphRendererHost({
@@ -27,11 +27,12 @@ export default function GraphRendererHost({
   rendererPreference = "xyflow",
   emptyLabel,
   layoutLabel,
+  variant = "spec",
 }) {
   const [layout, setLayout] = useState(() => new Map());
   const [layoutPending, setLayoutPending] = useState(false);
   const lastLayoutKeyRef = useRef("");
-  const topologyKey = useMemo(() => graphTopologyKey(nodes, edges), [edges, nodes]);
+  const topologyKey = useMemo(() => graphTopologyKey(nodes, edges, variant), [edges, nodes, variant]);
 
   useEffect(() => {
     let cancelled = false;
@@ -53,7 +54,7 @@ export default function GraphRendererHost({
     }
 
     setLayoutPending(true);
-    layoutSpecGraph(nodes, edges).then((nextLayout) => {
+    layoutSpecGraph(nodes, edges, { variant }).then((nextLayout) => {
       if (cancelled) return;
       lastLayoutKeyRef.current = topologyKey;
       setLayout(nextLayout);
@@ -63,7 +64,7 @@ export default function GraphRendererHost({
     return () => {
       cancelled = true;
     };
-  }, [edges, nodes, topologyKey]);
+  }, [edges, nodes, topologyKey, variant]);
 
   const rendererProps = {
     nodes,
@@ -75,6 +76,7 @@ export default function GraphRendererHost({
     state,
     emptyLabel,
     layoutLabel,
+    variant,
   };
 
   if (THREE_RENDERER_ENABLED && rendererPreference === "three") {

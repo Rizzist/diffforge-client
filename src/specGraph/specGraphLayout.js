@@ -16,6 +16,27 @@ const NODE_COLLISION_PADDING = {
   abstract: 32,
 };
 
+const RADIAL_LAYOUT_PROFILES = {
+  spec: {
+    rootRadius: 282,
+    childRadius: 178,
+    depthStep: 38,
+    rootChildStep: 10,
+    rootChildCap: 120,
+    orphanRadius: 360,
+    unplacedRadius: 460,
+  },
+  knowledge: {
+    rootRadius: 176,
+    childRadius: 112,
+    depthStep: 18,
+    rootChildStep: 5,
+    rootChildCap: 42,
+    orphanRadius: 230,
+    unplacedRadius: 260,
+  },
+};
+
 function setNodeCenter(layout, node, center) {
   const dimensions = dimensionsForNode(node);
   layout.set(node.id, {
@@ -148,9 +169,10 @@ function sortedChildren(children, nodeById) {
   });
 }
 
-export function radialHierarchyLayout(nodes, edges) {
+export function radialHierarchyLayout(nodes, edges, options = {}) {
   const root = graphRootNode(nodes, edges);
   if (!root) return new Map();
+  const profile = RADIAL_LAYOUT_PROFILES[options.variant] || RADIAL_LAYOUT_PROFILES.spec;
 
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const layout = new Map();
@@ -177,7 +199,9 @@ export function radialHierarchyLayout(nodes, edges) {
     const rootChild = parentId === root.id;
     const spread = rootChild ? Math.PI * 2 : Math.min(Math.PI * 1.25, 0.7 + children.length * 0.28);
     const start = rootChild ? -Math.PI / 2 : parentAngle - spread / 2;
-    const radius = (rootChild ? 282 : 178) + Math.min(120, Math.max(0, children.length - 3) * 10) + depth * 38;
+    const radius = (rootChild ? profile.rootRadius : profile.childRadius)
+      + Math.min(profile.rootChildCap, Math.max(0, children.length - 3) * profile.rootChildStep)
+      + depth * profile.depthStep;
     children.forEach((childId, index) => {
       const child = nodeById.get(childId);
       const angle = rootChild
@@ -202,14 +226,14 @@ export function radialHierarchyLayout(nodes, edges) {
   orphanStructural.forEach((node, index) => {
     const angle = -Math.PI / 2 + (index / Math.max(orphanStructural.length, 1)) * Math.PI * 2;
     setNodeCenter(layout, node, {
-      x: Math.cos(angle) * 360,
-      y: Math.sin(angle) * 360,
+      x: Math.cos(angle) * profile.orphanRadius,
+      y: Math.sin(angle) * profile.orphanRadius,
     });
     placed.add(node.id);
   });
 
   const structuralKinds = new Set(["workspace", "folder", "file"]);
-  const abstractNodes = nodes.filter((node) => !structuralKinds.has(nodeKind(node)));
+  const abstractNodes = nodes.filter((node) => !structuralKinds.has(nodeKind(node)) && !placed.has(node.id));
   const rootCenter = centerFor(layout, root);
   const occupiedRects = nodes
     .filter((node) => placed.has(node.id) && layout.has(node.id))
@@ -250,7 +274,7 @@ export function radialHierarchyLayout(nodes, edges) {
     placeNodeAvoidingCollisions(
       layout,
       node,
-      spiralCandidateCenters(rootCenter, angle, 460),
+      spiralCandidateCenters(rootCenter, angle, profile.unplacedRadius),
       occupiedRects,
     );
   });
@@ -282,14 +306,14 @@ export async function elkFallbackLayout(nodes, edges) {
   return new Map((result.children || []).map((child) => [child.id, { x: child.x || 0, y: child.y || 0 }]));
 }
 
-export async function layoutSpecGraph(nodes, edges) {
+export async function layoutSpecGraph(nodes, edges, options = {}) {
   if (!nodes.length) return new Map();
   if (edges.some(isContainmentEdge) || nodes.some((node) => isWorkspaceNodeType(node.node_type))) {
-    return radialHierarchyLayout(nodes, edges);
+    return radialHierarchyLayout(nodes, edges, options);
   }
   try {
     return await elkFallbackLayout(nodes, edges);
   } catch {
-    return radialHierarchyLayout(nodes, edges);
+    return radialHierarchyLayout(nodes, edges, options);
   }
 }

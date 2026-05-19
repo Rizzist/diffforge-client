@@ -1114,6 +1114,20 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     });
     let task_title = requested_title.map(str::to_string);
 
+    if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
+        if !session_is_active_for_agent(kernel, session_id, agent_id)? {
+            return Ok(api_error(
+                "mcp_session_inactive_reconnect_required",
+                "This MCP session is no longer active. Reconnect the agent session before starting a task so Cloud and local coordination stay in sync.",
+                json!({
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "contract": "diffforge.app_ws.v1",
+                }),
+            ));
+        }
+    }
+
     let cloud = match crate::cloud_mcp_forward_agent_start_task(
         input["repo_path"].as_str(),
         input["db_path"].as_str().map(PathBuf::from).as_deref(),
@@ -1897,7 +1911,7 @@ fn active_session_for_identity(
                  FROM agent_sessions s
                  LEFT JOIN agents a ON a.id=s.agent_id
                  LEFT JOIN agent_slots sl ON sl.id=s.agent_slot_id
-                 WHERE s.id=?1
+                 WHERE s.id=?1 AND s.status='active'
                  ORDER BY s.updated_at DESC LIMIT 1",
                 &[&session_id],
             )
@@ -1947,6 +1961,25 @@ fn active_session_for_identity(
             .and_then(|rows| rows.into_iter().next());
     }
     None
+}
+
+fn session_is_active_for_agent(
+    kernel: &CoordinationKernel,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<bool, String> {
+    let rows = kernel.query_json(
+        "SELECT status
+         FROM agent_sessions
+         WHERE id=?1 AND agent_id=?2
+         LIMIT 1",
+        &[&session_id, &agent_id],
+    )?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|session| session["status"].as_str().map(str::to_string))
+        .is_some_and(|status| status == "active"))
 }
 
 fn clean_identity(value: Option<&str>) -> Option<String> {

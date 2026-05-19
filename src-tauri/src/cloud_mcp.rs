@@ -11,6 +11,7 @@ const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT: &str = "cloud-mcp-knowledge-graph-cache";
+const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_KNOWLEDGE_GRAPH_DEBOUNCE_MS: u64 = 650;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
@@ -21,10 +22,13 @@ const CLOUD_MCP_KNOWLEDGE_MAX_NOTE_BYTES: u64 = 384 * 1024;
 #[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
-    client: reqwest::Client,
     spec_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpSpecGraphSyncRuntime>>>,
     spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
     knowledge_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpKnowledgeGraphSyncRuntime>>>,
+    global_ws_started: Arc<AtomicBool>,
+    global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
+    global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    global_ws_events: tokio::sync::broadcast::Sender<Value>,
 }
 
 #[derive(Clone)]
@@ -32,6 +36,7 @@ struct CloudMcpSpecGraphSyncRuntime {
     generation: u64,
     stop: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
+    request_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -47,6 +52,12 @@ struct CloudMcpRuntime {
     status: String,
     last_error: String,
     last_connected_ms: Option<u64>,
+    global_ws_connected: bool,
+    global_ws_status: String,
+    global_ws_last_error: String,
+    global_ws_last_connected_ms: Option<u64>,
+    global_ws_connection_id: Option<String>,
+    global_ws_message_token: Option<String>,
     registered_workspaces: HashMap<String, CloudMcpWorkspaceStatus>,
     terminal_contexts: HashMap<String, CloudMcpTerminalContextState>,
 }
@@ -78,6 +89,11 @@ struct CloudMcpStatus {
     status: String,
     last_error: String,
     last_connected_ms: Option<u64>,
+    global_ws_connected: bool,
+    global_ws_status: String,
+    global_ws_last_error: String,
+    global_ws_last_connected_ms: Option<u64>,
+    connection_contract: String,
     registered_workspace_count: usize,
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
 }
@@ -156,11 +172,7 @@ struct CloudMcpWorkspaceRegistrationResult {
 
 impl CloudMcpState {
     fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
+        let (global_ws_events, _) = tokio::sync::broadcast::channel(512);
         Self {
             inner: Arc::new(Mutex::new(CloudMcpRuntime {
                 base_url: cloud_mcp_base_url(),
@@ -168,13 +180,22 @@ impl CloudMcpState {
                 status: "starting".to_string(),
                 last_error: String::new(),
                 last_connected_ms: None,
+                global_ws_connected: false,
+                global_ws_status: "starting".to_string(),
+                global_ws_last_error: String::new(),
+                global_ws_last_connected_ms: None,
+                global_ws_connection_id: None,
+                global_ws_message_token: None,
                 registered_workspaces: HashMap::new(),
                 terminal_contexts: HashMap::new(),
             })),
-            client,
             spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
             spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
             knowledge_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
+            global_ws_started: Arc::new(AtomicBool::new(false)),
+            global_ws_tx: Arc::new(Mutex::new(None)),
+            global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
+            global_ws_events,
         }
     }
 }
@@ -197,6 +218,14 @@ fn cloud_mcp_base_url() -> String {
         })
     })
     .unwrap_or_else(|| CLOUD_MCP_DEFAULT_BASE_URL.to_string())
+}
+
+fn cloud_mcp_dev_auth_token() -> Option<String> {
+    env::var("CLOUD_DIFFFORGE_DEV_TOKEN")
+        .or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn cloud_mcp_now_ms() -> u64 {
@@ -231,6 +260,11 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         status: runtime.status.clone(),
         last_error: runtime.last_error.clone(),
         last_connected_ms: runtime.last_connected_ms,
+        global_ws_connected: runtime.global_ws_connected,
+        global_ws_status: runtime.global_ws_status.clone(),
+        global_ws_last_error: runtime.global_ws_last_error.clone(),
+        global_ws_last_connected_ms: runtime.global_ws_last_connected_ms,
+        connection_contract: "diffforge.app_ws.v1".to_string(),
         registered_workspace_count: registered_workspaces.len(),
         registered_workspaces,
     }
@@ -246,59 +280,30 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
     runtime.connected = false;
     runtime.status = "blocked".to_string();
     runtime.last_error = error;
+    runtime.global_ws_connected = false;
+    runtime.global_ws_status = "blocked".to_string();
+    runtime.global_ws_connection_id = None;
+    runtime.global_ws_message_token = None;
     cloud_mcp_snapshot(&runtime)
 }
 
 async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
-    let base_url = {
-        let runtime = state.inner.lock().await;
-        runtime.base_url.clone()
-    };
-    let mut last_error = String::new();
-    for endpoint in ["/v1/dev/connection", "/v1/status"] {
-        let url = format!("{base_url}{endpoint}");
-        let response = state
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS))
-            .send()
-            .await;
-
-        match response {
-            Ok(response) if response.status().is_success() => {
-                let mut runtime = state.inner.lock().await;
-                runtime.connected = true;
-                runtime.status = "connected".to_string();
-                runtime.last_error.clear();
-                runtime.last_connected_ms = Some(cloud_mcp_now_ms());
-                let snapshot = cloud_mcp_snapshot(&runtime);
-                drop(runtime);
-                return Ok(snapshot);
-            }
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                last_error = format!(
-                    "Cloud MCP {endpoint} returned HTTP {status}: {}",
-                    clean_terminal_telemetry_text(&body)
-                );
-            }
-            Err(error) => {
-                last_error = format!("Unable to reach Cloud MCP {endpoint}: {error}");
-            }
+    cloud_mcp_start_global_ws(state).await;
+    match cloud_mcp_wait_for_ws_sender(state).await {
+        Ok(_) => Ok(cloud_mcp_status_snapshot(state).await),
+        Err(error) => {
+            let snapshot = cloud_mcp_set_connection_error(state, error.clone()).await;
+            Err(format!(
+                "Cloud MCP app websocket is required before terminals can start. {}",
+                snapshot.last_error
+            ))
         }
     }
-
-    let snapshot = cloud_mcp_set_connection_error(state, last_error.clone()).await;
-    Err(format!(
-        "Cloud MCP is required before terminals can start. {}",
-        snapshot.last_error
-    ))
 }
 
 async fn cloud_mcp_connected_or_connect(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
     let current = cloud_mcp_status_snapshot(state).await;
-    if current.connected {
+    if current.connected && current.global_ws_connected {
         return Ok(current);
     }
 
@@ -308,7 +313,350 @@ async fn cloud_mcp_connected_or_connect(state: &CloudMcpState) -> Result<CloudMc
 async fn require_cloud_mcp_connected_state(
     state: &CloudMcpState,
 ) -> Result<CloudMcpStatus, String> {
-    Ok(cloud_mcp_status_snapshot(state).await)
+    cloud_mcp_connected_or_connect(state).await
+}
+
+async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
+    if state.global_ws_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_global_ws_loop(state).await;
+    });
+}
+
+async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
+    loop {
+        let base_url = {
+            let runtime = state.inner.lock().await;
+            runtime.base_url.clone()
+        };
+        let ws_url = cloud_mcp_app_ws_url(&base_url);
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.global_ws_connected = false;
+            runtime.global_ws_status = "connecting".to_string();
+            runtime.status = if runtime.connected {
+                "websocket_reconnecting".to_string()
+            } else {
+                "connecting".to_string()
+            };
+        }
+
+        match cloud_mcp_open_global_ws(&state, &ws_url).await {
+            Ok(()) => {}
+            Err(error) => {
+                {
+                    let mut runtime = state.inner.lock().await;
+                    runtime.connected = false;
+                    runtime.status = "websocket_retrying".to_string();
+                    runtime.last_error = format!("Cloud MCP websocket unavailable: {error}");
+                    runtime.global_ws_connected = false;
+                    runtime.global_ws_status = "retrying".to_string();
+                    runtime.global_ws_last_error = clean_terminal_telemetry_text(&error);
+                    runtime.global_ws_connection_id = None;
+                    runtime.global_ws_message_token = None;
+                }
+                let _ = state.global_ws_tx.lock().await.take();
+                cloud_mcp_fail_pending_ws_requests(&state, &error).await;
+            }
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result<(), String> {
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
+    request.headers_mut().insert(
+        "x-diffforge-client-id",
+        HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    if let Some(token) = cloud_mcp_dev_auth_token() {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| format!("Invalid Cloud MCP dev token header: {error}"))?;
+        request.headers_mut().insert("authorization", value);
+    }
+
+    let (stream, _) = connect_async(request)
+        .await
+        .map_err(|error| format!("Unable to open Cloud MCP app websocket: {error}"))?;
+    let (mut write, mut read) = stream.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    {
+        let mut tx_slot = state.global_ws_tx.lock().await;
+        *tx_slot = Some(tx.clone());
+    }
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "websocket_handshaking".to_string();
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "handshaking".to_string();
+        runtime.global_ws_connection_id = None;
+        runtime.global_ws_message_token = None;
+    }
+
+    loop {
+        tokio::select! {
+            outgoing = rx.recv() => {
+                let Some(outgoing) = outgoing else {
+                    return Ok(());
+                };
+                write
+                    .send(Message::Text(outgoing.to_string().into()))
+                    .await
+                    .map_err(|error| format!("Cloud MCP app websocket write failed: {error}"))?;
+            }
+            incoming = read.next() => {
+                let Some(incoming) = incoming else {
+                    return Err("Cloud MCP app websocket closed by server.".to_string());
+                };
+                match incoming {
+                    Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
+                    Ok(Message::Binary(bytes)) => {
+                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                            cloud_mcp_handle_global_ws_message(state, &text).await;
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        write
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| format!("Cloud MCP app websocket pong failed: {error}"))?;
+                    }
+                    Ok(Message::Close(_)) => return Err("Cloud MCP app websocket closed.".to_string()),
+                    Err(error) => return Err(format!("Cloud MCP app websocket read failed: {error}")),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    if message.get("kind").and_then(Value::as_str) == Some("cloud_app_ws_ready") {
+        let connection_id = message["message_auth"]["connection_id"]
+            .as_str()
+            .or_else(|| message["connection_id"].as_str())
+            .map(str::to_string);
+        let message_token = message["message_auth"]["message_token"]
+            .as_str()
+            .map(str::to_string);
+        let (Some(connection_id), Some(message_token)) = (connection_id, message_token) else {
+            let mut runtime = state.inner.lock().await;
+            runtime.connected = false;
+            runtime.status = "websocket_auth_missing".to_string();
+            runtime.global_ws_connected = false;
+            runtime.global_ws_status = "auth_missing".to_string();
+            runtime.global_ws_last_error =
+                "Cloud MCP app websocket ready message omitted message auth.".to_string();
+            return;
+        };
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.connected = true;
+            runtime.status = "connected".to_string();
+            runtime.last_error.clear();
+            runtime.last_connected_ms = Some(cloud_mcp_now_ms());
+            runtime.global_ws_connected = true;
+            runtime.global_ws_status = "connected".to_string();
+            runtime.global_ws_last_error.clear();
+            runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
+            runtime.global_ws_connection_id = Some(connection_id.clone());
+            runtime.global_ws_message_token = Some(message_token.clone());
+        }
+        let hello = json!({
+            "kind": "hello",
+            "id": format!("hello-{}", cloud_mcp_now_ms()),
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "source": "rust-diffforge",
+            "contract": "diffforge.app_ws.v1",
+            "auth": {
+                "connection_id": connection_id,
+                "message_token": message_token,
+            },
+            "workspaces": cloud_mcp_registered_workspace_subscriptions(state).await,
+        });
+        if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
+            let _ = tx.send(hello);
+        }
+        return;
+    }
+    if let Some(id) = message.get("id").and_then(Value::as_str) {
+        if let Some(sender) = state.global_ws_pending.lock().await.remove(id) {
+            let _ = sender.send(message);
+            return;
+        }
+    }
+    if message.get("kind").and_then(Value::as_str) == Some("cloud_event") {
+        // The graph/spec/knowledge sync loops still own local cache materialization.
+        // This global channel is the durable wake signal shared by every workspace.
+        let event = message
+            .get("event")
+            .cloned()
+            .unwrap_or_else(|| message.clone());
+        let _ = state.global_ws_events.send(event);
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = true;
+        runtime.status = "connected".to_string();
+        runtime.global_ws_connected = true;
+        runtime.global_ws_status = "connected".to_string();
+        runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
+    }
+}
+
+async fn cloud_mcp_registered_workspace_subscriptions(state: &CloudMcpState) -> Vec<Value> {
+    let runtime = state.inner.lock().await;
+    runtime
+        .registered_workspaces
+        .values()
+        .map(|workspace| {
+            json!({
+                "workspace_id": workspace.workspace_id,
+                "workspace_name": workspace.workspace_name,
+                "repo_id": cloud_mcp_repo_id_for_root(Path::new(&workspace.root)),
+                "workspace_root": workspace.root,
+            })
+        })
+        .collect()
+}
+
+fn cloud_mcp_app_ws_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        format!("ws://{base}")
+    };
+    format!("{ws_base}/v1/app/ws")
+}
+
+async fn cloud_mcp_fail_pending_ws_requests(state: &CloudMcpState, error: &str) {
+    let mut pending = state.global_ws_pending.lock().await;
+    let drained = std::mem::take(&mut *pending);
+    drop(pending);
+    for (_, sender) in drained {
+        let _ = sender.send(json!({
+            "kind": "error",
+            "ok": false,
+            "error": {
+                "code": "cloud_ws_disconnected",
+                "message": clean_terminal_telemetry_text(error),
+            }
+        }));
+    }
+}
+
+async fn cloud_mcp_ws_request(
+    state: &CloudMcpState,
+    request_kind: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    cloud_mcp_start_global_ws(state).await;
+    let tx = cloud_mcp_wait_for_ws_sender(state).await?;
+    let request_id = format!("ws-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let (response_tx, response_rx) = oneshot::channel::<Value>();
+    state
+        .global_ws_pending
+        .lock()
+        .await
+        .insert(request_id.clone(), response_tx);
+    let envelope = json!({
+        "kind": request_kind,
+        "id": request_id,
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": cloud_mcp_payload_text(payload, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_id"])),
+        "workspace_id": cloud_mcp_payload_text(payload, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"])),
+        "request": payload,
+    });
+    if tx.send(envelope).is_err() {
+        state.global_ws_pending.lock().await.remove(&request_id);
+        return Err("Cloud MCP app websocket is not accepting messages.".to_string());
+    }
+    let response = match timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS), response_rx).await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            return Err("Cloud MCP app websocket response was cancelled.".to_string());
+        }
+        Err(_) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            return Err("Cloud MCP app websocket request timed out.".to_string());
+        }
+    };
+    if response.get("ok").and_then(Value::as_bool) == Some(false)
+        || response.get("kind").and_then(Value::as_str) == Some("error")
+    {
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or("Cloud MCP app websocket request failed.");
+        return Err(message.to_string());
+    }
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+    Ok(json!({
+        "ok": true,
+        "data": data,
+        "warnings": [],
+    }))
+}
+
+async fn cloud_mcp_ws_auth_object(state: &CloudMcpState) -> Result<Value, String> {
+    let runtime = state.inner.lock().await;
+    let connection_id = runtime
+        .global_ws_connection_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Cloud MCP app websocket connection auth is not established.".to_string())?;
+    let message_token = runtime
+        .global_ws_message_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Cloud MCP app websocket message auth is not established.".to_string())?;
+    Ok(json!({
+        "connection_id": connection_id,
+        "message_token": message_token,
+    }))
+}
+
+async fn cloud_mcp_wait_for_ws_sender(
+    state: &CloudMcpState,
+) -> Result<mpsc::UnboundedSender<Value>, String> {
+    let started = Instant::now();
+    loop {
+        let ready = {
+            let runtime = state.inner.lock().await;
+            runtime.global_ws_connected
+                && runtime.global_ws_connection_id.is_some()
+                && runtime.global_ws_message_token.is_some()
+        };
+        if ready {
+            if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
+                return Ok(tx);
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS) {
+            return Err("Cloud MCP app websocket is not connected yet.".to_string());
+        }
+        sleep(Duration::from_millis(80)).await;
+    }
 }
 
 fn cloud_mcp_workspace_control_dir(root: &Path) -> PathBuf {
@@ -874,7 +1222,13 @@ fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFi
             break;
         }
         let path = root.join(&folder_path);
-        let metadata = fs::metadata(&path).ok();
+        let metadata = fs::symlink_metadata(&path).ok();
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            continue;
+        }
         entries.push(CloudMcpFileEntry {
             relative_path: folder_path,
             kind: "directory".to_string(),
@@ -892,10 +1246,10 @@ fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFi
             break;
         }
         let path = root.join(&file_path);
-        let Ok(metadata) = fs::metadata(&path) else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if !metadata.is_file() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
         let size = Some(metadata.len());
@@ -1130,91 +1484,86 @@ async fn cloud_mcp_post_json_endpoint(
     endpoint: &str,
     payload: &Value,
 ) -> Result<Value, String> {
-    let base_url = {
-        let runtime = state.inner.lock().await;
-        runtime.base_url.clone()
-    };
-    let url = format!("{base_url}{endpoint}");
     let log_context = cloud_mcp_post_log_context(endpoint, payload);
     if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
-        let _ = cloud_mcp_workspace_log(
-            root,
-            "cloud_mcp.http.start",
-            workspace_id,
-            workspace_name,
-            fields.clone(),
-        );
-    }
-
-    let mut request = state
-        .client
-        .post(&url)
-        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID);
-    if let Some(workspace_id) = cloud_mcp_payload_text(payload, &["workspace_id"])
-        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
-    {
-        request = request.header("x-diffforge-workspace-id", workspace_id);
-    }
-    if let Some(repo_id) = cloud_mcp_payload_text(payload, &["repo_id"])
-        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_id"]))
-    {
-        request = request.header("x-diffforge-repo-id", repo_id);
-    }
-    let response = match request
-        .timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS))
-        .json(payload)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
-                let mut fields = fields.clone();
-                fields["error"] = json!(error.to_string());
-                let _ = cloud_mcp_workspace_log(
-                    root,
-                    "cloud_mcp.http.error",
-                    workspace_id,
-                    workspace_name,
-                    fields,
-                );
-            }
-            return Err(format!("Unable to POST {endpoint} to Cloud MCP: {error}"));
-        }
-    };
-
-    if response.status().is_success() {
-        let value = response.json::<Value>().await.unwrap_or(Value::Null);
-        if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
-            let _ = cloud_mcp_workspace_log(
-                root,
-                "cloud_mcp.http.done",
-                workspace_id,
-                workspace_name,
-                fields.clone(),
-            );
-        }
-        return Ok(value);
-    }
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
         let mut fields = fields.clone();
-        fields["status"] = json!(status.as_u16());
-        fields["error"] = json!(clean_terminal_telemetry_text(&body));
+        fields["transport"] = json!("app_websocket");
         let _ = cloud_mcp_workspace_log(
             root,
-            "cloud_mcp.http.error",
+            "cloud_mcp.ws.start",
             workspace_id,
             workspace_name,
             fields,
         );
     }
-    Err(format!(
-        "Cloud MCP {endpoint} returned HTTP {status}: {}",
-        clean_terminal_telemetry_text(&body)
-    ))
+
+    let Some(ws_kind) = cloud_mcp_ws_kind_for_endpoint(endpoint) else {
+        let error = format!(
+            "Cloud MCP endpoint {endpoint} is not routed through the required app websocket"
+        );
+        if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+            let mut fields = fields.clone();
+            fields["transport"] = json!("app_websocket");
+            fields["error"] = json!(error.clone());
+            let _ = cloud_mcp_workspace_log(
+                root,
+                "cloud_mcp.ws.error",
+                workspace_id,
+                workspace_name,
+                fields,
+            );
+        }
+        return Err(error);
+    };
+
+    match cloud_mcp_ws_request(state, ws_kind, payload).await {
+        Ok(value) => {
+            if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+                let mut fields = fields.clone();
+                fields["transport"] = json!("app_websocket");
+                let _ = cloud_mcp_workspace_log(
+                    root,
+                    "cloud_mcp.ws.done",
+                    workspace_id,
+                    workspace_name,
+                    fields,
+                );
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
+                let mut fields = fields.clone();
+                fields["transport"] = json!("app_websocket");
+                fields["error"] = json!(clean_terminal_telemetry_text(&error));
+                let _ = cloud_mcp_workspace_log(
+                    root,
+                    "cloud_mcp.ws.error",
+                    workspace_id,
+                    workspace_name,
+                    fields,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
+    match endpoint {
+        "/v1/events" => Some("event"),
+        "/v1/sync/push" => Some("sync_push"),
+        "/v1/sync/pull" => Some("sync_pull"),
+        "/v1/context/pack" => Some("context_pack"),
+        "/v1/spec/graph" => Some("spec_graph"),
+        "/v1/spec/graph/delta" => Some("spec_graph_delta"),
+        "/v1/spec/task-history" => Some("spec_task_history"),
+        "/v1/spec/nodes" => Some("spec_node"),
+        "/v1/knowledge/graph" => Some("knowledge_graph"),
+        "/v1/knowledge/graph/delta" => Some("knowledge_graph_delta"),
+        "/v1/knowledge/context" => Some("knowledge_context"),
+        _ => None,
+    }
 }
 
 async fn cloud_mcp_post_event_endpoint(
@@ -1381,11 +1730,18 @@ async fn cloud_mcp_register_prepared_workspace(
         runtime
             .registered_workspaces
             .insert(workspace_status.root.clone(), workspace_status.clone());
-        runtime.connected = true;
-        runtime.status = "connected".to_string();
-        runtime.last_error.clear();
+        runtime.connected = runtime.global_ws_connected;
+        runtime.status = if runtime.global_ws_connected {
+            "connected".to_string()
+        } else {
+            "websocket_required".to_string()
+        };
+        if runtime.global_ws_connected {
+            runtime.last_error.clear();
+        }
         runtime.last_connected_ms = Some(now_ms);
     }
+    let _ = cloud_mcp_ws_send_workspace_subscription(state, &repo_id, &workspace_status).await;
     let status = cloud_mcp_status_snapshot(state).await;
     Ok(CloudMcpWorkspaceRegistrationResult {
         status,
@@ -1395,6 +1751,24 @@ async fn cloud_mcp_register_prepared_workspace(
         log_path: workspace_path_display(&log_path),
         message: "Workspace synced to Cloud MCP context ledger.".to_string(),
     })
+}
+
+async fn cloud_mcp_ws_send_workspace_subscription(
+    state: &CloudMcpState,
+    repo_id: &str,
+    workspace: &CloudMcpWorkspaceStatus,
+) -> Result<Value, String> {
+    cloud_mcp_ws_request(
+        state,
+        "workspace_subscribe",
+        &json!({
+            "repo_id": repo_id,
+            "workspace_id": workspace.workspace_id,
+            "workspace_name": workspace.workspace_name,
+            "workspace_root": workspace.root,
+        }),
+    )
+    .await
 }
 
 fn cloud_mcp_response_data(value: &Value) -> Value {
@@ -3290,17 +3664,6 @@ fn cloud_mcp_spec_graph_sync_request(
     }
 }
 
-fn cloud_mcp_graph_events_ws_url(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    if let Some(rest) = base_url.strip_prefix("https://") {
-        format!("wss://{rest}/v1/events/ws")
-    } else if let Some(rest) = base_url.strip_prefix("http://") {
-        format!("ws://{rest}/v1/events/ws")
-    } else {
-        format!("{base_url}/v1/events/ws")
-    }
-}
-
 fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &Value) -> bool {
     let kind = cloud_mcp_payload_text(event, &["kind"])
         .or_else(|| cloud_mcp_payload_text(event, &["type"]))
@@ -3331,14 +3694,6 @@ fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &
     true
 }
 
-fn cloud_mcp_graph_ws_message_event(
-    req: &CloudMcpSpecGraphSyncRequest,
-    message: &str,
-) -> Option<Value> {
-    let event = serde_json::from_str::<Value>(message).ok()?;
-    cloud_mcp_graph_ws_event_matches(req, &event).then_some(event)
-}
-
 async fn cloud_mcp_graph_ws_event_forward_loop(
     state: CloudMcpState,
     req: CloudMcpSpecGraphSyncRequest,
@@ -3350,52 +3705,8 @@ async fn cloud_mcp_graph_ws_event_forward_loop(
         return;
     }
 
-    let base_url = {
-        let runtime = state.inner.lock().await;
-        runtime.base_url.clone()
-    };
-    let url = cloud_mcp_graph_events_ws_url(&base_url);
-    let mut request = match url.clone().into_client_request() {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = event_tx
-                .send(Err(format!("Unable to prepare Cloud MCP graph WebSocket {url}: {error}")))
-                .await;
-            return;
-        }
-    };
-    {
-        let headers = request.headers_mut();
-        headers.insert(
-            "x-diffforge-client-id",
-            HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
-        );
-        if let Some(workspace_id) = req.workspace_id.as_deref() {
-            if let Ok(value) = HeaderValue::from_str(workspace_id) {
-                headers.insert("x-diffforge-workspace-id", value);
-            }
-        }
-        if let Ok(value) = HeaderValue::from_str(&req.repo_id) {
-            headers.insert("x-diffforge-repo-id", value);
-        }
-    }
-
-    let connect_result = timeout(Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS), connect_async(request)).await;
-    let (mut ws_stream, _) = match connect_result {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            let _ = event_tx
-                .send(Err(format!("Unable to connect Cloud MCP graph WebSocket {url}: {error}")))
-                .await;
-            return;
-        }
-        Err(_) => {
-            let _ = event_tx
-                .send(Err(format!("Timed out connecting Cloud MCP graph WebSocket {url}")))
-                .await;
-            return;
-        }
-    };
+    cloud_mcp_start_global_ws(&state).await;
+    let mut ws_events = state.global_ws_events.subscribe();
 
     loop {
         if stop.load(Ordering::SeqCst) || crate::app_shutdown_requested() {
@@ -3405,31 +3716,30 @@ async fn cloud_mcp_graph_ws_event_forward_loop(
         tokio::pin!(wake_signal);
         tokio::select! {
             _ = &mut wake_signal => break,
-            message = ws_stream.next() => {
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(event) = cloud_mcp_graph_ws_message_event(&req, text.as_ref()) {
-                            if event_tx.send(Ok(event)).await.is_err() {
-                                break;
-                            }
+            event = ws_events.recv() => {
+                match event {
+                    Ok(event) if cloud_mcp_graph_ws_event_matches(&req, &event) => {
+                        if event_tx.send(Ok(event)).await.is_err() {
+                            break;
                         }
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = ws_stream.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let _ = event_tx
-                            .send(Err("Cloud MCP graph WebSocket closed.".to_string()))
+                            .send(Ok(json!({
+                                "kind": "graph_invalidated",
+                                "event_kind": "app_ws_event_lagged",
+                                "repo_id": req.repo_id,
+                                "workspace_id": req.workspace_id,
+                            })))
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = event_tx
+                            .send(Err("Cloud MCP app websocket event channel closed.".to_string()))
                             .await;
                         break;
                     }
-                    Some(Err(error)) => {
-                        let _ = event_tx
-                            .send(Err(format!("Cloud MCP graph WebSocket failed: {error}")))
-                            .await;
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -3458,12 +3768,76 @@ fn cloud_mcp_spec_graph_cache_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("spec-graph")
 }
 
-fn cloud_mcp_spec_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
-    cloud_mcp_spec_graph_cache_dir(root).join(format!("{repo_id}.json"))
+fn cloud_mcp_cache_file_stem(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_').chars().take(96).collect::<String>();
+    if sanitized.is_empty() {
+        format!("cache-{}", cloud_mcp_short_hash(value))
+    } else {
+        sanitized
+    }
 }
 
-fn cloud_mcp_local_ignored_overlay_cache_path(root: &Path) -> PathBuf {
-    cloud_mcp_spec_graph_cache_dir(root).join(CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE)
+fn cloud_mcp_spec_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
+    cloud_mcp_spec_graph_cache_dir(root).join(format!(
+        "{}.json",
+        cloud_mcp_cache_file_stem(repo_id)
+    ))
+}
+
+fn cloud_mcp_safe_spec_graph_cache_file(root: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let file_path = Path::new(file_name);
+    if file_path.components().count() != 1
+        || !matches!(file_path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err("invalid_spec_graph_cache_file_name".to_string());
+    }
+    let cache_dir = cloud_mcp_spec_graph_cache_dir(root);
+    if cloud_mcp_path_contains_symlink_under(root, &cache_dir) {
+        return Err(format!(
+            "Refusing to use symlinked Spec Graph cache directory {}",
+            workspace_path_display(&cache_dir)
+        ));
+    }
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        format!(
+            "Unable to create Spec Graph cache directory {}: {error}",
+            workspace_path_display(&cache_dir)
+        )
+    })?;
+    if cloud_mcp_path_contains_symlink_under(root, &cache_dir) {
+        return Err(format!(
+            "Refusing to use symlinked Spec Graph cache directory {}",
+            workspace_path_display(&cache_dir)
+        ));
+    }
+    let cache_path = cache_dir.join(file_name);
+    if !cache_path.starts_with(&cache_dir)
+        || cloud_mcp_path_contains_symlink_under(root, &cache_path)
+    {
+        return Err(format!(
+            "Refusing to use unsafe Spec Graph cache path {}",
+            workspace_path_display(&cache_path)
+        ));
+    }
+    Ok(cache_path)
+}
+
+fn cloud_mcp_safe_spec_graph_repo_cache_path(
+    root: &Path,
+    repo_id: &str,
+) -> Result<PathBuf, String> {
+    let file_name = format!("{}.json", cloud_mcp_cache_file_stem(repo_id));
+    cloud_mcp_safe_spec_graph_cache_file(root, &file_name)
 }
 
 fn cloud_mcp_local_ignored_whitelist_candidates(root: &Path) -> Vec<(String, PathBuf)> {
@@ -3493,7 +3867,10 @@ fn cloud_mcp_local_ignored_whitelist_candidates(root: &Path) -> Vec<(String, Pat
 }
 
 fn cloud_mcp_local_ignored_entry_signature(relative_path: &str, path: &Path) -> Option<Value> {
-    let metadata = fs::metadata(path).ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
     let kind = if metadata.is_dir() {
         "folder"
     } else if metadata.is_file() {
@@ -3536,7 +3913,10 @@ fn cloud_mcp_local_ignored_overlay_node(
     relative_path: &str,
     path: &Path,
 ) -> Option<Value> {
-    let metadata = fs::metadata(path).ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
     let kind = if metadata.is_dir() {
         "folder"
     } else if metadata.is_file() {
@@ -3590,7 +3970,8 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
     let root_display = workspace_path_display(root);
     let repo_name = cloud_mcp_repo_display_name(root);
     let display_root = cloud_mcp_repo_display_root(root);
-    let cache_path = cloud_mcp_local_ignored_overlay_cache_path(root);
+    let cache_path =
+        cloud_mcp_safe_spec_graph_cache_file(root, CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE)?;
     let candidates = cloud_mcp_local_ignored_whitelist_candidates(root);
     let signatures = candidates
         .iter()
@@ -3644,14 +4025,6 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
         "edges": [],
         "updated_at_ms": cloud_mcp_now_ms(),
     });
-    if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Unable to create local ignored Spec Graph cache directory {}: {error}",
-                workspace_path_display(parent)
-            )
-        })?;
-    }
     let body = serde_json::to_vec_pretty(&overlay)
         .map_err(|error| format!("Unable to encode local ignored Spec Graph overlay: {error}"))?;
     fs::write(&cache_path, body).map_err(|error| {
@@ -3667,7 +4040,64 @@ fn cloud_mcp_knowledge_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("knowledge")
 }
 
+fn cloud_mcp_path_contains_symlink(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn cloud_mcp_path_contains_symlink_under(root: &Path, path: &Path) -> bool {
+    if fs::symlink_metadata(root)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return cloud_mcp_path_contains_symlink(path);
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return true;
+        }
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn cloud_mcp_safe_knowledge_target(
+    knowledge_dir: &Path,
+    relative_path: &Path,
+) -> Result<PathBuf, String> {
+    let target = knowledge_dir.join(relative_path);
+    if !target.starts_with(knowledge_dir) {
+        return Err("target_outside_knowledge_dir".to_string());
+    }
+    if cloud_mcp_path_contains_symlink(knowledge_dir) || cloud_mcp_path_contains_symlink(&target) {
+        return Err("knowledge_path_contains_symlink".to_string());
+    }
+    Ok(target)
+}
+
 fn cloud_mcp_prune_legacy_knowledge_page_notes(knowledge_dir: &Path) {
+    if cloud_mcp_path_contains_symlink(knowledge_dir) {
+        return;
+    }
     let mut queue = VecDeque::new();
     queue.push_back(knowledge_dir.to_path_buf());
     while let Some(dir) = queue.pop_front() {
@@ -3676,7 +4106,13 @@ fn cloud_mcp_prune_legacy_knowledge_page_notes(knowledge_dir: &Path) {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 if path.file_name().and_then(|name| name.to_str()) != Some(".cache") {
                     queue.push_back(path);
                 }
@@ -3734,13 +4170,27 @@ fn cloud_mcp_knowledge_authoring_result(response: &Value) -> Option<&Value> {
         .or_else(|| response.get("knowledge_authoring"))
 }
 
+fn cloud_mcp_knowledge_markdown_delta(response: &Value) -> Option<&Value> {
+    response
+        .pointer("/data/knowledge_markdown_delta")
+        .or_else(|| response.get("knowledge_markdown_delta"))
+        .or_else(|| {
+            response
+                .pointer("/data/knowledge_authoring/knowledge_markdown_delta")
+        })
+        .or_else(|| response.pointer("/knowledge_authoring/knowledge_markdown_delta"))
+}
+
 fn cloud_mcp_knowledge_authoring_note_path(value: &str) -> Option<PathBuf> {
     let normalized = value.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') || normalized.contains(':') {
+        return None;
+    }
     let stripped = normalized
         .strip_prefix(".agents/knowledge/")
         .unwrap_or(&normalized)
         .trim_start_matches("./")
-        .trim_matches('/');
+        .trim_end_matches('/');
     if stripped.is_empty()
         || stripped.starts_with('/')
         || stripped.contains(':')
@@ -3759,6 +4209,231 @@ fn cloud_mcp_knowledge_authoring_note_path(value: &str) -> Option<PathBuf> {
     (!output.as_os_str().is_empty()).then_some(output)
 }
 
+fn cloud_mcp_apply_knowledge_markdown_delta(
+    repo_root: &Path,
+    response: &Value,
+) -> Value {
+    let Some(delta) = cloud_mcp_knowledge_markdown_delta(response) else {
+        return json!({"ok": true, "present": false, "applied": false, "reason": "no_markdown_delta"});
+    };
+    let repo_root_display = workspace_path_display(repo_root);
+    let root = resolve_workspace_root_directory(Some(repo_root_display.as_str()))
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let knowledge_dir = cloud_mcp_knowledge_dir(&root);
+    if let Err(error) = fs::create_dir_all(&knowledge_dir) {
+        return json!({
+            "ok": false,
+            "present": true,
+            "applied": false,
+            "error": format!("Unable to create knowledge atlas directory {}: {error}", workspace_path_display(&knowledge_dir)),
+        });
+    }
+    if cloud_mcp_path_contains_symlink(&knowledge_dir) {
+        return json!({
+            "ok": false,
+            "present": true,
+            "applied": false,
+            "error": "Knowledge atlas directory contains a symlink; refusing server markdown sync.",
+        });
+    }
+
+    let mut applied = Vec::new();
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    for file in delta.get("files").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let raw_path = file
+            .get("path")
+            .or_else(|| file.get("note_path"))
+            .or_else(|| file.get("notePath"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(relative_path) = cloud_mcp_knowledge_authoring_note_path(raw_path) else {
+            skipped.push(json!({"path": raw_path, "reason": "invalid_delta_path"}));
+            continue;
+        };
+        let content = file
+            .get("content")
+            .or_else(|| file.get("markdown"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            skipped.push(json!({"path": raw_path, "reason": "empty_content"}));
+            continue;
+        }
+        let target = match cloud_mcp_safe_knowledge_target(&knowledge_dir, &relative_path) {
+            Ok(target) => target,
+            Err(reason) => {
+                skipped.push(json!({"path": raw_path, "reason": reason}));
+                continue;
+            }
+        };
+        if let Some(parent) = target.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                skipped.push(json!({
+                    "path": raw_path,
+                    "reason": format!("create_parent_failed: {error}"),
+                }));
+                continue;
+            }
+            if cloud_mcp_path_contains_symlink(parent) {
+                skipped.push(json!({"path": raw_path, "reason": "parent_contains_symlink"}));
+                continue;
+            }
+        }
+        let mut body = content.replace("\r\n", "\n");
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        if fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
+            applied.push(json!({
+                "path": relative_path.to_string_lossy(),
+                "changed": false,
+            }));
+            continue;
+        }
+        match fs::write(&target, body) {
+            Ok(_) => applied.push(json!({
+                "path": relative_path.to_string_lossy(),
+                "changed": true,
+            })),
+            Err(error) => skipped.push(json!({
+                "path": raw_path,
+                "reason": format!("write_failed: {error}"),
+            })),
+        }
+    }
+    for raw_path in delta
+        .get("delete_paths")
+        .or_else(|| delta.get("deletePaths"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let raw_path = raw_path.as_str().unwrap_or_default();
+        let Some(relative_path) = cloud_mcp_knowledge_authoring_note_path(raw_path) else {
+            skipped.push(json!({"path": raw_path, "reason": "invalid_delete_path"}));
+            continue;
+        };
+        let target = match cloud_mcp_safe_knowledge_target(&knowledge_dir, &relative_path) {
+            Ok(target) => target,
+            Err(reason) => {
+                skipped.push(json!({"path": raw_path, "reason": reason}));
+                continue;
+            }
+        };
+        match fs::remove_file(&target) {
+            Ok(_) => deleted.push(json!({"path": relative_path.to_string_lossy()})),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => skipped.push(json!({
+                "path": raw_path,
+                "reason": format!("delete_failed: {error}"),
+            })),
+        }
+    }
+
+    json!({
+        "ok": skipped.is_empty(),
+        "present": true,
+        "applied": !applied.is_empty() || !deleted.is_empty(),
+        "root": workspace_path_display(&root),
+        "mode": delta["mode"].clone(),
+        "source_of_truth": delta["source_of_truth"].clone(),
+        "files": applied,
+        "deleted": deleted,
+        "skipped": skipped,
+    })
+}
+
+fn cloud_mcp_materialize_knowledge_graph_mirror(repo_root: &Path, data: &Value) -> Value {
+    let mut files = Vec::new();
+    let mut expected_paths = HashSet::new();
+    for node in data
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let synthetic_root = node
+            .get("metadata")
+            .and_then(|metadata| metadata.get("synthetic_root"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if synthetic_root {
+            continue;
+        }
+        let raw_path = node
+            .get("note_path")
+            .or_else(|| node.get("notePath"))
+            .or_else(|| node.get("markdown_path"))
+            .or_else(|| node.get("markdownPath"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(relative_path) = cloud_mcp_knowledge_authoring_note_path(raw_path) else {
+            continue;
+        };
+        let markdown = node
+            .get("markdown")
+            .or_else(|| node.get("standard_capsule"))
+            .or_else(|| node.get("standardCapsule"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if markdown.is_empty() {
+            continue;
+        }
+        let relative = relative_path.to_string_lossy().replace('\\', "/");
+        expected_paths.insert(relative.clone());
+        files.push(json!({
+            "path": format!(".agents/knowledge/{relative}"),
+            "note_path": relative,
+            "content": markdown,
+        }));
+    }
+    let response = json!({
+        "knowledge_markdown_delta": {
+            "mode": "full_server_graph_mirror",
+            "source_of_truth": "server_authored_knowledge_graph",
+            "files": files,
+            "delete_paths": [],
+        }
+    });
+    let mut applied = cloud_mcp_apply_knowledge_markdown_delta(repo_root, &response);
+    if expected_paths.is_empty() {
+        return applied;
+    }
+    let knowledge_dir = cloud_mcp_knowledge_dir(repo_root);
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    if !cloud_mcp_path_contains_symlink(&knowledge_dir) {
+        for path in cloud_mcp_collect_knowledge_note_paths(repo_root) {
+            let Some(relative) = path
+                .strip_prefix(&knowledge_dir)
+                .ok()
+                .and_then(cloud_mcp_normalize_knowledge_relative_path)
+            else {
+                continue;
+            };
+            if expected_paths.contains(&relative) {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(_) => deleted.push(json!({"path": relative})),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => skipped.push(json!({
+                    "path": relative,
+                    "reason": format!("delete_stale_mirror_failed: {error}"),
+                })),
+            }
+        }
+    }
+    if let Some(object) = applied.as_object_mut() {
+        object.insert("expected_paths".to_string(), json!(expected_paths.len()));
+        object.insert("pruned".to_string(), Value::Array(deleted));
+        object.insert("prune_skipped".to_string(), Value::Array(skipped));
+    }
+    applied
+}
+
 fn cloud_mcp_apply_knowledge_authoring_result(
     repo_root: Option<&Path>,
     response: &Value,
@@ -3766,16 +4441,34 @@ fn cloud_mcp_apply_knowledge_authoring_result(
     let Some(repo_root) = repo_root else {
         return json!({"ok": false, "applied": false, "reason": "missing_repo_root"});
     };
+    let markdown_delta_apply = cloud_mcp_apply_knowledge_markdown_delta(repo_root, response);
     let Some(authoring) = cloud_mcp_knowledge_authoring_result(response) else {
-        return json!({"ok": true, "applied": false, "reason": "no_authoring_plan"});
+        return if markdown_delta_apply["present"].as_bool() == Some(true) {
+            markdown_delta_apply
+        } else {
+            json!({"ok": true, "applied": false, "reason": "no_authoring_plan"})
+        };
     };
+    if markdown_delta_apply["present"].as_bool() == Some(true)
+        && markdown_delta_apply["source_of_truth"].as_str() == Some("server_authored_knowledge_graph")
+    {
+        return json!({
+            "ok": markdown_delta_apply["ok"].as_bool().unwrap_or(true),
+            "applied": markdown_delta_apply["applied"].as_bool().unwrap_or(false),
+            "reason": "server_markdown_delta_applied",
+            "status": authoring["status"].clone(),
+            "provider": authoring["provider"].clone(),
+            "markdown_delta": markdown_delta_apply,
+        });
+    }
     if authoring["record"].as_bool() != Some(true) {
         return json!({
-            "ok": true,
-            "applied": false,
+            "ok": markdown_delta_apply["ok"].as_bool().unwrap_or(true),
+            "applied": markdown_delta_apply["applied"].as_bool().unwrap_or(false),
             "reason": authoring["reason"].as_str().unwrap_or("knowledge_authoring_not_recorded"),
             "status": authoring["status"].clone(),
             "provider": authoring["provider"].clone(),
+            "markdown_delta": markdown_delta_apply,
         });
     }
 
@@ -3790,7 +4483,23 @@ fn cloud_mcp_apply_knowledge_authoring_result(
             "error": format!("Unable to create knowledge atlas directory {}: {error}", workspace_path_display(&knowledge_dir)),
         });
     }
-    let index_path = knowledge_dir.join("index.md");
+    if cloud_mcp_path_contains_symlink(&knowledge_dir) {
+        return json!({
+            "ok": false,
+            "applied": false,
+            "error": "Knowledge atlas directory contains a symlink; refusing legacy authoring writes.",
+        });
+    }
+    let index_path = match cloud_mcp_safe_knowledge_target(&knowledge_dir, Path::new("index.md")) {
+        Ok(path) => path,
+        Err(reason) => {
+            return json!({
+                "ok": false,
+                "applied": false,
+                "error": reason,
+            });
+        }
+    };
     if !index_path.exists() {
         if let Err(error) = fs::write(&index_path, "") {
             return json!({
@@ -3824,13 +4533,23 @@ fn cloud_mcp_apply_knowledge_authoring_result(
             skipped.push(json!({"path": raw_path, "reason": "empty_markdown"}));
             continue;
         }
-        let target = knowledge_dir.join(&relative_path);
+        let target = match cloud_mcp_safe_knowledge_target(&knowledge_dir, &relative_path) {
+            Ok(target) => target,
+            Err(reason) => {
+                skipped.push(json!({"path": raw_path, "reason": reason}));
+                continue;
+            }
+        };
         if let Some(parent) = target.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
                 skipped.push(json!({
                     "path": raw_path,
                     "reason": format!("create_parent_failed: {error}"),
                 }));
+                continue;
+            }
+            if cloud_mcp_path_contains_symlink(parent) {
+                skipped.push(json!({"path": raw_path, "reason": "parent_contains_symlink"}));
                 continue;
             }
         }
@@ -3858,13 +4577,14 @@ fn cloud_mcp_apply_knowledge_authoring_result(
     }
 
     json!({
-        "ok": skipped.is_empty(),
-        "applied": !applied.is_empty(),
+        "ok": skipped.is_empty() && markdown_delta_apply["ok"].as_bool().unwrap_or(true),
+        "applied": !applied.is_empty() || markdown_delta_apply["applied"].as_bool().unwrap_or(false),
         "root": workspace_path_display(&root),
         "provider": authoring["provider"].clone(),
         "status": authoring["status"].clone(),
         "notes": applied,
         "skipped": skipped,
+        "markdown_delta": markdown_delta_apply,
     })
 }
 
@@ -3873,7 +4593,10 @@ fn cloud_mcp_knowledge_cache_dir(root: &Path) -> PathBuf {
 }
 
 fn cloud_mcp_knowledge_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
-    cloud_mcp_knowledge_cache_dir(root).join(format!("{repo_id}.json"))
+    cloud_mcp_knowledge_cache_dir(root).join(format!(
+        "{}.json",
+        cloud_mcp_cache_file_stem(repo_id)
+    ))
 }
 
 fn cloud_mcp_knowledge_note_id(repo_id: &str, note_path: &str) -> String {
@@ -3963,8 +4686,14 @@ fn cloud_mcp_ensure_knowledge_atlas(root: &Path) -> Result<(), String> {
             workspace_path_display(&knowledge_dir)
         )
     })?;
+    if cloud_mcp_path_contains_symlink(&knowledge_dir) {
+        return Err(format!(
+            "Refusing to initialize knowledge atlas through symlinked path {}",
+            workspace_path_display(&knowledge_dir)
+        ));
+    }
     if cloud_mcp_collect_knowledge_note_paths(root).is_empty() {
-        let index_path = knowledge_dir.join("index.md");
+        let index_path = cloud_mcp_safe_knowledge_target(&knowledge_dir, Path::new("index.md"))?;
         fs::write(&index_path, "").map_err(|error| {
             format!(
                 "Unable to create empty knowledge atlas root {}: {error}",
@@ -3972,12 +4701,19 @@ fn cloud_mcp_ensure_knowledge_atlas(root: &Path) -> Result<(), String> {
             )
         })?;
     }
-    fs::create_dir_all(cloud_mcp_knowledge_cache_dir(root)).map_err(|error| {
+    let cache_dir = cloud_mcp_knowledge_cache_dir(root);
+    fs::create_dir_all(&cache_dir).map_err(|error| {
         format!(
             "Unable to create knowledge graph cache directory {}: {error}",
-            workspace_path_display(&cloud_mcp_knowledge_cache_dir(root))
+            workspace_path_display(&cache_dir)
         )
     })?;
+    if cloud_mcp_path_contains_symlink(&cache_dir) {
+        return Err(format!(
+            "Refusing to use symlinked knowledge graph cache directory {}",
+            workspace_path_display(&cache_dir)
+        ));
+    }
     Ok(())
 }
 
@@ -4636,9 +5372,10 @@ fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest
         "edge_hashes": cloud_mcp_knowledge_hashes(&edges),
         "graph_stats_hash": cloud_mcp_short_hash(&graph_stats.to_string()),
         "source_of_truth": {
-            "kind": "markdown_knowledge_atlas",
+            "kind": "server_markdown_mirror_cache",
             "directory": ".agents/knowledge",
-            "local_first": true,
+            "local_first": false,
+            "read_only_mirror": true,
             "spec_edges_encoded": false,
         },
     }))
@@ -4739,9 +5476,10 @@ fn cloud_mcp_knowledge_graph_snapshot_from_data(
         "knowledgeEdges": edges,
         "graphStats": graph_stats,
         "sourceOfTruth": {
-            "kind": "knowledge_graph",
+            "kind": "server_authored_knowledge_graph",
             "repo_id": req.repo_id.clone(),
             "markdown_directory": ".agents/knowledge",
+            "client_mode": "read_only_markdown_sync",
             "cached_under_agents": true,
         },
         "raw": normalized_data
@@ -4783,9 +5521,10 @@ fn cloud_mcp_stamp_knowledge_graph_snapshot(
         object.insert("syncState".to_string(), json!(sync_state));
         object.insert("syncError".to_string(), json!(sync_error));
         object.insert("sourceOfTruth".to_string(), json!({
-            "kind": "knowledge_graph",
+            "kind": "server_authored_knowledge_graph",
             "repo_id": req.repo_id.clone(),
             "markdown_directory": ".agents/knowledge",
+            "client_mode": "read_only_markdown_sync",
             "cached_under_agents": true,
         }));
     }
@@ -4848,33 +5587,6 @@ fn cloud_mcp_write_knowledge_graph_cache(
     })
 }
 
-async fn cloud_mcp_push_knowledge_snapshot(
-    state: &CloudMcpState,
-    req: &CloudMcpSpecGraphSyncRequest,
-    data: &Value,
-) -> Result<Value, String> {
-    let repo_name = cloud_mcp_repo_display_name(&req.root);
-    let display_root = cloud_mcp_repo_display_root(&req.root);
-    let payload = json!({
-        "source": "rust-diffforge-knowledge",
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": req.repo_id.clone(),
-        "repo_name": repo_name,
-        "display_root": display_root,
-        "agent_id": "rust-diffforge",
-        "self_agent_id": "rust-diffforge",
-        "current_agent_id": "rust-diffforge",
-        "repo_path": req.root_display.clone(),
-        "workspace_root": req.root_display.clone(),
-        "workspace_id": req.workspace_id.clone(),
-        "workspace_name": req.workspace_name.clone(),
-        "notes": data.get("nodes").cloned().unwrap_or_else(|| json!([])),
-        "edges": data.get("edges").cloned().unwrap_or_else(|| json!([])),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    cloud_mcp_post_event_endpoint(state, "knowledge_snapshot", &payload).await
-}
-
 async fn cloud_mcp_fetch_full_knowledge_graph_data(
     state: &CloudMcpState,
     req: &CloudMcpSpecGraphSyncRequest,
@@ -4907,19 +5619,21 @@ async fn cloud_mcp_sync_knowledge_graph_once(
 ) -> Result<(Value, bool), String> {
     let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
     let current_cache = cloud_mcp_read_knowledge_graph_cache(req, "syncing", "");
-    let local_data = cloud_mcp_build_local_knowledge_graph_data(req)?;
-    let local_snapshot =
-        cloud_mcp_knowledge_graph_snapshot_from_data(req, local_data.clone(), &cache_path, "local", "");
-    cloud_mcp_write_knowledge_graph_cache(req, &local_snapshot)?;
+    cloud_mcp_write_knowledge_graph_cache(req, &current_cache)?;
 
     let next_snapshot = match cloud_mcp_connected_or_connect(state).await {
         Ok(_) => {
-            cloud_mcp_push_knowledge_snapshot(state, req, &local_data).await?;
             let data = cloud_mcp_fetch_full_knowledge_graph_data(state, req).await?;
-            cloud_mcp_knowledge_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
+            let mirror_sync = cloud_mcp_materialize_knowledge_graph_mirror(&req.root, &data);
+            let mut snapshot =
+                cloud_mcp_knowledge_graph_snapshot_from_data(req, data, &cache_path, "ready", "");
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("mirrorSync".to_string(), mirror_sync);
+            }
+            snapshot
         }
         Err(error) => {
-            let mut snapshot = local_snapshot;
+            let mut snapshot = current_cache.clone();
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("syncState".to_string(), json!("local"));
                 object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
@@ -4955,6 +5669,32 @@ fn cloud_mcp_knowledge_event_should_sync(root: &Path, event: &NotifyEvent) -> bo
         .paths
         .iter()
         .any(|path| !cloud_mcp_knowledge_cache_path_is_inside(root, path))
+}
+
+fn cloud_mcp_filetree_path_is_scan_relevant(root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(root) else {
+        return false;
+    };
+    !relative_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(cloud_mcp_skip_filetree_name)
+    })
+}
+
+fn cloud_mcp_filetree_event_should_sync(root: &Path, event: &NotifyEvent) -> bool {
+    match event.kind {
+        NotifyEventKind::Any
+        | NotifyEventKind::Create(_)
+        | NotifyEventKind::Modify(_)
+        | NotifyEventKind::Remove(_) => {}
+        _ => return false,
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| cloud_mcp_filetree_path_is_scan_relevant(root, path))
 }
 
 fn cloud_mcp_knowledge_event_action(event: &NotifyEvent) -> &'static str {
@@ -5555,7 +6295,20 @@ fn cloud_mcp_read_spec_graph_cache(
     sync_state: &str,
     sync_error: &str,
 ) -> Value {
-    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let cache_path = match cloud_mcp_safe_spec_graph_repo_cache_path(&req.root, &req.repo_id) {
+        Ok(path) => path,
+        Err(error) => {
+            let fallback_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+            let sync_error = clean_terminal_telemetry_text(&error);
+            return cloud_mcp_spec_graph_snapshot_from_data(
+                req,
+                cloud_mcp_spec_graph_empty_raw(req),
+                &fallback_path,
+                "error",
+                &sync_error,
+            );
+        }
+    };
     let snapshot = fs::read_to_string(&cache_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -5576,7 +6329,9 @@ fn cloud_mcp_read_spec_graph_cache_preserving_state(
     fallback_sync_state: &str,
     fallback_sync_error: &str,
 ) -> Value {
-    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let Ok(cache_path) = cloud_mcp_safe_spec_graph_repo_cache_path(&req.root, &req.repo_id) else {
+        return cloud_mcp_read_spec_graph_cache(req, fallback_sync_state, fallback_sync_error);
+    };
     let Some(snapshot) = fs::read_to_string(&cache_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -5608,14 +6363,7 @@ fn cloud_mcp_write_spec_graph_cache(
     req: &CloudMcpSpecGraphSyncRequest,
     snapshot: &Value,
 ) -> Result<PathBuf, String> {
-    let cache_dir = cloud_mcp_spec_graph_cache_dir(&req.root);
-    fs::create_dir_all(&cache_dir).map_err(|error| {
-        format!(
-            "Unable to create Spec Graph cache directory {}: {error}",
-            workspace_path_display(&cache_dir)
-        )
-    })?;
-    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    let cache_path = cloud_mcp_safe_spec_graph_repo_cache_path(&req.root, &req.repo_id)?;
     let body = serde_json::to_string_pretty(snapshot)
         .map_err(|error| format!("Unable to encode Spec Graph cache: {error}"))?;
     fs::write(&cache_path, body.as_bytes()).map_err(|error| {
@@ -5946,6 +6694,12 @@ fn cloud_mcp_emit_spec_graph_snapshot(app: &AppHandle, snapshot: Value) {
     let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot);
 }
 
+enum CloudMcpSpecGraphSyncSignal {
+    File(Result<NotifyEvent, notify::Error>),
+    Refresh,
+    Server(Result<Value, String>),
+}
+
 async fn cloud_mcp_sync_spec_graph_cycle(
     app: &AppHandle,
     state: &CloudMcpState,
@@ -6023,9 +6777,12 @@ async fn cloud_mcp_spec_graph_sync_loop(
     generation: u64,
     stop: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
+    request_wake: Arc<tokio::sync::Notify>,
 ) {
     let (graph_event_tx, mut graph_event_rx) =
         tokio::sync::mpsc::channel::<Result<Value, String>>(256);
+    let (file_event_tx, mut file_event_rx) =
+        tokio::sync::mpsc::channel::<Result<NotifyEvent, notify::Error>>(256);
     tauri::async_runtime::spawn(cloud_mcp_graph_ws_event_forward_loop(
         state.clone(),
         req.clone(),
@@ -6033,6 +6790,34 @@ async fn cloud_mcp_spec_graph_sync_loop(
         Arc::clone(&wake),
         graph_event_tx,
     ));
+    let mut filetree_watcher = match RecommendedWatcher::new(
+        move |event| {
+            let _ = file_event_tx.blocking_send(event);
+        },
+        NotifyConfig::default(),
+    ) {
+        Ok(mut watcher) => match watcher.watch(&req.root, RecursiveMode::Recursive) {
+            Ok(()) => Some(watcher),
+            Err(error) => {
+                let snapshot = cloud_mcp_read_spec_graph_cache(
+                    &req,
+                    "syncing",
+                    &format!("Unable to watch workspace filetree changes: {error}"),
+                );
+                cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                None
+            }
+        },
+        Err(error) => {
+            let snapshot = cloud_mcp_read_spec_graph_cache(
+                &req,
+                "syncing",
+                &format!("Unable to start workspace filetree watcher: {error}"),
+            );
+            cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+            None
+        }
+    };
 
     let mut first_sync = true;
     let mut needs_filetree_sync = true;
@@ -6051,6 +6836,10 @@ async fn cloud_mcp_spec_graph_sync_loop(
     .await;
 
     while !crate::app_shutdown_requested() {
+        let wake_signal = wake.notified();
+        let request_signal = request_wake.notified();
+        tokio::pin!(wake_signal);
+        tokio::pin!(request_signal);
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -6067,9 +6856,34 @@ async fn cloud_mcp_spec_graph_sync_loop(
             break;
         }
 
-        let event = graph_event_rx.recv().await;
-        match event {
-            Some(Ok(_)) => {
+        let signal = tokio::select! {
+            _ = &mut wake_signal => break,
+            _ = &mut request_signal => Some(CloudMcpSpecGraphSyncSignal::Refresh),
+            file_event = file_event_rx.recv(), if filetree_watcher.is_some() => {
+                file_event.map(CloudMcpSpecGraphSyncSignal::File)
+            }
+            graph_event = graph_event_rx.recv() => {
+                graph_event.map(CloudMcpSpecGraphSyncSignal::Server)
+            }
+        };
+        let Some(signal) = signal else {
+            break;
+        };
+        match signal {
+            CloudMcpSpecGraphSyncSignal::Refresh => {
+                needs_filetree_sync = true;
+                cloud_mcp_sync_spec_graph_cycle(
+                    &app,
+                    &state,
+                    &req,
+                    &mut first_sync,
+                    &mut needs_filetree_sync,
+                    &mut handled_filetree_request,
+                    &mut last_gitignore_signature,
+                )
+                .await;
+            }
+            CloudMcpSpecGraphSyncSignal::Server(Ok(_)) => {
                 while matches!(graph_event_rx.try_recv(), Ok(Ok(_))) {}
                 cloud_mcp_sync_spec_graph_cycle(
                     &app,
@@ -6082,7 +6896,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 )
                 .await;
             }
-            Some(Err(error)) => {
+            CloudMcpSpecGraphSyncSignal::Server(Err(error)) => {
                 let snapshot = cloud_mcp_read_spec_graph_cache(
                     &req,
                     "error",
@@ -6092,7 +6906,57 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
                 break;
             }
-            None => break,
+            CloudMcpSpecGraphSyncSignal::File(Ok(event))
+                if cloud_mcp_filetree_event_should_sync(&req.root, &event) =>
+            {
+                needs_filetree_sync = true;
+                let debounce_wake_signal = wake.notified();
+                tokio::pin!(debounce_wake_signal);
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS)) => {}
+                    _ = &mut debounce_wake_signal => break,
+                }
+                while let Ok(next_event_result) = file_event_rx.try_recv() {
+                    match next_event_result {
+                        Ok(next_event) => {
+                            if cloud_mcp_filetree_event_should_sync(&req.root, &next_event) {
+                                needs_filetree_sync = true;
+                            }
+                        }
+                        Err(error) => {
+                            let snapshot = cloud_mcp_read_spec_graph_cache(
+                                &req,
+                                "error",
+                                &format!("Workspace filetree watcher failed: {error}"),
+                            );
+                            cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                        }
+                    }
+                }
+                cloud_mcp_sync_spec_graph_cycle(
+                    &app,
+                    &state,
+                    &req,
+                    &mut first_sync,
+                    &mut needs_filetree_sync,
+                    &mut handled_filetree_request,
+                    &mut last_gitignore_signature,
+                )
+                .await;
+            }
+            CloudMcpSpecGraphSyncSignal::File(Ok(_)) => {}
+            CloudMcpSpecGraphSyncSignal::File(Err(error)) => {
+                let snapshot = cloud_mcp_read_spec_graph_cache(
+                    &req,
+                    "error",
+                    &format!("Workspace filetree watcher failed: {error}"),
+                );
+                cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                filetree_watcher = None;
+            }
         }
     }
 
@@ -6142,8 +7006,10 @@ async fn cloud_mcp_start_spec_graph_sync(
     let requested_generation = cloud_mcp_now_ms();
     let requested_stop = Arc::new(AtomicBool::new(false));
     let requested_wake = Arc::new(tokio::sync::Notify::new());
+    let requested_request_wake = Arc::new(tokio::sync::Notify::new());
     let mut active_generation = requested_generation;
     let mut should_spawn = false;
+    let mut existing_request_wake = None;
     {
         let mut syncs = state.spec_graph_syncs.lock().await;
         if let Some(existing_runtime) = syncs
@@ -6151,6 +7017,7 @@ async fn cloud_mcp_start_spec_graph_sync(
             .filter(|runtime| !runtime.stop.load(Ordering::SeqCst))
         {
             active_generation = existing_runtime.generation;
+            existing_request_wake = Some(Arc::clone(&existing_runtime.request_wake));
         } else {
             syncs.insert(
                 req.repo_id.clone(),
@@ -6158,6 +7025,7 @@ async fn cloud_mcp_start_spec_graph_sync(
                     generation: requested_generation,
                     stop: Arc::clone(&requested_stop),
                     wake: Arc::clone(&requested_wake),
+                    request_wake: Arc::clone(&requested_request_wake),
                 },
             );
             should_spawn = true;
@@ -6166,6 +7034,9 @@ async fn cloud_mcp_start_spec_graph_sync(
     {
         let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
         requests.insert(req.repo_id.clone(), requested_generation);
+    }
+    if let Some(request_wake) = existing_request_wake {
+        request_wake.notify_waiters();
     }
     let mut cached = if should_spawn {
         cloud_mcp_read_spec_graph_cache(&req, "syncing", "")
@@ -6187,6 +7058,7 @@ async fn cloud_mcp_start_spec_graph_sync(
                 requested_generation,
                 requested_stop,
                 requested_wake,
+                requested_request_wake,
             )
             .await;
         });
@@ -6337,17 +7209,20 @@ async fn cloud_mcp_get_knowledge_graph(
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
     let cache_path = cloud_mcp_knowledge_graph_cache_path(&req.root, &req.repo_id);
-    let local_data = cloud_mcp_build_local_knowledge_graph_data(&req)?;
-    let local_snapshot =
-        cloud_mcp_knowledge_graph_snapshot_from_data(&req, local_data.clone(), &cache_path, "local", "");
+    let cached_snapshot = cloud_mcp_read_knowledge_graph_cache(&req, "local", "");
     let snapshot = match cloud_mcp_connected_or_connect(state.inner()).await {
         Ok(_) => {
-            cloud_mcp_push_knowledge_snapshot(state.inner(), &req, &local_data).await?;
             let data = cloud_mcp_fetch_full_knowledge_graph_data(state.inner(), &req).await?;
-            cloud_mcp_knowledge_graph_snapshot_from_data(&req, data, &cache_path, "ready", "")
+            let mirror_sync = cloud_mcp_materialize_knowledge_graph_mirror(&req.root, &data);
+            let mut snapshot =
+                cloud_mcp_knowledge_graph_snapshot_from_data(&req, data, &cache_path, "ready", "");
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("mirrorSync".to_string(), mirror_sync);
+            }
+            snapshot
         }
         Err(error) => {
-            let mut snapshot = local_snapshot;
+            let mut snapshot = cached_snapshot;
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
             }
@@ -6472,7 +7347,7 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
                     "id": id,
                     "error": {
                         "code": -32000,
-                        "message": format!("Cloud MCP proxy could not reach Cloud MCP at {base_url}/mcp: {error}")
+                        "message": format!("Cloud MCP proxy could not reach Cloud MCP app websocket at {base_url}/v1/app/ws: {error}")
                     }
                 })
                 .to_string();
@@ -6586,6 +7461,135 @@ mod cloud_mcp_tests {
 
         let second = cloud_mcp_build_local_ignored_spec_graph_overlay(&root).unwrap();
         assert_eq!(second["cache_hit"].as_bool(), Some(true));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spec_graph_cache_path_sanitizes_repo_id_filename() {
+        let root = env::temp_dir().join("diffforge-spec-cache-path");
+        let cache_path = cloud_mcp_spec_graph_cache_path(&root, "../repo:outside/name");
+        let cache_dir = cloud_mcp_spec_graph_cache_dir(&root);
+
+        assert!(cache_path.starts_with(&cache_dir));
+        let file_name = cache_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        assert!(!file_name.contains('/'));
+        assert!(!file_name.contains('\\'));
+        assert!(!file_name.contains(':'));
+        assert!(file_name.ends_with(".json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spec_graph_cache_write_rejects_symlinked_cache_dir() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-spec-cache-symlink-{suffix}"));
+        let outside = env::temp_dir().join(format!("diffforge-spec-cache-outside-{suffix}"));
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join(".agents").join("spec-graph")).unwrap();
+        let req = CloudMcpSpecGraphSyncRequest {
+            root: root.clone(),
+            root_display: workspace_path_display(&root),
+            repo_id: "repo-test".to_string(),
+            workspace_id: None,
+            workspace_name: None,
+        };
+
+        let error = cloud_mcp_write_spec_graph_cache(&req, &json!({"ok": true})).unwrap_err();
+        assert!(error.contains("symlinked Spec Graph cache directory"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ignored_overlay_skips_symlinked_whitelist_paths() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-local-ignored-symlink-{suffix}"));
+        let outside = env::temp_dir().join(format!("diffforge-local-ignored-target-{suffix}.md"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "outside instructions\n").unwrap();
+        symlink(&outside, root.join("AGENTS.md")).unwrap();
+
+        let overlay = cloud_mcp_build_local_ignored_spec_graph_overlay(&root).unwrap();
+        let paths = overlay["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|node| node["path"].as_str().map(str::to_string))
+            .collect::<HashSet<_>>();
+        assert!(!paths.contains("AGENTS.md"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(outside);
+    }
+
+    #[test]
+    fn knowledge_authoring_note_path_rejects_absolute_paths() {
+        assert!(cloud_mcp_knowledge_authoring_note_path(".agents/knowledge/index.md").is_some());
+        assert!(cloud_mcp_knowledge_authoring_note_path("systems/backend-runtime.md").is_some());
+        assert!(cloud_mcp_knowledge_authoring_note_path("/tmp/outside.md").is_none());
+        assert!(cloud_mcp_knowledge_authoring_note_path("../outside.md").is_none());
+        assert!(cloud_mcp_knowledge_authoring_note_path("C:/outside.md").is_none());
+    }
+
+    #[test]
+    fn server_markdown_delta_prevents_legacy_authoring_overwrite() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("diffforge-knowledge-delta-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let response = json!({
+            "knowledge_markdown_delta": {
+                "mode": "server_markdown_delta",
+                "source_of_truth": "server_authored_knowledge_graph",
+                "files": [{
+                    "path": ".agents/knowledge/systems/backend-runtime.md",
+                    "content": "# Server Runtime\n\nPurpose: server-authored.\n"
+                }],
+                "delete_paths": []
+            },
+            "knowledge_authoring": {
+                "record": true,
+                "status": "planned",
+                "provider": "legacy",
+                "notes": [{
+                    "path": "systems/backend-runtime.md",
+                    "markdown": "# Legacy Runtime\n\nPurpose: should not overwrite.\n"
+                }]
+            }
+        });
+
+        let result = cloud_mcp_apply_knowledge_authoring_result(Some(&root), &response);
+        assert_eq!(result["reason"], "server_markdown_delta_applied");
+        let written = fs::read_to_string(
+            root.join(".agents")
+                .join("knowledge")
+                .join("systems")
+                .join("backend-runtime.md"),
+        )
+        .unwrap();
+        assert!(written.contains("# Server Runtime"));
+        assert!(!written.contains("# Legacy Runtime"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7271,16 +8275,38 @@ pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
     );
     match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
         Ok(response) => {
+            let filetree_sync = if let (Some(repo_id), Some(repo_path)) =
+                (identity.repo_id.as_deref(), identity.repo_path.as_ref())
+            {
+                match cloud_mcp_proxy_push_current_filetree_snapshot(
+                    &base_url,
+                    repo_id,
+                    repo_path,
+                    identity.workspace_id.as_deref(),
+                    identity.workspace_name.as_deref(),
+                    "acquire_lease_filetree_resync",
+                ) {
+                    Ok(response) => json!({"ok": true, "response": response}),
+                    Err(error) => json!({"ok": false, "error": error}),
+                }
+            } else {
+                json!({"ok": false, "skipped": true, "reason": "missing_repo_for_filetree_resync"})
+            };
             identity.log(
                 "cloud_mcp.agent_acquire_lease.done",
                 "acquire_lease",
                 json!({
                     "activity": "agent acquire_lease synced",
                     "baseUrl": base_url,
+                    "filetreeSync": filetree_sync,
                 }),
             );
-            Ok(serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response})))
+            let mut parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            if let Some(object) = parsed.as_object_mut() {
+                object.insert("filetree_sync".to_string(), filetree_sync);
+            }
+            Ok(parsed)
         }
         Err(error) => {
             identity.log(
@@ -7448,42 +8474,43 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         "payload": Value::Object(arguments),
         "ts_ms": cloud_mcp_now_ms(),
     });
+    let should_sync_filetree_for_submit = ok
+        && (auto_merge_status == "applied"
+            || matches!(task_status.as_str(), "merged" | "done" | "completed"));
+    let filetree_sync = if should_sync_filetree_for_submit {
+        if let (Some(repo_id), Some(repo_path)) =
+            (identity.repo_id.as_deref(), main_repo_path.as_ref())
+        {
+            match cloud_mcp_proxy_push_current_filetree_snapshot(
+                &base_url,
+                repo_id,
+                repo_path,
+                identity.workspace_id.as_deref(),
+                identity.workspace_name.as_deref(),
+                "submit_patch_pre_accept_filetree_resync",
+            ) {
+                Ok(response) => json!({"ok": true, "response": response}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
+        } else {
+            json!({"ok": false, "error": "missing_repo_for_filetree_resync"})
+        }
+    } else {
+        json!({"ok": false, "skipped": true, "reason": "patch_not_applied_to_main"})
+    };
     identity.log(
         "cloud_mcp.agent_submit_patch.start",
         "submit_patch",
         json!({
             "activity": "agent submit_patch",
             "baseUrl": base_url,
+            "filetreeSync": filetree_sync,
             "taskStatus": task_status,
             "taskId": active_task_id,
         }),
     );
     match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
         Ok(response) => {
-            let filetree_sync = if ok
-                && (auto_merge_status == "applied"
-                    || matches!(task_status.as_str(), "merged" | "done" | "completed"))
-            {
-                if let (Some(repo_id), Some(repo_path)) =
-                    (identity.repo_id.as_deref(), main_repo_path.as_ref())
-                {
-                    match cloud_mcp_proxy_push_current_filetree_snapshot(
-                        &base_url,
-                        repo_id,
-                        repo_path,
-                        identity.workspace_id.as_deref(),
-                        identity.workspace_name.as_deref(),
-                        "submit_patch_main_repo_resync",
-                    ) {
-                        Ok(response) => json!({"ok": true, "response": response}),
-                        Err(error) => json!({"ok": false, "error": error}),
-                    }
-                } else {
-                    json!({"ok": false, "error": "missing_repo_for_filetree_resync"})
-                }
-            } else {
-                json!({"ok": false, "skipped": true, "reason": "patch_not_applied_to_main"})
-            };
             let isolated_prune = if ok {
                 json!({"ok": false, "skipped": true, "reason": "patch_accepted"})
             } else {
@@ -7689,7 +8716,17 @@ fn cloud_mcp_prune_cached_isolated_spec_work(
     let (Some(repo_path), Some(repo_id)) = (repo_path, repo_id) else {
         return json!({"ok": false, "skipped": true, "reason": "missing_repo_identity"});
     };
-    let cache_path = cloud_mcp_spec_graph_cache_path(repo_path, repo_id);
+    let cache_path = match cloud_mcp_safe_spec_graph_repo_cache_path(repo_path, repo_id) {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "skipped": true,
+                "reason": "unsafe_cache_path",
+                "error": clean_terminal_telemetry_text(&error),
+            });
+        }
+    };
     let Ok(contents) = fs::read_to_string(&cache_path) else {
         return json!({"ok": false, "skipped": true, "reason": "cache_missing"});
     };
@@ -8758,7 +9795,30 @@ fn cloud_mcp_proxy_post_json_endpoint(
 ) -> Result<String, String> {
     use std::io::Write as _;
 
-    let endpoint = cloud_mcp_proxy_parse_http_url(base_url, endpoint_path)?;
+    let request_kind = if endpoint_path == "/mcp" {
+        "mcp"
+    } else {
+        cloud_mcp_ws_kind_for_endpoint(endpoint_path).ok_or_else(|| {
+            format!("Cloud MCP endpoint {endpoint_path} is not routed through the app websocket")
+        })?
+    };
+    let endpoint = cloud_mcp_proxy_parse_http_url(base_url, "/v1/app/ws")?;
+    let body_value = serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("invalid Cloud MCP websocket JSON payload: {error}"))?;
+    let client_id = cloud_mcp_proxy_payload_text(&body_value, &["client_id"])
+        .or_else(|| cloud_mcp_proxy_payload_text(&body_value, &["payload", "client_id"]))
+        .or_else(|| {
+            cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "client_id"])
+        })
+        .unwrap_or_else(|| CLOUD_MCP_RUST_CLIENT_ID.to_string());
+    let repo_id = cloud_mcp_proxy_payload_text(&body_value, &["repo_id"])
+        .or_else(|| cloud_mcp_proxy_payload_text(&body_value, &["payload", "repo_id"]))
+        .or_else(|| cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "repo_id"]));
+    let workspace_id = cloud_mcp_proxy_payload_text(&body_value, &["workspace_id"])
+        .or_else(|| cloud_mcp_proxy_payload_text(&body_value, &["payload", "workspace_id"]))
+        .or_else(|| {
+            cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "workspace_id"])
+        });
     let mut stream = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .map_err(|error| format!("connect failed: {error}"))?;
     let read_poll_timeout = Duration::from_secs(1);
@@ -8766,86 +9826,140 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let _ = stream.set_read_timeout(Some(read_poll_timeout));
     let _ = stream.set_write_timeout(Some(write_timeout));
 
-    let mut headers = String::new();
-    let body_value = serde_json::from_str::<Value>(body).ok();
-    let client_id = body_value
-        .as_ref()
-        .and_then(|value| {
-            cloud_mcp_payload_text(value, &["client_id"])
-                .or_else(|| cloud_mcp_payload_text(value, &["payload", "client_id"]))
-        })
-        .unwrap_or_else(|| CLOUD_MCP_RUST_CLIENT_ID.to_string());
-    headers.push_str(&format!("x-diffforge-client-id: {}\r\n", client_id.trim()));
-    if let Some(workspace_id) = body_value.as_ref().and_then(|value| {
-        cloud_mcp_payload_text(value, &["workspace_id"])
-            .or_else(|| cloud_mcp_payload_text(value, &["payload", "workspace_id"]))
-    }) {
-        headers.push_str(&format!(
-            "x-diffforge-workspace-id: {}\r\n",
-            workspace_id.trim()
-        ));
+    let websocket_key = general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+    let expected_accept = cloud_mcp_proxy_ws_accept_key(&websocket_key);
+    let mut headers = format!("x-diffforge-client-id: {}\r\n", client_id.trim());
+    if let Some(workspace_id) = workspace_id.as_deref() {
+        headers.push_str(&format!("x-diffforge-workspace-id: {}\r\n", workspace_id.trim()));
     }
-    if let Some(repo_id) = body_value.as_ref().and_then(|value| {
-        cloud_mcp_payload_text(value, &["repo_id"])
-            .or_else(|| cloud_mcp_payload_text(value, &["payload", "repo_id"]))
-    }) {
+    if let Some(repo_id) = repo_id.as_deref() {
         headers.push_str(&format!("x-diffforge-repo-id: {}\r\n", repo_id.trim()));
     }
-    if let Ok(token) =
-        env::var("CLOUD_DIFFFORGE_DEV_TOKEN").or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN"))
-    {
-        if !token.trim().is_empty() {
-            headers.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
+    if let Some(token) = cloud_mcp_dev_auth_token() {
+        headers.push_str(&format!("Authorization: Bearer {}\r\n", token));
+    }
+
+    let handshake = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n{}\r\n",
+        endpoint.path,
+        endpoint.host_header,
+        websocket_key,
+        headers,
+    );
+    stream
+        .write_all(handshake.as_bytes())
+        .map_err(|error| format!("write failed: {error}"))?;
+    let head = cloud_mcp_proxy_read_http_headers(&mut stream)?;
+    if !head.starts_with("HTTP/1.1 101") && !head.starts_with("HTTP/1.0 101") {
+        return Err(format!(
+            "Cloud MCP websocket upgrade returned {}",
+            head.lines().next().unwrap_or("non-101 status")
+        ));
+    }
+    if let Some(actual_accept) = cloud_mcp_proxy_http_header(&head, "sec-websocket-accept") {
+        if actual_accept.trim() != expected_accept {
+            return Err("Cloud MCP websocket upgrade returned an invalid accept key".to_string());
         }
     }
 
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
-        endpoint.path,
-        endpoint.host_header,
-        body.as_bytes().len(),
-        headers,
-        body
-    );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("write failed: {error}"))?;
-
-    let response = cloud_mcp_proxy_read_http_response(&mut stream)?;
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "invalid HTTP response from Cloud MCP".to_string())?;
-    let head = String::from_utf8_lossy(&response[..header_end]).to_string();
-    let body = &response[header_end + 4..];
-    if !head.starts_with("HTTP/1.1 2") && !head.starts_with("HTTP/1.0 2") {
-        return Err(format!(
-            "Cloud MCP returned {}",
-            head.lines().next().unwrap_or("non-2xx status")
-        ));
-    }
-    let body = if cloud_mcp_proxy_header_contains(&head, "transfer-encoding", "chunked") {
-        cloud_mcp_proxy_decode_chunked_body(body)?
-    } else {
-        body.to_vec()
-    };
-    String::from_utf8(body).map_err(|error| format!("Cloud MCP returned invalid UTF-8: {error}"))
-}
-
-fn cloud_mcp_proxy_read_http_response(stream: &mut std::net::TcpStream) -> Result<Vec<u8>, String> {
-    use std::io::Read as _;
+    let ready_text = cloud_mcp_proxy_read_ws_text_frame(&mut stream)?;
+    let ready = serde_json::from_str::<Value>(&ready_text)
+        .map_err(|error| format!("Cloud MCP websocket ready frame was invalid JSON: {error}"))?;
+    let (connection_id, message_token) = cloud_mcp_proxy_extract_ws_message_auth(&ready)?;
+    let request_id = format!("proxy-ws-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let envelope = json!({
+        "kind": request_kind,
+        "id": request_id,
+        "contract": "diffforge.app_ws.v1",
+        "auth": {
+            "connection_id": connection_id,
+            "message_token": message_token,
+        },
+        "client_id": client_id,
+        "repo_id": repo_id,
+        "workspace_id": workspace_id,
+        "request": body_value,
+    });
+    cloud_mcp_proxy_write_ws_text_frame(&mut stream, &envelope.to_string())?;
 
     let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Cloud MCP websocket request timed out.".to_string());
+        }
+        let response_text = cloud_mcp_proxy_read_ws_text_frame(&mut stream)?;
+        let response = serde_json::from_str::<Value>(&response_text).map_err(|error| {
+            format!("Cloud MCP websocket response was invalid JSON: {error}")
+        })?;
+        if response.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+            continue;
+        }
+        if response.get("ok").and_then(Value::as_bool) == Some(false)
+            || response.get("kind").and_then(Value::as_str) == Some("error")
+        {
+            let message = response["error"]["message"]
+                .as_str()
+                .unwrap_or("Cloud MCP websocket request failed.");
+            return Err(message.to_string());
+        }
+        let data = response
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| response.clone());
+        if endpoint_path == "/mcp" {
+            return Ok(data.to_string());
+        }
+        return Ok(json!({
+            "ok": true,
+            "data": data,
+            "warnings": [],
+        })
+        .to_string());
+    }
+}
+
+fn cloud_mcp_proxy_payload_text(value: &Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = cursor.get(*segment)?;
+    }
+    cursor.as_str().map(str::to_string)
+}
+
+fn cloud_mcp_proxy_ws_accept_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn cloud_mcp_proxy_http_header(head: &str, header_name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(header_name) {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn cloud_mcp_proxy_read_http_headers(stream: &mut std::net::TcpStream) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS);
     let mut response = Vec::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; 1];
     loop {
         match stream.read(&mut buffer) {
-            Ok(0) => return Ok(response),
+            Ok(0) => return Err("Cloud MCP websocket closed during handshake".to_string()),
             Ok(bytes_read) => {
                 response.extend_from_slice(&buffer[..bytes_read]);
-                if cloud_mcp_proxy_http_response_complete(&response) {
-                    return Ok(response);
+                if response.ends_with(b"\r\n\r\n") {
+                    let header_len = response.len().saturating_sub(4);
+                    return String::from_utf8(response[..header_len].to_vec()).map_err(|error| {
+                        format!("Cloud MCP websocket returned invalid handshake headers: {error}")
+                    });
                 }
             }
             Err(error)
@@ -8855,129 +9969,164 @@ fn cloud_mcp_proxy_read_http_response(stream: &mut std::net::TcpStream) -> Resul
                 ) =>
             {
                 if Instant::now() >= deadline {
-                    return Err(format!(
-                        "read timed out after {CLOUD_MCP_SYNC_TIMEOUT_SECS}s waiting for Cloud MCP response"
-                    ));
+                    return Err("Cloud MCP websocket handshake timed out".to_string());
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => return Err(format!("read failed: {error}")),
+            Err(error) => return Err(format!("Cloud MCP websocket handshake read failed: {error}")),
         }
     }
 }
 
-fn cloud_mcp_proxy_http_response_complete(response: &[u8]) -> bool {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
+fn cloud_mcp_proxy_extract_ws_message_auth(ready: &Value) -> Result<(String, String), String> {
+    if ready.get("kind").and_then(Value::as_str) != Some("cloud_app_ws_ready") {
+        return Err("Cloud MCP websocket did not send a ready frame".to_string());
+    }
+    let message_auth = ready.get("message_auth").unwrap_or(&Value::Null);
+    let connection_id = message_auth
+        .get("connection_id")
+        .or_else(|| message_auth.get("connectionId"))
+        .and_then(Value::as_str)
+        .or_else(|| ready.get("connection_id").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Cloud MCP websocket ready frame omitted connection_id".to_string())?;
+    let message_token = message_auth
+        .get("message_token")
+        .or_else(|| message_auth.get("messageToken"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Cloud MCP websocket ready frame omitted message_token".to_string())?;
+    Ok((connection_id.to_string(), message_token.to_string()))
+}
+
+fn cloud_mcp_proxy_write_ws_text_frame(
+    stream: &mut std::net::TcpStream,
+    text: &str,
+) -> Result<(), String> {
+    cloud_mcp_proxy_write_ws_frame(stream, 0x1, text.as_bytes())
+}
+
+fn cloud_mcp_proxy_write_ws_pong_frame(
+    stream: &mut std::net::TcpStream,
+    payload: &[u8],
+) -> Result<(), String> {
+    cloud_mcp_proxy_write_ws_frame(stream, 0xA, payload)
+}
+
+fn cloud_mcp_proxy_write_ws_frame(
+    stream: &mut std::net::TcpStream,
+    opcode: u8,
+    payload: &[u8],
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | (opcode & 0x0F));
+    if payload.len() <= 125 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    let mask_seed = cloud_mcp_now_ms() ^ u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
+    let mask = (mask_seed as u32).to_be_bytes();
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(*byte ^ mask[index % 4]);
+    }
+    stream
+        .write_all(&frame)
+        .map_err(|error| format!("Cloud MCP websocket write failed: {error}"))
+}
+
+fn cloud_mcp_proxy_read_ws_text_frame(stream: &mut std::net::TcpStream) -> Result<String, String> {
+    loop {
+        let (opcode, payload) = cloud_mcp_proxy_read_ws_frame(stream)?;
+        match opcode {
+            0x1 => {
+                return String::from_utf8(payload).map_err(|error| {
+                    format!("Cloud MCP websocket returned invalid UTF-8 text: {error}")
+                });
+            }
+            0x8 => return Err("Cloud MCP websocket closed the connection".to_string()),
+            0x9 => {
+                cloud_mcp_proxy_write_ws_pong_frame(stream, &payload)?;
+            }
+            0xA => {}
+            _ => {}
+        }
+    }
+}
+
+fn cloud_mcp_proxy_read_ws_frame(
+    stream: &mut std::net::TcpStream,
+) -> Result<(u8, Vec<u8>), String> {
+    let mut header = [0u8; 2];
+    cloud_mcp_proxy_read_exact(stream, &mut header)?;
+    let opcode = header[0] & 0x0F;
+    let masked = header[1] & 0x80 != 0;
+    let mut length = u64::from(header[1] & 0x7F);
+    if length == 126 {
+        let mut extended = [0u8; 2];
+        cloud_mcp_proxy_read_exact(stream, &mut extended)?;
+        length = u64::from(u16::from_be_bytes(extended));
+    } else if length == 127 {
+        let mut extended = [0u8; 8];
+        cloud_mcp_proxy_read_exact(stream, &mut extended)?;
+        length = u64::from_be_bytes(extended);
+    }
+    if length > 16 * 1024 * 1024 {
+        return Err("Cloud MCP websocket frame is too large".to_string());
+    }
+    let mask = if masked {
+        let mut mask = [0u8; 4];
+        cloud_mcp_proxy_read_exact(stream, &mut mask)?;
+        Some(mask)
+    } else {
+        None
     };
-    let head = String::from_utf8_lossy(&response[..header_end]);
-    let body = &response[header_end + 4..];
-    if let Some(content_length) = cloud_mcp_proxy_content_length(&head) {
-        return body.len() >= content_length;
+    let mut payload = vec![0u8; length as usize];
+    if !payload.is_empty() {
+        cloud_mcp_proxy_read_exact(stream, &mut payload)?;
     }
-    if cloud_mcp_proxy_header_contains(&head, "transfer-encoding", "chunked") {
-        return cloud_mcp_proxy_chunked_body_complete(body);
+    if let Some(mask) = mask {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
     }
-    false
+    Ok((opcode, payload))
 }
 
-fn cloud_mcp_proxy_content_length(head: &str) -> Option<usize> {
-    head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            value.trim().parse::<usize>().ok()
-        } else {
-            None
-        }
-    })
-}
+fn cloud_mcp_proxy_read_exact(
+    stream: &mut std::net::TcpStream,
+    buffer: &mut [u8],
+) -> Result<(), String> {
+    use std::io::Read as _;
 
-fn cloud_mcp_proxy_header_contains(head: &str, header_name: &str, expected_value: &str) -> bool {
-    let header_name = header_name.to_ascii_lowercase();
-    let expected_value = expected_value.to_ascii_lowercase();
-    head.lines().any(|line| {
-        let Some((name, value)) = line.split_once(':') else {
-            return false;
-        };
-        name.trim().eq_ignore_ascii_case(&header_name)
-            && value.to_ascii_lowercase().contains(&expected_value)
-    })
-}
-
-fn cloud_mcp_proxy_chunked_body_complete(body: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    loop {
-        let Some(line_end) = body[cursor..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .map(|offset| cursor + offset)
-        else {
-            return false;
-        };
-        let Ok(size_line) = std::str::from_utf8(&body[cursor..line_end]) else {
-            return false;
-        };
-        let size_text = size_line
-            .split_once(';')
-            .map(|(size, _)| size)
-            .unwrap_or(size_line)
-            .trim();
-        let Ok(size) = usize::from_str_radix(size_text, 16) else {
-            return false;
-        };
-        cursor = line_end + 2;
-        if size == 0 {
-            return body[cursor..].windows(2).any(|window| window == b"\r\n");
+    let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
+    let mut read = 0usize;
+    while read < buffer.len() {
+        match stream.read(&mut buffer[read..]) {
+            Ok(0) => return Err("Cloud MCP websocket closed unexpectedly".to_string()),
+            Ok(bytes_read) => read += bytes_read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err("Cloud MCP websocket read timed out".to_string());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("Cloud MCP websocket read failed: {error}")),
         }
-        let Some(chunk_end) = cursor.checked_add(size) else {
-            return false;
-        };
-        if chunk_end + 2 > body.len() || &body[chunk_end..chunk_end + 2] != b"\r\n" {
-            return false;
-        }
-        cursor = chunk_end + 2;
     }
-}
-
-fn cloud_mcp_proxy_decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
-    let mut cursor = 0usize;
-    let mut decoded = Vec::new();
-
-    loop {
-        let line_end = body[cursor..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .map(|offset| cursor + offset)
-            .ok_or_else(|| "invalid chunked Cloud MCP response: missing chunk size".to_string())?;
-        let size_line = std::str::from_utf8(&body[cursor..line_end])
-            .map_err(|error| format!("invalid chunked Cloud MCP size line: {error}"))?;
-        let size_text = size_line
-            .split_once(';')
-            .map(|(size, _)| size)
-            .unwrap_or(size_line)
-            .trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|error| {
-            format!("invalid chunked Cloud MCP chunk size '{size_text}': {error}")
-        })?;
-        cursor = line_end + 2;
-
-        if size == 0 {
-            break;
-        }
-        let chunk_end = cursor
-            .checked_add(size)
-            .ok_or_else(|| "invalid chunked Cloud MCP response: chunk size overflow".to_string())?;
-        if chunk_end + 2 > body.len() {
-            return Err("invalid chunked Cloud MCP response: chunk exceeds body".to_string());
-        }
-        decoded.extend_from_slice(&body[cursor..chunk_end]);
-        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
-            return Err("invalid chunked Cloud MCP response: missing chunk terminator".to_string());
-        }
-        cursor = chunk_end + 2;
-    }
-
-    Ok(decoded)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

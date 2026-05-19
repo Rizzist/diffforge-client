@@ -1097,7 +1097,7 @@ function WorkspaceTerminal({
       }
     }, 0);
   }, []);
-  const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "") => {
+  const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "", options = {}) => {
     if (isGenericTerminal) {
       logThreadBridgeDiagnostic("frontend.thread_terminal_observed_prompt.skip", {
         instanceId,
@@ -1145,7 +1145,9 @@ function WorkspaceTerminal({
       instanceId,
       paneId,
       promptLength: safeUserMessage.length,
+      promptEventId: options.promptEventId || "",
       rawText: getBigViewTextDiagnosticFields(userMessage),
+      source: options.source || options.messageSource || "",
       visibleText: getBigViewTextDiagnosticFields(safeUserMessage),
       slotKey: terminalThreadSlotKeyRef.current,
       terminalIndex,
@@ -1156,12 +1158,18 @@ function WorkspaceTerminal({
     onThreadTerminalLifecycle?.({
       agentId: agent?.id || terminalAgentKind,
       instanceId,
+      messageCreatedAt: options.messageCreatedAt,
+      messageId: options.messageId,
+      messageSource: options.messageSource || options.source,
       paneId,
+      promptEventId: options.promptEventId,
       repoPath: workingDirectory || "",
       slotKey: terminalThreadSlotKeyRef.current,
+      source: options.source,
       status: "active",
       terminalIndex,
       threadId: terminalThreadIdRef.current,
+      turnId: options.turnId,
       type: "message-submitted",
       userMessage: safeUserMessage,
       workspaceId: workspace?.id || "",
@@ -3742,6 +3750,13 @@ function WorkspaceTerminal({
       })
       .catch(() => {});
 
+    const pendingTerminalAudioInputChunks = [];
+    let applyTerminalAudioInputChunk = (insertedText) => {
+      if (insertedText) {
+        pendingTerminalAudioInputChunks.push(insertedText);
+      }
+    };
+
     listen(TERMINAL_AUDIO_INPUT_REFOCUS_EVENT, (event) => {
       if (
         isDisposed
@@ -3755,6 +3770,13 @@ function WorkspaceTerminal({
         requestTerminalAudioInputTarget(true);
         focusTerminalKeyboardInput();
       }
+
+      const insertedText = String(event.payload?.insertedText || "");
+      if (!insertedText || isGenericTerminal) {
+        return;
+      }
+
+      applyTerminalAudioInputChunk(insertedText);
     })
       .then((unlisten) => {
         if (isDisposed) {
@@ -7272,8 +7294,42 @@ function WorkspaceTerminal({
             });
           }
         };
-        const writeTerminalInputChunk = (data, reason) => {
+        applyTerminalAudioInputChunk = (insertedText) => {
+          const safeInsertedText = String(insertedText || "");
+          if (!safeInsertedText || isGenericTerminal) {
+            return;
+          }
+
+          refreshTerminalComposerDraftFromStore("audio_input_before_apply");
+          const draftBeforeApply = terminalSubmittedInputText;
+          if (terminalInputChunkHasVisibleText(safeInsertedText)) {
+            terminalSubmittedInputHasText = true;
+          }
+          terminalSubmittedInputText = applyTerminalInputChunkToDraft(
+            terminalSubmittedInputText,
+            safeInsertedText,
+          );
+          syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+          logBigViewSyncDiagnosticEvent("tui.audio.input_chunk_applied", {
+            agentId: terminalAgentKind,
+            draftAfter: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
+            draftBefore: getBigViewTextDiagnosticFields(draftBeforeApply),
+            inputDebug: getTerminalInputDebugFields(safeInsertedText),
+            instanceId: terminalInstanceId,
+            paneId,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            visibleText: getBigViewTextDiagnosticFields(terminalInputChunkVisibleText(safeInsertedText)),
+            workspaceId: workspace?.id || "",
+          });
+        };
+        while (pendingTerminalAudioInputChunks.length) {
+          applyTerminalAudioInputChunk(pendingTerminalAudioInputChunks.shift());
+        }
+        const writeTerminalInputChunk = (data, reason, promptMetadata = null) => {
           const textData = String(data || "");
+          const promptEventId = String(promptMetadata?.promptEventId || "").trim();
+          const promptEventText = String(promptMetadata?.promptEventText || "").trim();
           const isEscapeInput = String(data || "").includes("\x1b");
           const isSubmitInput = textData.includes("\r") || textData.includes("\n");
           const isFocusEventInput = textData.includes("\x1b[I") || textData.includes("\x1b[O");
@@ -7304,6 +7360,8 @@ function WorkspaceTerminal({
               isFocusEventInput,
               isSubmitInput,
               paneId,
+              promptEventId,
+              promptEventTextLength: promptEventText.length,
               reason,
               terminalIndex,
               threadId: terminalThreadIdRef.current || "",
@@ -7325,6 +7383,8 @@ function WorkspaceTerminal({
                   isFocusEventInput,
                   isSubmitInput,
                   paneId,
+                  promptEventId,
+                  promptEventTextLength: promptEventText.length,
                   reason,
                   terminalIndex,
                   threadId: terminalThreadIdRef.current || "",
@@ -7335,6 +7395,8 @@ function WorkspaceTerminal({
                 paneId,
                 instanceId: terminalInstanceId,
                 data,
+                promptEventId: promptEventId || undefined,
+                promptEventText: promptEventText || undefined,
                 threadId: terminalThreadIdRef.current,
               }).then((result) => {
                 if (escapeDebugFields) {
@@ -7348,6 +7410,8 @@ function WorkspaceTerminal({
                     isFocusEventInput,
                     isSubmitInput,
                     paneId,
+                    promptEventId,
+                    promptEventTextLength: promptEventText.length,
                     reason,
                     terminalIndex,
                     threadId: terminalThreadIdRef.current || "",
@@ -7374,6 +7438,8 @@ function WorkspaceTerminal({
                   isSubmitInput,
                   message: error?.message || String(error || ""),
                   paneId,
+                  promptEventId,
+                  promptEventTextLength: promptEventText.length,
                   reason,
                   terminalIndex,
                   threadId: terminalThreadIdRef.current || "",
@@ -7601,7 +7667,7 @@ function WorkspaceTerminal({
             poll();
           });
         };
-        const flushTerminalInput = (reason) => {
+        const flushTerminalInput = (reason, promptMetadata = null) => {
           if (terminalInputFlushTimer) {
             window.clearTimeout(terminalInputFlushTimer);
             terminalInputFlushTimer = 0;
@@ -7612,7 +7678,7 @@ function WorkspaceTerminal({
           }
           const queuedData = terminalInputBuffer;
           terminalInputBuffer = "";
-          writeTerminalInputChunk(queuedData, reason);
+          writeTerminalInputChunk(queuedData, reason, promptMetadata);
           return terminalInputWriteChain;
         };
         const scheduleTerminalInputFlush = (delayMs = TERMINAL_INPUT_BATCH_MS) => {
@@ -7822,6 +7888,7 @@ function WorkspaceTerminal({
             ? ""
             : terminalInputChunkVisibleText(safeData);
           const isFocusEventInput = safeData.includes("\x1b[I") || safeData.includes("\x1b[O");
+          let confirmedSubmitBridge = null;
           const traceTextInputChunk = !startupControlReply
             && !terminalGeneratedReply
             && (
@@ -7906,10 +7973,75 @@ function WorkspaceTerminal({
               visibleText: getBigViewTextDiagnosticFields(visibleInputText),
               workspaceId: workspace?.id || "",
             });
+            const promptTextAtSubmit = terminalSubmittedInputText.trim();
+            if (
+              terminalSubmittedInputHasText
+              && promptTextAtSubmit
+              && !promptTextAtSubmit.startsWith("/")
+              && !isGenericTerminal
+            ) {
+              const promptId = createThreadProjectionToken("terminal-prompt");
+              const startedAt = new Date().toISOString();
+              const turnId = `turn-${promptId}`;
+              const threadId = terminalThreadIdRef.current || "";
+              const workspaceId = workspace?.id || "";
+              const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
+              const submittedWaiterReady = createTerminalPromptSubmittedWaiter({
+                agentId: terminalAgentKind,
+                expectedPrompt: promptTextAtSubmit,
+                instanceId: terminalInstanceId,
+                paneId,
+                promptId,
+                threadId,
+                workspaceId,
+              });
+              const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
+                agentId: terminalAgentKind,
+                expectedPrompt: promptTextAtSubmit,
+                promptId,
+                threadId,
+                workspaceId,
+              });
+              confirmedSubmitBridge = {
+                acceptedWaiter,
+                promptEventId: promptId,
+                promptEventText: promptTextAtSubmit,
+                startedAt,
+                submittedWaiterReady,
+                syncKey,
+                threadId,
+                turnId,
+                workspaceId,
+              };
+              logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_start", {
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                paneId,
+                promptEventId: promptId,
+                promptText: getBigViewTextDiagnosticFields(promptTextAtSubmit),
+                syncKey,
+                terminalIndex,
+                threadId,
+                workspaceId,
+              });
+            }
             if (terminalSubmittedInputHasText) {
               recordSubmittedAgentMessage(
                 terminalInstanceId,
-                terminalSubmittedInputText.trim(),
+                promptTextAtSubmit,
+                confirmedSubmitBridge
+                  ? {
+                    messageCreatedAt: confirmedSubmitBridge.startedAt,
+                    messageId: confirmedSubmitBridge.promptEventId,
+                    messageSource: "tui-manual-input",
+                    promptEventId: confirmedSubmitBridge.promptEventId,
+                    source: "tui-manual-input",
+                    turnId: confirmedSubmitBridge.turnId,
+                  }
+                  : {
+                    messageSource: "tui-manual-input",
+                    source: "tui-manual-input",
+                  },
               );
             }
             terminalSubmittedInputHasText = false;
@@ -7948,6 +8080,101 @@ function WorkspaceTerminal({
             isSubmitInput
             || terminalInputBuffer.length >= TERMINAL_INPUT_BATCH_MAX_CHARS
           ) {
+            if (isSubmitInput && confirmedSubmitBridge) {
+              const bridge = confirmedSubmitBridge;
+              bridge.submittedWaiterReady
+                .then((submittedWaiter) => {
+                  const writePromise = flushTerminalInput("submit", {
+                    promptEventId: bridge.promptEventId,
+                    promptEventText: bridge.promptEventText,
+                  });
+                  return Promise.resolve(writePromise)
+                    .then(() => submittedWaiter.promise)
+                    .then(() => bridge.acceptedWaiter.promise)
+                    .then((acceptedDetail) => {
+                      const acceptedProviderSessionId = String(acceptedDetail?.sessionId || "").trim();
+                      const providerTurnStartProjectionEvents = buildProviderTurnStartProjectionEvents({
+                        agentId: terminalAgentKind,
+                        includeUserMessage: false,
+                        source: "terminal-confirmed",
+                        startedAt: bridge.startedAt,
+                        text: bridge.promptEventText,
+                        turnId: bridge.turnId,
+                        userMessageId: bridge.promptEventId,
+                      });
+                      logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_accepted", {
+                        acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+                        agentId: terminalAgentKind,
+                        instanceId: terminalInstanceId,
+                        paneId,
+                        promptEventId: bridge.promptEventId,
+                        providerSessionPresent: Boolean(acceptedProviderSessionId),
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        workspaceId: bridge.workspaceId,
+                      });
+                      onThreadTerminalLifecycle?.({
+                        activityStatus: "thinking",
+                        agentId: terminalAgentKind,
+                        instanceId: terminalInstanceId,
+                        paneId,
+                        status: "active",
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        type: "agent-output",
+                        workspaceId: bridge.workspaceId,
+                      });
+                      onThreadTerminalLifecycle?.({
+                        agentId: terminalAgentKind,
+                        clearPendingPrompt: false,
+                        instanceId: terminalInstanceId,
+                        nativeSessionId: acceptedProviderSessionId,
+                        nativeSessionKind: acceptedProviderSessionId ? "session" : "",
+                        nativeSessionSource: acceptedProviderSessionId ? "terminal-confirmed" : "",
+                        paneId,
+                        pendingPromptId: bridge.promptEventId,
+                        projectionEvents: providerTurnStartProjectionEvents,
+                        providerSessionId: acceptedProviderSessionId,
+                        repoPath: workingDirectory || "",
+                        status: "active",
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        type: "provider-turn-started",
+                        workspaceId: bridge.workspaceId,
+                        workspaceName: workspace?.name || "",
+                      });
+                    })
+                    .catch((error) => {
+                      submittedWaiter.cancel();
+                      bridge.acceptedWaiter.cancel();
+                      logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_error", {
+                        agentId: terminalAgentKind,
+                        instanceId: terminalInstanceId,
+                        message: getErrorMessage(error, "Unable to confirm submitted terminal prompt."),
+                        paneId,
+                        promptEventId: bridge.promptEventId,
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        workspaceId: bridge.workspaceId,
+                      });
+                    });
+                })
+                .catch((error) => {
+                  bridge.acceptedWaiter.cancel();
+                  logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_waiter_error", {
+                    agentId: terminalAgentKind,
+                    instanceId: terminalInstanceId,
+                    message: getErrorMessage(error, "Unable to observe submitted terminal prompt."),
+                    paneId,
+                    promptEventId: bridge.promptEventId,
+                    terminalIndex,
+                    threadId: bridge.threadId,
+                    workspaceId: bridge.workspaceId,
+                  });
+                  flushTerminalInput("submit");
+                });
+              return;
+            }
             flushTerminalInput(
               isSubmitInput
                 ? "submit"

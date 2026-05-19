@@ -12438,6 +12438,17 @@ impl CoordinationKernel {
             .filter(|value| !value.trim().is_empty())
             .map(|session_id| self.heartbeat_session(session_id).is_ok())
             .unwrap_or(false);
+        if session_id
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+            && !heartbeat
+        {
+            return Ok(api_error(
+                "mcp_session_inactive_reconnect_required",
+                "Session is not active. Reconnect the MCP agent session before starting a task.",
+                json!({"session_id": session_id, "contract": "diffforge.app_ws.v1"}),
+            ));
+        }
         let raw_task_id = task_id.map(str::trim).filter(|value| !value.is_empty());
         let task_id_is_session_id = raw_task_id.is_some_and(|value| session_id == Some(value));
         let requested_task_id = raw_task_id.filter(|value| session_id != Some(*value));

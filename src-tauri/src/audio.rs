@@ -3365,6 +3365,7 @@ async fn toggle_audio_widget(
 async fn insert_transcribed_text(
     app: AppHandle,
     terminal_state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     text: String,
 ) -> Result<AudioWidgetVisibility, String> {
     let text = clean_transcript_for_insert(text)?;
@@ -3373,7 +3374,9 @@ async fn insert_transcribed_text(
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
 
-    if write_to_active_terminal_audio_input_target(&app, &terminal_state, &text).await? {
+    if write_to_active_terminal_audio_input_target(&app, &terminal_state, &cloud_mcp_state, &text)
+        .await?
+    {
         return Ok(AudioWidgetVisibility {
             visible: widget_visible,
             installed: whisper_model_status_for(&app)?.installed,

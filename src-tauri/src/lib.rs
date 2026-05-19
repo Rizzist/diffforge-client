@@ -399,6 +399,7 @@ struct TerminalAudioInputTarget {
 struct TerminalAudioInputRefocusPayload {
     pane_id: String,
     instance_id: Option<u64>,
+    inserted_text: Option<String>,
 }
 
 #[derive(Clone)]

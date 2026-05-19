@@ -401,7 +401,7 @@ export default function SpecGraphWorkspaceView({
           </>
         ) : (
           <KnowledgeToolbarSummary>
-            <span>{knowledgeGraph.nodes.length} notes</span>
+            <span>{knowledgeGraph.nodes.length} nodes</span>
             <span>{knowledgeGraph.edges.length} links</span>
             {Number(knowledgeGraph.graphStats?.missing_paths || 0) > 0 && (
               <span data-state="missing">{knowledgeGraph.graphStats.missing_paths} missing paths</span>
@@ -432,6 +432,7 @@ export default function SpecGraphWorkspaceView({
         <KnowledgeGraphShell>
           <KnowledgeOutline
             nodes={knowledgeGraph.nodes}
+            edges={knowledgeGraph.edges}
             selectedNodeId={selectedKnowledgeNode?.id}
             onSelect={setSelectedKnowledgeNodeId}
           />
@@ -444,6 +445,7 @@ export default function SpecGraphWorkspaceView({
               state={knowledgeState}
               emptyLabel="No knowledge notes indexed yet."
               layoutLabel="Laying out knowledge graph..."
+              variant="knowledge"
             />
           </SpecGraphMain>
           <KnowledgeInspector
@@ -487,53 +489,174 @@ export default function SpecGraphWorkspaceView({
   );
 }
 
-const KNOWLEDGE_OUTLINE_GROUP_ORDER = [
-  { key: "areas", label: "Areas" },
-  { key: "flows", label: "Flows" },
-  { key: "systems", label: "Systems" },
-  { key: "data", label: "Data" },
-  { key: "decisions", label: "Decisions" },
-  { key: "notes", label: "Notes" },
-];
-
 function knowledgeOutlineNodePath(node) {
   return String(node?.note_path || node?.path || node?.markdown_path || "").replace(/\\/g, "/");
 }
 
-function knowledgeOutlineGroupKey(node) {
-  const notePath = knowledgeOutlineNodePath(node).toLowerCase();
+function isKnowledgeOutlineRoot(node) {
   const nodeType = String(node?.knowledge_node_type || node?.node_type || "").toLowerCase();
-  if (node?.is_root || nodeType === "workspace" || notePath === "index.md") return "root";
-  if (notePath.startsWith("areas/") || nodeType.includes("area")) return "areas";
-  if (notePath.startsWith("flows/") || nodeType.includes("flow")) return "flows";
-  if (notePath.startsWith("systems/") || nodeType.includes("system")) return "systems";
-  if (notePath.startsWith("data/") || nodeType.includes("data")) return "data";
-  if (notePath.startsWith("decisions/") || nodeType.includes("decision")) return "decisions";
-  return "notes";
+  const notePath = knowledgeOutlineNodePath(node).toLowerCase();
+  return Boolean(node?.is_root)
+    || nodeType === "workspace"
+    || nodeType === "repo_root"
+    || nodeType === "knowledge_root"
+    || notePath === "index.md";
 }
 
-function knowledgeOutlineGroups(nodes) {
-  const buckets = new Map(KNOWLEDGE_OUTLINE_GROUP_ORDER.map((group) => [group.key, []]));
-  for (const node of nodes) {
-    const groupKey = knowledgeOutlineGroupKey(node);
-    if (groupKey === "root") continue;
-    const bucket = buckets.get(groupKey) || buckets.get("notes");
-    bucket.push(node);
-  }
-  return KNOWLEDGE_OUTLINE_GROUP_ORDER
-    .map((group) => ({
-      ...group,
-      nodes: (buckets.get(group.key) || []).sort((left, right) => {
-        const leftPath = knowledgeOutlineNodePath(left);
-        const rightPath = knowledgeOutlineNodePath(right);
-        return leftPath.localeCompare(rightPath) || String(left.id).localeCompare(String(right.id));
-      }),
-    }))
-    .filter((group) => group.nodes.length > 0);
+function isKnowledgeContainmentEdge(edge) {
+  return edge?.kind === "contains" || edge?.metadata?.containment === true;
 }
 
-function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
+function compareKnowledgeOutlineNodes(left, right) {
+  const leftTitle = String(left?.display_title || left?.title || "").toLowerCase();
+  const rightTitle = String(right?.display_title || right?.title || "").toLowerCase();
+  return leftTitle.localeCompare(rightTitle)
+    || knowledgeOutlineNodePath(left).localeCompare(knowledgeOutlineNodePath(right))
+    || String(left?.id || "").localeCompare(String(right?.id || ""));
+}
+
+function buildKnowledgeOutlineTree(nodes, edges) {
   const visibleNodes = Array.isArray(nodes) ? nodes : [];
+  const visibleEdges = Array.isArray(edges) ? edges : [];
+  const nodeById = new Map(visibleNodes.map((node) => [node.id, node]));
+  const rootNode = visibleNodes.find(isKnowledgeOutlineRoot) || graphRootNode(visibleNodes, visibleEdges) || visibleNodes[0] || null;
+  const childrenByParent = new Map();
+  const parentById = new Map();
+
+  if (!rootNode) {
+    return { rootNode: null, childrenByParent, parentById };
+  }
+
+  const incomingByChild = new Map();
+  visibleEdges
+    .filter(isKnowledgeContainmentEdge)
+    .filter((edge) => nodeById.has(edge.from) && nodeById.has(edge.to) && edge.from !== edge.to)
+    .forEach((edge) => {
+      if (!incomingByChild.has(edge.to)) incomingByChild.set(edge.to, []);
+      incomingByChild.get(edge.to).push(edge);
+    });
+
+  for (const node of visibleNodes) {
+    if (node.id === rootNode.id) continue;
+    const incoming = incomingByChild.get(node.id) || [];
+    const chosen = incoming.find((edge) => edge.from !== rootNode.id) || incoming[0];
+    const parentId = chosen?.from && nodeById.has(chosen.from) ? chosen.from : rootNode.id;
+    parentById.set(node.id, parentId);
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(node);
+  }
+
+  for (const [parentId, children] of childrenByParent.entries()) {
+    childrenByParent.set(parentId, children.sort(compareKnowledgeOutlineNodes));
+  }
+
+  return { rootNode, childrenByParent, parentById };
+}
+
+function selectedKnowledgePath(parentById, selectedNodeId) {
+  const path = [];
+  let current = selectedNodeId;
+  const seen = new Set();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    path.push(current);
+    current = parentById.get(current);
+  }
+  return path;
+}
+
+function KnowledgeOutlineNode({
+  node,
+  depth,
+  childrenByParent,
+  expandedIds,
+  selectedNodeId,
+  onSelect,
+  onToggle,
+  ancestorIds = new Set(),
+}) {
+  const nextAncestorIds = useMemo(() => new Set([...ancestorIds, node.id]), [ancestorIds, node.id]);
+  const children = (childrenByParent.get(node.id) || []).filter((child) => !nextAncestorIds.has(child.id));
+  const hasChildren = children.length > 0;
+  const expanded = expandedIds.has(node.id);
+  const label = knowledgeNodeTypeLabel(node);
+  const notePath = knowledgeOutlineNodePath(node);
+
+  return (
+    <KnowledgeOutlineNodeBlock>
+      <KnowledgeOutlineRow $depth={depth}>
+        <KnowledgeOutlineDisclosure
+          type="button"
+          aria-label={expanded ? "Collapse concept" : "Expand concept"}
+          disabled={!hasChildren}
+          onClick={() => hasChildren && onToggle(node.id)}
+        >
+          {hasChildren ? (expanded ? "-" : "+") : ""}
+        </KnowledgeOutlineDisclosure>
+        <KnowledgeOutlineButton
+          type="button"
+          data-active={node.id === selectedNodeId ? "true" : "false"}
+          onClick={() => onSelect(node.id)}
+        >
+          <span>{node.display_title || node.title || "Knowledge concept"}</span>
+          <small>{label}{notePath ? ` - ${notePath}` : ""}</small>
+        </KnowledgeOutlineButton>
+      </KnowledgeOutlineRow>
+      {hasChildren && expanded ? (
+        <KnowledgeOutlineChildren>
+          {children.map((child) => (
+            <KnowledgeOutlineNode
+              key={child.id}
+              node={child}
+              depth={depth + 1}
+              childrenByParent={childrenByParent}
+              expandedIds={expandedIds}
+              selectedNodeId={selectedNodeId}
+              onSelect={onSelect}
+              onToggle={onToggle}
+              ancestorIds={nextAncestorIds}
+            />
+          ))}
+        </KnowledgeOutlineChildren>
+      ) : null}
+    </KnowledgeOutlineNodeBlock>
+  );
+}
+
+function KnowledgeOutline({ nodes, edges, selectedNodeId, onSelect }) {
+  const visibleNodes = Array.isArray(nodes) ? nodes : [];
+  const outline = useMemo(() => buildKnowledgeOutlineTree(visibleNodes, edges), [edges, visibleNodes]);
+  const hideRootItem = Boolean(outline.rootNode && isKnowledgeOutlineRoot(outline.rootNode));
+  const topLevelNodes = useMemo(() => {
+    if (!outline.rootNode) return [];
+    if (hideRootItem) return outline.childrenByParent.get(outline.rootNode.id) || [];
+    return [outline.rootNode];
+  }, [hideRootItem, outline.childrenByParent, outline.rootNode]);
+  const [expandedIds, setExpandedIds] = useState(() => new Set());
+
+  useEffect(() => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (outline.rootNode?.id) next.add(outline.rootNode.id);
+      for (const id of selectedKnowledgePath(outline.parentById, selectedNodeId)) {
+        next.add(id);
+      }
+      return next;
+    });
+  }, [outline.parentById, outline.rootNode?.id, selectedNodeId]);
+
+  const toggleExpanded = useCallback((nodeId) => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+  }, []);
+
   if (!visibleNodes.length) {
     return (
       <KnowledgeOutlinePanel>
@@ -542,45 +665,30 @@ function KnowledgeOutline({ nodes, selectedNodeId, onSelect }) {
     );
   }
 
-  const rootNode = visibleNodes.find((node) => knowledgeOutlineGroupKey(node) === "root");
-  const groups = knowledgeOutlineGroups(visibleNodes);
-
   return (
     <KnowledgeOutlinePanel>
       <KnowledgePanelHeader>
-        <span>Atlas</span>
+        <span>Graph</span>
         <small>.agents/knowledge</small>
       </KnowledgePanelHeader>
       <KnowledgeOutlineList>
-        {rootNode ? (
-          <KnowledgeOutlineButton
-            type="button"
-            data-active={rootNode.id === selectedNodeId ? "true" : "false"}
-            onClick={() => onSelect(rootNode.id)}
-          >
-            <span>{rootNode.display_title || rootNode.title || "Atlas index"}</span>
-            <small>root - index.md</small>
-          </KnowledgeOutlineButton>
-        ) : null}
-        {groups.map((group) => (
-          <KnowledgeOutlineGroup key={group.key}>
-            <KnowledgeOutlineGroupTitle>
-              <span>{group.label}</span>
-              <small>{group.nodes.length}</small>
-            </KnowledgeOutlineGroupTitle>
-            {group.nodes.map((node) => (
-              <KnowledgeOutlineButton
-                key={node.id}
-                type="button"
-                data-active={node.id === selectedNodeId ? "true" : "false"}
-                onClick={() => onSelect(node.id)}
-              >
-                <span>{node.display_title || node.title}</span>
-                <small>{knowledgeOutlineNodePath(node) || knowledgeNodeTypeLabel(node)}</small>
-              </KnowledgeOutlineButton>
-            ))}
-          </KnowledgeOutlineGroup>
-        ))}
+        {topLevelNodes.length ? (
+          topLevelNodes.map((node) => (
+            <KnowledgeOutlineNode
+              key={node.id}
+              node={node}
+              depth={0}
+              childrenByParent={outline.childrenByParent}
+              expandedIds={expandedIds}
+              selectedNodeId={selectedNodeId}
+              onSelect={onSelect}
+              onToggle={toggleExpanded}
+              ancestorIds={hideRootItem && outline.rootNode?.id ? new Set([outline.rootNode.id]) : new Set()}
+            />
+          ))
+        ) : (
+          <KnowledgeOutlineEmpty>No knowledge concepts indexed yet.</KnowledgeOutlineEmpty>
+        )}
       </KnowledgeOutlineList>
     </KnowledgeOutlinePanel>
   );
@@ -607,7 +715,7 @@ function KnowledgeInspector({ graph, node, relations, onSelect }) {
       </Inspector>
     );
   }
-  const markdown = normalizeKnowledgeMarkdownSource(node.markdown);
+  const markdown = normalizeKnowledgeMarkdownSource(node.markdown, node);
   const outbound = Array.isArray(relations?.outbound) ? relations.outbound : [];
   const backlinks = Array.isArray(relations?.backlinks) ? relations.backlinks : [];
   const suggested = suggestedKnowledgeNodes(graph, node, relations);
@@ -627,7 +735,7 @@ function KnowledgeInspector({ graph, node, relations, onSelect }) {
         </KnowledgeMetricRow>
       </KnowledgeInspectorHeader>
       <MarkdownPane>
-        <KnowledgeMarkdownBlock markdown={markdown} />
+        <KnowledgeMarkdownBlock markdown={markdown} node={node} />
         <KnowledgeRelationsPanel>
           <KnowledgeRelationSection
             title="Outgoing"
@@ -654,8 +762,8 @@ function KnowledgeInspector({ graph, node, relations, onSelect }) {
   );
 }
 
-function KnowledgeMarkdownBlock({ markdown }) {
-  const source = normalizeKnowledgeMarkdownSource(markdown);
+function KnowledgeMarkdownBlock({ markdown, node }) {
+  const source = normalizeKnowledgeMarkdownSource(markdown, node);
   if (!source) return <InspectorEmpty>No markdown content for this note yet.</InspectorEmpty>;
   return (
     <KnowledgeMarkdown>
@@ -666,21 +774,50 @@ function KnowledgeMarkdownBlock({ markdown }) {
   );
 }
 
-function normalizeKnowledgeMarkdownSource(markdown) {
-  const source = text(markdown).trim();
+function normalizeKnowledgeMarkdownText(markdown) {
+  return String(markdown || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, " ")
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .trim();
+}
+
+function compactKnowledgeHeading(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function stripRedundantKnowledgeTitle(source, node) {
+  const lines = source.split(/\n/);
+  const firstContentIndex = lines.findIndex((line) => line.trim());
+  if (firstContentIndex < 0) return "";
+  const firstLine = lines[firstContentIndex].trim();
+  const heading = firstLine.match(/^#\s+(.+)$/);
+  if (!heading) return source;
+
+  const headingText = compactKnowledgeHeading(heading[1]);
+  const titleCandidates = [
+    node?.title,
+    node?.display_title,
+    node?.displayTitle,
+    node?.summary && headingText.includes("knowledge root") ? "project knowledge root" : "",
+  ].map(compactKnowledgeHeading).filter(Boolean);
+  const redundant = !titleCandidates.length
+    || titleCandidates.some((candidate) => candidate === headingText || headingText.includes(candidate));
+  if (!redundant) return source;
+
+  const nextLines = [...lines.slice(0, firstContentIndex), ...lines.slice(firstContentIndex + 1)];
+  while (nextLines[0]?.trim() === "") nextLines.shift();
+  return nextLines.join("\n").trim();
+}
+
+function normalizeKnowledgeMarkdownSource(markdown, node = null) {
+  const source = normalizeKnowledgeMarkdownText(markdown);
   if (!source) return "";
-  return source
-    .split(/\r?\n/)
-    .map((line) => {
-      const expanded = line.replace(
-        /\s+-\s+(?=(?:`|\.{0,2}\/|areas\/|flows\/|systems\/|data\/|notes\/|[A-Za-z0-9_.-]+\.md:))/g,
-        "\n- ",
-      );
-      if (!/^#{1,6}\s/.test(expanded) || !expanded.includes("\n- ")) return expanded;
-      const parts = expanded.split(/\n(?=- )/);
-      return [parts[0].trim(), "", ...parts.slice(1)].join("\n");
-    })
-    .join("\n");
+  return stripRedundantKnowledgeTitle(source, node);
 }
 
 function knowledgeWordCount(markdown) {
@@ -693,13 +830,16 @@ function knowledgeWordCount(markdown) {
 
 function knowledgeKeywordsFor(node) {
   const pathRefs = Array.isArray(node?.path_refs) ? node.path_refs : [];
+  const pathRefText = pathRefs
+    .map((ref) => text(ref?.path || ref?.title || ref?.evidence_key || ref?.evidenceKey || ref))
+    .filter(Boolean);
   const raw = [
     node?.display_title,
     node?.displayTitle,
     node?.title,
     node?.note_path,
     node?.summary,
-    ...pathRefs,
+    ...pathRefText,
   ].join(" ");
   return new Set(
     raw
@@ -720,7 +860,7 @@ function suggestedKnowledgeNodes(graph, node, relations) {
   const activeKeywords = knowledgeKeywordsFor(node);
   if (!activeKeywords.size) return [];
   return (graph?.nodes || [])
-    .filter((candidate) => !relationIds.has(candidate.id) && candidate.knowledge_node_type !== "knowledge_root")
+    .filter((candidate) => !relationIds.has(candidate.id) && !["knowledge_root", "repo_root"].includes(candidate.knowledge_node_type))
     .map((candidate) => {
       const candidateKeywords = knowledgeKeywordsFor(candidate);
       let score = 0;
@@ -763,10 +903,14 @@ function KnowledgeRelationSection({ title, items, empty, onSelect, suggested = f
 
 function suggestedKeywordsForDisplay(node) {
   const pathRefs = Array.isArray(node?.path_refs) ? node.path_refs : [];
+  const pathRefText = pathRefs
+    .map((ref) => text(ref?.path || ref?.title || ref?.evidence_key || ref?.evidenceKey || ref))
+    .flatMap((value) => value.split(/[\\/._-]+/))
+    .filter((part) => part.length >= 4);
   const fallback = text(node.note_path || node.path || node.title)
     .split(/[\\/._-]+/)
     .filter((part) => part.length >= 4);
-  return [...pathRefs, ...fallback].slice(0, 4);
+  return [...pathRefText, ...fallback].slice(0, 4);
 }
 
 function KnowledgeLinkSection({ title, items, empty }) {
@@ -2206,35 +2350,49 @@ const KnowledgePanelHeader = styled.header`
 const KnowledgeOutlineList = styled.div`
   display: grid;
   align-content: flex-start;
-  gap: 8px;
+  gap: 3px;
   min-height: 0;
   overflow: auto;
   padding: 8px;
 `;
 
-const KnowledgeOutlineGroup = styled.section`
+const KnowledgeOutlineNodeBlock = styled.div`
   display: grid;
-  gap: 3px;
+  gap: 2px;
 `;
 
-const KnowledgeOutlineGroupTitle = styled.div`
+const KnowledgeOutlineRow = styled.div`
   align-items: center;
-  color: var(--history-subtle);
   display: flex;
-  font-size: 9px;
-  font-weight: 820;
-  justify-content: space-between;
-  letter-spacing: 0.08em;
-  padding: 7px 7px 3px;
-  text-transform: uppercase;
+  gap: 4px;
+  padding-left: ${({ $depth = 0 }) => Math.min($depth, 8) * 13}px;
+`;
 
-  small {
-    border: 1px solid var(--history-border);
-    border-radius: 999px;
-    color: var(--history-muted);
-    font-size: 8px;
-    line-height: 1;
-    padding: 2px 5px;
+const KnowledgeOutlineDisclosure = styled.button`
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--history-subtle);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 18px;
+  font-size: 12px;
+  font-weight: 760;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+
+  &:hover:not(:disabled) {
+    background: var(--history-panel);
+    border-color: var(--history-border);
+    color: var(--history-text);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.28;
   }
 `;
 
@@ -2245,6 +2403,7 @@ const KnowledgeOutlineButton = styled.button`
   color: inherit;
   cursor: pointer;
   display: grid;
+  flex: 1 1 auto;
   gap: 3px;
   padding: 7px 8px;
   text-align: left;
@@ -2276,6 +2435,11 @@ const KnowledgeOutlineButton = styled.button`
     background: var(--history-panel-soft);
     box-shadow: inset 2px 0 0 var(--history-blue);
   }
+`;
+
+const KnowledgeOutlineChildren = styled.div`
+  display: grid;
+  gap: 2px;
 `;
 
 const KnowledgeOutlineEmpty = styled.div`
@@ -2509,15 +2673,15 @@ const KnowledgeSection = styled(SpecObjectsSection)``;
 
 const KnowledgeMarkdown = styled.div`
   min-width: 0;
-  width: min(100%, 68ch);
+  width: min(100%, 70ch);
   margin: 0 auto;
-  padding: 28px 28px 46px;
+  padding: 22px 28px 38px;
   color: rgba(226, 232, 240, 0.82);
   font-family: ui-sans-serif, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 430;
-  letter-spacing: -0.003em;
-  line-height: 1.72;
+  letter-spacing: 0;
+  line-height: 1.56;
   overflow-wrap: break-word;
   user-select: text;
   -webkit-user-select: text;
@@ -2531,46 +2695,47 @@ const KnowledgeMarkdown = styled.div`
   }
 
   p {
-    margin: 0 0 14px;
+    margin: 0 0 10px;
   }
 
   h1,
   h2,
   h3,
   h4 {
-    color: rgba(248, 250, 252, 0.94);
-    font-weight: 660;
-    letter-spacing: -0.015em;
-    line-height: 1.28;
+    color: rgba(226, 232, 240, 0.86);
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    line-height: 1.3;
+    text-transform: uppercase;
   }
 
   h1 {
     border-bottom: 1px solid rgba(148, 163, 184, 0.13);
-    font-size: 1.5em;
-    margin: 0 0 18px;
-    padding-bottom: 12px;
+    font-size: 13px;
+    margin: 0 0 12px;
+    padding-bottom: 8px;
   }
 
   h2 {
-    font-size: 1.2em;
-    margin: 28px 0 10px;
+    font-size: 12px;
+    margin: 18px 0 8px;
   }
 
   h3,
   h4 {
-    font-size: 1.05em;
-    margin: 22px 0 8px;
+    font-size: 11.5px;
+    margin: 16px 0 7px;
   }
 
   ul,
   ol {
-    margin: 8px 0 18px;
+    margin: 6px 0 14px;
     padding-left: 1.35em;
   }
 
   li {
     color: rgba(226, 232, 240, 0.78);
-    margin: 6px 0;
+    margin: 4px 0;
     padding-left: 4px;
   }
 
@@ -2587,9 +2752,9 @@ const KnowledgeMarkdown = styled.div`
   }
 
   blockquote {
-    margin: 16px 0;
+    margin: 12px 0;
     border-left: 2px solid rgba(148, 163, 184, 0.3);
-    padding: 2px 0 2px 14px;
+    padding: 2px 0 2px 12px;
     color: rgba(203, 213, 225, 0.68);
   }
 
@@ -2617,12 +2782,12 @@ const KnowledgeMarkdown = styled.div`
 
   pre {
     max-width: 100%;
-    margin: 16px 0;
+    margin: 12px 0;
     overflow-x: auto;
     overflow-y: hidden;
     border: 1px solid rgba(148, 163, 184, 0.14);
-    border-radius: 10px;
-    padding: 13px 14px;
+    border-radius: 8px;
+    padding: 11px 12px;
     background: rgba(15, 23, 42, 0.46);
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     font-size: 12px;
@@ -2644,7 +2809,7 @@ const KnowledgeMarkdown = styled.div`
 
   .knowledge-markdown-table-wrap {
     max-width: 100%;
-    margin: 16px 0;
+    margin: 12px 0;
     overflow-x: auto;
     border: 1px solid rgba(148, 163, 184, 0.14);
     border-radius: 10px;
@@ -2678,7 +2843,7 @@ const KnowledgeMarkdown = styled.div`
 
   hr {
     height: 1px;
-    margin: 22px 0;
+    margin: 16px 0;
     border: 0;
     background: rgba(148, 163, 184, 0.14);
   }

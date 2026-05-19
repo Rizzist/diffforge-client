@@ -258,7 +258,11 @@ fn set_terminal_audio_input_target_for(
     Ok(())
 }
 
-fn emit_terminal_audio_input_refocus(app: &AppHandle, target: &TerminalAudioInputTarget) {
+fn emit_terminal_audio_input_refocus(
+    app: &AppHandle,
+    target: &TerminalAudioInputTarget,
+    inserted_text: Option<&str>,
+) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -269,6 +273,7 @@ fn emit_terminal_audio_input_refocus(app: &AppHandle, target: &TerminalAudioInpu
         TerminalAudioInputRefocusPayload {
             pane_id: target.pane_id.clone(),
             instance_id: target.instance_id,
+            inserted_text: inserted_text.map(str::to_string),
         },
     );
 }
@@ -343,6 +348,7 @@ async fn write_terminal_input(
 async fn write_to_active_terminal_audio_input_target(
     app: &AppHandle,
     state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
     data: &str,
 ) -> Result<bool, String> {
     let Some(target) = active_terminal_audio_input_target(state)? else {
@@ -354,23 +360,29 @@ async fn write_to_active_terminal_audio_input_target(
         return Ok(false);
     }
 
-    let wrote = write_terminal_input(
-        Some(app),
-        state,
-        &target.pane_id,
-        target.instance_id,
-        data,
-        "terminal.audio_input.skipped_stale_or_missing",
-    )
-    .await?;
-
-    if wrote {
-        emit_terminal_audio_input_refocus(app, &target);
-    } else {
+    if get_terminal_instance_if_current(state, &target.pane_id, target.instance_id)
+        .await?
+        .is_none()
+    {
         clear_terminal_audio_input_target_if_matches(state, &target.pane_id, target.instance_id)?;
+        return Ok(false);
     }
 
-    Ok(wrote)
+    terminal_write_inner(
+        app.clone(),
+        state,
+        cloud_mcp_state,
+        target.pane_id.clone(),
+        target.instance_id,
+        data.to_string(),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    emit_terminal_audio_input_refocus(app, &target, Some(data));
+
+    Ok(true)
 }
 
 fn poll_terminal_child_exit(child: &mut dyn Child) -> bool {
@@ -2268,13 +2280,15 @@ fn set_terminal_audio_input_target(
 async fn terminal_write_to_audio_input_target(
     app: AppHandle,
     state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     data: String,
 ) -> Result<bool, String> {
     if active_terminal_audio_input_target(&state)?.is_none() {
         return Ok(false);
     }
 
-    let wrote = write_to_active_terminal_audio_input_target(&app, &state, &data).await?;
+    let wrote =
+        write_to_active_terminal_audio_input_target(&app, &state, &cloud_mcp_state, &data).await?;
 
     Ok(wrote)
 }
