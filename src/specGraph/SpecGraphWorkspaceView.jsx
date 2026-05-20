@@ -9,7 +9,7 @@ import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowL
 import { Send } from "@styled-icons/material-rounded/Send";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 import { createWorkspaceDisplayIdentity } from "../workspace/workspaceDisplayIdentity.js";
 import GraphRendererHost from "./renderers/GraphRendererHost.jsx";
 import {
@@ -43,6 +43,7 @@ export default function SpecGraphWorkspaceView({
   specGraphState = "idle",
   isWorkspaceActive = false,
   onSubmitSpecEditIntent = null,
+  pendingSpecEdits = [],
   specEditAgents = [],
   workspace,
 }) {
@@ -106,6 +107,12 @@ export default function SpecGraphWorkspaceView({
     [knowledgeSnapshot, workspaceDisplayIdentity],
   );
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
+  const selectedNodePendingSpecEdits = useMemo(() => {
+    const nodeId = text(selectedNode?.id, "");
+    if (!nodeId) return [];
+    return (Array.isArray(pendingSpecEdits) ? pendingSpecEdits : [])
+      .filter((intent) => text(intent?.targetNodeId, "") === nodeId);
+  }, [pendingSpecEdits, selectedNode?.id]);
   const selectedKnowledgeNode = selectedFallback(knowledgeGraph.nodes, selectedKnowledgeNodeId);
   const selectedKnowledgeRelations = useMemo(
     () => relatedKnowledgeNodes(knowledgeGraph, selectedKnowledgeNode?.id),
@@ -376,6 +383,7 @@ export default function SpecGraphWorkspaceView({
               onAddSpec={() => openSpecEditDraft("add")}
               onDeleteSpec={(spec) => openSpecEditDraft("delete", spec)}
               onEditSpec={(spec) => openSpecEditDraft("edit", spec)}
+              pendingSpecEdits={selectedNodePendingSpecEdits}
             />
           </>
           )}
@@ -1538,6 +1546,7 @@ function SpecInspector({
   onAddSpec,
   onDeleteSpec,
   onEditSpec,
+  pendingSpecEdits = [],
 }) {
   if (!node) {
     return (
@@ -1592,6 +1601,7 @@ function SpecInspector({
           disabledReason={disabledReason}
           onDeleteSpec={onDeleteSpec}
           onEditSpec={onEditSpec}
+          pendingSpecs={pendingSpecEdits}
         />
         <SpecObjectList
           title="Superseded History"
@@ -1604,6 +1614,24 @@ function SpecInspector({
   );
 }
 
+function pendingSpecEditStatement(intent) {
+  const operation = text(intent?.operation, "edit").toLowerCase();
+  if (operation === "delete") {
+    return text(intent?.currentStatement || intent?.desiredStatement, "Deleting selected spec");
+  }
+  return text(
+    intent?.desiredStatement || intent?.currentStatement || intent?.userInstruction,
+    "Requested spec update",
+  );
+}
+
+function pendingSpecEditStatusLabel(intent) {
+  const operation = text(intent?.operation, "edit").toLowerCase();
+  if (operation === "add") return "adding";
+  if (operation === "delete") return "deleting";
+  return "updating";
+}
+
 function SpecObjectList({
   title,
   specs,
@@ -1613,8 +1641,10 @@ function SpecObjectList({
   disabledReason = "",
   onDeleteSpec,
   onEditSpec,
+  pendingSpecs = [],
 }) {
   const visibleSpecs = Array.isArray(specs) ? specs : [];
+  const visiblePendingSpecs = historical ? [] : (Array.isArray(pendingSpecs) ? pendingSpecs : []);
   const [expandedPriorSpecs, setExpandedPriorSpecs] = useState({});
   const togglePriorSpecs = useCallback((specKey) => {
     setExpandedPriorSpecs((current) => ({
@@ -1633,8 +1663,27 @@ function SpecObjectList({
           </SpecObjectsHeadingBadge>
         )}
       </h3>
-      {visibleSpecs.length ? (
-        visibleSpecs.map((spec, index) => {
+      {visibleSpecs.length || visiblePendingSpecs.length ? (
+        <>
+          {visiblePendingSpecs.map((intent, index) => (
+            <SpecObjectCard
+              key={intent?.intentId || `pending-spec-${index}`}
+              $pending
+              data-pending="true"
+            >
+              <SpecObjectCardHeader>
+                <p>{pendingSpecEditStatement(intent)}</p>
+                <SpecObjectPendingState>
+                  <SpecGhostSpinner aria-hidden="true" />
+                  <span>{pendingSpecEditStatusLabel(intent)}</span>
+                </SpecObjectPendingState>
+              </SpecObjectCardHeader>
+              <SpecObjectGhostMeta>
+                Processing with {text(intent?.agentLabel, "agent")}
+              </SpecObjectGhostMeta>
+            </SpecObjectCard>
+          ))}
+          {visibleSpecs.map((spec, index) => {
           const specKey = field(spec, "id") || `${title}-${index}`;
           const priorSpecs = Array.isArray(spec.consolidated_specs) ? spec.consolidated_specs : [];
           const priorSpecsExpanded = Boolean(expandedPriorSpecs[specKey]);
@@ -1697,7 +1746,8 @@ function SpecObjectList({
               )}
             </SpecObjectCard>
           );
-        })
+        })}
+        </>
       ) : (
         <SpecObjectsEmpty>{empty}</SpecObjectsEmpty>
       )}
@@ -3803,10 +3853,28 @@ const HistoryStatement = styled.div`
   }
 `;
 
+const specGhostSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const SpecObjectCard = styled.article`
-  border: 1px solid ${({ $historical }) => ($historical ? "rgba(148, 163, 184, 0.16)" : "rgba(52, 211, 153, 0.18)")};
+  border: 1px solid ${({ $historical, $pending }) => (
+    $pending
+      ? "rgba(136, 165, 200, 0.32)"
+      : $historical
+        ? "rgba(148, 163, 184, 0.16)"
+        : "rgba(52, 211, 153, 0.18)"
+  )};
   border-radius: 8px;
-  background: ${({ $historical }) => ($historical ? "rgba(15, 23, 42, 0.38)" : "rgba(6, 78, 59, 0.14)")};
+  background: ${({ $historical, $pending }) => (
+    $pending
+      ? "rgba(20, 36, 56, 0.36)"
+      : $historical
+        ? "rgba(15, 23, 42, 0.38)"
+        : "rgba(6, 78, 59, 0.14)"
+  )};
   padding: 9px 10px;
 
   & + & {
@@ -3814,7 +3882,7 @@ const SpecObjectCard = styled.article`
   }
 
   p {
-    color: rgba(229, 236, 246, ${({ $historical }) => ($historical ? 0.58 : 0.86)});
+    color: rgba(229, 236, 246, ${({ $historical, $pending }) => ($historical || $pending ? 0.64 : 0.86)});
     font-size: 11px;
     font-weight: 650;
     line-height: 1.45;
@@ -3831,12 +3899,24 @@ const SpecObjectCard = styled.article`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: ${({ $historical }) => ($historical ? "rgba(0, 0, 0, 0.1)" : "rgba(10, 127, 69, 0.24)")};
-    background: ${({ $historical }) => ($historical ? "#fafafc" : "rgba(10, 127, 69, 0.09)")};
+    border-color: ${({ $historical, $pending }) => (
+      $pending
+        ? "rgba(40, 89, 142, 0.24)"
+        : $historical
+          ? "rgba(0, 0, 0, 0.1)"
+          : "rgba(10, 127, 69, 0.24)"
+    )};
+    background: ${({ $historical, $pending }) => (
+      $pending
+        ? "rgba(40, 89, 142, 0.08)"
+        : $historical
+          ? "#fafafc"
+          : "rgba(10, 127, 69, 0.09)"
+    )};
   }
 
   html[data-forge-theme="light"] & p {
-    color: ${({ $historical }) => ($historical ? "var(--history-muted)" : "var(--history-text)")};
+    color: ${({ $historical, $pending }) => (($historical || $pending) ? "var(--history-muted)" : "var(--history-text)")};
   }
 
   html[data-forge-theme="light"] & small {
@@ -3860,6 +3940,44 @@ const SpecObjectActions = styled.div`
   display: inline-flex;
   flex-shrink: 0;
   gap: 5px;
+`;
+
+const SpecObjectPendingState = styled.div`
+  align-items: center;
+  border: 1px solid rgba(136, 165, 200, 0.24);
+  border-radius: 999px;
+  color: var(--history-blue);
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 760;
+  gap: 5px;
+  letter-spacing: 0.03em;
+  padding: 3px 7px;
+  text-transform: uppercase;
+`;
+
+const SpecGhostSpinner = styled.span`
+  animation: ${specGhostSpin} 0.9s linear infinite;
+  border: 2px solid rgba(136, 165, 200, 0.22);
+  border-top-color: var(--history-blue);
+  border-radius: 999px;
+  display: inline-block;
+  height: 10px;
+  width: 10px;
+`;
+
+const SpecObjectGhostMeta = styled.small`
+  color: rgba(136, 165, 200, 0.82);
+  display: block;
+  font-size: 10px;
+  font-weight: 680;
+  line-height: 1.4;
+  margin-top: 7px;
+
+  html[data-forge-theme="light"] & {
+    color: var(--history-blue);
+  }
 `;
 
 const SpecObjectIconButton = styled.button`
