@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { AddToQueue } from "@styled-icons/material-rounded/AddToQueue";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
@@ -53,11 +55,14 @@ import {
   getDraggedWorkspaceFile,
   getTerminalSubmitSequence,
   getThreadComposerSyncKey,
+  getWorkspaceThreadComposerAttachments,
   getWorkspaceThreadComposerDraftStore,
   isWorkspaceFileDragTransfer,
   requestTerminalSubmitDiagnosticSnapshot,
   setActiveWorkspaceFileDrag,
   setWorkspaceThreadComposerDraft,
+  subscribeWorkspaceThreadComposerAttachments,
+  subscribeWorkspaceThreadComposerDrafts,
   waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
   WORKSPACE_FILE_POINTER_DROP_EVENT,
   workspaceFileToComposerAttachment,
@@ -67,6 +72,16 @@ const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
+const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
+const TODO_QUEUE_BUSY_REASONS = new Set([
+  "busy_activity",
+  "busy_turn",
+  "composer_attachments_present",
+  "composer_draft_present",
+  "pending_prompt",
+  "reserved",
+  "terminal_starting",
+]);
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   originScaleX: 1,
   originScaleY: 1,
@@ -1102,6 +1117,11 @@ const TodoQueueItemCard = styled.article`
     background: rgba(47, 128, 255, 0.1);
   }
 
+  &:hover::before,
+  &:focus-within::before {
+    content: "";
+  }
+
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
   }
@@ -1136,6 +1156,14 @@ const TodoQueueItemCard = styled.article`
     pointer-events: none;
   }
 
+  &[data-todo-queued="true"] {
+    cursor: default;
+  }
+
+  &[data-todo-sending="true"] {
+    cursor: progress;
+  }
+
   &[data-todo-dragging="true"] {
     opacity: 0.42;
     transform: scale(0.985);
@@ -1159,6 +1187,83 @@ const TodoQueueItemCard = styled.article`
   }
 `;
 
+const TodoQueueItemActionButton = styled.button`
+  position: absolute;
+  top: 6px;
+  left: 7px;
+  z-index: 3;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #cfe2ff;
+  background: rgba(47, 128, 255, 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    background 130ms ease,
+    color 130ms ease,
+    opacity 130ms ease,
+    transform 130ms ease;
+
+  &:hover {
+    color: #ffffff;
+    background: rgba(47, 128, 255, 0.26);
+    transform: translateY(-1px);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(139, 184, 255, 0.52);
+    outline-offset: 1px;
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &[data-action="cancel"] {
+    color: #ffd2d2;
+    background: rgba(239, 107, 107, 0.16);
+  }
+
+  &[data-action="cancel"]:hover {
+    color: #ffffff;
+    background: rgba(239, 107, 107, 0.28);
+  }
+
+  ${TodoQueueItemCard}:hover &[data-visible="true"],
+  ${TodoQueueItemCard}:focus-within &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0056b3;
+    background: rgba(0, 102, 204, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #003f82;
+    background: rgba(0, 102, 204, 0.18);
+  }
+
+  html[data-forge-theme="light"] &[data-action="cancel"] {
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-action="cancel"]:hover {
+    color: #8f1c13;
+    background: rgba(180, 35, 24, 0.18);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+`;
+
 const todoQueuePendingSpin = keyframes`
   to {
     transform: rotate(360deg);
@@ -1173,8 +1278,14 @@ const TodoQueueItemPendingSpinner = styled.div`
   width: 16px;
   height: 16px;
   pointer-events: none;
+  transition: opacity 130ms ease;
 
   animation: ${todoQueuePendingSpin} 850ms linear infinite;
+
+  ${TodoQueueItemCard}[data-todo-cancellable="true"]:hover &,
+  ${TodoQueueItemCard}[data-todo-cancellable="true"]:focus-within & {
+    opacity: 0;
+  }
 
   span {
     position: absolute;
@@ -2183,6 +2294,25 @@ function getTodoDropErrorMessage(error) {
   return "Unable to send todo to terminal.";
 }
 
+function createTodoQueueBusyError(reason, message) {
+  const error = new Error(message || "No agent terminal is available yet.");
+  error.todoQueueBusy = true;
+  error.todoQueueBusyReason = String(reason || "");
+  return error;
+}
+
+function isTodoQueueBusyError(error) {
+  return Boolean(
+    error?.todoQueueBusy
+    || TODO_QUEUE_BUSY_REASONS.has(String(error?.todoQueueBusyReason || "").trim()),
+  );
+}
+
+function getTodoQueuePendingPhase(pendingItem) {
+  const phase = String(pendingItem?.phase || pendingItem?.state || "sending").trim().toLowerCase();
+  return phase === "queued" ? "queued" : "sending";
+}
+
 function createTodoQueueItem(text, options = {}) {
   const createdAt = new Date().toISOString();
   const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -2432,8 +2562,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   items,
   onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
+  onCancelQueuedItem,
   onDraftChange,
   onOpenWorkspaceSettings,
+  onQueueItem,
   onRemoveItem,
   onReorderItem,
   onSubmitDraft,
@@ -2956,6 +3088,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         const isEditing = editingItemId === item.id;
                         const pendingItem = pendingItems[item.id] || null;
                         const isPending = Boolean(pendingItem);
+                        const pendingPhase = getTodoQueuePendingPhase(pendingItem);
+                        const isQueued = pendingPhase === "queued";
+                        const isSending = isPending && !isQueued;
+                        const actionLabel = isQueued ? "Cancel queued todo" : "Queue todo";
+                        const actionTitle = isQueued ? "Cancel queued send" : "Send when an agent is available";
                         const image = getTodoQueueItemImage(item);
                         const note = getTodoQueueItemNote(item);
                         const hasPreview = Boolean(image || note);
@@ -2966,7 +3103,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
                             data-todo-editing={isEditing ? "true" : undefined}
                             data-todo-pending={isPending ? "true" : undefined}
+                            data-todo-queued={isQueued ? "true" : undefined}
                             data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
+                            data-todo-cancellable={isQueued ? "true" : undefined}
+                            data-todo-sending={isSending ? "true" : undefined}
                             key={item.id}
                             onDoubleClick={(event) => {
                               event.preventDefault();
@@ -2979,8 +3119,41 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             onPointerDown={(event) => handlePointerDown(event, item)}
                             ref={(element) => setTodoItemElement(item.id, element)}
                             role="listitem"
-                            title={isPending ? "Sending to terminal." : "Drag into an agent terminal. Double-click to edit."}
+                            title={
+                              isQueued
+                                ? "Queued for the next available agent."
+                                : isSending
+                                  ? "Sending to terminal."
+                                  : "Drag into an agent terminal. Double-click to edit."
+                            }
                           >
+                            {!isEditing && (
+                              <TodoQueueItemActionButton
+                                aria-label={actionLabel}
+                                data-action={isQueued ? "cancel" : "queue"}
+                                data-todo-control="true"
+                                data-visible={!isSending ? "true" : undefined}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (isQueued) {
+                                    onCancelQueuedItem?.(item.id);
+                                    return;
+                                  }
+                                  if (!isPending) {
+                                    onQueueItem?.(item.id);
+                                  }
+                                }}
+                                onPointerDown={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                }}
+                                title={actionTitle}
+                                type="button"
+                              >
+                                {isQueued ? <Close aria-hidden="true" /> : <AddToQueue aria-hidden="true" />}
+                              </TodoQueueItemActionButton>
+                            )}
                             {isPending && (
                               <TodoQueueItemPendingSpinner aria-label="Sending todo" role="img">
                                 {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
@@ -3126,6 +3299,7 @@ function TerminalView({
   const [todoQueueDraft, setTodoQueueDraft] = useState("");
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
+  const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const fullscreenTransitionTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
@@ -3135,14 +3309,18 @@ function TerminalView({
   const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
   const todoDragStateRef = useRef(null);
+  const todoQueueDispatchingRef = useRef(false);
+  const todoQueueItemsRef = useRef([]);
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
+  const todoQueueTerminalReservationsRef = useRef(new Map());
   const workspaceFileDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
   const todoQueueStorageKey = useMemo(
     () => getTodoQueueStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
+  todoQueueItemsRef.current = todoQueueItems;
   todoQueueStorageKeyRef.current = todoQueueStorageKey;
   const updateWorkspaceFileDragState = useCallback((nextState) => {
     workspaceFileDragStateRef.current = nextState || null;
@@ -3349,6 +3527,173 @@ function TerminalView({
 
     return terminal ? getTerminalPaneId(Number.parseInt(terminal.terminalIndex, 10)) : "";
   }, [getTerminalPaneId, workspaceThreadEntry]);
+  const getTodoQueueTerminalSendTarget = useCallback((terminalIndex, item = null, options = {}) => {
+    const targetTerminalIndex = Number(terminalIndex);
+    const image = getTodoQueueItemImage(item);
+    const itemId = String(options.reservationItemId || item?.id || item?.itemId || "").trim();
+    const allowGeneric = options.allowGeneric !== false;
+    const requireAvailable = Boolean(options.requireAvailable);
+    const baseWorkspaceId = String(item?.workspaceId || terminalWorkspace?.id || "");
+    const unavailable = (reason, message, fields = {}) => ({
+      available: false,
+      image,
+      message,
+      reason,
+      targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+      workspaceId: baseWorkspaceId,
+      ...fields,
+    });
+
+    if (!Number.isInteger(targetTerminalIndex) || !logicalTerminalIndexes.includes(targetTerminalIndex)) {
+      return unavailable("missing_target_terminal", "Choose an agent terminal for this todo.");
+    }
+
+    const paneId = getTerminalPaneId(targetTerminalIndex);
+    const targetRole = String(getTerminalRole(targetTerminalIndex) || "").trim().toLowerCase();
+    const terminalAgent = getTerminalAgent(targetTerminalIndex);
+    const terminalEntries = Object.values(workspaceThreadEntry?.terminals || {});
+    const liveTerminal = terminalEntries.find((candidate) => {
+      const candidateIndex = Number(candidate?.terminalIndex);
+      return Number.isInteger(candidateIndex)
+        ? candidateIndex === targetTerminalIndex
+        : candidate?.paneId === paneId;
+    }) || null;
+    const liveThread = liveTerminal?.threadId
+      ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
+      : null;
+    const configuredThread = getTerminalThread(targetTerminalIndex);
+    const targetThread = liveThread || configuredThread || null;
+    const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+    const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
+    const resolvedBinding = targetBinding
+      ? {
+        ...targetBinding,
+        instanceId: targetBinding.instanceId || liveTerminal?.instanceId || "",
+        paneId: targetBinding.paneId || paneId,
+      }
+      : liveTerminal?.instanceId
+        ? {
+          instanceId: liveTerminal.instanceId,
+          paneId,
+        }
+        : null;
+    const syncKey = getThreadComposerSyncKey(targetThread, {
+      ...resolvedBinding,
+      paneId: resolvedBinding?.paneId || paneId,
+    });
+    const workspaceId = targetThread?.workspaceId || baseWorkspaceId;
+    const terminalStatus = String(liveTerminal?.status || "").trim().toLowerCase();
+    const latestTurnState = String(targetThread?.latestTurn?.state || "").trim().toLowerCase();
+    const activityStatus = String(
+      targetThread?.activityStatus
+        || targetProviderBinding?.activityStatus
+        || "",
+    ).trim().toLowerCase();
+    const shouldAutoSubmit = Boolean(
+      !image
+        && targetRole
+        && !["generic", "terminal", "shell"].includes(targetRole),
+    );
+    const targetFields = {
+      activityStatus,
+      image,
+      latestTurnState,
+      liveTerminal,
+      paneId,
+      shouldAutoSubmit,
+      syncKey,
+      targetBinding: resolvedBinding,
+      targetProviderBinding,
+      targetRole,
+      targetTerminalIndex,
+      targetThread,
+      terminalAgent,
+      terminalStatus,
+      workspaceId,
+    };
+
+    if (!paneId) {
+      return unavailable("missing_pane", "Choose an agent terminal for this todo.", targetFields);
+    }
+    if (!allowGeneric && !TODO_QUEUE_AGENT_ROLES.has(targetRole)) {
+      return unavailable("unsupported_role", "Queued todos can only auto-send to agent terminals.", targetFields);
+    }
+
+    const imageInputSupport = image
+      ? getTerminalImageInputSupport(targetTerminalIndex)
+      : { supported: true };
+    if (image && !imageInputSupport.supported) {
+      return unavailable("image_unsupported", getTodoImageUnsupportedDropMessage(imageInputSupport), {
+        ...targetFields,
+        imageInputSupport,
+      });
+    }
+
+    if (!requireAvailable) {
+      return {
+        ...targetFields,
+        available: true,
+        imageInputSupport,
+        reason: "",
+      };
+    }
+
+    const reservation = todoQueueTerminalReservationsRef.current.get(targetTerminalIndex);
+    if (
+      reservation
+      && Number(reservation.startedAtMs || 0) > 0
+      && Date.now() - Number(reservation.startedAtMs || 0) > TODO_QUEUE_CONSUME_TIMEOUT_MS * 2
+    ) {
+      todoQueueTerminalReservationsRef.current.delete(targetTerminalIndex);
+    }
+    const activeReservation = todoQueueTerminalReservationsRef.current.get(targetTerminalIndex);
+    if (activeReservation && String(activeReservation.itemId || "") !== itemId) {
+      return unavailable("reserved", "Another queued todo is already sending to this terminal.", targetFields);
+    }
+    if (!liveTerminal || !["active", "running"].includes(terminalStatus)) {
+      return unavailable("terminal_starting", "This terminal is still starting.", targetFields);
+    }
+    if (!targetThread?.id) {
+      return unavailable("terminal_unavailable", "This terminal does not have a live thread yet.", targetFields);
+    }
+    if (!resolvedBinding?.instanceId) {
+      return unavailable("terminal_unavailable", "This terminal is not ready to receive a todo yet.", targetFields);
+    }
+    if (targetThread?.pendingPrompt) {
+      return unavailable("pending_prompt", "This terminal already has a prompt waiting to send.", targetFields);
+    }
+    if (latestTurnState === "running") {
+      return unavailable("busy_turn", "This agent is already working.", targetFields);
+    }
+    if (activityStatus === "thinking") {
+      return unavailable("busy_activity", "This agent is already working.", targetFields);
+    }
+    if (!syncKey) {
+      return unavailable("terminal_unavailable", "This terminal does not have a shared composer yet.", targetFields);
+    }
+    if (String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "").length > 0) {
+      return unavailable("composer_draft_present", "This terminal already has unsent composer text.", targetFields);
+    }
+    if (getWorkspaceThreadComposerAttachments(syncKey).length > 0) {
+      return unavailable("composer_attachments_present", "This terminal already has queued attachments.", targetFields);
+    }
+
+    return {
+      ...targetFields,
+      available: true,
+      imageInputSupport,
+      reason: "",
+    };
+  }, [
+    getTerminalAgent,
+    getTerminalImageInputSupport,
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+    workspaceThreadEntry,
+  ]);
   const fullscreenState = fullscreenActive
     ? fullscreenMotion.phase === "opening" || fullscreenMotion.phase === "closing"
       ? fullscreenMotion.phase
@@ -3452,6 +3797,17 @@ function TerminalView({
     setTodoQueueItems(readTodoQueueItems(todoQueueStorageKey));
     setTodoQueueDraft("");
   }, [todoQueueStorageKey]);
+
+  useEffect(() => {
+    const bumpDispatchRevision = () => setTodoQueueDispatchRevision((revision) => revision + 1);
+    const unsubscribeDrafts = subscribeWorkspaceThreadComposerDrafts(bumpDispatchRevision);
+    const unsubscribeAttachments = subscribeWorkspaceThreadComposerAttachments(bumpDispatchRevision);
+
+    return () => {
+      unsubscribeDrafts();
+      unsubscribeAttachments();
+    };
+  }, []);
 
   useEffect(() => {
     const element = terminalWorkspaceMainRef.current;
@@ -3593,11 +3949,12 @@ function TerminalView({
     logBigViewSyncDiagnosticEvent("tui.text.todo_pending_clear", {
       elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
       itemId: safeItemId,
+      phase: pendingItem.phase || pendingItem.state || "sending",
       reason,
       surface: "tui_todo_queue",
       targetRole: pendingItem.targetRole || "",
       targetTerminalIndex: pendingItem.targetTerminalIndex ?? "",
-      timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      timeoutMs: Number(pendingItem.timeoutMs || 0),
       workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
       ...fields,
     });
@@ -3619,43 +3976,56 @@ function TerminalView({
     }
 
     const startedAtMs = Date.now();
+    const rawPhase = String(fields.phase || fields.state || "sending").trim().toLowerCase();
+    const phase = rawPhase === "queued" ? "queued" : "sending";
+    const timeoutMs = phase === "queued" ? 0 : TODO_QUEUE_CONSUME_TIMEOUT_MS;
     const pendingItem = {
+      cancellable: phase === "queued",
+      item: fields.item || null,
       itemId: safeItemId,
+      paneId: String(fields.paneId || ""),
+      phase,
       startedAtMs,
+      state: phase,
       targetRole: String(fields.targetRole || ""),
       targetTerminalIndex: fields.targetTerminalIndex ?? "",
-      timeoutAtMs: startedAtMs + TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      timeoutAtMs: timeoutMs ? startedAtMs + timeoutMs : 0,
+      timeoutMs,
       workspaceId: String(fields.workspaceId || terminalWorkspace?.id || ""),
     };
-    const timeoutId = window.setTimeout(() => {
-      const currentPendingItem = todoQueuePendingItemsRef.current[safeItemId];
-      if (!currentPendingItem || Number(currentPendingItem.startedAtMs) !== startedAtMs) {
-        return;
-      }
+    if (timeoutMs) {
+      const timeoutId = window.setTimeout(() => {
+        const currentPendingItem = todoQueuePendingItemsRef.current[safeItemId];
+        if (!currentPendingItem || Number(currentPendingItem.startedAtMs) !== startedAtMs) {
+          return;
+        }
 
-      logBigViewSyncDiagnosticEvent("tui.text.todo_pending_timeout", {
-        elapsedMs: Date.now() - startedAtMs,
-        itemId: safeItemId,
-        surface: "tui_todo_queue",
-        targetRole: pendingItem.targetRole,
-        targetTerminalIndex: pendingItem.targetTerminalIndex,
-        timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
-        workspaceId: pendingItem.workspaceId,
-        ...fields,
-      });
-      todoQueuePendingTimersRef.current.delete(safeItemId);
-      const nextPendingItems = { ...todoQueuePendingItemsRef.current };
-      delete nextPendingItems[safeItemId];
-      replaceTodoQueuePendingItems(nextPendingItems);
-    }, TODO_QUEUE_CONSUME_TIMEOUT_MS);
+        logBigViewSyncDiagnosticEvent("tui.text.todo_pending_timeout", {
+          elapsedMs: Date.now() - startedAtMs,
+          itemId: safeItemId,
+          phase,
+          surface: "tui_todo_queue",
+          targetRole: pendingItem.targetRole,
+          targetTerminalIndex: pendingItem.targetTerminalIndex,
+          timeoutMs,
+          workspaceId: pendingItem.workspaceId,
+          ...fields,
+        });
+        todoQueuePendingTimersRef.current.delete(safeItemId);
+        const nextPendingItems = { ...todoQueuePendingItemsRef.current };
+        delete nextPendingItems[safeItemId];
+        replaceTodoQueuePendingItems(nextPendingItems);
+      }, timeoutMs);
 
-    todoQueuePendingTimersRef.current.set(safeItemId, timeoutId);
+      todoQueuePendingTimersRef.current.set(safeItemId, timeoutId);
+    }
     logBigViewSyncDiagnosticEvent("tui.text.todo_pending_start", {
       itemId: safeItemId,
+      phase,
       surface: "tui_todo_queue",
       targetRole: pendingItem.targetRole,
       targetTerminalIndex: pendingItem.targetTerminalIndex,
-      timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+      timeoutMs,
       workspaceId: pendingItem.workspaceId,
       ...fields,
     });
@@ -3680,6 +4050,527 @@ function TerminalView({
     todoQueuePendingTimersRef.current.clear();
     replaceTodoQueuePendingItems({});
   }, [replaceTodoQueuePendingItems, todoQueueStorageKey]);
+
+  const sendTodoQueueItemToTerminal = useCallback(async ({
+    allowGeneric = true,
+    focusReason = "todo_dropdown_drop",
+    item,
+    requireAvailable = false,
+    reservationItemId = "",
+    source = "tui-todo-drop",
+    targetTerminalIndex,
+  } = {}) => {
+    const currentItem = item && typeof item === "object" ? item : {};
+    const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentItem, {
+      allowGeneric,
+      requireAvailable,
+      reservationItemId,
+    });
+    const image = target.image || getTodoQueueItemImage(currentItem);
+    const paneId = target.paneId || "";
+    const targetRole = String(target.targetRole || "").toLowerCase();
+    const shouldAutoSubmit = Boolean(target.shouldAutoSubmit);
+    const workspaceId = target.workspaceId || currentItem.workspaceId || terminalWorkspace?.id || "";
+    const targetLogIndex = Number.isInteger(target.targetTerminalIndex)
+      ? target.targetTerminalIndex
+      : targetTerminalIndex ?? "";
+
+    logBigViewSyncDiagnosticEvent("tui.image.drop_start", {
+      hasImage: Boolean(image),
+      item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+      paneId,
+      shouldAutoSubmit,
+      source,
+      surface: "tui_terminal_grid",
+      targetRole,
+      targetTerminalIndex: targetLogIndex,
+      workspaceId,
+    });
+
+    if (!target.available) {
+      if (target.reason === "image_unsupported") {
+        logBigViewSyncDiagnosticEvent("tui.image.drop_unsupported", {
+          image: getTodoImageLogSummary([image])[0] || null,
+          imageSupportReason: target.imageInputSupport?.reason || "",
+          imageSupportState: target.imageInputSupport?.state || "",
+          paneId,
+          source,
+          surface: "tui_terminal_grid",
+          targetRole,
+          targetTerminalIndex: targetLogIndex,
+          workspaceId,
+        });
+      } else {
+        logBigViewSyncDiagnosticEvent("tui.image.drop_skip", {
+          hasImage: Boolean(image),
+          paneId,
+          reason: target.reason || "unavailable",
+          source,
+          surface: "tui_terminal_grid",
+          targetTerminalIndex: targetLogIndex,
+          workspaceId,
+        });
+      }
+
+      if (requireAvailable) {
+        throw createTodoQueueBusyError(target.reason || "terminal_unavailable", target.message);
+      }
+
+      throw new Error(target.message || "Choose an agent terminal for this todo.");
+    }
+
+    const targetThread = target.targetThread || null;
+    const targetBinding = target.targetBinding || null;
+    const syncKey = target.syncKey || "";
+    setActiveTerminalPaneId(paneId);
+    window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+      detail: {
+        paneId,
+        reason: focusReason,
+        terminalIndex: target.targetTerminalIndex,
+      },
+    }));
+
+    const terminalText = await prepareTodoTerminalText(currentItem);
+    const threadMessageText = getTodoQueueItemThreadMessageText(currentItem, terminalText);
+    const attachmentSource = source === "tui-todo-auto-queue" ? "tui_todo_auto_queue" : "tui_todo_drop";
+    const queuedAttachment = image
+      ? todoImageToComposerAttachment(image, 0, attachmentSource)
+      : null;
+
+    if (queuedAttachment && syncKey) {
+      appendWorkspaceThreadComposerAttachments(syncKey, [queuedAttachment], {
+        fields: {
+          image: getTodoImageLogSummary([image])[0] || null,
+          paneId,
+          source,
+          surface: "tui_terminal_grid",
+          targetRole,
+          targetTerminalIndex: targetLogIndex,
+          workspaceId,
+        },
+        source: attachmentSource,
+      });
+    }
+    if (queuedAttachment && !syncKey) {
+      logBigViewSyncDiagnosticEvent("tui.image.drop_attachment_skip", {
+        image: getTodoImageLogSummary([image])[0] || null,
+        paneId,
+        reason: "missing_sync_key",
+        source,
+        surface: "tui_terminal_grid",
+        targetRole,
+        targetTerminalIndex: targetLogIndex,
+        workspaceId,
+      });
+    }
+
+    let dropResult = null;
+    if (!terminalText && queuedAttachment) {
+      if (!syncKey) {
+        throw new Error("Unable to queue image because this terminal has no thread composer.");
+      }
+      logBigViewSyncDiagnosticEvent("tui.image.drop_queued_only", {
+        attachmentQueued: Boolean(syncKey),
+        image: getTodoImageLogSummary([image])[0] || null,
+        paneId,
+        shouldAutoSubmit,
+        source,
+        syncKey,
+        surface: "tui_terminal_grid",
+        targetRole,
+        targetTerminalIndex: targetLogIndex,
+        text: getBigViewTextDiagnosticFields(threadMessageText),
+        workspaceId,
+      });
+      dropResult = {
+        imageOnly: true,
+        syncKey,
+        targetBinding,
+        targetThread,
+        terminalText,
+        threadMessageText,
+      };
+    } else {
+      if (!terminalText) {
+        throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
+      }
+
+      const previousDraft = syncKey
+        ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+        : "";
+      const terminalSubmitSequence = getTerminalSubmitSequence(targetRole, false);
+      const shouldConfirmAutoSubmit = Boolean(
+        shouldAutoSubmit
+          && !image
+          && terminalSubmitSequence
+          && targetThread?.id,
+      );
+      if (shouldAutoSubmit && !shouldConfirmAutoSubmit) {
+        logBigViewSyncDiagnosticEvent("tui.text.drop_submit_blocked", {
+          hasSubmitSequence: Boolean(terminalSubmitSequence),
+          hasTargetThread: Boolean(targetThread?.id),
+          paneId,
+          reason: !terminalSubmitSequence
+            ? "missing_submit_sequence"
+            : "missing_thread",
+          source,
+          surface: "tui_terminal_grid",
+          targetRole,
+          targetTerminalIndex: targetLogIndex,
+          terminalText: getBigViewTextDiagnosticFields(terminalText),
+          workspaceId,
+        });
+        throw new Error("Unable to confirm this todo submission for the selected terminal.");
+      }
+      if (syncKey) {
+        setWorkspaceThreadComposerDraft(syncKey, terminalText);
+      }
+      logBigViewSyncDiagnosticEvent("tui.image.drop_prepared", {
+        attachmentQueued: Boolean(queuedAttachment && syncKey),
+        hasImageAttachmentBlock: false,
+        hasQueuedImage: Boolean(queuedAttachment),
+        paneId,
+        shouldAutoSubmit,
+        sharedDraftSynced: Boolean(syncKey),
+        source,
+        submitConfirmationRequired: shouldConfirmAutoSubmit,
+        syncKey,
+        surface: "tui_terminal_grid",
+        targetRole,
+        targetTerminalIndex: targetLogIndex,
+        terminalText: getBigViewTextDiagnosticFields(terminalText),
+        terminalTextLength: terminalText.length,
+        threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
+        workspaceId,
+      });
+      if (!shouldConfirmAutoSubmit) {
+        const writeResult = await invoke("terminal_write", {
+          data: terminalText,
+          instanceId: targetBinding?.instanceId,
+          paneId,
+          threadId: targetThread?.id || "",
+        });
+        dropResult = {
+          confirmedSubmit: false,
+          syncKey,
+          targetBinding,
+          targetThread,
+          terminalText,
+          threadMessageText,
+          writeResult,
+        };
+      } else {
+        const promptId = createThreadProjectionToken("todo-drop-prompt");
+        const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
+        const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
+          requestTerminalSubmitDiagnosticSnapshot({
+            agentId: targetRole,
+            delayMs,
+            expectedPrompt: terminalText,
+            expectedPromptLength: terminalText.length,
+            paneId,
+            promptId,
+            reason,
+            syncKey,
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThread.id,
+            workspaceId,
+            ...extraFields,
+          });
+        };
+        logBigViewSyncDiagnosticEvent("tui.text.drop_sync_start", {
+          agentId: targetRole,
+          paneId,
+          previousDraftLength: previousDraft.length,
+          promptId,
+          source,
+          syncData: getTerminalInputDebugFields(syncData),
+          syncDataHasForceReplace: syncData.includes("\x15"),
+          syncDataHasShiftEnter: syncData.includes(TERMINAL_SHIFT_ENTER_SEQUENCE),
+          syncDataLength: syncData.length,
+          syncKey,
+          surface: "tui_terminal_grid",
+          targetTerminalIndex: targetLogIndex,
+          terminalText: getBigViewTextDiagnosticFields(terminalText),
+          threadId: targetThread.id,
+          workspaceId,
+        });
+        const syncWriteStartedAt = performance.now();
+        if (syncData) {
+          await invoke("terminal_write", {
+            data: syncData,
+            instanceId: targetBinding?.instanceId,
+            paneId,
+            threadId: targetThread.id,
+          });
+        }
+        const syncWriteDurationMs = Math.round(performance.now() - syncWriteStartedAt);
+        logBigViewSyncDiagnosticEvent("tui.text.drop_sync_done", {
+          agentId: targetRole,
+          paneId,
+          promptId,
+          source,
+          syncDataLength: syncData.length,
+          syncKey,
+          syncWriteDurationMs,
+          surface: "tui_terminal_grid",
+          targetTerminalIndex: targetLogIndex,
+          threadId: targetThread.id,
+          workspaceId,
+        });
+        requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter");
+        requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_80ms", 80);
+        requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_300ms", 300);
+        requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_900ms", 900);
+        const submittedWaiter = await createTerminalPromptSubmittedWaiter({
+          agentId: targetRole,
+          expectedPrompt: terminalText,
+          instanceId: targetBinding?.instanceId,
+          paneId,
+          promptId,
+          threadId: targetThread.id,
+          workspaceId,
+        });
+        const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
+          agentId: targetRole,
+          expectedPrompt: terminalText,
+          promptId,
+          threadId: targetThread.id,
+          timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+          workspaceId,
+        });
+        try {
+          const submittedAt = new Date().toISOString();
+          const promptEventSource = source === "tui-todo-auto-queue"
+            ? "todo-auto-queue"
+            : "terminal-view-drop";
+          logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
+            agentId: targetRole,
+            paneId,
+            promptId,
+            source,
+            submitSequenceLength: terminalSubmitSequence.length,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetLogIndex,
+            terminalText: getBigViewTextDiagnosticFields(terminalText),
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          const writeResult = await invoke("terminal_write", {
+            data: terminalSubmitSequence,
+            instanceId: targetBinding?.instanceId,
+            paneId,
+            promptEventId: promptId,
+            promptEventSource,
+            promptEventSubmittedAt: submittedAt,
+            promptEventText: terminalText,
+            threadId: targetThread.id,
+          });
+          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
+            submitSequenceLength: terminalSubmitSequence.length,
+          });
+          requestDropSubmitSnapshot("tui.text.drop_after_enter_write", 160, {
+            submitSequenceLength: terminalSubmitSequence.length,
+          });
+          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_500ms", 500, {
+            submitSequenceLength: terminalSubmitSequence.length,
+          });
+          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
+            submitSequenceLength: terminalSubmitSequence.length,
+          });
+          await submittedWaiter.promise;
+          logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
+            agentId: targetRole,
+            paneId,
+            promptId,
+            source,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          const acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
+            acceptedWaiter,
+            agentId: targetRole,
+            binding: {
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              terminalIndex: target.targetTerminalIndex,
+            },
+            expectedPrompt: terminalText,
+            getDraftValue: () => (
+              syncKey
+                ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+                : terminalText
+            ),
+            isGenericTerminal: false,
+            logPrefix: source === "tui-todo-auto-queue" ? "frontend.todo_auto_queue" : "frontend.todo_drop",
+            promptId,
+            retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
+            submitSequence: terminalSubmitSequence,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
+            acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+            agentId: targetRole,
+            paneId,
+            promptId,
+            sessionIdPresent: Boolean(acceptedDetail?.sessionId),
+            source,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          dropResult = {
+            acceptedDetail,
+            confirmedSubmit: true,
+            promptId,
+            syncKey,
+            targetBinding,
+            targetThread,
+            terminalText,
+            threadMessageText,
+            writeResult,
+          };
+        } catch (submitError) {
+          submittedWaiter.cancel();
+          acceptedWaiter.cancel();
+          requestTerminalSubmitDiagnosticSnapshot({
+            agentId: targetRole,
+            expectedPrompt: terminalText,
+            expectedPromptLength: terminalText.length,
+            paneId,
+            promptId,
+            reason: "tui.text.drop_submit_confirm_error_snapshot",
+            syncKey,
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          logBigViewSyncDiagnosticEvent("tui.text.drop_submit_confirm_error", {
+            agentId: targetRole,
+            message: submitError?.message || String(submitError || ""),
+            paneId,
+            promptId,
+            source,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          throw submitError;
+        }
+      }
+    }
+
+    const writeResult = dropResult?.writeResult || null;
+    const resultThreadMessageText = String(dropResult?.threadMessageText || "");
+    const lifecycleSource = source === "tui-todo-auto-queue" ? "tui-todo-auto-queue" : "tui-todo-drop";
+    const shouldDispatchThreadMessage = Boolean(
+      dropResult?.confirmedSubmit
+        && shouldAutoSubmit
+        && !image
+        && resultThreadMessageText.trim()
+        && targetThread?.id
+        && targetRole
+        && targetRole !== "generic"
+        && targetRole !== "terminal"
+        && targetRole !== "shell"
+        && onThreadTerminalLifecycle,
+    );
+    if (shouldDispatchThreadMessage) {
+      onThreadTerminalLifecycle?.({
+        agentId: targetRole,
+        instanceId: targetBinding?.instanceId || "",
+        messageSource: lifecycleSource,
+        paneId,
+        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
+        source: lifecycleSource,
+        status: "active",
+        terminalIndex: target.targetTerminalIndex,
+        expectedUserMessage: dropResult?.terminalText || "",
+        threadId: targetThread.id,
+        type: "message-submitted",
+        userMessage: resultThreadMessageText,
+        workspaceId,
+        workspaceName: terminalWorkspace?.name || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_dispatched", {
+        agentId: targetRole,
+        paneId,
+        promptId: dropResult?.promptId || "",
+        source: lifecycleSource,
+        surface: "tui_terminal_grid",
+        syncKey,
+        submitConfirmed: true,
+        targetTerminalIndex: targetLogIndex,
+        terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
+        threadId: targetThread.id,
+        threadMessageText: getBigViewTextDiagnosticFields(resultThreadMessageText),
+        workspaceId,
+      });
+    } else if (shouldAutoSubmit && !image) {
+      logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_skip", {
+        confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
+        hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
+        hasTargetThread: Boolean(targetThread?.id),
+        hasThreadMessageText: Boolean(resultThreadMessageText.trim()),
+        paneId,
+        promptId: dropResult?.promptId || "",
+        reason: !dropResult?.confirmedSubmit
+          ? "submit_not_confirmed"
+          : !resultThreadMessageText.trim()
+          ? "empty_message"
+          : !targetThread?.id
+            ? "missing_thread"
+            : !onThreadTerminalLifecycle
+              ? "missing_lifecycle_handler"
+              : "unsupported_target_role",
+        source: lifecycleSource,
+        surface: "tui_terminal_grid",
+        targetRole,
+        targetTerminalIndex: targetLogIndex,
+        workspaceId,
+      });
+    }
+    if (syncKey && shouldAutoSubmit) {
+      setWorkspaceThreadComposerDraft(syncKey, "");
+    }
+    logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
+      imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
+      hadQueueItem: Boolean(currentItem.itemId || currentItem.id),
+      hasImage: Boolean(image),
+      paneId,
+      shouldAutoSubmit,
+      sharedDraftCleared: Boolean(syncKey && shouldAutoSubmit),
+      source,
+      submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+      syncKey,
+      surface: "tui_terminal_grid",
+      targetRole,
+      targetTerminalIndex: targetLogIndex,
+      terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
+      threadMessageText: getBigViewTextDiagnosticFields(resultThreadMessageText),
+      workspaceId,
+    });
+
+    return dropResult;
+  }, [
+    defaultWorkingDirectory,
+    getTodoQueueTerminalSendTarget,
+    onThreadTerminalLifecycle,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+  ]);
 
   const submitTodoQueueDraft = useCallback((options = {}) => {
     const text = normalizeTodoQueueText(todoQueueDraft);
@@ -3722,6 +4613,41 @@ function TerminalView({
       currentItems.filter((item) => item.id !== itemId)
     ));
   }, [clearTodoQueueItemPending, updateTodoQueueItems]);
+
+  const queueTodoQueueItem = useCallback((itemId) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+
+    const item = todoQueueItems.find((candidate) => candidate.id === safeItemId);
+    const pendingItem = todoQueuePendingItemsRef.current[safeItemId] || null;
+    if (!item || (pendingItem && getTodoQueuePendingPhase(pendingItem) === "sending")) {
+      return;
+    }
+
+    setTodoDropError("");
+    setTodoQueueItemPending(safeItemId, {
+      item: getTodoQueueItemLogSummary([item])[0] || null,
+      phase: "queued",
+      source: "tui-todo-auto-queue",
+      workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+    });
+    setTodoQueueDispatchRevision((revision) => revision + 1);
+  }, [setTodoQueueItemPending, terminalWorkspace?.id, todoQueueItems]);
+
+  const cancelQueuedTodoQueueItem = useCallback((itemId) => {
+    const safeItemId = String(itemId || "").trim();
+    const pendingItem = safeItemId ? todoQueuePendingItemsRef.current[safeItemId] || null : null;
+    if (!pendingItem || getTodoQueuePendingPhase(pendingItem) !== "queued") {
+      return;
+    }
+
+    clearTodoQueueItemPending(safeItemId, "cancelled", {
+      source: "tui-todo-auto-queue",
+    });
+    setTodoQueueDispatchRevision((revision) => revision + 1);
+  }, [clearTodoQueueItemPending]);
 
   const reorderTodoQueueItem = useCallback((itemId, targetIndex) => {
     updateTodoQueueItems((currentItems) => {
@@ -3767,6 +4693,134 @@ function TerminalView({
         ))
     ));
   }, [updateTodoQueueItems]);
+
+  const dispatchQueuedTodoItems = useCallback(() => {
+    if (todoQueueDispatchingRef.current) {
+      return;
+    }
+
+    const queuedItem = todoQueueItems.find((item) => {
+      const pendingItem = todoQueuePendingItemsRef.current[item.id] || null;
+      return pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued";
+    });
+    if (!queuedItem) {
+      return;
+    }
+
+    let target = null;
+    for (const terminalIndex of logicalTerminalIndexes) {
+      const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
+        allowGeneric: false,
+        requireAvailable: true,
+        reservationItemId: queuedItem.id,
+      });
+      if (candidate.available) {
+        target = candidate;
+        break;
+      }
+    }
+    if (!target) {
+      return;
+    }
+
+    const source = "tui-todo-auto-queue";
+    const targetTerminalIndex = target.targetTerminalIndex;
+    todoQueueDispatchingRef.current = true;
+    todoQueueTerminalReservationsRef.current.set(targetTerminalIndex, {
+      itemId: queuedItem.id,
+      startedAtMs: Date.now(),
+    });
+    setTodoQueueItemPending(queuedItem.id, {
+      item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+      paneId: target.paneId,
+      phase: "sending",
+      source,
+      targetRole: target.targetRole,
+      targetTerminalIndex,
+      workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+    });
+
+    sendTodoQueueItemToTerminal({
+      allowGeneric: false,
+      focusReason: "todo_auto_queue",
+      item: queuedItem,
+      requireAvailable: true,
+      reservationItemId: queuedItem.id,
+      source,
+      targetTerminalIndex,
+    })
+      .then((dropResult) => {
+        setTodoDropError("");
+        clearTodoQueueItemPending(queuedItem.id, "consumed", {
+          promptId: dropResult?.promptId || "",
+          source,
+          submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+          targetRole: target.targetRole,
+          targetTerminalIndex,
+        });
+        updateTodoQueueItems((currentItems) => (
+          currentItems.filter((item) => item.id !== queuedItem.id)
+        ));
+      })
+      .catch((error) => {
+        const stillQueued = todoQueueItemsRef.current.some((item) => item.id === queuedItem.id);
+        if (stillQueued && isTodoQueueBusyError(error)) {
+          setTodoQueueItemPending(queuedItem.id, {
+            item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+            phase: "queued",
+            reason: error?.todoQueueBusyReason || "",
+            source,
+            workspaceId: queuedItem.workspaceId || terminalWorkspace?.id || "",
+          });
+          return;
+        }
+
+        clearTodoQueueItemPending(queuedItem.id, "error", {
+          message: error?.message || String(error || ""),
+          source,
+          targetRole: target.targetRole,
+          targetTerminalIndex,
+        });
+        setTodoDropError(getTodoDropErrorMessage(error));
+        logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
+          hasImage: Boolean(getTodoQueueItemImage(queuedItem)),
+          message: error?.message || String(error || ""),
+          paneId: target.paneId,
+          shouldAutoSubmit: Boolean(target.shouldAutoSubmit),
+          source,
+          surface: "tui_terminal_grid",
+          targetRole: target.targetRole,
+          targetTerminalIndex,
+          workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+        });
+      })
+      .finally(() => {
+        const reservation = todoQueueTerminalReservationsRef.current.get(targetTerminalIndex);
+        if (String(reservation?.itemId || "") === queuedItem.id) {
+          todoQueueTerminalReservationsRef.current.delete(targetTerminalIndex);
+        }
+        todoQueueDispatchingRef.current = false;
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+      });
+  }, [
+    clearTodoQueueItemPending,
+    getTodoQueueTerminalSendTarget,
+    logicalTerminalIndexes,
+    sendTodoQueueItemToTerminal,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    todoQueueItems,
+    updateTodoQueueItems,
+  ]);
+
+  useEffect(() => {
+    dispatchQueuedTodoItems();
+  }, [
+    dispatchQueuedTodoItems,
+    todoQueueDispatchRevision,
+    todoQueuePendingItems,
+    workspaceThreads,
+  ]);
 
   const updateTodoDragState = useCallback((updater) => {
     setTodoDragState((currentState) => {
@@ -3930,541 +4984,112 @@ function TerminalView({
         return;
       }
 
-      const paneId = Number.isInteger(targetTerminalIndex)
-        ? getTerminalPaneId(targetTerminalIndex)
-        : "";
-      const targetRole = Number.isInteger(targetTerminalIndex)
-        ? String(getTerminalRole(targetTerminalIndex) || "").toLowerCase()
-        : "";
-      const image = getTodoQueueItemImage(currentDrag);
-      const shouldAutoSubmit = !image && !["generic", "terminal", "shell"].includes(targetRole);
-
-      updateTodoDragState(null);
-
-      logBigViewSyncDiagnosticEvent("tui.image.drop_start", {
-        hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
-        item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
-        paneId,
-        shouldAutoSubmit,
-        surface: "tui_terminal_grid",
-        targetRole,
-        targetTerminalIndex: targetTerminalIndex ?? "",
-        workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-      });
-
-      if (!paneId) {
-        logBigViewSyncDiagnosticEvent("tui.image.drop_skip", {
-          hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
-          reason: "missing_pane",
-          surface: "tui_terminal_grid",
-          targetTerminalIndex: targetTerminalIndex ?? "",
-          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+      {
+        const source = "tui-todo-drop";
+        const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentDrag, {
+          allowGeneric: true,
+          requireAvailable: false,
+          reservationItemId: currentDrag.itemId,
         });
-        return;
-      }
+        const paneId = target.paneId || "";
+        const targetRole = target.targetRole || "";
+        const reservationItemId = currentDrag.itemId || `todo-drop-${Date.now().toString(36)}`;
+        const reservedTerminalIndex = Number.isInteger(target.targetTerminalIndex)
+          ? target.targetTerminalIndex
+          : null;
 
-      const imageInputSupport = Number.isInteger(targetTerminalIndex)
-        ? getTerminalImageInputSupport(targetTerminalIndex)
-        : { supported: false };
+        updateTodoDragState(null);
 
-      if (image && !imageInputSupport.supported) {
-        setTodoDropError(getTodoImageUnsupportedDropMessage(imageInputSupport));
-        logBigViewSyncDiagnosticEvent("tui.image.drop_unsupported", {
-          image: getTodoImageLogSummary([image])[0] || null,
-          imageSupportReason: imageInputSupport.reason || "",
-          imageSupportState: imageInputSupport.state || "",
-          paneId,
-          surface: "tui_terminal_grid",
-          targetRole,
-          targetTerminalIndex: targetTerminalIndex ?? "",
-          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-        });
-        return;
-      }
-
-      if (currentDrag.itemId) {
-        setTodoQueueItemPending(currentDrag.itemId, {
-          item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
-          paneId,
-          targetRole,
-          targetTerminalIndex: targetTerminalIndex ?? "",
-          workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-        });
-      }
-      setActiveTerminalPaneId(paneId);
-      window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
-        detail: {
-          paneId,
-          reason: "todo_dropdown_drop",
-          terminalIndex: targetTerminalIndex,
-        },
-      }));
-      prepareTodoTerminalText(currentDrag)
-        .then(async (terminalText) => {
-          const threadMessageText = getTodoQueueItemThreadMessageText(currentDrag, terminalText);
-          const targetThread = Number.isInteger(targetTerminalIndex)
-            ? getTerminalThread(targetTerminalIndex)
-            : null;
-          const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
-          const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
-          const syncKey = getThreadComposerSyncKey(targetThread, {
-            ...targetBinding,
-            paneId: targetBinding?.paneId || paneId,
+        if (!target.available && ["missing_pane", "missing_target_terminal"].includes(target.reason)) {
+          logBigViewSyncDiagnosticEvent("tui.image.drop_skip", {
+            hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+            reason: target.reason || "missing_pane",
+            source,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
           });
-          const queuedAttachment = image
-            ? todoImageToComposerAttachment(image, 0, "tui_todo_drop")
-            : null;
-          if (queuedAttachment && syncKey) {
-            appendWorkspaceThreadComposerAttachments(syncKey, [queuedAttachment], {
-              fields: {
-                image: getTodoImageLogSummary([image])[0] || null,
-                paneId,
-                surface: "tui_terminal_grid",
+          return;
+        }
+
+        if (currentDrag.itemId && target.available) {
+          setTodoQueueItemPending(currentDrag.itemId, {
+            item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+            paneId,
+            phase: "sending",
+            source,
+            targetRole,
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
+        }
+
+        if (target.available && Number.isInteger(reservedTerminalIndex)) {
+          todoQueueTerminalReservationsRef.current.set(reservedTerminalIndex, {
+            itemId: reservationItemId,
+            source,
+            startedAtMs: Date.now(),
+          });
+          setTodoQueueDispatchRevision((revision) => revision + 1);
+        }
+
+        sendTodoQueueItemToTerminal({
+          allowGeneric: true,
+          focusReason: "todo_dropdown_drop",
+          item: currentDrag,
+          requireAvailable: false,
+          reservationItemId,
+          source,
+          targetTerminalIndex,
+        })
+          .then((dropResult) => {
+            setTodoDropError("");
+            if (currentDrag.itemId) {
+              clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
+                promptId: dropResult?.promptId || "",
+                source,
+                submitConfirmed: Boolean(dropResult?.confirmedSubmit),
                 targetRole,
                 targetTerminalIndex: targetTerminalIndex ?? "",
-                workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-              },
-              source: "tui_todo_drop",
-            });
-          }
-          if (queuedAttachment && !syncKey) {
-            logBigViewSyncDiagnosticEvent("tui.image.drop_attachment_skip", {
-              image: getTodoImageLogSummary([image])[0] || null,
-              paneId,
-              reason: "missing_sync_key",
-              surface: "tui_terminal_grid",
-              targetRole,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-            });
-          }
-          if (!terminalText && queuedAttachment) {
-            if (!syncKey) {
-              throw new Error("Unable to queue image because this terminal has no thread composer.");
+              });
+              updateTodoQueueItems((currentItems) => (
+                currentItems.filter((item) => item.id !== currentDrag.itemId)
+              ));
             }
-            logBigViewSyncDiagnosticEvent("tui.image.drop_queued_only", {
-              attachmentQueued: Boolean(syncKey),
-              image: getTodoImageLogSummary([image])[0] || null,
-              paneId,
-              shouldAutoSubmit,
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetRole,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              text: getBigViewTextDiagnosticFields(threadMessageText),
-              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-            });
-            return {
-              imageOnly: true,
-              syncKey,
-              targetBinding,
-              targetThread,
-              terminalText,
-              threadMessageText,
-            };
-          }
-          if (!terminalText) {
-            throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
-          }
-          const workspaceId = targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "";
-          const previousDraft = syncKey
-            ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-            : "";
-          const terminalSubmitSequence = getTerminalSubmitSequence(targetRole, false);
-          const shouldConfirmAutoSubmit = Boolean(
-            shouldAutoSubmit
-              && !image
-              && terminalSubmitSequence
-              && targetThread?.id,
-          );
-          if (shouldAutoSubmit && !shouldConfirmAutoSubmit) {
-            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_blocked", {
-              hasSubmitSequence: Boolean(terminalSubmitSequence),
-              hasTargetThread: Boolean(targetThread?.id),
-              paneId,
-              reason: !terminalSubmitSequence
-                ? "missing_submit_sequence"
-                : "missing_thread",
-              surface: "tui_terminal_grid",
-              targetRole,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              terminalText: getBigViewTextDiagnosticFields(terminalText),
-              workspaceId,
-            });
-            throw new Error("Unable to confirm this todo submission for the selected terminal.");
-          }
-          if (syncKey) {
-            setWorkspaceThreadComposerDraft(syncKey, terminalText);
-          }
-          logBigViewSyncDiagnosticEvent("tui.image.drop_prepared", {
-            attachmentQueued: Boolean(queuedAttachment && syncKey),
-            hasImageAttachmentBlock: false,
-            hasQueuedImage: Boolean(queuedAttachment),
-            paneId,
-            shouldAutoSubmit,
-            sharedDraftSynced: Boolean(syncKey),
-            submitConfirmationRequired: shouldConfirmAutoSubmit,
-            syncKey,
-            surface: "tui_terminal_grid",
-            targetRole,
-            targetTerminalIndex: targetTerminalIndex ?? "",
-            terminalText: getBigViewTextDiagnosticFields(terminalText),
-            terminalTextLength: terminalText.length,
-            threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
-            workspaceId,
-          });
-          if (!shouldConfirmAutoSubmit) {
-            return invoke("terminal_write", {
-              data: terminalText,
-              instanceId: targetBinding?.instanceId,
-              paneId,
-              threadId: targetThread?.id || "",
-            }).then((writeResult) => ({
-              confirmedSubmit: false,
-              syncKey,
-              targetBinding,
-              targetThread,
-              terminalText,
-              threadMessageText,
-              writeResult,
-            }));
-          }
-
-          const promptId = createThreadProjectionToken("todo-drop-prompt");
-          const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
-          const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
-            requestTerminalSubmitDiagnosticSnapshot({
-              agentId: targetRole,
-              delayMs,
-              expectedPrompt: terminalText,
-              expectedPromptLength: terminalText.length,
-              paneId,
-              promptId,
-              reason,
-              syncKey,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              threadId: targetThread.id,
-              workspaceId,
-              ...extraFields,
-            });
-          };
-          logBigViewSyncDiagnosticEvent("tui.text.drop_sync_start", {
-            agentId: targetRole,
-            paneId,
-            previousDraftLength: previousDraft.length,
-            promptId,
-            syncData: getTerminalInputDebugFields(syncData),
-            syncDataHasForceReplace: syncData.includes("\x15"),
-            syncDataHasShiftEnter: syncData.includes(TERMINAL_SHIFT_ENTER_SEQUENCE),
-            syncDataLength: syncData.length,
-            syncKey,
-            surface: "tui_terminal_grid",
-            targetTerminalIndex: targetTerminalIndex ?? "",
-            terminalText: getBigViewTextDiagnosticFields(terminalText),
-            threadId: targetThread.id,
-            workspaceId,
-          });
-          const syncWriteStartedAt = performance.now();
-          if (syncData) {
-            await invoke("terminal_write", {
-              data: syncData,
-              instanceId: targetBinding?.instanceId,
-              paneId,
-              threadId: targetThread.id,
-            });
-          }
-          const syncWriteDurationMs = Math.round(performance.now() - syncWriteStartedAt);
-          logBigViewSyncDiagnosticEvent("tui.text.drop_sync_done", {
-            agentId: targetRole,
-            paneId,
-            promptId,
-            syncDataLength: syncData.length,
-            syncKey,
-            syncWriteDurationMs,
-            surface: "tui_terminal_grid",
-            targetTerminalIndex: targetTerminalIndex ?? "",
-            threadId: targetThread.id,
-            workspaceId,
-          });
-          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter");
-          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_80ms", 80);
-          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_300ms", 300);
-          requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_900ms", 900);
-          const submittedWaiter = await createTerminalPromptSubmittedWaiter({
-            agentId: targetRole,
-            expectedPrompt: terminalText,
-            instanceId: targetBinding?.instanceId,
-            paneId,
-            promptId,
-            threadId: targetThread.id,
-            workspaceId,
-          });
-          const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
-            agentId: targetRole,
-            expectedPrompt: terminalText,
-            promptId,
-            threadId: targetThread.id,
-            timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
-            workspaceId,
-          });
-          try {
-            const submittedAt = new Date().toISOString();
-            logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
-              agentId: targetRole,
-              paneId,
-              promptId,
-              submitSequenceLength: terminalSubmitSequence.length,
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              terminalText: getBigViewTextDiagnosticFields(terminalText),
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            const writeResult = await invoke("terminal_write", {
-              data: terminalSubmitSequence,
-              instanceId: targetBinding?.instanceId,
-              paneId,
-              promptEventId: promptId,
-              promptEventSource: "terminal-view-drop",
-              promptEventSubmittedAt: submittedAt,
-              promptEventText: terminalText,
-              threadId: targetThread.id,
-            });
-            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
-              submitSequenceLength: terminalSubmitSequence.length,
-            });
-            requestDropSubmitSnapshot("tui.text.drop_after_enter_write", 160, {
-              submitSequenceLength: terminalSubmitSequence.length,
-            });
-            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_500ms", 500, {
-              submitSequenceLength: terminalSubmitSequence.length,
-            });
-            requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
-              submitSequenceLength: terminalSubmitSequence.length,
-            });
-            await submittedWaiter.promise;
-            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
-              agentId: targetRole,
-              paneId,
-              promptId,
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            const acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
-              acceptedWaiter,
-              agentId: targetRole,
-              binding: {
-                instanceId: targetBinding?.instanceId,
-                paneId,
-                terminalIndex: targetTerminalIndex,
-              },
-              expectedPrompt: terminalText,
-              getDraftValue: () => (
-                syncKey
-                  ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-                  : terminalText
-              ),
-              isGenericTerminal: false,
-              logPrefix: "frontend.todo_drop",
-              promptId,
-              retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
-              submitSequence: terminalSubmitSequence,
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
-              acceptedMatchedBy: acceptedDetail?.matchedBy || "",
-              agentId: targetRole,
-              paneId,
-              promptId,
-              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            return {
-              acceptedDetail,
-              confirmedSubmit: true,
-              promptId,
-              syncKey,
-              targetBinding,
-              targetThread,
-              terminalText,
-              threadMessageText,
-              writeResult,
-            };
-          } catch (submitError) {
-            submittedWaiter.cancel();
-            acceptedWaiter.cancel();
-            requestTerminalSubmitDiagnosticSnapshot({
-              agentId: targetRole,
-              expectedPrompt: terminalText,
-              expectedPromptLength: terminalText.length,
-              paneId,
-              promptId,
-              reason: "tui.text.drop_submit_confirm_error_snapshot",
-              syncKey,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_confirm_error", {
-              agentId: targetRole,
-              message: submitError?.message || String(submitError || ""),
-              paneId,
-              promptId,
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              threadId: targetThread.id,
-              workspaceId,
-            });
-            throw submitError;
-          }
-        })
-        .then((dropResult) => {
-          const writeResult = dropResult?.writeResult || null;
-          const targetThread = dropResult?.targetThread || (Number.isInteger(targetTerminalIndex)
-            ? getTerminalThread(targetTerminalIndex)
-            : null);
-          const targetProviderBinding = dropResult?.targetBinding
-            ? null
-            : getWorkspaceThreadProviderBinding(targetThread, targetRole);
-          const targetBinding = dropResult?.targetBinding
-            || targetProviderBinding?.terminalBinding
-            || targetThread?.terminalBinding
-            || null;
-          const syncKey = dropResult?.syncKey || getThreadComposerSyncKey(targetThread, {
-            ...targetBinding,
-            paneId: targetBinding?.paneId || paneId,
-          });
-          const threadMessageText = String(dropResult?.threadMessageText || "");
-          const shouldDispatchThreadMessage = Boolean(
-            dropResult?.confirmedSubmit
-              && shouldAutoSubmit
-              && !image
-              && threadMessageText.trim()
-              && targetThread?.id
-              && targetRole
-              && targetRole !== "generic"
-              && targetRole !== "terminal"
-              && targetRole !== "shell"
-              && onThreadTerminalLifecycle,
-          );
-          if (shouldDispatchThreadMessage) {
-            onThreadTerminalLifecycle?.({
-              agentId: targetRole,
-              instanceId: targetBinding?.instanceId || "",
-              messageSource: "tui-todo-drop",
-              paneId,
-              repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
-              slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
-              source: "tui-todo-drop",
-              status: "active",
-              terminalIndex: targetTerminalIndex,
-              expectedUserMessage: dropResult?.terminalText || "",
-              threadId: targetThread.id,
-              type: "message-submitted",
-              userMessage: threadMessageText,
-              workspaceId: targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "",
-              workspaceName: terminalWorkspace?.name || "",
-            });
-            logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_dispatched", {
-              agentId: targetRole,
-              paneId,
-              source: "tui-todo-drop",
-              surface: "tui_terminal_grid",
-              syncKey,
-              submitConfirmed: true,
-              promptId: dropResult?.promptId || "",
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
-              threadId: targetThread.id,
-              threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
-              workspaceId: targetThread?.workspaceId || currentDrag.workspaceId || terminalWorkspace?.id || "",
-            });
-          } else if (shouldAutoSubmit && !image) {
-            logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_skip", {
-              confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
-              hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
-              hasTargetThread: Boolean(targetThread?.id),
-              hasThreadMessageText: Boolean(threadMessageText.trim()),
-              paneId,
-              promptId: dropResult?.promptId || "",
-              reason: !dropResult?.confirmedSubmit
-                ? "submit_not_confirmed"
-                : !threadMessageText.trim()
-                ? "empty_message"
-                : !targetThread?.id
-                  ? "missing_thread"
-                  : !onThreadTerminalLifecycle
-                    ? "missing_lifecycle_handler"
-                    : "unsupported_target_role",
-              source: "tui-todo-drop",
-              surface: "tui_terminal_grid",
-              targetRole,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-            });
-          }
-          if (syncKey && shouldAutoSubmit) {
-            setWorkspaceThreadComposerDraft(syncKey, "");
-          }
-          logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
-            imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
-            hadQueueItem: Boolean(currentDrag.itemId),
-            hasImage: Boolean(image),
-            paneId,
-            shouldAutoSubmit,
-            sharedDraftCleared: Boolean(syncKey && shouldAutoSubmit),
-            syncKey,
-            surface: "tui_terminal_grid",
-            submitConfirmed: Boolean(dropResult?.confirmedSubmit),
-            targetRole,
-            targetTerminalIndex: targetTerminalIndex ?? "",
-            terminalText: getBigViewTextDiagnosticFields(dropResult?.terminalText || ""),
-            threadMessageText: getBigViewTextDiagnosticFields(threadMessageText),
-            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
-          });
-          setTodoDropError("");
-          if (currentDrag.itemId) {
-            clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
-              promptId: dropResult?.promptId || "",
-              submitConfirmed: Boolean(dropResult?.confirmedSubmit),
-              targetRole,
-              targetTerminalIndex: targetTerminalIndex ?? "",
-            });
-            updateTodoQueueItems((currentItems) => (
-              currentItems.filter((item) => item.id !== currentDrag.itemId)
-            ));
-          }
-        })
-        .catch((error) => {
-          if (currentDrag.itemId) {
-            clearTodoQueueItemPending(currentDrag.itemId, "error", {
+          })
+          .catch((error) => {
+            if (currentDrag.itemId) {
+              clearTodoQueueItemPending(currentDrag.itemId, "error", {
+                message: error?.message || String(error || ""),
+                source,
+                targetRole,
+                targetTerminalIndex: targetTerminalIndex ?? "",
+              });
+            }
+            setTodoDropError(getTodoDropErrorMessage(error));
+            logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
+              hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
               message: error?.message || String(error || ""),
+              paneId,
+              shouldAutoSubmit: Boolean(target.shouldAutoSubmit),
+              source,
+              surface: "tui_terminal_grid",
               targetRole,
               targetTerminalIndex: targetTerminalIndex ?? "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
             });
-          }
-          setTodoDropError(getTodoDropErrorMessage(error));
-          logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
-            hasImage: Boolean(image),
-            message: error?.message || String(error || ""),
-            paneId,
-            shouldAutoSubmit,
-            surface: "tui_terminal_grid",
-            targetRole,
-            targetTerminalIndex: targetTerminalIndex ?? "",
-            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          })
+          .finally(() => {
+            if (Number.isInteger(reservedTerminalIndex)) {
+              const reservation = todoQueueTerminalReservationsRef.current.get(reservedTerminalIndex);
+              if (String(reservation?.itemId || "") === reservationItemId) {
+                todoQueueTerminalReservationsRef.current.delete(reservedTerminalIndex);
+              }
+              setTodoQueueDispatchRevision((revision) => revision + 1);
+            }
           });
-        });
+        return;
+      }
     };
 
     const handlePointerMove = (event) => {
@@ -4523,7 +5148,9 @@ function TerminalView({
     getTerminalRole,
     getTerminalPaneId,
     getTerminalThread,
+    getTodoQueueTerminalSendTarget,
     logicalTerminalIndexes,
+    sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     todoDragActive,
@@ -5176,8 +5803,10 @@ function TerminalView({
                         items={todoQueueItems}
                         onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
                         onBeginTodoDrag={handleBeginTodoDrag}
+                        onCancelQueuedItem={cancelQueuedTodoQueueItem}
                         onDraftChange={setTodoQueueDraft}
                         onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+                        onQueueItem={queueTodoQueueItem}
                         onRemoveItem={removeTodoQueueItem}
                         onReorderItem={reorderTodoQueueItem}
                         onSubmitDraft={submitTodoQueueDraft}
