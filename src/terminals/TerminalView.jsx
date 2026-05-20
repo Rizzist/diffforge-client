@@ -20,6 +20,11 @@ import {
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
+import {
+  getAudioInputErrorMessage,
+  readSelectedAudioInputDeviceId,
+  startLowPowerAudioBuffer,
+} from "../audio/audioCapture";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import {
   getBigViewTextDiagnosticFields,
@@ -70,6 +75,465 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   phase: "idle",
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
+const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
+const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
+const ORCHESTRATOR_VOICE_RING_CENTER = 50;
+const ORCHESTRATOR_VOICE_RING_MIN_RADIUS = 35.8;
+const ORCHESTRATOR_VOICE_RING_BASE_RADIUS = 39.2;
+const ORCHESTRATOR_VOICE_RING_MAX_RADIUS = 46.2;
+const ORCHESTRATOR_VOICE_NOISE_CALIBRATION_MS = 700;
+const ORCHESTRATOR_VOICE_NOISE_MARGIN = 0.035;
+const ORCHESTRATOR_VOICE_ENVELOPE_MARGIN = 0.0015;
+const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_START = 0.5;
+const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_SPAN = 0.5;
+const EMPTY_ORCHESTRATOR_VOICE_STATS = {
+  bufferMs: 0,
+  frequencyBands: [],
+  peak: 0,
+  rms: 0,
+  timeDomainSamples: [],
+};
+
+function clampOrchestratorVoiceLevel(value) {
+  const level = Number(value);
+
+  if (!Number.isFinite(level)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, level));
+}
+
+function getOrchestratorVoiceLevel(stats) {
+  const rms = Math.max(0, Number(stats?.rms || 0));
+  const peak = Math.max(0, Number(stats?.peak || 0));
+  const rmsLevel = Math.pow(Math.min(1, rms * 18), 0.74) * 100;
+  const peakLevel = Math.pow(Math.min(1, peak * 2.8), 0.85) * 62;
+
+  return Math.round(clampOrchestratorVoiceLevel(Math.max(rmsLevel, peakLevel)));
+}
+
+function getOrchestratorVoiceFrequencyBand(
+  frequencyBands,
+  pointIndex,
+  pointCount = ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+) {
+  if (!Array.isArray(frequencyBands) || frequencyBands.length === 0) {
+    return null;
+  }
+
+  const bandPosition = (pointIndex / pointCount) * frequencyBands.length;
+  const lowerIndex = Math.floor(bandPosition) % frequencyBands.length;
+  const upperIndex = (lowerIndex + 1) % frequencyBands.length;
+  const mix = bandPosition - Math.floor(bandPosition);
+  const lowerValue = clampOrchestratorVoiceLevel(Number(frequencyBands[lowerIndex] || 0) * 100) / 100;
+  const upperValue = clampOrchestratorVoiceLevel(Number(frequencyBands[upperIndex] || 0) * 100) / 100;
+
+  return lowerValue + ((upperValue - lowerValue) * mix);
+}
+
+function getOrchestratorVoiceWaveformSample(
+  timeDomainSamples,
+  pointIndex,
+  pointCount = ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+) {
+  if (!Array.isArray(timeDomainSamples) || timeDomainSamples.length === 0) {
+    return null;
+  }
+
+  const sourceLength = timeDomainSamples.length;
+  const sourceStart = Math.floor(sourceLength * ORCHESTRATOR_VOICE_SAMPLE_SOURCE_START);
+  const sourceSpan = Math.max(1, Math.floor(sourceLength * ORCHESTRATOR_VOICE_SAMPLE_SOURCE_SPAN));
+  const wrappedPoint = ((pointIndex % pointCount) + pointCount) % pointCount;
+  const samplePosition = (wrappedPoint / pointCount) * sourceSpan;
+  const lowerOffset = Math.floor(samplePosition) % sourceSpan;
+  const upperOffset = (lowerOffset + 1) % sourceSpan;
+  const lowerIndex = (sourceStart + lowerOffset) % sourceLength;
+  const upperIndex = (sourceStart + upperOffset) % sourceLength;
+  const mix = samplePosition - Math.floor(samplePosition);
+  const lowerValue = Math.max(0, Math.min(1, Number(timeDomainSamples[lowerIndex] || 0)));
+  const upperValue = Math.max(0, Math.min(1, Number(timeDomainSamples[upperIndex] || 0)));
+
+  return lowerValue + ((upperValue - lowerValue) * mix);
+}
+
+function getOrchestratorVoiceEnvelopeStats(
+  timeDomainSamples,
+  pointCount = ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+) {
+  if (!Array.isArray(timeDomainSamples) || timeDomainSamples.length === 0) {
+    return {
+      average: 0,
+      maximum: 0,
+      minimum: 0,
+      range: 0,
+    };
+  }
+
+  let maximum = 0;
+  let minimum = 1;
+  let sum = 0;
+
+  for (let index = 0; index < pointCount; index += 1) {
+    const sample = getOrchestratorVoiceWaveformSample(timeDomainSamples, index, pointCount) || 0;
+    maximum = Math.max(maximum, sample);
+    minimum = Math.min(minimum, sample);
+    sum += sample;
+  }
+
+  return {
+    average: sum / pointCount,
+    maximum,
+    minimum,
+    range: maximum - minimum,
+  };
+}
+
+function getOrchestratorVoiceLocalEnvelopeAverage(
+  timeDomainSamples,
+  pointIndex,
+  pointCount = ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+) {
+  if (!Array.isArray(timeDomainSamples) || timeDomainSamples.length === 0) {
+    return 0;
+  }
+
+  const sampleRadius = 12;
+  let weightedSum = 0;
+  let weightSum = 0;
+
+  for (let offset = -sampleRadius; offset <= sampleRadius; offset += 1) {
+    const sample = getOrchestratorVoiceWaveformSample(
+      timeDomainSamples,
+      (pointIndex + offset + pointCount) % pointCount,
+      pointCount,
+    );
+    const weight = sampleRadius + 1 - Math.abs(offset);
+
+    weightedSum += (sample || 0) * weight;
+    weightSum += weight;
+  }
+
+  return weightSum > 0 ? weightedSum / weightSum : 0;
+}
+
+function getOrchestratorVoiceRingPoint(radius, angle) {
+  return {
+    x: ORCHESTRATOR_VOICE_RING_CENTER + Math.cos(angle) * radius,
+    y: ORCHESTRATOR_VOICE_RING_CENTER + Math.sin(angle) * radius,
+  };
+}
+
+function getOrchestratorVoiceCircularValue(values, index) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return 0;
+  }
+
+  return values[((index % values.length) + values.length) % values.length] || 0;
+}
+
+function getOrchestratorVoiceSmoothedEnvelopeValue(values, index) {
+  return (
+    (getOrchestratorVoiceCircularValue(values, index) * 0.34)
+    + (getOrchestratorVoiceCircularValue(values, index - 1) * 0.19)
+    + (getOrchestratorVoiceCircularValue(values, index + 1) * 0.19)
+    + (getOrchestratorVoiceCircularValue(values, index - 2) * 0.1)
+    + (getOrchestratorVoiceCircularValue(values, index + 2) * 0.1)
+    + (getOrchestratorVoiceCircularValue(values, index - 3) * 0.04)
+    + (getOrchestratorVoiceCircularValue(values, index + 3) * 0.04)
+  );
+}
+
+function getOrchestratorVoiceBandAboveFloor(
+  frequencyBands,
+  noiseFloorBands,
+  pointIndex,
+  pointCount = ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+) {
+  const rawEnergy = getOrchestratorVoiceFrequencyBand(frequencyBands, pointIndex, pointCount);
+  const floorEnergy = getOrchestratorVoiceFrequencyBand(noiseFloorBands, pointIndex, pointCount) || 0;
+
+  if (rawEnergy === null) {
+    return null;
+  }
+
+  return Math.max(0, rawEnergy - floorEnergy - ORCHESTRATOR_VOICE_NOISE_MARGIN);
+}
+
+function getOrchestratorVoiceWaveformTarget(
+  index,
+  level,
+  active,
+  timeDomainSamples = [],
+  envelopeStats = {},
+  frequencyBands = [],
+  noiseFloorBands = [],
+  animationPhase = 0,
+) {
+  const normalizedLevel = active ? clampOrchestratorVoiceLevel(level) / 100 : 0;
+  const activityGate = active
+    ? Math.max(0, Math.min(1, (normalizedLevel - 0.035) / 0.58))
+    : 0;
+  const pointAngle = (-Math.PI / 2)
+    + ((index / ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT) * Math.PI * 2);
+  const waveformSample = getOrchestratorVoiceWaveformSample(
+    timeDomainSamples,
+    index,
+    ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+  );
+  const fallbackSample = Math.max(
+    0,
+    (
+      Math.sin(pointAngle * 2.8 + animationPhase * 1.2)
+      + (Math.cos(pointAngle * 5.2 - animationPhase * 0.7) * 0.44)
+    ) * 0.003,
+  );
+  const envelopeSample = waveformSample ?? fallbackSample;
+  const localAverage = getOrchestratorVoiceLocalEnvelopeAverage(
+    timeDomainSamples,
+    index,
+    ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+  );
+  const frameAverage = Math.max(0, Number(envelopeStats.average || 0));
+  const dynamicRange = Math.max(
+    Number(envelopeStats.range || 0),
+    frameAverage * 0.28,
+    0.003,
+  );
+  const localContrast = Math.max(
+    0,
+    envelopeSample - localAverage - ORCHESTRATOR_VOICE_ENVELOPE_MARGIN,
+  );
+  const frameContrast = Math.max(
+    0,
+    envelopeSample - frameAverage - ORCHESTRATOR_VOICE_ENVELOPE_MARGIN,
+  );
+  const contrastSample = Math.max(localContrast * 1.45, frameContrast * 0.9);
+  const envelopeLift = Math.tanh((contrastSample / dynamicRange) * (2.2 + (normalizedLevel * 2.6)));
+  const frequencyEnergy = getOrchestratorVoiceBandAboveFloor(
+    frequencyBands,
+    noiseFloorBands,
+    index,
+    ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+  );
+  const previousEnergy = getOrchestratorVoiceBandAboveFloor(
+    frequencyBands,
+    noiseFloorBands,
+    (index - 1 + ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT) % ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+    ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+  ) || 0;
+  const nextEnergy = getOrchestratorVoiceBandAboveFloor(
+    frequencyBands,
+    noiseFloorBands,
+    (index + 1) % ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+    ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT,
+  ) || 0;
+  const bandEnergy = frequencyEnergy ?? 0;
+  const neighborAverage = (previousEnergy + nextEnergy) / 2;
+  const localPeak = Math.max(0, bandEnergy - (neighborAverage * 0.72));
+  const localLift = Math.min(0.1, Math.pow(localPeak * 7, 0.76) * 0.08);
+  const idleDrift = active
+    ? Math.max(0, Math.sin(pointAngle * 3 + animationPhase * 0.85) * 0.012)
+    : 0;
+
+  return active
+    ? Math.max(0, Math.min(1, (envelopeLift * activityGate) + localLift + idleDrift))
+    : 0;
+}
+
+function drawOrchestratorVoiceSmoothPath(context, points) {
+  if (!points.length) {
+    return;
+  }
+
+  const count = points.length;
+  context.moveTo(points[0].x, points[0].y);
+
+  for (let index = 0; index < count; index += 1) {
+    const previous = points[(index - 1 + count) % count];
+    const current = points[index];
+    const next = points[(index + 1) % count];
+    const afterNext = points[(index + 2) % count];
+    const controlOne = {
+      x: current.x + ((next.x - previous.x) / 6),
+      y: current.y + ((next.y - previous.y) / 6),
+    };
+    const controlTwo = {
+      x: next.x - ((afterNext.x - current.x) / 6),
+      y: next.y - ((afterNext.y - current.y) / 6),
+    };
+
+    context.bezierCurveTo(controlOne.x, controlOne.y, controlTwo.x, controlTwo.y, next.x, next.y);
+  }
+
+  context.closePath();
+}
+
+function getForgeThemeMode() {
+  if (typeof document === "undefined") {
+    return "dark";
+  }
+
+  return document.documentElement?.dataset?.forgeTheme === "light" ? "light" : "dark";
+}
+
+function drawOrchestratorVoiceDotField(context, themeMode, alpha, phase) {
+  const dotColor = themeMode === "light"
+    ? "rgba(0, 102, 204, 0.24)"
+    : "rgba(155, 213, 255, 0.26)";
+  const warmDotColor = themeMode === "light"
+    ? "rgba(221, 112, 31, 0.2)"
+    : "rgba(240, 140, 69, 0.22)";
+  const rings = [
+    { count: 22, radius: 35.4, size: 0.42, speed: -0.09 },
+    { count: 30, radius: 42.4, size: 0.5, speed: 0.07 },
+    { count: 38, radius: 46.1, size: 0.44, speed: -0.045 },
+  ];
+
+  context.save();
+  context.globalAlpha = alpha;
+
+  rings.forEach((ring, ringIndex) => {
+    for (let index = 0; index < ring.count; index += 1) {
+      const angle = ((Math.PI * 2 * index) / ring.count) + (phase * ring.speed);
+      const pulse = 0.66 + (Math.sin((phase * 1.8) + index * 0.72 + ringIndex) * 0.34);
+      const point = getOrchestratorVoiceRingPoint(ring.radius, angle);
+
+      context.beginPath();
+      context.arc(point.x, point.y, ring.size * (0.75 + (pulse * 0.38)), 0, Math.PI * 2);
+      context.fillStyle = index % 5 === 0 ? warmDotColor : dotColor;
+      context.fill();
+    }
+  });
+
+  context.restore();
+}
+
+function drawOrchestratorVoiceCanvasRing(context, waveform, options = {}) {
+  const active = Boolean(options.active);
+  const themeMode = options.themeMode === "light" ? "light" : "dark";
+  const breath = active ? Math.min(1, Math.max(0, Number(options.breath || 0))) : 0;
+  const phase = Number(options.phase || 0);
+  const maxAmplitude = waveform.reduce(
+    (maximum, value) => Math.max(maximum, Math.abs(Number(value || 0))),
+    0,
+  );
+  const baseRadius = ORCHESTRATOR_VOICE_RING_BASE_RADIUS + (breath * 0.9);
+  const waveLift = (ORCHESTRATOR_VOICE_RING_MAX_RADIUS - baseRadius) - 0.2;
+  const waveformPoints = waveform.map((value, index) => {
+    const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT);
+    const connectedValue = getOrchestratorVoiceSmoothedEnvelopeValue(waveform, index);
+    const shapedValue = Math.pow(Math.max(0, Math.min(1, Number(connectedValue || value || 0))), 0.78);
+    const radius = Math.max(
+      ORCHESTRATOR_VOICE_RING_MIN_RADIUS,
+      Math.min(
+        ORCHESTRATOR_VOICE_RING_MAX_RADIUS,
+        baseRadius + (shapedValue * waveLift) + (breath * 0.32),
+      ),
+    );
+
+    return getOrchestratorVoiceRingPoint(radius, angle);
+  });
+  const visibleAlpha = active || maxAmplitude > 0.01
+    ? Math.min(1, 0.32 + (breath * 0.16) + (maxAmplitude * 0.48))
+    : 0;
+  const baseStroke = themeMode === "light"
+    ? "rgba(0, 102, 204, 0.22)"
+    : "rgba(125, 176, 255, 0.2)";
+  const centerStroke = themeMode === "light"
+    ? "rgba(24, 34, 48, 0.08)"
+    : "rgba(230, 236, 245, 0.08)";
+  const glow = themeMode === "light"
+    ? "rgba(0, 102, 204, 0.3)"
+    : "rgba(125, 176, 255, 0.34)";
+  const strokeGradient = context.createLinearGradient(18, 10, 82, 90);
+  const glowGradient = context.createLinearGradient(14, 16, 88, 84);
+
+  if (themeMode === "light") {
+    strokeGradient.addColorStop(0, "#005fb8");
+    strokeGradient.addColorStop(0.54, "#1a8cff");
+    strokeGradient.addColorStop(1, "#d8681b");
+    glowGradient.addColorStop(0, "rgba(0, 102, 204, 0.14)");
+    glowGradient.addColorStop(0.56, "rgba(26, 140, 255, 0.22)");
+    glowGradient.addColorStop(1, "rgba(221, 112, 31, 0.22)");
+  } else {
+    strokeGradient.addColorStop(0, "#9edbff");
+    strokeGradient.addColorStop(0.46, "#4aa3ff");
+    strokeGradient.addColorStop(1, "#f08c45");
+    glowGradient.addColorStop(0, "rgba(158, 219, 255, 0.18)");
+    glowGradient.addColorStop(0.48, "rgba(74, 163, 255, 0.28)");
+    glowGradient.addColorStop(1, "rgba(240, 140, 69, 0.26)");
+  }
+
+  context.clearRect(0, 0, 100, 100);
+
+  if (visibleAlpha <= 0.01) {
+    return;
+  }
+
+  context.save();
+  context.globalAlpha = visibleAlpha;
+
+  drawOrchestratorVoiceDotField(context, themeMode, Math.min(0.42, 0.16 + (breath * 0.16)), phase);
+
+  context.beginPath();
+  context.arc(
+    ORCHESTRATOR_VOICE_RING_CENTER,
+    ORCHESTRATOR_VOICE_RING_CENTER,
+    baseRadius,
+    0,
+    Math.PI * 2,
+  );
+  context.strokeStyle = baseStroke;
+  context.lineWidth = 1.25;
+  context.stroke();
+
+  context.beginPath();
+  context.arc(
+    ORCHESTRATOR_VOICE_RING_CENTER,
+    ORCHESTRATOR_VOICE_RING_CENTER,
+    ORCHESTRATOR_VOICE_RING_MIN_RADIUS,
+    0,
+    Math.PI * 2,
+  );
+  context.strokeStyle = centerStroke;
+  context.lineWidth = 0.9;
+  context.stroke();
+
+  context.save();
+  context.globalAlpha *= 0.68;
+  context.shadowBlur = 14;
+  context.shadowColor = glow;
+  context.beginPath();
+  drawOrchestratorVoiceSmoothPath(context, waveformPoints);
+  context.strokeStyle = glowGradient;
+  context.lineWidth = 7.2;
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.stroke();
+  context.restore();
+
+  context.save();
+  context.globalAlpha *= 0.74;
+  context.beginPath();
+  drawOrchestratorVoiceSmoothPath(context, waveformPoints);
+  context.strokeStyle = themeMode === "light"
+    ? "rgba(255, 255, 255, 0.56)"
+    : "rgba(255, 255, 255, 0.24)";
+  context.lineWidth = 4.6;
+  context.stroke();
+  context.restore();
+
+  context.beginPath();
+  drawOrchestratorVoiceSmoothPath(context, waveformPoints);
+  context.strokeStyle = strokeGradient;
+  context.lineWidth = 2.55;
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.stroke();
+
+  context.restore();
+}
 
 const TerminalWorkspaceMain = styled.div`
   width: 100%;
@@ -277,7 +741,7 @@ const OrchestratorView = styled.div`
 
 const OrchestratorVoiceArea = styled.div`
   display: grid;
-  min-height: 116px;
+  min-height: 128px;
   place-items: center;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background:
@@ -293,6 +757,7 @@ const OrchestratorVoiceArea = styled.div`
 const OrchestratorVoiceButton = styled.button`
   display: grid;
   position: relative;
+  isolation: isolate;
   box-sizing: border-box;
   width: 58px;
   height: 58px;
@@ -305,13 +770,36 @@ const OrchestratorVoiceButton = styled.button`
   cursor: pointer;
   line-height: 0;
   outline: none;
-  overflow: hidden;
+  overflow: visible;
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease,
     transform 150ms ease;
   appearance: none;
   -webkit-appearance: none;
+
+  &::before {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    border-radius: inherit;
+    background:
+      radial-gradient(circle, rgba(125, 176, 255, 0.2), transparent 62%),
+      radial-gradient(circle, rgba(217, 121, 53, 0.1), transparent 76%);
+    content: "";
+    opacity: 0;
+    transform: scale(0.92);
+    transition:
+      opacity 160ms ease,
+      transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    pointer-events: none;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background:
+      radial-gradient(circle, rgba(0, 102, 204, 0.15), transparent 62%),
+      radial-gradient(circle, rgba(221, 112, 31, 0.09), transparent 76%);
+  }
 
   &:hover {
     border-color: rgba(138, 216, 255, 0.26);
@@ -320,6 +808,29 @@ const OrchestratorVoiceButton = styled.button`
 
   &:active {
     transform: scale(0.98);
+  }
+
+  &[data-monitoring="true"] {
+    border-color: rgba(138, 216, 255, 0.34);
+    box-shadow:
+      0 0 0 4px rgba(125, 176, 255, 0.13),
+      0 0 0 1px rgba(138, 216, 255, 0.14) inset;
+  }
+
+  &[data-monitoring="true"]::before {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  &[data-starting="true"] {
+    cursor: progress;
+  }
+
+  &[data-error="true"] {
+    border-color: rgba(239, 68, 68, 0.52);
+    box-shadow:
+      0 0 0 4px rgba(239, 68, 68, 0.1),
+      0 0 24px rgba(239, 68, 68, 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -331,6 +842,34 @@ const OrchestratorVoiceButton = styled.button`
   html[data-forge-theme="light"] &:hover {
     border-color: rgba(255, 255, 255, 0.22);
     box-shadow: 0 0 0 4px rgba(0, 102, 204, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-monitoring="true"] {
+    border-color: rgba(255, 255, 255, 0.36);
+    box-shadow:
+      0 0 0 4px rgba(0, 102, 204, 0.11),
+      0 0 0 1px rgba(0, 102, 204, 0.12) inset;
+  }
+`;
+
+const OrchestratorVoiceCanvasSurface = styled.canvas`
+  position: absolute;
+  inset: -22px;
+  z-index: 3;
+  display: block;
+  width: calc(100% + 44px);
+  height: calc(100% + 44px);
+  border-radius: inherit;
+  opacity: 0;
+  transform: scale(0.985);
+  transition:
+    opacity 150ms ease,
+    transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  pointer-events: none;
+
+  &[data-active="true"] {
+    opacity: 1;
+    transform: scale(1);
   }
 `;
 
@@ -347,7 +886,7 @@ const OrchestratorVoiceLogo = styled.img.attrs({
   object-fit: cover;
   object-position: center;
   position: relative;
-  z-index: 1;
+  z-index: 2;
   user-select: none;
   -webkit-user-drag: none;
 `;
@@ -1715,6 +2254,176 @@ function writeTodoQueueItems(storageKey, items) {
   }
 }
 
+function OrchestratorVoiceCanvasRing({
+  active = false,
+  hasSignal = false,
+  level = 0,
+  stats = EMPTY_ORCHESTRATOR_VOICE_STATS,
+}) {
+  const canvasRef = useRef(null);
+  const animationFrameRef = useRef(0);
+  const currentWaveformRef = useRef(Array.from({ length: ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT }, () => 0));
+  const smoothedEnvelopeRef = useRef(Array.from({ length: ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT }, () => 0));
+  const noiseFloorBandsRef = useRef([]);
+  const noiseCalibrationUntilRef = useRef(0);
+  const lastActiveRef = useRef(false);
+  const breathRef = useRef(0);
+  const renderStateRef = useRef({
+    active,
+    frequencyBands: Array.isArray(stats?.frequencyBands) ? stats.frequencyBands : [],
+    level,
+    timeDomainSamples: Array.isArray(stats?.timeDomainSamples) ? stats.timeDomainSamples : [],
+  });
+
+  useEffect(() => {
+    renderStateRef.current = {
+      active,
+      frequencyBands: Array.isArray(stats?.frequencyBands) ? stats.frequencyBands : [],
+      level,
+      timeDomainSamples: Array.isArray(stats?.timeDomainSamples) ? stats.timeDomainSamples : [],
+    };
+  }, [active, level, stats]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const renderFrame = (timestamp) => {
+      if (disposed) {
+        return;
+      }
+
+      const canvas = canvasRef.current;
+      const context = canvas?.getContext?.("2d");
+
+      if (canvas && context) {
+        const rect = canvas.getBoundingClientRect();
+        const width = Math.max(1, rect.width || 0);
+        const height = Math.max(1, rect.height || 0);
+        const pixelRatio = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+        const nextWidth = Math.round(width * pixelRatio);
+        const nextHeight = Math.round(height * pixelRatio);
+
+        if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+          canvas.width = nextWidth;
+          canvas.height = nextHeight;
+        }
+
+        context.setTransform(
+          (pixelRatio * width) / 100,
+          0,
+          0,
+          (pixelRatio * height) / 100,
+          0,
+          0,
+        );
+
+        const frameState = renderStateRef.current;
+        const currentWaveform = currentWaveformRef.current;
+        const smoothedEnvelope = smoothedEnvelopeRef.current;
+        const animationPhase = timestamp / 360;
+        const frequencyBands = Array.isArray(frameState.frequencyBands)
+          ? frameState.frequencyBands.map((value) => Math.max(0, Math.min(1, Number(value || 0))))
+          : [];
+        const timeDomainSamples = Array.isArray(frameState.timeDomainSamples)
+          ? frameState.timeDomainSamples.map((value) => Math.max(0, Math.min(1, Number(value || 0))))
+          : [];
+        const envelopeStats = getOrchestratorVoiceEnvelopeStats(timeDomainSamples);
+
+        if (frameState.active && !lastActiveRef.current) {
+          noiseFloorBandsRef.current = frequencyBands.map((value) => Math.min(0.2, value * 0.82));
+          noiseCalibrationUntilRef.current = timestamp + ORCHESTRATOR_VOICE_NOISE_CALIBRATION_MS;
+          currentWaveform.fill(0);
+          smoothedEnvelope.fill(0);
+          breathRef.current = 0;
+        } else if (!frameState.active && lastActiveRef.current) {
+          noiseCalibrationUntilRef.current = 0;
+        }
+
+        lastActiveRef.current = frameState.active;
+
+        if (frameState.active && frequencyBands.length) {
+          if (noiseFloorBandsRef.current.length !== frequencyBands.length) {
+            noiseFloorBandsRef.current = frequencyBands.map((value) => Math.min(0.2, value * 0.82));
+          } else {
+            noiseFloorBandsRef.current = noiseFloorBandsRef.current.map((floorValue, index) => {
+              const bandValue = frequencyBands[index] || 0;
+              if (timestamp < noiseCalibrationUntilRef.current) {
+                return Math.min(0.2, (floorValue * 0.72) + (bandValue * 0.28));
+              }
+
+              if (bandValue < floorValue + 0.015) {
+                return Math.max(0, (floorValue * 0.92) + (bandValue * 0.08));
+              }
+
+              return Math.min(0.24, (floorValue * 0.997) + (bandValue * 0.003));
+            });
+          }
+        }
+
+        const breathTarget = frameState.active
+          ? Math.max(0, Math.min(1, ((frameState.level / 100) - 0.12) * 0.36))
+          : 0;
+        const breathSmoothing = breathTarget > breathRef.current ? 0.14 : 0.055;
+        breathRef.current += (breathTarget - breathRef.current) * breathSmoothing;
+
+        for (let index = 0; index < ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT; index += 1) {
+          const target = getOrchestratorVoiceWaveformTarget(
+            index,
+            frameState.level,
+            frameState.active,
+            timeDomainSamples,
+            envelopeStats,
+            frequencyBands,
+            noiseFloorBandsRef.current,
+            animationPhase,
+          );
+          const current = smoothedEnvelope[index] || 0;
+          const smoothing = target > current ? 0.5 : 0.13;
+          const next = current + ((target - current) * smoothing);
+
+          smoothedEnvelope[index] = Math.abs(next) < 0.0005 ? 0 : next;
+        }
+
+        for (let index = 0; index < ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT; index += 1) {
+          const spatialTarget = getOrchestratorVoiceSmoothedEnvelopeValue(smoothedEnvelope, index);
+          const output = currentWaveform[index] || 0;
+          const smoothing = frameState.active ? 0.46 : 0.18;
+          const rendered = output + ((spatialTarget - output) * smoothing);
+
+          currentWaveform[index] = Math.abs(rendered) < 0.0005 ? 0 : rendered;
+        }
+
+        drawOrchestratorVoiceCanvasRing(context, currentWaveform, {
+          active: frameState.active,
+          breath: breathRef.current,
+          phase: timestamp / 1000,
+          themeMode: getForgeThemeMode(),
+        });
+      }
+
+      animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+    };
+
+    animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+
+    return () => {
+      disposed = true;
+      if (animationFrameRef.current) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <OrchestratorVoiceCanvasSurface
+      aria-hidden="true"
+      data-active={active ? "true" : "false"}
+      data-signal={hasSignal ? "live" : "quiet"}
+      ref={canvasRef}
+    />
+  );
+}
+
 const TodoQueuePanel = memo(function TodoQueuePanel({
   activeDragItemId = "",
   defaultWorkingDirectory = "",
@@ -1739,8 +2448,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
   const [editingItemId, setEditingItemId] = useState("");
   const [editingDraft, setEditingDraft] = useState("");
+  const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
+  const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
+  const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
   const [reorderingItemId, setReorderingItemId] = useState("");
   const [todoListOffset, setTodoListOffset] = useState(0);
+  const orchestratorVoiceMonitorRef = useRef(null);
+  const orchestratorVoiceRunRef = useRef(0);
   const todoBoardRef = useRef(null);
   const todoItemElementsRef = useRef(new Map());
   const todoReorderDragRef = useRef(null);
@@ -1748,6 +2462,68 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const editingTextAreaRef = useRef(null);
   const todoListRef = useRef(null);
   const skipEditBlurCommitRef = useRef(false);
+
+  const stopOrchestratorVoiceMonitor = useCallback(async () => {
+    orchestratorVoiceRunRef.current += 1;
+    const monitor = orchestratorVoiceMonitorRef.current;
+    orchestratorVoiceMonitorRef.current = null;
+    setOrchestratorVoiceState("idle");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    await monitor?.close?.().catch(() => {});
+  }, []);
+
+  const startOrchestratorVoiceMonitor = useCallback(async () => {
+    const runId = orchestratorVoiceRunRef.current + 1;
+    orchestratorVoiceRunRef.current = runId;
+    setOrchestratorVoiceState("starting");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+
+    try {
+      const monitor = await startLowPowerAudioBuffer({
+        deviceId: readSelectedAudioInputDeviceId(),
+        owner: ORCHESTRATOR_VOICE_OWNER,
+        onStats: (stats) => {
+          if (orchestratorVoiceRunRef.current === runId) {
+            setOrchestratorVoiceStats({
+              ...EMPTY_ORCHESTRATOR_VOICE_STATS,
+              ...(stats || {}),
+            });
+          }
+        },
+      });
+
+      if (orchestratorVoiceRunRef.current !== runId) {
+        await monitor.close().catch(() => {});
+        return;
+      }
+
+      orchestratorVoiceMonitorRef.current = monitor;
+      setOrchestratorVoiceState("listening");
+    } catch (error) {
+      if (orchestratorVoiceRunRef.current !== runId) {
+        return;
+      }
+
+      orchestratorVoiceMonitorRef.current = null;
+      setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+      setOrchestratorVoiceState("error");
+      setOrchestratorVoiceError(getAudioInputErrorMessage(
+        error,
+        "Unable to open the selected input source.",
+      ));
+    }
+  }, []);
+
+  const toggleOrchestratorVoiceMonitor = useCallback(() => {
+    if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
+      void stopOrchestratorVoiceMonitor();
+      return;
+    }
+
+    void startOrchestratorVoiceMonitor();
+  }, [orchestratorVoiceState, startOrchestratorVoiceMonitor, stopOrchestratorVoiceMonitor]);
 
   const handleDraftKeyDown = useCallback((event) => {
     if (event.key !== "Enter" || event.shiftKey) {
@@ -1994,6 +2770,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [activeOrchestratorSection, items.length]);
 
   useEffect(() => {
+    if (activeWorkspaceTool !== "orchestrator") {
+      void stopOrchestratorVoiceMonitor();
+    }
+  }, [activeWorkspaceTool, stopOrchestratorVoiceMonitor]);
+
+  useEffect(() => () => {
+    orchestratorVoiceRunRef.current += 1;
+    const monitor = orchestratorVoiceMonitorRef.current;
+    orchestratorVoiceMonitorRef.current = null;
+    monitor?.close?.().catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const drag = todoReorderDragRef.current;
     if (!reorderingItemId || !drag) {
       return undefined;
@@ -2052,6 +2841,24 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     };
   }, [items, onReorderItem, reorderingItemId]);
 
+  const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
+  const orchestratorVoiceActive = orchestratorVoiceState === "starting"
+    || orchestratorVoiceState === "listening";
+  const orchestratorVoiceHasSignal = orchestratorVoiceActive && orchestratorVoiceLevel >= 6;
+  const orchestratorVoiceButtonLabel = orchestratorVoiceState === "starting"
+    ? "Starting voice agent monitor"
+    : orchestratorVoiceState === "listening"
+      ? "Stop voice agent monitor"
+      : orchestratorVoiceError
+        ? "Restart voice agent monitor"
+        : "Start voice agent monitor";
+  const orchestratorVoiceButtonTitle = orchestratorVoiceError
+    || (orchestratorVoiceState === "starting"
+      ? "Starting input"
+      : orchestratorVoiceState === "listening"
+        ? "Stop listening"
+        : "Start listening");
+
   return (
     <TodoQueueSurface aria-label="Orchestrator">
       <OrchestratorTopNav aria-label="Workspace tool">
@@ -2088,7 +2895,21 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       ) : (
         <OrchestratorView>
           <OrchestratorVoiceArea>
-            <OrchestratorVoiceButton aria-label="Voice agent" type="button">
+            <OrchestratorVoiceButton
+              aria-label={orchestratorVoiceButtonLabel}
+              data-error={orchestratorVoiceError ? "true" : undefined}
+              data-monitoring={orchestratorVoiceActive ? "true" : undefined}
+              data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
+              onClick={toggleOrchestratorVoiceMonitor}
+              title={orchestratorVoiceButtonTitle}
+              type="button"
+            >
+              <OrchestratorVoiceCanvasRing
+                active={orchestratorVoiceActive}
+                hasSignal={orchestratorVoiceHasSignal}
+                level={orchestratorVoiceLevel}
+                stats={orchestratorVoiceStats}
+              />
               <OrchestratorVoiceLogo />
             </OrchestratorVoiceButton>
           </OrchestratorVoiceArea>

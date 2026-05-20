@@ -12,7 +12,6 @@ const DEFAULT_ROWS = 24;
 const DEFAULT_DEBOUNCE_MS = 0;
 const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 260;
 const DEFAULT_NATIVE_RESIZE_COMMIT_MS = 260;
-const DEFAULT_WEBGL_ATLAS_CLEAR_AFTER_RESIZE_MS = 120;
 const MAX_INVALID_CELL_RETRIES = 30;
 const RESIZE_DIAGNOSTIC_SLOW_MS = 16;
 
@@ -269,7 +268,6 @@ export function createTerminalResizeController({
   debounceMs = DEFAULT_DEBOUNCE_MS,
   defaultCols = DEFAULT_COLS,
   defaultRows = DEFAULT_ROWS,
-  getWebglAddon,
   instanceId,
   maxCols = DEFAULT_MAX_COLS,
   maxRows = DEFAULT_MAX_ROWS,
@@ -284,7 +282,6 @@ export function createTerminalResizeController({
   onStart,
   paneId,
   term,
-  webglAtlasClearAfterResizeMs = DEFAULT_WEBGL_ATLAS_CLEAR_AFTER_RESIZE_MS,
 } = {}) {
   if (!container || !term || typeof ResizeObserver !== "function") {
     return null;
@@ -333,37 +330,10 @@ export function createTerminalResizeController({
     webglAtlasClearTimer = 0;
   };
 
-  const clearWebglAtlasNow = (fields = {}) => {
-    const webglAddon = typeof getWebglAddon === "function" ? getWebglAddon() : null;
-    const clearTextureAtlas = webglAddon?.clearTextureAtlas;
-    if (typeof clearTextureAtlas !== "function") {
-      return false;
-    }
+  const clearWebglAtlasNow = () => false;
 
-    const atlasStartedAt = nowMs();
-    try {
-      clearTextureAtlas.call(webglAddon);
-    } catch {
-      return false;
-    }
-
-    logTerminalDiagnosticDuration(
-      "frontend.resize_webgl_atlas_clear.slow",
-      atlasStartedAt,
-      fields,
-      { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
-    );
-    return true;
-  };
-
-  const scheduleWebglAtlasClear = (fields = {}) => {
+  const scheduleWebglAtlasClear = () => {
     clearWebglAtlasClearTimer();
-
-    const delayMs = Math.max(0, Number(webglAtlasClearAfterResizeMs || 0));
-    webglAtlasClearTimer = window.setTimeout(() => {
-      webglAtlasClearTimer = 0;
-      clearWebglAtlasNow(fields);
-    }, delayMs);
   };
 
   const getNativeResizeDelayMs = (delayMs, force = false) => {

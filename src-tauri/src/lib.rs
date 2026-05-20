@@ -196,7 +196,15 @@ const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_BUFFER_MAX_SECONDS: f64 = 3.0;
 const AUDIO_CAPTURE_MAX_SECONDS: f64 = 90.0;
 const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
-const AUDIO_STATS_INTERVAL_MS: u64 = 140;
+const AUDIO_STATS_INTERVAL_MS: u64 = 60;
+const AUDIO_INPUT_FREQUENCY_BAND_COUNT: usize = 24;
+const AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES: usize = 2048;
+const AUDIO_INPUT_FREQUENCY_MIN_HZ: f32 = 90.0;
+const AUDIO_INPUT_FREQUENCY_MAX_HZ: f32 = 4200.0;
+const AUDIO_INPUT_FREQUENCY_MIN_DB: f32 = -78.0;
+const AUDIO_INPUT_FREQUENCY_MAX_DB: f32 = -24.0;
+const AUDIO_INPUT_WAVEFORM_WINDOW_SAMPLES: usize = 768;
+const AUDIO_INPUT_WAVEFORM_SAMPLE_COUNT: usize = 256;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
     OnceLock::new();
@@ -1127,6 +1135,8 @@ struct AudioInputStats {
     rms: f32,
     peak: f32,
     buffer_ms: u64,
+    frequency_bands: Vec<f32>,
+    time_domain_samples: Vec<f32>,
 }
 
 #[derive(Serialize)]

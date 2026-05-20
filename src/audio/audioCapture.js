@@ -23,8 +23,10 @@ export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-resul
 const MAX_AUDIO_TRANSCRIPTION_HISTORY_ITEMS = 500;
 const EMPTY_CAPTURE_STATS = {
   bufferMs: 0,
+  frequencyBands: [],
   peak: 0,
   rms: 0,
+  timeDomainSamples: [],
 };
 
 function canUseStorage() {

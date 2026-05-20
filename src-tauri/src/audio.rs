@@ -505,6 +505,140 @@ fn native_audio_stats(samples: &[f32]) -> (f32, f32) {
     ((sum_squares / samples.len().max(1) as f32).sqrt(), peak)
 }
 
+fn recent_native_audio_samples(chunks: &VecDeque<NativeAudioChunk>, max_samples: usize) -> Vec<f32> {
+    if max_samples == 0 {
+        return Vec::new();
+    }
+
+    let mut samples = Vec::with_capacity(max_samples);
+
+    for chunk in chunks.iter().rev() {
+        for sample in chunk.samples.iter().rev() {
+            samples.push(*sample);
+            if samples.len() >= max_samples {
+                samples.reverse();
+                return samples;
+            }
+        }
+    }
+
+    samples.reverse();
+    samples
+}
+
+fn native_audio_speech_weight(frequency_hz: f32) -> f32 {
+    if frequency_hz < 120.0 {
+        0.42
+    } else if frequency_hz < 250.0 {
+        0.66
+    } else if frequency_hz < 600.0 {
+        0.88
+    } else if frequency_hz < 2800.0 {
+        1.0
+    } else if frequency_hz < 4200.0 {
+        0.76
+    } else {
+        0.48
+    }
+}
+
+fn native_audio_frequency_bands(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.len() < 16 || sample_rate == 0 || AUDIO_INPUT_FREQUENCY_BAND_COUNT == 0 {
+        return vec![0.0; AUDIO_INPUT_FREQUENCY_BAND_COUNT];
+    }
+
+    let sample_count = samples.len();
+    let sample_rate = sample_rate as f32;
+    let min_hz = AUDIO_INPUT_FREQUENCY_MIN_HZ.max(1.0);
+    let max_hz = AUDIO_INPUT_FREQUENCY_MAX_HZ.min(sample_rate * 0.45).max(min_hz);
+    let log_min = min_hz.ln();
+    let log_max = max_hz.ln();
+    let (rms, peak) = native_audio_stats(samples);
+    let level_gate = ((rms * 18.0) + (peak * 0.34)).clamp(0.0, 1.0);
+    let mut bands = Vec::with_capacity(AUDIO_INPUT_FREQUENCY_BAND_COUNT);
+
+    for band_index in 0..AUDIO_INPUT_FREQUENCY_BAND_COUNT {
+        let band_t = if AUDIO_INPUT_FREQUENCY_BAND_COUNT <= 1 {
+            0.0
+        } else {
+            band_index as f32 / (AUDIO_INPUT_FREQUENCY_BAND_COUNT - 1) as f32
+        };
+        let frequency_hz = (log_min + (log_max - log_min) * band_t).exp();
+        let phase_step = (std::f32::consts::TAU * frequency_hz) / sample_rate;
+        let mut real = 0.0f32;
+        let mut imaginary = 0.0f32;
+
+        for (sample_index, sample) in samples.iter().enumerate() {
+            let window = if sample_count <= 1 {
+                1.0
+            } else {
+                0.5 - 0.5 * ((std::f32::consts::TAU * sample_index as f32) / (sample_count - 1) as f32).cos()
+            };
+            let phase = phase_step * sample_index as f32;
+            let weighted = sample * window;
+            real += weighted * phase.cos();
+            imaginary -= weighted * phase.sin();
+        }
+
+        let magnitude = ((real * real + imaginary * imaginary).sqrt() / sample_count as f32).max(0.0);
+        let magnitude_db = 20.0 * (magnitude + 1.0e-9).log10();
+        let normalized = ((magnitude_db - AUDIO_INPUT_FREQUENCY_MIN_DB)
+            / (AUDIO_INPUT_FREQUENCY_MAX_DB - AUDIO_INPUT_FREQUENCY_MIN_DB))
+            .clamp(0.0, 1.0);
+        let speech_weight = native_audio_speech_weight(frequency_hz);
+        bands.push((normalized * speech_weight * (0.38 + (level_gate * 0.62))).clamp(0.0, 1.0));
+    }
+
+    bands
+}
+
+fn native_audio_envelope_samples(samples: &[f32], sample_count: usize, sample_rate: u32) -> Vec<f32> {
+    if sample_count == 0 {
+        return Vec::new();
+    }
+
+    if samples.is_empty() {
+        return vec![0.0; sample_count];
+    }
+
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+
+    if sample_count == 1 || samples.len() == 1 {
+        return vec![(samples[0] - mean).abs().clamp(0.0, 1.0)];
+    }
+
+    let source_span = (samples.len() - 1) as f32;
+    let target_span = (sample_count - 1) as f32;
+    let sample_step = (samples.len() as f32 / sample_count as f32).max(1.0);
+    let half_window = (sample_step * 1.7).round() as isize;
+    let max_window = ((sample_rate as f32 * 0.0025).round() as isize).max(4);
+    let half_window = half_window.clamp(4, max_window);
+    let mut envelope = Vec::with_capacity(sample_count);
+
+    for index in 0..sample_count {
+        let position = (index as f32 / target_span) * source_span;
+        let center = position.round() as isize;
+        let start = (center - half_window).max(0) as usize;
+        let end = (center + half_window).min(samples.len() as isize - 1) as usize;
+        let mut sum_squares = 0.0f32;
+        let mut peak = 0.0f32;
+        let mut count = 0usize;
+
+        for sample in &samples[start..=end] {
+            let value = (*sample - mean).clamp(-1.0, 1.0);
+            sum_squares += value * value;
+            peak = peak.max(value.abs());
+            count += 1;
+        }
+
+        let rms = (sum_squares / count.max(1) as f32).sqrt();
+
+        envelope.push(((rms * 0.78) + (peak * 0.22)).clamp(0.0, 1.0));
+    }
+
+    envelope
+}
+
 fn native_audio_mono_samples<T, F>(data: &[T], channels: usize, convert: F) -> Vec<f32>
 where
     F: Fn(&T) -> f32,
@@ -608,12 +742,29 @@ fn process_native_audio_samples(
             None
         } else {
             shared.last_stats_at = now;
+            let frequency_samples = recent_native_audio_samples(
+                &shared.chunks,
+                AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES,
+            );
+            let frequency_bands =
+                native_audio_frequency_bands(&frequency_samples, shared.sample_rate);
+            let waveform_samples = recent_native_audio_samples(
+                &shared.chunks,
+                AUDIO_INPUT_WAVEFORM_WINDOW_SAMPLES,
+            );
+            let time_domain_samples = native_audio_envelope_samples(
+                &waveform_samples,
+                AUDIO_INPUT_WAVEFORM_SAMPLE_COUNT,
+                shared.sample_rate,
+            );
             Some(AudioInputStats {
                 device_id: device_id.to_string(),
                 rms,
                 peak,
                 buffer_ms: ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0)
                     .round() as u64,
+                frequency_bands,
+                time_domain_samples,
             })
         }
     };

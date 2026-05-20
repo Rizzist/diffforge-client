@@ -4619,16 +4619,7 @@ function WorkspaceTerminal({
         }
 
         if (afterWriteRefreshReasons.length) {
-          let clearedTextureAtlas = false;
-          const clearTextureAtlas = activeWebglAddon?.clearTextureAtlas;
-          if (typeof clearTextureAtlas === "function") {
-            try {
-              clearTextureAtlas.call(activeWebglAddon);
-              clearedTextureAtlas = true;
-            } catch (_error) {
-              // Renderer refresh below is the fallback when the WebGL atlas cannot be cleared.
-            }
-          }
+          const clearedTextureAtlas = false;
 
           const refreshed = refreshTerminalRenderer(afterWriteRefreshReasons[afterWriteRefreshReasons.length - 1], {
             bytes: batchData.byteLength,
@@ -7197,7 +7188,6 @@ function WorkspaceTerminal({
       container,
       defaultCols: TERMINAL_DEFAULT_COLS,
       defaultRows: TERMINAL_DEFAULT_ROWS,
-      getWebglAddon: () => activeWebglAddon,
       instanceId: () => terminalInstanceId,
       maxCols: TERMINAL_MAX_COLS,
       maxRows: TERMINAL_MAX_ROWS,
