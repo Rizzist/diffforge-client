@@ -240,6 +240,18 @@ fn set_terminal_audio_input_target_for(
     active: bool,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
+    write_thread_bridge_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": "backend.audio_input_target.set_request",
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": {
+            "active": active,
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+        },
+    }));
 
     if !active {
         return clear_terminal_audio_input_target_if_matches(state, &pane_id, instance_id);
@@ -2325,11 +2337,33 @@ async fn terminal_write_to_audio_input_target(
     data: String,
 ) -> Result<bool, String> {
     if active_terminal_audio_input_target(&state)?.is_none() {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.audio_input_target.write_skip",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "data": terminal_write_data_diagnostic(&data),
+                "reason": "missing_active_target",
+            },
+        }));
         return Ok(false);
     }
 
     let wrote =
         write_to_active_terminal_audio_input_target(&app, &state, &cloud_mcp_state, &data).await?;
+    write_thread_bridge_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": "backend.audio_input_target.write_done",
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": {
+            "data": terminal_write_data_diagnostic(&data),
+            "wrote": wrote,
+        },
+    }));
 
     Ok(wrote)
 }
@@ -2875,6 +2909,57 @@ async fn terminal_observe_submitted_prompt(
     let after = terminal_input_gate_diagnostic_snapshot(&gate);
 
     (submitted, before, after)
+}
+
+fn is_terminal_control_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with('/') || is_terminal_model_picker_ui_prompt(prompt)
+}
+
+fn normalize_terminal_control_prompt_text(prompt: &str) -> String {
+    let mut text = prompt
+        .replace('\u{00a0}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    loop {
+        let trimmed = text.trim_start();
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return String::new();
+        };
+        if matches!(
+            first,
+            '›' | '❯' | '❱' | '>' | '*' | '•' | '●' | '○' | '◉' | '✓' | '✔' | '+' | '-'
+        ) {
+            text = chars.as_str().trim_start().to_string();
+            continue;
+        }
+        return trimmed.to_string();
+    }
+}
+
+fn is_numbered_terminal_model_picker_row(text: &str) -> bool {
+    let Some((index, rest)) = text.split_once('.') else {
+        return false;
+    };
+    !index.is_empty()
+        && index.chars().all(|character| character.is_ascii_digit())
+        && rest.trim_start().to_ascii_lowercase().starts_with("gpt-")
+}
+
+fn is_terminal_model_picker_ui_prompt(prompt: &str) -> bool {
+    let text = normalize_terminal_control_prompt_text(prompt);
+    if text.is_empty() {
+        return false;
+    }
+
+    if is_numbered_terminal_model_picker_row(&text) {
+        return true;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    lower.contains("press enter to confirm") && lower.contains("esc") && lower.contains("go back")
 }
 
 fn terminal_prompt_task_title(prompt: &str) -> String {
@@ -4400,6 +4485,21 @@ async fn terminal_write_inner(
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.bridge.terminal_write.missing_session_any_input",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "data": terminal_write_data_diagnostic(&data),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            },
+        }));
         if prompt_event_text
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
@@ -4460,6 +4560,23 @@ async fn terminal_write_inner(
     let normalized_data_diagnostic = terminal_write_data_diagnostic(&data);
     let input_write_diagnostic_kind =
         terminal_input_write_diagnostic_kind(&data, &prompt_event_id, &prompt_event_text);
+    write_thread_bridge_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": "backend.bridge.input_write_any_start",
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": {
+            "diagnostic_kind": input_write_diagnostic_kind.unwrap_or("raw_input"),
+            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            "instance_id": instance.id,
+            "normalized_data": normalized_data_diagnostic.clone(),
+            "original_data": original_data_diagnostic.clone(),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "thread_id": thread_id.as_deref().unwrap_or_default(),
+        },
+    }));
 
     let escape_interrupt_task_id = if data == "\x1b" && instance.coordination.is_some() {
         instance
@@ -4530,6 +4647,24 @@ async fn terminal_write_inner(
     )
     .await?;
     let input_write_elapsed_ms = terminal_diagnostic_elapsed_ms(input_write_started_at);
+    write_thread_bridge_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": "backend.bridge.input_write_any_done",
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": {
+            "diagnostic_kind": input_write_diagnostic_kind.unwrap_or("raw_input"),
+            "elapsed_ms": input_write_elapsed_ms,
+            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            "instance_id": instance.id,
+            "normalized_data": normalized_data_diagnostic.clone(),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "thread_id": thread_id.as_deref().unwrap_or_default(),
+            "wrote": input_write_result,
+        },
+    }));
     if let Some(diagnostic_kind) = input_write_diagnostic_kind {
         write_thread_bridge_diagnostic_log_entry(json!({
             "ts_ms": current_time_ms(),
@@ -4559,6 +4694,28 @@ async fn terminal_write_inner(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        if is_terminal_control_prompt(&prompt) {
+            write_thread_bridge_diagnostic_log_entry(json!({
+                "ts_ms": current_time_ms(),
+                "phase": "backend.bridge.prompt_observed_control_skip",
+                "source": "backend",
+                "app_pid": std::process::id(),
+                "thread": terminal_diagnostic_thread_label(),
+                "fields": {
+                    "data_len": data.len(),
+                    "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "instance_id": instance.id,
+                    "normalized_data": normalized_data_diagnostic.clone(),
+                    "observed_prompt_len": prompt.len(),
+                    "original_data": original_data_diagnostic.clone(),
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "prompt_prefix": clean_terminal_diagnostic_log_text(prompt.split_whitespace().next().unwrap_or_default()),
+                    "thread_id": thread_id.as_deref().unwrap_or_default(),
+                },
+            }));
+            return Ok(());
+        }
         let prompt_event_text_matches_observed = requested_event_prompt
             .as_ref()
             .map(|value| value == &prompt)
@@ -4669,6 +4826,27 @@ async fn terminal_write_inner(
             .filter(|value| !value.is_empty())
             .map(str::to_string)
         {
+            if is_terminal_control_prompt(&event_prompt) {
+                write_thread_bridge_diagnostic_log_entry(json!({
+                    "ts_ms": current_time_ms(),
+                    "phase": "backend.bridge.prompt_event_text_control_skip",
+                    "source": "backend",
+                    "app_pid": std::process::id(),
+                    "thread": terminal_diagnostic_thread_label(),
+                    "fields": {
+                        "data_len": data.len(),
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "has_prompt_event_text": true,
+                        "instance_id": instance.id,
+                        "normalized_data": normalized_data_diagnostic.clone(),
+                        "original_data": original_data_diagnostic.clone(),
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_prefix": clean_terminal_diagnostic_log_text(event_prompt.split_whitespace().next().unwrap_or_default()),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    },
+                }));
+                return Ok(());
+            }
             emit_terminal_prompt_submitted(
                 &app,
                 &instance,

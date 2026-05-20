@@ -26,6 +26,9 @@ import {
   getBigViewTextDiagnosticFields,
   logBigViewSyncDiagnosticEvent,
 } from "../threads/bigViewSyncDiagnostics";
+import {
+  isTerminalControlHistoryPrompt,
+} from "../threads/terminalControlPrompts.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
 import {
@@ -7949,6 +7952,17 @@ export default function App() {
           instanceId: payload.instanceId || "",
           paneId: payload.paneId || "",
           threadId: payload.threadId || "",
+        });
+        return;
+      }
+      if (isTerminalControlHistoryPrompt(userMessage)) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
+          instanceId: payload.instanceId || "",
+          paneId: payload.paneId || "",
+          promptText: getBigViewTextDiagnosticFields(userMessage),
+          reason: "terminal_control_prompt",
+          threadId: payload.threadId || "",
+          workspaceId,
         });
         return;
       }

@@ -361,6 +361,10 @@ import {
   logFileDragDiagnosticEvent,
 } from "../../threads/bigViewSyncDiagnostics";
 import {
+  isTerminalControlHistoryPrompt,
+  isTerminalModelPickerUiPrompt,
+} from "../../threads/terminalControlPrompts.js";
+import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
 } from "../../threads/workspaceThreads";
@@ -659,6 +663,8 @@ async function saveTerminalImageAttachments(attachments) {
 
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
+const TERMINAL_CONTROL_UI_SUPPRESSION_EVENT = "diffforge:terminal-control-ui-suppression";
+const TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS = 10000;
 const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_QUOTED_PATH_LINK_PATTERN = /(["'`])((?:(?:[A-Za-z]:[\\/])|(?:\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/])|(?:\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/)|(?:~[A-Za-z0-9_.-]*[\\/])|(?:\/)|(?:\.{1,2}[\\/]))(?:(?!\1).)*?\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)\1/g;
@@ -709,6 +715,20 @@ const TERMINAL_BARE_FILE_EXTENSIONS = new Set([
   "yaml",
   "yml",
 ]);
+
+function dispatchTerminalControlUiSuppression(detail = {}) {
+  if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
+    return;
+  }
+
+  window.dispatchEvent(new CustomEvent(TERMINAL_CONTROL_UI_SUPPRESSION_EVENT, {
+    detail: {
+      durationMs: TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS,
+      reason: "terminal-control-ui",
+      ...detail,
+    },
+  }));
+}
 const TODO_DROP_OVERLAY_UNSUPPORTED_STYLE = {
   border: "2px dotted rgba(248, 113, 113, 0.96)",
   background: "rgba(45, 8, 13, 0.62)",
@@ -2543,9 +2563,44 @@ function WorkspaceTerminal({
   ]);
   const changeWorkspaceThreadModel = useCallback(async ({ model, thread: targetThread }) => {
     const nextModel = String(model || "").trim();
-    const agentId = getTerminalAgentKind(targetThread?.currentAgent || terminalAgentKind);
-    const providerBinding = getWorkspaceThreadProviderBinding(targetThread, agentId);
-    const binding = providerBinding?.terminalBinding || targetThread?.terminalBinding;
+    const {
+      agentId,
+      binding,
+      latestThread,
+    } = getWorkspaceThreadTerminalTarget({
+      fallbackWorkspace: workspace,
+      targetThread,
+      terminalAgentKind,
+      workspaceThreads,
+    });
+    const modelWorkspaceId = latestThread?.workspaceId || targetThread?.workspaceId || workspace?.id || "";
+    const modelWorkspaceEntry = modelWorkspaceId ? workspaceThreads?.[modelWorkspaceId] : null;
+    const modelTerminalSnapshot = Object.values(modelWorkspaceEntry?.terminals || {})
+      .map((terminal) => ({
+        agentId: terminal?.agentId || "",
+        instanceId: terminal?.instanceId || "",
+        paneId: terminal?.paneId || "",
+        status: terminal?.status || "",
+        terminalIndex: terminal?.terminalIndex ?? "",
+        threadId: terminal?.threadId || "",
+      }))
+      .slice(0, 16);
+    const modelThreadSnapshot = Object.values(modelWorkspaceEntry?.threads || {})
+      .filter((entryThread) => entryThread?.terminalBinding || entryThread?.id === latestThread?.id)
+      .map((entryThread) => ({
+        activityStatus: entryThread?.activityStatus || "",
+        currentAgent: entryThread?.currentAgent || "",
+        id: entryThread?.id || "",
+        latestTurnState: entryThread?.latestTurn?.state || "",
+        providerModel: getWorkspaceThreadProviderBinding(
+          entryThread,
+          getTerminalAgentKind(entryThread?.currentAgent || agentId),
+        )?.modelId || "",
+        terminalBindingInstanceId: entryThread?.terminalBinding?.instanceId || "",
+        terminalBindingPaneId: entryThread?.terminalBinding?.paneId || "",
+        terminalIndex: entryThread?.terminalIndex ?? "",
+      }))
+      .slice(0, 16);
     const thinkingPower = agentId === "codex"
       ? (nextModel.toLowerCase().includes("spark") ? "high" : "medium")
       : "";
@@ -2554,23 +2609,26 @@ function WorkspaceTerminal({
       bindingInstanceId: binding?.instanceId || "",
       bindingPaneId: binding?.paneId || "",
       hasModel: Boolean(nextModel),
+      modelTerminalSnapshot,
+      modelThreadSnapshot,
       model: nextModel,
       requestIncludesThinkingPower: false,
       thinkingPower,
       thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
-      threadId: targetThread?.id || "",
-      workspaceId: targetThread?.workspaceId || workspace?.id || "",
+      threadId: latestThread?.id || targetThread?.id || "",
+      workspaceId: latestThread?.workspaceId || targetThread?.workspaceId || workspace?.id || "",
     });
-    if (!nextModel || !binding?.paneId || !binding?.instanceId) {
+    if (!nextModel || !binding?.paneId || !binding?.instanceId || !latestThread?.id) {
       logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_error", {
         agentId,
         hasBinding: Boolean(binding?.paneId && binding?.instanceId),
+        hasLatestThread: Boolean(latestThread?.id),
         hasModel: Boolean(nextModel),
         message: "No active terminal is bound to this thread.",
         model: nextModel,
-        reason: !nextModel ? "missing_model" : "missing_live_terminal_binding",
-        threadId: targetThread?.id || "",
-        workspaceId: targetThread?.workspaceId || workspace?.id || "",
+        reason: !nextModel ? "missing_model" : !latestThread?.id ? "missing_thread" : "missing_live_terminal_binding",
+        threadId: latestThread?.id || targetThread?.id || "",
+        workspaceId: latestThread?.workspaceId || targetThread?.workspaceId || workspace?.id || "",
       });
       throw new Error("No active terminal is bound to this thread.");
     }
@@ -2584,8 +2642,8 @@ function WorkspaceTerminal({
         message: "Model id is invalid.",
         model: nextModel,
         reason: "invalid_model_id",
-        threadId: targetThread?.id || "",
-        workspaceId: targetThread?.workspaceId || workspace?.id || "",
+        threadId: latestThread.id,
+        workspaceId: latestThread.workspaceId || workspace?.id || "",
       });
       throw new Error("Model id is invalid.");
     }
@@ -2597,18 +2655,31 @@ function WorkspaceTerminal({
       bindingPaneId: binding.paneId,
       commandLength: command.length,
       model: nextModel,
+      modelTerminalSnapshot,
+      modelThreadSnapshot,
       requestIncludesThinkingPower: false,
       thinkingPower,
       thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
-      threadId: targetThread.id,
-      workspaceId: targetThread.workspaceId || workspace?.id || "",
+      threadId: latestThread.id,
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
+    });
+    dispatchTerminalControlUiSuppression({
+      agentId,
+      instanceId: binding.instanceId,
+      model: nextModel,
+      paneId: binding.paneId,
+      reason: "model-change",
+      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      threadId: latestThread.id,
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
     try {
       await invoke("terminal_write", {
         data: buildTerminalSubmittedInput(command, agentId),
         instanceId: binding.instanceId,
         paneId: binding.paneId,
-        threadId: targetThread.id,
+        promptEventSource: "model-change",
+        threadId: latestThread.id,
       });
     } catch (error) {
       logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_error", {
@@ -2620,8 +2691,8 @@ function WorkspaceTerminal({
         requestIncludesThinkingPower: false,
         thinkingPower,
         thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
-        threadId: targetThread.id,
-        workspaceId: targetThread.workspaceId || workspace?.id || "",
+        threadId: latestThread.id,
+        workspaceId: latestThread.workspaceId || workspace?.id || "",
       });
       throw error;
     }
@@ -2633,8 +2704,8 @@ function WorkspaceTerminal({
       requestIncludesThinkingPower: false,
       thinkingPower,
       thinkingPowerSource: agentId === "codex" ? "terminal_default_inference" : "not_configured",
-      threadId: targetThread.id,
-      workspaceId: targetThread.workspaceId || workspace?.id || "",
+      threadId: latestThread.id,
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
     logBigViewSyncDiagnosticEvent("bigview.model_state.terminal_selected_emit", {
       agentId,
@@ -2642,9 +2713,9 @@ function WorkspaceTerminal({
       bindingPaneId: binding.paneId,
       model: nextModel,
       modelSource: "user",
-      terminalIndex: targetThread.terminalIndex ?? binding.terminalIndex,
-      threadId: targetThread.id,
-      workspaceId: targetThread.workspaceId || workspace?.id || "",
+      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      threadId: latestThread.id,
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
     onThreadTerminalLifecycle?.({
       agentId,
@@ -2653,12 +2724,12 @@ function WorkspaceTerminal({
       modelId: nextModel,
       modelSource: "user",
       paneId: binding.paneId,
-      terminalIndex: targetThread.terminalIndex ?? binding.terminalIndex,
-      threadId: targetThread.id,
+      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      threadId: latestThread.id,
       type: "model-selected",
-      workspaceId: targetThread.workspaceId || workspace?.id || "",
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
-  }, [onThreadTerminalLifecycle, terminalAgentKind, workspace?.id]);
+  }, [onThreadTerminalLifecycle, terminalAgentKind, workspace, workspaceThreads]);
   const changeWorkspaceThreadAgent = useCallback(async ({ agentId, thread: targetThread, workspace: targetWorkspace }) => {
     const nextAgentId = getTerminalAgentKind(agentId);
     const targetTerminalIndex = Number.parseInt(
@@ -7511,6 +7582,15 @@ function WorkspaceTerminal({
             && event.payload?.instanceId === terminalInstanceId
             && !isDisposed
           ) {
+            logBigViewSyncDiagnosticEvent("tui.text.pty_input_backend_error_event", {
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              message: event.payload?.message || "",
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
             setTerminalError(getErrorMessage(event.payload?.message, "Unable to write to terminal."));
           }
         }));
@@ -7522,6 +7602,8 @@ function WorkspaceTerminal({
         let terminalSubmittedComposerState = createTerminalComposerState();
         let terminalLastSelectionAt = 0;
         let terminalLastSelectionText = "";
+        let terminalControlUiSuppressionUntilMs = 0;
+        let terminalControlUiSuppressionReason = "";
         const setTerminalSubmittedComposerState = (nextState, reason = "unspecified") => {
           terminalSubmittedComposerState = nextState || createTerminalComposerState();
           terminalSubmittedInputText = getTerminalComposerText(terminalSubmittedComposerState);
@@ -7570,12 +7652,67 @@ function WorkspaceTerminal({
           }));
         }
         const syncCurrentTerminalComposerDraft = (value) => {
+          if (isTerminalModelPickerUiPrompt(value)) {
+            logBigViewSyncDiagnosticEvent("tui.text.control_ui_draft_sync_skip", {
+              agentId: terminalAgentKind,
+              draft: getBigViewTextDiagnosticFields(value),
+              instanceId: terminalInstanceId,
+              paneId,
+              reason: "model_picker_ui_prompt",
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
+            return;
+          }
           setThreadComposerDraftValue(
             getCurrentThreadComposerSyncKey(terminalInstanceId),
             value,
             "terminal_input_observed",
           );
         };
+        const isTerminalControlUiSuppressionActive = () => (
+          terminalControlUiSuppressionUntilMs > Date.now()
+        );
+        const handleTerminalControlUiSuppression = (event) => {
+          const detail = event?.detail || {};
+          const requestedPaneId = String(detail.paneId || "");
+          const requestedInstanceId = Number(detail.instanceId || 0);
+          if (requestedPaneId && requestedPaneId !== paneId) {
+            return;
+          }
+          if (
+            Number.isFinite(requestedInstanceId)
+            && requestedInstanceId > 0
+            && requestedInstanceId !== Number(terminalInstanceId)
+          ) {
+            return;
+          }
+
+          const durationMs = Math.min(
+            30000,
+            Math.max(500, Number(detail.durationMs) || TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS),
+          );
+          terminalControlUiSuppressionUntilMs = Math.max(
+            terminalControlUiSuppressionUntilMs,
+            Date.now() + durationMs,
+          );
+          terminalControlUiSuppressionReason = String(detail.reason || "terminal-control-ui");
+          logBigViewSyncDiagnosticEvent("tui.text.control_ui_suppression_start", {
+            agentId: terminalAgentKind,
+            durationMs,
+            instanceId: terminalInstanceId,
+            paneId,
+            reason: terminalControlUiSuppressionReason,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+          });
+        };
+        window.addEventListener(TERMINAL_CONTROL_UI_SUPPRESSION_EVENT, handleTerminalControlUiSuppression);
+        disposables.push(() => {
+          window.removeEventListener(TERMINAL_CONTROL_UI_SUPPRESSION_EVENT, handleTerminalControlUiSuppression);
+        });
         const refreshTerminalComposerDraftFromStore = (reason = "unspecified") => {
           const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
           if (!syncKey) {
@@ -7592,6 +7729,21 @@ function WorkspaceTerminal({
           const nextDraft = storeHasDraft
             ? threadComposerDraftsRef.current.get(syncKey) || ""
             : "";
+          if (isTerminalModelPickerUiPrompt(nextDraft)) {
+            logBigViewSyncDiagnosticEvent("tui.text.control_ui_store_draft_clear", {
+              agentId: terminalAgentKind,
+              draft: getBigViewTextDiagnosticFields(nextDraft),
+              instanceId: terminalInstanceId,
+              paneId,
+              reason,
+              syncKey,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
+            setThreadComposerDraftValue(syncKey, "", "terminal_control_ui_store_clear");
+            return;
+          }
           setTerminalSubmittedComposerState(
             setTerminalComposerText(terminalSubmittedComposerState, nextDraft, {
               source: `store:${reason}`,
@@ -7850,6 +8002,23 @@ function WorkspaceTerminal({
           const safeCandidate = String(candidate || "").trim();
           const safeExpected = String(expected || "").trim();
           if (!safeCandidate) {
+            return false;
+          }
+          if (isTerminalModelPickerUiPrompt(safeCandidate)) {
+            return false;
+          }
+          if (isTerminalControlUiSuppressionActive()) {
+            logBigViewSyncDiagnosticEvent("tui.text.control_ui_prompt_candidate_skip", {
+              agentId: terminalAgentKind,
+              candidate: getBigViewTextDiagnosticFields(safeCandidate),
+              expectedLength: safeExpected.length,
+              instanceId: terminalInstanceId,
+              paneId,
+              reason: terminalControlUiSuppressionReason || "terminal-control-ui",
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
             return false;
           }
           if (!safeExpected) {
@@ -8272,6 +8441,19 @@ function WorkspaceTerminal({
           refreshTerminalComposerDraftFromStore("image_submit_before_submit");
           flushTerminalInput("image_submit_flush_before");
           const promptResolution = getTerminalPromptTextForSubmit(terminalSubmittedInputText);
+          if (isTerminalControlHistoryPrompt(promptResolution.promptText)) {
+            logBigViewSyncDiagnosticEvent("tui.image.control_ui_submit_skip", {
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              paneId,
+              promptResolutionSource: promptResolution.source,
+              promptText: getBigViewTextDiagnosticFields(promptResolution.promptText),
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
+            return false;
+          }
           if (
             promptResolution.usedTerminalScreen
             && promptResolution.promptText
@@ -8573,10 +8755,11 @@ function WorkspaceTerminal({
               syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
             }
             const promptTextAtSubmit = submitPromptResolution.promptText;
+            const isControlHistoryPrompt = isTerminalControlHistoryPrompt(promptTextAtSubmit);
             if (
               terminalSubmittedInputHasText
               && promptTextAtSubmit
-              && !promptTextAtSubmit.startsWith("/")
+              && !isControlHistoryPrompt
               && !isGenericTerminal
             ) {
               const promptId = createThreadProjectionToken("terminal-prompt");
@@ -8641,8 +8824,19 @@ function WorkspaceTerminal({
                 threadId,
                 workspaceId,
               });
+            } else if (terminalSubmittedInputHasText && isControlHistoryPrompt) {
+              logBigViewSyncDiagnosticEvent("tui.text.control_ui_submit_bridge_skip", {
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                paneId,
+                promptResolutionSource: submitPromptResolution.source,
+                promptText: getBigViewTextDiagnosticFields(promptTextAtSubmit),
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
             }
-            if (terminalSubmittedInputHasText) {
+            if (terminalSubmittedInputHasText && promptTextAtSubmit && !isControlHistoryPrompt) {
               recordSubmittedAgentMessage(
                 terminalInstanceId,
                 promptTextAtSubmit,

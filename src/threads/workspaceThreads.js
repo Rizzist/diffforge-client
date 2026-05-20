@@ -2,6 +2,10 @@ import {
   cleanLiveViewText,
   stripLiveViewControlSequences,
 } from "../terminals/liveViewSanitizer.js";
+import {
+  isTerminalControlHistoryPrompt,
+  isTerminalModelPickerUiPrompt,
+} from "./terminalControlPrompts.js";
 
 const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
 const MAX_THREAD_PROJECTION_EVENTS = 900;
@@ -346,12 +350,16 @@ function isTerminalArtifactLabel(value) {
 function isTerminalArtifactMessage(value) {
   const text = cleanMessageText(value);
   return !text
+    || isTerminalModelPickerUiPrompt(text)
     || isTerminalArtifactLabel(text);
 }
 
 function cleanSubmittedUserMessage(value) {
   const text = cleanMessageText(value);
   if (!text) {
+    return "";
+  }
+  if (isTerminalControlHistoryPrompt(text)) {
     return "";
   }
 
@@ -374,7 +382,7 @@ function cleanSubmittedUserMessage(value) {
 }
 
 function isSlashCommandPrompt(value) {
-  return String(value || "").trimStart().startsWith("/");
+  return isTerminalControlHistoryPrompt(value);
 }
 
 function cleanThreadLabelCandidate(value) {
@@ -675,6 +683,45 @@ function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
   }
 
   return normalizeThreadActivityStatus(fallback);
+}
+
+function providerBindingsHaveNativeSession(providerBindings) {
+  return Object.values(providerBindings || {}).some((binding) => (
+    Boolean(cleanText(binding?.nativeSessionId))
+  ));
+}
+
+function isOrphanRunningThreadState({
+  latestTurn,
+  messageCount = 0,
+  messages = [],
+  pendingPrompt = null,
+  projectionEvents = [],
+  providerBindings = {},
+  transcriptSessionId = "",
+} = {}) {
+  const normalizedLatestTurn = normalizeThreadLatestTurn(latestTurn);
+  return Boolean(
+    normalizedLatestTurn?.state === "running"
+    && normalizeMessageCount(messageCount) === 0
+    && !messages.length
+    && !projectionEvents.length
+    && !normalizePendingPrompt(pendingPrompt)
+    && !cleanText(transcriptSessionId)
+    && !providerBindingsHaveNativeSession(providerBindings)
+  );
+}
+
+function clearOrphanRunningProviderBindings(providerBindings) {
+  return Object.fromEntries(
+    Object.entries(providerBindings || {}).map(([agentId, binding]) => [
+      agentId,
+      {
+        ...binding,
+        activityStatus: "idle",
+      },
+    ]),
+  );
 }
 
 function normalizeThreadMessage(message) {
@@ -1354,6 +1401,9 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     };
 
     if (message.role === "user") {
+      if (isSlashCommandPrompt(message.text)) {
+        return;
+      }
       currentTurnId = cleanText(
         message.turnId
           || message.turn_id
@@ -1796,13 +1846,28 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const storedSessionName = cleanThreadLabelCandidate(thread.sessionName);
   const storedTitle = cleanThreadLabelCandidate(thread.title);
 
-  const latestTurn = projectedLatestTurn;
+  const transcriptSessionId = cleanText(thread.transcriptSessionId);
+  const orphanRunningThreadState = isOrphanRunningThreadState({
+    latestTurn: projectedLatestTurn,
+    messageCount,
+    messages,
+    pendingPrompt,
+    projectionEvents,
+    providerBindings,
+    transcriptSessionId,
+  });
+  const latestTurn = orphanRunningThreadState ? null : projectedLatestTurn;
   const activityStatus = options.stripLiveBindings
     ? "idle"
-    : activityStatusForLatestTurn(
+    : orphanRunningThreadState
+      ? "idle"
+      : activityStatusForLatestTurn(
       latestTurn,
       normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
     );
+  const normalizedProviderBindings = orphanRunningThreadState
+    ? clearOrphanRunningProviderBindings(providerBindings)
+    : providerBindings;
 
   return {
     coordination,
@@ -1828,14 +1893,14 @@ function normalizeThread(thread, workspaceId, options = {}) {
       terminalIndex == null ? `thread-${safeKey(id, "detached")}` : defaultSlotKey(terminalIndex),
     ),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
-    providerBindings,
+    providerBindings: normalizedProviderBindings,
     terminalBinding,
     terminalIndex,
     title: storedTitle || storedSessionName || fallbackTitle,
     transcriptHydratedAt: options.stripMessages ? "" : cleanText(thread.transcriptHydratedAt),
     transcriptHydrationMode: options.stripMessages ? "" : cleanText(thread.transcriptHydrationMode),
     transcriptLatestTimestamp: options.stripMessages ? "" : cleanText(thread.transcriptLatestTimestamp),
-    transcriptSessionId: cleanText(thread.transcriptSessionId),
+    transcriptSessionId,
     transcriptSourcePath: options.stripMessages ? "" : cleanText(thread.transcriptSourcePath),
     transcriptStatus: options.stripMessages ? "idle" : cleanText(thread.transcriptStatus, "idle"),
     updatedAt,
@@ -2807,17 +2872,29 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     );
     const messages = projectThreadProjectionMessages(projectionEvents, entry.threads[threadId].messages);
     const messageAdded = submittedEvents.length > 0 && messages.length > previousMessages.length;
-    const latestTurn = projectLatestTurnFromEvents(
+    const projectedLatestTurn = projectLatestTurnFromEvents(
       projectionEvents,
       entry.threads[threadId].latestTurn,
     );
+    const shouldClearOrphanRunning = isOrphanRunningThreadState({
+      latestTurn: projectedLatestTurn,
+      messageCount: messages.length,
+      messages,
+      pendingPrompt: pendingPrompt || entry.threads[threadId].pendingPrompt,
+      projectionEvents,
+      providerBindings: entry.threads[threadId].providerBindings,
+      transcriptSessionId: entry.threads[threadId].transcriptSessionId,
+    });
+    const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
     const activityStatus = activityStatusForLatestTurn(
       latestTurn,
-      messageAdded || pendingPrompt
+      shouldClearOrphanRunning
+        ? "idle"
+        : messageAdded || pendingPrompt
         ? entry.threads[threadId].activityStatus
         : previousActivityStatus,
     );
-    const providerBindings = normalizeProviderBindings(
+    let providerBindings = normalizeProviderBindings(
       entry.threads[threadId].providerBindings,
       entry.threads[threadId].currentAgent,
       {
@@ -2831,6 +2908,9 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
         updatedAt: entry.threads[threadId].updatedAt,
       },
     );
+    if (shouldClearOrphanRunning) {
+      providerBindings = clearOrphanRunningProviderBindings(providerBindings);
+    }
     if (isThreadAgentId(agentId) && providerBindings[agentId]) {
       providerBindings[agentId] = {
         ...providerBindings[agentId],
@@ -3424,12 +3504,22 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     }),
   );
   const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
-  const latestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const shouldClearOrphanRunning = isOrphanRunningThreadState({
+    latestTurn: projectedLatestTurn,
+    messageCount: messages.length,
+    messages,
+    pendingPrompt: existing.pendingPrompt,
+    projectionEvents,
+    providerBindings: existing.providerBindings,
+    transcriptSessionId: sessionId || existing.transcriptSessionId,
+  });
+  const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
   const activityStatus = activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
     : existing.lastMessageAt;
-  const providerBindings = normalizeProviderBindings(
+  let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
     {
@@ -3443,6 +3533,9 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       updatedAt: now,
     },
   );
+  if (shouldClearOrphanRunning) {
+    providerBindings = clearOrphanRunningProviderBindings(providerBindings);
+  }
 
   if (sessionId && providerBindings[agentId]) {
     providerBindings[agentId] = {
@@ -3520,7 +3613,17 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     event.projectionEvents || event.events || [],
   );
   const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
-  const latestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const shouldClearOrphanRunning = isOrphanRunningThreadState({
+    latestTurn: projectedLatestTurn,
+    messageCount: messages.length,
+    messages,
+    pendingPrompt: event.clearPendingPrompt === false ? existing.pendingPrompt : null,
+    projectionEvents,
+    providerBindings: existing.providerBindings,
+    transcriptSessionId: cleanText(event.providerSessionId || event.nativeSessionId, existing.transcriptSessionId),
+  });
+  const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const activityStatus = latestTurnState === "running"
     ? "thinking"
@@ -3528,7 +3631,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       ? "idle"
       : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
-  const providerBindings = normalizeProviderBindings(
+  let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
     {
@@ -3542,6 +3645,9 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       updatedAt: now,
     },
   );
+  if (shouldClearOrphanRunning) {
+    providerBindings = clearOrphanRunningProviderBindings(providerBindings);
+  }
   if (providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
