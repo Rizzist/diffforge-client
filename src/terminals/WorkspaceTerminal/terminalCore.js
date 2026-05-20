@@ -17,7 +17,29 @@ export const TERMINAL_MIN_COLS = 20;
 export const TERMINAL_MIN_ROWS = 6;
 export const TERMINAL_MAX_COLS = 400;
 export const TERMINAL_MAX_ROWS = 160;
-export const TERMINAL_ENABLE_WEBGL_RENDERER = false;
+
+function detectTerminalWebglRendererDefault() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const platformText = [
+    navigator.userAgentData?.platform,
+    navigator.platform,
+    navigator.userAgent,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (platformText.includes("linux")) {
+    return false;
+  }
+
+  return platformText.includes("mac") || platformText.includes("win");
+}
+
+export const TERMINAL_ENABLE_WEBGL_RENDERER = detectTerminalWebglRendererDefault();
 export const TERMINAL_START_LAYOUT_WAIT_MS = 4000;
 export const TERMINAL_START_METRIC_WAIT_MS = 900;
 export const TERMINAL_START_METRIC_POLL_MS = 16;

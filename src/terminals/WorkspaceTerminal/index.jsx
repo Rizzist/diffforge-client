@@ -3138,7 +3138,7 @@ function WorkspaceTerminal({
     let webglAttachAttempted = false;
     const startupWatchTimers = new Set();
     // Tauri's WebView can corrupt xterm's WebGL glyph atlas during rapid multi-pane resize.
-    let rendererMode = useWebglRenderer ? "webgl_pending" : "canvas";
+    let rendererMode = useWebglRenderer ? "webgl_pending" : "dom";
     let runtimeTerminalState = "starting";
     const preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
     const forceFreshSessionForThisStart = (
@@ -3327,12 +3327,13 @@ function WorkspaceTerminal({
       convertEol: false,
       cursorBlink: terminalActiveRef.current && !parkedPromptRef.current,
       cursorStyle: "block",
+      customGlyphs: true,
       disableStdin: Boolean(parkedPromptRef.current),
       fastScrollModifier: "alt",
       fastScrollSensitivity: 5,
       fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
       fontSize: 12,
-      lineHeight: 1.22,
+      lineHeight: 1.0,
       macOptionIsMeta: true,
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
       reflowCursorLine: false,
