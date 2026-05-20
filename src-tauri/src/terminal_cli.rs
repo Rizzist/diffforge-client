@@ -685,6 +685,10 @@ fn terminal_args_with_codex_mcp_identity(
     for (env_key, arg_key) in [
         ("COORDINATION_AGENT_SLOT_ID", "--agent-slot-id"),
         ("COORDINATION_SLOT_KEY", "--slot-key"),
+        (
+            "COORDINATION_TERMINAL_LAUNCH_EPOCH",
+            "--terminal-launch-epoch",
+        ),
         ("COORDINATION_TASK_ID", "--task-id"),
         ("COORDINATION_WORKTREE_ID", "--worktree-id"),
         ("COORDINATION_WORKTREE_PATH", "--worktree-path"),
@@ -819,6 +823,7 @@ fn claude_coordination_mcp_config_arg(
                     "COORDINATION_DB_PATH": coordination.db_path.clone(),
                     "COORDINATION_AGENT_ID": coordination.agent_id.clone(),
                     "COORDINATION_SESSION_ID": coordination.session_id.clone(),
+                    "COORDINATION_TERMINAL_LAUNCH_EPOCH": coordination.terminal_launch_epoch.clone().unwrap_or_default(),
                     "COORDINATION_MCP_ALWAYS_ON": "1"
                 },
                 "diffforge": {

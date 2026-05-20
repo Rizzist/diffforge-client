@@ -577,36 +577,47 @@ function transcriptSubmittedPromptIndex(messages, event = {}) {
   const promptText = normalizeWorkspaceThreadProjectionText(
     event.expectedUserMessage || event.userMessage || event.message,
   );
-  if (!promptText) {
-    return -1;
-  }
-
   const submittedAtMs = workspaceThreadMessageTimestampMs({
     createdAt: event.messageCreatedAt || event.submittedAt || event.createdAt,
   });
   const matchedBy = String(event.matchedBy || "").trim().toLowerCase();
+  const allowTimestampFallback = event.allowTimestampFallback === true
+    || matchedBy.includes("timestamp")
+    || matchedBy.includes("recovery");
   const requireTimestampForCwdMatch = matchedBy && matchedBy !== "sessionid";
   const transcriptMessages = Array.isArray(messages) ? messages : [];
   let userIndex = -1;
 
-  transcriptMessages.forEach((message, index) => {
-    const role = String(message?.role || "").trim().toLowerCase();
-    if (role !== "user") {
-      return;
-    }
-    const text = normalizeWorkspaceThreadProjectionText(message?.text || message?.message);
-    if (text !== promptText) {
-      return;
-    }
-    const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
-    if (submittedAtMs && messageTimestampMs && messageTimestampMs < submittedAtMs - 30000) {
-      return;
-    }
-    if (submittedAtMs && requireTimestampForCwdMatch && !messageTimestampMs) {
-      return;
-    }
-    userIndex = index;
-  });
+  if (promptText) {
+    transcriptMessages.forEach((message, index) => {
+      const role = String(message?.role || "").trim().toLowerCase();
+      if (role !== "user") {
+        return;
+      }
+      const text = normalizeWorkspaceThreadProjectionText(message?.text || message?.message);
+      if (text !== promptText) {
+        return;
+      }
+      const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
+      if (submittedAtMs && messageTimestampMs && messageTimestampMs < submittedAtMs - 30000) {
+        return;
+      }
+      if (submittedAtMs && requireTimestampForCwdMatch && !messageTimestampMs) {
+        return;
+      }
+      userIndex = index;
+    });
+  }
+
+  if (userIndex < 0 && allowTimestampFallback && submittedAtMs) {
+    transcriptMessages.forEach((message, index) => {
+      const role = String(message?.role || "").trim().toLowerCase();
+      const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
+      if (role === "user" && messageTimestampMs && messageTimestampMs >= submittedAtMs - 30000) {
+        userIndex = index;
+      }
+    });
+  }
 
   return userIndex;
 }
@@ -6062,11 +6073,14 @@ export default function App() {
       workspaceName: selectedWorkspace.name || "",
     });
     try {
+      const submittedAt = new Date().toISOString();
       await invoke("terminal_write", {
         data: `${prompt}\r`,
         instanceId: agent.instanceId,
         paneId: agent.paneId,
         promptEventId: intentId,
+        promptEventSource: "spec-edit",
+        promptEventSubmittedAt: submittedAt,
         promptEventText: prompt,
         threadId: agent.threadId || undefined,
       });
@@ -6270,6 +6284,15 @@ export default function App() {
         || "",
     ).trim();
     const promptEventId = String(event.promptEventId || event.pendingPromptId || "").trim();
+    const allowTimestampFallback = event.allowTimestampFallback === true
+      || event.allowRecovery === true
+      || event.source === "terminal-prompt-submitted";
+    const submittedAt = String(
+      event.submittedAt
+        || event.promptEventSubmittedAt
+        || expectedMessageCreatedAt
+        || "",
+    ).trim();
 
     if (workspaceThreadIdIsArchived(workspaceThreadsRef.current, workspaceId, threadId)) {
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -6301,8 +6324,15 @@ export default function App() {
     }
 
     const lookupKey = requestedProviderSessionId || "session-pending";
+    const expectedPromptRequestKey = expectedUserMessage
+      ? `${expectedUserMessage.length}:${expectedUserMessage.slice(0, 48)}`
+      : "no-prompt";
     const turnRequestKey = pollUntilTurnComplete
-      ? String(promptEventId || expectedMessageCreatedAt || "").trim()
+      ? String(
+        promptEventId
+          ? `${promptEventId}:${expectedPromptRequestKey}`
+          : expectedMessageCreatedAt || "",
+      ).trim()
       : "";
     const requestKey = `${workspaceId}:${threadId}:${lookupKey}${turnRequestKey ? `:turn:${turnRequestKey}` : ""}`;
     const existingRequest = workspaceThreadTranscriptRequestsRef.current.get(requestKey);
@@ -6389,7 +6419,7 @@ export default function App() {
       ).trim();
       const canDiscoverProviderSession = Boolean(
         !providerSessionId
-          && expectedUserMessage
+          && (expectedUserMessage || (allowTimestampFallback && discoveryCwd && submittedAt))
           && (pollUntilTurnComplete || promptEventId)
       );
       const threadRequiresSessionHydration = (
@@ -6529,10 +6559,13 @@ export default function App() {
           providerSessionId,
         }
         : {
+          allowTimestampFallback,
           agentId,
           cwd: discoveryCwd,
           expectedUserMessage,
+          fallbackWindowMs: 90000,
           maxMessages: 320,
+          submittedAt,
         };
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.invoke", {
         agentId,
@@ -6560,12 +6593,14 @@ export default function App() {
           const sessionId = String(result?.sessionId || providerSessionId || "").trim();
           const matchedBy = String(result?.matchedBy || "").trim().toLowerCase();
           const discoveredByPrompt = !providerSessionId
-            && ["prompt", "prompt+cwd"].includes(matchedBy)
+            && ["prompt", "prompt+cwd", "cwd+timestamp-recovery"].includes(matchedBy)
             && Boolean(sessionId);
           const promptAccepted = transcriptHasSubmittedPromptEvidence(messages, {
+            allowTimestampFallback,
             expectedUserMessage,
             matchedBy,
             messageCreatedAt: expectedMessageCreatedAt,
+            submittedAt,
           });
           const turnCompleteSeen = transcriptHasTurnCompletionForPrompt(messages, {
             agentId,
@@ -6597,9 +6632,11 @@ export default function App() {
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch", {
               agentId,
               diagnostics: getTranscriptPromptMatchDiagnostics(messages, {
+                allowTimestampFallback,
                 expectedUserMessage,
                 matchedBy,
                 messageCreatedAt: expectedMessageCreatedAt,
+                submittedAt,
               }),
               matchedBy,
               pollUntilTurnComplete,
@@ -6651,6 +6688,8 @@ export default function App() {
           const requiresExactPromptEvidence = (
             pollUntilTurnComplete
             && Boolean(expectedUserMessage)
+            && !matchedBy.includes("timestamp")
+            && !matchedBy.includes("recovery")
           );
           if (requiresExactPromptEvidence && !promptAccepted) {
             const elapsedMs = Date.now() - pollStartedAt;
@@ -7307,8 +7346,22 @@ export default function App() {
 
     listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
       const payload = promptEvent?.payload || {};
-      const userMessage = String(payload.prompt || "").trim();
-      const workspaceId = String(payload.workspaceId || "").trim();
+      const observedPrompt = String(payload.observedPrompt || payload.prompt || "").trim();
+      const expectedPrompt = String(payload.expectedPrompt || "").trim();
+      const userMessage = observedPrompt || expectedPrompt || String(payload.prompt || "").trim();
+      let workspaceId = String(payload.workspaceId || "").trim();
+      if (!workspaceId && payload.threadId) {
+        workspaceId = Object.entries(workspaceThreadsRef.current || {})
+          .find(([, entry]) => Boolean(entry?.threads?.[payload.threadId]))?.[0] || "";
+      }
+      if (!workspaceId && payload.terminalIndex != null) {
+        workspaceId = Object.entries(workspaceThreadsRef.current || {})
+          .find(([candidateWorkspaceId, entry]) => Boolean(getWorkspaceThreadForTerminalIndex(
+            { [candidateWorkspaceId]: entry },
+            candidateWorkspaceId,
+            payload.terminalIndex,
+          )))?.[0] || "";
+      }
       if (!userMessage || !workspaceId) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
           hasPrompt: Boolean(userMessage),
@@ -7320,7 +7373,7 @@ export default function App() {
         return;
       }
 
-      const submittedAgentId = String(payload.agentId || payload.agentKind || "").trim().toLowerCase();
+      let submittedAgentId = String(payload.agentId || payload.agentKind || "").trim().toLowerCase();
       const submittedThread = payload.threadId
         ? workspaceThreadsRef.current?.[workspaceId]?.threads?.[payload.threadId]
         : getWorkspaceThreadForTerminalIndex(
@@ -7328,6 +7381,9 @@ export default function App() {
           workspaceId,
           payload.terminalIndex,
         );
+      if (!submittedAgentId) {
+        submittedAgentId = String(submittedThread?.currentAgent || "").trim().toLowerCase();
+      }
       const submittedProviderBinding = getWorkspaceThreadProviderBinding(
         submittedThread,
         submittedAgentId,
@@ -7347,6 +7403,8 @@ export default function App() {
         providerSessionPresent: Boolean(submittedProviderSessionId),
         promptEventIdPresent: Boolean(payload.promptEventId),
         promptLength: userMessage.length,
+        promptMatch: payload.promptMatch,
+        promptSource: payload.promptSource || "",
         promptText: getBigViewTextDiagnosticFields(userMessage),
         source: "terminal-prompt-submitted",
         terminalIndex: payload.terminalIndex ?? "",
@@ -7354,17 +7412,20 @@ export default function App() {
         workspaceId,
       });
       requestWorkspaceThreadTranscript({
+        allowTimestampFallback: true,
         agentId: submittedAgentId,
         delayMs: 700,
-        expectedMessageCreatedAt: new Date().toISOString(),
+        expectedMessageCreatedAt: payload.promptEventSubmittedAt || new Date().toISOString(),
         expectedUserMessage: userMessage,
         instanceId: payload.instanceId,
         paneId: payload.paneId || "",
         pollStartedAt: Date.now(),
         pollUntilTurnComplete: true,
         promptEventId: payload.promptEventId || "",
+        promptEventSubmittedAt: payload.promptEventSubmittedAt || "",
         providerSessionId: submittedProviderSessionId,
         source: "terminal-prompt-submitted",
+        submittedAt: payload.promptEventSubmittedAt || new Date().toISOString(),
         terminalIndex: payload.terminalIndex,
         threadId: payload.threadId || "",
         userMessage,
@@ -7408,6 +7469,25 @@ export default function App() {
             || providerBinding?.nativeSessionId,
         );
         if (!hasSessionPointer) {
+          if (runningTurn && thread.latestTurn?.startedAt && thread.coordination?.worktreePath) {
+            const lastUserMessage = [...(Array.isArray(thread.messages) ? thread.messages : [])]
+              .reverse()
+              .find((message) => message?.role === "user");
+            requestWorkspaceThreadTranscript({
+              agentId,
+              allowTimestampFallback: true,
+              delayMs: 240,
+              expectedMessageCreatedAt: lastUserMessage?.createdAt || thread.latestTurn?.startedAt || "",
+              expectedUserMessage: lastUserMessage?.text || "",
+              pollStartedAt: Date.parse(thread.latestTurn?.startedAt || thread.latestTurn?.requestedAt || "")
+                || Date.now(),
+              pollUntilTurnComplete: true,
+              submittedAt: thread.latestTurn?.startedAt || thread.latestTurn?.requestedAt || "",
+              threadId,
+              worktreePath: thread.coordination?.worktreePath || "",
+              workspaceId,
+            });
+          }
           return;
         }
 

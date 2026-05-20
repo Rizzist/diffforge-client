@@ -3387,6 +3387,7 @@ function TerminalView({
             workspaceId,
           });
           try {
+            const submittedAt = new Date().toISOString();
             logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
               agentId: targetRole,
               paneId,
@@ -3404,6 +3405,8 @@ function TerminalView({
               instanceId: targetBinding?.instanceId,
               paneId,
               promptEventId: promptId,
+              promptEventSource: "terminal-view-drop",
+              promptEventSubmittedAt: submittedAt,
               promptEventText: terminalText,
               threadId: targetThread.id,
             });

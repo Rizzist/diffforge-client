@@ -174,7 +174,8 @@ export function terminalInputChunkVisibleText(data) {
   const strippedText = stripTerminalGeneratedReplyText(rawText);
   const visibleText = strippedText
     .replace(/(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c)/g, "")
-    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/\x1bO[A-Za-z]/g, "")
+    .replace(/\x1b\[[0-9;?]*[A-Za-z~]/g, "")
     .replace(/[\u0000-\u0008\u000b-\u001F\u007F]/g, "");
 
   if (rawLooksTerminalGenerated && !visibleText.trim()) {
@@ -188,21 +189,516 @@ export function terminalInputChunkHasVisibleText(data) {
   return terminalInputChunkVisibleText(data).length > 0;
 }
 
-export function applyTerminalInputChunkToDraft(draft, data) {
+function clampComposerOffset(value, text) {
+  const length = String(text || "").length;
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return length;
+  }
+
+  return Math.min(length, Math.max(0, Math.floor(numericValue)));
+}
+
+function normalizeComposerSelection(start, end, text) {
+  const safeStart = clampComposerOffset(start, text);
+  const safeEnd = clampComposerOffset(end, text);
+
+  return {
+    end: Math.max(safeStart, safeEnd),
+    start: Math.min(safeStart, safeEnd),
+  };
+}
+
+function createNormalizedTerminalComposerState(state = {}) {
+  const text = String(state?.text || "");
+  const fallbackCursor = text.length;
+  const selection = normalizeComposerSelection(
+    state?.selectionStart ?? state?.cursorStart ?? fallbackCursor,
+    state?.selectionEnd ?? state?.cursorEnd ?? state?.cursor ?? fallbackCursor,
+    text,
+  );
+
+  return {
+    confidence: String(state?.confidence || "certain"),
+    cursorEnd: selection.end,
+    cursorStart: selection.start,
+    revision: Math.max(0, Number.parseInt(state?.revision, 10) || 0),
+    source: String(state?.source || "initial"),
+    text,
+  };
+}
+
+export function createTerminalComposerState(text = "", options = {}) {
+  return createNormalizedTerminalComposerState({
+    confidence: options.confidence || "certain",
+    cursorEnd: options.cursorEnd ?? options.cursor ?? String(text || "").length,
+    cursorStart: options.cursorStart ?? options.cursor ?? String(text || "").length,
+    revision: options.revision || 0,
+    source: options.source || "initial",
+    text,
+  });
+}
+
+export function getTerminalComposerText(state) {
+  return createNormalizedTerminalComposerState(state).text;
+}
+
+export function setTerminalComposerText(state, text, options = {}) {
+  const previous = createNormalizedTerminalComposerState(state);
+  const nextText = String(text || "");
+  const cursor = clampComposerOffset(options.cursor ?? nextText.length, nextText);
+
+  return createNormalizedTerminalComposerState({
+    confidence: options.confidence || "certain",
+    cursorEnd: cursor,
+    cursorStart: cursor,
+    revision: previous.revision + (previous.text === nextText ? 0 : 1),
+    source: options.source || previous.source || "set_text",
+    text: nextText,
+  });
+}
+
+export function getTerminalComposerSnapshot(state, options = {}) {
+  const snapshot = createNormalizedTerminalComposerState(state);
+
+  return {
+    confidence: snapshot.confidence,
+    cursorEnd: snapshot.cursorEnd,
+    cursorStart: snapshot.cursorStart,
+    promptEventId: String(options.promptEventId || "").trim(),
+    revision: snapshot.revision,
+    source: String(options.source || snapshot.source || ""),
+    submittedAt: options.submittedAt || "",
+    text: snapshot.text,
+  };
+}
+
+function composerHasSelection(state) {
+  return state.cursorStart !== state.cursorEnd;
+}
+
+function moveComposerCursor(state, nextCursor, options = {}) {
+  const cursor = clampComposerOffset(nextCursor, state.text);
+  const selecting = options.selecting === true;
+
+  if (selecting) {
+    return {
+      ...state,
+      cursorEnd: cursor,
+      revision: state.revision + 1,
+      source: options.source || state.source || "cursor",
+    };
+  }
+
+  return {
+    ...state,
+    cursorEnd: cursor,
+    cursorStart: cursor,
+    revision: state.revision + 1,
+    source: options.source || state.source || "cursor",
+  };
+}
+
+function findComposerPreviousWordBoundary(text, cursor) {
+  const safeText = String(text || "");
+  let index = clampComposerOffset(cursor, safeText);
+
+  while (index > 0 && /\s/.test(safeText[index - 1] || "")) {
+    index -= 1;
+  }
+  while (index > 0 && !/\s/.test(safeText[index - 1] || "")) {
+    index -= 1;
+  }
+
+  return index;
+}
+
+function findComposerNextWordBoundary(text, cursor) {
+  const safeText = String(text || "");
+  let index = clampComposerOffset(cursor, safeText);
+
+  while (index < safeText.length && /\s/.test(safeText[index] || "")) {
+    index += 1;
+  }
+  while (index < safeText.length && !/\s/.test(safeText[index] || "")) {
+    index += 1;
+  }
+
+  return index;
+}
+
+function moveComposerWordLeft(state, options = {}) {
+  return moveComposerCursor(
+    state,
+    findComposerPreviousWordBoundary(state.text, state.cursorEnd),
+    {
+      selecting: options.selecting === true,
+      source: options.source || "word_left",
+    },
+  );
+}
+
+function moveComposerWordRight(state, options = {}) {
+  return moveComposerCursor(
+    state,
+    findComposerNextWordBoundary(state.text, state.cursorEnd),
+    {
+      selecting: options.selecting === true,
+      source: options.source || "word_right",
+    },
+  );
+}
+
+function replaceComposerRange(state, start, end, replacement, options = {}) {
+  const selection = normalizeComposerSelection(start, end, state.text);
+  const insertText = String(replacement || "");
+  const nextText = `${state.text.slice(0, selection.start)}${insertText}${state.text.slice(selection.end)}`;
+  const cursor = selection.start + insertText.length;
+
+  return createNormalizedTerminalComposerState({
+    confidence: options.confidence || state.confidence || "certain",
+    cursorEnd: cursor,
+    cursorStart: cursor,
+    revision: state.revision + 1,
+    source: options.source || state.source || "edit",
+    text: nextText,
+  });
+}
+
+function applyComposerExternalSelection(state, selectionText, options = {}) {
+  const safeSelectionText = String(selectionText || "").replace(/[\r\n]/g, "");
+  if (!safeSelectionText) {
+    return state;
+  }
+
+  const selectionIndex = state.text.lastIndexOf(safeSelectionText);
+  if (selectionIndex < 0) {
+    return {
+      ...state,
+      confidence: "uncertain",
+      source: options.source || state.source || "selection_miss",
+      revision: state.revision + 1,
+    };
+  }
+
+  return {
+    ...state,
+    cursorEnd: selectionIndex + safeSelectionText.length,
+    cursorStart: selectionIndex,
+    confidence: "uncertain",
+    revision: state.revision + 1,
+    source: options.source || state.source || "selection",
+  };
+}
+
+function applyComposerDeleteBeforeCursor(state, options = {}) {
+  if (composerHasSelection(state)) {
+    return replaceComposerRange(state, state.cursorStart, state.cursorEnd, "", options);
+  }
+  if (state.cursorStart <= 0) {
+    return state;
+  }
+
+  return replaceComposerRange(state, state.cursorStart - 1, state.cursorStart, "", options);
+}
+
+function applyComposerDeleteAtCursor(state, options = {}) {
+  if (composerHasSelection(state)) {
+    return replaceComposerRange(state, state.cursorStart, state.cursorEnd, "", options);
+  }
+  if (state.cursorStart >= state.text.length) {
+    return state;
+  }
+
+  return replaceComposerRange(state, state.cursorStart, state.cursorStart + 1, "", options);
+}
+
+function parseComposerCsiSequence(sequence) {
+  const match = String(sequence || "").match(/^\x1b\[([0-9;?]*)([A-Za-z~])$/);
+  if (!match) {
+    return null;
+  }
+
+  const params = match[1]
+    .split(";")
+    .map((part) => Number.parseInt(part.replace(/\?/g, ""), 10))
+    .filter(Number.isFinite);
+
+  return {
+    final: match[2],
+    params,
+  };
+}
+
+function applyComposerCsiSequence(state, sequence, options = {}) {
+  const parsed = parseComposerCsiSequence(sequence);
+  if (!parsed) {
+    return {
+      ...state,
+      confidence: state.confidence === "uncertain" ? "uncertain" : "inferred",
+      source: options.source || state.source || "escape",
+      revision: state.revision + 1,
+    };
+  }
+
+  const amount = Math.max(1, parsed.params[0] || 1);
+  const modifier = parsed.params.length > 1 ? parsed.params[1] : 1;
+  const selecting = [2, 4, 6, 8].includes(modifier);
+  const wordMode = [3, 4, 5, 6, 7, 8].includes(modifier);
+  const source = options.source || "cursor";
+
+  switch (parsed.final) {
+    case "C":
+      if (wordMode) {
+        return moveComposerWordRight(state, { selecting, source });
+      }
+      return moveComposerCursor(state, state.cursorEnd + amount, { selecting, source });
+    case "D":
+      if (wordMode) {
+        return moveComposerWordLeft(state, { selecting, source });
+      }
+      return moveComposerCursor(state, state.cursorEnd - amount, { selecting, source });
+    case "H":
+    case "F":
+      return moveComposerCursor(state, parsed.final === "H" ? 0 : state.text.length, { selecting, source });
+    case "~": {
+      const code = parsed.params[0] || 0;
+      if (code === 1 || code === 7) {
+        return moveComposerCursor(state, 0, { selecting, source });
+      }
+      if (code === 3) {
+        return applyComposerDeleteAtCursor(state, { source: options.source || "delete" });
+      }
+      if (code === 4 || code === 8) {
+        return moveComposerCursor(state, state.text.length, { selecting, source });
+      }
+      return {
+        ...state,
+        confidence: state.confidence === "uncertain" ? "uncertain" : "inferred",
+        source,
+        revision: state.revision + 1,
+      };
+    }
+    default:
+      return {
+        ...state,
+        confidence: state.confidence === "uncertain" ? "uncertain" : "inferred",
+        source,
+        revision: state.revision + 1,
+      };
+  }
+}
+
+function splitTerminalInputIntoComposerTokens(data) {
   const text = String(data || "");
-  if (text.includes("\x15")) {
-    return "";
-  }
-  if (text === "\x7f" || text === "\b") {
-    return draft.slice(0, -1);
+  const tokens = [];
+  let index = 0;
+
+  while (index < text.length) {
+    const char = text[index];
+    if (char !== "\x1b") {
+      tokens.push(char);
+      index += 1;
+      continue;
+    }
+
+    const ss3Match = text.slice(index).match(/^\x1bO[A-Za-z]/);
+    if (ss3Match) {
+      tokens.push(ss3Match[0]);
+      index += ss3Match[0].length;
+      continue;
+    }
+
+    const csiMatch = text.slice(index).match(/^\x1b\[[0-9;?]*[A-Za-z~]/);
+    if (csiMatch) {
+      tokens.push(csiMatch[0]);
+      index += csiMatch[0].length;
+      continue;
+    }
+
+    const escSingleMatch = text.slice(index).match(/^\x1b[A-Za-z\u007f]/);
+    if (escSingleMatch) {
+      tokens.push(escSingleMatch[0]);
+      index += escSingleMatch[0].length;
+      continue;
+    }
+
+    const oscMatch = text.slice(index).match(/^\x1b\][\s\S]*?(?:\x07|\x1b\\)/);
+    if (oscMatch) {
+      tokens.push(oscMatch[0]);
+      index += oscMatch[0].length;
+      continue;
+    }
+
+    tokens.push(char);
+    index += 1;
   }
 
-  const visibleText = terminalInputChunkVisibleText(text);
-  if (!visibleText) {
-    return draft;
+  return tokens;
+}
+
+export function applyTerminalInputChunkToComposer(state, data, options = {}) {
+  let nextState = createNormalizedTerminalComposerState(state);
+  if (options.selectionText) {
+    nextState = applyComposerExternalSelection(nextState, options.selectionText, {
+      source: options.source || "external_selection",
+    });
   }
 
-  return `${draft}${visibleText}`;
+  splitTerminalInputIntoComposerTokens(data).forEach((token) => {
+    if (!token) {
+      return;
+    }
+
+    if (token === "\x15") {
+      nextState = setTerminalComposerText(nextState, "", {
+        cursor: 0,
+        source: options.source || "line_clear",
+      });
+      return;
+    }
+
+    if (token === "\x01") {
+      nextState = moveComposerCursor(nextState, 0, { source: options.source || "home" });
+      return;
+    }
+
+    if (token === "\x05") {
+      nextState = moveComposerCursor(nextState, nextState.text.length, { source: options.source || "end" });
+      return;
+    }
+
+    if (token === "\x0b") {
+      nextState = replaceComposerRange(
+        nextState,
+        nextState.cursorStart,
+        nextState.text.length,
+        "",
+        { source: options.source || "line_delete_after_cursor" },
+      );
+      return;
+    }
+
+    if (token === "\x17") {
+      nextState = replaceComposerRange(
+        nextState,
+        findComposerPreviousWordBoundary(nextState.text, nextState.cursorStart),
+        nextState.cursorEnd,
+        "",
+        { source: options.source || "word_delete_before_cursor" },
+      );
+      return;
+    }
+
+    if (token === "\x7f" || token === "\b") {
+      nextState = applyComposerDeleteBeforeCursor(nextState, { source: options.source || "backspace" });
+      return;
+    }
+
+    if (token === "\r" || token === "\n") {
+      if (options.insertNewline === true) {
+        nextState = replaceComposerRange(
+          nextState,
+          nextState.cursorStart,
+          nextState.cursorEnd,
+          "\n",
+          { source: options.source || "newline" },
+        );
+      }
+      return;
+    }
+
+    if (token.startsWith("\x1b[")) {
+      nextState = applyComposerCsiSequence(nextState, token, {
+        source: options.source || "escape_sequence",
+      });
+      return;
+    }
+
+    if (token.startsWith("\x1bO")) {
+      const final = token[token.length - 1];
+      if (final === "H") {
+        nextState = moveComposerCursor(nextState, 0, { source: options.source || "home" });
+      } else if (final === "F") {
+        nextState = moveComposerCursor(nextState, nextState.text.length, { source: options.source || "end" });
+      } else {
+        nextState = {
+          ...nextState,
+          confidence: nextState.confidence === "uncertain" ? "uncertain" : "inferred",
+          source: options.source || "escape_sequence",
+          revision: nextState.revision + 1,
+        };
+      }
+      return;
+    }
+
+    if (token === "\x1bb" || token === "\x1bB") {
+      nextState = moveComposerWordLeft(nextState, { source: options.source || "word_left" });
+      return;
+    }
+
+    if (token === "\x1bf" || token === "\x1bF") {
+      nextState = moveComposerWordRight(nextState, { source: options.source || "word_right" });
+      return;
+    }
+
+    if (token === "\x1bd") {
+      nextState = replaceComposerRange(
+        nextState,
+        nextState.cursorStart,
+        findComposerNextWordBoundary(nextState.text, nextState.cursorEnd),
+        "",
+        { source: options.source || "word_delete_after_cursor" },
+      );
+      return;
+    }
+
+    if (token === "\x1b\x7f") {
+      nextState = replaceComposerRange(
+        nextState,
+        findComposerPreviousWordBoundary(nextState.text, nextState.cursorStart),
+        nextState.cursorEnd,
+        "",
+        { source: options.source || "word_delete_before_cursor" },
+      );
+      return;
+    }
+
+    if (token.startsWith("\x1b")) {
+      nextState = {
+        ...nextState,
+        confidence: nextState.confidence === "uncertain" ? "uncertain" : "inferred",
+        source: options.source || "escape",
+        revision: nextState.revision + 1,
+      };
+      return;
+    }
+
+    const visibleText = terminalInputChunkVisibleText(token);
+    if (!visibleText) {
+      return;
+    }
+
+    nextState = replaceComposerRange(
+      nextState,
+      nextState.cursorStart,
+      nextState.cursorEnd,
+      visibleText,
+      { source: options.source || "input" },
+    );
+  });
+
+  return createNormalizedTerminalComposerState(nextState);
+}
+
+export function applyTerminalInputChunkToDraft(draft, data) {
+  return getTerminalComposerText(
+    applyTerminalInputChunkToComposer(
+      createTerminalComposerState(draft),
+      data,
+    ),
+  );
 }
 
 export function getTerminalKeyDebugFields(event, extraFields = {}) {
@@ -989,11 +1485,14 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       workspaceId,
     });
     const retryWriteStartedAt = Date.now();
+    const retrySubmittedAt = new Date().toISOString();
     await invoke("terminal_write", {
       data: safeSubmitSequence,
       instanceId: binding.instanceId,
       paneId: binding.paneId,
       promptEventId: safePromptId,
+      promptEventSource: "enter-retry",
+      promptEventSubmittedAt: retrySubmittedAt,
       promptEventText: safePrompt,
       threadId: safeThreadId,
     });

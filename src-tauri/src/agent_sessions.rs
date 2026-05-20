@@ -16,10 +16,13 @@ struct CodexThreadTranscriptRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadSessionDiscoverRequest {
+    allow_timestamp_fallback: Option<bool>,
     agent_id: Option<String>,
     cwd: Option<String>,
     expected_user_message: Option<String>,
+    fallback_window_ms: Option<u64>,
     max_messages: Option<usize>,
+    submitted_at: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -138,6 +141,26 @@ fn transcript_has_exact_user_prompt(
             message.role.eq_ignore_ascii_case("user")
                 && normalize_prompt_match_text(&message.text) == expected
         })
+}
+
+fn timestamp_text_at_or_after(value: &str, submitted_at: &str) -> bool {
+    let value = value.trim();
+    let submitted_at = submitted_at.trim();
+    if value.is_empty() || submitted_at.is_empty() {
+        return false;
+    }
+
+    value >= submitted_at
+}
+
+fn transcript_has_user_prompt_at_or_after(
+    messages: &[CodexThreadTranscriptMessage],
+    submitted_at: &str,
+) -> bool {
+    messages.iter().any(|message| {
+        message.role.eq_ignore_ascii_case("user")
+            && timestamp_text_at_or_after(&message.created_at, submitted_at)
+    })
 }
 
 fn collect_codex_rollout_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -1648,6 +1671,9 @@ fn find_opencode_session(
 fn discover_codex_session_by_prompt(
     expected_user_message: &str,
     cwd: &str,
+    allow_timestamp_fallback: bool,
+    submitted_at: &str,
+    _fallback_window_ms: u64,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
     let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
@@ -1684,7 +1710,11 @@ fn discover_codex_session_by_prompt(
         if !cwd.trim().is_empty() && !agent_paths_match(&session_cwd, cwd) {
             continue;
         }
-        if !transcript_has_exact_user_prompt(&messages, expected_user_message) {
+        let exact_prompt_match = transcript_has_exact_user_prompt(&messages, expected_user_message);
+        let timestamp_recovery_match = allow_timestamp_fallback
+            && !submitted_at.trim().is_empty()
+            && transcript_has_user_prompt_at_or_after(&messages, submitted_at);
+        if !exact_prompt_match && !timestamp_recovery_match {
             continue;
         }
 
@@ -1704,7 +1734,9 @@ fn discover_codex_session_by_prompt(
             session_title,
             rollout_path: path.to_string_lossy().to_string(),
             cwd: session_cwd,
-            matched_by: if cwd.trim().is_empty() {
+            matched_by: if timestamp_recovery_match && !exact_prompt_match {
+                "cwd+timestamp-recovery".to_string()
+            } else if cwd.trim().is_empty() {
                 "prompt".to_string()
             } else {
                 "prompt+cwd".to_string()
@@ -1974,7 +2006,12 @@ async fn agent_thread_session_discover(
     let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
         .to_lowercase();
     let expected_user_message = request.expected_user_message.unwrap_or_default();
-    if normalize_prompt_match_text(&expected_user_message).is_empty() {
+    let allow_timestamp_fallback = request.allow_timestamp_fallback.unwrap_or(false);
+    let submitted_at = request.submitted_at.unwrap_or_default();
+    let fallback_window_ms = request.fallback_window_ms.unwrap_or(90_000);
+    if normalize_prompt_match_text(&expected_user_message).is_empty()
+        && !(allow_timestamp_fallback && !submitted_at.trim().is_empty())
+    {
         return Err("Expected user message is required to discover an agent session.".to_string());
     }
 
@@ -1992,7 +2029,14 @@ async fn agent_thread_session_discover(
         return discover_opencode_session_by_prompt(&expected_user_message, &cwd, max_messages);
     }
 
-    discover_codex_session_by_prompt(&expected_user_message, &cwd, max_messages)
+    discover_codex_session_by_prompt(
+        &expected_user_message,
+        &cwd,
+        allow_timestamp_fallback,
+        &submitted_at,
+        fallback_window_ms,
+        max_messages,
+    )
 }
 
 #[tauri::command]

@@ -483,12 +483,13 @@ import {
   TODO_DROP_OVERLAY_TARGET_STYLE,
   TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS,
   TERMINAL_SCROLLBAR_PLATFORM,
-  applyTerminalInputChunkToDraft,
+  applyTerminalInputChunkToComposer,
   buildProviderTurnErrorProjectionEvents,
   buildProviderTurnProjectionEvents,
   buildProviderTurnStartProjectionEvents,
   buildTerminalSubmittedInput,
   closeWorkspaceTerminalPane,
+  createTerminalComposerState,
   createTerminalPromptSubmittedWaiter,
   createThreadProjectionToken,
   createWorkspaceThreadPromptAcceptedWaiter,
@@ -506,6 +507,8 @@ import {
   getTerminalPaneMinSizePercent,
   getTerminalRoleSwitchOptions,
   getTerminalSubmitSequence,
+  getTerminalComposerSnapshot,
+  getTerminalComposerText,
   getWorkspaceTerminalPaneId,
   getWorkspaceThreadComposerAttachments,
   getWorkspaceThreadComposerAttachmentSnapshot,
@@ -523,6 +526,7 @@ import {
   normalizeWorkspaceTerminalIndexes,
   appendWorkspaceThreadComposerAttachments,
   removeWorkspaceThreadComposerAttachment,
+  setTerminalComposerText,
   setWorkspaceThreadComposerDraft,
   setWorkspaceThreadComposerAttachments,
   subscribeWorkspaceThreadComposerAttachments,
@@ -1506,6 +1510,9 @@ function WorkspaceTerminal({
     binding,
     data,
     promptEventId,
+    promptEventRevision,
+    promptEventSource,
+    promptEventSubmittedAt,
     promptEventText,
     threadId,
   }) => {
@@ -1545,6 +1552,9 @@ function WorkspaceTerminal({
           instanceId: binding.instanceId,
           paneId: binding.paneId,
           promptEventId,
+          promptEventRevision,
+          promptEventSource,
+          promptEventSubmittedAt,
           promptEventText,
           threadId,
         });
@@ -2331,6 +2341,8 @@ function WorkspaceTerminal({
         instanceId: binding.instanceId,
         paneId: binding.paneId,
         promptEventId: promptId,
+        promptEventSource: "bigview-submit",
+        promptEventSubmittedAt: startedAt,
         promptEventText: text,
         threadId: latestThread.id,
       });
@@ -7507,6 +7519,56 @@ function WorkspaceTerminal({
         let terminalInputWriteChain = Promise.resolve();
         let terminalSubmittedInputHasText = false;
         let terminalSubmittedInputText = "";
+        let terminalSubmittedComposerState = createTerminalComposerState();
+        let terminalLastSelectionAt = 0;
+        let terminalLastSelectionText = "";
+        const setTerminalSubmittedComposerState = (nextState, reason = "unspecified") => {
+          terminalSubmittedComposerState = nextState || createTerminalComposerState();
+          terminalSubmittedInputText = getTerminalComposerText(terminalSubmittedComposerState);
+          terminalSubmittedInputHasText = terminalSubmittedInputText.trim().length > 0;
+          logBigViewSyncDiagnosticEvent("tui.text.composer_state_updated", {
+            agentId: terminalAgentKind,
+            confidence: terminalSubmittedComposerState.confidence,
+            cursorEnd: terminalSubmittedComposerState.cursorEnd,
+            cursorStart: terminalSubmittedComposerState.cursorStart,
+            draft: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
+            instanceId: terminalInstanceId,
+            paneId,
+            reason,
+            revision: terminalSubmittedComposerState.revision,
+            source: terminalSubmittedComposerState.source,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+          });
+        };
+        const getTerminalSelectionTextForComposer = () => {
+          if (terminal?.hasSelection?.()) {
+            const currentSelection = String(terminal.getSelection?.() || "").replace(/[\r\n]/g, "");
+            if (currentSelection) {
+              terminalLastSelectionAt = Date.now();
+              terminalLastSelectionText = currentSelection;
+              return currentSelection;
+            }
+          }
+
+          if (terminalLastSelectionText && Date.now() - terminalLastSelectionAt < 1500) {
+            return terminalLastSelectionText;
+          }
+
+          return "";
+        };
+        if (typeof terminal.onSelectionChange === "function") {
+          disposables.push(terminal.onSelectionChange(() => {
+            const selectionText = terminal?.hasSelection?.()
+              ? String(terminal.getSelection?.() || "").replace(/[\r\n]/g, "")
+              : "";
+            if (selectionText) {
+              terminalLastSelectionAt = Date.now();
+              terminalLastSelectionText = selectionText;
+            }
+          }));
+        }
         const syncCurrentTerminalComposerDraft = (value) => {
           setThreadComposerDraftValue(
             getCurrentThreadComposerSyncKey(terminalInstanceId),
@@ -7527,10 +7589,15 @@ function WorkspaceTerminal({
 
           const previousDraft = terminalSubmittedInputText;
           const previousHadText = terminalSubmittedInputHasText;
-          terminalSubmittedInputText = storeHasDraft
+          const nextDraft = storeHasDraft
             ? threadComposerDraftsRef.current.get(syncKey) || ""
             : "";
-          terminalSubmittedInputHasText = terminalSubmittedInputText.trim().length > 0;
+          setTerminalSubmittedComposerState(
+            setTerminalComposerText(terminalSubmittedComposerState, nextDraft, {
+              source: `store:${reason}`,
+            }),
+            `store:${reason}`,
+          );
           if (
             previousDraft !== terminalSubmittedInputText
             || previousHadText !== terminalSubmittedInputHasText
@@ -7560,21 +7627,36 @@ function WorkspaceTerminal({
 
           refreshTerminalComposerDraftFromStore("audio_input_before_apply");
           const draftBeforeApply = terminalSubmittedInputText;
+          const selectionText = getTerminalSelectionTextForComposer();
           if (terminalInputChunkHasVisibleText(safeInsertedText)) {
             terminalSubmittedInputHasText = true;
           }
-          terminalSubmittedInputText = applyTerminalInputChunkToDraft(
-            terminalSubmittedInputText,
-            safeInsertedText,
+          setTerminalSubmittedComposerState(
+            applyTerminalInputChunkToComposer(
+              terminalSubmittedComposerState,
+              safeInsertedText,
+              {
+                selectionText,
+                source: "audio_input",
+              },
+            ),
+            "audio_input",
           );
+          if (selectionText) {
+            terminalLastSelectionAt = 0;
+            terminalLastSelectionText = "";
+          }
           syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
           logBigViewSyncDiagnosticEvent("tui.audio.input_chunk_applied", {
             agentId: terminalAgentKind,
+            composerConfidence: terminalSubmittedComposerState.confidence,
+            composerRevision: terminalSubmittedComposerState.revision,
             draftAfter: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
             draftBefore: getBigViewTextDiagnosticFields(draftBeforeApply),
             inputDebug: getTerminalInputDebugFields(safeInsertedText),
             instanceId: terminalInstanceId,
             paneId,
+            selectionTextLength: selectionText.length,
             terminalIndex,
             threadId: terminalThreadIdRef.current || "",
             visibleText: getBigViewTextDiagnosticFields(terminalInputChunkVisibleText(safeInsertedText)),
@@ -7588,6 +7670,9 @@ function WorkspaceTerminal({
           const textData = String(data || "");
           const promptEventId = String(promptMetadata?.promptEventId || "").trim();
           const promptEventText = String(promptMetadata?.promptEventText || "").trim();
+          const promptEventRevision = Number.parseInt(promptMetadata?.promptEventRevision, 10);
+          const promptEventSource = String(promptMetadata?.promptEventSource || "").trim();
+          const promptEventSubmittedAt = String(promptMetadata?.promptEventSubmittedAt || "").trim();
           const isEscapeInput = String(data || "").includes("\x1b");
           const isSubmitInput = textData.includes("\r") || textData.includes("\n");
           const isFocusEventInput = textData.includes("\x1b[I") || textData.includes("\x1b[O");
@@ -7654,6 +7739,9 @@ function WorkspaceTerminal({
                 instanceId: terminalInstanceId,
                 data,
                 promptEventId: promptEventId || undefined,
+                promptEventRevision: Number.isFinite(promptEventRevision) ? promptEventRevision : undefined,
+                promptEventSource: promptEventSource || undefined,
+                promptEventSubmittedAt: promptEventSubmittedAt || undefined,
                 promptEventText: promptEventText || undefined,
                 threadId: terminalThreadIdRef.current,
               }).then((result) => {
@@ -7749,6 +7837,193 @@ function WorkspaceTerminal({
             }
           }
           return lines.join("\n");
+        };
+        const normalizeTerminalPromptCompareText = (value) => String(value || "")
+          .toLowerCase()
+          .replace(/\s+/g, "");
+        const getTerminalPromptWordSet = (value) => new Set(
+          String(value || "")
+            .toLowerCase()
+            .match(/[a-z0-9_.-]{3,}/g) || [],
+        );
+        const terminalPromptCandidateIsPlausible = (candidate, expected) => {
+          const safeCandidate = String(candidate || "").trim();
+          const safeExpected = String(expected || "").trim();
+          if (!safeCandidate) {
+            return false;
+          }
+          if (!safeExpected) {
+            return true;
+          }
+
+          const candidateCompare = normalizeTerminalPromptCompareText(safeCandidate);
+          const expectedCompare = normalizeTerminalPromptCompareText(safeExpected);
+          if (candidateCompare === expectedCompare) {
+            return true;
+          }
+          if (
+            candidateCompare.includes(expectedCompare.slice(0, Math.min(24, expectedCompare.length)))
+            || expectedCompare.includes(candidateCompare.slice(0, Math.min(24, candidateCompare.length)))
+          ) {
+            return true;
+          }
+
+          const candidateWords = getTerminalPromptWordSet(safeCandidate);
+          const expectedWords = getTerminalPromptWordSet(safeExpected);
+          if (!candidateWords.size || !expectedWords.size) {
+            return false;
+          }
+          let overlap = 0;
+          candidateWords.forEach((word) => {
+            if (expectedWords.has(word)) {
+              overlap += 1;
+            }
+          });
+          return overlap / Math.max(candidateWords.size, expectedWords.size) >= 0.35;
+        };
+        const stripTerminalPromptLinePrefix = (rawLine) => {
+          const text = String(rawLine || "")
+            .replace(/\u00a0/g, " ")
+            .replace(/[ \t]+$/g, "");
+          const promptMatch = text.match(/^([ \t]*(?:[\u203a\u276f\u2771>]\s*)+)([\s\S]*)$/u);
+          if (promptMatch) {
+            return {
+              prefixLength: promptMatch[1].length,
+              promptText: promptMatch[2].trim(),
+              rawText: text,
+            };
+          }
+
+          const trimmedStartLength = text.length - text.trimStart().length;
+          return {
+            prefixLength: trimmedStartLength,
+            promptText: text.trim(),
+            rawText: text,
+          };
+        };
+        const getTerminalActivePromptLineSnapshot = (expectedPrompt = "") => {
+          const activeBuffer = terminal?.buffer?.active;
+          if (!activeBuffer) {
+            return null;
+          }
+
+          const lineCount = Number(activeBuffer.length || 0);
+          if (!lineCount) {
+            return null;
+          }
+
+          const cursorLine = Math.min(
+            lineCount - 1,
+            Math.max(0, Number(activeBuffer.baseY || 0) + Number(activeBuffer.cursorY || 0)),
+          );
+          let startLine = cursorLine;
+          while (startLine > 0 && activeBuffer.getLine(startLine)?.isWrapped) {
+            startLine -= 1;
+          }
+          let endLine = cursorLine;
+          while (endLine + 1 < lineCount && activeBuffer.getLine(endLine + 1)?.isWrapped) {
+            endLine += 1;
+          }
+
+          const rowTexts = [];
+          for (let lineIndex = startLine; lineIndex <= endLine; lineIndex += 1) {
+            const line = activeBuffer.getLine(lineIndex);
+            if (!line) {
+              rowTexts.push("");
+              continue;
+            }
+            rowTexts.push(line.translateToString(lineIndex === endLine).replace(/\u00a0/g, " "));
+          }
+
+          const stripped = stripTerminalPromptLinePrefix(rowTexts.join(""));
+          if (
+            !stripped.promptText
+            || !terminalPromptCandidateIsPlausible(stripped.promptText, expectedPrompt)
+          ) {
+            return {
+              activeBufferBaseY: Number(activeBuffer.baseY || 0),
+              activeBufferCursorX: Number(activeBuffer.cursorX || 0),
+              activeBufferCursorY: Number(activeBuffer.cursorY || 0),
+              endLine,
+              plausible: false,
+              promptStartOffset: stripped.prefixLength,
+              promptText: stripped.promptText,
+              rawText: stripped.rawText,
+              rowTexts,
+              startLine,
+            };
+          }
+
+          return {
+            activeBufferBaseY: Number(activeBuffer.baseY || 0),
+            activeBufferCursorX: Number(activeBuffer.cursorX || 0),
+            activeBufferCursorY: Number(activeBuffer.cursorY || 0),
+            endLine,
+            plausible: true,
+            promptStartOffset: stripped.prefixLength,
+            promptText: stripped.promptText,
+            rawText: stripped.rawText,
+            rowTexts,
+            startLine,
+          };
+        };
+        const getTerminalSelectionPromptRange = (lineSnapshot) => {
+          if (!lineSnapshot || !terminal?.getSelectionPosition) {
+            return null;
+          }
+          const position = terminal.getSelectionPosition();
+          if (!position) {
+            return null;
+          }
+
+          const activeBuffer = terminal?.buffer?.active;
+          const rowCandidates = (row) => [
+            Number(row),
+            Number(activeBuffer?.viewportY || 0) + Number(row),
+            Number(activeBuffer?.baseY || 0) + Number(row),
+          ].filter(Number.isFinite);
+          const resolveRow = (row) => rowCandidates(row).find((candidate) => (
+            candidate >= lineSnapshot.startLine && candidate <= lineSnapshot.endLine
+          ));
+          const startRow = resolveRow(position.startRow);
+          const endRow = resolveRow(position.endRow);
+          if (!Number.isFinite(startRow) || !Number.isFinite(endRow)) {
+            return null;
+          }
+
+          const rowOffset = (row, column) => {
+            let offset = 0;
+            for (let lineIndex = lineSnapshot.startLine; lineIndex < row; lineIndex += 1) {
+              offset += String(lineSnapshot.rowTexts[lineIndex - lineSnapshot.startLine] || "").length;
+            }
+            return offset + Math.max(0, Number(column) || 0);
+          };
+          const rawStart = rowOffset(startRow, position.startColumn);
+          const rawEnd = rowOffset(endRow, position.endColumn);
+          const promptStart = Math.max(0, Number(lineSnapshot.promptStartOffset) || 0);
+          const promptLength = String(lineSnapshot.promptText || "").length;
+          const start = Math.max(0, Math.min(promptLength, Math.min(rawStart, rawEnd) - promptStart));
+          const end = Math.max(0, Math.min(promptLength, Math.max(rawStart, rawEnd) - promptStart));
+          if (end <= start) {
+            return null;
+          }
+          return { end, start };
+        };
+        const getTerminalPromptTextForSubmit = (composerText) => {
+          const safeComposerText = String(composerText || "").trim();
+          const lineSnapshot = getTerminalActivePromptLineSnapshot(safeComposerText);
+          const screenPrompt = String(lineSnapshot?.promptText || "").trim();
+          const useScreenPrompt = Boolean(lineSnapshot?.plausible && screenPrompt);
+          return {
+            lineSnapshot,
+            promptText: useScreenPrompt ? screenPrompt : safeComposerText,
+            source: useScreenPrompt
+              ? normalizeTerminalPromptCompareText(screenPrompt) === normalizeTerminalPromptCompareText(safeComposerText)
+                ? "terminal_screen_confirmed"
+                : "terminal_screen_reconciled"
+              : "composer_state",
+            usedTerminalScreen: useScreenPrompt,
+          };
         };
         const getTerminalBufferTailText = (maxRows = 12) => (
           getTerminalBufferText(terminal?.buffer?.active, maxRows)
@@ -7972,8 +8247,17 @@ function WorkspaceTerminal({
 
           refreshTerminalComposerDraftFromStore("shift_enter_before_update");
           flushTerminalInput("shift_enter_flush_before");
-          terminalSubmittedInputText = `${terminalSubmittedInputText}\n`;
-          terminalSubmittedInputHasText = true;
+          setTerminalSubmittedComposerState(
+            applyTerminalInputChunkToComposer(
+              terminalSubmittedComposerState,
+              "\n",
+              {
+                insertNewline: true,
+                source: "shift_enter",
+              },
+            ),
+            "shift_enter",
+          );
           syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
           writeTerminalInputChunk(TERMINAL_SHIFT_ENTER_SEQUENCE, "shift_enter");
           return true;
@@ -7987,13 +8271,29 @@ function WorkspaceTerminal({
 
           refreshTerminalComposerDraftFromStore("image_submit_before_submit");
           flushTerminalInput("image_submit_flush_before");
-          const promptText = terminalSubmittedInputText.trim();
+          const promptResolution = getTerminalPromptTextForSubmit(terminalSubmittedInputText);
+          if (
+            promptResolution.usedTerminalScreen
+            && promptResolution.promptText
+            && promptResolution.promptText !== terminalSubmittedInputText.trim()
+          ) {
+            setTerminalSubmittedComposerState(
+              setTerminalComposerText(terminalSubmittedComposerState, promptResolution.promptText, {
+                confidence: "certain",
+                source: promptResolution.source,
+              }),
+              promptResolution.source,
+            );
+            syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+          }
+          const promptText = promptResolution.promptText;
           logBigViewSyncDiagnosticEvent("tui.image.submit_start", {
             agentId: terminalAgentKind,
             attachmentCount: attachments.length,
             hasPromptText: Boolean(promptText),
             instanceId: terminalInstanceId,
             paneId,
+            promptResolutionSource: promptResolution.source,
             syncKey,
             terminalIndex,
             threadId: terminalThreadIdRef.current || "",
@@ -8011,8 +8311,13 @@ function WorkspaceTerminal({
                 isGenericTerminal,
               );
               const syncData = buildTerminalComposerDraftInput(promptText, message, true);
-              terminalSubmittedInputHasText = false;
-              terminalSubmittedInputText = "";
+              setTerminalSubmittedComposerState(
+                setTerminalComposerText(terminalSubmittedComposerState, "", {
+                  cursor: 0,
+                  source: "image_submit_sync_full",
+                }),
+                "image_submit_sync_full",
+              );
               setThreadComposerDraftValue(syncKey, message, "tui_image_submit_sync_full");
               logBigViewSyncDiagnosticEvent("tui.image.submit_sync_start", {
                 agentId: terminalAgentKind,
@@ -8185,14 +8490,34 @@ function WorkspaceTerminal({
           if (!startupControlReply && !terminalGeneratedReply) {
             refreshTerminalComposerDraftFromStore("input_before_apply");
             const draftBeforeApply = terminalSubmittedInputText;
-            terminalSubmittedInputText = applyTerminalInputChunkToDraft(
-              terminalSubmittedInputText,
-              safeData,
+            const selectionText = getTerminalSelectionTextForComposer();
+            setTerminalSubmittedComposerState(
+              applyTerminalInputChunkToComposer(
+                terminalSubmittedComposerState,
+                safeData,
+                {
+                  selectionText,
+                  source: isSubmitInput
+                    ? "submit_boundary"
+                    : safeData.startsWith("\x1b")
+                      ? "escape_sequence"
+                      : "terminal_input",
+                },
+              ),
+              isSubmitInput ? "submit_boundary" : "terminal_input",
             );
+            if (selectionText) {
+              terminalLastSelectionAt = 0;
+              terminalLastSelectionText = "";
+            }
             syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
             if (traceTextInputChunk) {
               logBigViewSyncDiagnosticEvent("tui.text.input_chunk_applied", {
                 agentId: terminalAgentKind,
+                composerConfidence: terminalSubmittedComposerState.confidence,
+                composerCursorEnd: terminalSubmittedComposerState.cursorEnd,
+                composerCursorStart: terminalSubmittedComposerState.cursorStart,
+                composerRevision: terminalSubmittedComposerState.revision,
                 draftAfter: getBigViewTextDiagnosticFields(terminalSubmittedInputText),
                 draftBefore: getBigViewTextDiagnosticFields(draftBeforeApply),
                 hadDraftAfter: terminalSubmittedInputHasText,
@@ -8202,6 +8527,7 @@ function WorkspaceTerminal({
                 isSubmitInput,
                 paneId,
                 rawText: getBigViewTextDiagnosticFields(safeData),
+                selectionTextLength: selectionText.length,
                 startupControlReply,
                 terminalIndex,
                 terminalGeneratedReply,
@@ -8231,7 +8557,22 @@ function WorkspaceTerminal({
               visibleText: getBigViewTextDiagnosticFields(visibleInputText),
               workspaceId: workspace?.id || "",
             });
-            const promptTextAtSubmit = terminalSubmittedInputText.trim();
+            const submitPromptResolution = getTerminalPromptTextForSubmit(terminalSubmittedInputText);
+            if (
+              submitPromptResolution.usedTerminalScreen
+              && submitPromptResolution.promptText
+              && submitPromptResolution.promptText !== terminalSubmittedInputText.trim()
+            ) {
+              setTerminalSubmittedComposerState(
+                setTerminalComposerText(terminalSubmittedComposerState, submitPromptResolution.promptText, {
+                  confidence: "certain",
+                  source: submitPromptResolution.source,
+                }),
+                submitPromptResolution.source,
+              );
+              syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+            }
+            const promptTextAtSubmit = submitPromptResolution.promptText;
             if (
               terminalSubmittedInputHasText
               && promptTextAtSubmit
@@ -8240,6 +8581,14 @@ function WorkspaceTerminal({
             ) {
               const promptId = createThreadProjectionToken("terminal-prompt");
               const startedAt = new Date().toISOString();
+              const promptEventSource = submitPromptResolution.usedTerminalScreen
+                ? `tui-manual-input:${submitPromptResolution.source}`
+                : "tui-manual-input";
+              const promptSnapshot = getTerminalComposerSnapshot(terminalSubmittedComposerState, {
+                promptEventId: promptId,
+                source: promptEventSource,
+                submittedAt: startedAt,
+              });
               const turnId = `turn-${promptId}`;
               const threadId = terminalThreadIdRef.current || "";
               const workspaceId = workspace?.id || "";
@@ -8263,7 +8612,11 @@ function WorkspaceTerminal({
               confirmedSubmitBridge = {
                 acceptedWaiter,
                 promptEventId: promptId,
+                promptEventRevision: promptSnapshot.revision,
+                promptEventSource: promptSnapshot.source,
+                promptEventSubmittedAt: promptSnapshot.submittedAt,
                 promptEventText: promptTextAtSubmit,
+                promptSnapshot,
                 startedAt,
                 submittedWaiterReady,
                 syncKey,
@@ -8276,6 +8629,12 @@ function WorkspaceTerminal({
                 instanceId: terminalInstanceId,
                 paneId,
                 promptEventId: promptId,
+                promptRevision: promptSnapshot.revision,
+                promptSource: promptSnapshot.source,
+                promptResolutionSource: submitPromptResolution.source,
+                screenPrompt: getBigViewTextDiagnosticFields(
+                  submitPromptResolution.lineSnapshot?.promptText || "",
+                ),
                 promptText: getBigViewTextDiagnosticFields(promptTextAtSubmit),
                 syncKey,
                 terminalIndex,
@@ -8293,6 +8652,8 @@ function WorkspaceTerminal({
                     messageId: confirmedSubmitBridge.promptEventId,
                     messageSource: "tui-manual-input",
                     promptEventId: confirmedSubmitBridge.promptEventId,
+                    promptEventRevision: confirmedSubmitBridge.promptEventRevision,
+                    promptEventSource: confirmedSubmitBridge.promptEventSource,
                     source: "tui-manual-input",
                     turnId: confirmedSubmitBridge.turnId,
                   }
@@ -8302,8 +8663,13 @@ function WorkspaceTerminal({
                   },
               );
             }
-            terminalSubmittedInputHasText = false;
-            terminalSubmittedInputText = "";
+            setTerminalSubmittedComposerState(
+              setTerminalComposerText(terminalSubmittedComposerState, "", {
+                cursor: 0,
+                source: "submit_boundary_clear",
+              }),
+              "submit_boundary_clear",
+            );
             syncCurrentTerminalComposerDraft("");
             logBigViewSyncDiagnosticEvent("tui.text.submit_boundary_cleared", {
               agentId: terminalAgentKind,
@@ -8344,6 +8710,9 @@ function WorkspaceTerminal({
                 .then((submittedWaiter) => {
                   const writePromise = flushTerminalInput("submit", {
                     promptEventId: bridge.promptEventId,
+                    promptEventRevision: bridge.promptEventRevision,
+                    promptEventSource: bridge.promptEventSource,
+                    promptEventSubmittedAt: bridge.promptEventSubmittedAt,
                     promptEventText: bridge.promptEventText,
                   });
                   return Promise.resolve(writePromise)
@@ -8468,14 +8837,46 @@ function WorkspaceTerminal({
 
           event.preventDefault();
           event.stopPropagation();
+          const selectionLineSnapshot = getTerminalActivePromptLineSnapshot(terminalSubmittedInputText);
+          const selectionRange = getTerminalSelectionPromptRange(selectionLineSnapshot);
           Promise.resolve(flushTerminalInput("selection_delete_flush_before"))
             .then(() => invoke("terminal_delete_selection", {
+              currentLine: selectionLineSnapshot?.plausible
+                ? selectionLineSnapshot.promptText
+                : terminalSubmittedInputText,
               paneId,
               instanceId: terminalInstanceId,
               selection,
+              selectionEnd: selectionRange?.end,
+              selectionStart: selectionRange?.start,
             }))
             .then((result) => {
               if (result?.deleted) {
+                const remainingLine = String(result?.remainingLine || "");
+                if (remainingLine || result?.remainingChars === 0) {
+                  setTerminalSubmittedComposerState(
+                    setTerminalComposerText(terminalSubmittedComposerState, remainingLine, {
+                      confidence: "certain",
+                      source: "selection_delete_rewrite",
+                    }),
+                    "selection_delete_rewrite",
+                  );
+                } else {
+                  setTerminalSubmittedComposerState(
+                    applyTerminalInputChunkToComposer(
+                      terminalSubmittedComposerState,
+                      event.key === "Delete" ? "\x1b[3~" : "\x7f",
+                      {
+                        selectionText: selection,
+                        source: "selection_delete",
+                      },
+                    ),
+                    "selection_delete",
+                  );
+                }
+                syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+                terminalLastSelectionAt = 0;
+                terminalLastSelectionText = "";
                 terminal.clearSelection?.();
               }
             })
@@ -9209,11 +9610,14 @@ function WorkspaceTerminal({
             workspaceId: workspace?.id || thread?.workspaceId || "",
           });
           try {
+            const pendingPromptSubmittedAt = new Date().toISOString();
             await invoke("terminal_write", {
               data: getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal),
               instanceId: currentInstanceId,
               paneId,
               promptEventId: promptId,
+              promptEventSource: "pending-prompt",
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
               promptEventText: promptText,
               threadId: currentThreadId,
             });
@@ -9640,6 +10044,8 @@ function WorkspaceTerminal({
       threadId: terminalThreadIdRef.current || "",
       workspaceId: workspace?.id || "",
     });
+    const promptEventId = createThreadProjectionToken("native-drop-prompt");
+    const promptEventSubmittedAt = new Date().toISOString();
     recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt);
 
     try {
@@ -9647,6 +10053,9 @@ function WorkspaceTerminal({
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
         data: buildTerminalSubmittedInput(prompt, terminalAgentKind, isGenericTerminal),
+        promptEventId,
+        promptEventSource: "native-drop",
+        promptEventSubmittedAt,
         promptEventText: prompt,
         threadId: terminalThreadIdRef.current,
       });

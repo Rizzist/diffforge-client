@@ -44,6 +44,7 @@ pub struct McpContext {
     pub agent_slot_id: Option<String>,
     pub slot_key: Option<String>,
     pub session_id: Option<String>,
+    pub terminal_launch_epoch: Option<String>,
     pub task_id: Option<String>,
     pub worktree_id: Option<String>,
     pub worktree_path: Option<String>,
@@ -66,6 +67,9 @@ impl McpContext {
                 ("--agent-slot-id", Some(value)) => context.agent_slot_id = Some(value),
                 ("--slot-key", Some(value)) => context.slot_key = Some(value),
                 ("--session-id", Some(value)) => context.session_id = Some(value),
+                ("--terminal-launch-epoch", Some(value)) => {
+                    context.terminal_launch_epoch = Some(value)
+                }
                 ("--task-id", Some(value)) => context.task_id = Some(value),
                 ("--worktree-id", Some(value)) => context.worktree_id = Some(value),
                 ("--worktree-path", Some(value)) => context.worktree_path = Some(value),
@@ -88,6 +92,7 @@ impl McpContext {
             agent_slot_id: string_field(value, "agent_slot_id"),
             slot_key: string_field(value, "slot_key"),
             session_id: string_field(value, "session_id"),
+            terminal_launch_epoch: string_field(value, "terminal_launch_epoch"),
             task_id: string_field(value, "task_id"),
             worktree_id: string_field(value, "worktree_id"),
             worktree_path: string_field(value, "worktree_path"),
@@ -107,6 +112,7 @@ impl McpContext {
             "agent_slot_id": self.agent_slot_id,
             "slot_key": self.slot_key,
             "session_id": self.session_id,
+            "terminal_launch_epoch": self.terminal_launch_epoch,
             "task_id": self.task_id,
             "worktree_id": self.worktree_id,
             "worktree_path": self.worktree_path,
@@ -139,6 +145,10 @@ impl McpContext {
         );
         set_default_from_env(&mut self.agent_slot_id, &["COORDINATION_AGENT_SLOT_ID"]);
         set_default_from_env(&mut self.slot_key, &["COORDINATION_SLOT_KEY"]);
+        set_default_from_env(
+            &mut self.terminal_launch_epoch,
+            &["COORDINATION_TERMINAL_LAUNCH_EPOCH"],
+        );
         set_default_from_env(
             &mut self.session_id,
             &[
@@ -959,6 +969,7 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
         },
         json!({
             "slot_key": context.slot_key.clone(),
+            "terminal_launch_epoch": context.terminal_launch_epoch.clone(),
             "worktree_id": worktree_id,
             "worktree_path": worktree_path,
             "workspace_id": context.workspace_id.clone(),
@@ -1050,6 +1061,7 @@ fn dispatch_tool_result(
         Err(error) => return Ok(api_error("kernel_open_failed", error, json!({}))),
     };
     apply_live_session_defaults(&kernel, &mut input);
+    reconnect_mcp_session_if_needed(&kernel, &input, tool)?;
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
@@ -1061,6 +1073,36 @@ fn dispatch_tool_result(
             json!({}),
         )),
     }
+}
+
+fn reconnect_mcp_session_if_needed(
+    kernel: &CoordinationKernel,
+    input: &Value,
+    tool: &str,
+) -> Result<(), String> {
+    let Some(agent_id) = input["agent_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(session_id) = input["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    if session_is_active_for_agent(kernel, session_id, agent_id)? {
+        return Ok(());
+    }
+    let reason = format!("mcp_{tool}_reconnect");
+    let _ = kernel.reactivate_interrupted_session_for_agent(
+        session_id,
+        agent_id,
+        input["terminal_launch_epoch"].as_str(),
+        &reason,
+    )?;
+    Ok(())
 }
 
 fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -1116,15 +1158,24 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
 
     if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
         if !session_is_active_for_agent(kernel, session_id, agent_id)? {
-            return Ok(api_error(
-                "mcp_session_inactive_reconnect_required",
-                "This MCP session is no longer active. Reconnect the agent session before starting a task so Cloud and local coordination stay in sync.",
-                json!({
-                    "session_id": session_id,
-                    "agent_id": agent_id,
-                    "contract": "diffforge.app_ws.v1",
-                }),
-            ));
+            let reactivated = kernel.reactivate_interrupted_session_for_agent(
+                session_id,
+                agent_id,
+                input["terminal_launch_epoch"].as_str(),
+                "mcp_start_task_reconnect",
+            )?;
+            if reactivated.is_none() && !session_is_active_for_agent(kernel, session_id, agent_id)?
+            {
+                return Ok(api_error(
+                    "mcp_session_inactive_reconnect_required",
+                    "This MCP session is no longer active. Reconnect the agent session before starting a task so Cloud and local coordination stay in sync.",
+                    json!({
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "contract": "diffforge.app_ws.v1",
+                    }),
+                ));
+            }
         }
     }
 
@@ -1801,6 +1852,7 @@ fn apply_context_defaults(context: &McpContext, input: &mut Value) {
         ("agent_slot_id", &context.agent_slot_id),
         ("slot_key", &context.slot_key),
         ("session_id", &context.session_id),
+        ("terminal_launch_epoch", &context.terminal_launch_epoch),
         ("task_id", &context.task_id),
         ("worktree_id", &context.worktree_id),
         ("worktree_path", &context.worktree_path),
@@ -1832,7 +1884,15 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
         .get("session_id")
         .and_then(Value::as_str)
         .is_none_or(|value| value.trim().is_empty());
-    if !missing_task_id && !missing_agent_id && !missing_session_id {
+    let missing_terminal_launch_epoch = object
+        .get("terminal_launch_epoch")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if !missing_task_id
+        && !missing_agent_id
+        && !missing_session_id
+        && !missing_terminal_launch_epoch
+    {
         return;
     }
 
@@ -1852,6 +1912,7 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
         ("agent_kind", "agent_kind"),
         ("agent_slot_id", "agent_slot_id"),
         ("session_id", "id"),
+        ("terminal_launch_epoch", "terminal_launch_epoch"),
         ("task_id", "task_id"),
         ("worktree_id", "worktree_id"),
     ] {

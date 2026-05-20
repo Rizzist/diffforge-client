@@ -48,11 +48,12 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] =
     &["start_task", "acquire_lease", "checkpoint", "submit_patch"];
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SessionSlotOptions {
     refresh_worktree: bool,
     prepared_worktree_only: bool,
     replace_active_session: bool,
+    terminal_launch_epoch: Option<String>,
 }
 
 impl Default for SessionSlotOptions {
@@ -61,6 +62,7 @@ impl Default for SessionSlotOptions {
             refresh_worktree: true,
             prepared_worktree_only: false,
             replace_active_session: false,
+            terminal_launch_epoch: None,
         }
     }
 }
@@ -2565,6 +2567,7 @@ impl CoordinationKernel {
         write_enabled: bool,
         context_run_id: Option<&str>,
         context_role: Option<&str>,
+        terminal_launch_epoch: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
         let session = self.create_session_for_slot_with_options(
@@ -2578,6 +2581,10 @@ impl CoordinationKernel {
                 refresh_worktree: false,
                 prepared_worktree_only: true,
                 replace_active_session: true,
+                terminal_launch_epoch: terminal_launch_epoch
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
             },
         )?;
         Ok(session)
@@ -2632,6 +2639,24 @@ impl CoordinationKernel {
                     let requested_pty = pty_id.unwrap_or("");
                     if !requested_pty.is_empty() && existing_pty == requested_pty {
                         self.heartbeat_session(active_session_id)?;
+                        if let Some(terminal_launch_epoch) =
+                            options.terminal_launch_epoch.as_deref()
+                        {
+                            self.conn
+                                .execute(
+                                    "UPDATE agent_sessions
+                                     SET terminal_launch_epoch=?1, updated_at=?2
+                                     WHERE id=?3",
+                                    params![
+                                        terminal_launch_epoch,
+                                        now_rfc3339(),
+                                        active_session_id
+                                    ],
+                                )
+                                .map_err(|error| {
+                                    format!("Unable to advance terminal launch epoch: {error}")
+                                })?;
+                        }
                         if let Some(task_id) = task_id {
                             self.conn
                                 .execute(
@@ -2750,6 +2775,18 @@ impl CoordinationKernel {
                     )
                     .map_err(|error| format!("Unable to repair active slot pointer: {error}"))?;
                 self.heartbeat_session(existing_session_id)?;
+                if let Some(terminal_launch_epoch) = options.terminal_launch_epoch.as_deref() {
+                    self.conn
+                        .execute(
+                            "UPDATE agent_sessions
+                             SET terminal_launch_epoch=?1, updated_at=?2
+                             WHERE id=?3",
+                            params![terminal_launch_epoch, now_rfc3339(), existing_session_id],
+                        )
+                        .map_err(|error| {
+                            format!("Unable to advance repaired terminal launch epoch: {error}")
+                        })?;
+                }
                 let mcp_config = self.write_or_update_slot_mcp_config(
                     agent_slot_id,
                     existing_session_id,
@@ -2934,9 +2971,9 @@ impl CoordinationKernel {
             .execute(
                 "INSERT INTO agent_sessions(
                     id, agent_id, agent_slot_id, task_id, context_run_id,
-                    context_role, pty_id, worktree_id, base_git_sha, current_git_sha,
+                    context_role, pty_id, terminal_launch_epoch, worktree_id, base_git_sha, current_git_sha,
                     status, write_root, enforcement_mode, last_heartbeat_at, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'active', ?10, ?11, ?12, ?12, ?12)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 'active', ?11, ?12, ?13, ?13, ?13)",
                 params![
                     id,
                     agent_id,
@@ -2945,6 +2982,7 @@ impl CoordinationKernel {
                     context_run_id,
                     context_role,
                     pty_id,
+                    options.terminal_launch_epoch.as_deref(),
                     worktree_id,
                     base_git_sha,
                     write_root,
@@ -3053,6 +3091,7 @@ impl CoordinationKernel {
             .to_string();
         let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
         let slot_key = session["slotKey"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminalLaunchEpoch"].as_str().map(str::to_string);
         let worktree_id = session["worktreeId"].as_str().map(str::to_string);
         let write_root = session["writeRoot"]
             .as_str()
@@ -3095,6 +3134,7 @@ impl CoordinationKernel {
             agent_slot_id,
             slot_key,
             session_id,
+            terminal_launch_epoch,
             task_id: task_id.map(str::to_string),
             worktree_id,
             worktree_path,
@@ -3125,6 +3165,7 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         context_run_id: Option<&str>,
         context_role: Option<&str>,
+        terminal_launch_epoch: Option<&str>,
     ) -> Result<TerminalCoordinationContext, String> {
         let objective_key = require_workspace_objective_key(workspace_id)?;
         let _workspace_mcp =
@@ -3141,6 +3182,7 @@ impl CoordinationKernel {
             true,
             context_run_id,
             context_role,
+            terminal_launch_epoch,
         )?;
         let context = self.terminal_context_from_session(
             session,
@@ -3173,6 +3215,7 @@ impl CoordinationKernel {
             .to_string();
         let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
         let slot_key = session["slotKey"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminalLaunchEpoch"].as_str().map(str::to_string);
         let worktree_id = session["worktreeId"].as_str().map(str::to_string);
         let write_root = session["writeRoot"]
             .as_str()
@@ -3215,6 +3258,7 @@ impl CoordinationKernel {
             agent_slot_id,
             slot_key,
             session_id,
+            terminal_launch_epoch,
             task_id: task_id.map(str::to_string),
             worktree_id,
             worktree_path,
@@ -4701,6 +4745,234 @@ impl CoordinationKernel {
             return Err("Session is not active.".to_string());
         }
         Ok(json!({"session_id": session_id, "status": "active"}))
+    }
+
+    pub fn interrupt_session_for_terminal_launch(
+        &self,
+        session_id: &str,
+        reason: &str,
+        expected_terminal_launch_epoch: Option<&str>,
+    ) -> Result<Value, String> {
+        if let Some(expected_epoch) = expected_terminal_launch_epoch
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let rows = self.query_json(
+                "SELECT id, status, terminal_launch_epoch
+                 FROM agent_sessions
+                 WHERE id=?1
+                 LIMIT 1",
+                &[&session_id],
+            )?;
+            if let Some(session) = rows.into_iter().next() {
+                let current_epoch = session["terminal_launch_epoch"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if current_epoch != expected_epoch {
+                    let event_id = self.emit_event(
+                        "agent_session_interrupt_skipped",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs {
+                            session_id: Some(session_id.to_string()),
+                            ..EventRefs::default()
+                        },
+                        json!({
+                            "reason": reason,
+                            "skip_reason": "stale_terminal_launch_epoch",
+                            "expected_terminal_launch_epoch": expected_epoch,
+                            "current_terminal_launch_epoch": current_epoch,
+                            "session_status": session["status"].as_str(),
+                        }),
+                    )?;
+                    return Ok(json!({
+                        "status": "skipped",
+                        "reason": "stale_terminal_launch_epoch",
+                        "session_id": session_id,
+                        "event_id": event_id,
+                    }));
+                }
+            }
+        }
+
+        self.interrupt_session(session_id, reason)
+    }
+
+    pub fn reactivate_interrupted_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        terminal_launch_epoch: Option<&str>,
+        reason: &str,
+    ) -> Result<Option<Value>, String> {
+        let Some(session) = self
+            .query_json(
+                "SELECT * FROM agent_sessions WHERE id=?1 AND agent_id=?2 LIMIT 1",
+                &[&session_id, &agent_id],
+            )?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+
+        if session["status"].as_str() == Some("active") {
+            self.heartbeat_session(session_id)?;
+            return self
+                .query_json(
+                    "SELECT * FROM agent_sessions WHERE id=?1 LIMIT 1",
+                    &[&session_id],
+                )?
+                .into_iter()
+                .next()
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("Session {session_id} disappeared after heartbeat reactivation.")
+                });
+        }
+
+        if session["status"].as_str() != Some("interrupted") {
+            return Ok(None);
+        }
+
+        let Some(agent_slot_id) = session["agent_slot_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let active_peer = self.query_json(
+            "SELECT id FROM agent_sessions
+             WHERE agent_slot_id=?1 AND status='active' AND id<>?2
+             LIMIT 1",
+            &[&agent_slot_id, &session_id],
+        )?;
+        if !active_peer.is_empty() {
+            return Ok(None);
+        }
+
+        let requires_worktree = session["enforcement_mode"]
+            .as_str()
+            .unwrap_or("worktree_required")
+            == "worktree_required";
+        if requires_worktree {
+            if let Some(problem) = self.session_worktree_isolation_problem(&session)? {
+                self.emit_event(
+                    "agent_session_reactivation_blocked",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs {
+                        agent_id: Some(agent_id.to_string()),
+                        agent_slot_id: Some(agent_slot_id.to_string()),
+                        session_id: Some(session_id.to_string()),
+                        ..EventRefs::default()
+                    },
+                    json!({
+                        "reason": reason,
+                        "problem": problem,
+                    }),
+                )?;
+                return Ok(None);
+            }
+        }
+
+        if !requires_worktree
+            && session["write_root"]
+                .as_str()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            self.emit_event(
+                "agent_session_reactivation_blocked",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: Some(agent_slot_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "reason": reason,
+                    "problem": {
+                        "reason": "missing_write_root",
+                        "session_id": session_id,
+                    },
+                }),
+            )?;
+            return Ok(None);
+        }
+
+        let now = now_rfc3339();
+        let reactivated_rows = self
+            .conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET status='active',
+                     terminal_launch_epoch=COALESCE(?1, terminal_launch_epoch),
+                     last_heartbeat_at=?2,
+                     updated_at=?2
+                 WHERE id=?3 AND agent_id=?4 AND status='interrupted'",
+                params![
+                    terminal_launch_epoch
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    now,
+                    session_id,
+                    agent_id
+                ],
+            )
+            .map_err(|error| format!("Unable to reactivate interrupted session: {error}"))?;
+        if reactivated_rows == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .execute(
+                "UPDATE agent_slots
+                 SET active_session_id=?1, status='active', updated_at=?2
+                 WHERE id=?3",
+                params![session_id, now_rfc3339(), agent_slot_id],
+            )
+            .map_err(|error| format!("Unable to restore active session slot: {error}"))?;
+        if let Some(worktree_id) = session["worktree_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let _ = self.conn.execute(
+                "UPDATE worktrees SET status='active', updated_at=?1 WHERE id=?2",
+                params![now_rfc3339(), worktree_id],
+            );
+        }
+        self.emit_event(
+            "agent_session_reactivated",
+            "agent",
+            agent_id,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: Some(agent_slot_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                task_id: session["task_id"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "reason": reason,
+                "terminal_launch_epoch": terminal_launch_epoch,
+                "previous_status": "interrupted",
+            }),
+        )?;
+
+        self.query_json(
+            "SELECT * FROM agent_sessions WHERE id=?1 LIMIT 1",
+            &[&session_id],
+        )?
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or_else(|| format!("Session {session_id} disappeared after reactivation."))
     }
 
     pub fn acquire_lease(
@@ -15689,6 +15961,7 @@ impl CoordinationKernel {
             "slotKey": slot["slot_key"].as_str().unwrap_or_default(),
             "taskId": session["task_id"].as_str(),
             "ptyId": session["pty_id"].as_str(),
+            "terminalLaunchEpoch": session["terminal_launch_epoch"].as_str(),
             "worktreeId": session["worktree_id"].as_str(),
             "writeRoot": session["write_root"].as_str().unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or("")),
             "enforcementMode": session["enforcement_mode"].as_str().unwrap_or("coordination_only"),
@@ -18351,6 +18624,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session["task_id"].as_str(), Some(task_id));
+    }
+
+    #[test]
+    fn terminal_launch_epoch_skips_stale_cleanup_after_session_reuse() {
+        let repo = init_git_repo("terminal_launch_epoch_cleanup");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let first = kernel
+            .create_terminal_session_for_slot_key(
+                "1",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-1"),
+                false,
+                None,
+                None,
+                Some("epoch-1"),
+            )
+            .unwrap();
+        let session_id = first["id"].as_str().unwrap().to_string();
+
+        let second = kernel
+            .create_terminal_session_for_slot_key(
+                "1",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-1"),
+                false,
+                None,
+                None,
+                Some("epoch-2"),
+            )
+            .unwrap();
+        assert_eq!(second["id"].as_str(), Some(session_id.as_str()));
+        assert_eq!(second["terminalLaunchEpoch"].as_str(), Some("epoch-2"));
+
+        let stale_cleanup = kernel
+            .interrupt_session_for_terminal_launch(&session_id, "terminal_close", Some("epoch-1"))
+            .unwrap();
+        assert_eq!(stale_cleanup["status"].as_str(), Some("skipped"));
+
+        let session = kernel
+            .query_one(
+                "SELECT status, terminal_launch_epoch FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(session["status"].as_str(), Some("active"));
+        assert_eq!(session["terminal_launch_epoch"].as_str(), Some("epoch-2"));
+    }
+
+    #[test]
+    fn mcp_start_task_reactivates_interrupted_session() {
+        let repo = init_git_repo("mcp_reactivate_interrupted_session");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let session = kernel
+            .create_session(&agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        kernel
+            .interrupt_session(&session_id, "terminal_close")
+            .unwrap();
+        let cloud_url = fake_cloud_mcp_url("cloud-reactivated-task", false);
+
+        let started = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(agent_id.clone()),
+                session_id: Some(session_id.clone()),
+                terminal_launch_epoch: Some("epoch-resume".to_string()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Continue after a terminal reconnect."
+            }),
+        );
+
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        assert_eq!(
+            started["data"]["task_id"].as_str(),
+            Some("cloud-reactivated-task")
+        );
+        let session = kernel
+            .query_one(
+                "SELECT status, task_id, terminal_launch_epoch FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(session["status"].as_str(), Some("active"));
+        assert_eq!(session["task_id"].as_str(), Some("cloud-reactivated-task"));
+        assert_eq!(
+            session["terminal_launch_epoch"].as_str(),
+            Some("epoch-resume")
+        );
     }
 
     #[test]

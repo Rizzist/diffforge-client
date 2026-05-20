@@ -16,6 +16,7 @@ use super::schema::{
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
+    TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
 };
 
 pub const REPO_ID: &str = "local";
@@ -302,6 +303,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_dependency_graph_migration(connection)?);
     diagnostics.push(apply_task_lifecycle_migration(connection)?);
     diagnostics.push(apply_integrator_policy_migration(connection)?);
+    diagnostics.push(apply_terminal_launch_epoch_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -530,6 +532,38 @@ fn apply_integrator_policy_migration(
         connection,
         INTEGRATOR_POLICY_MIGRATION_VERSION,
         INTEGRATOR_POLICY_MIGRATION_NAME,
+    )?;
+    migration.details.splice(0..0, details);
+    Ok(migration)
+}
+
+fn apply_terminal_launch_epoch_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
+            TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let mut details = Vec::new();
+    let added = ensure_column(
+        connection,
+        "agent_sessions",
+        "terminal_launch_epoch",
+        "TEXT",
+    )?;
+    details.push(format!(
+        "agent_sessions.terminal_launch_epoch {}",
+        if added { "added" } else { "already_present" }
+    ));
+    let mut migration = record_migration_if_missing(
+        connection,
+        TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
+        TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME,
     )?;
     migration.details.splice(0..0, details);
     Ok(migration)

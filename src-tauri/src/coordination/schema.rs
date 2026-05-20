@@ -16,6 +16,8 @@ pub const TASK_LIFECYCLE_MIGRATION_NAME: &str = "coordination_kernel_task_lifecy
 pub const INTEGRATOR_POLICY_MIGRATION_VERSION: i64 = 8;
 pub const INTEGRATOR_POLICY_MIGRATION_NAME: &str =
     "coordination_kernel_concurrent_integrator_policy";
+pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION: i64 = 9;
+pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME: &str = "coordination_kernel_terminal_launch_epoch";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions(
   context_run_id TEXT,
   context_role TEXT,
   pty_id TEXT,
+  terminal_launch_epoch TEXT,
   worktree_id TEXT,
   sandbox_db_id TEXT,
   base_git_sha TEXT,

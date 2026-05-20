@@ -378,6 +378,9 @@ async fn write_to_active_terminal_audio_input_target(
         None,
         None,
         None,
+        None,
+        None,
+        None,
     )
     .await?;
     emit_terminal_audio_input_refocus(app, &target, Some(data));
@@ -534,7 +537,11 @@ fn interrupt_terminal_coordination_session(
         Err(_) => return,
     };
 
-    let _ = kernel.interrupt_session(&coordination.session_id, reason);
+    let _ = kernel.interrupt_session_for_terminal_launch(
+        &coordination.session_id,
+        reason,
+        coordination.terminal_launch_epoch.as_deref(),
+    );
 }
 
 fn terminal_coordination_session_from_context(
@@ -547,7 +554,34 @@ fn terminal_coordination_session_from_context(
         agent_id: context.agent_id.clone(),
         agent_kind: context.agent_kind.clone(),
         session_id: context.session_id.clone(),
+        terminal_launch_epoch: context.terminal_launch_epoch.clone(),
         env_vars: context.env_vars(),
+    }
+}
+
+fn ensure_terminal_coordination_ready_for_prompt(
+    coordination: &TerminalCoordinationSession,
+) -> Result<(), String> {
+    let kernel = crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    )?;
+
+    if kernel.heartbeat_session(&coordination.session_id).is_ok() {
+        return Ok(());
+    }
+
+    match kernel.reactivate_interrupted_session_for_agent(
+        &coordination.session_id,
+        &coordination.agent_id,
+        coordination.terminal_launch_epoch.as_deref(),
+        "terminal_prompt_submit_reconnect",
+    )? {
+        Some(_) => Ok(()),
+        None => Err(
+            "Coordination session is not active. Reconnect the terminal before sending a prompt."
+                .to_string(),
+        ),
     }
 }
 
@@ -563,6 +597,7 @@ struct TerminalShutdownCoordinationCleanup {
     repo_path: String,
     db_path: String,
     session_id: String,
+    terminal_launch_epoch: Option<String>,
 }
 
 fn terminal_shutdown_coordination_cleanup_from_instance(
@@ -573,6 +608,7 @@ fn terminal_shutdown_coordination_cleanup_from_instance(
         repo_path: coordination.repo_path.clone(),
         db_path: coordination.db_path.clone(),
         session_id: coordination.session_id.clone(),
+        terminal_launch_epoch: coordination.terminal_launch_epoch.clone(),
     })
 }
 
@@ -608,11 +644,6 @@ fn cleanup_terminal_shutdown_coordination_batch(
     }
 
     for ((repo_path, db_path), group) in grouped {
-        let session_ids = group
-            .iter()
-            .map(|cleanup| cleanup.session_id.clone())
-            .collect::<Vec<_>>();
-
         let kernel = match crate::coordination::CoordinationKernel::open_for_shutdown_cleanup(
             &repo_path,
             Some(PathBuf::from(&db_path)),
@@ -621,7 +652,13 @@ fn cleanup_terminal_shutdown_coordination_batch(
             Err(_) => continue,
         };
 
-        let _ = kernel.interrupt_sessions_for_shutdown(&session_ids, reason);
+        for cleanup in group {
+            let _ = kernel.interrupt_session_for_terminal_launch(
+                &cleanup.session_id,
+                reason,
+                cleanup.terminal_launch_epoch.as_deref(),
+            );
+        }
     }
 }
 
@@ -869,6 +906,7 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
 
 async fn prepare_terminal_coordination_launch(
     pty_id: String,
+    terminal_launch_epoch: String,
     working_directory: PathBuf,
     kind: String,
     provider_for_coordination: Option<String>,
@@ -928,6 +966,7 @@ async fn prepare_terminal_coordination_launch(
             None,
             None,
             None,
+            Some(&terminal_launch_epoch),
         ) {
             Ok(context) => {
                 let worktree_required = context.enforcement_mode == "worktree_required";
@@ -1553,6 +1592,7 @@ async fn terminal_open(
             .next_terminal_instance_id
             .fetch_add(1, Ordering::Relaxed)
     });
+    let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if plain_shell {
     } else if !is_prewarm_pty {
         ensure_workspace_git_bootstrap_for_terminal(&working_directory).await?;
@@ -1564,6 +1604,7 @@ async fn terminal_open(
         };
         let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
             coordination_pty_id,
+            terminal_launch_epoch,
             working_directory.clone(),
             kind.clone(),
             provider_for_coordination.clone(),
@@ -2293,6 +2334,175 @@ async fn terminal_write_to_audio_input_target(
     Ok(wrote)
 }
 
+fn terminal_input_gate_line_char_len(gate: &TerminalInputGate) -> usize {
+    gate.current_line.chars().count()
+}
+
+fn terminal_input_gate_clamp_cursor(gate: &mut TerminalInputGate) {
+    let len = terminal_input_gate_line_char_len(gate);
+    if gate.cursor_position > len {
+        gate.cursor_position = len;
+    }
+}
+
+fn terminal_input_gate_byte_index(line: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+
+    line.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(line.len())
+}
+
+fn terminal_input_gate_previous_word_boundary(line: &str, cursor: usize) -> usize {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn terminal_input_gate_next_word_boundary(line: &str, cursor: usize) -> usize {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn terminal_input_gate_replace_char_range(
+    gate: &mut TerminalInputGate,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) {
+    terminal_input_gate_clamp_cursor(gate);
+    let len = terminal_input_gate_line_char_len(gate);
+    let safe_start = start.min(len);
+    let safe_end = end.min(len).max(safe_start);
+    let byte_start = terminal_input_gate_byte_index(&gate.current_line, safe_start);
+    let byte_end = terminal_input_gate_byte_index(&gate.current_line, safe_end);
+    gate.current_line
+        .replace_range(byte_start..byte_end, replacement);
+    gate.cursor_position = safe_start + replacement.chars().count();
+    gate.current_line_user_touched = true;
+}
+
+fn terminal_input_gate_insert_char(gate: &mut TerminalInputGate, character: char) {
+    terminal_input_gate_clamp_cursor(gate);
+    let byte_index = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
+    gate.current_line.insert(byte_index, character);
+    gate.cursor_position += 1;
+    gate.current_line_user_touched = true;
+}
+
+fn terminal_input_gate_delete_before_cursor(gate: &mut TerminalInputGate) {
+    terminal_input_gate_clamp_cursor(gate);
+    if gate.cursor_position == 0 {
+        return;
+    }
+
+    let start = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position - 1);
+    let end = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
+    gate.current_line.replace_range(start..end, "");
+    gate.cursor_position -= 1;
+    gate.current_line_user_touched = true;
+}
+
+fn terminal_input_gate_delete_at_cursor(gate: &mut TerminalInputGate) {
+    terminal_input_gate_clamp_cursor(gate);
+    if gate.cursor_position >= terminal_input_gate_line_char_len(gate) {
+        return;
+    }
+
+    let start = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
+    let end = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position + 1);
+    gate.current_line.replace_range(start..end, "");
+    gate.current_line_user_touched = true;
+}
+
+fn terminal_input_gate_delete_before_word(gate: &mut TerminalInputGate) {
+    terminal_input_gate_clamp_cursor(gate);
+    let start =
+        terminal_input_gate_previous_word_boundary(&gate.current_line, gate.cursor_position);
+    terminal_input_gate_replace_char_range(gate, start, gate.cursor_position, "");
+}
+
+fn terminal_input_gate_delete_after_word(gate: &mut TerminalInputGate) {
+    terminal_input_gate_clamp_cursor(gate);
+    let end = terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
+    terminal_input_gate_replace_char_range(gate, gate.cursor_position, end, "");
+}
+
+fn terminal_input_gate_apply_csi(gate: &mut TerminalInputGate) {
+    let Some(final_char) = gate.ansi_csi_buffer.chars().last() else {
+        return;
+    };
+    let params_text = gate
+        .ansi_csi_buffer
+        .strip_suffix(final_char)
+        .unwrap_or_default();
+    let params = params_text
+        .split(';')
+        .filter_map(|part| {
+            let clean = part.trim_start_matches('?');
+            if clean.is_empty() {
+                None
+            } else {
+                clean.parse::<usize>().ok()
+            }
+        })
+        .collect::<Vec<_>>();
+    let amount = params.first().copied().unwrap_or(1).max(1);
+    let modifier = params.get(1).copied().unwrap_or(1);
+    let word_mode = matches!(modifier, 3 | 4 | 5 | 6 | 7 | 8);
+
+    match final_char {
+        'C' => {
+            if word_mode {
+                gate.cursor_position =
+                    terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
+            } else {
+                gate.cursor_position = (gate.cursor_position + amount)
+                    .min(terminal_input_gate_line_char_len(gate));
+            }
+        }
+        'D' => {
+            if word_mode {
+                gate.cursor_position = terminal_input_gate_previous_word_boundary(
+                    &gate.current_line,
+                    gate.cursor_position,
+                );
+            } else {
+                gate.cursor_position = gate.cursor_position.saturating_sub(amount);
+            }
+        }
+        'H' => {
+            gate.cursor_position = 0;
+        }
+        'F' => {
+            gate.cursor_position = terminal_input_gate_line_char_len(gate);
+        }
+        '~' => match params.first().copied().unwrap_or_default() {
+            1 | 7 => gate.cursor_position = 0,
+            3 => terminal_input_gate_delete_at_cursor(gate),
+            4 | 8 => gate.cursor_position = terminal_input_gate_line_char_len(gate),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 fn terminal_observe_input_gate_submitted_prompt(
     gate: &mut TerminalInputGate,
     data: &str,
@@ -2300,7 +2510,7 @@ fn terminal_observe_input_gate_submitted_prompt(
     let mut submitted = None;
 
     if data == TERMINAL_SHIFT_ENTER_SEQUENCE {
-        gate.current_line.push('\n');
+        terminal_input_gate_insert_char(gate, '\n');
         gate.current_line_user_touched = true;
         return None;
     }
@@ -2342,8 +2552,11 @@ fn terminal_observe_input_gate_submitted_prompt(
         }
 
         if gate.ansi_csi_active {
+            gate.ansi_csi_buffer.push(character);
             let code = character as u32;
             if (0x40..=0x7e).contains(&code) {
+                terminal_input_gate_apply_csi(gate);
+                gate.ansi_csi_buffer.clear();
                 gate.ansi_csi_active = false;
                 gate.ansi_escape_active = false;
             }
@@ -2351,6 +2564,22 @@ fn terminal_observe_input_gate_submitted_prompt(
         }
 
         if gate.ansi_ss3_active {
+            match character {
+                'C' => {
+                    gate.cursor_position = (gate.cursor_position + 1)
+                        .min(terminal_input_gate_line_char_len(gate));
+                }
+                'D' => {
+                    gate.cursor_position = gate.cursor_position.saturating_sub(1);
+                }
+                'H' => {
+                    gate.cursor_position = 0;
+                }
+                'F' => {
+                    gate.cursor_position = terminal_input_gate_line_char_len(gate);
+                }
+                _ => {}
+            }
             gate.ansi_ss3_active = false;
             gate.ansi_escape_active = false;
             continue;
@@ -2360,6 +2589,7 @@ fn terminal_observe_input_gate_submitted_prompt(
             match character {
                 '[' => {
                     gate.ansi_csi_active = true;
+                    gate.ansi_csi_buffer.clear();
                 }
                 ']' | 'P' | '^' | '_' | 'X' => {
                     gate.ansi_osc_active = true;
@@ -2367,6 +2597,26 @@ fn terminal_observe_input_gate_submitted_prompt(
                 }
                 'O' => {
                     gate.ansi_ss3_active = true;
+                }
+                'b' | 'B' => {
+                    gate.cursor_position = terminal_input_gate_previous_word_boundary(
+                        &gate.current_line,
+                        gate.cursor_position,
+                    );
+                    gate.ansi_escape_active = false;
+                }
+                'f' | 'F' => {
+                    gate.cursor_position =
+                        terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
+                    gate.ansi_escape_active = false;
+                }
+                'd' => {
+                    terminal_input_gate_delete_after_word(gate);
+                    gate.ansi_escape_active = false;
+                }
+                '\u{7f}' => {
+                    terminal_input_gate_delete_before_word(gate);
+                    gate.ansi_escape_active = false;
                 }
                 _ => {
                     gate.ansi_escape_active = false;
@@ -2379,33 +2629,49 @@ fn terminal_observe_input_gate_submitted_prompt(
             '\r' | '\n' => {
                 let prompt = gate.current_line.trim().to_string();
                 gate.current_line.clear();
+                gate.cursor_position = 0;
                 gate.current_line_user_touched = false;
                 if !prompt.is_empty() && !is_terminal_color_reply_prompt(&prompt) {
                     submitted = Some(prompt);
                 }
             }
             '\u{7f}' | '\u{8}' => {
-                gate.current_line.pop();
-                gate.current_line_user_touched = true;
+                terminal_input_gate_delete_before_cursor(gate);
             }
             '\u{15}' => {
                 gate.current_line.clear();
+                gate.cursor_position = 0;
                 gate.current_line_user_touched = true;
+            }
+            '\u{11}' => {
+                let start = gate.cursor_position.min(terminal_input_gate_line_char_len(gate));
+                let end = terminal_input_gate_line_char_len(gate);
+                terminal_input_gate_replace_char_range(gate, start, end, "");
+            }
+            '\u{17}' => {
+                terminal_input_gate_delete_before_word(gate);
+            }
+            '\u{1}' => {
+                gate.cursor_position = 0;
+            }
+            '\u{5}' => {
+                gate.cursor_position = terminal_input_gate_line_char_len(gate);
             }
             '\u{1b}' => {
                 gate.ansi_escape_active = true;
                 gate.ansi_csi_active = false;
+                gate.ansi_csi_buffer.clear();
                 gate.ansi_osc_active = false;
                 gate.ansi_osc_escape_pending = false;
                 gate.ansi_ss3_active = false;
             }
             character if character.is_control() => {}
             character => {
-                gate.current_line.push(character);
-                gate.current_line_user_touched = true;
+                terminal_input_gate_insert_char(gate, character);
                 if gate.current_line.len() > 8192 {
                     let drain_to = gate.current_line.len().saturating_sub(4096);
                     gate.current_line.drain(..drain_to);
+                    gate.cursor_position = terminal_input_gate_line_char_len(gate);
                 }
             }
         }
@@ -2418,6 +2684,7 @@ fn terminal_input_gate_diagnostic_snapshot(gate: &TerminalInputGate) -> Value {
     let current_line = gate.current_line.as_str();
     json!({
         "ansi_csi_active": gate.ansi_csi_active,
+        "ansi_csi_buffer": clean_terminal_diagnostic_log_text(&gate.ansi_csi_buffer),
         "ansi_escape_active": gate.ansi_escape_active,
         "ansi_osc_active": gate.ansi_osc_active,
         "ansi_osc_escape_pending": gate.ansi_osc_escape_pending,
@@ -2435,6 +2702,7 @@ fn terminal_input_gate_diagnostic_snapshot(gate: &TerminalInputGate) -> Value {
                 .collect::<String>(),
         ),
         "current_line_user_touched": gate.current_line_user_touched,
+        "cursor_position": gate.cursor_position,
         "trimmed_line_len": current_line.trim().len(),
     })
 }
@@ -3991,6 +4259,13 @@ fn emit_terminal_prompt_submitted(
     instance: &TerminalInstance,
     prompt: &str,
     prompt_event_id: Option<&str>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<&str>,
+    prompt_event_submitted_at: Option<&str>,
+    expected_prompt: Option<&str>,
+    observed_prompt: Option<&str>,
+    prompt_match: bool,
+    prompt_source: &str,
     thread_id_override: Option<&str>,
 ) {
     let prompt = prompt.trim();
@@ -4018,6 +4293,25 @@ fn emit_terminal_prompt_submitted(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            prompt_event_revision,
+            prompt_event_source: prompt_event_source
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            prompt_event_submitted_at: prompt_event_submitted_at
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            expected_prompt: expected_prompt
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            observed_prompt: observed_prompt
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            prompt_match,
+            prompt_source: prompt_source.to_string(),
             prompt: prompt.to_string(),
         },
     );
@@ -4054,6 +4348,9 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
                 payload.instance_id,
                 payload.data,
                 payload.prompt_event_id,
+                payload.prompt_event_revision,
+                payload.prompt_event_source,
+                payload.prompt_event_submitted_at,
                 payload.prompt_event_text,
                 payload.thread_id,
             )
@@ -4094,6 +4391,9 @@ async fn terminal_write_inner(
     instance_id: Option<u64>,
     data: String,
     prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
@@ -4123,6 +4423,37 @@ async fn terminal_write_inner(
         }
         return Ok(());
     };
+    let prompt_submission_requested = prompt_event_text
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if prompt_submission_requested {
+        if let Some(coordination) = instance.coordination.clone() {
+            let readiness = tauri::async_runtime::spawn_blocking(move || {
+                ensure_terminal_coordination_ready_for_prompt(&coordination)
+            })
+            .await
+            .map_err(|error| {
+                format!("Unable to validate coordination session before prompt submit: {error}")
+            })?;
+            if let Err(error) = readiness {
+                write_thread_bridge_diagnostic_log_entry(json!({
+                    "ts_ms": current_time_ms(),
+                    "phase": "backend.bridge.terminal_write.coordination_not_ready",
+                    "source": "backend",
+                    "app_pid": std::process::id(),
+                    "thread": terminal_diagnostic_thread_label(),
+                    "fields": {
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "has_prompt_event_text": true,
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    },
+                }));
+                return Err(error);
+            }
+        }
+    }
     let _input_guard = instance.input_queue.lock().await;
     let original_data_diagnostic = terminal_write_data_diagnostic(&data);
     let data = normalize_terminal_enter_sequences_for_pty(data);
@@ -4238,6 +4569,17 @@ async fn terminal_write_inner(
             &instance,
             &event_prompt,
             prompt_event_id.as_deref(),
+            prompt_event_revision,
+            prompt_event_source.as_deref(),
+            prompt_event_submitted_at.as_deref(),
+            requested_event_prompt.as_deref(),
+            Some(&prompt),
+            prompt_event_text_matches_observed,
+            if prompt_event_text_matches_observed {
+                "observed_input_gate"
+            } else {
+                "observed_input_gate_mismatch"
+            },
             thread_id.as_deref(),
         );
         write_thread_bridge_diagnostic_log_entry(json!({
@@ -4321,6 +4663,50 @@ async fn terminal_write_inner(
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             },
         }));
+        if let Some(event_prompt) = prompt_event_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        {
+            emit_terminal_prompt_submitted(
+                &app,
+                &instance,
+                &event_prompt,
+                prompt_event_id.as_deref(),
+                prompt_event_revision,
+                prompt_event_source.as_deref(),
+                prompt_event_submitted_at.as_deref(),
+                Some(&event_prompt),
+                None,
+                false,
+                "prompt_event_text_unobserved",
+                thread_id.as_deref(),
+            );
+            if *instance.agent_started.lock().await {
+                let cloud_state = cloud_mcp_state.clone();
+                let pane_id_for_context = pane_id.clone();
+                let working_directory = instance.working_directory.as_ref().clone();
+                let coordination = instance.coordination.clone();
+                let terminal_instance_id = instance.id;
+                let active_task = instance.active_task.lock().await.clone();
+                let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
+                let local_task_title = active_task.as_ref().map(|task| task.title.clone());
+                tauri::async_runtime::spawn(async move {
+                    cloud_mcp_terminal_context_pack_for_prompt(
+                        cloud_state,
+                        pane_id_for_context,
+                        terminal_instance_id,
+                        working_directory,
+                        coordination,
+                        local_task_id,
+                        local_task_title,
+                        event_prompt,
+                    )
+                    .await;
+                });
+            }
+        }
     } else if let Some(diagnostic_kind) = input_write_diagnostic_kind {
         let observer_reason = terminal_prompt_observer_not_observed_reason(
             &data,
@@ -4360,6 +4746,9 @@ async fn terminal_write(
     instance_id: Option<u64>,
     data: String,
     prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
@@ -4371,6 +4760,9 @@ async fn terminal_write(
         instance_id,
         data,
         prompt_event_id,
+        prompt_event_revision,
+        prompt_event_source,
+        prompt_event_submitted_at,
         prompt_event_text,
         thread_id,
     )
@@ -4414,6 +4806,9 @@ async fn terminal_delete_selection(
     pane_id: String,
     instance_id: Option<u64>,
     selection: String,
+    current_line: Option<String>,
+    selection_start: Option<usize>,
+    selection_end: Option<usize>,
 ) -> Result<Value, String> {
     validate_terminal_pane_id(&pane_id)?;
     let selected_text = selection
@@ -4438,17 +4833,41 @@ async fn terminal_delete_selection(
 
     let _input_guard = instance.input_queue.lock().await;
     let mut gate = instance.input_gate.lock().await;
-    let current_line = gate.current_line.clone();
-    let Some(start) = current_line.rfind(&selected_text) else {
+    let observed_line = current_line
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect::<String>();
+    let current_line = if observed_line.trim().is_empty() {
+        gate.current_line.clone()
+    } else {
+        observed_line
+    };
+    let line_char_len = current_line.chars().count();
+    let offset_range = selection_start
+        .zip(selection_end)
+        .map(|(start, end)| (start.min(end), start.max(end)))
+        .filter(|(start, end)| *end > *start && *end <= line_char_len);
+    let text_range = if offset_range.is_some() {
+        offset_range
+    } else {
+        current_line.rfind(&selected_text).map(|start_byte| {
+            let start = current_line[..start_byte].chars().count();
+            let end = start + selected_text.chars().count();
+            (start, end)
+        })
+    };
+    let Some((start, end)) = text_range else {
         return Ok(json!({
             "deleted": false,
             "reason": "selection_not_in_current_input",
         }));
     };
 
-    let end = start + selected_text.len();
+    let start_byte = terminal_input_gate_byte_index(&current_line, start);
+    let end_byte = terminal_input_gate_byte_index(&current_line, end);
     let mut next_line = current_line;
-    next_line.replace_range(start..end, "");
+    next_line.replace_range(start_byte..end_byte, "");
     let rewrite_input = format!("\u{15}{next_line}");
     if rewrite_input.len() > MAX_TERMINAL_WRITE_BYTES {
         return Err("Terminal rewrite input is too large.".to_string());
@@ -4465,11 +4884,15 @@ async fn terminal_delete_selection(
     }
 
     gate.current_line = next_line;
+    gate.cursor_position = terminal_input_gate_line_char_len(&gate);
     gate.current_line_user_touched = true;
 
     Ok(json!({
         "deleted": true,
+        "remainingLine": gate.current_line,
+        "remainingChars": gate.current_line.chars().count(),
         "remaining_chars": gate.current_line.chars().count(),
+        "removedChars": selected_text.chars().count(),
         "removed_chars": selected_text.chars().count(),
     }))
 }
@@ -4916,6 +5339,7 @@ mod terminal_tests {
             agent_id,
             agent_kind: "codex".to_string(),
             session_id,
+            terminal_launch_epoch: None,
             env_vars: Vec::new(),
         }
     }
@@ -4948,6 +5372,57 @@ mod terminal_tests {
                 &format!("send from overlay{TERMINAL_ENTER_SEQUENCE}"),
             ),
             Some("send from overlay".to_string())
+        );
+    }
+
+    #[test]
+    fn input_gate_tracks_cursor_edits_before_submit() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[D!\r"),
+            Some("hell!o".to_string())
+        );
+
+        let mut gate = TerminalInputGate::default();
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[3DXX\r"),
+            Some("heXXllo".to_string())
+        );
+    }
+
+    #[test]
+    fn input_gate_tracks_delete_at_cursor_and_line_anchors() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[D\u{1b}[3~\r"),
+            Some("hell".to_string())
+        );
+
+        let mut gate = TerminalInputGate::default();
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "ice\u{1}nice \u{5}!\r"),
+            Some("nice ice!".to_string())
+        );
+    }
+
+    #[test]
+    fn input_gate_tracks_word_cursor_edits_before_submit() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                "alpha beta gamma\u{1b}[1;5D!\r"
+            ),
+            Some("alpha beta !gamma".to_string())
+        );
+
+        let mut gate = TerminalInputGate::default();
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "alpha beta gamma\u{1b}b!\r"),
+            Some("alpha beta !gamma".to_string())
         );
     }
 

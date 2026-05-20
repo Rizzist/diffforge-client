@@ -482,6 +482,7 @@ struct TerminalCoordinationSession {
     agent_id: String,
     agent_kind: String,
     session_id: String,
+    terminal_launch_epoch: Option<String>,
     env_vars: Vec<(String, String)>,
 }
 
@@ -531,9 +532,11 @@ struct TerminalInputGate {
     current_line_user_touched: bool,
     ansi_escape_active: bool,
     ansi_csi_active: bool,
+    ansi_csi_buffer: String,
     ansi_osc_active: bool,
     ansi_osc_escape_pending: bool,
     ansi_ss3_active: bool,
+    cursor_position: usize,
 }
 
 impl TerminalInstance {
@@ -1040,6 +1043,9 @@ struct TerminalInputEventPayload {
     instance_id: Option<u64>,
     data: String,
     prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
 }
@@ -1064,6 +1070,13 @@ struct TerminalPromptSubmittedPayload {
     agent_id: String,
     agent_kind: String,
     prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    expected_prompt: Option<String>,
+    observed_prompt: Option<String>,
+    prompt_match: bool,
+    prompt_source: String,
     prompt: String,
 }
 

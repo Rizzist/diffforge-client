@@ -30,6 +30,7 @@ pub struct TerminalCoordinationContext {
     pub agent_slot_id: Option<String>,
     pub slot_key: Option<String>,
     pub session_id: String,
+    pub terminal_launch_epoch: Option<String>,
     pub task_id: Option<String>,
     pub worktree_id: Option<String>,
     pub worktree_path: Option<String>,
@@ -72,6 +73,10 @@ impl TerminalCoordinationContext {
             ),
             ("DIFFFORGE_SESSION_ID".to_string(), self.session_id.clone()),
             ("CLOUD_MCP_SESSION_ID".to_string(), self.session_id.clone()),
+            (
+                "COORDINATION_TERMINAL_LAUNCH_EPOCH".to_string(),
+                self.terminal_launch_epoch.clone().unwrap_or_default(),
+            ),
             ("COORDINATION_REPO_PATH".to_string(), self.repo_path.clone()),
             ("DIFFFORGE_REPO_PATH".to_string(), self.repo_path.clone()),
             ("CLOUD_MCP_REPO_PATH".to_string(), self.repo_path.clone()),

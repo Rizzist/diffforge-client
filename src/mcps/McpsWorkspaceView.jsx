@@ -198,11 +198,24 @@ export default function McpsWorkspaceView({
   const clientMountSummary = health.agent_client_mount_summary || {};
   const clientMounts = clientMountSummary.mounts || [];
   const isHealthy = health.status === "healthy";
+  const isChecking = status === "loading";
   const healthyCount = isHealthy ? 1 : 0;
   const probeToolCount = numberValue(probe.tool_count) || COORDINATION_TOOLS.length;
   const activeAgentCount = numberValue(clientMountSummary.active_session_count);
   const confirmedAgentCount = numberValue(clientMountSummary.confirmed_session_count);
   const identity = workspaceIdentityState({ health, isReady, status, workspaceId });
+  const registryStatusState = isHealthy
+    ? "enabled"
+    : isChecking || isReady
+      ? "planned"
+      : "blocked";
+  const registryStatusLabel = isHealthy
+    ? "Healthy"
+    : isChecking
+      ? "Checking"
+      : isReady
+        ? "Check"
+        : "Blocked";
   const integratorEnabled = Number(repoPolicy?.integrator_enabled || 0) !== 0;
   const integratorAgent = repoPolicy?.integrator_agent_id || "codex";
   const integratorModel = repoPolicy?.integrator_model || "gpt-5.5";
@@ -252,8 +265,8 @@ export default function McpsWorkspaceView({
                 <strong>Coordination Kernel</strong>
                 <span>{workspaceId ? "Workspace MCP" : "Workspace identity missing"}</span>
               </McpServerCopy>
-              <McpStatusBadge data-state={isHealthy ? "enabled" : isReady ? "planned" : "blocked"}>
-                {isHealthy ? "Healthy" : isReady ? "Check" : "Blocked"}
+              <McpStatusBadge data-state={registryStatusState}>
+                {registryStatusLabel}
               </McpStatusBadge>
             </McpServerButton>
           </McpServerList>
