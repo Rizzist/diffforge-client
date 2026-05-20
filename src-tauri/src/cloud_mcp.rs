@@ -3602,6 +3602,39 @@ async fn cloud_mcp_sync_workspace(
 }
 
 #[tauri::command]
+async fn cloud_mcp_record_spec_edit_intent(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    intent: Value,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = match intent {
+        Value::Object(object) => Value::Object(object),
+        _ => return Err("Spec edit intent payload must be an object.".to_string()),
+    };
+    let event_kind = cloud_mcp_payload_text(&payload, &["event_kind", "eventKind", "kind"])
+        .unwrap_or_else(|| "spec_edit_requested".to_string());
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_kind".to_string(), json!(event_kind.clone()));
+        object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
+        object.insert("repo_path".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_root".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_id".to_string(), json!(workspace_id));
+        if let Some(name) = workspace_name {
+            object.insert("workspace_name".to_string(), json!(name));
+        }
+    }
+
+    cloud_mcp_post_event_endpoint(state.inner(), &event_kind, &payload).await
+}
+
+#[tauri::command]
 async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
     let root = resolve_workspace_root_directory(Some(&repo_path))
         .unwrap_or_else(|_| PathBuf::from(&repo_path));
@@ -4093,76 +4126,6 @@ fn cloud_mcp_safe_knowledge_target(
     Ok(target)
 }
 
-fn cloud_mcp_prune_legacy_knowledge_page_notes(knowledge_dir: &Path) {
-    if cloud_mcp_path_contains_symlink(knowledge_dir) {
-        return;
-    }
-    let mut queue = VecDeque::new();
-    queue.push_back(knowledge_dir.to_path_buf());
-    while let Some(dir) = queue.pop_front() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if path.file_name().and_then(|name| name.to_str()) != Some(".cache") {
-                    queue.push_back(path);
-                }
-                continue;
-            }
-            if !cloud_mcp_is_legacy_knowledge_page_note(knowledge_dir, &path) {
-                continue;
-            }
-            let Ok(markdown) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if cloud_mcp_markdown_looks_like_generated_page_note(&markdown) {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-}
-
-fn cloud_mcp_is_legacy_knowledge_page_note(knowledge_dir: &Path, path: &Path) -> bool {
-    let Some(relative_path) = path
-        .strip_prefix(knowledge_dir)
-        .ok()
-        .and_then(cloud_mcp_normalize_knowledge_relative_path)
-    else {
-        return false;
-    };
-    let relative = relative_path.replace('\\', "/").to_lowercase();
-    if relative == "index.md" {
-        return false;
-    }
-    if relative.starts_with("areas/") && relative.ends_with(".md") {
-        return true;
-    }
-    relative.ends_with("-html.md")
-        || relative.ends_with("-page.md")
-        || relative.ends_with("-jsx.md")
-        || relative.ends_with("-tsx.md")
-        || relative.ends_with("-js.md")
-        || relative.ends_with("-ts.md")
-        || relative.ends_with("-rs.md")
-        || relative.ends_with("-py.md")
-}
-
-fn cloud_mcp_markdown_looks_like_generated_page_note(markdown: &str) -> bool {
-    let lower = markdown.to_lowercase();
-    lower.contains("## entry point")
-        || lower.contains("## page structure")
-        || lower.contains("## content flow")
-        || lower.contains("## maintenance")
-}
-
 fn cloud_mcp_knowledge_authoring_result(response: &Value) -> Option<&Value> {
     response
         .pointer("/data/knowledge_authoring")
@@ -4462,119 +4425,12 @@ fn cloud_mcp_apply_knowledge_authoring_result(
             "markdown_delta": markdown_delta_apply,
         });
     }
-
-    let repo_root_display = workspace_path_display(repo_root);
-    let root = resolve_workspace_root_directory(Some(repo_root_display.as_str()))
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    let knowledge_dir = cloud_mcp_knowledge_dir(&root);
-    if let Err(error) = fs::create_dir_all(&knowledge_dir) {
-        return json!({
-            "ok": false,
-            "applied": false,
-            "error": format!("Unable to create knowledge atlas directory {}: {error}", workspace_path_display(&knowledge_dir)),
-        });
-    }
-    if cloud_mcp_path_contains_symlink(&knowledge_dir) {
-        return json!({
-            "ok": false,
-            "applied": false,
-            "error": "Knowledge atlas directory contains a symlink; refusing legacy authoring writes.",
-        });
-    }
-    let index_path = match cloud_mcp_safe_knowledge_target(&knowledge_dir, Path::new("index.md")) {
-        Ok(path) => path,
-        Err(reason) => {
-            return json!({
-                "ok": false,
-                "applied": false,
-                "error": reason,
-            });
-        }
-    };
-    if !index_path.exists() {
-        if let Err(error) = fs::write(&index_path, "") {
-            return json!({
-                "ok": false,
-                "applied": false,
-                "error": format!("Unable to create empty knowledge atlas index {}: {error}", workspace_path_display(&index_path)),
-            });
-        }
-    }
-    cloud_mcp_prune_legacy_knowledge_page_notes(&knowledge_dir);
-
-    let mut applied = Vec::new();
-    let mut skipped = Vec::new();
-    for note in authoring["notes"].as_array().cloned().unwrap_or_default() {
-        let raw_path = note
-            .get("path")
-            .or_else(|| note.get("note_path"))
-            .or_else(|| note.get("notePath"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(relative_path) = cloud_mcp_knowledge_authoring_note_path(raw_path) else {
-            skipped.push(json!({"path": raw_path, "reason": "invalid_note_path"}));
-            continue;
-        };
-        if relative_path.to_string_lossy().replace('\\', "/") == "index.md" {
-            skipped.push(json!({"path": raw_path, "reason": "index_md_is_empty_anchor"}));
-            continue;
-        }
-        let markdown = note["markdown"].as_str().unwrap_or_default().trim();
-        if markdown.is_empty() {
-            skipped.push(json!({"path": raw_path, "reason": "empty_markdown"}));
-            continue;
-        }
-        let target = match cloud_mcp_safe_knowledge_target(&knowledge_dir, &relative_path) {
-            Ok(target) => target,
-            Err(reason) => {
-                skipped.push(json!({"path": raw_path, "reason": reason}));
-                continue;
-            }
-        };
-        if let Some(parent) = target.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                skipped.push(json!({
-                    "path": raw_path,
-                    "reason": format!("create_parent_failed: {error}"),
-                }));
-                continue;
-            }
-            if cloud_mcp_path_contains_symlink(parent) {
-                skipped.push(json!({"path": raw_path, "reason": "parent_contains_symlink"}));
-                continue;
-            }
-        }
-        let mut body = markdown.replace("\r\n", "\n");
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        if fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
-            applied.push(json!({
-                "path": relative_path.to_string_lossy(),
-                "changed": false,
-            }));
-            continue;
-        }
-        match fs::write(&target, body) {
-            Ok(_) => applied.push(json!({
-                "path": relative_path.to_string_lossy(),
-                "changed": true,
-            })),
-            Err(error) => skipped.push(json!({
-                "path": raw_path,
-                "reason": format!("write_failed: {error}"),
-            })),
-        }
-    }
-
     json!({
-        "ok": skipped.is_empty() && markdown_delta_apply["ok"].as_bool().unwrap_or(true),
-        "applied": !applied.is_empty() || markdown_delta_apply["applied"].as_bool().unwrap_or(false),
-        "root": workspace_path_display(&root),
+        "ok": markdown_delta_apply["ok"].as_bool().unwrap_or(true),
+        "applied": markdown_delta_apply["applied"].as_bool().unwrap_or(false),
+        "reason": "server_markdown_delta_required",
         "provider": authoring["provider"].clone(),
         "status": authoring["status"].clone(),
-        "notes": applied,
-        "skipped": skipped,
         "markdown_delta": markdown_delta_apply,
     })
 }
@@ -4775,16 +4631,8 @@ fn cloud_mcp_knowledge_node_type(note_path: &str) -> String {
     let lower = note_path.to_ascii_lowercase();
     let node_type = if lower == "index.md" || lower.ends_with("/index.md") {
         "repo_root"
-    } else if lower.starts_with("flows/") || lower.contains("/flows/") {
-        "knowledge_flow"
-    } else if lower.starts_with("areas/") || lower.contains("/areas/") {
-        "knowledge_area"
-    } else if lower.starts_with("systems/") || lower.contains("/systems/") {
-        "knowledge_system"
-    } else if lower.starts_with("data/") || lower.contains("/data/") || lower.contains("database") {
-        "knowledge_data"
     } else {
-        "knowledge_note"
+        "concept"
     };
     node_type.to_string()
 }
@@ -5025,7 +4873,7 @@ fn cloud_mcp_read_knowledge_notes(
             note_path: note_path.clone(),
             node_type: cloud_mcp_knowledge_node_type(&note_path),
             title: if blank_root_note {
-                format!("{} atlas", cloud_mcp_repo_display_name(root))
+                "index.md".to_string()
             } else {
                 cloud_mcp_markdown_title(&markdown, &note_path)
             },
@@ -5133,8 +4981,7 @@ fn cloud_mcp_knowledge_graph_stats(notes: &[Value], edges: &[Value]) -> Value {
         "edges": edges.len(),
         "missing_paths": missing_paths,
         "root_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("repo_root")).count(),
-        "flow_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_flow")).count(),
-        "area_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("knowledge_area")).count(),
+        "concept_notes": notes.iter().filter(|node| node["node_type"].as_str() == Some("concept")).count(),
     })
 }
 
@@ -5149,14 +4996,13 @@ fn cloud_mcp_knowledge_hashes(items: &[Value]) -> Value {
 }
 
 fn cloud_mcp_programmatic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest) -> Value {
-    let repo_name = cloud_mcp_repo_display_name(&req.root);
     json!({
         "id": cloud_mcp_knowledge_note_id(&req.repo_id, "index.md"),
         "repo_id": req.repo_id.clone(),
         "workspace_id": req.workspace_id.clone(),
         "node_key": "repo_root",
         "node_type": "repo_root",
-        "title": format!("{repo_name} knowledge"),
+        "title": "index.md",
         "summary": "",
         "purpose": "",
         "note_path": "index.md",
@@ -5168,9 +5014,9 @@ fn cloud_mcp_programmatic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest
         "outbound_links": [],
         "freshness_state": "no_spec",
         "knowledge_state": "no_spec",
-        "source": "rust-diffforge-programmatic-knowledge-root",
+        "source": "rust-diffforge-programmatic-index-root",
         "metadata": {
-            "source": "knowledge_graph_root",
+            "source": "index_md_root",
             "atlas_dir": ".agents/knowledge",
             "markdown_mirror_path": ".agents/knowledge/index.md",
         },

@@ -1,6 +1,5 @@
 import {
   createWorkspaceDisplayIdentity,
-  getWorkspacePathDisplayLabel,
   workspaceRelativePath,
 } from "../workspace/workspaceDisplayIdentity.js";
 import { field, text } from "./specGraphCore.js";
@@ -48,9 +47,7 @@ function knowledgeFreshness(value) {
 
 function displayTitle(title, notePath, nodeType, displayIdentity) {
   if (nodeType === "repo_root") {
-    return displayIdentity?.repoName
-      ? `${displayIdentity.repoName} knowledge`
-      : getWorkspacePathDisplayLabel(title, { fallback: "Knowledge atlas", includeChildPath: false });
+    return notePath || title || "index.md";
   }
   return title || notePath || "Knowledge note";
 }
@@ -116,7 +113,7 @@ function normalizeKnowledgeNode(raw, index, displayIdentity) {
   const metadata = jsonObject(field(raw, "metadata", "metadata_json", "metadataJson"));
   const id = text(field(raw, "id", "node_id", "nodeId"), `knowledge-${index}`);
   const notePath = text(field(raw, "note_path", "notePath", "markdown_path", "markdownPath", "path"));
-  const knowledgeType = text(field(raw, "node_type", "nodeType", "type"), "knowledge_note");
+  const knowledgeType = text(field(raw, "node_type", "nodeType", "type"), "concept");
   const title = text(field(raw, "title"), notePath || "Knowledge note");
   const rawMarkdown = markdownText(field(raw, "markdown", "body", "content"));
   const isRoot = knowledgeType === "repo_root";

@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Add } from "@styled-icons/material-rounded/Add";
+import { Close } from "@styled-icons/material-rounded/Close";
+import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
+import { Send } from "@styled-icons/material-rounded/Send";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled from "styled-components";
@@ -36,6 +41,9 @@ export default function SpecGraphWorkspaceView({
   specGraphError = "",
   specGraphSnapshot = null,
   specGraphState = "idle",
+  isWorkspaceActive = false,
+  onSubmitSpecEditIntent = null,
+  specEditAgents = [],
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
@@ -52,6 +60,8 @@ export default function SpecGraphWorkspaceView({
   const [localIgnoredError, setLocalIgnoredError] = useState("");
   const [viewMode, setViewMode] = useState("graph");
   const [graphKind, setGraphKind] = useState("specs");
+  const [specEditDraft, setSpecEditDraft] = useState(null);
+  const [specEditStatus, setSpecEditStatus] = useState({ state: "idle", message: "" });
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedHistoryNodeId, setSelectedHistoryNodeId] = useState("");
   const [selectedKnowledgeNodeId, setSelectedKnowledgeNodeId] = useState("");
@@ -110,6 +120,93 @@ export default function SpecGraphWorkspaceView({
   const localIgnoredCount = Array.isArray(localIgnoredOverlay?.nodes)
     ? localIgnoredOverlay.nodes.length
     : 0;
+  const readySpecEditAgents = useMemo(
+    () => (Array.isArray(specEditAgents) ? specEditAgents : [])
+      .filter((agent) => agent?.ready !== false && agent?.paneId && agent?.instanceId),
+    [specEditAgents],
+  );
+  const specEditDisabledReason = useMemo(() => {
+    if (!isWorkspaceActive) return "Activate this workspace to edit specs.";
+    if (!readySpecEditAgents.length) return "Start an agent terminal to edit specs.";
+    if (state === "loading" || state === "syncing") return "Wait for the Spec Graph to finish syncing.";
+    if (error) return "Resolve the Spec Graph sync error before editing.";
+    return "";
+  }, [error, isWorkspaceActive, readySpecEditAgents.length, state]);
+  const openSpecEditDraft = useCallback((operation, spec = null) => {
+    if (!selectedNode) return;
+    const targetSpec = spec || null;
+    const currentStatement = targetSpec ? text(field(targetSpec, "statement"), "") : "";
+    setSpecEditStatus({ state: "idle", message: "" });
+    setSpecEditDraft({
+      operation,
+      targetNodeId: selectedNode.id,
+      targetSpecObjectId: targetSpec ? text(field(targetSpec, "id"), "") : "",
+      currentStatement,
+      desiredStatement: operation === "edit" ? currentStatement : "",
+      userInstruction: "",
+      terminalKey: readySpecEditAgents[0]?.key || "",
+    });
+  }, [readySpecEditAgents, selectedNode]);
+  const closeSpecEditDraft = useCallback(() => {
+    setSpecEditDraft(null);
+    setSpecEditStatus({ state: "idle", message: "" });
+  }, []);
+  const submitSpecEditDraft = useCallback((event) => {
+    event.preventDefault();
+    if (!specEditDraft || !selectedNode || !onSubmitSpecEditIntent) return;
+    const agent = readySpecEditAgents.find((candidate) => candidate.key === specEditDraft.terminalKey)
+      || readySpecEditAgents[0]
+      || null;
+    if (!agent) {
+      setSpecEditStatus({ state: "error", message: "Choose an active agent terminal." });
+      return;
+    }
+    const instruction = text(specEditDraft.userInstruction, "");
+    const desiredStatement = text(specEditDraft.desiredStatement, "");
+    if (specEditDraft.operation !== "delete" && !desiredStatement && !instruction) {
+      setSpecEditStatus({ state: "error", message: "Describe the spec change first." });
+      return;
+    }
+    if (specEditDraft.operation === "delete" && !specEditDraft.targetSpecObjectId) {
+      setSpecEditStatus({ state: "error", message: "Choose an active spec to delete." });
+      return;
+    }
+    setSpecEditStatus({ state: "submitting", message: "Sending spec edit to the agent..." });
+    onSubmitSpecEditIntent({
+      agent,
+      baseGraphHash: text(specGraphSnapshot?.cursor, ""),
+      baseNodeHash: text(specGraphSnapshot?.nodeHashes?.[selectedNode.id], ""),
+      currentStatement: specEditDraft.currentStatement,
+      desiredStatement,
+      operation: specEditDraft.operation,
+      targetNode: selectedNode,
+      targetNodeId: selectedNode.id,
+      targetPath: text(selectedNode.display_path || selectedNode.displayPath || selectedNode.path, ""),
+      targetSpecObjectId: specEditDraft.targetSpecObjectId,
+      targetTitle: text(selectedNode.display_title || selectedNode.displayTitle || selectedNode.title, "Spec node"),
+      userInstruction: instruction,
+    })
+      .then((result) => {
+        setSpecEditStatus({
+          state: "sent",
+          message: result?.intentId ? `Sent to ${agent.label || agent.agentId}.` : "Sent to the agent.",
+        });
+        window.setTimeout(() => setSpecEditDraft(null), 650);
+      })
+      .catch((nextError) => {
+        setSpecEditStatus({
+          state: "error",
+          message: nextError?.message || String(nextError || "Unable to send spec edit."),
+        });
+      });
+  }, [
+    onSubmitSpecEditIntent,
+    readySpecEditAgents,
+    selectedNode,
+    specEditDraft,
+    specGraphSnapshot?.cursor,
+    specGraphSnapshot?.nodeHashes,
+  ]);
 
   useEffect(() => {
     if (specGraph.nodes.length && !specGraph.nodes.some((node) => node.id === selectedNodeId)) {
@@ -273,10 +370,28 @@ export default function SpecGraphWorkspaceView({
               />
             </SpecGraphMain>
 
-            <SpecInspector node={selectedNode} />
+            <SpecInspector
+              editDisabledReason={specEditDisabledReason}
+              node={selectedNode}
+              onAddSpec={() => openSpecEditDraft("add")}
+              onDeleteSpec={(spec) => openSpecEditDraft("delete", spec)}
+              onEditSpec={(spec) => openSpecEditDraft("edit", spec)}
+            />
           </>
           )}
         </SpecGraphShell>
+      )}
+      {specEditDraft && (
+        <SpecEditDialog
+          agents={readySpecEditAgents}
+          disabledReason={specEditDisabledReason}
+          draft={specEditDraft}
+          node={selectedNode}
+          onChange={setSpecEditDraft}
+          onClose={closeSpecEditDraft}
+          onSubmit={submitSpecEditDraft}
+          status={specEditStatus}
+        />
       )}
     </SpecGraphSurface>
   );
@@ -1307,7 +1422,123 @@ function GraphDeltaPanel({ delta }) {
   );
 }
 
-function SpecInspector({ node }) {
+function specEditOperationLabel(operation) {
+  switch (operation) {
+    case "add":
+      return "Add spec";
+    case "delete":
+      return "Delete spec";
+    case "edit":
+    default:
+      return "Edit spec";
+  }
+}
+
+function SpecEditDialog({
+  agents,
+  disabledReason,
+  draft,
+  node,
+  onChange,
+  onClose,
+  onSubmit,
+  status,
+}) {
+  const visibleAgents = Array.isArray(agents) ? agents : [];
+  const operationLabel = specEditOperationLabel(draft.operation);
+  const submitDisabled = Boolean(disabledReason)
+    || status.state === "submitting"
+    || !visibleAgents.length
+    || !draft.terminalKey
+    || (draft.operation !== "delete" && !text(draft.desiredStatement) && !text(draft.userInstruction));
+  const nodeTitle = text(node?.display_title || node?.displayTitle || node?.title, "Spec node");
+
+  return (
+    <SpecEditOverlay role="presentation">
+      <SpecEditModal role="dialog" aria-modal="true" aria-label={operationLabel}>
+        <SpecEditModalHeader>
+          <SpecEditModalTitle>
+            <span>{operationLabel}</span>
+            <strong>{nodeTitle}</strong>
+          </SpecEditModalTitle>
+          <SpecEditCloseButton type="button" aria-label="Close" onClick={onClose}>
+            <CloseSpecIcon aria-hidden="true" />
+          </SpecEditCloseButton>
+        </SpecEditModalHeader>
+        <SpecEditForm onSubmit={onSubmit}>
+          <SpecEditField>
+            <label htmlFor="spec-edit-agent">Agent</label>
+            <SpecEditSelect
+              id="spec-edit-agent"
+              value={draft.terminalKey}
+              onChange={(event) => onChange((current) => ({
+                ...current,
+                terminalKey: event.target.value,
+              }))}
+            >
+              {visibleAgents.map((agent) => (
+                <option key={agent.key} value={agent.key}>
+                  {agent.label || agent.agentId} #{Number(agent.terminalIndex) + 1}
+                </option>
+              ))}
+            </SpecEditSelect>
+          </SpecEditField>
+          {draft.currentStatement && (
+            <SpecEditField>
+              <label htmlFor="spec-edit-current">Current</label>
+              <SpecEditReadonly id="spec-edit-current">{draft.currentStatement}</SpecEditReadonly>
+            </SpecEditField>
+          )}
+          {draft.operation !== "delete" && (
+            <SpecEditField>
+              <label htmlFor="spec-edit-desired">Spec</label>
+              <SpecEditTextarea
+                id="spec-edit-desired"
+                rows={4}
+                value={draft.desiredStatement}
+                onChange={(event) => onChange((current) => ({
+                  ...current,
+                  desiredStatement: event.target.value,
+                }))}
+              />
+            </SpecEditField>
+          )}
+          <SpecEditField>
+            <label htmlFor="spec-edit-instruction">Instruction</label>
+            <SpecEditTextarea
+              id="spec-edit-instruction"
+              rows={3}
+              value={draft.userInstruction}
+              onChange={(event) => onChange((current) => ({
+                ...current,
+                userInstruction: event.target.value,
+              }))}
+            />
+          </SpecEditField>
+          {disabledReason && <SpecEditMessage data-state="error">{disabledReason}</SpecEditMessage>}
+          {status.message && <SpecEditMessage data-state={status.state}>{status.message}</SpecEditMessage>}
+          <SpecEditFooter>
+            <SpecEditSecondaryButton type="button" onClick={onClose}>
+              Cancel
+            </SpecEditSecondaryButton>
+            <SpecEditPrimaryButton type="submit" disabled={submitDisabled}>
+              <SendSpecIcon aria-hidden="true" />
+              <span>{status.state === "submitting" ? "Sending" : "Send"}</span>
+            </SpecEditPrimaryButton>
+          </SpecEditFooter>
+        </SpecEditForm>
+      </SpecEditModal>
+    </SpecEditOverlay>
+  );
+}
+
+function SpecInspector({
+  editDisabledReason = "",
+  node,
+  onAddSpec,
+  onDeleteSpec,
+  onEditSpec,
+}) {
   if (!node) {
     return (
       <Inspector>
@@ -1318,11 +1549,29 @@ function SpecInspector({ node }) {
 
   const specHistory = splitSpecHistory(node.active_specs, node.superseded_specs);
   const activeAgentCount = Number(node.active_agent_count) || 0;
+  const localOnly = isLocalOnlyNode(node);
+  const disabledReason = localOnly
+    ? "Sync this local-only node before editing specs."
+    : editDisabledReason;
+  const canEdit = !disabledReason;
 
   return (
     <Inspector>
       <InspectorHeader>
-        <h2>{node.display_title || node.displayTitle || node.title}</h2>
+        <InspectorTitleBlock>
+          <h2>{node.display_title || node.displayTitle || node.title}</h2>
+          <InspectorActions>
+            <InspectorIconButton
+              type="button"
+              aria-label="Add spec"
+              title={disabledReason || "Add spec"}
+              disabled={!canEdit}
+              onClick={onAddSpec}
+            >
+              <AddSpecIcon aria-hidden="true" />
+            </InspectorIconButton>
+          </InspectorActions>
+        </InspectorTitleBlock>
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
           {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}
@@ -1340,6 +1589,9 @@ function SpecInspector({ node }) {
           specs={specHistory.active}
           empty="No active specs recorded yet."
           activeAgentCount={activeAgentCount}
+          disabledReason={disabledReason}
+          onDeleteSpec={onDeleteSpec}
+          onEditSpec={onEditSpec}
         />
         <SpecObjectList
           title="Superseded History"
@@ -1352,7 +1604,16 @@ function SpecInspector({ node }) {
   );
 }
 
-function SpecObjectList({ title, specs, empty, historical = false, activeAgentCount = null }) {
+function SpecObjectList({
+  title,
+  specs,
+  empty,
+  historical = false,
+  activeAgentCount = null,
+  disabledReason = "",
+  onDeleteSpec,
+  onEditSpec,
+}) {
   const visibleSpecs = Array.isArray(specs) ? specs : [];
   const [expandedPriorSpecs, setExpandedPriorSpecs] = useState({});
   const togglePriorSpecs = useCallback((specKey) => {
@@ -1377,9 +1638,34 @@ function SpecObjectList({ title, specs, empty, historical = false, activeAgentCo
           const specKey = field(spec, "id") || `${title}-${index}`;
           const priorSpecs = Array.isArray(spec.consolidated_specs) ? spec.consolidated_specs : [];
           const priorSpecsExpanded = Boolean(expandedPriorSpecs[specKey]);
+          const editBlocked = Boolean(historical || disabledReason);
           return (
             <SpecObjectCard key={specKey} $historical={historical}>
-              <p>{text(field(spec, "statement"), "Unnamed spec")}</p>
+              <SpecObjectCardHeader>
+                <p>{text(field(spec, "statement"), "Unnamed spec")}</p>
+                {!historical && (
+                  <SpecObjectActions>
+                    <SpecObjectIconButton
+                      type="button"
+                      aria-label="Edit spec"
+                      title={disabledReason || "Edit spec"}
+                      disabled={editBlocked}
+                      onClick={() => onEditSpec?.(spec)}
+                    >
+                      <EditSpecIcon aria-hidden="true" />
+                    </SpecObjectIconButton>
+                    <SpecObjectIconButton
+                      type="button"
+                      aria-label="Delete spec"
+                      title={disabledReason || "Delete spec"}
+                      disabled={editBlocked}
+                      onClick={() => onDeleteSpec?.(spec)}
+                    >
+                      <DeleteSpecIcon aria-hidden="true" />
+                    </SpecObjectIconButton>
+                  </SpecObjectActions>
+                )}
+              </SpecObjectCardHeader>
               {priorSpecs.length > 0 && (
                 <>
                   <PriorSpecsButton
@@ -1447,6 +1733,7 @@ const SpecGraphSurface = styled.section`
   display: flex;
   flex-direction: column;
   gap: 10px;
+  position: relative;
 
   html[data-forge-theme="light"] & {
     --history-bg: #ffffff;
@@ -2585,6 +2872,311 @@ const InspectorFacts = styled.div`
   }
 `;
 
+const InspectorTitleBlock = styled.div`
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const InspectorActions = styled.div`
+  align-items: center;
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 5px;
+`;
+
+const InspectorIconButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  border-radius: 6px;
+  background: rgba(6, 78, 59, 0.16);
+  color: rgba(167, 243, 208, 0.9);
+  cursor: pointer;
+  display: inline-flex;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  width: 28px;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(52, 211, 153, 0.42);
+    background: rgba(6, 78, 59, 0.28);
+    color: #d1fae5;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.42;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(10, 127, 69, 0.22);
+    background: rgba(10, 127, 69, 0.08);
+    color: var(--history-green);
+  }
+`;
+
+const AddSpecIcon = styled(Add)`
+  height: 15px;
+  width: 15px;
+`;
+
+const EditSpecIcon = styled(Edit)`
+  height: 13px;
+  width: 13px;
+`;
+
+const DeleteSpecIcon = styled(DeleteOutline)`
+  height: 14px;
+  width: 14px;
+`;
+
+const SendSpecIcon = styled(Send)`
+  height: 15px;
+  width: 15px;
+`;
+
+const CloseSpecIcon = styled(Close)`
+  height: 15px;
+  width: 15px;
+`;
+
+const SpecEditOverlay = styled.div`
+  align-items: center;
+  background: rgba(2, 6, 12, 0.58);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: absolute;
+  z-index: 20;
+`;
+
+const SpecEditModal = styled.div`
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: #0b111b;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
+  color: var(--history-text);
+  display: flex;
+  flex-direction: column;
+  max-height: min(720px, calc(100% - 16px));
+  max-width: min(620px, calc(100% - 16px));
+  min-width: min(520px, calc(100% - 16px));
+  overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(29, 29, 31, 0.12);
+  }
+`;
+
+const SpecEditModalHeader = styled.header`
+  align-items: center;
+  border-bottom: 1px solid var(--history-border);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 14px 16px;
+`;
+
+const SpecEditModalTitle = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  span {
+    color: var(--history-green);
+    font-size: 11px;
+    font-weight: 760;
+    letter-spacing: 0.04em;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+
+  strong {
+    color: var(--history-text);
+    font-size: 15px;
+    font-weight: 720;
+    line-height: 1.22;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const SpecEditCloseButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--history-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 760;
+  height: 28px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 28px;
+
+  &:hover {
+    border-color: rgba(148, 163, 184, 0.32);
+    color: var(--history-text);
+  }
+`;
+
+const SpecEditForm = styled.form`
+  display: grid;
+  gap: 12px;
+  overflow: auto;
+  padding: 14px 16px 16px;
+`;
+
+const SpecEditField = styled.div`
+  display: grid;
+  gap: 6px;
+
+  label {
+    color: var(--history-muted);
+    font-size: 10px;
+    font-weight: 760;
+    letter-spacing: 0.05em;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+`;
+
+const SpecEditSelect = styled.select`
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.74);
+  color: var(--history-text);
+  font: inherit;
+  font-size: 12px;
+  height: 36px;
+  outline: none;
+  padding: 0 10px;
+
+  &:focus {
+    border-color: rgba(52, 211, 153, 0.48);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+`;
+
+const SpecEditTextarea = styled.textarea`
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.74);
+  color: var(--history-text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  min-height: 92px;
+  outline: none;
+  padding: 9px 10px;
+  resize: vertical;
+
+  &:focus {
+    border-color: rgba(52, 211, 153, 0.48);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+`;
+
+const SpecEditReadonly = styled.div`
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.45);
+  color: rgba(229, 236, 246, 0.76);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.45;
+  max-height: 120px;
+  overflow: auto;
+  padding: 9px 10px;
+
+  html[data-forge-theme="light"] & {
+    background: #f7f9fc;
+    color: var(--history-text);
+  }
+`;
+
+const SpecEditMessage = styled.div`
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: var(--history-muted);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  padding: 8px 10px;
+
+  &[data-state="error"] {
+    border-color: rgba(196, 135, 135, 0.32);
+    color: var(--history-red);
+  }
+
+  &[data-state="sent"] {
+    border-color: rgba(52, 211, 153, 0.28);
+    color: var(--history-green);
+  }
+`;
+
+const SpecEditFooter = styled.footer`
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+`;
+
+const SpecEditSecondaryButton = styled.button`
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--history-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  height: 34px;
+  padding: 0 12px;
+
+  &:hover {
+    color: var(--history-text);
+  }
+`;
+
+const SpecEditPrimaryButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 7px;
+  background: rgba(6, 78, 59, 0.34);
+  color: #d1fae5;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 760;
+  gap: 7px;
+  height: 34px;
+  padding: 0 13px;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(52, 211, 153, 0.48);
+    background: rgba(6, 78, 59, 0.46);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+`;
+
 const KnowledgeInspectorHeader = styled.header`
   border-bottom: 1px solid var(--history-border);
   background:
@@ -3249,6 +3841,59 @@ const SpecObjectCard = styled.article`
 
   html[data-forge-theme="light"] & small {
     color: var(--history-amber);
+  }
+`;
+
+const SpecObjectCardHeader = styled.div`
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+
+  > p {
+    flex: 1;
+    min-width: 0;
+  }
+`;
+
+const SpecObjectActions = styled.div`
+  align-items: center;
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 5px;
+`;
+
+const SpecObjectIconButton = styled.button`
+  align-items: center;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 6px;
+  background: rgba(7, 12, 19, 0.24);
+  color: rgba(219, 231, 247, 0.68);
+  cursor: pointer;
+  display: inline-flex;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  width: 24px;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(52, 211, 153, 0.3);
+    color: rgba(238, 245, 255, 0.92);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.38;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(10, 127, 69, 0.16);
+    background: rgba(255, 255, 255, 0.78);
+    color: var(--history-muted);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(10, 127, 69, 0.32);
+    color: var(--history-green);
   }
 `;
 

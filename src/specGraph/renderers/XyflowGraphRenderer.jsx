@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
   BaseEdge,
   Background,
@@ -15,6 +15,7 @@ import {
 } from "@xyflow/react";
 import styled from "styled-components";
 import "@xyflow/react/dist/style.css";
+import { buildKnowledgeOutwardHierarchy } from "../specGraphLayout.js";
 import {
   dimensionsForNode,
   field,
@@ -52,14 +53,28 @@ const LIGHT_READABLE_TONES = {
   "#64748b": "#475569",
 };
 const KNOWLEDGE_NODE_DIMENSIONS = {
-  root: { width: 170, height: 96 },
-  concept: { width: 158, height: 88 },
+  root: { width: 190, height: 118 },
+  branch: { width: 168, height: 98 },
+  nested: { width: 142, height: 78 },
+  deep: { width: 120, height: 66 },
 };
-const KNOWLEDGE_DOT_CENTER = { x: 0.5, y: 0.58 };
+const KNOWLEDGE_DOT_CENTER = { x: 0.5, y: 0.55 };
 const KNOWLEDGE_DOT_RADIUS = {
-  root: 17,
-  concept: 11,
+  root: 24,
+  branch: 18,
+  nested: 13,
+  deep: 10,
 };
+const KNOWLEDGE_BRANCH_TONES = [
+  "#38bdf8",
+  "#2dd4bf",
+  "#a78bfa",
+  "#f59e0b",
+  "#fb7185",
+  "#34d399",
+  "#f472b6",
+  "#fbbf24",
+];
 const VIEWPORT_FIT_DELAYS = [90, 240];
 
 const EDGE_ANCHORS = [
@@ -79,6 +94,18 @@ const EDGE_ANCHORS = [
 
 function colorWithAlpha(color, alpha) {
   return color?.startsWith("#") ? `${color}${alpha}` : color;
+}
+
+function alphaHex(alpha) {
+  return Math.round(Math.min(1, Math.max(0, alpha)) * 255).toString(16).padStart(2, "0");
+}
+
+function toneWithAlpha(tone, alpha) {
+  return colorWithAlpha(tone || "#94a3b8", alphaHex(alpha));
+}
+
+function tintStrength(value) {
+  return Math.min(0.86, Math.max(0, Number(value) || 0));
 }
 
 function lightReadableTone(color, fallback = "#0066cc") {
@@ -116,19 +143,74 @@ function isKnowledgeRootNode(node) {
     || type === "repo_root";
 }
 
+function knowledgeDepth(node) {
+  return Number(node?.__knowledgeDepth ?? node?.knowledge_depth ?? node?.knowledgeDepth) || 0;
+}
+
+function knowledgeVisualLevel(node) {
+  if (isKnowledgeRootNode(node)) return "root";
+  const depth = knowledgeDepth(node);
+  if (depth >= 4) return "deep";
+  if (depth >= 3) return "nested";
+  return "branch";
+}
+
+function knowledgeVisualSpec(node) {
+  const level = knowledgeVisualLevel(node);
+  return {
+    level,
+    dimensions: KNOWLEDGE_NODE_DIMENSIONS[level] || KNOWLEDGE_NODE_DIMENSIONS.branch,
+    radius: KNOWLEDGE_DOT_RADIUS[level] || KNOWLEDGE_DOT_RADIUS.branch,
+  };
+}
+
+function knowledgeTintStrength(metrics, branchIndex, isRoot) {
+  if (isRoot) {
+    return Math.min(0.28, 0.12 + Math.log2((metrics?.descendantCount || 0) + 1) * 0.025);
+  }
+  if (branchIndex === undefined || branchIndex === null) return 0;
+  const descendants = metrics?.descendantCount || 0;
+  const childCount = metrics?.childCount || 0;
+  if (!descendants && !childCount) return 0.1;
+  return Math.min(0.78, 0.14 + Math.log2(descendants + 1) * 0.16 + Math.min(0.16, childCount * 0.04));
+}
+
+function buildKnowledgeTintMap(nodes, edges) {
+  const {
+    root,
+    metricsById,
+    branchIndexById,
+    depthById,
+  } = buildKnowledgeOutwardHierarchy(nodes, edges);
+  const tintById = new Map();
+  if (!root) return tintById;
+
+  nodes.forEach((node) => {
+    const rootNode = node.id === root.id;
+    const branchIndex = branchIndexById.get(node.id);
+    const depth = depthById.get(node.id) || 0;
+    const tone = rootNode
+      ? "#cbd5e1"
+      : KNOWLEDGE_BRANCH_TONES[(branchIndex || 0) % KNOWLEDGE_BRANCH_TONES.length];
+    tintById.set(node.id, {
+      tone,
+      depth,
+      strength: knowledgeTintStrength(metricsById.get(node.id), branchIndex, rootNode),
+    });
+  });
+
+  return tintById;
+}
+
 function dimensionsForFlowNode(node, variant) {
   if (variant === "knowledge") {
-    return isKnowledgeRootNode(node)
-      ? KNOWLEDGE_NODE_DIMENSIONS.root
-      : KNOWLEDGE_NODE_DIMENSIONS.concept;
+    return knowledgeVisualSpec(node).dimensions;
   }
   return dimensionsForNode(node);
 }
 
 function knowledgeDotRadius(node) {
-  return isKnowledgeRootNode(node)
-    ? KNOWLEDGE_DOT_RADIUS.root
-    : KNOWLEDGE_DOT_RADIUS.concept;
+  return knowledgeVisualSpec(node).radius;
 }
 
 function anchorRatioForNode(node, anchor, variant) {
@@ -170,8 +252,8 @@ function knowledgeDotPointForDirection(layout, node, direction) {
 function flowEdgeColor(edge, sourceNode, targetNode, variant) {
   if (variant === "knowledge") {
     return isKnowledgeCrossLink(edge, variant)
-      ? "rgba(148, 163, 184, 0.22)"
-      : "rgba(148, 163, 184, 0.46)";
+      ? "rgba(148, 163, 184, 0.38)"
+      : "rgba(148, 163, 184, 0.62)";
   }
   if (isKnowledgeCrossLink(edge, variant)) {
     return "rgba(148, 163, 184, 0.36)";
@@ -189,10 +271,11 @@ function flowEdgeColor(edge, sourceNode, targetNode, variant) {
 
 function flowEdgeStyle(edge, sourceNode, targetNode, variant) {
   if (variant === "knowledge") {
+    const crossLink = isKnowledgeCrossLink(edge, variant);
     return {
       stroke: flowEdgeColor(edge, sourceNode, targetNode, variant),
-      strokeWidth: isKnowledgeCrossLink(edge, variant) ? 1.05 : 1.55,
-      opacity: isKnowledgeCrossLink(edge, variant) ? 0.5 : 0.7,
+      strokeWidth: crossLink ? 1.45 : 2.35,
+      opacity: crossLink ? 0.72 : 0.86,
     };
   }
   if (isKnowledgeCrossLink(edge, variant)) {
@@ -214,25 +297,9 @@ function flowEdgeStyle(edge, sourceNode, targetNode, variant) {
   };
 }
 
-function edgeTouchesNode(edge, nodeId) {
-  return Boolean(nodeId) && (edge.from === nodeId || edge.to === nodeId);
-}
-
 function edgeTouchesAbstract(edge, sourceNode, targetNode) {
   return !isContainmentEdge(edge)
     && [sourceNode, targetNode].some((node) => nodeKind(node) === "abstract");
-}
-
-function nodeFocusClassName(nodeId, hoveredNodeId, hoveredNeighborIds) {
-  if (!hoveredNodeId) return "";
-  if (nodeId === hoveredNodeId) return "df-node-hovered";
-  if (hoveredNeighborIds.has(nodeId)) return "df-node-connected";
-  return "df-node-dimmed";
-}
-
-function edgeFocusClassName(edge, hoveredNodeId) {
-  if (!hoveredNodeId) return "";
-  return edgeTouchesNode(edge, hoveredNodeId) ? "df-edge-highlighted" : "df-edge-dimmed";
 }
 
 function prefixedHandleId(type, anchorId) {
@@ -352,13 +419,12 @@ function closestEdgeHandles(edge, nodeById, layout, variant) {
   };
 }
 
-function toFlowEdges(edges, nodes, layout, hoveredNodeId, variant) {
+function toFlowEdges(edges, nodes, layout, variant) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   return edges.map((edge) => {
     const sourceNode = nodeById.get(edge.from);
     const targetNode = nodeById.get(edge.to);
     const color = flowEdgeColor(edge, sourceNode, targetNode, variant);
-    const focused = edgeTouchesNode(edge, hoveredNodeId);
     const knowledgeCrossLink = isKnowledgeCrossLink(edge, variant);
     const endpoints = knowledgeEdgeEndpoints(edge, nodeById, layout, variant);
     return {
@@ -371,9 +437,8 @@ function toFlowEdges(edges, nodes, layout, hoveredNodeId, variant) {
       className: [
         edgeTouchesAbstract(edge, sourceNode, targetNode) ? "df-edge-abstract" : "",
         knowledgeCrossLink ? "df-edge-crosslink" : "",
-        edgeFocusClassName(edge, hoveredNodeId),
       ].filter(Boolean).join(" "),
-      zIndex: focused ? 4 : (knowledgeCrossLink ? 0 : 1),
+      zIndex: knowledgeCrossLink ? 0 : 1,
       interactionWidth: knowledgeCrossLink ? 12 : 18,
       markerEnd: variant === "knowledge"
         ? undefined
@@ -452,10 +517,20 @@ export default function XyflowGraphRenderer({
   const nodeTypes = useMemo(() => ({ specGraphNode: SpecGraphNode }), []);
   const edgeTypes = useMemo(() => ({ knowledgeStraight: KnowledgeStraightEdge }), []);
   const activeLayout = layout || EMPTY_LAYOUT;
+  const viewportInteractedRef = useRef(false);
   const viewportKey = useMemo(
     () => graphViewportKey(nodes, edges, activeLayout, variant),
     [activeLayout, edges, nodes, variant],
   );
+
+  useEffect(() => {
+    viewportInteractedRef.current = false;
+  }, [viewportKey]);
+
+  const handleMoveStart = useCallback((event) => {
+    if (event) viewportInteractedRef.current = true;
+  }, []);
+  const shouldSkipViewportFit = useCallback(() => viewportInteractedRef.current, []);
 
   useEffect(() => {
     if (!nodes.length) {
@@ -468,8 +543,15 @@ export default function XyflowGraphRenderer({
       return;
     }
 
+    const knowledgeTintById = variant === "knowledge" ? buildKnowledgeTintMap(nodes, edges) : EMPTY_LAYOUT;
+    const renderNodes = variant === "knowledge"
+      ? nodes.map((node) => ({
+        ...node,
+        __knowledgeDepth: knowledgeTintById.get(node.id)?.depth || 0,
+      }))
+      : nodes;
     const flowLayout = new Map();
-    nodes.forEach((node) => {
+    renderNodes.forEach((node) => {
       const position = activeLayout.get(node.id) || { x: 0, y: 0 };
       if (variant !== "knowledge") {
         flowLayout.set(node.id, position);
@@ -483,19 +565,20 @@ export default function XyflowGraphRenderer({
         y: position.y + (originalDimensions.height - flowDimensions.height) / 2,
       });
     });
-    const nextNodes = nodes.map((node) => {
+    const nextNodes = renderNodes.map((node) => {
       const dimensions = dimensionsForFlowNode(node, variant);
       return {
         id: node.id,
         type: "specGraphNode",
         position: flowLayout.get(node.id) || { x: 0, y: 0 },
         zIndex: 10,
-        className: "",
+        className: variant === "knowledge" ? "df-knowledge-flow-node" : "",
         data: {
           node,
           onSelect,
           selected: node.id === selectedNodeId,
           variant,
+          knowledgeTint: knowledgeTintById.get(node.id) || null,
         },
         draggable: false,
         selectable: true,
@@ -506,7 +589,7 @@ export default function XyflowGraphRenderer({
       };
     });
     setFlowNodes(nextNodes);
-    setFlowEdges(toFlowEdges(edges, nodes, flowLayout, null, variant));
+    setFlowEdges(toFlowEdges(edges, renderNodes, flowLayout, variant));
   }, [activeLayout, edges, layoutPending, nodes, onSelect, selectedNodeId, setFlowEdges, setFlowNodes, variant]);
 
   useEffect(() => {
@@ -541,17 +624,24 @@ export default function XyflowGraphRenderer({
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onMoveStart={handleMoveStart}
         onNodeClick={(_, node) => onSelect(node.id)}
         minZoom={0.18}
         maxZoom={1.8}
         elevateEdgesOnSelect={false}
         nodesConnectable={false}
         nodesDraggable={false}
-        panOnScroll
+        panOnDrag
+        panOnScroll={false}
+        zoomOnScroll
         proOptions={{ hideAttribution: true }}
         zIndexMode="manual"
       >
-        <ViewportFitController fitKey={viewportKey} variant={variant} />
+        <ViewportFitController
+          fitKey={viewportKey}
+          shouldSkipFit={shouldSkipViewportFit}
+          variant={variant}
+        />
         <Background color="rgba(148, 163, 184, 0.08)" gap={28} size={1} />
         <Controls showInteractive={false} />
       </ReactFlow>
@@ -559,18 +649,21 @@ export default function XyflowGraphRenderer({
   );
 }
 
-function ViewportFitController({ fitKey, variant }) {
+function ViewportFitController({ fitKey, shouldSkipFit, variant }) {
   const reactFlow = useReactFlow();
   const nodesInitialized = useNodesInitialized();
+  const lastFittedKeyRef = useRef("");
 
   useEffect(() => {
     if (!fitKey || !nodesInitialized) return undefined;
+    if (lastFittedKeyRef.current === fitKey) return undefined;
+    lastFittedKeyRef.current = fitKey;
 
     let cancelled = false;
     let secondFrame = 0;
     const timeouts = [];
     const fit = () => {
-      if (cancelled) return;
+      if (cancelled || shouldSkipFit?.()) return;
       reactFlow.fitView({ padding: viewportFitPadding(variant), duration: 0 });
     };
 
@@ -587,7 +680,7 @@ function ViewportFitController({ fitKey, variant }) {
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
       timeouts.forEach((timeout) => window.clearTimeout(timeout));
     };
-  }, [fitKey, nodesInitialized, reactFlow, variant]);
+  }, [fitKey, nodesInitialized, reactFlow, shouldSkipFit, variant]);
 
   return null;
 }
@@ -717,6 +810,9 @@ function KnowledgeGraphNode({ data, selected }) {
   const active = Boolean(selected || data.selected);
   const title = text(node.display_title || node.displayTitle || node.title, "Knowledge concept");
   const root = isKnowledgeRootNode(node);
+  const tint = data.knowledgeTint || {};
+  const depth = Number(tint.depth) || 0;
+  const visualLevel = knowledgeVisualLevel(node);
 
   return (
     <KnowledgeFlowNodeButton
@@ -749,8 +845,16 @@ function KnowledgeGraphNode({ data, selected }) {
           style={edgeHandleStyle(anchor, node, data.variant)}
         />
       ))}
-      <KnowledgeNodeLabel title={title}>{title}</KnowledgeNodeLabel>
-      <KnowledgeNodeDot aria-hidden="true" $active={active} $root={root} />
+      <KnowledgeNodeLabel title={title} $depth={depth} $visualLevel={visualLevel}>{title}</KnowledgeNodeLabel>
+      <KnowledgeNodeDot
+        aria-hidden="true"
+        className="df-knowledge-hit-target"
+        $active={active}
+        $root={root}
+        $tintStrength={tint.strength || 0}
+        $tone={tint.tone || "#94a3b8"}
+        $visualLevel={visualLevel}
+      />
     </KnowledgeFlowNodeButton>
   );
 }
@@ -769,57 +873,32 @@ const FlowFrame = styled.div`
   }
 
   ${({ $variant }) => ($variant === "knowledge" ? `
+    .react-flow__node.df-knowledge-flow-node {
+      pointer-events: none;
+    }
+
+    .react-flow__node.df-knowledge-flow-node .df-knowledge-hit-target {
+      pointer-events: auto;
+    }
+
+    .react-flow__edge,
+    .react-flow__edge-path,
+    .react-flow__edge-interaction {
+      pointer-events: none;
+    }
+
     .react-flow__edge-path {
       filter: none;
       stroke-linecap: round;
     }
 
-    .react-flow__edge.df-edge-highlighted .react-flow__edge-path {
-      filter: none;
-      stroke: rgba(203, 213, 225, 0.74) !important;
-      stroke-width: 1.85px !important;
-    }
-
-    .react-flow__edge.df-edge-dimmed {
-      opacity: 0.18;
-    }
-
-    .react-flow__node.df-node-hovered,
-    .react-flow__node.df-node-connected {
-      filter: none;
-    }
   ` : "")}
-
-  html[data-forge-theme="light"] & .react-flow__node.df-node-connected {
-    opacity: 0.86;
-  }
-
-  html[data-forge-theme="light"] & .react-flow__node.df-node-dimmed {
-    opacity: 0.34;
-  }
 
   .react-flow__node {
     transition:
       filter 180ms ease,
       opacity 180ms ease,
       transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
-  }
-
-  .react-flow__node.df-node-hovered {
-    filter: ${({ $variant }) => ($variant === "knowledge" ? "none" : "saturate(1.08)")};
-    opacity: 1;
-    z-index: 12 !important;
-  }
-
-  .react-flow__node.df-node-connected {
-    filter: ${({ $variant }) => ($variant === "knowledge" ? "none" : "saturate(0.95)")};
-    opacity: 0.78;
-    z-index: 11 !important;
-  }
-
-  .react-flow__node.df-node-dimmed {
-    filter: ${({ $variant }) => ($variant === "knowledge" ? "none" : "grayscale(0.42) saturate(0.48)")};
-    opacity: 0.24;
   }
 
   .react-flow__edges {
@@ -846,39 +925,20 @@ const FlowFrame = styled.div`
     stroke-linecap: round;
   }
 
-  .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) {
+  .react-flow__edge.df-edge-abstract {
     opacity: 0.62;
   }
 
-  .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) .react-flow__edge-path {
+  .react-flow__edge.df-edge-abstract .react-flow__edge-path {
     filter: ${({ $variant }) => ($variant === "knowledge" ? "none" : "drop-shadow(0 0 4px rgba(125, 211, 252, 0.18))")};
   }
 
-  .react-flow__edge.df-edge-crosslink:not(.df-edge-highlighted) {
-    opacity: 0.5;
-    z-index: 0 !important;
+  .react-flow__edge.df-edge-crosslink {
+    opacity: ${({ $variant }) => ($variant === "knowledge" ? 0.62 : 0.5)};
+    z-index: ${({ $variant }) => ($variant === "knowledge" ? 1 : 0)} !important;
   }
 
-  .react-flow__edge.df-edge-crosslink:not(.df-edge-highlighted) .react-flow__edge-path {
-    filter: none;
-  }
-
-  .react-flow__edge.df-edge-highlighted {
-    opacity: 1;
-    z-index: 6 !important;
-  }
-
-  .react-flow__edge.df-edge-highlighted .react-flow__edge-path {
-    filter: ${({ $variant }) => ($variant === "knowledge" ? "none" : "drop-shadow(0 0 10px rgba(45, 212, 191, 0.5))")};
-    opacity: 1 !important;
-    stroke-width: ${({ $variant }) => ($variant === "knowledge" ? "1.85px" : "3.25px")} !important;
-  }
-
-  .react-flow__edge.df-edge-dimmed {
-    opacity: 0.12;
-  }
-
-  .react-flow__edge.df-edge-dimmed .react-flow__edge-path {
+  .react-flow__edge.df-edge-crosslink .react-flow__edge-path {
     filter: none;
   }
 
@@ -886,16 +946,12 @@ const FlowFrame = styled.div`
     filter: none;
   }
 
-  html[data-forge-theme="light"] & .react-flow__edge.df-edge-abstract:not(.df-edge-highlighted) {
+  html[data-forge-theme="light"] & .react-flow__edge.df-edge-abstract {
     opacity: 0.74;
   }
 
-  html[data-forge-theme="light"] & .react-flow__edge.df-edge-crosslink:not(.df-edge-highlighted) {
+  html[data-forge-theme="light"] & .react-flow__edge.df-edge-crosslink {
     opacity: 0.42;
-  }
-
-  html[data-forge-theme="light"] & .react-flow__edge.df-edge-dimmed {
-    opacity: 0.18;
   }
 
   .react-flow__controls {
@@ -941,18 +997,33 @@ const KnowledgeFlowNodeButton = styled.button`
 const KnowledgeNodeLabel = styled.span`
   color: rgba(203, 213, 225, 0.74);
   display: -webkit-box;
-  font-size: 12px;
-  font-weight: 590;
+  font-size: ${({ $visualLevel }) => {
+    if ($visualLevel === "root") return "13px";
+    if ($visualLevel === "branch") return "12px";
+    if ($visualLevel === "nested") return "10.4px";
+    return "9.4px";
+  }};
+  font-weight: ${({ $visualLevel }) => ($visualLevel === "deep" ? 620 : 660)};
   left: 50%;
   letter-spacing: 0;
-  line-height: 1.18;
-  max-width: 164px;
+  line-height: ${({ $visualLevel }) => ($visualLevel === "root" || $visualLevel === "branch" ? 1.14 : 1.08)};
+  max-width: ${({ $visualLevel }) => {
+    if ($visualLevel === "root") return "174px";
+    if ($visualLevel === "branch") return "154px";
+    if ($visualLevel === "nested") return "124px";
+    return "106px";
+  }};
   overflow: hidden;
   pointer-events: none;
   position: absolute;
   text-align: center;
   text-shadow: 0 1px 7px rgba(0, 0, 0, 0.72);
-  top: 1px;
+  top: ${({ $visualLevel }) => {
+    if ($visualLevel === "root") return "5px";
+    if ($visualLevel === "branch") return "6px";
+    if ($visualLevel === "nested") return "7px";
+    return "6px";
+  }};
   transform: translateX(-50%);
   width: max-content;
   z-index: 2;
@@ -966,15 +1037,29 @@ const KnowledgeNodeLabel = styled.span`
 `;
 
 const KnowledgeNodeDot = styled.span`
-  background: ${({ $active }) => ($active ? "rgba(226, 232, 240, 0.92)" : "rgba(148, 163, 184, 0.78)")};
-  border: ${({ $active }) => ($active ? "1px solid rgba(248, 250, 252, 0.92)" : "1px solid rgba(203, 213, 225, 0.42)")};
+  background: ${({ $active, $root, $tintStrength, $tone }) => {
+    const strength = tintStrength($tintStrength);
+    const tintAlpha = $active ? 0.46 + strength * 0.34 : 0.22 + strength * 0.42;
+    const baseAlpha = $active ? 0.94 : ($root ? 0.82 : 0.76);
+    return `
+      radial-gradient(circle at 38% 31%, rgba(248, 250, 252, 0.86), transparent 35%),
+      linear-gradient(135deg, ${toneWithAlpha($tone, tintAlpha)}, rgba(148, 163, 184, ${baseAlpha}) 84%)
+    `;
+  }};
+  border: ${({ $active, $tintStrength, $tone }) => {
+    const strength = tintStrength($tintStrength);
+    return $active
+      ? `2px solid ${toneWithAlpha($tone, 0.78 + strength * 0.18)}`
+      : `2px solid ${toneWithAlpha($tone, 0.38 + strength * 0.42)}`;
+  }};
   border-radius: 999px;
-  box-shadow: ${({ $active }) => (
-    $active
-      ? "0 0 0 5px rgba(148, 163, 184, 0.14), 0 0 22px rgba(226, 232, 240, 0.26)"
-      : "0 0 0 3px rgba(148, 163, 184, 0.07), 0 0 14px rgba(148, 163, 184, 0.12)"
-  )};
-  height: ${({ $root }) => ($root ? "34px" : "22px")};
+  box-shadow: ${({ $active, $tintStrength, $tone }) => {
+    const strength = tintStrength($tintStrength);
+    return $active
+      ? `0 0 0 6px ${toneWithAlpha($tone, 0.18 + strength * 0.2)}, 0 0 28px ${toneWithAlpha($tone, 0.26 + strength * 0.3)}, inset 0 0 0 2px rgba(248, 250, 252, 0.16)`
+      : `0 0 0 4px ${toneWithAlpha($tone, 0.1 + strength * 0.16)}, 0 0 18px ${toneWithAlpha($tone, 0.14 + strength * 0.22)}, inset 0 0 0 1px rgba(248, 250, 252, 0.12)`;
+  }};
+  height: ${({ $visualLevel }) => `${(KNOWLEDGE_DOT_RADIUS[$visualLevel] || KNOWLEDGE_DOT_RADIUS.branch) * 2}px`};
   left: 50%;
   position: absolute;
   top: 58%;
@@ -984,23 +1069,39 @@ const KnowledgeNodeDot = styled.span`
     border-color 160ms ease,
     box-shadow 160ms ease,
     transform 160ms ease;
-  width: ${({ $root }) => ($root ? "34px" : "22px")};
+  width: ${({ $visualLevel }) => `${(KNOWLEDGE_DOT_RADIUS[$visualLevel] || KNOWLEDGE_DOT_RADIUS.branch) * 2}px`};
   z-index: 1;
 
   ${KnowledgeFlowNodeButton}:hover & {
-    background: rgba(241, 245, 249, 0.96);
-    border-color: rgba(248, 250, 252, 0.96);
-    box-shadow: 0 0 0 6px rgba(148, 163, 184, 0.16), 0 0 26px rgba(226, 232, 240, 0.28);
+    background: ${({ $tintStrength, $tone }) => {
+      const strength = tintStrength($tintStrength);
+      return `
+        radial-gradient(circle at 38% 31%, rgba(255, 255, 255, 0.92), transparent 35%),
+        linear-gradient(135deg, ${toneWithAlpha($tone, 0.52 + strength * 0.34)}, rgba(241, 245, 249, 0.96) 84%)
+      `;
+    }};
+    border-color: ${({ $tintStrength, $tone }) => toneWithAlpha($tone, 0.78 + tintStrength($tintStrength) * 0.16)};
+    box-shadow: ${({ $tintStrength, $tone }) => {
+      const strength = tintStrength($tintStrength);
+      return `0 0 0 6px ${toneWithAlpha($tone, 0.18 + strength * 0.18)}, 0 0 28px ${toneWithAlpha($tone, 0.26 + strength * 0.3)}`;
+    }};
   }
 
   html[data-forge-theme="light"] & {
-    background: ${({ $active }) => ($active ? "rgba(31, 41, 55, 0.88)" : "rgba(75, 85, 99, 0.68)")};
-    border-color: rgba(31, 41, 55, 0.22);
-    box-shadow: ${({ $active }) => (
-      $active
-        ? "0 0 0 5px rgba(75, 85, 99, 0.12)"
-        : "0 0 0 3px rgba(75, 85, 99, 0.07)"
-    )};
+    background: ${({ $active, $tintStrength, $tone }) => {
+      const strength = tintStrength($tintStrength);
+      return `
+        radial-gradient(circle at 38% 31%, rgba(255, 255, 255, 0.86), transparent 34%),
+        linear-gradient(135deg, ${toneWithAlpha($tone, 0.28 + strength * 0.28)}, rgba(75, 85, 99, ${$active ? 0.82 : 0.64}) 86%)
+      `;
+    }};
+    border-color: ${({ $tintStrength, $tone }) => toneWithAlpha($tone, 0.28 + tintStrength($tintStrength) * 0.34)};
+    box-shadow: ${({ $active, $tintStrength, $tone }) => {
+      const strength = tintStrength($tintStrength);
+      return $active
+        ? `0 0 0 5px ${toneWithAlpha($tone, 0.12 + strength * 0.14)}`
+        : `0 0 0 3px ${toneWithAlpha($tone, 0.07 + strength * 0.1)}`;
+    }};
   }
 `;
 

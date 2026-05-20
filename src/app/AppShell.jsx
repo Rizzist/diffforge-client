@@ -1071,6 +1071,66 @@ function getErrorMessage(error, fallback) {
   return fallback;
 }
 
+function createSpecEditIntentId() {
+  const randomId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `spec-edit-${randomId}`;
+}
+
+function cleanSpecEditPromptText(value, maxLength = 1800) {
+  const cleaned = String(value || "")
+    .replace(/\r/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .trim();
+  if (cleaned.length <= maxLength) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, maxLength - 12).trimEnd()}...`;
+}
+
+function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
+  const operation = String(payload.operation || "edit").toLowerCase();
+  const operationLabel = operation === "add"
+    ? "add"
+    : operation === "delete"
+      ? "delete"
+      : "edit";
+  const targetTitle = cleanSpecEditPromptText(payload.targetTitle || "Spec node", 240);
+  const targetPath = cleanSpecEditPromptText(payload.targetPath || "", 300);
+  const currentStatement = cleanSpecEditPromptText(payload.currentStatement || "", 1800);
+  const desiredStatement = cleanSpecEditPromptText(payload.desiredStatement || "", 1800);
+  const userInstruction = cleanSpecEditPromptText(payload.userInstruction || "", 1800);
+  const lines = [
+    `Diff Forge Spec Edit Intent: ${intentId}`,
+    "",
+    `Operation: ${operationLabel}`,
+    `Workspace: ${workspace?.name || workspace?.id || "Workspace"}`,
+    `Repository path: ${repoPath || ""}`,
+    `Target node id: ${payload.targetNodeId || ""}`,
+    `Target node: ${targetTitle}`,
+  ];
+  if (targetPath) lines.push(`Target path: ${targetPath}`);
+  if (payload.targetSpecObjectId) lines.push(`Target spec object id: ${payload.targetSpecObjectId}`);
+  if (payload.baseGraphHash) lines.push(`Base graph cursor: ${payload.baseGraphHash}`);
+  if (payload.baseNodeHash) lines.push(`Base node hash: ${payload.baseNodeHash}`);
+  if (currentStatement) {
+    lines.push("", "Current spec:", currentStatement);
+  }
+  if (desiredStatement) {
+    lines.push("", operation === "add" ? "New spec:" : "Desired spec:", desiredStatement);
+  }
+  if (userInstruction) {
+    lines.push("", "User instruction:", userInstruction);
+  }
+  lines.push(
+    "",
+    "Use coordination-kernel.start_task before changing files or specs. Include this spec_edit_intent_id in the task metadata or plan if the tool schema allows it.",
+    "Acquire leases for affected paths before file edits. Checkpoint progress and submit_patch when complete.",
+    "For delete, retire or supersede the selected spec through the Spec Graph workflow; do not hard-delete history.",
+  );
+  return lines.join("\n");
+}
+
 function isTerminalSessionMissingError(error) {
   const message = getErrorMessage(error, "").toLowerCase();
 
@@ -5914,6 +5974,145 @@ export default function App() {
   const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
     ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
     : {};
+  const activeSpecEditAgents = useMemo(() => {
+    if (!activatedWorkspace) {
+      return [];
+    }
+
+    return activatedWorkspaceAgentTerminalEntries
+      .map(({ role, terminalIndex }) => {
+        const agent = activatedWorkspaceTerminalAgentsByIndex[terminalIndex];
+        if (!agent || role === WORKSPACE_TERMINAL_ROLE_GENERIC) {
+          return null;
+        }
+        const thread = activatedWorkspaceThreadsByIndex[terminalIndex] || null;
+        const providerBinding = getWorkspaceThreadProviderBinding(thread, agent.id);
+        const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || {};
+        const status = String(providerBinding?.status || thread?.status || "").toLowerCase();
+        const paneId = String(terminalBinding?.paneId || "").trim();
+        const instanceId = terminalBinding?.instanceId || "";
+        const closed = ["closed", "error", "exited", "idle"].includes(status);
+
+        return {
+          activityStatus: providerBinding?.activityStatus || thread?.activityStatus || "",
+          agentId: agent.id,
+          instanceId,
+          key: `${terminalIndex}:${agent.id}:${paneId}:${instanceId}`,
+          label: agent.label || getTerminalRoleOption(role, workspaceTerminalRoleOptions).label,
+          model: providerBinding?.modelId || "",
+          paneId,
+          ready: Boolean(paneId && instanceId && !closed),
+          status: status || (paneId && instanceId ? "active" : ""),
+          terminalIndex,
+          threadId: thread?.id || "",
+          workspaceId: activatedWorkspace.id,
+        };
+      })
+      .filter(Boolean);
+  }, [
+    activatedWorkspace?.id,
+    activatedWorkspaceAgentTerminalEntries,
+    activatedWorkspaceTerminalAgentsByIndex,
+    activatedWorkspaceThreadsByIndex,
+    workspaceTerminalRoleOptions,
+  ]);
+  const submitSpecEditIntent = useCallback(async (payload) => {
+    if (!selectedWorkspace || !activatedWorkspace || selectedWorkspace.id !== activatedWorkspace.id) {
+      throw new Error("Activate this workspace to edit specs.");
+    }
+    if (workspaceDeactivationState.isActive) {
+      throw new Error("Workspace deactivation is in progress.");
+    }
+    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory || defaultWorkingDirectory;
+    if (!repoPath) {
+      throw new Error("Workspace root is not available.");
+    }
+    const agent = payload?.agent || {};
+    if (!agent.paneId || !agent.instanceId) {
+      throw new Error("Choose an active agent terminal.");
+    }
+
+    const intentId = createSpecEditIntentId();
+    const intentPayload = {
+      agent_id: agent.agentId || "",
+      base_graph_hash: payload.baseGraphHash || "",
+      base_node_hash: payload.baseNodeHash || "",
+      current_statement: payload.currentStatement || "",
+      desired_statement: payload.desiredStatement || "",
+      event_kind: "spec_edit_requested",
+      intent_id: intentId,
+      operation: payload.operation || "edit",
+      status: "requested",
+      target_node_id: payload.targetNodeId || "",
+      target_path: payload.targetPath || "",
+      target_spec_object_id: payload.targetSpecObjectId || "",
+      target_title: payload.targetTitle || "",
+      terminal_id: agent.paneId || "",
+      terminal_index: agent.terminalIndex,
+      terminal_instance_id: String(agent.instanceId || ""),
+      thread_id: agent.threadId || "",
+      user_instruction: payload.userInstruction || "",
+    };
+
+    const prompt = buildSpecEditAgentPrompt(intentId, payload, selectedWorkspace, repoPath);
+    const requested = await invoke("cloud_mcp_record_spec_edit_intent", {
+      intent: intentPayload,
+      repoPath,
+      workspaceId: selectedWorkspace.id,
+      workspaceName: selectedWorkspace.name || "",
+    });
+    try {
+      await invoke("terminal_write", {
+        data: `${prompt}\r`,
+        instanceId: agent.instanceId,
+        paneId: agent.paneId,
+        promptEventId: intentId,
+        promptEventText: prompt,
+        threadId: agent.threadId || undefined,
+      });
+    } catch (error) {
+      invoke("cloud_mcp_record_spec_edit_intent", {
+        intent: {
+          ...intentPayload,
+          event_kind: "spec_edit_cancelled",
+          status: "cancelled",
+          user_instruction: `${intentPayload.user_instruction || ""}\n\nDispatch failed: ${getErrorMessage(error, "Terminal write failed.")}`.trim(),
+        },
+        repoPath,
+        workspaceId: selectedWorkspace.id,
+        workspaceName: selectedWorkspace.name || "",
+      }).catch(() => {});
+      throw error;
+    }
+    invoke("cloud_mcp_record_spec_edit_intent", {
+      intent: {
+        ...intentPayload,
+        event_kind: "spec_edit_dispatched",
+        status: "dispatched",
+      },
+      repoPath,
+      workspaceId: selectedWorkspace.id,
+      workspaceName: selectedWorkspace.name || "",
+    }).catch((error) => {
+      logBigViewSyncDiagnosticEvent("spec_edit.dispatch_status_error", {
+        intentId,
+        message: getErrorMessage(error, "Unable to mark spec edit dispatched."),
+        workspaceId: selectedWorkspace.id,
+      });
+    });
+
+    return {
+      intentId,
+      requested,
+    };
+  }, [
+    activatedWorkspace?.id,
+    activatedWorkspaceTerminalWorkingDirectory,
+    defaultWorkingDirectory,
+    selectedWorkspace,
+    selectedWorkspaceFileRoot,
+    workspaceDeactivationState.isActive,
+  ]);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
@@ -8483,7 +8682,13 @@ export default function App() {
                       knowledgeGraphError={selectedWorkspaceGraphState.knowledgeError || ""}
                       knowledgeGraphSnapshot={selectedWorkspaceGraphState.knowledgeSnapshot || null}
                       knowledgeGraphState={selectedWorkspaceGraphState.knowledgeState || "idle"}
+                      isWorkspaceActive={Boolean(
+                        isSelectedWorkspaceActivated
+                        && !workspaceDeactivationState.isActive,
+                      )}
+                      onSubmitSpecEditIntent={submitSpecEditIntent}
                       rootDirectory={selectedWorkspaceFileRoot}
+                      specEditAgents={isSelectedWorkspaceActivated ? activeSpecEditAgents : []}
                       specGraphError={selectedWorkspaceGraphState.specError || ""}
                       specGraphSnapshot={selectedWorkspaceGraphState.specSnapshot || null}
                       specGraphState={selectedWorkspaceGraphState.specState || "idle"}

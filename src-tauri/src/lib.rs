@@ -2140,6 +2140,7 @@ pub fn run() {
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
+            cloud_mcp_record_spec_edit_intent,
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,
             cloud_mcp_get_local_ignored_spec_graph_overlay,
