@@ -2496,6 +2496,10 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
   }
 
   const planTask = normalizeTodoQueuePlanTask({
+    doneWhen: args.plan_done_when || args.planDoneWhen,
+    maxConcurrency: args.plan_max_concurrency ?? args.planMaxConcurrency,
+    releasePolicy: args.plan_release_policy || args.planReleasePolicy,
+    requiresQueueDrain: args.plan_requires_queue_drain ?? args.planRequiresQueueDrain,
     runId: args.plan_run_id || args.planRunId,
     taskId: args.plan_task_id || args.planTaskId,
     stage: args.plan_stage || args.planStage,
@@ -2601,6 +2605,9 @@ function normalizeVoicePlanSnapshot(value) {
     const ordinal = Number.isFinite(Number(step?.ordinal)) ? Number(step.ordinal) : index;
     return {
       executionStatus: String(step?.executionStatus || step?.execution_status || "").trim(),
+      executionPolicy: String(step?.executionPolicy || step?.execution_policy || "").trim(),
+      executionRequiresQueueDrain: Boolean(step?.executionRequiresQueueDrain || step?.execution_requires_queue_drain),
+      executionDoneWhen: String(step?.executionDoneWhen || step?.execution_done_when || "").trim(),
       executionTasks: normalizeVoicePlanTasks(
         step?.executionTasks || step?.execution_tasks,
         { runId, stage: "execution", stepOrdinal: ordinal },
@@ -2608,6 +2615,9 @@ function normalizeVoicePlanSnapshot(value) {
       objective: normalizeVoiceHistoryText(step?.objective, 600),
       ordinal,
       revisionStatus: String(step?.revisionStatus || step?.revision_status || "").trim(),
+      revisionPolicy: String(step?.revisionPolicy || step?.revision_policy || "").trim(),
+      revisionRequiresQueueDrain: Boolean(step?.revisionRequiresQueueDrain || step?.revision_requires_queue_drain),
+      revisionDoneWhen: String(step?.revisionDoneWhen || step?.revision_done_when || "").trim(),
       revisionTasks: normalizeVoicePlanTasks(
         step?.revisionTasks || step?.revision_tasks,
         { runId, stage: "revision", stepOrdinal: ordinal },
@@ -2636,6 +2646,12 @@ function normalizeVoicePlanTasks(value, context = {}) {
     id: String(task?.taskId || task?.id || "").trim(),
     ordinal: Number.isFinite(Number(task?.ordinal)) ? Number(task.ordinal) : index,
     promptEventId: String(task?.promptEventId || task?.prompt_event_id || "").trim(),
+    releasePolicy: String(task?.releasePolicy || task?.release_policy || "").trim(),
+    requiresQueueDrain: Boolean(task?.requiresQueueDrain || task?.requires_queue_drain),
+    doneWhen: String(task?.doneWhen || task?.done_when || "").trim(),
+    maxConcurrency: Number.isFinite(Number(task?.maxConcurrency ?? task?.max_concurrency))
+      ? Number(task?.maxConcurrency ?? task?.max_concurrency)
+      : 0,
     runId: String(task?.runId || task?.run_id || context.runId || "").trim(),
     stage: String(task?.stage || context.stage || "").trim(),
     status: String(task?.status || "").trim(),
@@ -2673,6 +2689,18 @@ function getVoicePlanTaskStatusLabel(task) {
   return status;
 }
 
+function getVoicePlanStageLabel(stageLabel, policy, doneWhen = "") {
+  const normalizedPolicy = String(policy || "").trim().replace(/_/g, " ");
+  const normalizedDoneWhen = String(doneWhen || "").trim().replace(/_/g, " ");
+  if (!normalizedPolicy || normalizedPolicy === "parallel") {
+    return stageLabel;
+  }
+  if (normalizedDoneWhen && normalizedDoneWhen !== "stage tasks completed") {
+    return `${stageLabel} · ${normalizedPolicy} · ${normalizedDoneWhen}`;
+  }
+  return `${stageLabel} · ${normalizedPolicy}`;
+}
+
 function normalizeVoicePlanReleasedTask(value, snapshot = null) {
   if (!value || typeof value !== "object") {
     return null;
@@ -2691,6 +2719,12 @@ function normalizeVoicePlanReleasedTask(value, snapshot = null) {
     return null;
   }
   return {
+    doneWhen: String(value.doneWhen || value.done_when || value.planDoneWhen || value.plan_done_when || "").trim(),
+    maxConcurrency: Number.isFinite(Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency))
+      ? Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency)
+      : 0,
+    releasePolicy: String(value.releasePolicy || value.release_policy || value.planReleasePolicy || value.plan_release_policy || "").trim(),
+    requiresQueueDrain: Boolean(value.requiresQueueDrain || value.requires_queue_drain || value.planRequiresQueueDrain || value.plan_requires_queue_drain),
     runId,
     stage: String(value.stage || value.planStage || value.plan_stage || snapshot?.currentStage || "").trim(),
     stepOrdinal: Number.isFinite(Number(value.stepOrdinal ?? value.step_ordinal ?? snapshot?.currentStepOrdinal))
@@ -2781,6 +2815,12 @@ function normalizeTodoQueuePlanTask(value) {
     return null;
   }
   return {
+    doneWhen: String(value.doneWhen || value.done_when || value.planDoneWhen || value.plan_done_when || "").trim(),
+    maxConcurrency: Number.isFinite(Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency))
+      ? Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency)
+      : 0,
+    releasePolicy: String(value.releasePolicy || value.release_policy || value.planReleasePolicy || value.plan_release_policy || "").trim(),
+    requiresQueueDrain: Boolean(value.requiresQueueDrain || value.requires_queue_drain || value.planRequiresQueueDrain || value.plan_requires_queue_drain),
     runId,
     taskId,
     stage: String(value.stage || value.planStage || value.plan_stage || "").trim(),
@@ -2792,6 +2832,18 @@ function normalizeTodoQueuePlanTask(value) {
 
 function getTodoQueueItemPlanTask(item) {
   return normalizeTodoQueuePlanTask(item?.planTask || item?.plan_task);
+}
+
+function isVoicePlanBoundaryQueueItem(item) {
+  const planTask = getTodoQueueItemPlanTask(item);
+  const releasePolicy = String(planTask?.releasePolicy || "").trim();
+  return Boolean(
+    planTask
+      && (
+        planTask.requiresQueueDrain
+        || releasePolicy === "verification_barrier"
+      ),
+  );
 }
 
 function isSpecEditTodoQueueItem(item) {
@@ -4634,12 +4686,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   {item.plan.steps.map((step) => {
                                     const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
                                     const activeStage = isActiveStep ? item.plan.currentStage : "";
-                                    const renderStage = (stageName, stageLabel, stageStatus, tasks) => {
+                                    const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
                                       const isActiveStage = isActiveStep && activeStage === stageName;
                                       return (
                                         <OrchestratorHistoryPlanStage key={stageName}>
                                           <OrchestratorHistoryPlanStageHeader data-active={isActiveStage ? "true" : undefined}>
-                                            <span>{stageLabel}</span>
+                                            <span>{getVoicePlanStageLabel(stageLabel, policy, doneWhen)}</span>
                                             <span>{stageStatus || "waiting"}</span>
                                           </OrchestratorHistoryPlanStageHeader>
                                           {tasks.length > 0 && (
@@ -4664,8 +4716,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                         <OrchestratorHistoryPlanStepTitle>
                                           {step.ordinal + 1}. {step.title}
                                         </OrchestratorHistoryPlanStepTitle>
-                                        {renderStage("execution", "Execution", step.executionStatus, step.executionTasks)}
-                                        {renderStage("revision", "Revision", step.revisionStatus, step.revisionTasks)}
+                                        {renderStage("execution", "Execution", step.executionStatus, step.executionTasks, step.executionPolicy, step.executionDoneWhen)}
+                                        {renderStage("revision", "Revision", step.revisionStatus, step.revisionTasks, step.revisionPolicy, step.revisionDoneWhen)}
                                       </OrchestratorHistoryPlanStep>
                                     );
                                   })}
@@ -5514,6 +5566,10 @@ function TerminalView({
       const item = createTodoQueueItem(task.text, {
         id: task.taskId,
         planTask: {
+          doneWhen: task.doneWhen,
+          maxConcurrency: task.maxConcurrency,
+          releasePolicy: task.releasePolicy,
+          requiresQueueDrain: task.requiresQueueDrain,
           runId: task.runId,
           stage: task.stage,
           stepOrdinal: task.stepOrdinal,
@@ -5584,6 +5640,9 @@ function TerminalView({
       planTaskId: normalizedPlanTask.taskId,
       planStage: normalizedPlanTask.stage,
       planStepOrdinal: normalizedPlanTask.stepOrdinal,
+      planReleasePolicy: normalizedPlanTask.releasePolicy,
+      planRequiresQueueDrain: normalizedPlanTask.requiresQueueDrain,
+      planDoneWhen: normalizedPlanTask.doneWhen,
       status: nextStatus,
     };
     try {
@@ -6766,12 +6825,44 @@ function TerminalView({
       return;
     }
 
-    const queuedItem = todoQueueItems.find((item) => {
+    const queuedItems = todoQueueItems.filter((item) => {
       const pendingItem = todoQueuePendingItemsRef.current[item.id] || null;
       return pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued";
     });
+    const firstQueuedItem = queuedItems[0] || null;
+    const queuedItem = firstQueuedItem && isVoicePlanBoundaryQueueItem(firstQueuedItem)
+      ? queuedItems.find((item) => !isVoicePlanBoundaryQueueItem(item)) || firstQueuedItem
+      : firstQueuedItem;
     if (!queuedItem) {
       return;
+    }
+    if (isVoicePlanBoundaryQueueItem(queuedItem)) {
+      const hasSendingItem = Object.values(todoQueuePendingItemsRef.current).some((pendingItem) => (
+        pendingItem?.itemId !== queuedItem.id
+        && getTodoQueuePendingPhase(pendingItem) === "sending"
+      ));
+      if (hasSendingItem) {
+        return;
+      }
+      const busyReasons = new Set([
+        "reserved",
+        "pending_prompt",
+        "busy_turn",
+        "busy_activity",
+        "composer_draft_present",
+        "composer_attachments_present",
+      ]);
+      const hasBusyAgent = logicalTerminalIndexes.some((terminalIndex) => {
+        const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
+          allowGeneric: false,
+          requireAvailable: true,
+          reservationItemId: queuedItem.id,
+        });
+        return !candidate.available && busyReasons.has(String(candidate.reason || ""));
+      });
+      if (hasBusyAgent) {
+        return;
+      }
     }
 
     let target = null;
