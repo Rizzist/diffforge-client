@@ -106,6 +106,8 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
+const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
@@ -120,6 +122,7 @@ const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
+const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
 #[cfg(target_os = "macos")]
@@ -143,6 +146,7 @@ static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
@@ -1403,6 +1407,10 @@ fn bigview_sync_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE)
 }
 
+fn terminal_status_log_path() -> PathBuf {
+    diagnostic_log_path(TERMINAL_STATUS_LOG_FILE)
+}
+
 fn windows_terminal_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
@@ -1509,6 +1517,36 @@ fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
     let _ = writeln!(file, "{entry}");
 }
 
+fn write_terminal_status_log_entry(entry: Value) {
+    if !TERMINAL_STATUS_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = terminal_status_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = TERMINAL_STATUS_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
 fn write_windows_terminal_diagnostic_log_entry(entry: Value) {
     let log_path = windows_terminal_diagnostic_log_path();
     let Some(log_dir) = log_path.parent() else {
@@ -1549,6 +1587,17 @@ fn log_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
     }
 
     write_terminal_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+}
+
+fn log_terminal_status_event(phase: &str, fields: Value) {
+    write_terminal_status_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(phase),
         "source": "backend",
@@ -1641,6 +1690,20 @@ fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), Stri
 #[tauri::command]
 fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_bigview_sync_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_status_log(phase: String, fields: Value) -> Result<(), String> {
+    write_terminal_status_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
         "source": "frontend",
@@ -2255,6 +2318,7 @@ pub fn run() {
             terminal_diagnostic_log,
             thread_bridge_diagnostic_log,
             bigview_sync_diagnostic_log,
+            terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,
             terminal_delete_selection,

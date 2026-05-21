@@ -43,17 +43,16 @@ impl WinChild {
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
         if res != 0 {
-            Err(err)
-        } else {
             Ok(())
+        } else {
+            Err(err)
         }
     }
 }
 
 impl ChildKiller for WinChild {
     fn kill(&mut self) -> IoResult<()> {
-        self.do_kill().ok();
-        Ok(())
+        self.do_kill()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
@@ -72,9 +71,9 @@ impl ChildKiller for WinChildKiller {
         let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
         if res != 0 {
-            Err(err)
-        } else {
             Ok(())
+        } else {
+            Err(err)
         }
     }
 
@@ -133,10 +132,10 @@ impl std::future::Future for WinChild {
                 unsafe impl Send for PassRawHandleToWaiterThread {}
 
                 let proc = self.proc.lock().unwrap().try_clone()?;
-                let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
 
                 let waker = cx.waker().clone();
                 std::thread::spawn(move || {
+                    let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
                     unsafe {
                         WaitForSingleObject(handle.0 as _, INFINITE);
                     }

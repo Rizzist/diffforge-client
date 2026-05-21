@@ -22,6 +22,7 @@ import {
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
+import { logTerminalStatus } from "../terminals/terminalStatusLog";
 import {
   getBigViewTextDiagnosticFields,
   logBigViewSyncDiagnosticEvent,
@@ -31,6 +32,22 @@ import {
 } from "../threads/terminalControlPrompts.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
+import { createWorkspaceNotificationSfx } from "../notifications/notificationSfx";
+import {
+  formatWorkspaceNotificationBadgeCount,
+  getWorkspaceNotificationSummaries,
+  markWorkspaceNotificationsSeen,
+  normalizeWorkspaceNotificationPath,
+  persistWorkspaceNotifications,
+  readWorkspaceNotifications,
+  reconcileWorkspaceNotificationSnapshot,
+  reduceTerminalParkedNotificationEvent,
+  reduceThreadLifecycleNotificationEvent,
+  reduceWorkspaceNotificationEvent,
+  resolveWorkspaceIdForNotificationEvent,
+  TERMINAL_PARKED_PROMPT_EVENT,
+  WORKSPACE_NOTIFICATION_EVENT,
+} from "../notifications/workspaceNotifications";
 import {
   archiveWorkspaceThread,
   appendWorkspaceThreadProjectionEvents,
@@ -156,6 +173,7 @@ import {
   WorkspaceButton,
   WorkspaceLabel,
   WorkspaceCompactGlyph,
+  WorkspaceNotificationBadge,
   WorkspaceSettingsButton,
   WorkspaceAccent,
   WorkspaceMuted,
@@ -2776,6 +2794,7 @@ export default function App() {
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
+  const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
@@ -2816,6 +2835,9 @@ export default function App() {
   const workspaceSettingsRef = useRef(workspaceSettings);
   const defaultWorkingDirectoryRef = useRef(defaultWorkingDirectory);
   const workspaceThreadsRef = useRef(workspaceThreads);
+  const workspaceNotificationCueIdsRef = useRef(new Set());
+  const workspaceNotificationSfxRef = useRef(null);
+  const workspaceNotificationSnapshotKeyRef = useRef("");
   const workspaceThreadsHydratedKeyRef = useRef("");
   const workspaceThreadsPersistenceReadyRef = useRef(false);
   const workspaceThreadTranscriptRequestsRef = useRef(new Map());
@@ -2840,6 +2862,25 @@ export default function App() {
   const workspaceTerminalFallbackRole = getWorkspaceTerminalFallbackRole(
     workspaceTerminalRoleOptions,
     activeAgent,
+  );
+  const workspaceNotificationRoots = useMemo(() => (
+    workspaces
+      .map((workspace) => {
+        const workspaceId = String(workspace?.id || "").trim();
+        if (!workspaceId) {
+          return null;
+        }
+        const rootDirectory = (
+          getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+          || cleanWorkspaceRootDirectory(defaultWorkingDirectory)
+        );
+        return rootDirectory ? { rootDirectory, workspaceId } : null;
+      })
+      .filter(Boolean)
+  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  const workspaceNotificationSummaries = useMemo(
+    () => getWorkspaceNotificationSummaries(workspaceNotifications, workspaceThreads),
+    [workspaceNotifications, workspaceThreads],
   );
   const workspaceCloseAllowNativeRef = useRef(false);
 
@@ -3148,6 +3189,177 @@ export default function App() {
     workspaceThreads,
     workspaces,
   ]);
+
+  useEffect(() => {
+    persistWorkspaceNotifications(workspaceNotifications);
+  }, [workspaceNotifications]);
+
+  useEffect(() => {
+    const sfx = createWorkspaceNotificationSfx();
+    workspaceNotificationSfxRef.current = sfx;
+    const unlock = () => {
+      sfx.unlock();
+    };
+
+    window.addEventListener("keydown", unlock, { passive: true });
+    window.addEventListener("pointerdown", unlock, { passive: true });
+
+    return () => {
+      window.removeEventListener("keydown", unlock);
+      window.removeEventListener("pointerdown", unlock);
+      sfx.dispose();
+      if (workspaceNotificationSfxRef.current === sfx) {
+        workspaceNotificationSfxRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const cues = Array.isArray(workspaceNotifications.cues) ? workspaceNotifications.cues : [];
+    cues.forEach((cue) => {
+      if (!cue?.id || workspaceNotificationCueIdsRef.current.has(cue.id)) {
+        return;
+      }
+      workspaceNotificationCueIdsRef.current.add(cue.id);
+      workspaceNotificationSfxRef.current?.play(cue.kind);
+    });
+    if (workspaceNotificationCueIdsRef.current.size > 200) {
+      workspaceNotificationCueIdsRef.current = new Set(
+        Array.from(workspaceNotificationCueIdsRef.current).slice(-120),
+      );
+    }
+  }, [workspaceNotifications.cues]);
+
+  useEffect(() => {
+    if (!selectedWorkspaceId) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
+    }, 350);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [selectedWorkspaceId]);
+
+  useEffect(() => {
+    const snapshotTargets = workspaceNotificationRoots.filter((entry) => (
+      entry?.workspaceId && entry?.rootDirectory
+    ));
+    const snapshotKey = JSON.stringify(snapshotTargets.map((entry) => [
+      entry.workspaceId,
+      normalizeWorkspaceNotificationPath(entry.rootDirectory),
+    ]));
+    if (!snapshotTargets.length || workspaceNotificationSnapshotKeyRef.current === snapshotKey) {
+      return undefined;
+    }
+
+    workspaceNotificationSnapshotKeyRef.current = snapshotKey;
+    let cancelled = false;
+
+    snapshotTargets.forEach((target) => {
+      invoke("coordination_get_snapshot", {
+        dbPath: null,
+        repoPath: target.rootDirectory,
+      }).then((response) => {
+        if (cancelled) return;
+        const snapshot = response?.data && typeof response.data === "object"
+          ? response.data
+          : response;
+        setWorkspaceNotifications((current) => reconcileWorkspaceNotificationSnapshot(
+          current,
+          target.workspaceId,
+          snapshot,
+          { suppressCue: true },
+        ));
+      }).catch(() => {
+        // Snapshot reconciliation is opportunistic; live events still keep the rail responsive.
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceNotificationRoots]);
+
+  useEffect(() => {
+    let unlistenNotification = null;
+    let cancelled = false;
+
+    listen(WORKSPACE_NOTIFICATION_EVENT, (notificationEvent) => {
+      const payload = notificationEvent?.payload || {};
+      const workspaceId = resolveWorkspaceIdForNotificationEvent(
+        payload,
+        workspaceNotificationRoots,
+      );
+      if (!workspaceId) {
+        return;
+      }
+      setWorkspaceNotifications((current) => reduceWorkspaceNotificationEvent(
+        current,
+        {
+          ...payload,
+          workspaceId,
+        },
+        {
+          selectedWorkspaceId: selectedWorkspaceIdRef.current,
+          workspaceId,
+        },
+      ));
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenNotification = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typeof unlistenNotification === "function") {
+        unlistenNotification();
+      }
+    };
+  }, [workspaceNotificationRoots]);
+
+  useEffect(() => {
+    let unlistenParkedPrompt = null;
+    let cancelled = false;
+
+    listen(TERMINAL_PARKED_PROMPT_EVENT, (parkedEvent) => {
+      const payload = parkedEvent?.payload || {};
+      const workspaceId = activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current;
+      if (!workspaceId) {
+        return;
+      }
+      setWorkspaceNotifications((current) => reduceTerminalParkedNotificationEvent(
+        current,
+        {
+          ...payload,
+          workspaceId,
+        },
+        {
+          selectedWorkspaceId: selectedWorkspaceIdRef.current,
+          workspaceId,
+        },
+      ));
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenParkedPrompt = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typeof unlistenParkedPrompt === "function") {
+        unlistenParkedPrompt();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     workspaceTerminalLogicalIndexesRef.current = workspaceTerminalLogicalIndexes;
@@ -3535,6 +3747,7 @@ export default function App() {
   }, [activeView, clearPreparedWorkspaceTerminals, visibleView, workspaces]);
 
   const activateWorkspaceFromRail = useCallback((workspaceId) => {
+    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
     activateWorkspace(workspaceId, "workspace_click");
     showView(DEFAULT_WORKSPACE_VIEW, {
       telemetrySource: "workspace_click_terminal_focus",
@@ -7314,6 +7527,20 @@ export default function App() {
             turnCompleteSeen,
             workspaceId,
           });
+          logTerminalStatus("frontend.terminal_status.transcript_result", {
+            agentId,
+            matchedBy: result?.matchedBy || "",
+            messageCount: messages.length,
+            pollUntilTurnComplete,
+            promptAccepted,
+            promptEventId,
+            requestKey,
+            sessionIdPresent: Boolean(sessionId),
+            terminalGroundTruthStatus: turnCompleteSeen ? "idle_or_done" : "processing_or_unknown",
+            threadId,
+            turnCompleteSeen,
+            workspaceId,
+          });
           if (expectedUserMessage && !promptAccepted && (agentId === "codex" || promptEventId)) {
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch", {
               agentId,
@@ -7504,6 +7731,16 @@ export default function App() {
             return nextThreads;
           });
           if (turnCompleteSeen && promptEventId.startsWith("voice-plan-")) {
+            logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
+              agentId,
+              matchedBy,
+              pendingPromptId: promptEventId,
+              promptEventId,
+              reason: "transcript_turn_complete_seen",
+              threadId,
+              type: "provider-turn-completed",
+              workspaceId,
+            });
             window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
               detail: {
                 agentId,
@@ -7511,6 +7748,7 @@ export default function App() {
                 pendingPromptId: promptEventId,
                 promptEventId,
                 threadId,
+                turnCompleteSeen: true,
                 type: "provider-turn-completed",
                 workspaceId,
               },
@@ -7526,6 +7764,17 @@ export default function App() {
               expectedUserMessagePresent: Boolean(expectedUserMessage),
               requestKey,
               shouldContinuePolling,
+              threadId,
+              turnCompleteSeen,
+              workspaceId,
+            });
+            logTerminalStatus("frontend.terminal_status.transcript_poll_decision", {
+              agentId,
+              elapsedMs,
+              promptEventId,
+              requestKey,
+              shouldContinuePolling,
+              terminalGroundTruthStatus: turnCompleteSeen ? "idle_or_done" : "processing_or_unknown",
               threadId,
               turnCompleteSeen,
               workspaceId,
@@ -7661,6 +7910,37 @@ export default function App() {
         nativeSessionId: lifecycleNativeSessionId,
       };
     }
+    logTerminalStatus("frontend.terminal_status.lifecycle_received", {
+      activityStatus: lifecycleEvent.activityStatus || "",
+      agentId: lifecycleAgentId,
+      hasNativeSessionId: Boolean(lifecycleNativeSessionId),
+      hasOutputText: Boolean(lifecycleEvent.outputText || lifecycleEvent.text),
+      instanceId: lifecycleEvent.instanceId || "",
+      pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+      promptEventId: lifecycleEvent.promptEventId || "",
+      source: lifecycleEvent.source || "",
+      status: lifecycleEvent.status || "",
+      terminalGroundTruthStatus: lifecycleEvent.activityStatus
+        || (lifecycleEvent.type === "terminal-input-ready" || lifecycleEvent.type === "terminal-prompt-ready"
+          ? "idle"
+          : lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
+            ? "processing"
+            : lifecycleEvent.type === "provider-turn-completed"
+              ? "idle_or_done"
+              : ""),
+      terminalIndex: lifecycleEvent.terminalIndex ?? "",
+      threadId: lifecycleThreadId,
+      type: lifecycleEvent.type || "",
+      workspaceId: lifecycleWorkspaceId,
+    });
+    setWorkspaceNotifications((current) => reduceThreadLifecycleNotificationEvent(
+      current,
+      lifecycleEvent,
+      {
+        selectedWorkspaceId: selectedWorkspaceIdRef.current,
+        workspaceId: lifecycleWorkspaceId,
+      },
+    ));
     let lifecyclePromptEventId = String(
       lifecycleEvent.promptEventId
         || lifecycleEvent.pendingPromptId
@@ -7683,19 +7963,37 @@ export default function App() {
       && (
         lifecycleEvent.type === "provider-turn-completed"
         || lifecycleEvent.type === "provider-turn-error"
-        || lifecycleEvent.type === "terminal-prompt-ready"
       )
     ) {
+      logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
+        completionInferred: lifecycleEvent.completionInferred === true,
+        lifecycleType: lifecycleEvent.type,
+        promptEventId: lifecyclePromptEventId,
+        reason: "thread_terminal_lifecycle",
+        terminalGroundTruthStatus: lifecycleEvent.type === "provider-turn-error" ? "error" : "idle_or_done",
+        threadId: lifecycleThreadId,
+        workspaceId: lifecycleWorkspaceId,
+      });
       window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
         detail: {
           ...lifecycleEvent,
-          completionInferred: lifecycleEvent.type === "terminal-prompt-ready",
+          completionInferred: lifecycleEvent.completionInferred === true,
           promptEventId: lifecyclePromptEventId,
-          type: lifecycleEvent.type === "terminal-prompt-ready"
-            ? "provider-turn-completed"
-            : lifecycleEvent.type,
+          type: lifecycleEvent.type,
         },
       }));
+    } else if (
+      lifecyclePromptEventId.startsWith("voice-plan-")
+      && lifecycleEvent.type === "terminal-prompt-ready"
+    ) {
+      logTerminalStatus("frontend.voice_plan.lifecycle_not_dispatched", {
+        lifecycleType: lifecycleEvent.type,
+        promptEventId: lifecyclePromptEventId,
+        reason: "terminal_prompt_ready_is_not_provider_turn_complete",
+        terminalGroundTruthStatus: "idle_or_prompt_ready",
+        threadId: lifecycleThreadId,
+        workspaceId: lifecycleWorkspaceId,
+      });
     }
     setPendingSpecEditIntents((current) => {
       let changed = false;
@@ -8013,6 +8311,27 @@ export default function App() {
         userMessageText: getBigViewTextDiagnosticFields(
           lifecycleEvent.userMessage || lifecycleEvent.message || "",
         ),
+        workspaceId: lifecycleWorkspaceId,
+      });
+      logTerminalStatus("frontend.terminal_status.lifecycle_applied", {
+        after: afterSnapshot,
+        agentId: lifecycleAgentId,
+        before: beforeSnapshot,
+        eventActivityStatus: lifecycleEvent.activityStatus || "",
+        eventStatus: lifecycleEvent.status || "",
+        operation,
+        pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+        stateChanged: nextThreads !== threads,
+        terminalGroundTruthStatus: afterSnapshot.activityStatus
+          || lifecycleEvent.activityStatus
+          || (lifecycleEvent.type === "terminal-input-ready" || lifecycleEvent.type === "terminal-prompt-ready"
+            ? "idle"
+            : lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
+              ? "processing"
+              : ""),
+        terminalIndex: lifecycleEvent.terminalIndex ?? "",
+        threadId: lifecycleThreadId,
+        type: lifecycleEvent.type || "",
         workspaceId: lifecycleWorkspaceId,
       });
       if (
@@ -8935,6 +9254,19 @@ export default function App() {
                           ? "activated"
                           : "activating"
                         : "closed";
+                      const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
+                      const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
+                        notificationSummary.badgeCount,
+                      );
+                      const hasNotificationBadge = Boolean(notificationBadgeText);
+                      const notificationLabel = notificationSummary.pendingActionCount
+                        ? `${notificationSummary.pendingActionCount} action${notificationSummary.pendingActionCount === 1 ? "" : "s"} required`
+                        : notificationSummary.unreadCount
+                          ? `${notificationSummary.unreadCount} unread notification${notificationSummary.unreadCount === 1 ? "" : "s"}`
+                          : "";
+                      const workspaceButtonLabel = notificationLabel
+                        ? `${workspace.name}, ${notificationLabel}`
+                        : workspace.name;
 
                       return (
                         <WorkspaceRow
@@ -8943,12 +9275,13 @@ export default function App() {
                           key={workspace.id}
                         >
                           <WorkspaceButton
+                            aria-label={workspaceButtonLabel}
                             data-runtime={workspaceRuntimeState}
                             data-selected={workspace.id === selectedWorkspaceId}
                             onClick={() => {
                               activateWorkspaceFromRail(workspace.id);
                             }}
-                            title={workspace.name}
+                            title={notificationLabel ? `${workspace.name} - ${notificationLabel}` : workspace.name}
                             type="button"
                           >
                             <WorkspaceAccent aria-hidden="true" />
@@ -8959,6 +9292,14 @@ export default function App() {
                               <strong>{workspace.name}</strong>
                               <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
                             </WorkspaceLabel>
+                            {hasNotificationBadge && (
+                              <WorkspaceNotificationBadge
+                                aria-hidden="true"
+                                data-variant={notificationSummary.badgeVariant}
+                              >
+                                {notificationBadgeText}
+                              </WorkspaceNotificationBadge>
+                            )}
                           </WorkspaceButton>
                           <WorkspaceSettingsButton
                             aria-label={`Open settings for ${workspace.name}`}

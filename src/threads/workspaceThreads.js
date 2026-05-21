@@ -2455,7 +2455,9 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     && Number(existing.instanceId) === eventInstanceId;
   const marksInputReady = explicitInputReady === true
     || eventType === "terminal-input-ready"
-    || eventType === "terminal-prompt-ready";
+    || eventType === "terminal-prompt-ready"
+    || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-error";
   const marksInputBusy = explicitInputReady === false
     || (eventType === "opened" && !openedExistingReadyInstance)
     || eventType === "message-submitted"
@@ -3699,6 +3701,8 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const inputReady = event.inputReady === true
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
+    || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-error"
     ? true
     : latestTurnState === "running"
       ? false
@@ -3841,7 +3845,9 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
   const marksInputReady = explicitInputReady === true
     || eventType === "terminal-input-ready"
-    || eventType === "terminal-prompt-ready";
+    || eventType === "terminal-prompt-ready"
+    || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-error";
   const marksInputBusy = explicitInputReady === false || activityStatus === "thinking";
   const inputReady = marksInputReady
     ? true

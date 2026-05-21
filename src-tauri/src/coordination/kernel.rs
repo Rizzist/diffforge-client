@@ -789,6 +789,14 @@ impl CoordinationKernel {
                 ],
             ) {
                 Ok(_) => {
+                    let event_seq = self
+                        .conn
+                        .query_row(
+                            "SELECT seq FROM events WHERE id=?1 LIMIT 1",
+                            params![&id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .ok();
                     let log_dir = self.paths.repo_path.join("logs");
                     if fs::create_dir_all(&log_dir).is_ok() {
                         if let Ok(mut file) = fs::OpenOptions::new()
@@ -811,6 +819,7 @@ impl CoordinationKernel {
                                     "resource_id": resource_id,
                                     "artifact_id": artifact_id,
                                     "context_run_id": context_run_id,
+                                    "seq": event_seq,
                                     "payload": payload.clone(),
                                     "created_at": created_at,
                                 })
@@ -820,6 +829,16 @@ impl CoordinationKernel {
                     crate::observe_terminal_coordination_event(
                         self.paths.repo_path.clone(),
                         self.paths.db_path.clone(),
+                        event_type.to_string(),
+                        refs.clone(),
+                        payload.clone(),
+                    );
+                    crate::observe_workspace_notification_coordination_event(
+                        self.paths.repo_path.clone(),
+                        self.paths.db_path.clone(),
+                        id.clone(),
+                        event_seq,
+                        created_at.clone(),
                         event_type.to_string(),
                         refs.clone(),
                         payload.clone(),

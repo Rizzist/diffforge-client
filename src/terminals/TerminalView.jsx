@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { AddToQueue } from "@styled-icons/material-rounded/AddToQueue";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -43,6 +44,7 @@ import {
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
+import { logTerminalStatus } from "./terminalStatusLog.js";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
@@ -104,7 +106,8 @@ const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-disp
 const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
-const VOICE_AGENT_MANAGEMENT_RESULT_EVENT = "diffforge:voice-agent-management-result";
+const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
+const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-coding-agents-result";
 const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
 const TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO = "tui-spec-edit-auto-queue";
 const TODO_QUEUE_SOURCE_VOICE_PLAN = "tui-voice-plan-queue";
@@ -119,7 +122,6 @@ const ORCHESTRATOR_VOICE_NOISE_MARGIN = 0.035;
 const ORCHESTRATOR_VOICE_ENVELOPE_MARGIN = 0.0015;
 const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_START = 0.5;
 const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_SPAN = 0.5;
-const ORCHESTRATOR_FAST_LLM_RESPONSE_HOLD_MS = 1200;
 const EMPTY_ORCHESTRATOR_VOICE_STATS = {
   bufferMs: 0,
   frequencyBands: [],
@@ -675,6 +677,29 @@ const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
 const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
 const ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS = 24;
 const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude"]);
+const VOICE_PLAN_STAGE_ORDER = ["execution", "revision"];
+const VOICE_PLAN_COMPLETED_STATUSES = new Set([
+  "accepted",
+  "complete",
+  "completed",
+  "done",
+  "finished",
+  "merged",
+  "not required",
+  "not_required",
+  "passed",
+  "skipped",
+  "success",
+  "succeeded",
+  "verified",
+]);
+const VOICE_PLAN_CLIENT_RELEASE_STATUSES = new Set([
+  "queued",
+  "ready",
+  "ready_to_queue",
+  "released",
+  "sent_to_client",
+]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
   { id: "files", label: "Files" },
@@ -1172,6 +1197,36 @@ const OrchestratorHistoryLlmText = styled.div`
 
   html[data-forge-theme="light"] & {
     color: #343a46;
+  }
+`;
+
+const orchestratorHistorySpinner = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
+const OrchestratorHistoryPendingLine = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: #b9c7d9;
+`;
+
+const OrchestratorHistoryInlineSpinner = styled.span`
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(125, 176, 255, 0.2);
+  border-top-color: rgba(125, 176, 255, 0.88);
+  border-radius: 999px;
+  animation: ${orchestratorHistorySpinner} 760ms linear infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    border-top-color: rgba(0, 102, 204, 0.82);
   }
 `;
 
@@ -2414,7 +2469,7 @@ function normalizeVoiceAgentManagementAgent(value) {
   return "";
 }
 
-function normalizeVoiceAgentManagementAction(value) {
+function normalizeVoiceAgentOpenCodingAgentsAction(value) {
   const normalized = String(value || "")
     .trim()
     .toLowerCase()
@@ -2423,40 +2478,26 @@ function normalizeVoiceAgentManagementAction(value) {
   if (["ensure", "ensure_count", "set_count", "launch_count"].includes(normalized)) {
     return "ensure_count";
   }
-  if (["spawn", "spawn_count", "add", "create", "launch"].includes(normalized)) {
-    return "spawn_count";
-  }
-  if (["close_idle_by_agent", "close_agent_idle"].includes(normalized)) {
-    return "close_idle_by_agent";
-  }
-  if (["close", "close_idle", "remove_idle"].includes(normalized)) {
-    return "close_idle";
-  }
-  return "status";
+  return "spawn_count";
 }
 
-function getVoiceAgentManagementRequestSummary(args = {}) {
-  const action = normalizeVoiceAgentManagementAction(args.action);
+function getVoiceAgentOpenCodingAgentsRequestSummary(args = {}) {
+  const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
   const agentId = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
-  const count = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
+  const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
   const agentLabel = agentId || "agent";
 
   if (action === "ensure_count") {
-    return `Ensure ${count} ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
+    return `Open ${count} total ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
   }
-  if (action === "spawn_count") {
-    return `Launch ${count} ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
-  }
-  if (action === "close_idle" || action === "close_idle_by_agent") {
-    return `Close ${count > 0 ? count : "all"} idle ${agentLabel === "agent" ? "agent" : agentLabel} terminal${count === 1 ? "" : "s"}.`;
-  }
-  return "Check coding-agent terminal status.";
+  return `Open ${count} more ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
 }
 
 function getVoiceAgentToolCallSignature(toolCall) {
   const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
+  const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
   const fallbackSignature = JSON.stringify(toolCall?.arguments || toolCall?.args || {});
-  return callId || fallbackSignature;
+  return callId || `${toolName}:${fallbackSignature}`;
 }
 
 function getVoiceAgentEventKind(event) {
@@ -2596,7 +2637,7 @@ function getVoiceHistoryTurnStatus(item) {
   if (item?.llmFeedback) {
     return "Thinking";
   }
-  return "Submitted";
+  return "Thinking";
 }
 
 function getVoiceHistoryTurnLabel(item) {
@@ -2817,9 +2858,13 @@ function getVoicePlanSnapshotFromPayload(value) {
 function getVoicePlanReleasedTasksFromPayload(value, snapshot = null) {
   const payload = unwrapCloudVoicePlanResult(value);
   const rawTasks = payload?.released_tasks || payload?.releasedTasks || [];
-  return (Array.isArray(rawTasks) ? rawTasks : [])
+  const releasedTasks = (Array.isArray(rawTasks) ? rawTasks : [])
     .map((task) => normalizeVoicePlanReleasedTask(task, snapshot))
     .filter(Boolean);
+  if (releasedTasks.length) {
+    return releasedTasks;
+  }
+  return getVoicePlanReleasedTasksFromSnapshot(snapshot || getVoicePlanSnapshotFromPayload(value));
 }
 
 function getVoicePlanTaskFromPromptEventId(value) {
@@ -2895,6 +2940,252 @@ function isVoicePlanBoundaryQueueItem(item) {
         || releasePolicy === "verification_barrier"
       ),
   );
+}
+
+function normalizeVoicePlanStageName(value) {
+  const stage = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (stage === "execute" || stage === "implementation" || stage === "implement") {
+    return "execution";
+  }
+  if (stage === "review" || stage === "verify" || stage === "verification") {
+    return "revision";
+  }
+  return stage;
+}
+
+function getVoicePlanStageIndex(value) {
+  return VOICE_PLAN_STAGE_ORDER.indexOf(normalizeVoicePlanStageName(value));
+}
+
+function normalizeVoicePlanStatus(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function isVoicePlanCompletedStatus(value) {
+  const normalized = normalizeVoicePlanStatus(value);
+  return VOICE_PLAN_COMPLETED_STATUSES.has(normalized)
+    || VOICE_PLAN_COMPLETED_STATUSES.has(normalized.replace(/_/g, " "));
+}
+
+function getVoicePlanStepByOrdinal(plan, ordinal) {
+  const stepOrdinal = Number(ordinal);
+  if (!Number.isFinite(stepOrdinal)) {
+    return null;
+  }
+  return (Array.isArray(plan?.steps) ? plan.steps : []).find((step) => (
+    Number(step?.ordinal) === stepOrdinal
+  )) || null;
+}
+
+function getVoicePlanStageStatus(step, stageName) {
+  const stage = normalizeVoicePlanStageName(stageName);
+  if (stage === "execution") {
+    return String(step?.executionStatus || "").trim();
+  }
+  if (stage === "revision") {
+    return String(step?.revisionStatus || "").trim();
+  }
+  return "";
+}
+
+function getVoicePlanStageTasks(step, stageName) {
+  const stage = normalizeVoicePlanStageName(stageName);
+  if (stage === "execution") {
+    return Array.isArray(step?.executionTasks) ? step.executionTasks : [];
+  }
+  if (stage === "revision") {
+    return Array.isArray(step?.revisionTasks) ? step.revisionTasks : [];
+  }
+  return [];
+}
+
+function isVoicePlanStageComplete(step, stageName) {
+  if (!step) {
+    return false;
+  }
+  const status = getVoicePlanStageStatus(step, stageName);
+  if (isVoicePlanCompletedStatus(status)) {
+    return true;
+  }
+  const tasks = getVoicePlanStageTasks(step, stageName);
+  if (!tasks.length) {
+    return !status;
+  }
+  return tasks.every((task) => isVoicePlanCompletedStatus(task?.status));
+}
+
+function isVoicePlanStepComplete(step) {
+  if (!step) {
+    return false;
+  }
+  if (isVoicePlanCompletedStatus(step?.status)) {
+    return true;
+  }
+  return VOICE_PLAN_STAGE_ORDER.every((stageName) => isVoicePlanStageComplete(step, stageName));
+}
+
+function getVoicePlanTaskReleaseDecision(task, snapshot = null) {
+  const planTask = normalizeTodoQueuePlanTask(task);
+  if (!planTask) {
+    return { eligible: false, reason: "invalid_plan_task" };
+  }
+
+  const taskStepOrdinal = Number(planTask.stepOrdinal || 0);
+  const taskStage = normalizeVoicePlanStageName(planTask.stage || snapshot?.currentStage || "execution");
+  const taskStageIndex = getVoicePlanStageIndex(taskStage);
+  if (isVoicePlanCompletedStatus(snapshot?.status)) {
+    return { eligible: false, reason: "plan_complete" };
+  }
+  if (!snapshot?.runId) {
+    return taskStepOrdinal === 0 && (taskStageIndex <= 0)
+      ? { eligible: true, reason: "first_slot_without_snapshot" }
+      : { eligible: false, reason: "missing_plan_snapshot" };
+  }
+  if (planTask.runId && snapshot.runId && planTask.runId !== snapshot.runId) {
+    return { eligible: false, reason: "plan_snapshot_mismatch" };
+  }
+
+  const currentStepOrdinal = Number(snapshot.currentStepOrdinal);
+  const currentStage = normalizeVoicePlanStageName(snapshot.currentStage);
+  const currentStageIndex = getVoicePlanStageIndex(currentStage);
+  if (Number.isFinite(currentStepOrdinal)) {
+    if (taskStepOrdinal < currentStepOrdinal) {
+      return { eligible: false, reason: "past_step" };
+    }
+    if (
+      taskStepOrdinal === currentStepOrdinal
+      && currentStage
+      && taskStage
+      && taskStageIndex >= 0
+      && currentStageIndex >= 0
+    ) {
+      if (taskStageIndex < currentStageIndex) {
+        return { eligible: false, reason: "past_stage" };
+      }
+      if (taskStageIndex === currentStageIndex) {
+        return { eligible: true, reason: "current_stage" };
+      }
+    }
+  }
+
+  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
+  for (const step of steps) {
+    const stepOrdinal = Number(step?.ordinal);
+    if (Number.isFinite(stepOrdinal) && stepOrdinal < taskStepOrdinal && !isVoicePlanStepComplete(step)) {
+      return { eligible: false, reason: "previous_step_incomplete" };
+    }
+  }
+  const currentStep = getVoicePlanStepByOrdinal(snapshot, taskStepOrdinal);
+  for (const stageName of VOICE_PLAN_STAGE_ORDER) {
+    const stageIndex = getVoicePlanStageIndex(stageName);
+    if (stageIndex >= taskStageIndex || stageIndex < 0) {
+      continue;
+    }
+    if (!isVoicePlanStageComplete(currentStep, stageName)) {
+      return { eligible: false, reason: "previous_stage_incomplete" };
+    }
+  }
+
+  return { eligible: true, reason: "previous_slots_complete" };
+}
+
+function shouldDeferVoicePlanTaskRelease(reason) {
+  return [
+    "future_stage",
+    "future_step",
+    "missing_plan_snapshot",
+    "previous_stage_incomplete",
+    "previous_step_incomplete",
+  ].includes(String(reason || ""));
+}
+
+function isVoicePlanClientReleaseStatus(value) {
+  return VOICE_PLAN_CLIENT_RELEASE_STATUSES.has(normalizeVoicePlanStatus(value));
+}
+
+function getVoicePlanReleasedTaskKey(task) {
+  return `${task?.runId || "plan"}:${task?.taskId || task?.id || ""}`;
+}
+
+function getVoicePlanTaskStatusLogSummary(task) {
+  if (!task) {
+    return null;
+  }
+  return {
+    runId: task.runId || task.run_id || task.planRunId || task.plan_run_id || "",
+    stage: task.stage || task.planStage || task.plan_stage || "",
+    stepOrdinal: task.stepOrdinal ?? task.step_ordinal ?? "",
+    status: task.status || "",
+    taskId: task.taskId || task.task_id || task.id || task.planTaskId || task.plan_task_id || "",
+    textLength: String(task.text || task.todo || task.task || "").length,
+    title: task.title || "",
+  };
+}
+
+function getVoicePlanSnapshotLogSummary(snapshot) {
+  if (!snapshot) {
+    return null;
+  }
+  return {
+    currentStage: snapshot.currentStage || "",
+    currentStepOrdinal: snapshot.currentStepOrdinal ?? "",
+    runId: snapshot.runId || "",
+    status: snapshot.status || "",
+    stepCount: Array.isArray(snapshot.steps) ? snapshot.steps.length : 0,
+    steps: (Array.isArray(snapshot.steps) ? snapshot.steps : []).map((step) => ({
+      executionStatus: step?.executionStatus || "",
+      executionTaskStatuses: (Array.isArray(step?.executionTasks) ? step.executionTasks : [])
+        .map((task) => ({
+          id: task?.id || task?.taskId || "",
+          status: task?.status || "",
+        })),
+      ordinal: step?.ordinal ?? "",
+      revisionStatus: step?.revisionStatus || "",
+      revisionTaskStatuses: (Array.isArray(step?.revisionTasks) ? step.revisionTasks : [])
+        .map((task) => ({
+          id: task?.id || task?.taskId || "",
+          status: task?.status || "",
+        })),
+      status: step?.status || "",
+    })),
+  };
+}
+
+function getVoicePlanReleasedTasksFromSnapshot(snapshot) {
+  if (!snapshot?.runId) {
+    return [];
+  }
+  const currentStepOrdinal = Number(snapshot.currentStepOrdinal || 0);
+  const currentStage = normalizeVoicePlanStageName(snapshot.currentStage);
+  const releasedTasks = [];
+  (Array.isArray(snapshot.steps) ? snapshot.steps : []).forEach((step) => {
+    const stepOrdinal = Number.isFinite(Number(step?.ordinal)) ? Number(step.ordinal) : 0;
+    const stages = currentStage && stepOrdinal === currentStepOrdinal
+      ? [currentStage]
+      : VOICE_PLAN_STAGE_ORDER;
+    stages.forEach((stageName) => {
+      getVoicePlanStageTasks(step, stageName).forEach((task) => {
+        if (!isVoicePlanClientReleaseStatus(task?.status)) {
+          return;
+        }
+        releasedTasks.push({
+          doneWhen: task.doneWhen,
+          maxConcurrency: task.maxConcurrency,
+          releasePolicy: task.releasePolicy,
+          requiresQueueDrain: task.requiresQueueDrain,
+          runId: task.runId || snapshot.runId,
+          stage: task.stage || stageName,
+          stepOrdinal: task.stepOrdinal ?? stepOrdinal,
+          taskId: task.id || task.taskId,
+          title: task.title,
+          text: task.text,
+        });
+      });
+    });
+  });
+  return releasedTasks
+    .map((task) => normalizeVoicePlanReleasedTask(task, snapshot))
+    .filter(Boolean);
 }
 
 function isPlaceholderVoicePlanTaskText(value) {
@@ -3452,6 +3743,10 @@ async function readOrchestratorVoiceHistoryItemsFromAgents({
   rootDirectory = "",
   workspaceId = "",
 } = {}) {
+  logTerminalStatus("frontend.voice_history.read.start", {
+    rootDirectory,
+    workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+  });
   try {
     const result = await invoke("read_orchestrator_voice_history", {
       request: {
@@ -3459,8 +3754,19 @@ async function readOrchestratorVoiceHistoryItemsFromAgents({
         workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
       },
     });
-    return normalizeOrchestratorVoiceHistoryItems(result?.items || []);
-  } catch {
+    const items = normalizeOrchestratorVoiceHistoryItems(result?.items || []);
+    logTerminalStatus("frontend.voice_history.read.result", {
+      count: items.length,
+      rootDirectory,
+      workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+    });
+    return items;
+  } catch (error) {
+    logTerminalStatus("frontend.voice_history.read.error", {
+      message: error?.message || String(error || ""),
+      rootDirectory,
+      workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+    });
     return [];
   }
 }
@@ -3471,6 +3777,11 @@ async function writeOrchestratorVoiceHistoryItemsToAgents({
   workspaceId = "",
 } = {}) {
   try {
+    logTerminalStatus("frontend.voice_history.write.start", {
+      count: normalizeOrchestratorVoiceHistoryItems(items).length,
+      rootDirectory,
+      workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+    });
     await invoke("write_orchestrator_voice_history", {
       request: {
         items: normalizeOrchestratorVoiceHistoryItems(items),
@@ -3478,7 +3789,17 @@ async function writeOrchestratorVoiceHistoryItemsToAgents({
         workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
       },
     });
-  } catch {
+    logTerminalStatus("frontend.voice_history.write.result", {
+      count: normalizeOrchestratorVoiceHistoryItems(items).length,
+      rootDirectory,
+      workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+    });
+  } catch (error) {
+    logTerminalStatus("frontend.voice_history.write.error", {
+      message: error?.message || String(error || ""),
+      rootDirectory,
+      workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+    });
     // Voice history persistence should never interrupt terminal work.
   }
 }
@@ -3671,6 +3992,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onSubmitDraft,
   onUpdateItem,
   onVoiceAgentToolCall,
+  onVoicePlanServerResult,
   pendingItems = {},
   rootDirectory = "",
   workspace,
@@ -3824,12 +4146,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
+    logTerminalStatus("frontend.voice_history.transcript_arrived", {
+      final: isFinal,
+      textLength: transcript.length,
+      turnIndex: getVoiceHistoryTurnIndex(event),
+      turnKey,
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
     updateVoiceHistoryTurn(turnKey, (currentItem) => ({
       transcript: transcript || currentItem.transcript,
       transcriptFinal: currentItem.transcriptFinal || isFinal,
       turnIndex: getVoiceHistoryTurnIndex(event),
     }));
-  }, [updateVoiceHistoryTurn]);
+  }, [orchestratorPanelWorkspaceId, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryLlmFeedback = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -3839,37 +4168,57 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
+    logTerminalStatus("frontend.voice_history.llm_feedback_arrived", {
+      final: Boolean(event?.final),
+      status: String(event?.status || "").trim(),
+      textLength: feedback.length,
+      turnIndex: getVoiceHistoryTurnIndex(event),
+      turnKey,
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
     updateVoiceHistoryTurn(turnKey, {
       llmFeedback: feedback,
       llmFinal: Boolean(event?.final),
       llmStatus: String(event?.status || "").trim(),
       turnIndex: getVoiceHistoryTurnIndex(event),
     });
-  }, [updateVoiceHistoryTurn]);
+  }, [orchestratorPanelWorkspaceId, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryToolCall = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
     const turnKey = getVoiceHistoryTurnKey(event, sessionId);
     const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
     const args = normalizeVoiceAgentQueueArguments(event?.arguments || event?.args);
+    const openAgentsSummary = getVoiceAgentOpenCodingAgentsRequestSummary(args);
+    const planSummary = normalizeVoiceHistoryText(args.title || args.goal || args.objective || args.text || "", 220);
     const patch = {
-      queued: toolName !== "manage_agents",
+      queued: toolName === "queue",
       queuedText: normalizeVoiceHistoryText(
-        toolName === "manage_agents"
-          ? getVoiceAgentManagementRequestSummary(args)
+        toolName === "open_coding_agents"
+          ? openAgentsSummary
+          : toolName === "create_plan"
+            ? planSummary
           : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
         600,
       ),
       turnIndex: getVoiceHistoryTurnIndex(event),
     };
-    if (toolName === "manage_agents") {
-      patch.llmFeedback = `Managing agents: ${getVoiceAgentManagementRequestSummary(args)}`;
+    if (toolName === "open_coding_agents") {
+      patch.llmFeedback = `Opening agents: ${openAgentsSummary}`;
+      patch.llmFinal = false;
+    } else if (toolName === "create_plan") {
+      patch.llmFeedback = planSummary ? `Creating plan: ${planSummary}` : "Creating plan...";
       patch.llmFinal = false;
     }
-    updateVoiceHistoryTurn(turnKey, patch);
+    updateVoiceHistoryTurn(turnKey, (currentItem) => ({
+      ...patch,
+      llmFeedback: currentItem.llmFeedback || patch.llmFeedback || "",
+      llmFinal: currentItem.llmFeedback ? currentItem.llmFinal : Boolean(patch.llmFinal),
+      llmStatus: currentItem.llmStatus || patch.llmStatus || "",
+    }));
   }, [updateVoiceHistoryTurn]);
 
-  const recordVoiceHistoryManagementResult = useCallback((event, message, status = "ready") => {
+  const recordVoiceHistoryOpenCodingAgentsResult = useCallback((event, message, status = "ready") => {
     const sessionId = orchestratorVoiceSessionRef.current;
     const turnKey = getVoiceHistoryTurnKey(event, sessionId);
     updateVoiceHistoryTurn(turnKey, {
@@ -3886,6 +4235,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
+    logTerminalStatus("frontend.voice_history.plan_snapshot_arrived", {
+      snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
     const hasTurnIndex = event?.turn_index != null || event?.turnIndex != null;
     const sessionId = orchestratorVoiceSessionRef.current;
     const turnKey = hasTurnIndex
@@ -3929,7 +4282,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         : [nextItem].concat(currentItems);
       return nextItems.slice(0, ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
     });
-  }, []);
+  }, [orchestratorPanelWorkspaceId]);
 
   const resetOrchestratorFastResponseGate = useCallback(() => {
     const gate = orchestratorVoiceFastResponseGateRef.current;
@@ -4014,50 +4367,26 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   const bufferOrReleaseOrchestratorFastResponseEvent = useCallback((event) => {
     const kind = getVoiceAgentEventKind(event);
-    const runId = orchestratorVoiceRunRef.current;
-    let gate = orchestratorVoiceFastResponseGateRef.current;
-    if (!gate || gate.runId !== runId) {
-      gate = {
-        cancelled: false,
-        pendingFeedback: null,
-        pendingTtsEvents: [],
-        released: false,
-        runId,
-        timer: 0,
-      };
-      orchestratorVoiceFastResponseGateRef.current = gate;
-    }
-
-    if (gate.cancelled) {
-      return "cancelled";
-    }
-    if (gate.released) {
-      if (isVoiceAgentTtsEventKind(kind)) {
-        void orchestratorVoiceTtsPlayerRef.current?.handleEvent?.(event);
-      } else if (kind === "voice_agent_fast_llm_feedback" || kind === "voice_agent_initial_llm_feedback") {
-        const normalizedEvent = normalizeFastVoiceAgentFeedbackEvent(event);
-        recordVoiceHistoryLlmFeedback(normalizedEvent);
-        const feedback = String(normalizedEvent.feedback || "").trim();
-        if (feedback) {
-          setOrchestratorVoiceFeedback(feedback);
-        }
-      }
+    if (isVoiceAgentTtsEventKind(kind)) {
+      void orchestratorVoiceTtsPlayerRef.current?.handleEvent?.(event);
       return "released";
     }
 
-    if (isVoiceAgentTtsEventKind(kind)) {
-      gate.pendingTtsEvents.push(event);
-    } else {
-      gate.pendingFeedback = event;
+    const normalizedEvent = normalizeFastVoiceAgentFeedbackEvent(event);
+    recordVoiceHistoryLlmFeedback(normalizedEvent);
+    const feedback = String(normalizedEvent.feedback || "").trim();
+    if (feedback) {
+      setOrchestratorVoiceFeedback(feedback);
     }
-
-    if (!gate.timer) {
-      gate.timer = window.setTimeout(() => {
-        releaseOrchestratorFastResponseGate("timeout");
-      }, ORCHESTRATOR_FAST_LLM_RESPONSE_HOLD_MS);
-    }
-    return "buffered";
-  }, [recordVoiceHistoryLlmFeedback, releaseOrchestratorFastResponseGate]);
+    logBigViewSyncDiagnosticEvent("tui.voice_agent.fast_response_released", {
+      hasFeedback: Boolean(feedback),
+      reason: "immediate",
+      surface: "tui_voice_agent",
+      ttsEventCount: 0,
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
+    return "released";
+  }, [orchestratorPanelWorkspaceId, recordVoiceHistoryLlmFeedback]);
 
   const stopOrchestratorVoiceMonitor = useCallback(async () => {
     orchestratorVoiceRunRef.current += 1;
@@ -4119,7 +4448,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorVoiceInputFinishRequestedRef.current = false;
     orchestratorVoiceSessionRef.current = Date.now();
     orchestratorVoiceEventsActiveRef.current = true;
-    await orchestratorVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+    const previousTtsPlayer = orchestratorVoiceTtsPlayerRef.current;
     orchestratorVoiceTtsPlayerRef.current = createCloudVoiceAgentTtsPlayer({
       onError: (error) => {
         logBigViewSyncDiagnosticEvent("tui.voice_agent.tts_playback_error", {
@@ -4129,6 +4458,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         });
       },
     });
+    void orchestratorVoiceTtsPlayerRef.current?.prime?.();
+    await previousTtsPlayer?.close?.().catch(() => {});
     setOrchestratorVoiceState("starting");
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
@@ -4614,7 +4945,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
       if (kind === "voice_agent_plan_snapshot") {
         cancelOrchestratorFastResponseGate("plan_snapshot");
-        recordVoiceHistoryPlanSnapshot(event);
+        logTerminalStatus("frontend.voice_agent.plan_snapshot_event", {
+          active: Boolean(orchestratorVoiceEventsActiveRef.current),
+          releasedTaskCount: getVoicePlanReleasedTasksFromPayload(event).length,
+          snapshot: getVoicePlanSnapshotLogSummary(getVoicePlanSnapshotFromPayload(event)),
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
+        const handledPlanResult = onVoicePlanServerResult?.(event);
+        logTerminalStatus("frontend.voice_agent.plan_snapshot_routed", {
+          handledPlanResult: Boolean(handledPlanResult),
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
+        if (!handledPlanResult) {
+          recordVoiceHistoryPlanSnapshot(event);
+        }
         const snapshot = getVoicePlanSnapshotFromPayload(event);
         if (snapshot) {
           setOrchestratorVoiceError("");
@@ -4625,15 +4969,31 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
       if (kind === "voice_agent_tool_call") {
         if (!orchestratorVoiceEventsActiveRef.current) {
+          logTerminalStatus("frontend.voice_agent.tool_call_ignored", {
+            kind,
+            reason: "orchestrator_voice_events_inactive",
+            toolName: String(event?.name || event?.tool_name || event?.toolName || "").trim(),
+            workspaceId: orchestratorPanelWorkspaceId,
+          });
           return;
         }
         cancelOrchestratorFastResponseGate("tool_call");
         const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
-        if (toolName === "queue" || toolName === "manage_agents") {
+        if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "create_plan") {
+          logTerminalStatus("frontend.voice_agent.tool_call_arrived", {
+            toolName,
+            workspaceId: orchestratorPanelWorkspaceId,
+          });
           recordVoiceHistoryToolCall(event);
           onVoiceAgentToolCall?.(event);
           setOrchestratorVoiceError("");
-          setOrchestratorVoiceFeedback(toolName === "manage_agents" ? "Managing agents..." : "Queued voice todo.");
+          setOrchestratorVoiceFeedback(
+            toolName === "open_coding_agents"
+              ? "Opening coding agents..."
+              : toolName === "create_plan"
+                ? "Creating plan..."
+                : "Queued voice todo.",
+          );
         }
         return;
       }
@@ -4662,6 +5022,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     recordVoiceHistoryPlanSnapshot,
     recordVoiceHistoryToolCall,
     recordVoiceHistoryTranscript,
+    onVoicePlanServerResult,
     completeOrchestratorVoiceSession,
     stopOrchestratorVoiceMonitor,
     orchestratorPanelWorkspaceId,
@@ -4678,7 +5039,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [recordVoiceHistoryPlanSnapshot]);
 
   useEffect(() => {
-    const handleVoiceAgentManagementResult = (event) => {
+    const handleVoiceAgentOpenCodingAgentsResult = (event) => {
       const detail = event?.detail || {};
       const eventWorkspaceId = String(detail.workspaceId || "").trim();
       if (workspaceId && eventWorkspaceId && eventWorkspaceId !== workspaceId) {
@@ -4691,7 +5052,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
-      recordVoiceHistoryManagementResult(detail.toolCall || detail.event || detail, message, status);
+      recordVoiceHistoryOpenCodingAgentsResult(detail.toolCall || detail.event || detail, message, status);
       if (status === "error") {
         setOrchestratorVoiceError(message);
         setOrchestratorVoiceFeedback("");
@@ -4701,11 +5062,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
     };
 
-    window.addEventListener(VOICE_AGENT_MANAGEMENT_RESULT_EVENT, handleVoiceAgentManagementResult);
+    window.addEventListener(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
     return () => {
-      window.removeEventListener(VOICE_AGENT_MANAGEMENT_RESULT_EVENT, handleVoiceAgentManagementResult);
+      window.removeEventListener(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
     };
-  }, [recordVoiceHistoryManagementResult, workspaceId]);
+  }, [recordVoiceHistoryOpenCodingAgentsResult, workspaceId]);
 
   useEffect(() => {
     const drag = todoReorderDragRef.current;
@@ -5031,7 +5392,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                   <OrchestratorHistoryList>
                     {orchestratorVoiceHistoryItems.map((item) => {
                       const status = getVoiceHistoryTurnStatus(item);
-                      const pending = status === "Pending";
+                      const pending = status === "Pending" || status === "Thinking";
+                      const llmPending = Boolean(
+                        item.transcriptFinal
+                          && !item.llmFeedback
+                          && !item.llmFinal
+                          && !item.queued
+                          && !item.plan,
+                      );
                       const llmLabel = item.llmFinal || item.queued
                         ? "LLM response"
                         : "LLM response pending";
@@ -5047,10 +5415,17 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                               {item.transcript}
                             </OrchestratorHistoryTranscript>
                           )}
-                          {item.llmFeedback && (
+                          {(item.llmFeedback || llmPending) && (
                             <OrchestratorHistoryLlm>
                               <OrchestratorHistoryLlmLabel>{llmLabel}</OrchestratorHistoryLlmLabel>
-                              <OrchestratorHistoryLlmText>{item.llmFeedback}</OrchestratorHistoryLlmText>
+                              <OrchestratorHistoryLlmText>
+                                {item.llmFeedback || (
+                                  <OrchestratorHistoryPendingLine>
+                                    <OrchestratorHistoryInlineSpinner aria-hidden="true" />
+                                    <span>Waiting for orchestrator response...</span>
+                                  </OrchestratorHistoryPendingLine>
+                                )}
+                              </OrchestratorHistoryLlmText>
                             </OrchestratorHistoryLlm>
                           )}
                           {item.plan && (
@@ -5067,10 +5442,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                     const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
                                     const activeStage = isActiveStep ? item.plan.currentStage : "";
                                     const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
+                                      const normalizedStageStatus = String(stageStatus || "").trim().toLowerCase();
                                       if (!tasks.length && !stageStatus) {
                                         return null;
                                       }
-                                      if (!tasks.length && String(stageStatus || "").trim().toLowerCase() === "draft") {
+                                      if (!tasks.length && (normalizedStageStatus === "draft" || normalizedStageStatus === "planned")) {
                                         return null;
                                       }
                                       const isActiveStage = isActiveStep && activeStage === stageName;
@@ -5212,6 +5588,8 @@ function TerminalView({
   const todoQueuePendingTimersRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
   const voiceAgentToolCallIdsRef = useRef(new Set());
+  const voicePlanDeferredTasksRef = useRef(new Map());
+  const voicePlanSnapshotsRef = useRef(new Map());
   const workspaceFileDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
   const todoQueueStorageKey = useMemo(
@@ -5432,15 +5810,46 @@ function TerminalView({
     const allowGeneric = options.allowGeneric !== false;
     const requireAvailable = Boolean(options.requireAvailable);
     const baseWorkspaceId = String(item?.workspaceId || terminalWorkspace?.id || "");
-    const unavailable = (reason, message, fields = {}) => ({
-      available: false,
-      image,
-      message,
-      reason,
-      targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
-      workspaceId: baseWorkspaceId,
-      ...fields,
-    });
+    const logAvailability = (available, reason, message, fields = {}) => {
+      if (!requireAvailable) {
+        return;
+      }
+      logTerminalStatus("frontend.terminal_status.ground_truth_availability", {
+        activityStatus: fields.activityStatus || "",
+        agentInputReady: Boolean(fields.agentInputReady),
+        allowGeneric,
+        available,
+        hasComposerDraft: Boolean(fields.syncKey && String(getWorkspaceThreadComposerDraftStore().get(fields.syncKey) || "").length > 0),
+        hasComposerSyncKey: Boolean(fields.syncKey),
+        hasLiveTerminal: Boolean(fields.liveTerminal),
+        hasPendingPrompt: Boolean(fields.targetThread?.pendingPrompt),
+        hasResolvedBinding: Boolean(fields.targetBinding?.instanceId),
+        hasTargetThread: Boolean(fields.targetThread?.id),
+        latestTurnState: fields.latestTurnState || "",
+        message,
+        reason,
+        recordedAgentInputReady: Boolean(fields.recordedAgentInputReady),
+        completedTurnLooksSendable: Boolean(fields.completedTurnLooksSendable),
+        requiresAgentInputReady: Boolean(fields.requiresAgentInputReady),
+        sourceItem: getTodoQueueItemLogSummary(item ? [item] : [])[0] || null,
+        targetRole: fields.targetRole || "",
+        targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+        terminalStatus: fields.terminalStatus || "",
+        workspaceId: fields.workspaceId || baseWorkspaceId,
+      });
+    };
+    const unavailable = (reason, message, fields = {}) => {
+      logAvailability(false, reason, message, fields);
+      return {
+        available: false,
+        image,
+        message,
+        reason,
+        targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+        workspaceId: baseWorkspaceId,
+        ...fields,
+      };
+    };
 
     if (!Number.isInteger(targetTerminalIndex) || !logicalTerminalIndexes.includes(targetTerminalIndex)) {
       return unavailable("missing_target_terminal", "Choose an agent terminal for this todo.");
@@ -5493,15 +5902,27 @@ function TerminalView({
         && !["generic", "terminal", "shell"].includes(targetRole),
     );
     const requiresAgentInputReady = TODO_QUEUE_AGENT_ROLES.has(targetRole);
+    const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || targetProviderBinding?.inputReady);
+    const completedTurnLooksSendable = Boolean(
+      requiresAgentInputReady
+        && !recordedAgentInputReady
+        && ["completed", "error", "interrupted"].includes(latestTurnState)
+        && activityStatus !== "thinking"
+        && !targetThread?.pendingPrompt
+        && ["active", "running"].includes(terminalStatus),
+    );
     const agentInputReady = !requiresAgentInputReady
-      || Boolean(liveTerminal?.inputReady || targetProviderBinding?.inputReady);
+      || recordedAgentInputReady
+      || completedTurnLooksSendable;
     const targetFields = {
       agentInputReady,
       activityStatus,
+      completedTurnLooksSendable,
       image,
       latestTurnState,
       liveTerminal,
       paneId,
+      recordedAgentInputReady,
       requiresAgentInputReady,
       shouldAutoSubmit,
       syncKey,
@@ -5584,6 +6005,10 @@ function TerminalView({
       return unavailable("composer_attachments_present", "This terminal already has queued attachments.", targetFields);
     }
 
+    logAvailability(true, "", "", {
+      ...targetFields,
+      imageInputSupport,
+    });
     return {
       ...targetFields,
       available: true,
@@ -5822,6 +6247,12 @@ function TerminalView({
           workspaceId: terminalWorkspace?.id || "",
         });
       }
+      logTerminalStatus("frontend.todo_queue.items_state", {
+        nextItemCount: nextItems.length,
+        previousItemCount: currentItems.length,
+        voicePlanItems: getTodoQueueItemLogSummary(nextItems.filter((item) => getTodoQueueItemPlanTask(item))),
+        workspaceId: terminalWorkspace?.id || "",
+      });
       writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
       return nextItems;
     });
@@ -5861,6 +6292,16 @@ function TerminalView({
       targetRole: pendingItem.targetRole || "",
       targetTerminalIndex: pendingItem.targetTerminalIndex ?? "",
       timeoutMs: Number(pendingItem.timeoutMs || 0),
+      workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
+      ...fields,
+    });
+    logTerminalStatus("frontend.todo_queue.pending_clear", {
+      elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
+      itemId: safeItemId,
+      phase: pendingItem.phase || pendingItem.state || "sending",
+      reason,
+      targetRole: pendingItem.targetRole || "",
+      targetTerminalIndex: pendingItem.targetTerminalIndex ?? "",
       workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
       ...fields,
     });
@@ -5917,6 +6358,16 @@ function TerminalView({
           workspaceId: pendingItem.workspaceId,
           ...fields,
         });
+        logTerminalStatus("frontend.todo_queue.pending_timeout", {
+          elapsedMs: Date.now() - startedAtMs,
+          itemId: safeItemId,
+          phase,
+          targetRole: pendingItem.targetRole,
+          targetTerminalIndex: pendingItem.targetTerminalIndex,
+          timeoutMs,
+          workspaceId: pendingItem.workspaceId,
+          ...fields,
+        });
         todoQueuePendingTimersRef.current.delete(safeItemId);
         const nextPendingItems = { ...todoQueuePendingItemsRef.current };
         delete nextPendingItems[safeItemId];
@@ -5935,26 +6386,142 @@ function TerminalView({
       workspaceId: pendingItem.workspaceId,
       ...fields,
     });
+    logTerminalStatus("frontend.todo_queue.pending_start", {
+      itemId: safeItemId,
+      phase,
+      targetRole: pendingItem.targetRole,
+      targetTerminalIndex: pendingItem.targetTerminalIndex,
+      timeoutMs,
+      workspaceId: pendingItem.workspaceId,
+      ...fields,
+    });
     replaceTodoQueuePendingItems({
       ...todoQueuePendingItemsRef.current,
       [safeItemId]: pendingItem,
     });
   }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
 
-  const queueReleasedVoicePlanTasks = useCallback((tasks, snapshot = null) => {
+  const queueReleasedVoicePlanTasks = useCallback((tasks, snapshot = null, options = {}) => {
     const releasedTasks = (Array.isArray(tasks) ? tasks : [])
       .map((task) => normalizeVoicePlanReleasedTask(task, snapshot))
       .filter(Boolean);
+    logTerminalStatus("frontend.voice_plan.release_input", {
+      rawTaskCount: Array.isArray(tasks) ? tasks.length : 0,
+      releasedTaskCount: releasedTasks.length,
+      releaseSource: String(options.source || "voice_plan_result").trim() || "voice_plan_result",
+      snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+      tasks: releasedTasks.map(getVoicePlanTaskStatusLogSummary),
+      workspaceId: terminalWorkspace?.id || "",
+    });
     if (!releasedTasks.length) {
       return [];
     }
 
+    if (snapshot?.runId) {
+      voicePlanSnapshotsRef.current.set(snapshot.runId, snapshot);
+    }
+
+    const releaseSource = String(options.source || "voice_plan_result").trim() || "voice_plan_result";
+    const eligibleTasks = [];
+    const deferredTasks = [];
+    const discardedTasks = [];
+    releasedTasks.forEach((task) => {
+      const taskKey = getVoicePlanReleasedTaskKey(task);
+      const effectiveSnapshot = snapshot?.runId === task.runId
+        ? snapshot
+        : voicePlanSnapshotsRef.current.get(task.runId) || null;
+      const decision = getVoicePlanTaskReleaseDecision(task, effectiveSnapshot);
+      logTerminalStatus("frontend.voice_plan.release_decision", {
+        decision,
+        effectiveSnapshot: getVoicePlanSnapshotLogSummary(effectiveSnapshot),
+        releaseSource,
+        task: getVoicePlanTaskStatusLogSummary(task),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      if (!decision.eligible) {
+        const summary = {
+          planRunId: task.runId,
+          planStage: task.stage,
+          planStepOrdinal: task.stepOrdinal,
+          planTaskId: task.taskId,
+          reason: decision.reason,
+        };
+        if (shouldDeferVoicePlanTaskRelease(decision.reason)) {
+          voicePlanDeferredTasksRef.current.set(taskKey, {
+            task,
+            reason: decision.reason,
+            source: releaseSource,
+            updatedAtMs: Date.now(),
+          });
+          deferredTasks.push(summary);
+        } else {
+          voicePlanDeferredTasksRef.current.delete(taskKey);
+          discardedTasks.push(summary);
+        }
+        return;
+      }
+
+      voicePlanDeferredTasksRef.current.delete(taskKey);
+      eligibleTasks.push(task);
+    });
+
+    if (deferredTasks.length) {
+      logTerminalStatus("frontend.voice_plan.released_tasks_deferred", {
+        items: deferredTasks,
+        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        releaseSource,
+        snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.voice_plan.released_tasks_deferred", {
+        items: deferredTasks,
+        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        source: releaseSource,
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+    if (discardedTasks.length) {
+      logTerminalStatus("frontend.voice_plan.released_tasks_discarded", {
+        items: discardedTasks,
+        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        releaseSource,
+        snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.voice_plan.released_tasks_discarded", {
+        items: discardedTasks,
+        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        source: releaseSource,
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+    if (!eligibleTasks.length) {
+      logTerminalStatus("frontend.voice_plan.release_no_eligible_tasks", {
+        deferredTasks,
+        discardedTasks,
+        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        releaseSource,
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return [];
+    }
+
     const existingIds = new Set(todoQueueItemsRef.current.map((item) => item.id));
-    const createdItems = releasedTasks.reduce((items, task) => {
+    const createdItems = eligibleTasks.reduce((items, task) => {
       if (
         existingIds.has(task.taskId)
         || todoQueuePendingItemsRef.current[task.taskId]
       ) {
+        logTerminalStatus("frontend.voice_plan.release_duplicate_skip", {
+          alreadyPending: Boolean(todoQueuePendingItemsRef.current[task.taskId]),
+          alreadyQueued: existingIds.has(task.taskId),
+          releaseSource,
+          task: getVoicePlanTaskStatusLogSummary(task),
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        voicePlanDeferredTasksRef.current.delete(getVoicePlanReleasedTaskKey(task));
         return items;
       }
       const item = createTodoQueueItem(task.text, {
@@ -5977,6 +6544,12 @@ function TerminalView({
       return items.concat([item]);
     }, []);
     if (!createdItems.length) {
+      logTerminalStatus("frontend.voice_plan.release_no_created_items", {
+        eligibleTasks: eligibleTasks.map(getVoicePlanTaskStatusLogSummary),
+        planRunId: snapshot?.runId || eligibleTasks[0]?.runId || "",
+        releaseSource,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return [];
     }
 
@@ -5995,9 +6568,16 @@ function TerminalView({
     });
     if (createdItems.length) {
       setTodoQueueDispatchRevision((revision) => revision + 1);
+      logTerminalStatus("frontend.voice_plan.released_tasks_queued", {
+        items: getTodoQueueItemLogSummary(createdItems),
+        planRunId: snapshot?.runId || eligibleTasks[0]?.runId || "",
+        releaseSource,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       logBigViewSyncDiagnosticEvent("tui.voice_plan.released_tasks_queued", {
         items: getTodoQueueItemLogSummary(createdItems),
-        planRunId: snapshot?.runId || releasedTasks[0]?.runId || "",
+        planRunId: snapshot?.runId || eligibleTasks[0]?.runId || "",
+        source: releaseSource,
         surface: "tui_todo_queue",
         workspaceId: terminalWorkspace?.id || "",
       });
@@ -6011,16 +6591,107 @@ function TerminalView({
 
   const handleVoicePlanServerResult = useCallback((value) => {
     const snapshot = getVoicePlanSnapshotFromPayload(value);
+    const releasedTasks = getVoicePlanReleasedTasksFromPayload(value, snapshot);
+    logTerminalStatus("frontend.voice_plan.server_result_received", {
+      releasedTaskCount: releasedTasks.length,
+      releasedTasks: releasedTasks.map(getVoicePlanTaskStatusLogSummary),
+      snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+      workspaceId: terminalWorkspace?.id || "",
+    });
     if (snapshot) {
+      voicePlanSnapshotsRef.current.set(snapshot.runId, snapshot);
       window.dispatchEvent(new CustomEvent(VOICE_PLAN_SNAPSHOT_EVENT, {
         detail: { snapshot },
       }));
     }
-    const releasedTasks = getVoicePlanReleasedTasksFromPayload(value, snapshot);
+    let queuedItems = [];
     if (releasedTasks.length) {
-      queueReleasedVoicePlanTasks(releasedTasks, snapshot);
+      queuedItems = queuedItems.concat(queueReleasedVoicePlanTasks(releasedTasks, snapshot, {
+        source: "voice_plan_server_result",
+      }));
     }
-  }, [queueReleasedVoicePlanTasks]);
+    if (snapshot?.runId) {
+      const deferredTasks = Array.from(voicePlanDeferredTasksRef.current.values())
+        .filter((entry) => entry?.task?.runId === snapshot.runId)
+        .map((entry) => entry.task);
+      if (deferredTasks.length) {
+        logTerminalStatus("frontend.voice_plan.deferred_retry_start", {
+          deferredTaskCount: deferredTasks.length,
+          deferredTasks: deferredTasks.map(getVoicePlanTaskStatusLogSummary),
+          snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        queuedItems = queuedItems.concat(queueReleasedVoicePlanTasks(deferredTasks, snapshot, {
+          source: "voice_plan_deferred_release",
+        }));
+      }
+    }
+    logTerminalStatus("frontend.voice_plan.server_result_handled", {
+      handled: Boolean(snapshot || releasedTasks.length || queuedItems.length),
+      queuedItemCount: queuedItems.length,
+      queuedItems: getTodoQueueItemLogSummary(queuedItems),
+      releasedTaskCount: releasedTasks.length,
+      snapshot: getVoicePlanSnapshotLogSummary(snapshot),
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    return Boolean(snapshot || releasedTasks.length || queuedItems.length);
+  }, [queueReleasedVoicePlanTasks, terminalWorkspace?.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    listen(VOICE_PLAN_SERVER_RESULT_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (eventWorkspaceId && terminalWorkspace?.id && eventWorkspaceId !== terminalWorkspace.id) {
+        logTerminalStatus("frontend.voice_plan.backend_server_result_ignored", {
+          eventWorkspaceId,
+          reason: "workspace_mismatch",
+          workspaceId: terminalWorkspace.id,
+        });
+        return;
+      }
+      logTerminalStatus("frontend.voice_plan.backend_server_result_event", {
+        source: payload.source || "",
+        statusPayload: payload.statusPayload || null,
+        workspaceId: terminalWorkspace?.id || eventWorkspaceId,
+      });
+      const statusPayload = payload.statusPayload || {};
+      const promptEventId = String(statusPayload.promptEventId || statusPayload.prompt_event_id || "").trim();
+      if (promptEventId) {
+        logTerminalStatus("frontend.voice_plan.backend_prompt_ready_not_lifecycle", {
+          agentId: statusPayload.agentId || statusPayload.agent_id || "",
+          promptEventId,
+          source: payload.source || "backend_terminal_prompt_ready",
+          targetTerminalIndex: statusPayload.terminalIndex ?? statusPayload.terminal_index ?? "",
+          reason: "backend_prompt_ready_is_not_provider_turn_complete",
+          threadId: statusPayload.threadId || statusPayload.thread_id || "",
+          workspaceId: terminalWorkspace?.id || eventWorkspaceId,
+        });
+      }
+      handleVoicePlanServerResult(payload.result || payload);
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten?.();
+        return;
+      }
+      unlisten = nextUnlisten;
+    }).catch((error) => {
+      logTerminalStatus("frontend.voice_plan.backend_server_result_listen_error", {
+        message: error?.message || String(error || ""),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [handleVoicePlanServerResult, terminalWorkspace?.id]);
 
   const recordVoicePlanTaskStatus = useCallback(async (planTask, status, fields = {}) => {
     const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
@@ -6041,15 +6712,39 @@ function TerminalView({
       status: nextStatus,
     };
     try {
+      logTerminalStatus("frontend.voice_plan.status_send", {
+        payload,
+        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        workspaceId: terminalWorkspace.id,
+        workspaceName: terminalWorkspace.name || "",
+      });
       const result = await invoke("cloud_mcp_record_voice_plan_task_status", {
         repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
         status: payload,
         workspaceId: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || "",
       });
+      logTerminalStatus("frontend.voice_plan.status_result", {
+        planRunId: normalizedPlanTask.runId,
+        planStage: normalizedPlanTask.stage,
+        planStepOrdinal: normalizedPlanTask.stepOrdinal,
+        planTaskId: normalizedPlanTask.taskId,
+        resultSnapshot: getVoicePlanSnapshotLogSummary(getVoicePlanSnapshotFromPayload(result)),
+        releasedTaskCount: getVoicePlanReleasedTasksFromPayload(result).length,
+        status: nextStatus,
+        workspaceId: terminalWorkspace.id,
+      });
       handleVoicePlanServerResult(result);
       return result;
     } catch (error) {
+      logTerminalStatus("frontend.voice_plan.status_error", {
+        message: getTodoDropErrorMessage(error),
+        payload,
+        planRunId: normalizedPlanTask.runId,
+        planTaskId: normalizedPlanTask.taskId,
+        status: nextStatus,
+        workspaceId: terminalWorkspace.id,
+      });
       logBigViewSyncDiagnosticEvent("tui.voice_plan.status_error", {
         message: getTodoDropErrorMessage(error),
         planRunId: normalizedPlanTask.runId,
@@ -6072,7 +6767,35 @@ function TerminalView({
     const handleVoicePlanLifecycle = (event) => {
       const detail = event?.detail || {};
       const eventType = String(detail.type || "").trim();
+      logTerminalStatus("frontend.voice_plan.lifecycle_event_received", {
+        detail,
+        eventType,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       if (!["provider-turn-completed", "provider-turn-error"].includes(eventType)) {
+        logTerminalStatus("frontend.voice_plan.lifecycle_event_ignored", {
+          eventType,
+          reason: "unsupported_event_type",
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
+      const completionSource = String(detail.completionSource || detail.source || "").trim();
+      if (
+        eventType === "provider-turn-completed"
+        && (
+          detail.completionInferred === true
+          || completionSource === "backend_terminal_prompt_ready"
+          || completionSource === "terminal_prompt_ready"
+        )
+      ) {
+        logTerminalStatus("frontend.voice_plan.lifecycle_event_ignored", {
+          eventType,
+          promptEventId: detail.promptEventId || detail.pendingPromptId || detail.promptId || "",
+          reason: "inferred_completion_is_not_final",
+          source: completionSource,
+          workspaceId: terminalWorkspace?.id || "",
+        });
         return;
       }
       const promptEventId = String(
@@ -6083,8 +6806,21 @@ function TerminalView({
       ).trim();
       const planTask = getVoicePlanTaskFromPromptEventId(promptEventId);
       if (!planTask) {
+        logTerminalStatus("frontend.voice_plan.lifecycle_event_ignored", {
+          eventType,
+          promptEventId,
+          reason: "not_voice_plan_prompt",
+          workspaceId: terminalWorkspace?.id || "",
+        });
         return;
       }
+      logTerminalStatus("frontend.voice_plan.lifecycle_event_recording_status", {
+        eventType,
+        planTask,
+        promptEventId,
+        terminalGroundTruthStatus: eventType === "provider-turn-error" ? "error" : "idle_or_done",
+        workspaceId: terminalWorkspace?.id || "",
+      });
       void recordVoicePlanTaskStatus(
         planTask,
         eventType === "provider-turn-error" ? "failed" : "done",
@@ -6106,7 +6842,7 @@ function TerminalView({
     return () => {
       window.removeEventListener(VOICE_PLAN_TASK_LIFECYCLE_EVENT, handleVoicePlanLifecycle);
     };
-  }, [recordVoicePlanTaskStatus]);
+  }, [recordVoicePlanTaskStatus, terminalWorkspace?.id]);
 
   useEffect(() => () => {
     todoQueuePendingTimersRef.current.forEach((timeoutId) => {
@@ -6685,6 +7421,19 @@ function TerminalView({
         && onThreadTerminalLifecycle,
     );
     if (shouldDispatchThreadMessage) {
+      logTerminalStatus("frontend.terminal_status.lifecycle_send", {
+        agentId: targetRole,
+        eventStatus: "active",
+        eventType: "message-submitted",
+        item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+        pendingPromptId: dropResult?.promptId || "",
+        promptEventId: dropResult?.promptId || "",
+        source: lifecycleSource,
+        targetTerminalIndex: target.targetTerminalIndex,
+        terminalGroundTruthStatus: "processing_request_submitted",
+        threadId: targetThread.id,
+        workspaceId,
+      });
       onThreadTerminalLifecycle?.({
         agentId: targetRole,
         instanceId: targetBinding?.instanceId || "",
@@ -6719,6 +7468,18 @@ function TerminalView({
         workspaceId,
       });
     } else if (shouldAutoSubmit && !image) {
+      logTerminalStatus("frontend.terminal_status.lifecycle_send_skip", {
+        confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
+        hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
+        hasTargetThread: Boolean(targetThread?.id),
+        hasThreadMessageText: Boolean(resultThreadMessageText.trim()),
+        item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+        promptId: dropResult?.promptId || "",
+        source: lifecycleSource,
+        targetRole,
+        targetTerminalIndex: targetLogIndex,
+        workspaceId,
+      });
       logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_skip", {
         confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
         hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
@@ -6865,10 +7626,21 @@ function TerminalView({
     const item = todoQueueItems.find((candidate) => candidate.id === safeItemId);
     const pendingItem = todoQueuePendingItemsRef.current[safeItemId] || null;
     if (!item || (pendingItem && getTodoQueuePendingPhase(pendingItem) === "sending")) {
+      logTerminalStatus("frontend.todo_queue.manual_queue_skip", {
+        itemId: safeItemId,
+        pendingPhase: pendingItem ? getTodoQueuePendingPhase(pendingItem) : "",
+        reason: !item ? "missing_item" : "already_sending",
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return;
     }
 
     const source = getTodoQueueItemAutoQueueSource(item);
+    logTerminalStatus("frontend.todo_queue.manual_queue", {
+      item: getTodoQueueItemLogSummary([item])[0] || null,
+      source,
+      workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+    });
     setTodoDropError("");
     setTodoQueueItemPending(safeItemId, {
       item: getTodoQueueItemLogSummary([item])[0] || null,
@@ -6904,87 +7676,22 @@ function TerminalView({
     return true;
   }, []);
 
-  const closeIdleWorkspaceAgentsForVoice = useCallback(async (args = {}) => {
-    if (!terminalWorkspace?.id) {
-      throw new Error("Open a workspace before closing idle coding agents.");
-    }
-
-    const agentId = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
-    const requestedCount = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
-    const candidates = logicalTerminalIndexes
-      .map((terminalIndex) => getTodoQueueTerminalSendTarget(terminalIndex, null, {
-        allowGeneric: false,
-        requireAvailable: true,
-        reservationItemId: `voice-agent-manage-${terminalIndex}`,
-      }))
-      .filter((candidate) => (
-        candidate.available
-        && TODO_QUEUE_AGENT_ROLES.has(candidate.targetRole)
-        && (!agentId || candidate.targetRole === agentId)
-      ))
-      .sort((left, right) => Number(right.targetTerminalIndex) - Number(left.targetTerminalIndex));
-    const maxClosable = Math.max(0, logicalTerminalIndexes.length - 1);
-    const closeCount = Math.min(
-      requestedCount > 0 ? requestedCount : candidates.length,
-      candidates.length,
-      maxClosable,
-    );
-    if (closeCount <= 0) {
-      return {
-        closedCount: 0,
-        message: agentId
-          ? `No idle ${agentId} terminals are safe to close.`
-          : "No idle coding-agent terminals are safe to close.",
-      };
-    }
-
-    const closed = [];
-    for (const target of candidates.slice(0, closeCount)) {
-      const instanceId = Number(target.targetBinding?.instanceId || 0);
-      await invoke("terminal_close", {
-        paneId: target.paneId,
-        instanceId: Number.isFinite(instanceId) && instanceId > 0 ? instanceId : undefined,
-      });
-      closeWorkspaceTerminal?.({
-        paneId: target.paneId,
-        threadId: target.targetThread?.id || "",
-        terminalIndex: target.targetTerminalIndex,
-        workspaceId: terminalWorkspace.id,
-      });
-      closed.push(target);
-    }
-
-    const label = agentId || "coding-agent";
-    return {
-      closedCount: closed.length,
-      message: `Closed ${closed.length} idle ${label} terminal${closed.length === 1 ? "" : "s"}.`,
-      terminalIndexes: closed.map((target) => target.targetTerminalIndex),
-    };
-  }, [
-    closeWorkspaceTerminal,
-    getTodoQueueTerminalSendTarget,
-    logicalTerminalIndexes,
-    terminalWorkspace?.id,
-  ]);
-
-  const executeVoiceAgentManagementToolCall = useCallback(async (toolCall) => {
+  const executeVoiceAgentOpenCodingAgentsToolCall = useCallback(async (toolCall) => {
     const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
-    const action = normalizeVoiceAgentManagementAction(args.action);
+    const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
     const agentType = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
-    const count = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
+    const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
 
     try {
-      const result = action === "close_idle" || action === "close_idle_by_agent"
-        ? await closeIdleWorkspaceAgentsForVoice({ ...args, action, agent_type: agentType, count })
-        : await manageWorkspaceAgents?.({
-          action,
-          agentType,
-          count,
-          source: "voice-agent-manage-agents",
-          workspaceId: terminalWorkspace?.id || "",
-        });
+      const result = await manageWorkspaceAgents?.({
+        action,
+        agentType,
+        count,
+        source: "voice-agent-open-coding-agents",
+        workspaceId: terminalWorkspace?.id || "",
+      });
       const message = result?.message || "Coding-agent terminals updated.";
-      window.dispatchEvent(new CustomEvent(VOICE_AGENT_MANAGEMENT_RESULT_EVENT, {
+      window.dispatchEvent(new CustomEvent(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, {
         detail: {
           message,
           status: "ready",
@@ -6992,7 +7699,7 @@ function TerminalView({
           workspaceId: terminalWorkspace?.id || "",
         },
       }));
-      logBigViewSyncDiagnosticEvent("tui.voice_agent.manage_agents", {
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.open_coding_agents", {
         action,
         agentType,
         count,
@@ -7002,8 +7709,8 @@ function TerminalView({
       });
       return result;
     } catch (error) {
-      const message = getErrorMessage(error, "Unable to manage coding agents.");
-      window.dispatchEvent(new CustomEvent(VOICE_AGENT_MANAGEMENT_RESULT_EVENT, {
+      const message = getErrorMessage(error, "Unable to open coding-agent terminals.");
+      window.dispatchEvent(new CustomEvent(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, {
         detail: {
           message,
           status: "error",
@@ -7011,7 +7718,7 @@ function TerminalView({
           workspaceId: terminalWorkspace?.id || "",
         },
       }));
-      logBigViewSyncDiagnosticEvent("tui.voice_agent.manage_agents_error", {
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.open_coding_agents_error", {
         action,
         agentType,
         count,
@@ -7022,29 +7729,72 @@ function TerminalView({
       return null;
     }
   }, [
-    closeIdleWorkspaceAgentsForVoice,
     manageWorkspaceAgents,
     terminalWorkspace?.id,
   ]);
 
   const handleVoiceAgentToolCall = useCallback((toolCall) => {
     const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
-    if (toolName === "manage_agents") {
+    logTerminalStatus("frontend.voice_agent.tool_call_handle", {
+      callId: String(toolCall?.call_id || toolCall?.callId || "").trim(),
+      toolName,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    if (toolName === "open_coding_agents") {
       if (!claimVoiceAgentToolCall(toolCall)) {
+        logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+          reason: "duplicate_open_coding_agents",
+          toolName,
+          workspaceId: terminalWorkspace?.id || "",
+        });
         return null;
       }
-      void executeVoiceAgentManagementToolCall(toolCall);
+      void executeVoiceAgentOpenCodingAgentsToolCall(toolCall);
+      return null;
+    }
+    if (toolName === "create_plan") {
+      if (!claimVoiceAgentToolCall(toolCall)) {
+        logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+          reason: "duplicate_create_plan",
+          toolName,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return null;
+      }
+      const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
+      const handledPlanResult = handleVoicePlanServerResult(toolCall) || handleVoicePlanServerResult(args);
+      logTerminalStatus("frontend.voice_agent.create_plan_tool_call", {
+        handledPlanResult,
+        snapshot: getVoicePlanSnapshotLogSummary(getVoicePlanSnapshotFromPayload(args) || getVoicePlanSnapshotFromPayload(toolCall)),
+        toolName,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return null;
     }
     if (toolName && toolName !== "queue") {
+      logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+        reason: "unsupported_tool",
+        toolName,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return null;
     }
     if (!claimVoiceAgentToolCall(toolCall)) {
+      logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+        reason: "duplicate_queue",
+        toolName,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return null;
     }
 
     const item = createTodoQueueItemFromVoiceAgentToolCall(toolCall);
     if (!item) {
+      logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+        reason: "invalid_queue_item",
+        toolName,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return null;
     }
     if (isUnsafeVoicePlanQueueItem(item)) {
@@ -7067,22 +7817,47 @@ function TerminalView({
       return null;
     }
 
+    const planTask = getTodoQueueItemPlanTask(item);
+    if (planTask) {
+      logTerminalStatus("frontend.voice_plan.tool_call_release", {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        planTask,
+        snapshot: getVoicePlanSnapshotLogSummary(voicePlanSnapshotsRef.current.get(planTask.runId) || null),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      const createdItems = queueReleasedVoicePlanTasks([{
+        doneWhen: planTask.doneWhen,
+        maxConcurrency: planTask.maxConcurrency,
+        releasePolicy: planTask.releasePolicy,
+        requiresQueueDrain: planTask.requiresQueueDrain,
+        runId: planTask.runId,
+        stage: planTask.stage,
+        stepOrdinal: planTask.stepOrdinal,
+        taskId: planTask.taskId,
+        title: planTask.title,
+        text: getTodoQueueItemTerminalText(item) || item.text,
+      }], voicePlanSnapshotsRef.current.get(planTask.runId) || null, {
+        source: "voice_agent_tool_call",
+      });
+      return createdItems[0] || null;
+    }
+
     const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
     const source = getTodoQueueItemAutoQueueSource(item);
     updateTodoQueueItems((currentItems) => currentItems.concat([item]));
     setTodoDropError("");
+    logTerminalStatus("frontend.voice_agent.queue_item_created", {
+      callId,
+      item: getTodoQueueItemLogSummary([item])[0] || null,
+      source,
+      workspaceId: terminalWorkspace?.id || "",
+    });
     setTodoQueueItemPending(item.id, {
       item: getTodoQueueItemLogSummary([item])[0] || null,
       phase: "queued",
       source,
       workspaceId: terminalWorkspace?.id || "",
     });
-    const planTask = getTodoQueueItemPlanTask(item);
-    if (planTask) {
-      void recordVoicePlanTaskStatus(planTask, "queued", {
-        clientTodoId: item.id || "",
-      });
-    }
     setTodoQueueDispatchRevision((revision) => revision + 1);
 
     logBigViewSyncDiagnosticEvent("tui.text.voice_agent_queue", {
@@ -7096,7 +7871,9 @@ function TerminalView({
     return item;
   }, [
     claimVoiceAgentToolCall,
-    executeVoiceAgentManagementToolCall,
+    executeVoiceAgentOpenCodingAgentsToolCall,
+    handleVoicePlanServerResult,
+    queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
@@ -7237,6 +8014,10 @@ function TerminalView({
 
   const dispatchQueuedTodoItems = useCallback(() => {
     if (todoQueueDispatchingRef.current) {
+      logTerminalStatus("frontend.todo_queue.dispatch_skip", {
+        reason: "dispatch_already_in_progress",
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return;
     }
 
@@ -7249,8 +8030,19 @@ function TerminalView({
       ? queuedItems.find((item) => !isVoicePlanBoundaryQueueItem(item)) || firstQueuedItem
       : firstQueuedItem;
     if (!queuedItem) {
+      logTerminalStatus("frontend.todo_queue.dispatch_skip", {
+        pendingCount: Object.keys(todoQueuePendingItemsRef.current || {}).length,
+        queueItemCount: todoQueueItems.length,
+        reason: "no_queued_items",
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return;
     }
+    logTerminalStatus("frontend.todo_queue.dispatch_consider", {
+      item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+      queuedItemCount: queuedItems.length,
+      workspaceId: terminalWorkspace?.id || "",
+    });
     if (isUnsafeVoicePlanQueueItem(queuedItem)) {
       const planTask = getTodoQueueItemPlanTask(queuedItem);
       const message = "Voice plan produced placeholder task text, so it was blocked before dispatch.";
@@ -7282,6 +8074,11 @@ function TerminalView({
         && getTodoQueuePendingPhase(pendingItem) === "sending"
       ));
       if (hasSendingItem) {
+        logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: "voice_plan_boundary_waiting_for_sending_item",
+          workspaceId: terminalWorkspace?.id || "",
+        });
         return;
       }
       const busyReasons = new Set([
@@ -7302,6 +8099,11 @@ function TerminalView({
         return !candidate.available && busyReasons.has(String(candidate.reason || ""));
       });
       if (hasBusyAgent) {
+        logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: "voice_plan_boundary_waiting_for_busy_agent",
+          workspaceId: terminalWorkspace?.id || "",
+        });
         return;
       }
     }
@@ -7319,12 +8121,28 @@ function TerminalView({
       }
     }
     if (!target) {
+      logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+        item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+        reason: "no_available_terminal",
+        terminalCount: logicalTerminalIndexes.length,
+        workspaceId: terminalWorkspace?.id || "",
+      });
       return;
     }
 
     const source = getTodoQueueItemAutoQueueSource(queuedItem);
     const targetTerminalIndex = target.targetTerminalIndex;
     todoQueueDispatchingRef.current = true;
+    logTerminalStatus("frontend.todo_queue.dispatch_start", {
+      item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+      source,
+      targetRole: target.targetRole,
+      targetTerminalIndex,
+      terminalStatus: target.terminalStatus || "",
+      threadActivityStatus: target.activityStatus || "",
+      threadLatestTurnState: target.latestTurnState || "",
+      workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+    });
     todoQueueTerminalReservationsRef.current.set(targetTerminalIndex, {
       itemId: queuedItem.id,
       startedAtMs: Date.now(),
@@ -7350,6 +8168,15 @@ function TerminalView({
     })
       .then((dropResult) => {
         setTodoDropError("");
+        logTerminalStatus("frontend.todo_queue.dispatch_consumed", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          promptId: dropResult?.promptId || "",
+          source,
+          submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+          targetRole: target.targetRole,
+          targetTerminalIndex,
+          workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+        });
         clearTodoQueueItemPending(queuedItem.id, "consumed", {
           promptId: dropResult?.promptId || "",
           source,
@@ -7364,6 +8191,13 @@ function TerminalView({
       .catch((error) => {
         const stillQueued = todoQueueItemsRef.current.some((item) => item.id === queuedItem.id);
         if (stillQueued && isTodoQueueBusyError(error)) {
+          logTerminalStatus("frontend.todo_queue.dispatch_requeued_busy", {
+            item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+            message: error?.message || String(error || ""),
+            reason: error?.todoQueueBusyReason || "",
+            source,
+            workspaceId: queuedItem.workspaceId || terminalWorkspace?.id || "",
+          });
           setTodoQueueItemPending(queuedItem.id, {
             item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
             phase: "queued",
@@ -7374,6 +8208,14 @@ function TerminalView({
           return;
         }
 
+        logTerminalStatus("frontend.todo_queue.dispatch_error", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          message: error?.message || String(error || ""),
+          source,
+          targetRole: target.targetRole,
+          targetTerminalIndex,
+          workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+        });
         clearTodoQueueItemPending(queuedItem.id, "error", {
           message: error?.message || String(error || ""),
           source,
@@ -8517,6 +9359,7 @@ function TerminalView({
                         onSubmitDraft={submitTodoQueueDraft}
                         onUpdateItem={updateTodoQueueItemText}
                         onVoiceAgentToolCall={handleVoiceAgentToolCall}
+                        onVoicePlanServerResult={handleVoicePlanServerResult}
                         pendingItems={todoQueuePendingItems}
                         rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
                         workspace={terminalWorkspace}

@@ -1556,6 +1556,8 @@ async fn terminal_open(
     let open_started_at = Instant::now();
     validate_terminal_pane_id(&request.pane_id)?;
     ensure_app_not_shutting_down("terminal open")?;
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
     let pane_id = request.pane_id;
     let requested_cols = request.cols;
     let requested_rows = request.rows;
@@ -3643,6 +3645,105 @@ pub(crate) fn observe_terminal_coordination_event(
     });
 }
 
+pub(crate) fn observe_workspace_notification_coordination_event(
+    repo_path: PathBuf,
+    db_path: PathBuf,
+    event_id: String,
+    event_seq: Option<i64>,
+    created_at: String,
+    event_type: String,
+    refs: crate::coordination::kernel::EventRefs,
+    payload: Value,
+) {
+    if !matches!(
+        event_type.as_str(),
+        "approval_requested"
+            | "approval_request_reused"
+            | "db_change_approval_required"
+            | "approval_granted"
+            | "approval_denied"
+            | "db_change_approved"
+            | "db_change_rejected"
+            | "task_parked_for_resource_queue"
+            | "active_file_lease_queue_waiter_released"
+            | "patch_submitted"
+            | "task_noop_submitted"
+            | "task_cancelled"
+            | "task_interrupted"
+            | "terminal_crash_recovery_interrupted_task"
+            | "merge_succeeded"
+            | "mcp_agent_tool_failed"
+    ) {
+        return;
+    }
+
+    let Some(app) = TERMINAL_COORDINATION_EVENT_APP.get().cloned() else {
+        return;
+    };
+
+    let refs_payload = json!({
+        "taskId": refs.task_id,
+        "agentId": refs.agent_id,
+        "agentSlotId": refs.agent_slot_id,
+        "sessionId": refs.session_id,
+        "resourceId": refs.resource_id,
+        "artifactId": refs.artifact_id,
+        "contextRunId": refs.context_run_id,
+    });
+
+    let notification_kind = match event_type.as_str() {
+        "approval_requested" | "approval_request_reused" | "db_change_approval_required" => {
+            "approval.required"
+        }
+        "approval_granted" | "approval_denied" | "db_change_approved" | "db_change_rejected" => {
+            "approval.resolved"
+        }
+        "task_parked_for_resource_queue" => "task.parked",
+        "active_file_lease_queue_waiter_released" => "task.resume_ready",
+        "patch_submitted" => "task.patch_submitted",
+        "task_noop_submitted" => "task.skipped",
+        "merge_succeeded" => "task.completed",
+        "task_cancelled" | "task_interrupted" | "terminal_crash_recovery_interrupted_task" => {
+            "task.stopped"
+        }
+        "mcp_agent_tool_failed" => "tool.failed",
+        _ => "coordination.event",
+    };
+
+    let severity = match notification_kind {
+        "approval.required" | "task.resume_ready" => "action_required",
+        "task.completed" => "success",
+        "tool.failed" | "task.stopped" => "warning",
+        _ => "info",
+    };
+
+    let actionability = match notification_kind {
+        "approval.required" => "approve_deny",
+        "task.resume_ready" => "resume_task",
+        "task.patch_submitted" => "review_patch",
+        _ => "open_thread",
+    };
+
+    let _ = app.emit(
+        WORKSPACE_NOTIFICATION_EVENT,
+        json!({
+            "source": "coordination",
+            "eventId": event_id,
+            "sourceEventId": event_id,
+            "seq": event_seq,
+            "createdAt": created_at,
+            "repoPath": repo_path.display().to_string(),
+            "dbPath": db_path.display().to_string(),
+            "eventType": event_type,
+            "kind": notification_kind,
+            "severity": severity,
+            "actionability": actionability,
+            "refs": refs_payload,
+            "payload": payload,
+        }),
+    );
+}
+
 async fn terminal_handle_coordination_event(
     app: AppHandle,
     event_type: String,
@@ -4275,6 +4376,26 @@ async fn terminal_resume_parked_prompt_once(
         return false;
     }
 
+    let _input_guard = instance.input_queue.lock().await;
+    let still_current = {
+        let guard = terminals.read().await;
+        guard
+            .get(&parked.pane_id)
+            .map(|current| current.id == parked.instance_id)
+            .unwrap_or(false)
+    };
+    if !still_current {
+        terminal_emit_parked_prompt_interrupted(
+            &app,
+            &cloud_mcp_state,
+            &parked,
+            "terminal_replaced",
+            "Interrupted while parked: the terminal session changed before the task could resume.",
+        )
+        .await;
+        return false;
+    }
+
     {
         let mut writer = instance.writer.lock().await;
         if writer.write_all(resume_request.as_bytes()).is_err() || writer.flush().is_err() {
@@ -4294,6 +4415,24 @@ async fn terminal_resume_parked_prompt_once(
         TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
     ))
     .await;
+    let still_current = {
+        let guard = terminals.read().await;
+        guard
+            .get(&parked.pane_id)
+            .map(|current| current.id == parked.instance_id)
+            .unwrap_or(false)
+    };
+    if !still_current {
+        terminal_emit_parked_prompt_interrupted(
+            &app,
+            &cloud_mcp_state,
+            &parked,
+            "terminal_replaced",
+            "Interrupted while parked: the terminal session changed before the resume submit could be sent.",
+        )
+        .await;
+        return false;
+    }
     {
         let mut writer = instance.writer.lock().await;
         if writer
@@ -4371,6 +4510,29 @@ fn emit_terminal_prompt_submitted(
     }
 
     let metadata = instance.metadata.clone();
+    log_terminal_status_event(
+        "backend.terminal.prompt_submitted",
+        json!({
+            "agent_id": metadata.agent_id.clone(),
+            "agent_kind": metadata.agent_kind.clone(),
+            "expected_prompt_len": expected_prompt.map(str::len).unwrap_or_default(),
+            "instance_id": instance.id,
+            "observed_prompt_len": observed_prompt.map(str::len).unwrap_or_default(),
+            "pane_id": metadata.pane_id.clone(),
+            "prompt_event_id": prompt_event_id.unwrap_or_default(),
+            "prompt_event_source": prompt_event_source.unwrap_or_default(),
+            "prompt_len": prompt.len(),
+            "prompt_match": prompt_match,
+            "prompt_source": prompt_source,
+            "status_truth": "processing_request_submitted",
+            "terminal_index": metadata.terminal_index,
+            "thread_id": thread_id_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(metadata.thread_id.as_str()),
+            "workspace_id": metadata.workspace_id.clone(),
+        }),
+    );
     let _ = app.emit(
         TERMINAL_PROMPT_SUBMITTED_EVENT,
         TerminalPromptSubmittedPayload {
@@ -4785,6 +4947,18 @@ async fn terminal_write_inner(
             let active_task = instance.active_task.lock().await.clone();
             let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
             let local_task_title = active_task.as_ref().map(|task| task.title.clone());
+            let metadata = instance.metadata.clone();
+            let prompt_metadata = CloudMcpTerminalPromptMetadata {
+                prompt_event_id: prompt_event_id.clone(),
+                prompt_event_source: prompt_event_source.clone(),
+                prompt_event_submitted_at: prompt_event_submitted_at.clone(),
+                terminal_index: metadata.terminal_index,
+                thread_id: thread_id
+                    .clone()
+                    .or_else(|| Some(metadata.thread_id.clone())),
+                workspace_id: metadata.workspace_id.clone(),
+                workspace_name: metadata.workspace_name.clone(),
+            };
             let prompt_for_cloud = prompt.clone();
             tauri::async_runtime::spawn(async move {
                 cloud_mcp_terminal_context_pack_for_prompt(
@@ -4796,6 +4970,7 @@ async fn terminal_write_inner(
                     local_task_id,
                     local_task_title,
                     prompt_for_cloud,
+                    Some(prompt_metadata),
                 )
                 .await;
             });
@@ -4882,6 +5057,18 @@ async fn terminal_write_inner(
                 let active_task = instance.active_task.lock().await.clone();
                 let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
                 let local_task_title = active_task.as_ref().map(|task| task.title.clone());
+                let metadata = instance.metadata.clone();
+                let prompt_metadata = CloudMcpTerminalPromptMetadata {
+                    prompt_event_id: prompt_event_id.clone(),
+                    prompt_event_source: prompt_event_source.clone(),
+                    prompt_event_submitted_at: prompt_event_submitted_at.clone(),
+                    terminal_index: metadata.terminal_index,
+                    thread_id: thread_id
+                        .clone()
+                        .or_else(|| Some(metadata.thread_id.clone())),
+                    workspace_id: metadata.workspace_id.clone(),
+                    workspace_name: metadata.workspace_name.clone(),
+                };
                 tauri::async_runtime::spawn(async move {
                     cloud_mcp_terminal_context_pack_for_prompt(
                         cloud_state,
@@ -4892,6 +5079,7 @@ async fn terminal_write_inner(
                         local_task_id,
                         local_task_title,
                         event_prompt,
+                        Some(prompt_metadata),
                     )
                     .await;
                 });

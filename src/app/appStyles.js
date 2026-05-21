@@ -2527,6 +2527,75 @@ export const WorkspaceCompactGlyph = styled.span.attrs({ "data-compact-glyph": "
   }
 `;
 
+export const WorkspaceNotificationBadge = styled.span`
+  position: absolute;
+  top: 5px;
+  right: 36px;
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  place-items: center;
+  padding: 0 5px;
+  border: 1px solid rgba(247, 181, 83, 0.38);
+  border-radius: 999px;
+  box-sizing: border-box;
+  color: #fff8ea;
+  background: #b85d19;
+  box-shadow: 0 0 0 1px rgba(3, 5, 8, 0.74), 0 6px 14px rgba(184, 93, 25, 0.24);
+  font-size: 9px;
+  font-weight: 820;
+  line-height: 1;
+  pointer-events: none;
+  text-align: center;
+  white-space: nowrap;
+  z-index: 2;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    opacity 160ms ease,
+    right 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    top 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &[data-variant="unread"] {
+    border-color: rgba(101, 161, 245, 0.36);
+    color: #edf5ff;
+    background: #2f69d1;
+    box-shadow: 0 0 0 1px rgba(3, 5, 8, 0.7), 0 6px 14px rgba(47, 105, 209, 0.22);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(139, 90, 0, 0.22);
+    color: #ffffff;
+    background: #a65316;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.72), 0 6px 12px rgba(105, 70, 25, 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-variant="unread"] {
+    border-color: rgba(0, 102, 204, 0.24);
+    background: #0066cc;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.74), 0 6px 12px rgba(0, 102, 204, 0.16);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    top: 2px;
+    right: 2px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 4px;
+    font-size: 8px;
+  }
+
+  @media (max-width: 760px) {
+    top: 5px;
+    right: 36px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 5px;
+    font-size: 9px;
+  }
+`;
+
 export const WorkspaceSettingsButton = styled.button`
   position: absolute;
   top: 50%;

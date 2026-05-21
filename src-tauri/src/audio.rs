@@ -2,7 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const CLOUD_VOICE_AGENT_TTS_SUPPRESSION_TAIL_MS: u64 = 2_500;
 const CLOUD_VOICE_AGENT_TTS_SUPPRESSION_MAX_MS: u64 = 30_000;
-const CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS: u64 = 1_200;
+const CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS: u64 = 0;
 
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
@@ -3655,13 +3655,17 @@ async fn start_cloud_voice_agent_stream(
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
     let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
+    let resolved_workspace_root = if workspace_root.is_empty() {
+        resolve_workspace_root_directory(None)?
+    } else {
+        resolve_workspace_root_directory(Some(&workspace_root))?
+    };
+    let workspace_root = workspace_path_display(&resolved_workspace_root);
     let repo_id = clean_cloud_voice_agent_text(repo_id, 160);
     let repo_id = if !repo_id.is_empty() {
         repo_id
-    } else if !workspace_root.is_empty() {
-        cloud_mcp_repo_id_for_root(Path::new(&workspace_root))
     } else {
-        "default-repo".to_string()
+        cloud_mcp_repo_id_for_root(&resolved_workspace_root)
     };
     let agent_statuses = agent_statuses.unwrap_or_else(|| json!([]));
 
@@ -3677,9 +3681,12 @@ async fn start_cloud_voice_agent_stream(
         "agent_statuses": agent_statuses,
         "fast_response_policy": {
             "enabled": true,
+            "required": true,
             "generate": "llm",
             "hold_ms": CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS,
-            "release": "client_after_timeout_unless_main_response",
+            "emit_immediately": true,
+            "release": "immediate",
+            "also_emit_main_response": true,
             "tts": {
                 "provider": "deepgram_aura",
                 "stream": true,
@@ -3688,6 +3695,28 @@ async fn start_cloud_voice_agent_stream(
                 "fast_flag": "fast_response",
                 "feedback_kind": "voice_agent_fast_llm_feedback",
             },
+        },
+        "llm_orchestrator_policy": {
+            "mode": "respond_or_create_plan",
+            "disable_search": true,
+            "disabled_tools": [
+                "search",
+                "web_search",
+                "web_search_preview",
+                "browser_search",
+                "file_search"
+            ],
+            "allowed_tools": ["create_plan", "open_coding_agents"],
+            "tool_choice": "auto",
+            "response_contract": {
+                "immediate_feedback_required": true,
+                "main_response_required": true,
+                "main_response_may_call_tool": true,
+                "regular_response_kind": "voice_agent_llm_feedback",
+                "plan_tool_name": "create_plan",
+                "agent_open_tool_name": "open_coding_agents",
+                "plan_snapshot_kind": "voice_agent_plan_snapshot"
+            }
         },
         "audio": {
             "encoding": "linear16",

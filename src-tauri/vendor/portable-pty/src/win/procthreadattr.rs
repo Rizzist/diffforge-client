@@ -8,7 +8,7 @@ use winapi::um::processthreadsapi::*;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
 
 pub struct ProcThreadAttributeList {
-    data: Vec<u8>,
+    data: Vec<usize>,
 }
 
 impl ProcThreadAttributeList {
@@ -22,13 +22,15 @@ impl ProcThreadAttributeList {
                 &mut bytes_required,
             )
         };
-        let mut data = Vec::with_capacity(bytes_required);
-        // We have the right capacity, so force the vec to consider itself
-        // that length.  The contents of those bytes will be maintained
-        // by the win32 apis used in this impl.
-        unsafe { data.set_len(bytes_required) };
+        ensure!(
+            bytes_required > 0,
+            "InitializeProcThreadAttributeList did not report a buffer size: {}",
+            IoError::last_os_error()
+        );
+        let word_count = (bytes_required + mem::size_of::<usize>() - 1) / mem::size_of::<usize>();
+        let mut data = vec![0usize; word_count];
 
-        let attr_ptr = data.as_mut_slice().as_mut_ptr() as *mut _;
+        let attr_ptr = data.as_mut_ptr() as *mut _;
         let res = unsafe {
             InitializeProcThreadAttributeList(attr_ptr, num_attributes, 0, &mut bytes_required)
         };
@@ -41,7 +43,7 @@ impl ProcThreadAttributeList {
     }
 
     pub fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.data.as_mut_slice().as_mut_ptr() as *mut _
+        self.data.as_mut_ptr() as *mut _
     }
 
     pub fn set_pty(&mut self, con: HPCON) -> Result<(), Error> {

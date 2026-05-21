@@ -1,6 +1,6 @@
 use notify::{
-    Config as NotifyConfig, Event as NotifyEvent, EventKind as NotifyEventKind,
-    RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event as NotifyEvent, EventKind as NotifyEventKind, RecommendedWatcher,
+    RecursiveMode, Watcher,
 };
 
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
@@ -68,6 +68,13 @@ struct CloudMcpTerminalContextState {
     agent_id: String,
     lane: String,
     working_directory: PathBuf,
+    prompt_event_id: Option<String>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    terminal_index: Option<u16>,
+    thread_id: Option<String>,
+    workspace_id: String,
+    workspace_name: String,
     created_ms: u64,
     last_changed_hash: String,
     last_checkpoint_ms: u64,
@@ -78,6 +85,17 @@ struct CloudMcpTerminalContextState {
     work_brief: String,
     work_brief_reported: bool,
     done_reported: bool,
+}
+
+#[derive(Clone)]
+struct CloudMcpTerminalPromptMetadata {
+    prompt_event_id: Option<String>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    terminal_index: Option<u16>,
+    thread_id: Option<String>,
+    workspace_id: String,
+    workspace_name: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -586,7 +604,11 @@ async fn cloud_mcp_ws_request(
         state.global_ws_pending.lock().await.remove(&request_id);
         return Err("Cloud MCP app websocket is not accepting messages.".to_string());
     }
-    let response = match timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS), response_rx).await
+    let response = match timeout(
+        Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS),
+        response_rx,
+    )
+    .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
@@ -831,7 +853,10 @@ fn cloud_mcp_normalized_git_path(value: &[u8]) -> Option<String> {
     if path.is_empty()
         || path == ".git"
         || path == ".agents"
-        || matches!(path.as_str(), ".gitignore" | ".gitattributes" | ".gitmodules")
+        || matches!(
+            path.as_str(),
+            ".gitignore" | ".gitattributes" | ".gitmodules"
+        )
         || path.starts_with(".git/")
         || path.starts_with(".agents/")
         || path.ends_with("/.gitignore")
@@ -1193,7 +1218,13 @@ fn cloud_mcp_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
 fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
     let output = cloud_mcp_git_output(
         root,
-        &["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
     )?;
 
     let mut file_paths = output
@@ -1917,30 +1948,29 @@ fn cloud_mcp_terminal_claimed_paths(
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
-    let rows =
-        match statement.query_map(
-            rusqlite::params![coordination.session_id.as_str(), local_task_id],
-            |row| {
-                let resource_key: String = row.get(0)?;
-                let mode: String = row.get(1)?;
-                let reason: Option<String> = row.get(2)?;
-                let path = resource_key
-                    .strip_prefix("file:")
-                    .unwrap_or(resource_key.as_str())
-                    .to_string();
-                Ok(json!({
-                    "resource_key": resource_key,
-                    "path": path,
-                    "mode": mode,
-                    "reason": reason,
-                    "lease_state": "active",
-                    "file_state": "lease",
-                }))
-            },
-        ) {
-            Ok(rows) => rows,
-            Err(_) => return Vec::new(),
-        };
+    let rows = match statement.query_map(
+        rusqlite::params![coordination.session_id.as_str(), local_task_id],
+        |row| {
+            let resource_key: String = row.get(0)?;
+            let mode: String = row.get(1)?;
+            let reason: Option<String> = row.get(2)?;
+            let path = resource_key
+                .strip_prefix("file:")
+                .unwrap_or(resource_key.as_str())
+                .to_string();
+            Ok(json!({
+                "resource_key": resource_key,
+                "path": path,
+                "mode": mode,
+                "reason": reason,
+                "lease_state": "active",
+                "file_state": "lease",
+            }))
+        },
+    ) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
     for row in rows.filter_map(Result::ok) {
         let key = row["resource_key"]
             .as_str()
@@ -2362,9 +2392,10 @@ fn cloud_mcp_title_from_changed_files(changed_files: &[Value]) -> Option<String>
 }
 
 fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
-    let Some(output) =
-        cloud_mcp_git_output(root, &["status", "--porcelain", "-z", "--untracked-files=all"])
-    else {
+    let Some(output) = cloud_mcp_git_output(
+        root,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    ) else {
         return Vec::new();
     };
 
@@ -2580,7 +2611,44 @@ async fn cloud_mcp_sync_terminal_agent_status(
         },
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let _ = cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await;
+    log_terminal_status_event(
+        "backend.cloud_mcp.agent_status.send",
+        json!({
+            "endpoint": "agent_heartbeat",
+            "payload": payload.clone(),
+            "reason": reason,
+            "server_status": status,
+            "terminal_ground_truth_hint": progress_summary,
+        }),
+    );
+    let result = cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await;
+    match &result {
+        Ok(value) => log_terminal_status_event(
+            "backend.cloud_mcp.agent_status.result",
+            json!({
+                "agent_id": agent_id,
+                "endpoint": "agent_heartbeat",
+                "ok": true,
+                "reason": reason,
+                "server_status": status,
+                "terminal_id": pane_id,
+                "terminal_instance_id": instance_id,
+                "result": value,
+            }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.cloud_mcp.agent_status.error",
+            json!({
+                "agent_id": agent_id,
+                "endpoint": "agent_heartbeat",
+                "error": clean_terminal_telemetry_text(error),
+                "reason": reason,
+                "server_status": status,
+                "terminal_id": pane_id,
+                "terminal_instance_id": instance_id,
+            }),
+        ),
+    }
 }
 
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
@@ -2723,8 +2791,8 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
                 },
                 "ts_ms": cloud_mcp_now_ms(),
             });
-            let _ = cloud_mcp_post_event_endpoint(state, "isolated_work_pruned", &prune_payload)
-                .await;
+            let _ =
+                cloud_mcp_post_event_endpoint(state, "isolated_work_pruned", &prune_payload).await;
             let _ = cloud_mcp_prune_cached_isolated_spec_work(
                 Some(&repo_root),
                 Some(&repo_id),
@@ -2989,6 +3057,19 @@ async fn cloud_mcp_observe_terminal_output(
         return;
     }
 
+    log_terminal_status_event(
+        "backend.terminal.ground_truth.output_observed",
+        json!({
+            "bytes": chunk.len(),
+            "decoded_preview": clean_terminal_diagnostic_log_text(&text),
+            "instance_id": instance_id,
+            "looks_active": looks_active,
+            "looks_ready": looks_ready,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+        }),
+    );
+
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
     let work_brief = cloud_mcp_extract_agent_work_brief(&text);
     let (work_update, completion) = {
@@ -2996,6 +3077,17 @@ async fn cloud_mcp_observe_terminal_output(
         let mut runtime = state.inner.lock().await;
         let lock_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
         let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) else {
+            log_terminal_status_event(
+                "backend.terminal.ground_truth.missing_context",
+                json!({
+                    "bytes": chunk.len(),
+                    "instance_id": instance_id,
+                    "looks_active": looks_active,
+                    "looks_ready": looks_ready,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+                }),
+            );
             let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
             if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
                 log_terminal_diagnostic_event(
@@ -3040,24 +3132,28 @@ async fn cloud_mcp_observe_terminal_output(
             None
         };
         let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
-        let completion = if entry.saw_agent_activity
-            && !entry.done_reported
-            && old_enough
-            && looks_ready
-        {
-            entry.done_reported = true;
-            Some((
-                entry.local_task_id.clone(),
-                entry.repo_id.clone(),
-                entry.agent_id.clone(),
-                entry.lane.clone(),
-                entry.last_prompt.clone(),
-                entry.work_brief.clone(),
-                entry.working_directory.clone(),
-            ))
-        } else {
-            None
-        };
+        let completion =
+            if entry.saw_agent_activity && !entry.done_reported && old_enough && looks_ready {
+                entry.done_reported = true;
+                Some((
+                    entry.local_task_id.clone(),
+                    entry.repo_id.clone(),
+                    entry.agent_id.clone(),
+                    entry.lane.clone(),
+                    entry.last_prompt.clone(),
+                    entry.work_brief.clone(),
+                    entry.working_directory.clone(),
+                    entry.prompt_event_id.clone(),
+                    entry.prompt_event_source.clone(),
+                    entry.prompt_event_submitted_at.clone(),
+                    entry.terminal_index,
+                    entry.thread_id.clone(),
+                    entry.workspace_id.clone(),
+                    entry.workspace_name.clone(),
+                ))
+            } else {
+                None
+            };
         let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
         if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
             log_terminal_diagnostic_event(
@@ -3081,6 +3177,20 @@ async fn cloud_mcp_observe_terminal_output(
         (work_update, completion)
     };
 
+    log_terminal_status_event(
+        "backend.terminal.ground_truth.output_decision",
+        json!({
+            "bytes": chunk.len(),
+            "instance_id": instance_id,
+            "looks_active": looks_active,
+            "looks_ready": looks_ready,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+            "will_mark_done": completion.is_some(),
+            "will_send_active_update": work_update.is_some(),
+        }),
+    );
+
     if let Some((repo_id, agent_id, lane, local_task_id, brief, working_directory)) = work_update {
         cloud_mcp_sync_terminal_agent_status(
             &state,
@@ -3100,11 +3210,62 @@ async fn cloud_mcp_observe_terminal_output(
         .await;
     }
 
-    let Some((local_task_id, repo_id, agent_id, lane, _prompt, work_brief, working_directory)) =
-        completion
+    let Some((
+        local_task_id,
+        repo_id,
+        agent_id,
+        lane,
+        _prompt,
+        work_brief,
+        working_directory,
+        prompt_event_id,
+        prompt_event_source,
+        prompt_event_submitted_at,
+        terminal_index,
+        thread_id,
+        workspace_id,
+        _workspace_name,
+    )) = completion
     else {
         return;
     };
+    log_terminal_status_event(
+        "backend.terminal.ground_truth.done_detected",
+        json!({
+            "agent_id": agent_id.clone(),
+            "instance_id": instance_id,
+            "lane": lane.clone(),
+            "local_task_id": local_task_id.clone(),
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "prompt_event_id": prompt_event_id.clone(),
+            "prompt_event_submitted_at": prompt_event_submitted_at.clone(),
+            "repo_id": repo_id.clone(),
+            "status_truth": "idle_or_prompt_ready",
+            "thread_id": thread_id.clone(),
+            "workspace_id": workspace_id.clone(),
+            "work_brief": clean_terminal_diagnostic_log_text(&work_brief),
+        }),
+    );
+    if let Some(prompt_event_id) = prompt_event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        log_terminal_status_event(
+            "backend.voice_plan_task_status.prompt_ready_not_final",
+            json!({
+                "agent_id": agent_id.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "prompt_event_id": prompt_event_id,
+                "prompt_event_source": prompt_event_source.clone(),
+                "reason": "terminal_prompt_ready_is_not_provider_turn_complete",
+                "terminal_index": terminal_index,
+                "thread_id": thread_id.clone(),
+                "workspace_id": workspace_id.clone(),
+            }),
+        );
+    }
     let scan_root = working_directory.clone();
     let changed_files =
         match tauri::async_runtime::spawn_blocking(move || cloud_mcp_git_changed_files(&scan_root))
@@ -3175,6 +3336,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
     local_task_id: Option<String>,
     local_task_title: Option<String>,
     prompt: String,
+    prompt_metadata: Option<CloudMcpTerminalPromptMetadata>,
 ) {
     let prompt = cloud_mcp_clean_prompt_text(&prompt);
     if prompt.trim().is_empty() {
@@ -3184,6 +3346,15 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
     let agent_id = cloud_mcp_terminal_agent_id(&pane_id, instance_id, coordination.as_ref());
     let repo_id = cloud_mcp_terminal_repo_id(&working_directory, coordination.as_ref());
     let terminal_key = cloud_mcp_terminal_key(&pane_id, instance_id);
+    let prompt_metadata = prompt_metadata.unwrap_or_else(|| CloudMcpTerminalPromptMetadata {
+        prompt_event_id: None,
+        prompt_event_source: None,
+        prompt_event_submitted_at: None,
+        terminal_index: None,
+        thread_id: None,
+        workspace_id: String::new(),
+        workspace_name: String::new(),
+    });
     {
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.insert(
@@ -3194,6 +3365,13 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 agent_id: agent_id.clone(),
                 lane: String::new(),
                 working_directory: working_directory.clone(),
+                prompt_event_id: prompt_metadata.prompt_event_id.clone(),
+                prompt_event_source: prompt_metadata.prompt_event_source.clone(),
+                prompt_event_submitted_at: prompt_metadata.prompt_event_submitted_at.clone(),
+                terminal_index: prompt_metadata.terminal_index,
+                thread_id: prompt_metadata.thread_id.clone(),
+                workspace_id: prompt_metadata.workspace_id.clone(),
+                workspace_name: prompt_metadata.workspace_name.clone(),
                 created_ms: cloud_mcp_now_ms(),
                 last_changed_hash: String::new(),
                 last_checkpoint_ms: 0,
@@ -3234,6 +3412,13 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "current_agent_id": agent_id,
         "terminal_id": pane_id,
         "terminal_instance_id": instance_id,
+        "terminal_index": prompt_metadata.terminal_index,
+        "thread_id": prompt_metadata.thread_id,
+        "workspace_id": prompt_metadata.workspace_id,
+        "workspace_name": prompt_metadata.workspace_name,
+        "prompt_event_id": prompt_metadata.prompt_event_id,
+        "prompt_event_source": prompt_metadata.prompt_event_source,
+        "prompt_event_submitted_at": prompt_metadata.prompt_event_submitted_at,
         "task_id": local_task_id.clone(),
         "run_id": local_task_id.clone(),
         "prompt": prompt,
@@ -3413,8 +3598,8 @@ async fn cloud_mcp_track_terminal_file_changes(
                 .get(&terminal_key)
                 .and_then(|entry| entry.local_task_id.clone())
         };
-        let local_task_id_for_scope =
-            local_task_id_for_scope.or_else(|| cloud_mcp_terminal_active_task_id(coordination.as_ref()));
+        let local_task_id_for_scope = local_task_id_for_scope
+            .or_else(|| cloud_mcp_terminal_active_task_id(coordination.as_ref()));
         let Some(local_task_id_for_scope) = local_task_id_for_scope
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -3710,11 +3895,8 @@ async fn cloud_mcp_sync_agent_installations(
     let workspace_id = clean_option(workspace_id);
     let workspace_name = clean_option(workspace_name);
     let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
-    let req = cloud_mcp_spec_graph_sync_request(
-        repo_path,
-        workspace_id.clone(),
-        workspace_name.clone(),
-    );
+    let req =
+        cloud_mcp_spec_graph_sync_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let agent_count = agent_statuses
         .as_array()
         .map(Vec::len)
@@ -3768,8 +3950,11 @@ async fn cloud_mcp_record_spec_edit_intent(
         object.insert("event_kind".to_string(), json!(event_kind.clone()));
         object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
         object.insert("repo_path".to_string(), json!(req.root_display.clone()));
-        object.insert("workspace_root".to_string(), json!(req.root_display.clone()));
-        object.insert("workspace_id".to_string(), json!(workspace_id));
+        object.insert(
+            "workspace_root".to_string(),
+            json!(req.root_display.clone()),
+        );
+        object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
         if let Some(name) = workspace_name {
             object.insert("workspace_name".to_string(), json!(name));
         }
@@ -3795,18 +3980,102 @@ async fn cloud_mcp_record_voice_plan_task_status(
         Value::Object(object) => Value::Object(object),
         _ => return Err("Voice plan task status payload must be an object.".to_string()),
     };
+    let plan_run_id = cloud_mcp_payload_text(&payload, &["planRunId"])
+        .or_else(|| cloud_mcp_payload_text(&payload, &["plan_run_id"]))
+        .or_else(|| cloud_mcp_payload_text(&payload, &["runId"]))
+        .or_else(|| cloud_mcp_payload_text(&payload, &["run_id"]));
+    let plan_task_id = cloud_mcp_payload_text(&payload, &["planTaskId"])
+        .or_else(|| cloud_mcp_payload_text(&payload, &["plan_task_id"]))
+        .or_else(|| cloud_mcp_payload_text(&payload, &["taskId"]))
+        .or_else(|| cloud_mcp_payload_text(&payload, &["task_id"]));
+    let plan_stage = cloud_mcp_payload_text(&payload, &["planStage"])
+        .or_else(|| cloud_mcp_payload_text(&payload, &["plan_stage"]))
+        .or_else(|| cloud_mcp_payload_text(&payload, &["stage"]));
+    let prompt_event_id = cloud_mcp_payload_text(&payload, &["promptEventId"])
+        .or_else(|| cloud_mcp_payload_text(&payload, &["prompt_event_id"]));
+    let plan_step_ordinal = payload
+        .get("planStepOrdinal")
+        .or_else(|| payload.get("plan_step_ordinal"))
+        .or_else(|| payload.get("stepOrdinal"))
+        .or_else(|| payload.get("step_ordinal"))
+        .cloned();
     if let Some(object) = payload.as_object_mut() {
         object.insert("event_kind".to_string(), json!("voice_plan_task_status"));
         object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
+        object.insert("repoId".to_string(), json!(req.repo_id.clone()));
         object.insert("repo_path".to_string(), json!(req.root_display.clone()));
-        object.insert("workspace_root".to_string(), json!(req.root_display.clone()));
-        object.insert("workspace_id".to_string(), json!(workspace_id));
+        object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+        object.insert(
+            "workspace_root".to_string(),
+            json!(req.root_display.clone()),
+        );
+        object.insert("workspaceRoot".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
+        object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
         if let Some(name) = workspace_name {
             object.insert("workspace_name".to_string(), json!(name));
         }
+        if let Some(value) = plan_run_id.as_deref() {
+            for key in ["planRunId", "plan_run_id", "runId", "run_id"] {
+                object.insert(key.to_string(), json!(value));
+            }
+        }
+        if let Some(value) = plan_task_id.as_deref() {
+            for key in ["planTaskId", "plan_task_id", "taskId", "task_id"] {
+                object.insert(key.to_string(), json!(value));
+            }
+        }
+        if let Some(value) = plan_stage.as_deref() {
+            for key in ["planStage", "plan_stage", "stage"] {
+                object.insert(key.to_string(), json!(value));
+            }
+        }
+        if let Some(value) = plan_step_ordinal {
+            for key in [
+                "planStepOrdinal",
+                "plan_step_ordinal",
+                "stepOrdinal",
+                "step_ordinal",
+            ] {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(value) = prompt_event_id.as_deref() {
+            for key in ["promptEventId", "prompt_event_id"] {
+                object.insert(key.to_string(), json!(value));
+            }
+        }
     }
 
-    cloud_mcp_post_event_endpoint(state.inner(), "voice_plan_task_status", &payload).await
+    log_terminal_status_event(
+        "backend.voice_plan_task_status.send",
+        json!({
+            "endpoint": "voice_plan_task_status",
+            "payload": payload.clone(),
+            "workspace_id": workspace_id,
+        }),
+    );
+    let result =
+        cloud_mcp_post_event_endpoint(state.inner(), "voice_plan_task_status", &payload).await;
+    match &result {
+        Ok(value) => log_terminal_status_event(
+            "backend.voice_plan_task_status.result",
+            json!({
+                "endpoint": "voice_plan_task_status",
+                "ok": true,
+                "result": value,
+            }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.voice_plan_task_status.error",
+            json!({
+                "endpoint": "voice_plan_task_status",
+                "error": clean_terminal_telemetry_text(error),
+                "payload": payload,
+            }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -3893,8 +4162,7 @@ fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &
 
     let workspace_id = cloud_mcp_payload_text(event, &["workspace_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]));
-    if let (Some(expected), Some(actual)) = (req.workspace_id.as_deref(), workspace_id.as_deref())
-    {
+    if let (Some(expected), Some(actual)) = (req.workspace_id.as_deref(), workspace_id.as_deref()) {
         return expected == actual;
     }
 
@@ -3986,7 +4254,11 @@ fn cloud_mcp_cache_file_stem(value: &str) -> String {
             }
         })
         .collect::<String>();
-    let sanitized = sanitized.trim_matches('_').chars().take(96).collect::<String>();
+    let sanitized = sanitized
+        .trim_matches('_')
+        .chars()
+        .take(96)
+        .collect::<String>();
     if sanitized.is_empty() {
         format!("cache-{}", cloud_mcp_short_hash(value))
     } else {
@@ -3995,10 +4267,8 @@ fn cloud_mcp_cache_file_stem(value: &str) -> String {
 }
 
 fn cloud_mcp_spec_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
-    cloud_mcp_spec_graph_cache_dir(root).join(format!(
-        "{}.json",
-        cloud_mcp_cache_file_stem(repo_id)
-    ))
+    cloud_mcp_spec_graph_cache_dir(root)
+        .join(format!("{}.json", cloud_mcp_cache_file_stem(repo_id)))
 }
 
 fn cloud_mcp_safe_spec_graph_cache_file(root: &Path, file_name: &str) -> Result<PathBuf, String> {
@@ -4203,7 +4473,10 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
     {
         if let Some(object) = cached.as_object_mut() {
             object.insert("cache_hit".to_string(), json!(true));
-            object.insert("cache_path".to_string(), json!(workspace_path_display(&cache_path)));
+            object.insert(
+                "cache_path".to_string(),
+                json!(workspace_path_display(&cache_path)),
+            );
             object.insert("repo_name".to_string(), json!(repo_name.clone()));
             object.insert("display_root".to_string(), json!(display_root.clone()));
         }
@@ -4311,10 +4584,7 @@ fn cloud_mcp_knowledge_markdown_delta(response: &Value) -> Option<&Value> {
     response
         .pointer("/data/knowledge_markdown_delta")
         .or_else(|| response.get("knowledge_markdown_delta"))
-        .or_else(|| {
-            response
-                .pointer("/data/knowledge_authoring/knowledge_markdown_delta")
-        })
+        .or_else(|| response.pointer("/data/knowledge_authoring/knowledge_markdown_delta"))
         .or_else(|| response.pointer("/knowledge_authoring/knowledge_markdown_delta"))
 }
 
@@ -4346,10 +4616,7 @@ fn cloud_mcp_knowledge_authoring_note_path(value: &str) -> Option<PathBuf> {
     (!output.as_os_str().is_empty()).then_some(output)
 }
 
-fn cloud_mcp_apply_knowledge_markdown_delta(
-    repo_root: &Path,
-    response: &Value,
-) -> Value {
+fn cloud_mcp_apply_knowledge_markdown_delta(repo_root: &Path, response: &Value) -> Value {
     let Some(delta) = cloud_mcp_knowledge_markdown_delta(response) else {
         return json!({"ok": true, "present": false, "applied": false, "reason": "no_markdown_delta"});
     };
@@ -4377,7 +4644,12 @@ fn cloud_mcp_apply_knowledge_markdown_delta(
     let mut applied = Vec::new();
     let mut deleted = Vec::new();
     let mut skipped = Vec::new();
-    for file in delta.get("files").and_then(Value::as_array).cloned().unwrap_or_default() {
+    for file in delta
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
         let raw_path = file
             .get("path")
             .or_else(|| file.get("note_path"))
@@ -4563,10 +4835,7 @@ fn cloud_mcp_materialize_knowledge_graph_mirror(repo_root: &Path, data: &Value) 
     applied
 }
 
-fn cloud_mcp_apply_knowledge_authoring_result(
-    repo_root: Option<&Path>,
-    response: &Value,
-) -> Value {
+fn cloud_mcp_apply_knowledge_authoring_result(repo_root: Option<&Path>, response: &Value) -> Value {
     let Some(repo_root) = repo_root else {
         return json!({"ok": false, "applied": false, "reason": "missing_repo_root"});
     };
@@ -4579,7 +4848,8 @@ fn cloud_mcp_apply_knowledge_authoring_result(
         };
     };
     if markdown_delta_apply["present"].as_bool() == Some(true)
-        && markdown_delta_apply["source_of_truth"].as_str() == Some("server_authored_knowledge_graph")
+        && markdown_delta_apply["source_of_truth"].as_str()
+            == Some("server_authored_knowledge_graph")
     {
         return json!({
             "ok": markdown_delta_apply["ok"].as_bool().unwrap_or(true),
@@ -4615,10 +4885,7 @@ fn cloud_mcp_knowledge_cache_dir(root: &Path) -> PathBuf {
 }
 
 fn cloud_mcp_knowledge_graph_cache_path(root: &Path, repo_id: &str) -> PathBuf {
-    cloud_mcp_knowledge_cache_dir(root).join(format!(
-        "{}.json",
-        cloud_mcp_cache_file_stem(repo_id)
-    ))
+    cloud_mcp_knowledge_cache_dir(root).join(format!("{}.json", cloud_mcp_cache_file_stem(repo_id)))
 }
 
 fn cloud_mcp_knowledge_note_id(repo_id: &str, note_path: &str) -> String {
@@ -4847,7 +5114,14 @@ fn cloud_mcp_markdown_link_targets(markdown: &str) -> Vec<String> {
     }
     targets
         .into_iter()
-        .map(|target| target.split(['#', '?']).next().unwrap_or("").trim().to_string())
+        .map(|target| {
+            target
+                .split(['#', '?'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
         .filter(|target| !target.is_empty())
         .filter(|target| {
             let lower = target.to_ascii_lowercase();
@@ -4977,7 +5251,10 @@ fn cloud_mcp_collect_knowledge_path_refs(
                 })
                 .unwrap_or("missing")
                 .to_string();
-            let size = metadata.as_ref().filter(|metadata| metadata.is_file()).map(fs::Metadata::len);
+            let size = metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_file())
+                .map(fs::Metadata::len);
             let modified_ms = metadata.as_ref().and_then(cloud_mcp_modified_ms);
             CloudMcpKnowledgePathRef {
                 path,
@@ -5164,7 +5441,10 @@ fn cloud_mcp_knowledge_hashes(items: &[Value]) -> Value {
     let mut map = serde_json::Map::new();
     for item in items {
         if let Some(id) = item.get("id").and_then(Value::as_str) {
-            map.insert(id.to_string(), json!(cloud_mcp_short_hash(&item.to_string())));
+            map.insert(
+                id.to_string(),
+                json!(cloud_mcp_short_hash(&item.to_string())),
+            );
         }
     }
     Value::Object(map)
@@ -5198,7 +5478,9 @@ fn cloud_mcp_programmatic_knowledge_root_node(req: &CloudMcpSpecGraphSyncRequest
     })
 }
 
-fn cloud_mcp_build_local_knowledge_graph_data(req: &CloudMcpSpecGraphSyncRequest) -> Result<Value, String> {
+fn cloud_mcp_build_local_knowledge_graph_data(
+    req: &CloudMcpSpecGraphSyncRequest,
+) -> Result<Value, String> {
     let notes = cloud_mcp_read_knowledge_notes(&req.root, &req.repo_id)?;
     let edges = cloud_mcp_build_knowledge_edges(&req.repo_id, &notes);
     let nodes = notes
@@ -5312,20 +5594,23 @@ fn cloud_mcp_knowledge_graph_snapshot_from_data(
         object.insert("nodes".to_string(), nodes.clone());
         object.insert("edges".to_string(), edges.clone());
     }
-    let graph_stats = data.get("graph_stats").cloned().unwrap_or_else(|| json!({}));
+    let graph_stats = data
+        .get("graph_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let cursor = data
         .get("cursor")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| cloud_mcp_short_hash(&json!({"nodes": nodes, "edges": edges}).to_string()));
-    let node_hashes = data
-        .get("node_hashes")
-        .cloned()
-        .unwrap_or_else(|| cloud_mcp_knowledge_hashes(nodes.as_array().map(Vec::as_slice).unwrap_or(&[])));
-    let edge_hashes = data
-        .get("edge_hashes")
-        .cloned()
-        .unwrap_or_else(|| cloud_mcp_knowledge_hashes(edges.as_array().map(Vec::as_slice).unwrap_or(&[])));
+        .unwrap_or_else(|| {
+            cloud_mcp_short_hash(&json!({"nodes": nodes, "edges": edges}).to_string())
+        });
+    let node_hashes = data.get("node_hashes").cloned().unwrap_or_else(|| {
+        cloud_mcp_knowledge_hashes(nodes.as_array().map(Vec::as_slice).unwrap_or(&[]))
+    });
+    let edge_hashes = data.get("edge_hashes").cloned().unwrap_or_else(|| {
+        cloud_mcp_knowledge_hashes(edges.as_array().map(Vec::as_slice).unwrap_or(&[]))
+    });
     let graph_stats_hash = data
         .get("graph_stats_hash")
         .and_then(Value::as_str)
@@ -5391,23 +5676,35 @@ fn cloud_mcp_stamp_knowledge_graph_snapshot(
         object.insert("repoPath".to_string(), json!(req.root_display.clone()));
         object.insert("repoName".to_string(), json!(repo_name.clone()));
         object.insert("displayRoot".to_string(), json!(display_root.clone()));
-        object.insert("workspaceDisplay".to_string(), json!({
-            "repoName": repo_name,
-            "displayRoot": display_root,
-            "repoPath": req.root_display.clone(),
-        }));
+        object.insert(
+            "workspaceDisplay".to_string(),
+            json!({
+                "repoName": repo_name,
+                "displayRoot": display_root,
+                "repoPath": req.root_display.clone(),
+            }),
+        );
         object.insert("workspaceId".to_string(), json!(req.workspace_id.clone()));
-        object.insert("workspaceName".to_string(), json!(req.workspace_name.clone()));
-        object.insert("cachePath".to_string(), json!(workspace_path_display(cache_path)));
+        object.insert(
+            "workspaceName".to_string(),
+            json!(req.workspace_name.clone()),
+        );
+        object.insert(
+            "cachePath".to_string(),
+            json!(workspace_path_display(cache_path)),
+        );
         object.insert("syncState".to_string(), json!(sync_state));
         object.insert("syncError".to_string(), json!(sync_error));
-        object.insert("sourceOfTruth".to_string(), json!({
-            "kind": "server_authored_knowledge_graph",
-            "repo_id": req.repo_id.clone(),
-            "markdown_directory": ".agents/knowledge",
-            "client_mode": "read_only_markdown_sync",
-            "cached_under_agents": true,
-        }));
+        object.insert(
+            "sourceOfTruth".to_string(),
+            json!({
+                "kind": "server_authored_knowledge_graph",
+                "repo_id": req.repo_id.clone(),
+                "markdown_directory": ".agents/knowledge",
+                "client_mode": "read_only_markdown_sync",
+                "cached_under_agents": true,
+            }),
+        );
     }
     snapshot
 }
@@ -5550,7 +5847,10 @@ async fn cloud_mcp_sync_knowledge_graph_once(
             let mut snapshot = current_cache.clone();
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("syncState".to_string(), json!("local"));
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             snapshot
         }
@@ -5653,7 +5953,10 @@ fn cloud_mcp_merge_knowledge_note_changes(changes: &mut Vec<Value>, next: Vec<Va
         .iter()
         .filter_map(|change| {
             let path = change.get("path").and_then(Value::as_str)?;
-            let action = change.get("action").and_then(Value::as_str).unwrap_or("changed");
+            let action = change
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("changed");
             Some(format!("{path}:{action}"))
         })
         .collect::<HashSet<_>>();
@@ -5661,7 +5964,10 @@ fn cloud_mcp_merge_knowledge_note_changes(changes: &mut Vec<Value>, next: Vec<Va
         let Some(path) = change.get("path").and_then(Value::as_str) else {
             continue;
         };
-        let action = change.get("action").and_then(Value::as_str).unwrap_or("changed");
+        let action = change
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("changed");
         if seen.insert(format!("{path}:{action}")) {
             changes.push(change);
         }
@@ -5874,8 +6180,15 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
         &mut watched,
         cloud_mcp_knowledge_watch_targets(&req, &initial_snapshot),
     );
-    cloud_mcp_sync_knowledge_graph_and_rewatch(&app, &state, &req, &mut watcher, &mut watched, true)
-        .await;
+    cloud_mcp_sync_knowledge_graph_and_rewatch(
+        &app,
+        &state,
+        &req,
+        &mut watcher,
+        &mut watched,
+        true,
+    )
+    .await;
 
     while !crate::app_shutdown_requested() {
         let wake_signal = wake.notified();
@@ -5927,8 +6240,11 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
                 cloud_mcp_emit_knowledge_graph_snapshot(&app, snapshot);
                 break;
             }
-            CloudMcpKnowledgeGraphSyncSignal::File(Ok(event)) if cloud_mcp_knowledge_event_should_sync(&req.root, &event) => {
-                let mut note_changes = cloud_mcp_knowledge_note_changes_from_event(&req.root, &event);
+            CloudMcpKnowledgeGraphSyncSignal::File(Ok(event))
+                if cloud_mcp_knowledge_event_should_sync(&req.root, &event) =>
+            {
+                let mut note_changes =
+                    cloud_mcp_knowledge_note_changes_from_event(&req.root, &event);
                 let debounce_wake_signal = wake.notified();
                 tokio::pin!(debounce_wake_signal);
                 if stop.load(Ordering::SeqCst) {
@@ -5957,12 +6273,7 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
                         }
                     }
                 }
-                cloud_mcp_push_knowledge_atlas_file_invalidation(
-                    &state,
-                    &req,
-                    note_changes,
-                )
-                .await;
+                cloud_mcp_push_knowledge_atlas_file_invalidation(&state, &req, note_changes).await;
                 cloud_mcp_sync_knowledge_graph_and_rewatch(
                     &app,
                     &state,
@@ -5998,7 +6309,10 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
 async fn cloud_mcp_stop_all_knowledge_graph_syncs(state: &CloudMcpState) -> usize {
     let runtimes = {
         let mut syncs = state.knowledge_graph_syncs.lock().await;
-        syncs.drain().map(|(_, runtime)| runtime).collect::<Vec<_>>()
+        syncs
+            .drain()
+            .map(|(_, runtime)| runtime)
+            .collect::<Vec<_>>()
     };
     let stopped = runtimes.len();
     for runtime in runtimes {
@@ -6595,8 +6909,12 @@ async fn cloud_mcp_sync_spec_graph_once(
     next_snapshot = cloud_mcp_attach_spec_task_history(next_snapshot, task_history);
     let changed = current_cache.get("cursor").and_then(Value::as_str)
         != next_snapshot.get("cursor").and_then(Value::as_str)
-        || current_cache.get("taskHistoryCursor").and_then(Value::as_str)
-            != next_snapshot.get("taskHistoryCursor").and_then(Value::as_str)
+        || current_cache
+            .get("taskHistoryCursor")
+            .and_then(Value::as_str)
+            != next_snapshot
+                .get("taskHistoryCursor")
+                .and_then(Value::as_str)
         || current_cache.get("syncState").and_then(Value::as_str) == Some("error");
     if changed {
         cloud_mcp_write_spec_graph_cache(req, &next_snapshot)?;
@@ -6897,7 +7215,9 @@ async fn cloud_mcp_get_cached_spec_graph(
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_local_ignored_spec_graph_overlay(repo_path: String) -> Result<Value, String> {
+async fn cloud_mcp_get_local_ignored_spec_graph_overlay(
+    repo_path: String,
+) -> Result<Value, String> {
     let root = resolve_workspace_root_directory(Some(&repo_path))
         .unwrap_or_else(|_| PathBuf::from(&repo_path));
     let root = workspace_path_for_process(&root);
@@ -7138,7 +7458,10 @@ async fn cloud_mcp_get_knowledge_graph(
         Err(error) => {
             let mut snapshot = cached_snapshot;
             if let Some(object) = snapshot.as_object_mut() {
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             snapshot
         }
@@ -8009,8 +8332,10 @@ fn cloud_mcp_proxy_push_current_filetree_snapshot(
         "payload": payload,
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_proxy_post_json_endpoint(base_url, "/v1/events", &request.to_string())?;
-    Ok(serde_json::from_str::<Value>(&response).unwrap_or_else(|_| json!({"raw_response": response})))
+    let response =
+        cloud_mcp_proxy_post_json_endpoint(base_url, "/v1/events", &request.to_string())?;
+    Ok(serde_json::from_str::<Value>(&response)
+        .unwrap_or_else(|_| json!({"raw_response": response})))
 }
 
 fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> {
@@ -8113,7 +8438,10 @@ pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
     metadata.insert("lease_state".to_string(), json!("active"));
     metadata.insert("file_state".to_string(), json!("lease"));
     metadata.insert("local_lease_file_evidence".to_string(), json!(true));
-    metadata.insert("local_active_leases".to_string(), json!([lease_scope.clone()]));
+    metadata.insert(
+        "local_active_leases".to_string(),
+        json!([lease_scope.clone()]),
+    );
     metadata.insert("acquire_result".to_string(), acquire_result.clone());
     if let Some(lease_id) = lease_id {
         metadata.insert("lease_id".to_string(), json!(lease_id));
@@ -8336,7 +8664,10 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         metadata.insert("local_patch_id".to_string(), json!(patch_id));
     }
     if let Some(diff_artifact_id) = data["diff_artifact_id"].as_str() {
-        metadata.insert("local_diff_artifact_id".to_string(), json!(diff_artifact_id));
+        metadata.insert(
+            "local_diff_artifact_id".to_string(),
+            json!(diff_artifact_id),
+        );
     }
     if let Some(worktree_id) = worktree_id {
         metadata.insert("worktree_id".to_string(), json!(worktree_id));
@@ -8452,9 +8783,7 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
             );
             let mut parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
-            let knowledge_root = main_repo_path
-                .as_deref()
-                .or(identity.repo_path.as_deref());
+            let knowledge_root = main_repo_path.as_deref().or(identity.repo_path.as_deref());
             let knowledge_authoring_apply =
                 cloud_mcp_apply_knowledge_authoring_result(knowledge_root, &parsed);
             if let Some(object) = parsed.as_object_mut() {
@@ -8566,7 +8895,10 @@ fn cloud_mcp_forward_isolated_work_pruned(
     payload.insert("remove_isolated_work".to_string(), json!(true));
     payload.insert("claimed_paths".to_string(), json!([]));
     payload.insert("changed_files".to_string(), json!(changed_file_paths));
-    payload.insert("summary".to_string(), json!("Pruned rejected isolated work from the spec graph."));
+    payload.insert(
+        "summary".to_string(),
+        json!("Pruned rejected isolated work from the spec graph."),
+    );
     payload.insert("metadata".to_string(), Value::Object(metadata));
     if let Some(repo_id) = identity.repo_id.as_deref() {
         payload.insert("repo_id".to_string(), json!(repo_id));
@@ -8656,12 +8988,7 @@ fn cloud_mcp_prune_cached_isolated_spec_work(
     let mut kept_nodes = Vec::new();
     for node in nodes {
         let remove = cloud_mcp_cached_node_is_isolated(&node)
-            && cloud_mcp_cached_node_matches_cleanup(
-                &node,
-                task_id,
-                worktree_id,
-                &path_set,
-            );
+            && cloud_mcp_cached_node_matches_cleanup(&node, task_id, worktree_id, &path_set);
         if remove {
             if let Some(id) = cloud_mcp_spec_graph_item_id(&node) {
                 removed_ids.insert(id);
@@ -8698,7 +9025,8 @@ fn cloud_mcp_prune_cached_isolated_spec_work(
 
 fn cloud_mcp_cached_node_is_isolated(node: &Value) -> bool {
     let metadata = node.get("metadata").unwrap_or(&Value::Null);
-    let file_source = cloud_mcp_cached_text(node, metadata, &["file_source", "fileSource", "source"]);
+    let file_source =
+        cloud_mcp_cached_text(node, metadata, &["file_source", "fileSource", "source"]);
     file_source.eq_ignore_ascii_case("worktree")
         || cloud_mcp_cached_bool(node, metadata, &["provisional", "isProvisional"])
         || cloud_mcp_cached_bool(node, metadata, &["pending_main_sync", "pendingMainSync"])
@@ -9271,10 +9599,7 @@ fn cloud_mcp_proxy_insert_local_file_scope(
             json!(git_changed_files.clone()),
         );
     }
-    if matches!(
-        tool_name,
-        "checkpoint_recorded"
-    ) {
+    if matches!(tool_name, "checkpoint_recorded") {
         arguments
             .entry("record_spec_activity".to_string())
             .or_insert_with(|| json!(true));
@@ -9744,7 +10069,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let expected_accept = cloud_mcp_proxy_ws_accept_key(&websocket_key);
     let mut headers = format!("x-diffforge-client-id: {}\r\n", client_id.trim());
     if let Some(workspace_id) = workspace_id.as_deref() {
-        headers.push_str(&format!("x-diffforge-workspace-id: {}\r\n", workspace_id.trim()));
+        headers.push_str(&format!(
+            "x-diffforge-workspace-id: {}\r\n",
+            workspace_id.trim()
+        ));
     }
     if let Some(repo_id) = repo_id.as_deref() {
         headers.push_str(&format!("x-diffforge-repo-id: {}\r\n", repo_id.trim()));
@@ -9802,9 +10130,8 @@ fn cloud_mcp_proxy_post_json_endpoint(
             return Err("Cloud MCP websocket request timed out.".to_string());
         }
         let response_text = cloud_mcp_proxy_read_ws_text_frame(&mut stream)?;
-        let response = serde_json::from_str::<Value>(&response_text).map_err(|error| {
-            format!("Cloud MCP websocket response was invalid JSON: {error}")
-        })?;
+        let response = serde_json::from_str::<Value>(&response_text)
+            .map_err(|error| format!("Cloud MCP websocket response was invalid JSON: {error}"))?;
         if response.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
             continue;
         }
@@ -9887,7 +10214,11 @@ fn cloud_mcp_proxy_read_http_headers(stream: &mut std::net::TcpStream) -> Result
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => return Err(format!("Cloud MCP websocket handshake read failed: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "Cloud MCP websocket handshake read failed: {error}"
+                ))
+            }
         }
     }
 }

@@ -130,6 +130,13 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
   };
 
   return {
+    async prime() {
+      try {
+        await ensureAudioContext();
+      } catch (error) {
+        onError?.(error);
+      }
+    },
     async handleEvent(event) {
       if (closed) {
         return;
