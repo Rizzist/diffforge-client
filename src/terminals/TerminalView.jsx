@@ -28,6 +28,8 @@ import {
   startLowPowerAudioBuffer,
 } from "../audio/audioCapture";
 import {
+  createCloudVoiceAgentTtsPlayer,
+  finishCloudVoiceAgentInput,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -84,6 +86,7 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "busy_turn",
   "composer_attachments_present",
   "composer_draft_present",
+  "agent_not_ready",
   "pending_prompt",
   "reserved",
   "terminal_starting",
@@ -116,6 +119,7 @@ const ORCHESTRATOR_VOICE_NOISE_MARGIN = 0.035;
 const ORCHESTRATOR_VOICE_ENVELOPE_MARGIN = 0.0015;
 const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_START = 0.5;
 const ORCHESTRATOR_VOICE_SAMPLE_SOURCE_SPAN = 0.5;
+const ORCHESTRATOR_FAST_LLM_RESPONSE_HOLD_MS = 1200;
 const EMPTY_ORCHESTRATOR_VOICE_STATS = {
   bufferMs: 0,
   frequencyBands: [],
@@ -669,7 +673,6 @@ const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
 const TODO_QUEUE_NOTE_LINE_THRESHOLD = 6;
 const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
 const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
-const ORCHESTRATOR_VOICE_HISTORY_STORAGE_PREFIX = "diffforge.orchestratorVoiceHistory.v1";
 const ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS = 24;
 const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude"]);
 const WORKSPACE_TOOL_TABS = [
@@ -2263,12 +2266,8 @@ function getTodoQueueStorageKey(workspaceId) {
   return `${TODO_QUEUE_STORAGE_PREFIX}.${safeWorkspaceId}`;
 }
 
-function getOrchestratorVoiceHistoryStorageKey(workspaceId) {
-  const safeWorkspaceId = String(workspaceId || "default")
-    .replace(/[^\w.-]/g, "_")
-    .slice(0, 120) || "default";
-
-  return `${ORCHESTRATOR_VOICE_HISTORY_STORAGE_PREFIX}.${safeWorkspaceId}`;
+function getOrchestratorVoiceHistoryWorkspaceId(workspaceId) {
+  return String(workspaceId || "default").trim() || "default";
 }
 
 function normalizeTodoQueueText(value) {
@@ -2460,6 +2459,54 @@ function getVoiceAgentToolCallSignature(toolCall) {
   return callId || fallbackSignature;
 }
 
+function getVoiceAgentEventKind(event) {
+  return String(event?.kind || event?.type || "").trim();
+}
+
+function getVoiceAgentEventMarker(event) {
+  return String(
+    event?.response_kind
+      || event?.responseKind
+      || event?.phase
+      || event?.status
+      || event?.scope
+      || "",
+  ).trim().toLowerCase();
+}
+
+function isVoiceAgentTtsEventKind(kind) {
+  return kind === "voice_agent_tts_start"
+    || kind === "voice_agent_tts_audio"
+    || kind === "voice_agent_tts_end";
+}
+
+function isVoiceAgentFastResponseEvent(event) {
+  const kind = getVoiceAgentEventKind(event);
+  const marker = getVoiceAgentEventMarker(event);
+  return Boolean(
+    event?.fast_response
+      || event?.fastResponse
+      || event?.is_fast_response
+      || event?.isFastResponse
+      || event?.fast_llm_response
+      || event?.fastLlmResponse,
+  )
+    || kind === "voice_agent_fast_llm_feedback"
+    || kind === "voice_agent_initial_llm_feedback"
+    || marker === "fast_response"
+    || marker === "fast_llm_response"
+    || marker === "initial_fast_response";
+}
+
+function normalizeFastVoiceAgentFeedbackEvent(event) {
+  return {
+    ...(event || {}),
+    final: false,
+    kind: "voice_agent_llm_feedback",
+    status: String(event?.status || "fast_response").trim() || "fast_response",
+  };
+}
+
 function cleanPublicVoiceAgentText(value) {
   let text = String(value || "")
     .replace(/\r\n/g, "\n")
@@ -2504,6 +2551,7 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
     taskId: args.plan_task_id || args.planTaskId,
     stage: args.plan_stage || args.planStage,
     stepOrdinal: args.plan_step_ordinal ?? args.planStepOrdinal,
+    title: args.plan_task_title || args.planTaskTitle || args.title,
   });
 
   return createTodoQueueItem(text, {
@@ -2662,6 +2710,7 @@ function normalizeVoicePlanTasks(value, context = {}) {
       ? Number(task?.terminalIndex ?? task?.terminal_index)
       : null,
     text: normalizeVoiceHistoryText(task?.text, 420),
+    title: normalizeVoiceHistoryText(task?.title, 120),
   })).filter((task) => task.id || task.text);
 }
 
@@ -2731,6 +2780,7 @@ function normalizeVoicePlanReleasedTask(value, snapshot = null) {
       ? Number(value.stepOrdinal ?? value.step_ordinal ?? snapshot?.currentStepOrdinal)
       : 0,
     taskId,
+    title: normalizeVoiceHistoryText(value.title, 120),
     text,
   };
 }
@@ -2822,6 +2872,7 @@ function normalizeTodoQueuePlanTask(value) {
     releasePolicy: String(value.releasePolicy || value.release_policy || value.planReleasePolicy || value.plan_release_policy || "").trim(),
     requiresQueueDrain: Boolean(value.requiresQueueDrain || value.requires_queue_drain || value.planRequiresQueueDrain || value.plan_requires_queue_drain),
     runId,
+    title: normalizeVoiceHistoryText(value.title, 120),
     taskId,
     stage: String(value.stage || value.planStage || value.plan_stage || "").trim(),
     stepOrdinal: Number.isFinite(Number(value.stepOrdinal ?? value.step_ordinal))
@@ -2844,6 +2895,28 @@ function isVoicePlanBoundaryQueueItem(item) {
         || releasePolicy === "verification_barrier"
       ),
   );
+}
+
+function isPlaceholderVoicePlanTaskText(value) {
+  const normalized = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, "")
+    .toLowerCase();
+  return [
+    "",
+    "voice plan",
+    "execute request",
+    "step",
+    "step 1",
+    "task",
+    "todo",
+    "plan",
+  ].includes(normalized);
+}
+
+function isUnsafeVoicePlanQueueItem(item) {
+  return Boolean(getTodoQueueItemPlanTask(item) && isPlaceholderVoicePlanTaskText(item?.text));
 }
 
 function isSpecEditTodoQueueItem(item) {
@@ -3375,32 +3448,38 @@ function writeTodoQueueItems(storageKey, items) {
   }
 }
 
-function readOrchestratorVoiceHistoryItems(storageKey) {
-  if (!canUseTodoQueueStorage()) {
-    return [];
-  }
-
+async function readOrchestratorVoiceHistoryItemsFromAgents({
+  rootDirectory = "",
+  workspaceId = "",
+} = {}) {
   try {
-    return normalizeOrchestratorVoiceHistoryItems(
-      JSON.parse(window.localStorage.getItem(storageKey) || "[]"),
-    );
+    const result = await invoke("read_orchestrator_voice_history", {
+      request: {
+        rootDirectory: rootDirectory || "",
+        workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+      },
+    });
+    return normalizeOrchestratorVoiceHistoryItems(result?.items || []);
   } catch {
     return [];
   }
 }
 
-function writeOrchestratorVoiceHistoryItems(storageKey, items) {
-  if (!canUseTodoQueueStorage()) {
-    return;
-  }
-
+async function writeOrchestratorVoiceHistoryItemsToAgents({
+  items = [],
+  rootDirectory = "",
+  workspaceId = "",
+} = {}) {
   try {
-    window.localStorage.setItem(
-      storageKey,
-      JSON.stringify(normalizeOrchestratorVoiceHistoryItems(items)),
-    );
+    await invoke("write_orchestrator_voice_history", {
+      request: {
+        items: normalizeOrchestratorVoiceHistoryItems(items),
+        rootDirectory: rootDirectory || "",
+        workspaceId: getOrchestratorVoiceHistoryWorkspaceId(workspaceId),
+      },
+    });
   } catch {
-    // Voice history mirrors the todo queue: persistence should never interrupt work.
+    // Voice history persistence should never interrupt terminal work.
   }
 }
 
@@ -3598,9 +3677,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   workspaceError = "",
   workspaceId,
 }) {
-  const orchestratorVoiceHistoryStorageKey = useMemo(
-    () => getOrchestratorVoiceHistoryStorageKey(workspaceId || workspace?.id),
-    [workspace?.id, workspaceId],
+  const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
+  const orchestratorVoiceHistoryStoreKey = useMemo(
+    () => `${rootDirectory || ""}:${getOrchestratorVoiceHistoryWorkspaceId(orchestratorPanelWorkspaceId)}`,
+    [orchestratorPanelWorkspaceId, rootDirectory],
   );
   const [activeWorkspaceTool, setActiveWorkspaceTool] = useState("orchestrator");
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
@@ -3608,19 +3688,28 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [editingDraft, setEditingDraft] = useState("");
   const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
   const [orchestratorVoiceFeedback, setOrchestratorVoiceFeedback] = useState("");
-  const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState(
-    () => readOrchestratorVoiceHistoryItems(orchestratorVoiceHistoryStorageKey),
-  );
+  const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
   const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
   const [reorderingItemId, setReorderingItemId] = useState("");
   const [todoListOffset, setTodoListOffset] = useState(0);
   const orchestratorVoiceEventsActiveRef = useRef(false);
+  const orchestratorVoiceInputFinishRequestedRef = useRef(false);
   const orchestratorVoiceMonitorRef = useRef(null);
   const orchestratorVoiceRunRef = useRef(0);
   const orchestratorVoiceSessionRef = useRef(Date.now());
-  const orchestratorVoiceHistoryStorageKeyRef = useRef(orchestratorVoiceHistoryStorageKey);
-  const orchestratorVoiceHistorySkipWriteRef = useRef(false);
+  const orchestratorVoiceTtsPlayerRef = useRef(null);
+  const orchestratorVoiceHistoryStoreKeyRef = useRef(orchestratorVoiceHistoryStoreKey);
+  const orchestratorVoiceHistoryLoadedRef = useRef(false);
+  const orchestratorVoiceHistoryWriteTimerRef = useRef(0);
+  const orchestratorVoiceFastResponseGateRef = useRef({
+    cancelled: false,
+    pendingFeedback: null,
+    pendingTtsEvents: [],
+    released: false,
+    runId: 0,
+    timer: 0,
+  });
   const todoBoardRef = useRef(null);
   const todoItemElementsRef = useRef(new Map());
   const todoReorderDragRef = useRef(null);
@@ -3668,26 +3757,63 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   useEffect(() => {
-    if (orchestratorVoiceHistoryStorageKeyRef.current === orchestratorVoiceHistoryStorageKey) {
-      return;
-    }
-    orchestratorVoiceHistoryStorageKeyRef.current = orchestratorVoiceHistoryStorageKey;
-    orchestratorVoiceHistorySkipWriteRef.current = true;
-    setOrchestratorVoiceHistoryItems(readOrchestratorVoiceHistoryItems(
-      orchestratorVoiceHistoryStorageKey,
-    ));
-  }, [orchestratorVoiceHistoryStorageKey]);
+    let disposed = false;
+    orchestratorVoiceHistoryStoreKeyRef.current = orchestratorVoiceHistoryStoreKey;
+    orchestratorVoiceHistoryLoadedRef.current = false;
+    setOrchestratorVoiceHistoryItems([]);
+
+    readOrchestratorVoiceHistoryItemsFromAgents({
+      rootDirectory,
+      workspaceId: orchestratorPanelWorkspaceId,
+    }).then((items) => {
+      if (
+        disposed
+        || orchestratorVoiceHistoryStoreKeyRef.current !== orchestratorVoiceHistoryStoreKey
+      ) {
+        return;
+      }
+      orchestratorVoiceHistoryLoadedRef.current = true;
+      setOrchestratorVoiceHistoryItems(items);
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [orchestratorPanelWorkspaceId, orchestratorVoiceHistoryStoreKey, rootDirectory]);
 
   useEffect(() => {
-    if (orchestratorVoiceHistorySkipWriteRef.current) {
-      orchestratorVoiceHistorySkipWriteRef.current = false;
-      return;
+    if (!orchestratorVoiceHistoryLoadedRef.current) {
+      return undefined;
     }
-    writeOrchestratorVoiceHistoryItems(
-      orchestratorVoiceHistoryStorageKey,
-      orchestratorVoiceHistoryItems,
-    );
-  }, [orchestratorVoiceHistoryItems, orchestratorVoiceHistoryStorageKey]);
+
+    const scheduledStoreKey = orchestratorVoiceHistoryStoreKey;
+    if (orchestratorVoiceHistoryWriteTimerRef.current) {
+      window.clearTimeout(orchestratorVoiceHistoryWriteTimerRef.current);
+    }
+    orchestratorVoiceHistoryWriteTimerRef.current = window.setTimeout(() => {
+      orchestratorVoiceHistoryWriteTimerRef.current = 0;
+      if (orchestratorVoiceHistoryStoreKeyRef.current !== scheduledStoreKey) {
+        return;
+      }
+      void writeOrchestratorVoiceHistoryItemsToAgents({
+        items: orchestratorVoiceHistoryItems,
+        rootDirectory,
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    }, 120);
+
+    return () => {
+      if (orchestratorVoiceHistoryWriteTimerRef.current) {
+        window.clearTimeout(orchestratorVoiceHistoryWriteTimerRef.current);
+        orchestratorVoiceHistoryWriteTimerRef.current = 0;
+      }
+    };
+  }, [
+    orchestratorPanelWorkspaceId,
+    orchestratorVoiceHistoryItems,
+    orchestratorVoiceHistoryStoreKey,
+    rootDirectory,
+  ]);
 
   const recordVoiceHistoryTranscript = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -3805,8 +3931,175 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     });
   }, []);
 
+  const resetOrchestratorFastResponseGate = useCallback(() => {
+    const gate = orchestratorVoiceFastResponseGateRef.current;
+    if (gate?.timer) {
+      window.clearTimeout(gate.timer);
+    }
+    orchestratorVoiceFastResponseGateRef.current = {
+      cancelled: false,
+      pendingFeedback: null,
+      pendingTtsEvents: [],
+      released: false,
+      runId: orchestratorVoiceRunRef.current,
+      timer: 0,
+    };
+  }, []);
+
+  const cancelOrchestratorFastResponseGate = useCallback((reason = "main_response") => {
+    const gate = orchestratorVoiceFastResponseGateRef.current;
+    if (!gate || gate.cancelled || gate.released) {
+      return;
+    }
+    const hadPending = Boolean(gate.pendingFeedback) || gate.pendingTtsEvents.length > 0;
+    if (gate.timer) {
+      window.clearTimeout(gate.timer);
+    }
+    orchestratorVoiceFastResponseGateRef.current = {
+      ...gate,
+      cancelled: true,
+      pendingFeedback: null,
+      pendingTtsEvents: [],
+      timer: 0,
+    };
+    if (hadPending) {
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.fast_response_cancelled", {
+        reason,
+        surface: "tui_voice_agent",
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    }
+  }, [orchestratorPanelWorkspaceId]);
+
+  const releaseOrchestratorFastResponseGate = useCallback((reason = "timeout") => {
+    const gate = orchestratorVoiceFastResponseGateRef.current;
+    if (!gate || gate.cancelled || gate.released) {
+      return;
+    }
+    if (gate.runId !== orchestratorVoiceRunRef.current || !orchestratorVoiceEventsActiveRef.current) {
+      return;
+    }
+    if (gate.timer) {
+      window.clearTimeout(gate.timer);
+    }
+    const feedbackEvent = gate.pendingFeedback;
+    const ttsEvents = gate.pendingTtsEvents.slice();
+    orchestratorVoiceFastResponseGateRef.current = {
+      ...gate,
+      pendingFeedback: null,
+      pendingTtsEvents: [],
+      released: true,
+      timer: 0,
+    };
+
+    if (feedbackEvent) {
+      const normalizedEvent = normalizeFastVoiceAgentFeedbackEvent(feedbackEvent);
+      recordVoiceHistoryLlmFeedback(normalizedEvent);
+      const feedback = String(normalizedEvent.feedback || "").trim();
+      if (feedback) {
+        setOrchestratorVoiceFeedback(feedback);
+      }
+    }
+    for (const ttsEvent of ttsEvents) {
+      void orchestratorVoiceTtsPlayerRef.current?.handleEvent?.(ttsEvent);
+    }
+    logBigViewSyncDiagnosticEvent("tui.voice_agent.fast_response_released", {
+      hasFeedback: Boolean(feedbackEvent),
+      reason,
+      surface: "tui_voice_agent",
+      ttsEventCount: ttsEvents.length,
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
+  }, [orchestratorPanelWorkspaceId, recordVoiceHistoryLlmFeedback]);
+
+  const bufferOrReleaseOrchestratorFastResponseEvent = useCallback((event) => {
+    const kind = getVoiceAgentEventKind(event);
+    const runId = orchestratorVoiceRunRef.current;
+    let gate = orchestratorVoiceFastResponseGateRef.current;
+    if (!gate || gate.runId !== runId) {
+      gate = {
+        cancelled: false,
+        pendingFeedback: null,
+        pendingTtsEvents: [],
+        released: false,
+        runId,
+        timer: 0,
+      };
+      orchestratorVoiceFastResponseGateRef.current = gate;
+    }
+
+    if (gate.cancelled) {
+      return "cancelled";
+    }
+    if (gate.released) {
+      if (isVoiceAgentTtsEventKind(kind)) {
+        void orchestratorVoiceTtsPlayerRef.current?.handleEvent?.(event);
+      } else if (kind === "voice_agent_fast_llm_feedback" || kind === "voice_agent_initial_llm_feedback") {
+        const normalizedEvent = normalizeFastVoiceAgentFeedbackEvent(event);
+        recordVoiceHistoryLlmFeedback(normalizedEvent);
+        const feedback = String(normalizedEvent.feedback || "").trim();
+        if (feedback) {
+          setOrchestratorVoiceFeedback(feedback);
+        }
+      }
+      return "released";
+    }
+
+    if (isVoiceAgentTtsEventKind(kind)) {
+      gate.pendingTtsEvents.push(event);
+    } else {
+      gate.pendingFeedback = event;
+    }
+
+    if (!gate.timer) {
+      gate.timer = window.setTimeout(() => {
+        releaseOrchestratorFastResponseGate("timeout");
+      }, ORCHESTRATOR_FAST_LLM_RESPONSE_HOLD_MS);
+    }
+    return "buffered";
+  }, [recordVoiceHistoryLlmFeedback, releaseOrchestratorFastResponseGate]);
+
   const stopOrchestratorVoiceMonitor = useCallback(async () => {
     orchestratorVoiceRunRef.current += 1;
+    cancelOrchestratorFastResponseGate("stop");
+    orchestratorVoiceInputFinishRequestedRef.current = false;
+    const monitor = orchestratorVoiceMonitorRef.current;
+    orchestratorVoiceMonitorRef.current = null;
+    const ttsPlayer = orchestratorVoiceTtsPlayerRef.current;
+    orchestratorVoiceTtsPlayerRef.current = null;
+    setOrchestratorVoiceState("idle");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    setOrchestratorVoiceFeedback("");
+    await ttsPlayer?.close?.().catch(() => {});
+    await stopCloudVoiceAgentStream().catch(() => {});
+    await monitor?.finishCapture?.().catch(() => null);
+    await monitor?.close?.().catch(() => {});
+    orchestratorVoiceEventsActiveRef.current = false;
+  }, [cancelOrchestratorFastResponseGate]);
+
+  const finishOrchestratorVoiceInput = useCallback(async () => {
+    orchestratorVoiceInputFinishRequestedRef.current = true;
+    const monitor = orchestratorVoiceMonitorRef.current;
+    orchestratorVoiceMonitorRef.current = null;
+    setOrchestratorVoiceState("processing");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    await finishCloudVoiceAgentInput().catch((error) => {
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.finish_input_error", {
+        message: getAudioInputErrorMessage(error, "Unable to finish voice input."),
+        surface: "tui_voice_agent",
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    });
+    await monitor?.finishCapture?.().catch(() => null);
+    await monitor?.close?.().catch(() => {});
+  }, [orchestratorPanelWorkspaceId]);
+
+  const completeOrchestratorVoiceSession = useCallback(async () => {
+    orchestratorVoiceRunRef.current += 1;
+    cancelOrchestratorFastResponseGate("finished");
+    orchestratorVoiceInputFinishRequestedRef.current = false;
     const monitor = orchestratorVoiceMonitorRef.current;
     orchestratorVoiceMonitorRef.current = null;
     setOrchestratorVoiceState("idle");
@@ -3817,13 +4110,25 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, []);
+  }, [cancelOrchestratorFastResponseGate]);
 
   const startOrchestratorVoiceMonitor = useCallback(async () => {
     const runId = orchestratorVoiceRunRef.current + 1;
     orchestratorVoiceRunRef.current = runId;
+    resetOrchestratorFastResponseGate();
+    orchestratorVoiceInputFinishRequestedRef.current = false;
     orchestratorVoiceSessionRef.current = Date.now();
     orchestratorVoiceEventsActiveRef.current = true;
+    await orchestratorVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+    orchestratorVoiceTtsPlayerRef.current = createCloudVoiceAgentTtsPlayer({
+      onError: (error) => {
+        logBigViewSyncDiagnosticEvent("tui.voice_agent.tts_playback_error", {
+          message: getAudioInputErrorMessage(error, "Unable to play voice response."),
+          surface: "tui_voice_agent",
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
+      },
+    });
     setOrchestratorVoiceState("starting");
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
@@ -3892,6 +4197,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
+      if (orchestratorVoiceInputFinishRequestedRef.current) {
+        const ownedMonitor = orchestratorVoiceMonitorRef.current === monitor ? monitor : null;
+        if (ownedMonitor) {
+          orchestratorVoiceMonitorRef.current = null;
+        }
+        setOrchestratorVoiceState("processing");
+        setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+        await finishCloudVoiceAgentInput().catch(() => {});
+        await ownedMonitor?.finishCapture?.().catch(() => null);
+        await ownedMonitor?.close?.().catch(() => {});
+        return;
+      }
+
       setOrchestratorVoiceState("listening");
     } catch (error) {
       if (orchestratorVoiceRunRef.current !== runId) {
@@ -3910,16 +4228,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         "Unable to start the cloud voice agent.",
       ));
     }
-  }, [agentStatuses, defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+  }, [agentStatuses, defaultWorkingDirectory, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
 
   const toggleOrchestratorVoiceMonitor = useCallback(() => {
     if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
-      void stopOrchestratorVoiceMonitor();
+      void finishOrchestratorVoiceInput();
+      return;
+    }
+
+    if (orchestratorVoiceState === "processing") {
       return;
     }
 
     void startOrchestratorVoiceMonitor();
-  }, [orchestratorVoiceState, startOrchestratorVoiceMonitor, stopOrchestratorVoiceMonitor]);
+  }, [finishOrchestratorVoiceInput, orchestratorVoiceState, startOrchestratorVoiceMonitor]);
 
   const handleDraftKeyDown = useCallback((event) => {
     if (event.key !== "Enter" || event.shiftKey) {
@@ -4178,13 +4500,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   useEffect(() => () => {
     orchestratorVoiceRunRef.current += 1;
+    cancelOrchestratorFastResponseGate("unmount");
+    orchestratorVoiceInputFinishRequestedRef.current = false;
     const monitor = orchestratorVoiceMonitorRef.current;
     orchestratorVoiceMonitorRef.current = null;
+    const ttsPlayer = orchestratorVoiceTtsPlayerRef.current;
+    orchestratorVoiceTtsPlayerRef.current = null;
     stopCloudVoiceAgentStream().catch(() => {});
+    ttsPlayer?.close?.().catch(() => {});
     monitor?.finishCapture?.().catch(() => null);
     monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, []);
+  }, [cancelOrchestratorFastResponseGate]);
 
   useEffect(() => {
     let disposed = false;
@@ -4200,6 +4527,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         if (!orchestratorVoiceEventsActiveRef.current) {
           return;
         }
+        cancelOrchestratorFastResponseGate("error");
         const message = String(event?.error?.message || event?.message || "Cloud voice agent stopped.");
         void stopOrchestratorVoiceMonitor().finally(() => {
           if (disposed) {
@@ -4228,10 +4556,27 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
+      if (
+        isVoiceAgentFastResponseEvent(event)
+        && !isVoiceAgentTtsEventKind(kind)
+        && (kind === "voice_agent_fast_llm_feedback" || kind === "voice_agent_initial_llm_feedback" || event?.feedback)
+      ) {
+        if (!orchestratorVoiceEventsActiveRef.current) {
+          return;
+        }
+        bufferOrReleaseOrchestratorFastResponseEvent(event);
+        return;
+      }
+
       if (kind === "voice_agent_llm_feedback") {
         if (!orchestratorVoiceEventsActiveRef.current) {
           return;
         }
+        if (isVoiceAgentFastResponseEvent(event)) {
+          bufferOrReleaseOrchestratorFastResponseEvent(event);
+          return;
+        }
+        cancelOrchestratorFastResponseGate("llm_feedback");
         recordVoiceHistoryLlmFeedback(event);
         const feedback = String(event?.feedback || "").trim();
         if (feedback) {
@@ -4240,7 +4585,35 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
+      if (
+        kind === "voice_agent_tts_start"
+        || kind === "voice_agent_tts_audio"
+        || kind === "voice_agent_tts_end"
+      ) {
+        if (!orchestratorVoiceEventsActiveRef.current) {
+          return;
+        }
+        if (isVoiceAgentFastResponseEvent(event)) {
+          bufferOrReleaseOrchestratorFastResponseEvent(event);
+          return;
+        }
+        cancelOrchestratorFastResponseGate("tts");
+        void orchestratorVoiceTtsPlayerRef.current?.handleEvent?.(event);
+        return;
+      }
+
+      if (kind === "voice_agent_tts_error") {
+        logBigViewSyncDiagnosticEvent("tui.voice_agent.tts_error", {
+          message: String(event?.error?.message || event?.message || "Voice response playback failed."),
+          phase: String(event?.phase || ""),
+          surface: "tui_voice_agent",
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
+        return;
+      }
+
       if (kind === "voice_agent_plan_snapshot") {
+        cancelOrchestratorFastResponseGate("plan_snapshot");
         recordVoiceHistoryPlanSnapshot(event);
         const snapshot = getVoicePlanSnapshotFromPayload(event);
         if (snapshot) {
@@ -4254,6 +4627,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         if (!orchestratorVoiceEventsActiveRef.current) {
           return;
         }
+        cancelOrchestratorFastResponseGate("tool_call");
         const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
         if (toolName === "queue" || toolName === "manage_agents") {
           recordVoiceHistoryToolCall(event);
@@ -4264,8 +4638,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
-      if (kind === "voice_agent_finished" && orchestratorVoiceMonitorRef.current) {
-        void stopOrchestratorVoiceMonitor();
+      if (kind === "voice_agent_finished" && orchestratorVoiceEventsActiveRef.current) {
+        cancelOrchestratorFastResponseGate("finished_event");
+        void completeOrchestratorVoiceSession();
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -4281,11 +4656,15 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     };
   }, [
     onVoiceAgentToolCall,
+    bufferOrReleaseOrchestratorFastResponseEvent,
+    cancelOrchestratorFastResponseGate,
     recordVoiceHistoryLlmFeedback,
     recordVoiceHistoryPlanSnapshot,
     recordVoiceHistoryToolCall,
     recordVoiceHistoryTranscript,
+    completeOrchestratorVoiceSession,
     stopOrchestratorVoiceMonitor,
+    orchestratorPanelWorkspaceId,
   ]);
 
   useEffect(() => {
@@ -4388,23 +4767,27 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [items, onReorderItem, reorderingItemId]);
 
   const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
-  const orchestratorVoiceActive = orchestratorVoiceState === "starting"
+  const orchestratorVoiceInputActive = orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening";
-  const orchestratorVoiceHasSignal = orchestratorVoiceActive && orchestratorVoiceLevel >= 6;
+  const orchestratorVoiceHasSignal = orchestratorVoiceInputActive && orchestratorVoiceLevel >= 6;
   const orchestratorVoiceButtonLabel = orchestratorVoiceState === "starting"
     ? "Starting voice agent monitor"
     : orchestratorVoiceState === "listening"
-      ? "Stop voice agent monitor"
-      : orchestratorVoiceError
-        ? "Restart voice agent monitor"
-        : "Start voice agent monitor";
+      ? "Finish voice agent input"
+      : orchestratorVoiceState === "processing"
+        ? "Voice agent response in progress"
+        : orchestratorVoiceError
+          ? "Restart voice agent monitor"
+          : "Start voice agent monitor";
   const orchestratorVoiceButtonTitle = orchestratorVoiceError
     || orchestratorVoiceFeedback
     || (orchestratorVoiceState === "starting"
       ? "Starting input"
       : orchestratorVoiceState === "listening"
-        ? "Stop listening"
-        : "Start listening");
+        ? "Stop sending audio"
+        : orchestratorVoiceState === "processing"
+          ? "Waiting for the voice response"
+          : "Start listening");
 
   return (
     <TodoQueueSurface aria-label="Orchestrator">
@@ -4445,14 +4828,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             <OrchestratorVoiceButton
               aria-label={orchestratorVoiceButtonLabel}
               data-error={orchestratorVoiceError ? "true" : undefined}
-              data-monitoring={orchestratorVoiceActive ? "true" : undefined}
+              data-monitoring={orchestratorVoiceInputActive ? "true" : undefined}
               data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
               onClick={toggleOrchestratorVoiceMonitor}
               title={orchestratorVoiceButtonTitle}
               type="button"
             >
               <OrchestratorVoiceCanvasRing
-                active={orchestratorVoiceActive}
+                active={orchestratorVoiceInputActive}
                 hasSignal={orchestratorVoiceHasSignal}
                 level={orchestratorVoiceLevel}
                 stats={orchestratorVoiceStats}
@@ -4678,15 +5061,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   {getVoicePlanStatusLabel(item.plan)}
                                 </OrchestratorHistoryPlanStatus>
                               </OrchestratorHistoryPlanHeader>
-                              {item.plan.goal && (
-                                <OrchestratorHistoryPlanGoal>{item.plan.goal}</OrchestratorHistoryPlanGoal>
-                              )}
                               {item.plan.steps.length > 0 && (
                                 <OrchestratorHistoryPlanSteps>
                                   {item.plan.steps.map((step) => {
                                     const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
                                     const activeStage = isActiveStep ? item.plan.currentStage : "";
                                     const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
+                                      if (!tasks.length && !stageStatus) {
+                                        return null;
+                                      }
+                                      if (!tasks.length && String(stageStatus || "").trim().toLowerCase() === "draft") {
+                                        return null;
+                                      }
                                       const isActiveStage = isActiveStep && activeStage === stageName;
                                       return (
                                         <OrchestratorHistoryPlanStage key={stageName}>
@@ -4699,7 +5085,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                               {tasks.map((task) => (
                                                 <OrchestratorHistoryPlanTask key={task.id || `${stageName}-${task.ordinal}`}>
                                                   <span>{getVoicePlanTaskStatusLabel(task)}</span>
-                                                  <div>{task.text}</div>
+                                                  <div title={task.text}>{task.title || task.text}</div>
                                                 </OrchestratorHistoryPlanTask>
                                               ))}
                                             </OrchestratorHistoryPlanTaskList>
@@ -5106,12 +5492,17 @@ function TerminalView({
         && targetRole
         && !["generic", "terminal", "shell"].includes(targetRole),
     );
+    const requiresAgentInputReady = TODO_QUEUE_AGENT_ROLES.has(targetRole);
+    const agentInputReady = !requiresAgentInputReady
+      || Boolean(liveTerminal?.inputReady || targetProviderBinding?.inputReady);
     const targetFields = {
+      agentInputReady,
       activityStatus,
       image,
       latestTurnState,
       liveTerminal,
       paneId,
+      requiresAgentInputReady,
       shouldAutoSubmit,
       syncKey,
       targetBinding: resolvedBinding,
@@ -5179,6 +5570,9 @@ function TerminalView({
     }
     if (activityStatus === "thinking") {
       return unavailable("busy_activity", "This agent is already working.", targetFields);
+    }
+    if (requiresAgentInputReady && !agentInputReady) {
+      return unavailable("agent_not_ready", "This agent is still starting.", targetFields);
     }
     if (!syncKey) {
       return unavailable("terminal_unavailable", "This terminal does not have a shared composer yet.", targetFields);
@@ -5574,6 +5968,7 @@ function TerminalView({
           stage: task.stage,
           stepOrdinal: task.stepOrdinal,
           taskId: task.taskId,
+          title: task.title,
         },
         source: TODO_QUEUE_SOURCE_VOICE_PLAN,
         workspaceId: terminalWorkspace?.id || "",
@@ -6371,6 +6766,7 @@ function TerminalView({
         terminalIndex: target.targetTerminalIndex,
         threadId: targetThread?.id || "",
       });
+      dropResult.planTaskStatusRecorded = true;
     }
     logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
       imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
@@ -6651,6 +7047,25 @@ function TerminalView({
     if (!item) {
       return null;
     }
+    if (isUnsafeVoicePlanQueueItem(item)) {
+      const planTask = getTodoQueueItemPlanTask(item);
+      const message = "Voice plan produced placeholder task text, so it was not queued.";
+      setTodoDropError(message);
+      if (planTask) {
+        void recordVoicePlanTaskStatus(planTask, "failed", {
+          clientTodoId: item.id || "",
+          error: message,
+        });
+      }
+      logBigViewSyncDiagnosticEvent("tui.voice_plan.placeholder_blocked", {
+        callId: String(toolCall?.call_id || toolCall?.callId || "").trim(),
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        message,
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return null;
+    }
 
     const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
     const source = getTodoQueueItemAutoQueueSource(item);
@@ -6836,6 +7251,31 @@ function TerminalView({
     if (!queuedItem) {
       return;
     }
+    if (isUnsafeVoicePlanQueueItem(queuedItem)) {
+      const planTask = getTodoQueueItemPlanTask(queuedItem);
+      const message = "Voice plan produced placeholder task text, so it was blocked before dispatch.";
+      clearTodoQueueItemPending(queuedItem.id, "error", {
+        message,
+        source: getTodoQueueItemAutoQueueSource(queuedItem),
+      });
+      updateTodoQueueItems((currentItems) => (
+        currentItems.filter((item) => item.id !== queuedItem.id)
+      ));
+      setTodoDropError(message);
+      if (planTask) {
+        void recordVoicePlanTaskStatus(planTask, "failed", {
+          clientTodoId: queuedItem.id || "",
+          error: message,
+        });
+      }
+      logBigViewSyncDiagnosticEvent("tui.voice_plan.placeholder_dispatch_blocked", {
+        item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+        message,
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return;
+    }
     if (isVoicePlanBoundaryQueueItem(queuedItem)) {
       const hasSendingItem = Object.values(todoQueuePendingItemsRef.current).some((pendingItem) => (
         pendingItem?.itemId !== queuedItem.id
@@ -6845,6 +7285,7 @@ function TerminalView({
         return;
       }
       const busyReasons = new Set([
+        "agent_not_ready",
         "reserved",
         "pending_prompt",
         "busy_turn",
@@ -7172,7 +7613,7 @@ function TerminalView({
             : "tui-todo-drop";
         const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentDrag, {
           allowGeneric: true,
-          requireAvailable: false,
+          requireAvailable: true,
           reservationItemId: currentDrag.itemId,
         });
         const paneId = target.paneId || "";
@@ -7190,6 +7631,45 @@ function TerminalView({
             reason: target.reason || "missing_pane",
             source,
             surface: "tui_terminal_grid",
+            targetTerminalIndex: targetTerminalIndex ?? "",
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
+          return;
+        }
+        if (!target.available) {
+          const message = target.message || "This terminal is not ready for that todo yet.";
+          if (currentDrag.itemId && TODO_QUEUE_BUSY_REASONS.has(String(target.reason || ""))) {
+            setTodoQueueItemPending(currentDrag.itemId, {
+              item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+              phase: "queued",
+              reason: target.reason || "",
+              source,
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+            const planTask = getTodoQueueItemPlanTask(currentDrag);
+            if (planTask) {
+              void recordVoicePlanTaskStatus(planTask, "queued", {
+                clientTodoId: currentDrag.itemId || "",
+                reason: target.reason || "",
+                terminalIndex: targetTerminalIndex ?? null,
+              });
+            }
+          } else if (currentDrag.itemId) {
+            clearTodoQueueItemPending(currentDrag.itemId, "error", {
+              message,
+              source,
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+            });
+          }
+          setTodoDropError(message);
+          logBigViewSyncDiagnosticEvent("tui.image.drop_skip", {
+            hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+            paneId,
+            reason: target.reason || "unavailable",
+            source,
+            surface: "tui_terminal_grid",
+            targetRole,
             targetTerminalIndex: targetTerminalIndex ?? "",
             workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
           });
@@ -7221,13 +7701,24 @@ function TerminalView({
           allowGeneric: true,
           focusReason: "todo_dropdown_drop",
           item: currentDrag,
-          requireAvailable: false,
+          requireAvailable: true,
           reservationItemId,
           source,
           targetTerminalIndex,
         })
-          .then((dropResult) => {
+          .then(async (dropResult) => {
             setTodoDropError("");
+            const planTask = getTodoQueueItemPlanTask(currentDrag);
+            if (dropResult?.confirmedSubmit && planTask && !dropResult?.planTaskStatusRecorded) {
+              await recordVoicePlanTaskStatus(planTask, "dispatched", {
+                agentId: targetRole,
+                clientTodoId: currentDrag.itemId || "",
+                promptEventId: dropResult?.promptId || planTask.taskId,
+                terminalId: paneId,
+                terminalIndex: targetTerminalIndex ?? null,
+                threadId: dropResult?.targetThread?.id || "",
+              });
+            }
             if (currentDrag.itemId) {
               clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
                 promptId: dropResult?.promptId || "",
@@ -7242,6 +7733,26 @@ function TerminalView({
             }
           })
           .catch((error) => {
+            if (currentDrag.itemId && isTodoQueueBusyError(error)) {
+              setTodoQueueItemPending(currentDrag.itemId, {
+                item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+                phase: "queued",
+                reason: error?.todoQueueBusyReason || "",
+                source,
+                workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+              });
+              const planTask = getTodoQueueItemPlanTask(currentDrag);
+              if (planTask) {
+                void recordVoicePlanTaskStatus(planTask, "queued", {
+                  clientTodoId: currentDrag.itemId || "",
+                  error: error?.message || String(error || ""),
+                  reason: error?.todoQueueBusyReason || "",
+                  terminalIndex: targetTerminalIndex ?? null,
+                });
+              }
+              setTodoDropError(getTodoDropErrorMessage(error));
+              return;
+            }
             if (currentDrag.itemId) {
               clearTodoQueueItemPending(currentDrag.itemId, "error", {
                 message: error?.message || String(error || ""),

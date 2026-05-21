@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex, OnceLock},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -37,6 +38,7 @@ const SHUTDOWN_COORDINATION_BUSY_TIMEOUT_MS: u64 = 250;
 const INTEGRATION_BRANCH: &str = "diff-forge/integration";
 const INTEGRATION_WORKTREE_NAME: &str = "diff-forge-integration";
 const INTEGRATION_WORKTREE_CACHE_TTL: Duration = Duration::from_secs(60);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
     "mcp_agent_server_started",
     "mcp_agent_client_initialized",
@@ -44,8 +46,13 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
     "mcp_agent_tool_called",
     "mcp_agent_tool_failed",
 ];
-const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] =
-    &["start_task", "acquire_lease", "checkpoint", "submit_patch"];
+const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
+    "start_task",
+    "acquire_lease",
+    "checkpoint",
+    "submit_patch",
+    "submit_patch_status",
+];
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
 #[derive(Clone)]
@@ -98,6 +105,29 @@ pub fn now_rfc3339() -> String {
     format!("{}.{:03}Z", duration.as_secs(), duration.subsec_millis())
 }
 
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+fn epoch_millis_from_now_text(value: &str) -> Option<u64> {
+    let trimmed = value.trim().strip_suffix('Z').unwrap_or(value.trim());
+    let (seconds, millis) = trimmed
+        .split_once('.')
+        .map(|(seconds, millis)| (seconds, millis))
+        .unwrap_or((trimmed, "0"));
+    let seconds = seconds.parse::<u64>().ok()?;
+    let millis = millis
+        .chars()
+        .take(3)
+        .collect::<String>()
+        .parse::<u64>()
+        .unwrap_or(0);
+    Some(seconds.saturating_mul(1000).saturating_add(millis))
+}
+
 fn uuid() -> String {
     Uuid::new_v4().to_string()
 }
@@ -108,6 +138,52 @@ fn bool_i64(value: bool) -> i64 {
     } else {
         0
     }
+}
+
+fn submit_job_public_value(job: &Value) -> Value {
+    json!({
+        "id": job["id"],
+        "task_id": job["task_id"],
+        "agent_id": job["agent_id"],
+        "session_id": job["session_id"],
+        "worktree_id": job["worktree_id"],
+        "status": job["status"],
+        "phase": job["phase"],
+        "phase_message": job["phase_message"],
+        "summary": job["summary"],
+        "lane": job["lane"],
+        "patch_id": job["patch_id"],
+        "validation_id": job["validation_id"],
+        "diff_artifact_id": job["diff_artifact_id"],
+        "diff_hash": job["diff_hash"],
+        "error_message": job["error_message"],
+        "warnings": job["warnings_json"],
+        "phase_timings_ms": job["phase_timings_json"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "result": job["result_json"],
+    })
+}
+
+fn is_lockfile_path(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path);
+    matches!(
+        name,
+        "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "Cargo.lock"
+            | "Gemfile.lock"
+            | "poetry.lock"
+            | "Pipfile.lock"
+            | "composer.lock"
+    )
 }
 
 fn resource_keys_overlap(left: &str, right: &str) -> bool {
@@ -6788,6 +6864,367 @@ impl CoordinationKernel {
         }))
     }
 
+    pub fn enqueue_submit_patch_job(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        worktree_id: Option<&str>,
+        summary: Option<&str>,
+        lane: Option<&str>,
+        client_request_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let worktree_id = worktree_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let lane = lane
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let client_request_id = client_request_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let idempotency_key = client_request_id
+            .as_ref()
+            .map(|value| format!("client:{value}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "task:{task_id}:session:{session_id}:worktree:{}",
+                    worktree_id.as_deref().unwrap_or("")
+                )
+            });
+
+        if let Some(existing) =
+            self.find_existing_submit_job(client_request_id.as_deref(), &idempotency_key)?
+        {
+            return Ok(api_ok(json!({
+                "submit_job_id": existing["id"],
+                "status": existing["status"],
+                "phase": existing["phase"],
+                "reused": true,
+                "status_tool": "submit_patch_status",
+                "submit_job": submit_job_public_value(&existing),
+            })));
+        }
+
+        let id = uuid();
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO submit_jobs(
+                    id, task_id, agent_id, session_id, worktree_id, status, phase,
+                    phase_message, summary, lane, client_request_id, idempotency_key,
+                    warnings_json, phase_timings_json, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 'queued', 'queued', ?6, ?7, ?8, ?9, ?10, '[]', '{}', ?11, ?11)",
+                params![
+                    id,
+                    task_id,
+                    agent_id,
+                    session_id,
+                    worktree_id,
+                    "submit_patch accepted; background validation will start shortly.",
+                    summary,
+                    lane,
+                    client_request_id,
+                    idempotency_key,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to create submit job: {error}"))?;
+        self.emit_submit_job_event(
+            "submit_patch_job_queued",
+            &id,
+            task_id,
+            agent_id,
+            session_id,
+            json!({
+                "phase": "queued",
+                "status": "queued",
+                "worktree_id": worktree_id,
+                "idempotency_key": idempotency_key,
+            }),
+        )?;
+        let job = self.get_submit_job(&id)?;
+        Ok(api_ok(json!({
+            "submit_job_id": id,
+            "status": "queued",
+            "phase": "queued",
+            "reused": false,
+            "status_tool": "submit_patch_status",
+            "submit_job": submit_job_public_value(&job),
+        })))
+    }
+
+    pub fn submit_patch_job_status(
+        &self,
+        submit_job_id: Option<&str>,
+        task_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let job =
+            if let Some(submit_job_id) = submit_job_id.filter(|value| !value.trim().is_empty()) {
+                self.get_submit_job(submit_job_id)?
+            } else if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+                let rows =
+                    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+                        self.query_json(
+                            "SELECT * FROM submit_jobs
+                     WHERE task_id=?1 AND session_id=?2
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                            &[&task_id, &session_id],
+                        )?
+                    } else {
+                        self.query_json(
+                            "SELECT * FROM submit_jobs
+                     WHERE task_id=?1
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                            &[&task_id],
+                        )?
+                    };
+                rows.into_iter()
+                    .next()
+                    .ok_or_else(|| "No submit job exists for this task.".to_string())?
+            } else {
+                return Err("submit_patch_status requires submit_job_id or task_id.".to_string());
+            };
+
+        Ok(api_ok(json!({
+            "submit_job_id": job["id"],
+            "status": job["status"],
+            "phase": job["phase"],
+            "submit_job": submit_job_public_value(&job),
+        })))
+    }
+
+    fn find_existing_submit_job(
+        &self,
+        client_request_id: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<Option<Value>, String> {
+        if let Some(client_request_id) = client_request_id {
+            let existing = self.query_json(
+                "SELECT * FROM submit_jobs
+                 WHERE client_request_id=?1
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+                &[&client_request_id],
+            )?;
+            if let Some(job) = existing.into_iter().next() {
+                return Ok(Some(job));
+            }
+        }
+
+        Ok(self
+            .query_json(
+                "SELECT * FROM submit_jobs
+                 WHERE idempotency_key=?1
+                   AND status IN ('queued', 'running', 'done')
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+                &[&idempotency_key],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    fn get_submit_job(&self, submit_job_id: &str) -> Result<Value, String> {
+        self.query_one(
+            "SELECT * FROM submit_jobs WHERE id=?1 LIMIT 1",
+            &[&submit_job_id],
+            "Submit job does not exist.",
+        )
+    }
+
+    pub fn set_submit_job_phase(
+        &self,
+        submit_job_id: &str,
+        status: &str,
+        phase: &str,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let existing = self.get_submit_job(submit_job_id)?;
+        let mut timings = existing["phase_timings_json"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let previous_phase = existing["phase"].as_str().unwrap_or("");
+        if !previous_phase.is_empty() && previous_phase != phase {
+            let elapsed_ms = existing["updated_at"]
+                .as_str()
+                .and_then(epoch_millis_from_now_text)
+                .map(|previous| now_epoch_millis().saturating_sub(previous));
+            if let Some(elapsed_ms) = elapsed_ms {
+                let current = timings
+                    .get(previous_phase)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                timings.insert(
+                    previous_phase.to_string(),
+                    Value::Number((current.saturating_add(elapsed_ms)).into()),
+                );
+            }
+        }
+
+        let now = now_rfc3339();
+        let timings_json = Value::Object(timings).to_string();
+        self.conn
+            .execute(
+                "UPDATE submit_jobs
+                 SET status=?1,
+                     phase=?2,
+                     phase_message=?3,
+                     phase_timings_json=?4,
+                     started_at=COALESCE(started_at, CASE WHEN ?1='running' THEN ?5 ELSE NULL END),
+                     updated_at=?5
+                 WHERE id=?6",
+                params![status, phase, message, timings_json, now, submit_job_id],
+            )
+            .map_err(|error| format!("Unable to update submit job phase: {error}"))?;
+        self.emit_submit_job_event(
+            "submit_patch_job_phase",
+            submit_job_id,
+            existing["task_id"].as_str().unwrap_or_default(),
+            existing["agent_id"].as_str().unwrap_or("system"),
+            existing["session_id"].as_str().unwrap_or_default(),
+            json!({
+                "status": status,
+                "phase": phase,
+                "previous_phase": previous_phase,
+                "message": message,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub fn update_submit_job_patch_metadata(
+        &self,
+        submit_job_id: &str,
+        patch_id: Option<&str>,
+        validation_id: Option<&str>,
+        diff_artifact_id: Option<&str>,
+        diff_hash: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE submit_jobs
+                 SET patch_id=COALESCE(?1, patch_id),
+                     validation_id=COALESCE(?2, validation_id),
+                     diff_artifact_id=COALESCE(?3, diff_artifact_id),
+                     diff_hash=COALESCE(?4, diff_hash),
+                     updated_at=?5
+                 WHERE id=?6",
+                params![
+                    patch_id,
+                    validation_id,
+                    diff_artifact_id,
+                    diff_hash,
+                    now_rfc3339(),
+                    submit_job_id
+                ],
+            )
+            .map_err(|error| format!("Unable to update submit job patch metadata: {error}"))?;
+        Ok(())
+    }
+
+    pub fn finish_submit_job_success(
+        &self,
+        submit_job_id: &str,
+        result: &Value,
+    ) -> Result<(), String> {
+        self.set_submit_job_phase(
+            submit_job_id,
+            "done",
+            "done",
+            Some("submit_patch completed."),
+        )?;
+        let data = result.get("data").unwrap_or(&Value::Null);
+        let warnings = result
+            .get("warnings")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+            .to_string();
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE submit_jobs
+                 SET result_json=?1,
+                     patch_id=COALESCE(?2, patch_id),
+                     validation_id=COALESCE(?3, validation_id),
+                     diff_artifact_id=COALESCE(?4, diff_artifact_id),
+                     warnings_json=?5,
+                     error_message=NULL,
+                     finished_at=?6,
+                     updated_at=?6
+                 WHERE id=?7",
+                params![
+                    result.to_string(),
+                    data["patch_id"].as_str(),
+                    data["validation_id"].as_str(),
+                    data["diff_artifact_id"].as_str(),
+                    warnings,
+                    now,
+                    submit_job_id
+                ],
+            )
+            .map_err(|error| format!("Unable to finish submit job: {error}"))?;
+        Ok(())
+    }
+
+    pub fn finish_submit_job_failure(
+        &self,
+        submit_job_id: &str,
+        phase: &str,
+        error_message: &str,
+        result: Option<&Value>,
+    ) -> Result<(), String> {
+        self.set_submit_job_phase(submit_job_id, "failed", phase, Some(error_message))?;
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE submit_jobs
+                 SET result_json=?1,
+                     error_message=?2,
+                     finished_at=?3,
+                     updated_at=?3
+                 WHERE id=?4",
+                params![
+                    result.map(Value::to_string),
+                    error_message,
+                    now,
+                    submit_job_id
+                ],
+            )
+            .map_err(|error| format!("Unable to fail submit job: {error}"))?;
+        Ok(())
+    }
+
+    fn emit_submit_job_event(
+        &self,
+        event_type: &str,
+        submit_job_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        payload: Value,
+    ) -> Result<String, String> {
+        self.emit_event(
+            event_type,
+            "agent",
+            agent_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "submit_job_id": submit_job_id,
+                "details": payload,
+            }),
+        )
+    }
+
     pub fn submit_patch(
         &self,
         task_id: &str,
@@ -6796,8 +7233,27 @@ impl CoordinationKernel {
         worktree_id: Option<&str>,
         summary: Option<&str>,
     ) -> Result<Value, String> {
-        let validation =
-            self.run_patch_validation(task_id, agent_id, session_id, worktree_id, summary, true)?;
+        self.submit_patch_with_job(task_id, agent_id, session_id, worktree_id, summary, None)
+    }
+
+    pub fn submit_patch_with_job(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        worktree_id: Option<&str>,
+        summary: Option<&str>,
+        submit_job_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let validation = self.run_patch_validation(
+            task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            summary,
+            true,
+            submit_job_id,
+        )?;
         if validation.status == "passed" {
             let session = self.ensure_session_active(session_id, agent_id)?;
             let agent_slot_id = session["agent_slot_id"]
@@ -6852,6 +7308,14 @@ impl CoordinationKernel {
                     "reason": "patch_id_missing",
                 })
             };
+            if let Some(submit_job_id) = submit_job_id {
+                self.set_submit_job_phase(
+                    submit_job_id,
+                    "running",
+                    "applying",
+                    Some("Applying accepted patch to the local integration branch when safe."),
+                )?;
+            }
             let auto_merge = if let Some(patch_id) = validation.patch_id.as_deref() {
                 self.auto_apply_submitted_patch_for_concurrency(
                     patch_id,
@@ -8190,8 +8654,15 @@ impl CoordinationKernel {
         worktree_id: Option<&str>,
         summary: Option<&str>,
     ) -> Result<Value, String> {
-        let validation =
-            self.run_patch_validation(task_id, agent_id, session_id, worktree_id, summary, false)?;
+        let validation = self.run_patch_validation(
+            task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            summary,
+            false,
+            None,
+        )?;
         if validation.status == "passed" {
             return Ok(api_ok_warnings(
                 json!({
@@ -8218,6 +8689,7 @@ impl CoordinationKernel {
         worktree_id: Option<&str>,
         summary: Option<&str>,
         submit: bool,
+        submit_job_id: Option<&str>,
     ) -> Result<PatchValidationResult, String> {
         self.expire_old_leases()?;
         let session = self.ensure_session_active(session_id, agent_id)?;
@@ -8239,6 +8711,14 @@ impl CoordinationKernel {
             },
             json!({"worktree_id": worktree_id, "submit": submit, "summary": summary}),
         )?;
+        if let Some(submit_job_id) = submit_job_id {
+            self.set_submit_job_phase(
+                submit_job_id,
+                "running",
+                "validating",
+                Some("Validating leases, task ownership, and changed files."),
+            )?;
+        }
         let policy = self.repo_policy()?;
         let worktree_required = policy["agent_worktree_required"].as_i64().unwrap_or(1) == 1;
         let Some(worktree_id) = worktree_id.filter(|value| !value.trim().is_empty()) else {
@@ -8582,6 +9062,27 @@ impl CoordinationKernel {
 
         self.mark_untracked_intent_to_add(&canonical_worktree, &changed)?;
         let base_sha = worktree["base_sha"].as_str().unwrap_or("HEAD");
+        if let Some(submit_job_id) = submit_job_id {
+            let lockfile_paths = changed
+                .iter()
+                .filter(|file| is_lockfile_path(&file.path))
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>();
+            let message = if !lockfile_paths.is_empty() || changed.len() > 100 {
+                format!(
+                    "Collecting git binary diff for {} changed files; large/lockfile-heavy submit detected: {}.",
+                    changed.len(),
+                    if lockfile_paths.is_empty() {
+                        "many changed files".to_string()
+                    } else {
+                        lockfile_paths.join(", ")
+                    }
+                )
+            } else {
+                "Collecting git binary diff for patch artifact creation.".to_string()
+            };
+            self.set_submit_job_phase(submit_job_id, "running", "diffing", Some(&message))?;
+        }
         let diff = run_git(&canonical_worktree, &["diff", "--binary", base_sha])?;
         let diff_artifact_id = self.write_artifact(
             Some(task_id),
@@ -8592,6 +9093,29 @@ impl CoordinationKernel {
             json!({"worktree_id": worktree_id, "summary": summary}),
         )?;
         let diff_hash = sha256_hex(diff.as_bytes());
+        if let Some(submit_job_id) = submit_job_id {
+            let artifact_message = if diff.len() > 1_000_000 {
+                format!(
+                    "Patch diff artifact written locally ({} bytes); continuing asynchronously.",
+                    diff.len()
+                )
+            } else {
+                "Patch diff artifact written locally.".to_string()
+            };
+            self.update_submit_job_patch_metadata(
+                submit_job_id,
+                None,
+                None,
+                Some(&diff_artifact_id),
+                Some(&diff_hash),
+            )?;
+            self.set_submit_job_phase(
+                submit_job_id,
+                "running",
+                "artifact_written",
+                Some(&artifact_message),
+            )?;
+        }
         let head_sha = run_git(&canonical_worktree, &["rev-parse", "HEAD"])
             .ok()
             .map(|value| value.trim().to_string());
@@ -8646,6 +9170,23 @@ impl CoordinationKernel {
                     params![validation_id, patch_id],
                 )
                 .map_err(|error| format!("Unable to attach validation to patch: {error}"))?;
+        }
+        if let Some(submit_job_id) = submit_job_id {
+            self.update_submit_job_patch_metadata(
+                submit_job_id,
+                actual_patch_id.as_deref(),
+                Some(&validation_id),
+                Some(&diff_artifact_id),
+                Some(&diff_hash),
+            )?;
+            if submit {
+                self.set_submit_job_phase(
+                    submit_job_id,
+                    "running",
+                    "patch_submitted",
+                    Some("Patch row recorded and validation passed."),
+                )?;
+            }
         }
         self.emit_event(
             "patch_validation_passed",
@@ -12854,13 +13395,13 @@ impl CoordinationKernel {
             "session_heartbeat_recorded": heartbeat,
             "brief": brief["data"].clone(),
             "workflow": {
-                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "submit_patch"],
+                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "submit_patch", "submit_patch_status"],
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
                     "Use normal shell and edit tools inside COORDINATION_AGENT_BRANCH_ROOT.",
-                    "Submit the patch when finished; submit_patch owns validation and safe integration."
+                    "Submit the patch when finished; submit_patch returns a job id and submit_patch_status reports progress."
                 ],
                 "cloud_mcp": {
                     "mode": "automatic_rust_lifecycle",
@@ -12930,6 +13471,7 @@ impl CoordinationKernel {
             "workspace_changes": self.query_json("SELECT * FROM workspace_changes ORDER BY created_at DESC LIMIT 200", &[])?,
             "open_workspace_violations": self.query_json("SELECT * FROM workspace_violations WHERE status='open' ORDER BY created_at DESC LIMIT 200", &[])?,
             "patch_validations": self.query_json("SELECT * FROM patch_validations ORDER BY updated_at DESC LIMIT 200", &[])?,
+            "submit_jobs": self.query_json("SELECT * FROM submit_jobs ORDER BY updated_at DESC LIMIT 200", &[])?,
             "patches": self.query_json(
                 "SELECT p.*, v.status AS validation_status
                  FROM patches p
@@ -13317,7 +13859,13 @@ impl CoordinationKernel {
         let request_merge_listed = mcp_tools.contains(&"request_merge");
         let violation_resolver_listed = mcp_tools.contains(&"resolve_workspace_violation");
         let apply_merge_listed = mcp_tools.contains(&"apply_merge");
-        let minimal_agent_tools = ["start_task", "acquire_lease", "checkpoint", "submit_patch"];
+        let minimal_agent_tools = [
+            "start_task",
+            "acquire_lease",
+            "checkpoint",
+            "submit_patch",
+            "submit_patch_status",
+        ];
         let missing_minimal_agent_tools = minimal_agent_tools
             .iter()
             .filter(|tool| !mcp_tools.contains(tool))
@@ -13395,9 +13943,9 @@ impl CoordinationKernel {
             } else if !missing_minimal_agent_tools.is_empty()
                 || mcp_tools.len() != minimal_agent_tools.len()
             {
-                "Agent MCP should expose only start_task, acquire_lease, checkpoint, and submit_patch."
+                "Agent MCP should expose only start_task, acquire_lease, checkpoint, submit_patch, and submit_patch_status."
             } else {
-                "Agent MCP exposes only start_task, acquire_lease, checkpoint, and submit_patch; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
+                "Agent MCP exposes only start_task, acquire_lease, checkpoint, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
@@ -16738,16 +17286,56 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to run git {}: {error}", args.join(" ")))?;
-    loop {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Unable to capture git {} stdout", args.join(" ")))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Unable to capture git {} stderr", args.join(" ")))?;
+    let stdout_handle = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stderr.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let started = Instant::now();
+    let status = loop {
         if crate::app_shutdown_requested() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
             return Err(crate::app_shutdown_blocked_message("git"));
+        }
+        if started.elapsed() >= GIT_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            let stderr = stderr_handle
+                .join()
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            return Err(format!(
+                "git {} timed out after {}s{}",
+                args.join(" "),
+                GIT_COMMAND_TIMEOUT.as_secs(),
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            ));
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(error) => {
                 let _ = child.kill();
                 return Err(format!(
@@ -16756,20 +17344,24 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
                 ));
             }
         }
-    }
+    };
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| format!("Unable to join git {} stdout reader", args.join(" ")))?
+        .map_err(|error| format!("Unable to read git {} stdout: {error}", args.join(" ")))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| format!("Unable to join git {} stderr reader", args.join(" ")))?
+        .map_err(|error| format!("Unable to read git {} stderr: {error}", args.join(" ")))?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("Unable to read git {} output: {error}", args.join(" ")))?;
-
-    if output.status.success() {
-        return Ok(output.stdout);
+    if status.success() {
+        return Ok(stdout);
     }
 
     Err(format!(
         "git {} failed: {}",
         args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
+        String::from_utf8_lossy(&stderr).trim()
     ))
 }
 
@@ -17019,14 +17611,14 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 4. Use normal shell and edit tools inside `COORDINATION_AGENT_BRANCH_ROOT`; never edit the shared project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
-6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\n\
+6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, lane claims, and merge context through the Rust cloud event path.\n\
 - Use the local coordination kernel for leases, patch submission, and merge safety.\n\
 - Edit only inside the assigned agent worktree/branch root when one is provided.\n\
-- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch.\n\
+- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch, then poll submit_patch_status when needed.\n\
 - Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
@@ -17585,6 +18177,7 @@ fn normalize_change_path(value: &str) -> Result<String, String> {
 mod tests {
     use std::{
         fs,
+        io::{Read, Write},
         process::Command,
         sync::{Arc, Barrier},
         thread,
@@ -17668,6 +18261,81 @@ mod tests {
             }
         }
         let request_text = String::from_utf8_lossy(&buffer);
+        let header_text = request_text
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers)
+            .unwrap_or(request_text.as_ref());
+        if header_text
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("upgrade: websocket"))
+        {
+            let websocket_key = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap_or_default();
+            let accept_key = fake_websocket_accept_key(&websocket_key);
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept_key
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = fake_write_ws_text(
+                &mut stream,
+                &json!({
+                    "kind": "cloud_app_ws_ready",
+                    "connection_id": "fake-cloud-connection",
+                    "message_auth": {"message_token": "fake-message-token"}
+                })
+                .to_string(),
+            );
+            if let Ok(envelope_text) = fake_read_ws_text(&mut stream) {
+                let envelope = serde_json::from_str::<serde_json::Value>(&envelope_text)
+                    .unwrap_or_else(|_| json!({}));
+                let request_json = envelope
+                    .get("request")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let data = fake_cloud_response_data(
+                    envelope["kind"].as_str().unwrap_or("event"),
+                    &request_json,
+                    default_task_id.as_str(),
+                    omit_task_id,
+                );
+                let reply = json!({
+                    "id": envelope["id"].clone(),
+                    "ok": true,
+                    "data": data,
+                });
+                let _ = fake_write_ws_text(&mut stream, &reply.to_string());
+            }
+            return;
+        }
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let header_end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap_or(buffer.len());
+        while buffer.len().saturating_sub(header_end) < content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                Err(_) => break,
+            }
+        }
+        let request_text = String::from_utf8_lossy(&buffer);
         let path = request_text
             .lines()
             .next()
@@ -17679,41 +18347,10 @@ mod tests {
             .unwrap_or_default();
         let request_json =
             serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_else(|_| json!({}));
-        let requested_task_id = request_json["payload"]["task_id"]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(default_task_id.as_str());
-
         let body = if path == "/v1/events" {
-            if omit_task_id {
-                json!({
-                    "data": {
-                        "task": {},
-                        "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
-                    }
-                })
-            } else {
-                json!({
-                    "data": {
-                        "task_id": requested_task_id,
-                        "task": {"id": requested_task_id},
-                        "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
-                    }
-                })
-            }
+            json!({"data": fake_cloud_response_data("event", &request_json, default_task_id.as_str(), omit_task_id)})
         } else if path == "/v1/spec/graph" {
-            json!({
-                "data": {
-                    "kind": "project_spec_graph",
-                    "version": 3,
-                    "repo_id": "repo-test",
-                    "workspace_id": "workspace-test",
-                    "graph_stats": {},
-                    "agent_work": {},
-                    "nodes": [],
-                    "edges": []
-                }
-            })
+            json!({"data": fake_cloud_response_data("spec_graph", &request_json, default_task_id.as_str(), omit_task_id)})
         } else {
             json!({"data": {"ok": true}})
         }
@@ -17724,6 +18361,117 @@ mod tests {
             body
         );
         let _ = stream.write_all(response.as_bytes());
+    }
+
+    fn fake_cloud_response_data(
+        kind: &str,
+        request_json: &serde_json::Value,
+        default_task_id: &str,
+        omit_task_id: bool,
+    ) -> serde_json::Value {
+        if kind == "event" {
+            let requested_task_id = request_json["payload"]["task_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(default_task_id);
+            if omit_task_id {
+                json!({
+                    "task": {},
+                    "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
+                })
+            } else {
+                json!({
+                    "task_id": requested_task_id,
+                    "task": {"id": requested_task_id},
+                    "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
+                })
+            }
+        } else if kind == "spec_graph" {
+            json!({
+                "kind": "project_spec_graph",
+                "version": 3,
+                "repo_id": "repo-test",
+                "workspace_id": "workspace-test",
+                "graph_stats": {},
+                "agent_work": {},
+                "nodes": [],
+                "edges": []
+            })
+        } else {
+            json!({"ok": true})
+        }
+    }
+
+    fn fake_websocket_accept_key(key: &str) -> String {
+        use base64::{engine::general_purpose, Engine as _};
+        use sha1::{Digest as _, Sha1};
+
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        general_purpose::STANDARD.encode(hasher.finalize())
+    }
+
+    fn fake_write_ws_text(stream: &mut std::net::TcpStream, text: &str) -> std::io::Result<()> {
+        let payload = text.as_bytes();
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x81);
+        if payload.len() <= 125 {
+            frame.push(payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame)
+    }
+
+    fn fake_read_ws_text(stream: &mut std::net::TcpStream) -> Result<String, String> {
+        let mut header = [0u8; 2];
+        stream
+            .read_exact(&mut header)
+            .map_err(|error| error.to_string())?;
+        let opcode = header[0] & 0x0F;
+        if opcode != 0x1 {
+            return Err(format!("unexpected websocket opcode {opcode}"));
+        }
+        let masked = header[1] & 0x80 != 0;
+        let mut length = u64::from(header[1] & 0x7F);
+        if length == 126 {
+            let mut extended = [0u8; 2];
+            stream
+                .read_exact(&mut extended)
+                .map_err(|error| error.to_string())?;
+            length = u64::from(u16::from_be_bytes(extended));
+        } else if length == 127 {
+            let mut extended = [0u8; 8];
+            stream
+                .read_exact(&mut extended)
+                .map_err(|error| error.to_string())?;
+            length = u64::from_be_bytes(extended);
+        }
+        let mask = if masked {
+            let mut mask = [0u8; 4];
+            stream
+                .read_exact(&mut mask)
+                .map_err(|error| error.to_string())?;
+            Some(mask)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; length as usize];
+        stream
+            .read_exact(&mut payload)
+            .map_err(|error| error.to_string())?;
+        if let Some(mask) = mask {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % 4];
+            }
+        }
+        String::from_utf8(payload).map_err(|error| error.to_string())
     }
 
     #[test]
@@ -18477,7 +19225,13 @@ mod tests {
         let claude_settings_path = repo.join(".claude").join("settings.local.json");
 
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
-        for tool in ["start_task", "acquire_lease", "checkpoint", "submit_patch"] {
+        for tool in [
+            "start_task",
+            "acquire_lease",
+            "checkpoint",
+            "submit_patch",
+            "submit_patch_status",
+        ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
             )));
@@ -18502,6 +19256,7 @@ mod tests {
             "mcp__coordination-kernel__acquire_lease",
             "mcp__coordination-kernel__checkpoint",
             "mcp__coordination-kernel__submit_patch",
+            "mcp__coordination-kernel__submit_patch_status",
         ] {
             assert!(claude_allow.contains(tool));
         }
@@ -18535,7 +19290,13 @@ mod tests {
         let tools = crate::coordination::mcp::TOOL_NAMES;
         assert_eq!(
             tools,
-            &["start_task", "acquire_lease", "checkpoint", "submit_patch"]
+            &[
+                "start_task",
+                "acquire_lease",
+                "checkpoint",
+                "submit_patch",
+                "submit_patch_status"
+            ]
         );
         assert!(!tools.contains(&"request_merge"));
         assert!(!tools.contains(&"resolve_workspace_violation"));
@@ -18562,6 +19323,102 @@ mod tests {
         assert!(!allowed
             .iter()
             .any(|tool| tool.as_str() == Some("resolve_workspace_violation")));
+    }
+
+    #[test]
+    fn submit_patch_jobs_are_idempotent_and_status_visible() {
+        let repo = init_git_repo("async_submit_job_status");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let session = kernel
+            .create_session_for_slot_key(
+                "async-submit",
+                "Async Submit",
+                "codex",
+                None,
+                None,
+                None,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_id = session["agentId"].as_str().unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task(
+                "Async submit",
+                Some("queue a patch"),
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        let first = kernel
+            .enqueue_submit_patch_job(
+                task_id,
+                agent_id,
+                session_id,
+                Some("worktree-1"),
+                Some("submit it"),
+                Some("terminal-agent"),
+                Some("client-request-1"),
+            )
+            .unwrap();
+        let submit_job_id = first["data"]["submit_job_id"].as_str().unwrap();
+        assert_eq!(first["data"]["phase"].as_str(), Some("queued"));
+        assert_eq!(first["data"]["reused"].as_bool(), Some(false));
+
+        let second = kernel
+            .enqueue_submit_patch_job(
+                task_id,
+                agent_id,
+                session_id,
+                Some("worktree-1"),
+                Some("submit it"),
+                Some("terminal-agent"),
+                Some("client-request-1"),
+            )
+            .unwrap();
+        assert_eq!(
+            second["data"]["submit_job_id"].as_str(),
+            Some(submit_job_id)
+        );
+        assert_eq!(second["data"]["reused"].as_bool(), Some(true));
+
+        kernel
+            .set_submit_job_phase(
+                submit_job_id,
+                "running",
+                "diffing",
+                Some("Collecting git binary diff for package-lock.json."),
+            )
+            .unwrap();
+        let status = kernel
+            .submit_patch_job_status(Some(submit_job_id), None, None)
+            .unwrap();
+        assert_eq!(status["data"]["phase"].as_str(), Some("diffing"));
+        assert_eq!(
+            status["data"]["submit_job"]["phase_message"].as_str(),
+            Some("Collecting git binary diff for package-lock.json.")
+        );
+    }
+
+    #[test]
+    fn run_git_bytes_drains_large_binary_diff_output() {
+        let repo = init_git_repo("large_git_diff_drain");
+        let large_lockfile = "x".repeat(2_000_000);
+        fs::write(repo.join("package-lock.json"), large_lockfile).unwrap();
+        run(&repo, "git", &["add", "package-lock.json"]);
+
+        let diff = run_git_bytes(&repo, &["diff", "--binary", "--cached", "HEAD"]).unwrap();
+        assert!(diff.len() > 1_000_000);
+        assert!(String::from_utf8_lossy(&diff).contains("package-lock.json"));
     }
 
     #[test]

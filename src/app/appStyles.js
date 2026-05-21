@@ -3584,16 +3584,88 @@ export const TerminalParkedAgents = styled.span`
 `;
 
 export const TerminalParkedAgentBadge = styled.span`
+  --terminal-slot-accent: rgba(148, 163, 184, 0.88);
+
   display: inline-flex;
   align-items: center;
-  border: 1px solid rgba(56, 189, 248, 0.36);
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.28);
   border-radius: 999px;
-  padding: 3px 7px;
-  background: rgba(56, 189, 248, 0.1);
-  color: #67e8f9;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
+  padding: 0;
+  background: var(--terminal-slot-accent);
+  color: transparent;
+  font-size: 0;
+  line-height: 0;
+  box-shadow:
+    inset 0 0 0 4px rgba(4, 8, 16, 0.9),
+    0 0 14px var(--terminal-slot-accent);
+
+  &[data-slot="0"] {
+    --terminal-slot-accent: #62a0ff;
+  }
+
+  &[data-slot="1"] {
+    --terminal-slot-accent: #ff9d48;
+  }
+
+  &[data-slot="2"] {
+    --terminal-slot-accent: #3ccb7f;
+  }
+
+  &[data-slot="3"] {
+    --terminal-slot-accent: #e5c45f;
+  }
+
+  &[data-slot="4"] {
+    --terminal-slot-accent: #68d8d6;
+  }
+
+  &[data-slot="5"] {
+    --terminal-slot-accent: #f46d8a;
+  }
+
+  &[data-slot="6"] {
+    --terminal-slot-accent: #aac66d;
+  }
+
+  &[data-slot="7"] {
+    --terminal-slot-accent: #d0d7e6;
+  }
+
+  &[data-slot="8"] {
+    --terminal-slot-accent: #54b6ff;
+  }
+
+  &[data-slot="9"] {
+    --terminal-slot-accent: #ffbf66;
+  }
+
+  &[data-slot="10"] {
+    --terminal-slot-accent: #7bdc9d;
+  }
+
+  &[data-slot="11"] {
+    --terminal-slot-accent: #ff8a9c;
+  }
+
+  &[data-slot="12"] {
+    --terminal-slot-accent: #56d0b6;
+  }
+
+  &[data-slot="13"] {
+    --terminal-slot-accent: #d8b34d;
+  }
+
+  &[data-slot="14"] {
+    --terminal-slot-accent: #9fb6d9;
+  }
+
+  &[data-slot="15"] {
+    --terminal-slot-accent: #f0f4ff;
+  }
 `;
 
 export const TerminalParkedCancelButton = styled.button`

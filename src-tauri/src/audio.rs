@@ -1,5 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+const CLOUD_VOICE_AGENT_TTS_SUPPRESSION_TAIL_MS: u64 = 2_500;
+const CLOUD_VOICE_AGENT_TTS_SUPPRESSION_MAX_MS: u64 = 30_000;
+const CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS: u64 = 1_200;
+
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
 }
@@ -505,7 +509,10 @@ fn native_audio_stats(samples: &[f32]) -> (f32, f32) {
     ((sum_squares / samples.len().max(1) as f32).sqrt(), peak)
 }
 
-fn recent_native_audio_samples(chunks: &VecDeque<NativeAudioChunk>, max_samples: usize) -> Vec<f32> {
+fn recent_native_audio_samples(
+    chunks: &VecDeque<NativeAudioChunk>,
+    max_samples: usize,
+) -> Vec<f32> {
     if max_samples == 0 {
         return Vec::new();
     }
@@ -550,7 +557,9 @@ fn native_audio_frequency_bands(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     let sample_count = samples.len();
     let sample_rate = sample_rate as f32;
     let min_hz = AUDIO_INPUT_FREQUENCY_MIN_HZ.max(1.0);
-    let max_hz = AUDIO_INPUT_FREQUENCY_MAX_HZ.min(sample_rate * 0.45).max(min_hz);
+    let max_hz = AUDIO_INPUT_FREQUENCY_MAX_HZ
+        .min(sample_rate * 0.45)
+        .max(min_hz);
     let log_min = min_hz.ln();
     let log_max = max_hz.ln();
     let (rms, peak) = native_audio_stats(samples);
@@ -572,7 +581,9 @@ fn native_audio_frequency_bands(samples: &[f32], sample_rate: u32) -> Vec<f32> {
             let window = if sample_count <= 1 {
                 1.0
             } else {
-                0.5 - 0.5 * ((std::f32::consts::TAU * sample_index as f32) / (sample_count - 1) as f32).cos()
+                0.5 - 0.5
+                    * ((std::f32::consts::TAU * sample_index as f32) / (sample_count - 1) as f32)
+                        .cos()
             };
             let phase = phase_step * sample_index as f32;
             let weighted = sample * window;
@@ -580,7 +591,8 @@ fn native_audio_frequency_bands(samples: &[f32], sample_rate: u32) -> Vec<f32> {
             imaginary -= weighted * phase.sin();
         }
 
-        let magnitude = ((real * real + imaginary * imaginary).sqrt() / sample_count as f32).max(0.0);
+        let magnitude =
+            ((real * real + imaginary * imaginary).sqrt() / sample_count as f32).max(0.0);
         let magnitude_db = 20.0 * (magnitude + 1.0e-9).log10();
         let normalized = ((magnitude_db - AUDIO_INPUT_FREQUENCY_MIN_DB)
             / (AUDIO_INPUT_FREQUENCY_MAX_DB - AUDIO_INPUT_FREQUENCY_MIN_DB))
@@ -592,7 +604,11 @@ fn native_audio_frequency_bands(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     bands
 }
 
-fn native_audio_envelope_samples(samples: &[f32], sample_count: usize, sample_rate: u32) -> Vec<f32> {
+fn native_audio_envelope_samples(
+    samples: &[f32],
+    sample_count: usize,
+    sample_rate: u32,
+) -> Vec<f32> {
     if sample_count == 0 {
         return Vec::new();
     }
@@ -742,16 +758,12 @@ fn process_native_audio_samples(
             None
         } else {
             shared.last_stats_at = now;
-            let frequency_samples = recent_native_audio_samples(
-                &shared.chunks,
-                AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES,
-            );
+            let frequency_samples =
+                recent_native_audio_samples(&shared.chunks, AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES);
             let frequency_bands =
                 native_audio_frequency_bands(&frequency_samples, shared.sample_rate);
-            let waveform_samples = recent_native_audio_samples(
-                &shared.chunks,
-                AUDIO_INPUT_WAVEFORM_WINDOW_SAMPLES,
-            );
+            let waveform_samples =
+                recent_native_audio_samples(&shared.chunks, AUDIO_INPUT_WAVEFORM_WINDOW_SAMPLES);
             let time_domain_samples = native_audio_envelope_samples(
                 &waveform_samples,
                 AUDIO_INPUT_WAVEFORM_SAMPLE_COUNT,
@@ -3194,6 +3206,108 @@ fn emit_cloud_voice_agent_event(app: &AppHandle, payload: Value) {
     let _ = app.emit(CLOUD_VOICE_AGENT_EVENT, payload);
 }
 
+fn voice_history_safe_workspace_id(value: &str) -> String {
+    let mut safe = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    if safe.is_empty() {
+        safe = "default".to_string();
+    }
+    safe
+}
+
+fn voice_history_path(root_directory: Option<&str>, workspace_id: &str) -> Result<PathBuf, String> {
+    let root = resolve_workspace_root_directory(root_directory)?;
+    let agents_dir = root.join(".agents");
+    fs::create_dir_all(&agents_dir)
+        .map_err(|error| format!("Unable to create workspace .agents directory: {error}"))?;
+    let _ = ensure_workspace_agents_gitignore(&root);
+    let history_dir = agents_dir.join("voice-history");
+    fs::create_dir_all(&history_dir)
+        .map_err(|error| format!("Unable to create voice history directory: {error}"))?;
+    Ok(history_dir.join(format!(
+        "{}.json",
+        voice_history_safe_workspace_id(workspace_id)
+    )))
+}
+
+fn read_orchestrator_voice_history_blocking(
+    request: OrchestratorVoiceHistoryReadRequest,
+) -> Result<OrchestratorVoiceHistoryReadResult, String> {
+    let workspace_id = clean_cloud_voice_agent_text(Some(request.workspace_id), 160);
+    let workspace_id = if workspace_id.is_empty() {
+        "default".to_string()
+    } else {
+        workspace_id
+    };
+    let path = voice_history_path(request.root_directory.as_deref(), &workspace_id)?;
+    let items = match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str::<Value>(&contents).unwrap_or_else(|_| json!([])),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!([]),
+        Err(error) => return Err(format!("Unable to read voice history: {error}")),
+    };
+    Ok(OrchestratorVoiceHistoryReadResult {
+        items,
+        path: path.display().to_string(),
+        workspace_id,
+    })
+}
+
+fn write_orchestrator_voice_history_blocking(
+    request: OrchestratorVoiceHistoryWriteRequest,
+) -> Result<OrchestratorVoiceHistoryWriteResult, String> {
+    let workspace_id = clean_cloud_voice_agent_text(Some(request.workspace_id), 160);
+    let workspace_id = if workspace_id.is_empty() {
+        "default".to_string()
+    } else {
+        workspace_id
+    };
+    let path = voice_history_path(request.root_directory.as_deref(), &workspace_id)?;
+    let items = match request.items {
+        Value::Array(items) => Value::Array(items.into_iter().take(24).collect()),
+        _ => json!([]),
+    };
+    let bytes = serde_json::to_vec_pretty(&items)
+        .map_err(|error| format!("Unable to serialize voice history: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Unable to write voice history: {error}"))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to save voice history: {error}"))?;
+    Ok(OrchestratorVoiceHistoryWriteResult {
+        saved: items.as_array().map(Vec::len).unwrap_or(0),
+        path: path.display().to_string(),
+        workspace_id,
+    })
+}
+
+#[tauri::command]
+async fn read_orchestrator_voice_history(
+    request: OrchestratorVoiceHistoryReadRequest,
+) -> Result<OrchestratorVoiceHistoryReadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || read_orchestrator_voice_history_blocking(request))
+        .await
+        .map_err(|error| format!("Unable to load voice history: {error}"))?
+}
+
+#[tauri::command]
+async fn write_orchestrator_voice_history(
+    request: OrchestratorVoiceHistoryWriteRequest,
+) -> Result<OrchestratorVoiceHistoryWriteResult, String> {
+    tauri::async_runtime::spawn_blocking(move || write_orchestrator_voice_history_blocking(request))
+        .await
+        .map_err(|error| format!("Unable to persist voice history: {error}"))?
+}
+
 fn is_expected_cloud_voice_agent_close_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("connection reset without closing handshake")
@@ -3202,6 +3316,49 @@ fn is_expected_cloud_voice_agent_close_error(error: &str) -> bool {
         || error.contains("closed by peer")
         || error.contains("reset by peer")
         || error.contains("websocket protocol error: connection reset")
+}
+
+fn cloud_voice_agent_event_kind(payload: &Value) -> &str {
+    payload
+        .get("kind")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn cloud_voice_agent_tts_suppression_active(deadline: Option<Instant>) -> bool {
+    match deadline {
+        Some(deadline) => deadline > Instant::now(),
+        None => false,
+    }
+}
+
+fn update_cloud_voice_agent_tts_suppression(
+    payload: &Value,
+    suppression_until: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    match cloud_voice_agent_event_kind(payload) {
+        "voice_agent_tts_start" => {
+            *suppression_until =
+                Some(now + Duration::from_millis(CLOUD_VOICE_AGENT_TTS_SUPPRESSION_MAX_MS));
+        }
+        "voice_agent_tts_audio" => {
+            let next_deadline =
+                now + Duration::from_millis(CLOUD_VOICE_AGENT_TTS_SUPPRESSION_TAIL_MS);
+            if suppression_until
+                .map(|deadline| deadline < next_deadline)
+                .unwrap_or(true)
+            {
+                *suppression_until = Some(next_deadline);
+            }
+        }
+        "voice_agent_tts_end" | "voice_agent_tts_error" => {
+            *suppression_until =
+                Some(now + Duration::from_millis(CLOUD_VOICE_AGENT_TTS_SUPPRESSION_TAIL_MS));
+        }
+        _ => {}
+    }
 }
 
 async fn run_cloud_voice_agent_stream(
@@ -3282,7 +3439,10 @@ async fn run_cloud_voice_agent_stream(
         }
     };
     let (mut write, mut read) = ws_stream.split();
-    if let Err(error) = write.send(Message::Text(start_request.to_string().into())).await {
+    if let Err(error) = write
+        .send(Message::Text(start_request.to_string().into()))
+        .await
+    {
         let message = format!("Unable to start cloud voice agent stream: {error}");
         let _ = ready_tx.send(Err(message.clone()));
         let _ = finished_tx.send(Err(message));
@@ -3301,6 +3461,9 @@ async fn run_cloud_voice_agent_stream(
 
     let mut stream_error: Option<String> = None;
     let mut client_stop_requested = false;
+    let mut tts_suppression_until: Option<Instant> = None;
+    let mut suppressed_audio_chunks = 0u64;
+    let mut suppressed_audio_bytes = 0u64;
     loop {
         tokio::select! {
             maybe_audio = audio_rx.recv() => {
@@ -3309,6 +3472,25 @@ async fn run_cloud_voice_agent_stream(
                     break;
                 };
                 if !audio_bytes.is_empty() {
+                    if cloud_voice_agent_tts_suppression_active(tts_suppression_until) {
+                        suppressed_audio_chunks += 1;
+                        suppressed_audio_bytes += audio_bytes.len() as u64;
+                        continue;
+                    }
+                    if suppressed_audio_chunks > 0 {
+                        log_audio_diagnostic_event(
+                            "audio.cloud_voice.tts_echo_suppressed",
+                            json!({
+                                "bytes": suppressed_audio_bytes,
+                                "chunks": suppressed_audio_chunks,
+                                "repo_id": repo_id,
+                                "workspace_id": workspace_id,
+                            }),
+                        );
+                        suppressed_audio_chunks = 0;
+                        suppressed_audio_bytes = 0;
+                    }
+                    tts_suppression_until = None;
                     if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
                         stream_error = Some(format!("Unable to stream audio to cloud voice agent: {error}"));
                         break;
@@ -3319,12 +3501,20 @@ async fn run_cloud_voice_agent_stream(
                 match maybe_message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
+                            update_cloud_voice_agent_tts_suppression(
+                                &payload,
+                                &mut tts_suppression_until,
+                            );
                             emit_cloud_voice_agent_event(&app, payload);
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                             if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                                update_cloud_voice_agent_tts_suppression(
+                                    &payload,
+                                    &mut tts_suppression_until,
+                                );
                                 emit_cloud_voice_agent_event(&app, payload);
                             }
                         }
@@ -3355,41 +3545,62 @@ async fn run_cloud_voice_agent_stream(
             "kind": "stop",
             "contract": "diffforge.voice_agent.v1",
         });
-        if let Err(error) = write.send(Message::Text(stop_message.to_string().into())).await {
+        if let Err(error) = write
+            .send(Message::Text(stop_message.to_string().into()))
+            .await
+        {
             let error_text = error.to_string();
             if client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text) {
                 stream_error = None;
             } else {
-                stream_error = Some(format!("Unable to stop cloud voice agent stream: {error_text}"));
+                stream_error = Some(format!(
+                    "Unable to stop cloud voice agent stream: {error_text}"
+                ));
             }
         }
     }
 
     if stream_error.is_none() {
         loop {
-            match timeout(Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS), read.next()).await {
+            match timeout(
+                Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
+                read.next(),
+            )
+            .await
+            {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
+                        update_cloud_voice_agent_tts_suppression(
+                            &payload,
+                            &mut tts_suppression_until,
+                        );
                         emit_cloud_voice_agent_event(&app, payload);
                     }
                 }
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
                     if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                         if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                            update_cloud_voice_agent_tts_suppression(
+                                &payload,
+                                &mut tts_suppression_until,
+                            );
                             emit_cloud_voice_agent_event(&app, payload);
                         }
                     }
                 }
                 Ok(Some(Ok(Message::Ping(payload)))) => {
                     if let Err(error) = write.send(Message::Pong(payload)).await {
-                        stream_error = Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                        stream_error =
+                            Some(format!("Unable to answer cloud voice agent ping: {error}"));
                         break;
                     }
                 }
                 Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
                 Ok(Some(Err(error))) => {
                     let error_text = error.to_string();
-                    if client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text) {
+                    if client_stop_requested
+                        && is_expected_cloud_voice_agent_close_error(&error_text)
+                    {
                         break;
                     }
                     stream_error = Some(format!("Cloud voice agent stream failed: {error_text}"));
@@ -3401,14 +3612,17 @@ async fn run_cloud_voice_agent_stream(
     }
 
     if let Some(error) = stream_error {
-        emit_cloud_voice_agent_event(&app, json!({
-            "kind": "voice_agent_error",
-            "contract": "diffforge.voice_agent.v1",
-            "error": {
-                "code": "desktop_cloud_voice_stream_failed",
-                "message": error.clone(),
-            },
-        }));
+        emit_cloud_voice_agent_event(
+            &app,
+            json!({
+                "kind": "voice_agent_error",
+                "contract": "diffforge.voice_agent.v1",
+                "error": {
+                    "code": "desktop_cloud_voice_stream_failed",
+                    "message": error.clone(),
+                },
+            }),
+        );
         let _ = finished_tx.send(Err(error));
     } else {
         let _ = finished_tx.send(Ok(()));
@@ -3461,6 +3675,20 @@ async fn start_cloud_voice_agent_stream(
         "workspace_root": workspace_root,
         "repo_id": repo_id,
         "agent_statuses": agent_statuses,
+        "fast_response_policy": {
+            "enabled": true,
+            "generate": "llm",
+            "hold_ms": CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS,
+            "release": "client_after_timeout_unless_main_response",
+            "tts": {
+                "provider": "deepgram_aura",
+                "stream": true,
+            },
+            "event_contract": {
+                "fast_flag": "fast_response",
+                "feedback_kind": "voice_agent_fast_llm_feedback",
+            },
+        },
         "audio": {
             "encoding": "linear16",
             "sample_rate": status.sample_rate,
@@ -3522,11 +3750,28 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
 
     audio_state.input_worker.detach_realtime_stream()?;
 
-    timeout(Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS), session.finished_rx)
-        .await
-        .map_err(|_| "Cloud voice agent stream timed out while stopping.".to_string())?
-        .map_err(|_| "Cloud voice agent stream stopped before it returned.".to_string())??;
+    timeout(
+        Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
+        session.finished_rx,
+    )
+    .await
+    .map_err(|_| "Cloud voice agent stream timed out while stopping.".to_string())?
+    .map_err(|_| "Cloud voice agent stream stopped before it returned.".to_string())??;
     log_audio_diagnostic_event("audio.cloud_voice.stop.done", json!({}));
+    Ok(())
+}
+
+#[tauri::command]
+async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> Result<(), String> {
+    log_audio_diagnostic_event("audio.cloud_voice.finish_input.command", json!({}));
+    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+    if audio_state.cloud_voice_agent_stream.lock().await.is_none() {
+        log_audio_diagnostic_event("audio.cloud_voice.finish_input.inactive", json!({}));
+        return Ok(());
+    }
+
+    audio_state.input_worker.detach_realtime_stream()?;
+    log_audio_diagnostic_event("audio.cloud_voice.finish_input.done", json!({}));
     Ok(())
 }
 

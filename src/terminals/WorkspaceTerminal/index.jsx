@@ -665,6 +665,7 @@ const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const TERMINAL_CONTROL_UI_SUPPRESSION_EVENT = "diffforge:terminal-control-ui-suppression";
 const TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS = 10000;
+const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
 const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_QUOTED_PATH_LINK_PATTERN = /(["'`])((?:(?:[A-Za-z]:[\\/])|(?:\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/])|(?:\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/)|(?:~[A-Za-z0-9_.-]*[\\/])|(?:\/)|(?:\.{1,2}[\\/]))(?:(?!\1).)*?\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)\1/g;
@@ -729,6 +730,41 @@ function dispatchTerminalControlUiSuppression(detail = {}) {
     },
   }));
 }
+
+function getParkedWaitingOnTerminalIndex(waitingOn) {
+  const directIndex = Number.parseInt(
+    waitingOn?.terminalIndex ?? waitingOn?.terminal_index,
+    10,
+  );
+  if (Number.isInteger(directIndex) && directIndex >= 0) {
+    return directIndex;
+  }
+
+  const slotIndex = Number.parseInt(waitingOn?.slotKey ?? waitingOn?.slot_key, 10);
+  if (Number.isInteger(slotIndex) && slotIndex > 0) {
+    return slotIndex - 1;
+  }
+
+  return null;
+}
+
+function getParkedWaitingOnColorSlot(waitingOn) {
+  const terminalIndex = getParkedWaitingOnTerminalIndex(waitingOn);
+  return terminalIndex == null ? "unknown" : getTerminalAgentColorSlot(terminalIndex);
+}
+
+function getParkedWaitingOnLabel(waitingOn) {
+  const slotKey = String(waitingOn?.slotKey || waitingOn?.slot_key || "").trim();
+  const taskTitle = String(waitingOn?.taskTitle || waitingOn?.task_title || "").trim();
+  const resourceKey = String(waitingOn?.resourceKey || waitingOn?.resource_key || "").trim();
+  const agentLabel = String(waitingOn?.agentLabel || waitingOn?.agent_label || "").trim();
+  const agentId = String(waitingOn?.agentId || waitingOn?.agent_id || "").trim();
+  const terminalLabel = slotKey ? `terminal ${slotKey}` : "peer terminal";
+  const details = taskTitle || resourceKey || agentLabel || agentId;
+
+  return details ? `${terminalLabel}: ${details}` : terminalLabel;
+}
+
 const TODO_DROP_OVERLAY_UNSUPPORTED_STYLE = {
   border: "2px dotted rgba(248, 113, 113, 0.96)",
   background: "rgba(45, 8, 13, 0.62)",
@@ -3345,6 +3381,71 @@ function WorkspaceTerminal({
       theme: getTerminalThemeForForgeTheme(),
     });
     xtermRef.current = terminal;
+
+    let providerSessionCaptureBuffer = "";
+    let providerSessionCaptureMissesLogged = 0;
+    let capturedProviderSessionId = startupThreadProviderSessionId || "";
+    let codingAgentInputReadyEmitted = false;
+    const emitCodingAgentInputReady = (source = "timer") => {
+      if (
+        isDisposed
+        || isGenericTerminal
+        || runtimeTerminalState !== "running"
+        || terminalThreadActivityStatusRef.current === "thinking"
+      ) {
+        return false;
+      }
+      if (codingAgentInputReadyEmitted) {
+        return false;
+      }
+
+      codingAgentInputReadyEmitted = true;
+      const inputReadyAt = new Date().toISOString();
+      logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready_timer", {
+        agentId: terminalAgentKind,
+        instanceId: terminalInstanceId,
+        nativeSessionIdPresent: Boolean(capturedProviderSessionId),
+        paneId,
+        source,
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      onThreadTerminalLifecycle?.({
+        activityStatus: "idle",
+        agentId: terminalAgentKind,
+        inputReady: true,
+        inputReadyAt,
+        inputReadyConfidence: "timer",
+        instanceId: terminalInstanceId,
+        nativeSessionId: capturedProviderSessionId || "",
+        nativeSessionKind: capturedProviderSessionId ? "session" : "",
+        nativeSessionSource: capturedProviderSessionId ? source : "",
+        paneId,
+        providerSessionId: capturedProviderSessionId || "",
+        source,
+        status: "active",
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        type: "terminal-input-ready",
+        workspaceId: workspace?.id || "",
+      });
+      return true;
+    };
+    const scheduleCodingAgentInputReady = (
+      reason,
+      delayMs = TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS,
+    ) => {
+      if (isDisposed || isGenericTerminal || codingAgentInputReadyEmitted) {
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        startupWatchTimers.delete(timer);
+        emitCodingAgentInputReady(`timer:${reason}`);
+      }, Math.max(0, Number(delayMs) || 0));
+      startupWatchTimers.add(timer);
+    };
 
     const terminalOutputNormalizer = createTerminalOutputNormalizer({
       dropEraseDisplay2OutsideSync: terminalStabilityFeatures.dropEraseDisplay2OutsideSync,
@@ -7252,9 +7353,6 @@ function WorkspaceTerminal({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
         const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
-        let providerSessionCaptureBuffer = "";
-        let providerSessionCaptureMissesLogged = 0;
-        let capturedProviderSessionId = startupThreadProviderSessionId || "";
         const outputChannel = new Channel((message) => {
           if (isDisposed) {
             return;
@@ -7379,8 +7477,9 @@ function WorkspaceTerminal({
           }
 
           const decodedTerminalText = outputTextDecoder.decode(terminalData, { stream: true });
+          const visibleTerminalText = stripLiveViewControlSequences(decodedTerminalText);
           if (!capturedProviderSessionId && !isGenericTerminal && terminalThreadIdRef.current) {
-            const captureText = stripLiveViewControlSequences(decodedTerminalText);
+            const captureText = visibleTerminalText;
             providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${captureText}`.slice(-2400);
             const nativeSessionId = extractNativeSessionIdFromOutput(
               terminalAgentKind,
@@ -7424,7 +7523,6 @@ function WorkspaceTerminal({
               });
             }
           }
-
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += 1;
           outputBytes += terminalData.byteLength;
@@ -7453,9 +7551,9 @@ function WorkspaceTerminal({
             && terminalThreadIdRef.current
             && terminalThreadActivityStatusRef.current === "thinking"
           ) {
-            terminalThreadActivityStatusRef.current = "idle";
             logThreadBridgeDiagnostic("frontend.thread_agent_output_status", {
               activityStatusBefore: "thinking",
+              activityStatusAfter: "thinking",
               agentId: terminalAgentKind,
               hasVisibleOutput,
               instanceId: terminalInstanceId,
@@ -9229,6 +9327,7 @@ function WorkspaceTerminal({
           setPaneStage("running", "Agent Running", "Terminal is connected.");
           resizeController?.resizeNow("agent_launch_done");
           scheduleBlankStartupWatch("agent_launch_done");
+          scheduleCodingAgentInputReady(`${reason}_agent_started`);
         };
         startAgentInPrewarmedTerminalRef.current = shouldPrewarmShell ? startAgentInCurrentPty : null;
 
@@ -9390,6 +9489,7 @@ function WorkspaceTerminal({
             title: "Terminal Running",
             visible: false,
           });
+          scheduleCodingAgentInputReady("terminal_open_done");
         }
         const startupMs = performance.now() - openStartedAt;
         patchTerminalMetrics({ startupMs });
@@ -11023,11 +11123,22 @@ function WorkspaceTerminal({
                     <TerminalParkedAgents>
                       {(parkedPrompt.waitingOn || []).length
                         ? parkedPrompt.waitingOn.map((agent, index) => (
-                          <TerminalParkedAgentBadge key={`${agent.agentId || agent.agentLabel || "agent"}-${index}`}>
-                            {agent.agentLabel || "agent"}
-                          </TerminalParkedAgentBadge>
+                          <TerminalParkedAgentBadge
+                            aria-label={getParkedWaitingOnLabel(agent)}
+                            data-slot={getParkedWaitingOnColorSlot(agent)}
+                            key={`${agent.slotKey || agent.agentId || agent.agentLabel || "agent"}-${index}`}
+                            role="img"
+                            title={getParkedWaitingOnLabel(agent)}
+                          />
                         ))
-                        : <TerminalParkedAgentBadge>peer</TerminalParkedAgentBadge>}
+                        : (
+                          <TerminalParkedAgentBadge
+                            aria-label="peer terminal"
+                            data-slot="unknown"
+                            role="img"
+                            title="peer terminal"
+                          />
+                        )}
                     </TerminalParkedAgents>
                   </span>
                 </TerminalParkedCopy>

@@ -524,6 +524,7 @@ struct TerminalParkedPrompt {
 struct TerminalParkedWaitingOn {
     agent_id: Option<String>,
     agent_label: Option<String>,
+    slot_key: Option<String>,
     task_id: Option<String>,
     task_title: Option<String>,
     resource_key: Option<String>,
@@ -1310,6 +1311,37 @@ struct CloudVoiceAgentStartStatus {
     active: bool,
     repo_id: String,
     sample_rate: u32,
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorVoiceHistoryReadRequest {
+    root_directory: Option<String>,
+    workspace_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorVoiceHistoryReadResult {
+    items: Value,
+    path: String,
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorVoiceHistoryWriteRequest {
+    root_directory: Option<String>,
+    workspace_id: String,
+    items: Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorVoiceHistoryWriteResult {
+    saved: usize,
+    path: String,
     workspace_id: String,
 }
 
@@ -2175,7 +2207,10 @@ pub fn run() {
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
             start_cloud_voice_agent_stream,
+            finish_cloud_voice_agent_input,
             stop_cloud_voice_agent_stream,
+            read_orchestrator_voice_history,
+            write_orchestrator_voice_history,
             audio_shortcuts_status,
             audio_push_to_talk_status,
             open_audio_shortcut_permissions,
@@ -2257,6 +2292,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_create_worktree,
             coordination::tauri_commands::coordination_validate_patch,
             coordination::tauri_commands::coordination_submit_patch,
+            coordination::tauri_commands::coordination_submit_patch_status,
             coordination::tauri_commands::coordination_request_merge,
             coordination::tauri_commands::coordination_initialize_merge_resolution,
             coordination::tauri_commands::coordination_apply_merge,

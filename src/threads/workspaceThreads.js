@@ -1700,6 +1700,9 @@ function normalizeActiveTerminal(value) {
   return {
     agentId: cleanAgentId(value.agentId || value.currentAgent),
     instanceId: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
+    inputReady: value.inputReady === true,
+    inputReadyAt: cleanText(value.inputReadyAt || value.promptReadyAt),
+    inputReadyConfidence: cleanText(value.inputReadyConfidence || value.promptReadyConfidence),
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
@@ -1732,6 +1735,18 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     activityStatus: options.stripLiveBindings
       ? "idle"
       : normalizeThreadActivityStatus(binding.activityStatus, fallback.activityStatus),
+    inputReady: options.stripLiveBindings
+      ? false
+      : Boolean(binding.inputReady ?? fallback.inputReady),
+    inputReadyAt: options.stripLiveBindings
+      ? ""
+      : cleanText(binding.inputReadyAt || binding.promptReadyAt, fallback.inputReadyAt || fallback.promptReadyAt),
+    inputReadyConfidence: options.stripLiveBindings
+      ? ""
+      : cleanText(
+        binding.inputReadyConfidence || binding.promptReadyConfidence,
+        fallback.inputReadyConfidence || fallback.promptReadyConfidence,
+      ),
     lastActiveAt: cleanText(binding.lastActiveAt, fallback.lastActiveAt),
     lastMessageAt: cleanText(binding.lastMessageAt, fallback.lastMessageAt),
     messageCount: normalizeMessageCount(binding.messageCount ?? fallback.messageCount),
@@ -2429,8 +2444,39 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     });
   }
   const now = nowIso();
+  const eventType = cleanText(event.type).toLowerCase();
+  const eventActivityStatus = normalizeThreadActivityStatus(event.activityStatus, "");
+  const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
+  const eventInstanceId = Number.parseInt(event.instanceId, 10);
+  const openedExistingReadyInstance = eventType === "opened"
+    && Boolean(existing.inputReady)
+    && Number.isInteger(eventInstanceId)
+    && eventInstanceId > 0
+    && Number(existing.instanceId) === eventInstanceId;
+  const marksInputReady = explicitInputReady === true
+    || eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready";
+  const marksInputBusy = explicitInputReady === false
+    || (eventType === "opened" && !openedExistingReadyInstance)
+    || eventType === "message-submitted"
+    || eventType === "provider-turn-started"
+    || eventActivityStatus === "thinking";
+  const inputReady = marksInputReady
+    ? true
+    : marksInputBusy
+      ? false
+      : Boolean(existing.inputReady);
+  const inputReadyAt = inputReady
+    ? cleanText(event.inputReadyAt || event.promptReadyAt, existing.inputReadyAt || now)
+    : "";
+  const inputReadyConfidence = inputReady
+    ? cleanText(event.inputReadyConfidence || event.promptReadyConfidence, existing.inputReadyConfidence)
+    : "";
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
+    inputReady,
+    inputReadyAt,
+    inputReadyConfidence,
     instanceId: event.instanceId ?? existing.instanceId,
     lastActiveAt: now,
     paneId: event.paneId || existing.paneId,
@@ -2598,6 +2644,9 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
   );
   const providerBinding = normalizeProviderBinding(existingProviderBindings[agentId], agentId, {
     coordination,
+    inputReady: Boolean(activeTerminal?.inputReady),
+    inputReadyAt: activeTerminal?.inputReadyAt || "",
+    inputReadyConfidence: activeTerminal?.inputReadyConfidence || "",
     lastActiveAt: now,
     lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
     messageCount: nextMessageCount,
@@ -2619,6 +2668,9 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       ...providerBinding,
       activityStatus,
       coordination,
+      inputReady: Boolean(activeTerminal?.inputReady),
+      inputReadyAt: activeTerminal?.inputReadyAt || "",
+      inputReadyConfidence: activeTerminal?.inputReadyConfidence || "",
       lastActiveAt: now,
       lastMessageAt: options.incrementMessageCount ? now : providerBinding?.lastMessageAt || existing.lastMessageAt,
       messageCount: nextMessageCount,
@@ -2727,6 +2779,9 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
       providerBindings: {
         [terminal.agentId]: normalizeProviderBinding(null, terminal.agentId, {
           activityStatus: "idle",
+          inputReady: Boolean(terminal.inputReady),
+          inputReadyAt: terminal.inputReadyAt || "",
+          inputReadyConfidence: terminal.inputReadyConfidence || "",
           lastActiveAt: now,
           messageCount: 0,
           status: terminal.status || event.status || "active",
@@ -3625,11 +3680,38 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   });
   const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
+  const eventType = cleanText(event.type).toLowerCase();
   const activityStatus = latestTurnState === "running"
     ? "thinking"
     : ["completed", "error", "interrupted"].includes(latestTurnState)
       ? "idle"
       : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
+  const existingProviderBindingForAgent = normalizeProviderBinding(existing.providerBindings?.[agentId], agentId, {
+    activityStatus: existing.activityStatus,
+    coordination: existing.coordination,
+    lastActiveAt: existing.lastActiveAt,
+    lastMessageAt: existing.lastMessageAt,
+    messageCount: existing.messageCount,
+    status: existing.status,
+    terminalBinding: existing.terminalBinding,
+    updatedAt: existing.updatedAt,
+  });
+  const inputReady = event.inputReady === true
+    || eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready"
+    ? true
+    : latestTurnState === "running"
+      ? false
+      : Boolean(event.inputReady ?? existingProviderBindingForAgent?.inputReady);
+  const inputReadyAt = inputReady
+    ? cleanText(event.inputReadyAt || event.promptReadyAt, existingProviderBindingForAgent?.inputReadyAt)
+    : "";
+  const inputReadyConfidence = inputReady
+    ? cleanText(
+      event.inputReadyConfidence || event.promptReadyConfidence,
+      existingProviderBindingForAgent?.inputReadyConfidence,
+    )
+    : "";
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
   let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
@@ -3655,6 +3737,9 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       lastActiveAt: now,
       lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : providerBindings[agentId].lastMessageAt,
       messageCount: messages.length,
+      inputReady,
+      inputReadyAt,
+      inputReadyConfidence,
       modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
       modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "provider-turn") : providerBindings[agentId].modelSource,
       modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBindings[agentId].modelUpdatedAt,
@@ -3667,11 +3752,24 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     };
   }
 
+  const terminalKey = getTerminalKeyForEvent(entry, event);
+  const terminals = { ...entry.terminals };
+  if (terminalKey && terminals[terminalKey]) {
+    terminals[terminalKey] = {
+      ...terminals[terminalKey],
+      inputReady,
+      inputReadyAt,
+      inputReadyConfidence,
+      updatedAt: now,
+    };
+  }
+
   return {
     ...currentState,
     [workspaceId]: {
       ...entry,
       activeThreadId: threadId,
+      terminals,
       threads: {
         ...entry.threads,
         [threadId]: {
@@ -3715,6 +3813,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   const activityStatus = hasExplicitActivityStatus
     ? normalizeThreadActivityStatus(event.activityStatus)
     : activityStatusForLatestTurn(existing.latestTurn, existing.activityStatus);
+  const eventType = cleanText(event.type).toLowerCase();
   const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
@@ -3729,25 +3828,60 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       updatedAt: existing.updatedAt,
     },
   );
+  const previousProviderBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
+    activityStatus: existing.activityStatus,
+    coordination: existing.coordination,
+    lastActiveAt: existing.lastActiveAt,
+    lastMessageAt: existing.lastMessageAt,
+    messageCount: existing.messageCount,
+    status: existing.status,
+    terminalBinding: existing.currentAgent === agentId ? existing.terminalBinding : null,
+    updatedAt: existing.updatedAt,
+  });
+  const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
+  const marksInputReady = explicitInputReady === true
+    || eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready";
+  const marksInputBusy = explicitInputReady === false || activityStatus === "thinking";
+  const inputReady = marksInputReady
+    ? true
+    : marksInputBusy
+      ? false
+      : Boolean(previousProviderBinding?.inputReady);
+  const inputReadyAt = inputReady
+    ? cleanText(event.inputReadyAt || event.promptReadyAt, previousProviderBinding?.inputReadyAt || now)
+    : "";
+  const inputReadyConfidence = inputReady
+    ? cleanText(
+      event.inputReadyConfidence || event.promptReadyConfidence,
+      previousProviderBinding?.inputReadyConfidence,
+    )
+    : "";
   providerBindings[agentId] = {
-    ...normalizeProviderBinding(providerBindings[agentId], agentId, {
-      activityStatus: existing.activityStatus,
-      coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
-      status: existing.status,
-      terminalBinding: existing.currentAgent === agentId ? existing.terminalBinding : null,
-      updatedAt: existing.updatedAt,
-    }),
+    ...previousProviderBinding,
     activityStatus,
+    inputReady,
+    inputReadyAt,
+    inputReadyConfidence,
     updatedAt: now,
   };
+  const terminalKey = getTerminalKeyForEvent(entry, event);
+  const terminals = { ...entry.terminals };
+  if (terminalKey && terminals[terminalKey]) {
+    terminals[terminalKey] = {
+      ...terminals[terminalKey],
+      inputReady,
+      inputReadyAt,
+      inputReadyConfidence,
+      updatedAt: now,
+    };
+  }
 
   return {
     ...currentState,
     [workspaceId]: {
       ...entry,
+      terminals,
       threads: {
         ...entry.threads,
         [threadId]: {

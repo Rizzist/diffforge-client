@@ -20,7 +20,13 @@ use super::{
     kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
 };
 
-pub const TOOL_NAMES: &[&str] = &["start_task", "acquire_lease", "checkpoint", "submit_patch"];
+pub const TOOL_NAMES: &[&str] = &[
+    "start_task",
+    "acquire_lease",
+    "checkpoint",
+    "submit_patch",
+    "submit_patch_status",
+];
 const SHARED_DAEMON_INFO_RELATIVE_PATH: &[&str] = &[".agents", "mcp", "coordination.daemon.json"];
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
 
@@ -1067,6 +1073,7 @@ fn dispatch_tool_result(
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "submit_patch" => kernel_submit_patch(&kernel, &input),
+        "submit_patch_status" => kernel_submit_patch_status(&kernel, &input),
         _ => Ok(api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),
@@ -1801,13 +1808,106 @@ fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Val
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| task["assigned_role"].as_str());
-    let submitted = kernel.submit_patch(
+    let job = kernel.enqueue_submit_patch_job(
         task_id,
         agent_id,
         session_id,
         input["worktree_id"].as_str(),
         input["summary"].as_str(),
+        lane,
+        input["client_request_id"].as_str(),
     )?;
+    let submit_job_id = job["data"]["submit_job_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let reused = job["data"]["reused"].as_bool() == Some(true);
+    if !submit_job_id.is_empty() && !reused {
+        let repo_path = input["repo_path"].as_str().unwrap_or_default().to_string();
+        let db_path = input["db_path"].as_str().map(PathBuf::from);
+        let workspace_id = input["workspace_id"].as_str().map(str::to_string);
+        let agent_id = agent_id.to_string();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let worktree_id = input["worktree_id"].as_str().map(str::to_string);
+        let worktree_path = input["worktree_path"].as_str().map(str::to_string);
+        let lane = lane.map(str::to_string);
+        let summary = input["summary"].as_str().map(str::to_string);
+        thread::spawn(move || {
+            run_submit_patch_job_worker(
+                submit_job_id,
+                repo_path,
+                db_path,
+                workspace_id,
+                agent_id,
+                session_id,
+                task_id,
+                worktree_id,
+                worktree_path,
+                lane,
+                summary,
+            );
+        });
+    }
+    Ok(job)
+}
+
+fn run_submit_patch_job_worker(
+    submit_job_id: String,
+    repo_path: String,
+    db_path: Option<PathBuf>,
+    workspace_id: Option<String>,
+    agent_id: String,
+    session_id: String,
+    task_id: String,
+    worktree_id: Option<String>,
+    worktree_path: Option<String>,
+    lane: Option<String>,
+    summary: Option<String>,
+) {
+    let kernel = match CoordinationKernel::open(&repo_path, db_path.clone()) {
+        Ok(kernel) => kernel,
+        Err(error) => {
+            eprintln!("submit_patch worker failed to open kernel: {error}");
+            return;
+        }
+    };
+    let submitted = match kernel.submit_patch_with_job(
+        &task_id,
+        &agent_id,
+        &session_id,
+        worktree_id.as_deref(),
+        summary.as_deref(),
+        Some(&submit_job_id),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = kernel.finish_submit_job_failure(
+                &submit_job_id,
+                "failed",
+                &error,
+                Some(&api_error("submit_patch_failed", error.clone(), json!({}))),
+            );
+            return;
+        }
+    };
+
+    if submitted["ok"].as_bool() == Some(false) {
+        let message = submitted["error"]["message"]
+            .as_str()
+            .unwrap_or("submit_patch failed")
+            .to_string();
+        let _ =
+            kernel.finish_submit_job_failure(&submit_job_id, "failed", &message, Some(&submitted));
+        return;
+    }
+
+    let _ = kernel.set_submit_job_phase(
+        &submit_job_id,
+        "running",
+        "cloud_syncing",
+        Some("Local patch submission completed; syncing advisory cloud context."),
+    );
     let task_after = kernel
         .query_json(
             "SELECT id, status, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
@@ -1815,29 +1915,37 @@ fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Val
         )
         .ok()
         .and_then(|rows| rows.into_iter().next())
-        .unwrap_or_else(|| task.clone());
+        .unwrap_or_else(|| json!({}));
     let cloud = match crate::cloud_mcp_forward_agent_submit_patch(
-        input["repo_path"].as_str(),
-        input["db_path"].as_str().map(PathBuf::from).as_deref(),
-        input["workspace_id"].as_str(),
-        Some(agent_id),
-        Some(session_id),
-        Some(task_id),
-        input["worktree_id"].as_str(),
-        input["worktree_path"].as_str(),
-        lane,
-        input["summary"].as_str(),
+        Some(repo_path.as_str()),
+        db_path.as_deref(),
+        workspace_id.as_deref(),
+        Some(agent_id.as_str()),
+        Some(session_id.as_str()),
+        Some(task_id.as_str()),
+        worktree_id.as_deref(),
+        worktree_path.as_deref(),
+        lane.as_deref(),
+        summary.as_deref(),
         task_after["status"].as_str(),
         &submitted,
     ) {
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
-    let mut response = submitted;
-    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+    let mut result = submitted;
+    if let Some(data) = result.get_mut("data").and_then(Value::as_object_mut) {
         data.insert("cloud".to_string(), cloud);
     }
-    Ok(response)
+    let _ = kernel.finish_submit_job_success(&submit_job_id, &result);
+}
+
+fn kernel_submit_patch_status(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    kernel.submit_patch_job_status(
+        input["submit_job_id"].as_str(),
+        input["task_id"].as_str(),
+        input["session_id"].as_str(),
+    )
 }
 
 fn apply_context_defaults(context: &McpContext, input: &mut Value) {
@@ -2082,7 +2190,8 @@ fn tool_description(name: &str) -> String {
         "start_task" => "Start the coordination task only after read-only inspection, immediately before editing. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, and patches.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
-        "submit_patch" => "Submit the current task patch for validation and automatic safe integration when possible. You must pass the task_id returned by start_task.".to_string(),
+        "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
+        "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
     }
 }
@@ -2124,9 +2233,18 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
                 "worktree_id": {"type": "string", "description": "Optional; defaults to the current session worktree when available."},
-                "summary": {"type": "string", "description": "Short public summary of the completed changes."}
+                "summary": {"type": "string", "description": "Short public summary of the completed changes."},
+                "client_request_id": {"type": "string", "description": "Optional caller-provided idempotency key. Reusing it returns the existing submit job."}
             },
             "required": ["task_id"],
+            "additionalProperties": true
+        }),
+        "submit_patch_status" => json!({
+            "type": "object",
+            "properties": {
+                "submit_job_id": {"type": "string", "description": "Preferred submit_job_id returned by submit_patch."},
+                "task_id": {"type": "string", "description": "Fallback: return the latest submit job for this task."}
+            },
             "additionalProperties": true
         }),
         _ => json!({"type": "object", "additionalProperties": true}),

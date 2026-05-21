@@ -18,6 +18,8 @@ pub const INTEGRATOR_POLICY_MIGRATION_NAME: &str =
     "coordination_kernel_concurrent_integrator_policy";
 pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION: i64 = 9;
 pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME: &str = "coordination_kernel_terminal_launch_epoch";
+pub const SUBMIT_JOB_MIGRATION_VERSION: i64 = 10;
+pub const SUBMIT_JOB_MIGRATION_NAME: &str = "coordination_kernel_async_submit_jobs";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -342,6 +344,33 @@ CREATE TABLE IF NOT EXISTS patch_file_lease_validations(
   status TEXT NOT NULL,
   reason TEXT,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS submit_jobs(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  worktree_id TEXT,
+  status TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  phase_message TEXT,
+  summary TEXT,
+  lane TEXT,
+  client_request_id TEXT,
+  idempotency_key TEXT NOT NULL,
+  patch_id TEXT,
+  validation_id TEXT,
+  diff_artifact_id TEXT,
+  diff_hash TEXT,
+  result_json TEXT,
+  error_message TEXT,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  phase_timings_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS merge_jobs(
@@ -702,6 +731,11 @@ CREATE INDEX IF NOT EXISTS idx_workspace_changes_resource ON workspace_changes(r
 CREATE INDEX IF NOT EXISTS idx_file_watchers_status ON file_watchers(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_violations_status ON workspace_violations(status);
 CREATE INDEX IF NOT EXISTS idx_patches_status ON patches(status);
+CREATE INDEX IF NOT EXISTS idx_submit_jobs_task ON submit_jobs(task_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_submit_jobs_idempotency ON submit_jobs(idempotency_key, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_submit_jobs_client_request
+ON submit_jobs(client_request_id)
+WHERE client_request_id IS NOT NULL AND client_request_id <> '';
 CREATE INDEX IF NOT EXISTS idx_merge_jobs_status ON merge_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_merge_resolution_tasks_patch ON merge_resolution_tasks(patch_id, status);
 CREATE INDEX IF NOT EXISTS idx_integration_batches_status ON integration_batches(status, updated_at);
@@ -792,4 +826,39 @@ WHERE status='active' AND agent_slot_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_pty
 ON agent_sessions(pty_id)
 WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
+"#;
+
+pub const SUBMIT_JOB_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS submit_jobs(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  worktree_id TEXT,
+  status TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  phase_message TEXT,
+  summary TEXT,
+  lane TEXT,
+  client_request_id TEXT,
+  idempotency_key TEXT NOT NULL,
+  patch_id TEXT,
+  validation_id TEXT,
+  diff_artifact_id TEXT,
+  diff_hash TEXT,
+  result_json TEXT,
+  error_message TEXT,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  phase_timings_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_submit_jobs_task ON submit_jobs(task_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_submit_jobs_idempotency ON submit_jobs(idempotency_key, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_submit_jobs_client_request
+ON submit_jobs(client_request_id)
+WHERE client_request_id IS NOT NULL AND client_request_id <> '';
 "#;

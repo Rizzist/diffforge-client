@@ -15,6 +15,7 @@ use super::schema::{
     INTEGRATOR_POLICY_MIGRATION_NAME, INTEGRATOR_POLICY_MIGRATION_VERSION, MIGRATION_NAME,
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
+    SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
 };
@@ -304,6 +305,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_task_lifecycle_migration(connection)?);
     diagnostics.push(apply_integrator_policy_migration(connection)?);
     diagnostics.push(apply_terminal_launch_epoch_migration(connection)?);
+    diagnostics.push(apply_submit_job_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -566,6 +568,33 @@ fn apply_terminal_launch_epoch_migration(
         TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME,
     )?;
     migration.details.splice(0..0, details);
+    Ok(migration)
+}
+
+fn apply_submit_job_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, SUBMIT_JOB_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            SUBMIT_JOB_MIGRATION_VERSION,
+            SUBMIT_JOB_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry("Unable to initialize async submit job schema", || {
+        connection.execute_batch(SUBMIT_JOB_SCHEMA_SQL)
+    })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        SUBMIT_JOB_MIGRATION_VERSION,
+        SUBMIT_JOB_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        ["SUBMIT_JOB_SCHEMA_SQL executed idempotently".to_string()],
+    );
     Ok(migration)
 }
 

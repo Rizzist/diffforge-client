@@ -416,6 +416,19 @@ pub fn coordination_submit_patch(
 }
 
 #[tauri::command]
+pub fn coordination_submit_patch_status(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel(repo_path, db_path)?.submit_patch_job_status(
+        input["submit_job_id"].as_str(),
+        input["task_id"].as_str(),
+        input["session_id"].as_str(),
+    ))
+}
+
+#[tauri::command]
 pub fn coordination_request_merge(
     repo_path: Option<String>,
     db_path: Option<String>,

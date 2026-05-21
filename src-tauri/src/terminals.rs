@@ -3089,12 +3089,14 @@ fn terminal_push_unique_waiting_on(
         next.task_id.clone(),
         next.agent_id.clone(),
         next.agent_label.clone(),
+        next.slot_key.clone(),
     );
     if waiting_on.iter().any(|existing| {
         (
             existing.task_id.clone(),
             existing.agent_id.clone(),
             existing.agent_label.clone(),
+            existing.slot_key.clone(),
         ) == next_key
     }) {
         return;
@@ -3114,12 +3116,13 @@ fn terminal_parked_waiting_on_from_blocking_dependencies(
             continue;
         }
         let agent_id = item["depends_on_agent_id"].as_str().map(str::to_string);
+        let slot_key = item["depends_on_slot_key"].as_str().map(str::to_string);
         let agent_label = agent_id
             .as_deref()
             .map(terminal_waiting_agent_label)
             .or_else(|| {
-                item["depends_on_slot_key"]
-                    .as_str()
+                slot_key
+                    .as_deref()
                     .map(terminal_waiting_slot_label)
             });
         terminal_push_unique_waiting_on(
@@ -3127,6 +3130,7 @@ fn terminal_parked_waiting_on_from_blocking_dependencies(
             TerminalParkedWaitingOn {
                 agent_id,
                 agent_label,
+                slot_key,
                 task_id: item["depends_on_task_id"].as_str().map(str::to_string),
                 task_title: item["depends_on_title"].as_str().map(str::to_string),
                 resource_key: item["resource_key"].as_str().map(str::to_string),

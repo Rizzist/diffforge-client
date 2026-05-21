@@ -490,7 +490,8 @@ const FILE_PREVIEW_DEFAULT_SIZE = 72;
 const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
 const WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS = 700;
-const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 120000;
+const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS = 120;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
@@ -578,6 +579,64 @@ function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
   }
 
   return false;
+}
+
+function workspaceThreadProjectionIdPart(value, fallback = "event") {
+  const clean = normalizeWorkspaceThreadProjectionText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9_.:-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return clean || fallback;
+}
+
+function getLatestWorkspaceThreadUserMessage(thread) {
+  return [...(Array.isArray(thread?.messages) ? thread.messages : [])]
+    .reverse()
+    .find((message) => String(message?.role || "").trim().toLowerCase() === "user") || null;
+}
+
+function getPromptEventIdFromRunningThread(thread) {
+  const latestTurn = thread?.latestTurn || null;
+  const turnId = String(latestTurn?.turnId || "").trim();
+  if (turnId.startsWith("turn-")) {
+    return turnId.slice(5);
+  }
+
+  const messageId = String(latestTurn?.messageId || "").trim();
+  if (messageId.startsWith("voice-plan-")) {
+    return messageId;
+  }
+
+  const latestUserMessageId = String(getLatestWorkspaceThreadUserMessage(thread)?.id || "").trim();
+  return latestUserMessageId.startsWith("voice-plan-") ? latestUserMessageId : "";
+}
+
+function buildTerminalPromptReadyProjectionEvents(thread, event = {}) {
+  const latestTurn = thread?.latestTurn || null;
+  const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+  const turnId = String(latestTurn?.turnId || "").trim();
+  if (latestTurnState !== "running" || !turnId) {
+    return [];
+  }
+
+  const completedAt = String(event.promptReadyAt || event.completedAt || new Date().toISOString()).trim();
+  const eventKey = workspaceThreadProjectionIdPart(
+    event.promptEventId || event.pendingPromptId || turnId,
+    "terminal-prompt-ready",
+  );
+  return [{
+    agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
+    assistantMessageId: latestTurn.assistantMessageId || "",
+    completedAt,
+    createdAt: completedAt,
+    id: `projection-terminal-prompt-ready-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
+    messageId: latestTurn.messageId || "",
+    source: "terminal-prompt-ready",
+    status: "completed",
+    turnId,
+    type: "thread.turn.completed",
+  }];
 }
 
 function transcriptSubmittedPromptIndex(messages, event = {}) {
@@ -7602,23 +7661,39 @@ export default function App() {
         nativeSessionId: lifecycleNativeSessionId,
       };
     }
-    const lifecyclePromptEventId = String(
+    let lifecyclePromptEventId = String(
       lifecycleEvent.promptEventId
         || lifecycleEvent.pendingPromptId
         || lifecycleEvent.promptId
         || "",
     ).trim();
+    if (!lifecyclePromptEventId && lifecycleEvent.type === "terminal-prompt-ready") {
+      const lifecycleThread = workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+      lifecyclePromptEventId = getPromptEventIdFromRunningThread(lifecycleThread);
+      if (lifecyclePromptEventId) {
+        lifecycleEvent = {
+          ...lifecycleEvent,
+          promptEventId: lifecyclePromptEventId,
+          pendingPromptId: lifecycleEvent.pendingPromptId || lifecyclePromptEventId,
+        };
+      }
+    }
     if (
       lifecyclePromptEventId.startsWith("voice-plan-")
       && (
         lifecycleEvent.type === "provider-turn-completed"
         || lifecycleEvent.type === "provider-turn-error"
+        || lifecycleEvent.type === "terminal-prompt-ready"
       )
     ) {
       window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
         detail: {
           ...lifecycleEvent,
+          completionInferred: lifecycleEvent.type === "terminal-prompt-ready",
           promptEventId: lifecyclePromptEventId,
+          type: lifecycleEvent.type === "terminal-prompt-ready"
+            ? "provider-turn-completed"
+            : lifecycleEvent.type,
         },
       }));
     }
@@ -7689,6 +7764,7 @@ export default function App() {
       lifecycleEvent.type === "message-submitted"
       || lifecycleEvent.type === "provider-turn-started"
       || lifecycleEvent.type === "provider-turn-completed"
+      || lifecycleEvent.type === "terminal-prompt-ready"
       || lifecycleEvent.type === "provider-turn-error"
     ) {
       const projectionEvents = Array.isArray(lifecycleEvent.projectionEvents)
@@ -7731,7 +7807,11 @@ export default function App() {
       });
     }
 
-    if (lifecycleEvent.type === "pending-prompt-sent" || lifecycleEvent.type === "provider-turn-completed") {
+    if (
+      lifecycleEvent.type === "pending-prompt-sent"
+      || lifecycleEvent.type === "provider-turn-completed"
+      || lifecycleEvent.type === "terminal-prompt-ready"
+    ) {
       settleWorkspacePromptDelivery(lifecycleEvent.pendingPromptId || lifecycleEvent.promptId);
     } else if (lifecycleEvent.type === "pending-prompt-error") {
       settleWorkspacePromptDelivery(
@@ -7823,6 +7903,47 @@ export default function App() {
           ? "provider_turn_error"
           : "provider_turn_completed";
         nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+      } else if (lifecycleEvent.type === "terminal-input-ready") {
+        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        if (existingThread) {
+          operation = "terminal_input_ready_idle";
+          nextThreads = markWorkspaceThreadAgentActivity(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+          });
+        } else {
+          operation = "terminal_input_ready_active_terminal";
+          nextThreads = updateWorkspaceActiveTerminal(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+            status: lifecycleEvent.status || "active",
+          });
+        }
+      } else if (lifecycleEvent.type === "terminal-prompt-ready") {
+        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        const projectionEvents = buildTerminalPromptReadyProjectionEvents(existingThread, lifecycleEvent);
+        if (!existingThread && !projectionEvents.length) {
+          operation = "terminal_prompt_ready_active_terminal";
+          nextThreads = updateWorkspaceActiveTerminal(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+            status: lifecycleEvent.status || "active",
+          });
+        } else {
+          operation = projectionEvents.length
+            ? "terminal_prompt_ready_completed"
+            : "terminal_prompt_ready_idle";
+          nextThreads = projectionEvents.length
+            ? appendWorkspaceThreadProjectionEvents(threads, {
+              ...lifecycleEvent,
+              clearPendingPrompt: true,
+              projectionEvents,
+            })
+            : markWorkspaceThreadAgentActivity(threads, {
+              ...lifecycleEvent,
+              activityStatus: "idle",
+            });
+        }
       } else if (lifecycleEvent.type === "agent-output") {
         operation = "mark_agent_activity";
         nextThreads = markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
@@ -7942,6 +8063,7 @@ export default function App() {
         lifecycleEvent.type === "message-submitted"
         || lifecycleEvent.type === "provider-turn-started"
         || lifecycleEvent.type === "provider-turn-completed"
+        || lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "provider-turn-error"
       ) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.apply_delta", {
@@ -7968,6 +8090,10 @@ export default function App() {
     });
 
     const lifecycleHasOutputText = Boolean(lifecycleEvent.outputText || lifecycleEvent.text);
+    const lifecycleThreadForTranscript = workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+    const lifecycleLatestUserMessage = lifecycleEvent.type === "terminal-prompt-ready"
+      ? getLatestWorkspaceThreadUserMessage(lifecycleThreadForTranscript)
+      : null;
     const lifecycleTranscriptExpectedUserMessage = String(
       lifecycleEvent.expectedUserMessage
         || lifecycleEvent.terminalPrompt
@@ -7975,6 +8101,16 @@ export default function App() {
         || lifecycleEvent.terminalText
         || lifecycleEvent.userMessage
         || lifecycleEvent.message
+        || lifecycleLatestUserMessage?.text
+        || "",
+    );
+    const lifecycleTranscriptSubmittedAt = String(
+      lifecycleEvent.messageCreatedAt
+        || lifecycleEvent.promptEventSubmittedAt
+        || lifecycleEvent.submittedAt
+        || lifecycleLatestUserMessage?.createdAt
+        || lifecycleThreadForTranscript?.latestTurn?.startedAt
+        || lifecycleThreadForTranscript?.latestTurn?.requestedAt
         || "",
     );
     const shouldRequestTranscript = (
@@ -7983,6 +8119,7 @@ export default function App() {
       )
       && (
         lifecycleEvent.type === "message-submitted"
+        || lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "provider-session"
         || (lifecycleEvent.type === "opened" && Boolean(lifecycleNativeSessionId))
       )
@@ -7998,11 +8135,19 @@ export default function App() {
     if (shouldRequestTranscript) {
       requestWorkspaceThreadTranscript({
         ...lifecycleEvent,
-        delayMs: lifecycleEvent.type === "message-submitted" ? 240 : 120,
-        expectedMessageCreatedAt: lifecycleEvent.messageCreatedAt || "",
+        allowRecovery: lifecycleEvent.type === "terminal-prompt-ready",
+        allowTimestampFallback: lifecycleEvent.type === "terminal-prompt-ready"
+          || lifecycleEvent.allowTimestampFallback === true,
+        delayMs: lifecycleEvent.type === "message-submitted"
+          ? 240
+          : lifecycleEvent.type === "terminal-prompt-ready"
+            ? WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS
+            : 120,
+        expectedMessageCreatedAt: lifecycleTranscriptSubmittedAt,
         expectedUserMessage: lifecycleTranscriptExpectedUserMessage,
         pollStartedAt: Date.now(),
         pollUntilTurnComplete: lifecycleEvent.type === "message-submitted",
+        submittedAt: lifecycleTranscriptSubmittedAt,
       });
     }
   }, [
