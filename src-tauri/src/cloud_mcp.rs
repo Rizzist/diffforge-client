@@ -1695,6 +1695,32 @@ async fn cloud_mcp_register_prepared_workspace(
         }
     });
     let server_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
+    if reason == "workspace_registration" {
+        let reconcile_payload = json!({
+            "source": "rust-diffforge-terminal-lifecycle",
+            "repo_id": repo_id.clone(),
+            "agent_id": "rust-diffforge",
+            "event_kind": "terminal_presence_reconciled",
+            "reason": "workspace_registration",
+            "workspace_id": prepared.workspace_id,
+            "workspace_name": prepared.workspace_name,
+            "workspace_root": prepared.root_display,
+            "summary": format!("Workspace {} opened; reconciling stale terminal agent presence.", prepared.workspace_name),
+            "payload": {
+                "reason": "workspace_registration",
+                "workspace_id": prepared.workspace_id,
+                "workspace_name": prepared.workspace_name,
+                "workspace_root": prepared.root_display,
+                "managed_by": "rust-diffforge",
+            }
+        });
+        let _ = cloud_mcp_post_event_endpoint(
+            state,
+            "terminal_presence_reconciled",
+            &reconcile_payload,
+        )
+        .await;
+    }
     let filetree_response = cloud_mcp_push_filetree_snapshot(
         state,
         &repo_id,
@@ -2731,6 +2757,72 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     }
 
     None
+}
+
+pub(crate) async fn cloud_mcp_mark_terminal_context_interrupted(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    close_context: &TerminalCloudMcpCloseContext,
+    _reason: &str,
+    brief: &str,
+) -> bool {
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let context_entry = {
+        let runtime = state.inner.lock().await;
+        runtime.terminal_contexts.get(&terminal_key).cloned()
+    };
+    let active_task = close_context.active_task.lock().await.clone();
+    if active_task.is_none() && context_entry.is_none() {
+        return false;
+    }
+
+    if cloud_mcp_connected_or_connect(state).await.is_err() {
+        let mut runtime = state.inner.lock().await;
+        runtime.terminal_contexts.remove(&terminal_key);
+        return false;
+    }
+
+    let coordination = close_context.coordination.as_ref();
+    let working_directory = close_context.working_directory.as_ref();
+    let lane = context_entry
+        .as_ref()
+        .map(|entry| entry.lane.as_str())
+        .filter(|lane| !lane.trim().is_empty())
+        .unwrap_or("terminal-agent")
+        .to_string();
+    let local_task_id = active_task
+        .as_ref()
+        .map(|task| task.task_id.as_str())
+        .or_else(|| {
+            context_entry
+                .as_ref()
+                .and_then(|entry| entry.local_task_id.as_deref())
+        });
+    let title = active_task
+        .as_ref()
+        .map(|task| task.title.as_str())
+        .or_else(|| {
+            context_entry
+                .as_ref()
+                .map(|entry| entry.work_brief.as_str())
+                .filter(|value| !value.trim().is_empty())
+        });
+
+    cloud_mcp_mark_terminal_task_lifecycle(
+        state,
+        pane_id,
+        instance_id,
+        working_directory,
+        coordination,
+        local_task_id,
+        title,
+        "interrupted",
+        &lane,
+        brief,
+    )
+    .await;
+    true
 }
 
 pub(crate) async fn cloud_mcp_mark_terminal_closed(

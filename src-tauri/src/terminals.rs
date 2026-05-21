@@ -1341,12 +1341,13 @@ async fn close_all_terminal_sessions(
         .filter_map(|(_, instance)| terminal_shutdown_coordination_cleanup_from_instance(instance))
         .collect::<Vec<_>>();
 
+    let mut notify_tasks = Vec::new();
     for (pane_id, instance) in &instances {
         let notify_state = cloud_mcp_state.clone();
         let notify_pane_id = pane_id.clone();
         let notify_instance_id = instance.id;
         let notify_context = TerminalCloudMcpCloseContext::from_instance(instance);
-        tauri::async_runtime::spawn(async move {
+        notify_tasks.push(tauri::async_runtime::spawn(async move {
             cloud_mcp_mark_terminal_closed(
                 &notify_state,
                 &notify_pane_id,
@@ -1355,7 +1356,14 @@ async fn close_all_terminal_sessions(
                 "close_all",
             )
             .await;
-        });
+        }));
+    }
+    if !notify_tasks.is_empty() {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            futures_util::future::join_all(notify_tasks),
+        )
+        .await;
     }
 
     emit_terminal_close_all_progress(&app, 0, total, None, None);
@@ -5275,7 +5283,7 @@ async fn terminal_interrupt_agent(
         .as_ref()
         .map(|task| task.task_id.clone());
     write_terminal_interrupt_escape(&instance).await?;
-    mark_terminal_active_task_interrupted(
+    let interrupted_active_task = mark_terminal_active_task_interrupted(
         cloud_mcp_state.inner(),
         &pane_id,
         &instance,
@@ -5283,6 +5291,18 @@ async fn terminal_interrupt_agent(
         "Interrupted by Escape; the terminal remains open for follow-up instructions.",
     )
     .await?;
+    if !interrupted_active_task {
+        let close_context = TerminalCloudMcpCloseContext::from_instance(&instance);
+        cloud_mcp_mark_terminal_context_interrupted(
+            cloud_mcp_state.inner(),
+            &pane_id,
+            instance.id,
+            &close_context,
+            &reason,
+            "Interrupted by Escape before an active task was attached; clearing terminal presence.",
+        )
+        .await;
+    }
     interrupt_terminal_parked_prompts(
         &app,
         state.inner(),

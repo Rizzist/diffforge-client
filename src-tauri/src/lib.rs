@@ -189,6 +189,7 @@ const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
 const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
 const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
 const AUDIO_REALTIME_TRANSCRIPT_EVENT: &str = "forge-audio-realtime-transcript";
+const CLOUD_VOICE_AGENT_EVENT: &str = "forge-cloud-voice-agent-event";
 const MAX_AUDIO_TRANSCRIPT_INSERT_CHARS: usize = 8_000;
 const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-progress";
 const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
@@ -413,11 +414,17 @@ struct TerminalAudioInputRefocusPayload {
 #[derive(Clone)]
 struct AudioState {
     download_lock: Arc<Mutex<()>>,
+    cloud_voice_agent_stream: Arc<Mutex<Option<CloudVoiceAgentSession>>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     input_worker: NativeAudioWorker,
+    realtime_stream_lock: Arc<Mutex<()>>,
     shortcut_manager: AudioShortcutManager,
     whisper_cancel_token: Arc<AtomicU64>,
     whisper_engine: WhisperCliWarmCache,
+}
+
+struct CloudVoiceAgentSession {
+    finished_rx: oneshot::Receiver<Result<(), String>>,
 }
 
 struct DeepgramRealtimeSession {
@@ -1287,6 +1294,24 @@ struct DeepgramRealtimeStartStatus {
     sample_rate: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudVoiceAgentStartRequest {
+    repo_id: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    workspace_root: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudVoiceAgentStartStatus {
+    active: bool,
+    repo_id: String,
+    sample_rate: u32,
+    workspace_id: String,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeepgramRealtimeTranscriptEvent {
@@ -2058,8 +2083,10 @@ pub fn run() {
         .manage(DeveloperProcessMonitorState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
+            cloud_voice_agent_stream: Arc::new(Mutex::new(None)),
             deepgram_stream: Arc::new(Mutex::new(None)),
             input_worker: NativeAudioWorker::new(),
+            realtime_stream_lock: Arc::new(Mutex::new(())),
             shortcut_manager: AudioShortcutManager::new(),
             whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
@@ -2146,6 +2173,8 @@ pub fn run() {
             cancel_whisper_transcription,
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
+            start_cloud_voice_agent_stream,
+            stop_cloud_voice_agent_stream,
             audio_shortcuts_status,
             audio_push_to_talk_status,
             open_audio_shortcut_permissions,
