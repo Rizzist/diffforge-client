@@ -418,20 +418,6 @@ import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import WebWorkspaceView, { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
-import {
-  buildTerminalComposerDraftInput,
-  getTerminalInputDebugFields,
-} from "../terminals/WorkspaceTerminal/terminalCore.js";
-import {
-  createTerminalPromptSubmittedWaiter,
-  createWorkspaceThreadPromptAcceptedWaiter,
-  getTerminalSubmitSequence,
-  getThreadComposerSyncKey,
-  getWorkspaceThreadComposerDraftStore,
-  requestTerminalSubmitDiagnosticSnapshot,
-  setWorkspaceThreadComposerDraft,
-  waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
-} from "../terminals/WorkspaceTerminal/threadRuntime.js";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -475,8 +461,6 @@ const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_THEME_DARK = "dark";
-const SPEC_EDIT_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
-const SPEC_EDIT_PROMPT_ACCEPT_TIMEOUT_MS = 45000;
 const APP_THEME_LIGHT = "light";
 const APP_THEME_DEFAULT = APP_THEME_DARK;
 const APP_THEME_META_COLORS = {
@@ -509,6 +493,9 @@ const WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS = 700;
 const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 120000;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
+const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
+const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
+const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
 
 function getThreadDiagnosticTextLength(value) {
   return String(value ?? "").length;
@@ -1159,226 +1146,6 @@ function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
     "For delete, retire or supersede the selected spec through the Spec Graph workflow; do not hard-delete history.",
   );
   return lines.join("\n");
-}
-
-async function submitSpecEditPromptWithConfirmedEnter({
-  agent,
-  onSubmitted,
-  prompt,
-  promptId,
-  submittedAt,
-  workspaceId,
-}) {
-  const agentId = String(agent?.agentId || "").trim();
-  const instanceId = agent?.instanceId;
-  const paneId = String(agent?.paneId || "").trim();
-  const threadId = String(agent?.threadId || agent?.thread?.id || "").trim();
-  if (!paneId || !instanceId || !threadId) {
-    throw new Error("Choose an active agent terminal with a live thread.");
-  }
-
-  const terminalIndex = Number.isInteger(agent?.terminalIndex) ? agent.terminalIndex : undefined;
-  const binding = { instanceId, paneId, terminalIndex };
-  const thread = {
-    ...(agent?.thread && typeof agent.thread === "object" ? agent.thread : {}),
-    id: threadId,
-    workspaceId: workspaceId || agent?.workspaceId || agent?.thread?.workspaceId || "",
-  };
-  const syncKey = getThreadComposerSyncKey(thread, binding);
-  const previousDraft = syncKey
-    ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-    : "";
-  const submitSequence = getTerminalSubmitSequence(agentId, false);
-  if (!syncKey || !submitSequence) {
-    throw new Error("Unable to prepare this agent terminal for confirmed submission.");
-  }
-
-  const promptText = String(prompt || "");
-  const syncData = buildTerminalComposerDraftInput(previousDraft, promptText, true);
-  const requestSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
-    requestTerminalSubmitDiagnosticSnapshot({
-      agentId,
-      delayMs,
-      expectedPrompt: promptText,
-      expectedPromptLength: promptText.length,
-      paneId,
-      promptId,
-      reason,
-      syncKey,
-      targetTerminalIndex: terminalIndex ?? "",
-      threadId,
-      workspaceId,
-      ...extraFields,
-    });
-  };
-
-  setWorkspaceThreadComposerDraft(syncKey, promptText);
-  logBigViewSyncDiagnosticEvent("spec_edit.prompt_sync_start", {
-    agentId,
-    paneId,
-    previousDraftLength: previousDraft.length,
-    promptId,
-    syncData: getTerminalInputDebugFields(syncData),
-    syncDataLength: syncData.length,
-    syncKey,
-    targetTerminalIndex: terminalIndex ?? "",
-    threadId,
-    workspaceId,
-  });
-  const syncWriteStartedAt = performance.now();
-  if (syncData) {
-    await invoke("terminal_write", {
-      data: syncData,
-      instanceId,
-      paneId,
-      threadId,
-    });
-  }
-  logBigViewSyncDiagnosticEvent("spec_edit.prompt_sync_done", {
-    agentId,
-    paneId,
-    promptId,
-    syncDataLength: syncData.length,
-    syncKey,
-    syncWriteDurationMs: Math.round(performance.now() - syncWriteStartedAt),
-    targetTerminalIndex: terminalIndex ?? "",
-    threadId,
-    workspaceId,
-  });
-  requestSubmitSnapshot("spec_edit.after_sync_before_enter");
-  requestSubmitSnapshot("spec_edit.after_sync_before_enter_300ms", 300);
-
-  const submittedWaiter = await createTerminalPromptSubmittedWaiter({
-    agentId,
-    expectedPrompt: promptText,
-    instanceId,
-    paneId,
-    promptId,
-    threadId,
-    workspaceId,
-  });
-  const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
-    agentId,
-    expectedPrompt: promptText,
-    promptId,
-    threadId,
-    timeoutMs: SPEC_EDIT_PROMPT_ACCEPT_TIMEOUT_MS,
-    workspaceId,
-  });
-
-  try {
-    const promptSubmittedAt = String(submittedAt || "").trim() || new Date().toISOString();
-    logBigViewSyncDiagnosticEvent("spec_edit.prompt_enter_write", {
-      agentId,
-      paneId,
-      promptId,
-      submitSequenceLength: submitSequence.length,
-      syncKey,
-      targetTerminalIndex: terminalIndex ?? "",
-      threadId,
-      workspaceId,
-    });
-    const writeResult = await invoke("terminal_write", {
-      data: submitSequence,
-      instanceId,
-      paneId,
-      promptEventId: promptId,
-      promptEventSource: "spec-edit",
-      promptEventSubmittedAt: promptSubmittedAt,
-      promptEventText: promptText,
-      threadId,
-    });
-    requestSubmitSnapshot("spec_edit.after_enter_write", 160, {
-      submitSequenceLength: submitSequence.length,
-    });
-    requestSubmitSnapshot("spec_edit.after_enter_write_900ms", 900, {
-      submitSequenceLength: submitSequence.length,
-    });
-
-    await submittedWaiter.promise;
-    onSubmitted?.();
-    logBigViewSyncDiagnosticEvent("spec_edit.prompt_submit_observed", {
-      agentId,
-      paneId,
-      promptId,
-      syncKey,
-      targetTerminalIndex: terminalIndex ?? "",
-      threadId,
-      workspaceId,
-    });
-
-    try {
-      const acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
-        acceptedWaiter,
-        agentId,
-        binding,
-        expectedPrompt: promptText,
-        getDraftValue: () => String(getWorkspaceThreadComposerDraftStore().get(syncKey) || ""),
-        isGenericTerminal: false,
-        logPrefix: "frontend.spec_edit",
-        promptId,
-        retryDelaysMs: SPEC_EDIT_PROMPT_ACCEPT_RETRY_DELAYS_MS,
-        submitSequence,
-        threadId,
-        workspaceId,
-      });
-      logBigViewSyncDiagnosticEvent("spec_edit.prompt_submit_accepted", {
-        acceptedMatchedBy: acceptedDetail?.matchedBy || "",
-        agentId,
-        paneId,
-        promptId,
-        sessionIdPresent: Boolean(acceptedDetail?.sessionId),
-        syncKey,
-        targetTerminalIndex: terminalIndex ?? "",
-        threadId,
-        workspaceId,
-      });
-      return {
-        accepted: true,
-        acceptedDetail,
-        confirmedSubmit: true,
-        promptId,
-        submittedAt: promptSubmittedAt,
-        syncKey,
-        writeResult,
-      };
-    } catch (acceptError) {
-      logBigViewSyncDiagnosticEvent("spec_edit.prompt_accept_timeout_after_submit", {
-        agentId,
-        message: getErrorMessage(acceptError, "Timed out waiting for agent session acceptance."),
-        paneId,
-        promptId,
-        syncKey,
-        targetTerminalIndex: terminalIndex ?? "",
-        threadId,
-        workspaceId,
-      });
-      return {
-        accepted: false,
-        acceptError,
-        confirmedSubmit: true,
-        promptId,
-        submittedAt: promptSubmittedAt,
-        syncKey,
-        writeResult,
-      };
-    }
-  } catch (submitError) {
-    submittedWaiter.cancel();
-    acceptedWaiter.cancel();
-    requestSubmitSnapshot("spec_edit.submit_confirm_error_snapshot");
-    logBigViewSyncDiagnosticEvent("spec_edit.prompt_submit_confirm_error", {
-      agentId,
-      message: getErrorMessage(submitError, "Unable to submit spec edit."),
-      paneId,
-      promptId,
-      syncKey,
-      targetTerminalIndex: terminalIndex ?? "",
-      threadId,
-      workspaceId,
-    });
-    throw submitError;
-  }
 }
 
 function specEditField(item, ...keys) {
@@ -6513,51 +6280,48 @@ export default function App() {
     Object.values(pendingSpecEditIntents)
       .filter((intent) => intent?.workspaceId && intent.workspaceId === (selectedWorkspace?.id || ""))
   ), [pendingSpecEditIntents, selectedWorkspace?.id]);
-  const activeSpecEditAgents = useMemo(() => {
-    if (!activatedWorkspace) {
-      return [];
-    }
-
-    return activatedWorkspaceAgentTerminalEntries
-      .map(({ role, terminalIndex }) => {
-        const agent = activatedWorkspaceTerminalAgentsByIndex[terminalIndex];
-        if (!agent || role === WORKSPACE_TERMINAL_ROLE_GENERIC) {
-          return null;
-        }
-        const thread = activatedWorkspaceThreadsByIndex[terminalIndex] || null;
-        const providerBinding = getWorkspaceThreadProviderBinding(thread, agent.id);
-        const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || {};
-        const status = String(providerBinding?.status || thread?.status || "").toLowerCase();
-        const paneId = String(terminalBinding?.paneId || "").trim();
-        const instanceId = terminalBinding?.instanceId || "";
-        const closed = ["closed", "error", "exited", "idle"].includes(status);
-        const latestTurnState = String(thread?.latestTurn?.state || "").toLowerCase();
-
+  useEffect(() => {
+    const handleSpecEditDispatched = (event) => {
+      const detail = event?.detail || {};
+      const intentId = String(detail.intentId || detail.intent_id || "").trim();
+      if (!intentId) return;
+      setPendingSpecEditIntents((current) => {
+        const intent = current[intentId];
+        if (!intent) return current;
         return {
-          activityStatus: providerBinding?.activityStatus || thread?.activityStatus || "",
-          agentId: agent.id,
-          instanceId,
-          key: `${terminalIndex}:${agent.id}:${paneId}:${instanceId}`,
-          label: agent.label || getTerminalRoleOption(role, workspaceTerminalRoleOptions).label,
-          latestTurnState,
-          model: providerBinding?.modelId || "",
-          paneId,
-          ready: Boolean(paneId && instanceId && thread?.id && !closed),
-          status: status || (paneId && instanceId ? "active" : ""),
-          terminalIndex,
-          thread,
-          threadId: thread?.id || "",
-          workspaceId: activatedWorkspace.id,
+          ...current,
+          [intentId]: {
+            ...intent,
+            agentId: detail.agentId || detail.agent_id || intent.agentId || "",
+            agentLabel: detail.agentLabel || detail.agent_label || detail.agentId || intent.agentLabel || "agent",
+            dispatchedAt: detail.dispatchedAt || detail.dispatched_at || new Date().toISOString(),
+            terminalId: detail.terminalId || detail.terminal_id || intent.terminalId || "",
+            terminalIndex: Number.isInteger(detail.terminalIndex) ? detail.terminalIndex : intent.terminalIndex,
+            terminalInstanceId: detail.terminalInstanceId || detail.terminal_instance_id || intent.terminalInstanceId || "",
+            threadId: detail.threadId || detail.thread_id || intent.threadId || "",
+          },
         };
-      })
-      .filter(Boolean);
-  }, [
-    activatedWorkspace?.id,
-    activatedWorkspaceAgentTerminalEntries,
-    activatedWorkspaceTerminalAgentsByIndex,
-    activatedWorkspaceThreadsByIndex,
-    workspaceTerminalRoleOptions,
-  ]);
+      });
+    };
+    const handleSpecEditCancelled = (event) => {
+      const detail = event?.detail || {};
+      const intentId = String(detail.intentId || detail.intent_id || "").trim();
+      if (!intentId) return;
+      setPendingSpecEditIntents((current) => {
+        if (!current[intentId]) return current;
+        const next = { ...current };
+        delete next[intentId];
+        return next;
+      });
+    };
+
+    window.addEventListener(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, handleSpecEditDispatched);
+    window.addEventListener(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, handleSpecEditCancelled);
+    return () => {
+      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, handleSpecEditDispatched);
+      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, handleSpecEditCancelled);
+    };
+  }, []);
   const submitSpecEditIntent = useCallback(async (payload) => {
     if (!selectedWorkspace || !activatedWorkspace || selectedWorkspace.id !== activatedWorkspace.id) {
       throw new Error("Activate this workspace to edit specs.");
@@ -6569,15 +6333,10 @@ export default function App() {
     if (!repoPath) {
       throw new Error("Workspace root is not available.");
     }
-    const agent = payload?.agent || {};
-    if (!agent.paneId || !agent.instanceId) {
-      throw new Error("Choose an active agent terminal.");
-    }
-    const agentThreadId = String(agent.threadId || agent.thread?.id || "").trim();
 
     const intentId = createSpecEditIntentId();
     const intentPayload = {
-      agent_id: agent.agentId || "",
+      agent_id: "",
       base_graph_hash: payload.baseGraphHash || "",
       base_node_hash: payload.baseNodeHash || "",
       current_statement: payload.currentStatement || "",
@@ -6585,15 +6344,15 @@ export default function App() {
       event_kind: "spec_edit_requested",
       intent_id: intentId,
       operation: payload.operation || "edit",
-      status: "requested",
+      status: "queued",
       target_node_id: payload.targetNodeId || "",
       target_path: payload.targetPath || "",
       target_spec_object_id: payload.targetSpecObjectId || "",
       target_title: payload.targetTitle || "",
-      terminal_id: agent.paneId || "",
-      terminal_index: agent.terminalIndex,
-      terminal_instance_id: String(agent.instanceId || ""),
-      thread_id: agentThreadId,
+      terminal_id: "",
+      terminal_index: null,
+      terminal_instance_id: "",
+      thread_id: "",
       user_instruction: payload.userInstruction || "",
     };
 
@@ -6606,86 +6365,67 @@ export default function App() {
       workspaceId: selectedWorkspace.id,
       workspaceName: selectedWorkspace.name || "",
     });
-    let ghostAdded = false;
-    const addPendingSpecEditGhost = () => {
-      if (ghostAdded) return;
-      ghostAdded = true;
-      setPendingSpecEditIntents((current) => ({
-        ...current,
-        [intentId]: {
-          agentId: agent.agentId || "",
-          agentLabel: agent.label || agent.agentId || "Agent",
-          baseGraphHash: payload.baseGraphHash || "",
-          baseNodeHash: payload.baseNodeHash || "",
+
+    setPendingSpecEditIntents((current) => ({
+      ...current,
+      [intentId]: {
+        agentId: "",
+        agentLabel: "the next available agent",
+        baseGraphHash: payload.baseGraphHash || "",
+        baseNodeHash: payload.baseNodeHash || "",
+        createdAt: promptSubmittedAt,
+        currentStatement: payload.currentStatement || "",
+        desiredStatement: payload.desiredStatement || "",
+        intentId,
+        operation: payload.operation || "edit",
+        promptText: prompt,
+        repoPath,
+        submittedAt: promptSubmittedAt,
+        submittedAtMs: promptSubmittedAtMs,
+        targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
+        targetNodeId: payload.targetNodeId || "",
+        targetPath: payload.targetPath || "",
+        targetSpecObjectId: payload.targetSpecObjectId || "",
+        targetTitle: payload.targetTitle || "",
+        terminalId: "",
+        terminalIndex: null,
+        terminalInstanceId: "",
+        threadId: "",
+        userInstruction: payload.userInstruction || "",
+        workspaceId: selectedWorkspace.id,
+      },
+    }));
+
+    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_EVENT, {
+      detail: {
+        item: {
           createdAt: promptSubmittedAt,
-          currentStatement: payload.currentStatement || "",
-          desiredStatement: payload.desiredStatement || "",
-          intentId,
-          operation: payload.operation || "edit",
-          promptText: prompt,
-          repoPath,
-          submittedAt: promptSubmittedAt,
-          submittedAtMs: promptSubmittedAtMs,
-          targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
-          targetNodeId: payload.targetNodeId || "",
-          targetPath: payload.targetPath || "",
-          targetSpecObjectId: payload.targetSpecObjectId || "",
-          targetTitle: payload.targetTitle || "",
-          terminalIndex: agent.terminalIndex,
-          threadId: agentThreadId,
-          userInstruction: payload.userInstruction || "",
+          id: intentId,
+          kind: "spec-edit",
+          source: "tui-spec-edit-auto-queue",
+          specEdit: {
+            baseGraphHash: payload.baseGraphHash || "",
+            baseNodeHash: payload.baseNodeHash || "",
+            intentId,
+            intentPayload,
+            operation: payload.operation || "edit",
+            promptText: prompt,
+            repoPath,
+            targetNodeId: payload.targetNodeId || "",
+            targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
+            targetPath: payload.targetPath || "",
+            targetSpecObjectId: payload.targetSpecObjectId || "",
+            targetTitle: payload.targetTitle || "",
+            workspaceId: selectedWorkspace.id,
+            workspaceName: selectedWorkspace.name || "",
+          },
+          text: `Spec edit: ${payload.operation || "edit"} ${payload.targetTitle || payload.targetPath || "spec"}`,
           workspaceId: selectedWorkspace.id,
         },
-      }));
-    };
-    try {
-      await submitSpecEditPromptWithConfirmedEnter({
-        agent,
-        onSubmitted: addPendingSpecEditGhost,
-        prompt,
-        promptId: intentId,
-        submittedAt: promptSubmittedAt,
-        workspaceId: selectedWorkspace.id,
-      });
-      addPendingSpecEditGhost();
-    } catch (error) {
-      if (!ghostAdded) {
-        setPendingSpecEditIntents((current) => {
-          if (!current[intentId]) return current;
-          const next = { ...current };
-          delete next[intentId];
-          return next;
-        });
-      }
-      invoke("cloud_mcp_record_spec_edit_intent", {
-        intent: {
-          ...intentPayload,
-          event_kind: "spec_edit_cancelled",
-          status: "cancelled",
-          user_instruction: `${intentPayload.user_instruction || ""}\n\nDispatch failed: ${getErrorMessage(error, "Terminal write failed.")}`.trim(),
-        },
-        repoPath,
-        workspaceId: selectedWorkspace.id,
-        workspaceName: selectedWorkspace.name || "",
-      }).catch(() => {});
-      throw error;
-    }
-    invoke("cloud_mcp_record_spec_edit_intent", {
-      intent: {
-        ...intentPayload,
-        event_kind: "spec_edit_dispatched",
-        status: "dispatched",
-      },
-      repoPath,
-      workspaceId: selectedWorkspace.id,
-      workspaceName: selectedWorkspace.name || "",
-    }).catch((error) => {
-      logBigViewSyncDiagnosticEvent("spec_edit.dispatch_status_error", {
         intentId,
-        message: getErrorMessage(error, "Unable to mark spec edit dispatched."),
         workspaceId: selectedWorkspace.id,
-      });
-    });
+      },
+    }));
 
     return {
       intentId,
@@ -9363,7 +9103,6 @@ export default function App() {
                       onSubmitSpecEditIntent={submitSpecEditIntent}
                       pendingSpecEdits={selectedWorkspacePendingSpecEdits}
                       rootDirectory={selectedWorkspaceFileRoot}
-                      specEditAgents={isSelectedWorkspaceActivated ? activeSpecEditAgents : []}
                       specGraphError={selectedWorkspaceGraphState.specError || ""}
                       specGraphSnapshot={selectedWorkspaceGraphState.specSnapshot || null}
                       specGraphState={selectedWorkspaceGraphState.specState || "idle"}

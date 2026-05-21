@@ -95,6 +95,11 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   phase: "idle",
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
+const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
+const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
+const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
+const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
+const TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO = "tui-spec-edit-auto-queue";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
 const ORCHESTRATOR_VOICE_RING_CENTER = 50;
@@ -2153,6 +2158,64 @@ function normalizeTodoQueueNote(value) {
   };
 }
 
+function normalizeTodoQueueKind(value) {
+  const kind = String(value || "").trim().toLowerCase();
+  return kind === TODO_QUEUE_KIND_SPEC_EDIT ? TODO_QUEUE_KIND_SPEC_EDIT : "todo";
+}
+
+function normalizeTodoQueueSource(value) {
+  return String(value || "").trim().slice(0, 80);
+}
+
+function normalizeTodoQueueSpecEdit(value) {
+  const specEdit = value && typeof value === "object" ? value : null;
+  if (!specEdit) {
+    return null;
+  }
+
+  const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object" && !Array.isArray(specEdit.intentPayload)
+    ? { ...specEdit.intentPayload }
+    : null;
+  const intentId = String(
+    specEdit.intentId
+      || specEdit.intent_id
+      || intentPayload?.intent_id
+      || "",
+  ).trim();
+  const promptText = normalizeTodoQueueMultilineText(
+    specEdit.promptText
+      || specEdit.prompt
+      || specEdit.terminalText
+      || "",
+  );
+
+  if (!intentId && !promptText) {
+    return null;
+  }
+
+  return {
+    ...(intentPayload ? { intentPayload } : {}),
+    baseGraphHash: String(specEdit.baseGraphHash || specEdit.base_graph_hash || intentPayload?.base_graph_hash || "").trim(),
+    baseNodeHash: String(specEdit.baseNodeHash || specEdit.base_node_hash || intentPayload?.base_node_hash || "").trim(),
+    intentId,
+    operation: String(specEdit.operation || intentPayload?.operation || "edit").trim().slice(0, 40),
+    promptText,
+    repoPath: String(specEdit.repoPath || specEdit.repo_path || "").trim().slice(0, 4096),
+    targetNodeId: String(specEdit.targetNodeId || specEdit.target_node_id || intentPayload?.target_node_id || "").trim(),
+    targetNodeSignature: String(specEdit.targetNodeSignature || specEdit.target_node_signature || "").trim(),
+    targetPath: String(specEdit.targetPath || specEdit.target_path || intentPayload?.target_path || "").trim(),
+    targetSpecObjectId: String(
+      specEdit.targetSpecObjectId
+        || specEdit.target_spec_object_id
+        || intentPayload?.target_spec_object_id
+        || "",
+    ).trim(),
+    targetTitle: String(specEdit.targetTitle || specEdit.target_title || intentPayload?.target_title || "").trim(),
+    workspaceId: String(specEdit.workspaceId || specEdit.workspace_id || "").trim(),
+    workspaceName: String(specEdit.workspaceName || specEdit.workspace_name || "").trim(),
+  };
+}
+
 function normalizeVoiceAgentQueueArguments(value) {
   if (typeof value === "string") {
     try {
@@ -2201,7 +2264,7 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
     return null;
   }
 
-  return createTodoQueueItem(text);
+  return createTodoQueueItem(text, { source: "tui-voice-agent-queue" });
 }
 
 function normalizeVoiceHistoryText(value, maxLength = TODO_QUEUE_MAX_TEXT_LENGTH) {
@@ -2284,6 +2347,16 @@ function getTodoQueueItemNote(item) {
   return normalizeTodoQueueNote(item?.note || item?.noteText || item?.longText);
 }
 
+function getTodoQueueItemSpecEdit(item) {
+  const specEdit = normalizeTodoQueueSpecEdit(item?.specEdit || item?.spec_edit);
+  return specEdit?.intentId || specEdit?.promptText ? specEdit : null;
+}
+
+function isSpecEditTodoQueueItem(item) {
+  return normalizeTodoQueueKind(item?.kind || item?.type) === TODO_QUEUE_KIND_SPEC_EDIT
+    || Boolean(getTodoQueueItemSpecEdit(item));
+}
+
 function getTodoQueueNoteFromPastedText(value) {
   return getTodoQueueLineCount(value) > TODO_QUEUE_NOTE_LINE_THRESHOLD
     ? normalizeTodoQueueNote(value)
@@ -2338,6 +2411,11 @@ function dedupeTodoQueueImages(images) {
 }
 
 function getTodoQueueItemTerminalText(item) {
+  const specEdit = getTodoQueueItemSpecEdit(item);
+  if (specEdit?.promptText) {
+    return specEdit.promptText;
+  }
+
   const text = normalizeTodoQueueText(item?.text);
   const note = getTodoQueueItemNote(item);
 
@@ -2350,6 +2428,64 @@ function getTodoQueueItemTerminalText(item) {
 
 function getTodoQueueItemThreadMessageText(item, fallback = "") {
   return getTodoQueueItemTerminalText(item) || String(fallback || "");
+}
+
+function getTodoQueueItemAutoQueueSource(item) {
+  if (isSpecEditTodoQueueItem(item)) {
+    return TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO;
+  }
+
+  const source = normalizeTodoQueueSource(item?.source);
+  if (source === "tui-voice-agent-queue") {
+    return source;
+  }
+
+  return "tui-todo-auto-queue";
+}
+
+function getTodoQueueAttachmentSource(source) {
+  if (source === TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO) {
+    return "tui_spec_edit_auto_queue";
+  }
+  if (source === "tui-voice-agent-queue") {
+    return "tui_voice_agent_queue";
+  }
+  return source === "tui-todo-auto-queue" ? "tui_todo_auto_queue" : "tui_todo_drop";
+}
+
+function getTodoQueuePromptEventSource(source, item) {
+  if (isSpecEditTodoQueueItem(item)) {
+    return "spec-edit";
+  }
+  if (source === "tui-todo-auto-queue") {
+    return "todo-auto-queue";
+  }
+  if (source === "tui-voice-agent-queue") {
+    return "voice-agent-queue";
+  }
+  return "terminal-view-drop";
+}
+
+function getTodoQueueLifecycleSource(source, item) {
+  if (isSpecEditTodoQueueItem(item)) {
+    return TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO;
+  }
+  return source === "tui-todo-auto-queue" || source === "tui-voice-agent-queue"
+    ? source
+    : "tui-todo-drop";
+}
+
+function getTodoQueueAcceptLogPrefix(source, item) {
+  if (isSpecEditTodoQueueItem(item)) {
+    return "frontend.spec_edit";
+  }
+  if (source === "tui-todo-auto-queue") {
+    return "frontend.todo_auto_queue";
+  }
+  if (source === "tui-voice-agent-queue") {
+    return "frontend.voice_agent_queue";
+  }
+  return "frontend.todo_drop";
 }
 
 function normalizeTodoTerminalAgentId(value) {
@@ -2437,12 +2573,17 @@ function getTodoQueueItemLogSummary(items) {
     .map((item) => {
       const image = getTodoQueueItemImage(item);
       const note = getTodoQueueItemNote(item);
+      const specEdit = getTodoQueueItemSpecEdit(item);
       return {
         hasImage: Boolean(image),
         hasNote: Boolean(note),
+        hasSpecEdit: Boolean(specEdit),
         id: String(item?.id || ""),
         image: image ? getTodoImageLogSummary([image])[0] || null : null,
+        kind: normalizeTodoQueueKind(item?.kind || item?.type),
         noteLength: note ? normalizeTodoQueueMultilineText(note.text).length : 0,
+        source: normalizeTodoQueueSource(item?.source),
+        specEditIntentId: specEdit?.intentId || "",
         textLength: normalizeTodoQueueText(item?.text).length,
       };
     });
@@ -2520,6 +2661,11 @@ async function saveTodoQueueTextAttachment(note) {
 }
 
 async function prepareTodoTerminalText(item) {
+  const specEdit = getTodoQueueItemSpecEdit(item);
+  if (specEdit?.promptText) {
+    return specEdit.promptText;
+  }
+
   const text = normalizeTodoQueueText(item?.text);
   const note = getTodoQueueItemNote(item);
   const parts = [];
@@ -2627,19 +2773,31 @@ function getTodoQueuePendingPhase(pendingItem) {
 }
 
 function createTodoQueueItem(text, options = {}) {
-  const createdAt = new Date().toISOString();
-  const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+  const createdAt = typeof options.createdAt === "string" && options.createdAt.trim()
+    ? options.createdAt
+    : new Date().toISOString();
+  const id = typeof options.id === "string" && options.id.trim()
+    ? options.id.trim()
+    : typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const image = normalizeTodoQueueImage(options.image);
   const note = normalizeTodoQueueNote(options.note);
+  const kind = normalizeTodoQueueKind(options.kind);
+  const source = normalizeTodoQueueSource(options.source);
+  const specEdit = normalizeTodoQueueSpecEdit(options.specEdit);
+  const workspaceId = String(options.workspaceId || specEdit?.workspaceId || "").trim();
 
   return {
     createdAt,
     id,
     ...(image ? { image } : {}),
+    kind,
     ...(note ? { note } : {}),
-    text,
+    ...(source ? { source } : {}),
+    ...(specEdit ? { specEdit } : {}),
+    text: normalizeTodoQueueText(text),
+    ...(workspaceId ? { workspaceId } : {}),
   };
 }
 
@@ -2651,7 +2809,11 @@ function normalizeTodoQueueItem(item) {
   const text = normalizeTodoQueueText(item.text);
   const image = getTodoQueueItemImage(item);
   const note = getTodoQueueItemNote(item);
-  if (!text && !image && !note) {
+  const kind = normalizeTodoQueueKind(item.kind || item.type);
+  const source = normalizeTodoQueueSource(item.source);
+  const specEdit = getTodoQueueItemSpecEdit(item);
+  const workspaceId = String(item.workspaceId || item.workspace_id || specEdit?.workspaceId || "").trim();
+  if (!text && !image && !note && !specEdit?.promptText) {
     return null;
   }
 
@@ -2661,8 +2823,12 @@ function normalizeTodoQueueItem(item) {
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     ...(image ? { image } : {}),
+    kind: specEdit ? TODO_QUEUE_KIND_SPEC_EDIT : kind,
     ...(note ? { note } : {}),
+    ...(source ? { source } : {}),
+    ...(specEdit ? { specEdit } : {}),
     text,
+    ...(workspaceId ? { workspaceId } : {}),
   };
 }
 
@@ -4693,6 +4859,132 @@ function TerminalView({
     replaceTodoQueuePendingItems({});
   }, [replaceTodoQueuePendingItems, todoQueueStorageKey]);
 
+  const recordTodoQueueSpecEditDispatch = useCallback(async ({
+    item,
+    paneId,
+    target,
+    targetBinding,
+    targetRole,
+    targetThread,
+    workspaceId,
+  } = {}) => {
+    const specEdit = getTodoQueueItemSpecEdit(item);
+    if (!specEdit?.intentId) {
+      return;
+    }
+
+    const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object"
+      ? specEdit.intentPayload
+      : {};
+    const targetTerminalIndex = Number.isInteger(target?.targetTerminalIndex)
+      ? target.targetTerminalIndex
+      : null;
+    const terminalInstanceId = String(targetBinding?.instanceId || "");
+    const threadId = String(targetThread?.id || "");
+    const agentId = String(targetRole || intentPayload.agent_id || "").trim();
+    const repoPath = specEdit.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    const nextWorkspaceId = specEdit.workspaceId || workspaceId || terminalWorkspace?.id || "";
+    const workspaceName = specEdit.workspaceName || terminalWorkspace?.name || "";
+    const dispatchedAt = new Date().toISOString();
+    const intent = {
+      ...intentPayload,
+      agent_id: agentId,
+      event_kind: "spec_edit_dispatched",
+      intent_id: specEdit.intentId,
+      status: "dispatched",
+      terminal_id: paneId || "",
+      terminal_index: targetTerminalIndex,
+      terminal_instance_id: terminalInstanceId,
+      thread_id: threadId,
+    };
+
+    try {
+      await invoke("cloud_mcp_record_spec_edit_intent", {
+        intent,
+        repoPath,
+        workspaceId: nextWorkspaceId,
+        workspaceName,
+      });
+    } catch (error) {
+      logBigViewSyncDiagnosticEvent("spec_edit.queue_dispatch_status_error", {
+        intentId: specEdit.intentId,
+        message: getTodoDropErrorMessage(error),
+        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+        workspaceId: nextWorkspaceId,
+      });
+    }
+
+    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, {
+      detail: {
+        agentId,
+        agentLabel: target?.terminalAgent?.label || agentId || "agent",
+        dispatchedAt,
+        intentId: specEdit.intentId,
+        terminalId: paneId || "",
+        terminalIndex: targetTerminalIndex,
+        terminalInstanceId,
+        threadId,
+        workspaceId: nextWorkspaceId,
+      },
+    }));
+  }, [
+    defaultWorkingDirectory,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+  ]);
+
+  const recordTodoQueueSpecEditCancelled = useCallback((item, reason = "cancelled", message = "") => {
+    const specEdit = getTodoQueueItemSpecEdit(item);
+    if (!specEdit?.intentId) {
+      return;
+    }
+
+    const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object"
+      ? specEdit.intentPayload
+      : {};
+    const repoPath = specEdit.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    const workspaceId = specEdit.workspaceId || terminalWorkspace?.id || "";
+    const workspaceName = specEdit.workspaceName || terminalWorkspace?.name || "";
+    const cancellationNote = message
+      ? `${intentPayload.user_instruction || ""}\n\nQueue ${reason}: ${message}`.trim()
+      : `${intentPayload.user_instruction || ""}\n\nQueue ${reason}.`.trim();
+
+    invoke("cloud_mcp_record_spec_edit_intent", {
+      intent: {
+        ...intentPayload,
+        event_kind: "spec_edit_cancelled",
+        intent_id: specEdit.intentId,
+        status: "cancelled",
+        user_instruction: cancellationNote,
+      },
+      repoPath,
+      workspaceId,
+      workspaceName,
+    }).catch((error) => {
+      logBigViewSyncDiagnosticEvent("spec_edit.queue_cancel_status_error", {
+        intentId: specEdit.intentId,
+        message: getTodoDropErrorMessage(error),
+        reason,
+        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+        workspaceId,
+      });
+    });
+
+    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, {
+      detail: {
+        intentId: specEdit.intentId,
+        reason,
+        workspaceId,
+      },
+    }));
+  }, [
+    defaultWorkingDirectory,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+  ]);
+
   const sendTodoQueueItemToTerminal = useCallback(async ({
     allowGeneric = true,
     focusReason = "todo_dropdown_drop",
@@ -4775,7 +5067,7 @@ function TerminalView({
 
     const terminalText = await prepareTodoTerminalText(currentItem);
     const threadMessageText = getTodoQueueItemThreadMessageText(currentItem, terminalText);
-    const attachmentSource = source === "tui-todo-auto-queue" ? "tui_todo_auto_queue" : "tui_todo_drop";
+    const attachmentSource = getTodoQueueAttachmentSource(source);
     const queuedAttachment = image
       ? todoImageToComposerAttachment(image, 0, attachmentSource)
       : null;
@@ -4903,7 +5195,8 @@ function TerminalView({
           writeResult,
         };
       } else {
-        const promptId = createThreadProjectionToken("todo-drop-prompt");
+        const promptId = getTodoQueueItemSpecEdit(currentItem)?.intentId
+          || createThreadProjectionToken("todo-drop-prompt");
         const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
         const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
           requestTerminalSubmitDiagnosticSnapshot({
@@ -4984,9 +5277,7 @@ function TerminalView({
         });
         try {
           const submittedAt = new Date().toISOString();
-          const promptEventSource = source === "tui-todo-auto-queue"
-            ? "todo-auto-queue"
-            : "terminal-view-drop";
+          const promptEventSource = getTodoQueuePromptEventSource(source, currentItem);
           logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
             agentId: targetRole,
             paneId,
@@ -5049,7 +5340,7 @@ function TerminalView({
                 : terminalText
             ),
             isGenericTerminal: false,
-            logPrefix: source === "tui-todo-auto-queue" ? "frontend.todo_auto_queue" : "frontend.todo_drop",
+            logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
             promptId,
             retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
             submitSequence: terminalSubmitSequence,
@@ -5114,7 +5405,7 @@ function TerminalView({
 
     const writeResult = dropResult?.writeResult || null;
     const resultThreadMessageText = String(dropResult?.threadMessageText || "");
-    const lifecycleSource = source === "tui-todo-auto-queue" ? "tui-todo-auto-queue" : "tui-todo-drop";
+    const lifecycleSource = getTodoQueueLifecycleSource(source, currentItem);
     const shouldDispatchThreadMessage = Boolean(
       dropResult?.confirmedSubmit
         && shouldAutoSubmit
@@ -5186,6 +5477,17 @@ function TerminalView({
     if (syncKey && shouldAutoSubmit) {
       setWorkspaceThreadComposerDraft(syncKey, "");
     }
+    if (dropResult?.confirmedSubmit && isSpecEditTodoQueueItem(currentItem)) {
+      await recordTodoQueueSpecEditDispatch({
+        item: currentItem,
+        paneId,
+        target,
+        targetBinding,
+        targetRole,
+        targetThread,
+        workspaceId,
+      });
+    }
     logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
       imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
       hadQueueItem: Boolean(currentItem.itemId || currentItem.id),
@@ -5209,6 +5511,7 @@ function TerminalView({
     defaultWorkingDirectory,
     getTodoQueueTerminalSendTarget,
     onThreadTerminalLifecycle,
+    recordTodoQueueSpecEditDispatch,
     terminalWorkspace?.id,
     terminalWorkspace?.name,
     terminalWorkspaceWorkingDirectory,
@@ -5250,11 +5553,15 @@ function TerminalView({
   }, [todoQueueDraft, updateTodoQueueItems]);
 
   const removeTodoQueueItem = useCallback((itemId) => {
+    const item = todoQueueItemsRef.current.find((candidate) => candidate.id === itemId) || null;
+    if (item && isSpecEditTodoQueueItem(item)) {
+      recordTodoQueueSpecEditCancelled(item, "removed", "User removed the queued spec edit.");
+    }
     clearTodoQueueItemPending(itemId, "removed");
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
     ));
-  }, [clearTodoQueueItemPending, updateTodoQueueItems]);
+  }, [clearTodoQueueItemPending, recordTodoQueueSpecEditCancelled, updateTodoQueueItems]);
 
   const queueTodoQueueItem = useCallback((itemId) => {
     const safeItemId = String(itemId || "").trim();
@@ -5268,11 +5575,12 @@ function TerminalView({
       return;
     }
 
+    const source = getTodoQueueItemAutoQueueSource(item);
     setTodoDropError("");
     setTodoQueueItemPending(safeItemId, {
       item: getTodoQueueItemLogSummary([item])[0] || null,
       phase: "queued",
-      source: "tui-todo-auto-queue",
+      source,
       workspaceId: item.workspaceId || terminalWorkspace?.id || "",
     });
     setTodoQueueDispatchRevision((revision) => revision + 1);
@@ -5323,6 +5631,56 @@ function TerminalView({
     return item;
   }, [setTodoQueueItemPending, terminalWorkspace?.id, updateTodoQueueItems]);
 
+  useEffect(() => {
+    const handleSpecEditQueueEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || detail.item?.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+
+      const item = normalizeTodoQueueItem({
+        ...(detail.item || {}),
+        kind: TODO_QUEUE_KIND_SPEC_EDIT,
+        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+        workspaceId: eventWorkspaceId,
+      });
+      if (!item || !isSpecEditTodoQueueItem(item)) {
+        return;
+      }
+
+      updateTodoQueueItems((currentItems) => (
+        currentItems
+          .filter((candidate) => candidate.id !== item.id)
+          .concat([item])
+      ));
+      setTodoDropError("");
+      setTodoQueueItemPending(item.id, {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        phase: "queued",
+        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+        workspaceId: terminalWorkspace.id,
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+      logBigViewSyncDiagnosticEvent("spec_edit.queue_added", {
+        intentId: getTodoQueueItemSpecEdit(item)?.intentId || item.id,
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace.id,
+      });
+    };
+
+    window.addEventListener(SPEC_EDIT_TODO_QUEUE_EVENT, handleSpecEditQueueEvent);
+    return () => {
+      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_EVENT, handleSpecEditQueueEvent);
+    };
+  }, [
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
   const cancelQueuedTodoQueueItem = useCallback((itemId) => {
     const safeItemId = String(itemId || "").trim();
     const pendingItem = safeItemId ? todoQueuePendingItemsRef.current[safeItemId] || null : null;
@@ -5330,11 +5688,19 @@ function TerminalView({
       return;
     }
 
+    const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
+    const source = item ? getTodoQueueItemAutoQueueSource(item) : "tui-todo-auto-queue";
     clearTodoQueueItemPending(safeItemId, "cancelled", {
-      source: "tui-todo-auto-queue",
+      source,
     });
+    if (item && isSpecEditTodoQueueItem(item)) {
+      recordTodoQueueSpecEditCancelled(item, "cancelled", "User cancelled the queued spec edit.");
+      updateTodoQueueItems((currentItems) => (
+        currentItems.filter((candidate) => candidate.id !== safeItemId)
+      ));
+    }
     setTodoQueueDispatchRevision((revision) => revision + 1);
-  }, [clearTodoQueueItemPending]);
+  }, [clearTodoQueueItemPending, recordTodoQueueSpecEditCancelled, updateTodoQueueItems]);
 
   const reorderTodoQueueItem = useCallback((itemId, targetIndex) => {
     updateTodoQueueItems((currentItems) => {
@@ -5410,7 +5776,7 @@ function TerminalView({
       return;
     }
 
-    const source = "tui-todo-auto-queue";
+    const source = getTodoQueueItemAutoQueueSource(queuedItem);
     const targetTerminalIndex = target.targetTerminalIndex;
     todoQueueDispatchingRef.current = true;
     todoQueueTerminalReservationsRef.current.set(targetTerminalIndex, {
@@ -5468,6 +5834,13 @@ function TerminalView({
           targetRole: target.targetRole,
           targetTerminalIndex,
         });
+        if (isSpecEditTodoQueueItem(queuedItem)) {
+          recordTodoQueueSpecEditCancelled(
+            queuedItem,
+            "dispatch_error",
+            error?.message || String(error || ""),
+          );
+        }
         setTodoDropError(getTodoDropErrorMessage(error));
         logBigViewSyncDiagnosticEvent("tui.image.drop_write_error", {
           hasImage: Boolean(getTodoQueueItemImage(queuedItem)),
@@ -5493,6 +5866,7 @@ function TerminalView({
     clearTodoQueueItemPending,
     getTodoQueueTerminalSendTarget,
     logicalTerminalIndexes,
+    recordTodoQueueSpecEditCancelled,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
@@ -5519,12 +5893,14 @@ function TerminalView({
 
   const handleBeginTodoDrag = useCallback((event) => {
     const text = normalizeTodoQueueText(event?.item?.text);
+    const terminalText = getTodoQueueItemTerminalText(event?.item);
     const image = getTodoQueueItemImage(event?.item);
     const note = getTodoQueueItemNote(event?.item);
+    const specEdit = getTodoQueueItemSpecEdit(event?.item);
     const sourceRect = event?.sourceRect;
 
     if (
-      (!text && !image && !note)
+      (!terminalText && !image && !note)
       || !terminalWorkspace?.id
       || !sourceRect
       || !terminalPanelsRef.current
@@ -5558,8 +5934,11 @@ function TerminalView({
       pointerId: event.pointerId,
       targetTerminalIndex,
       text,
+      kind: specEdit ? TODO_QUEUE_KIND_SPEC_EDIT : normalizeTodoQueueKind(event.item?.kind),
+      source: normalizeTodoQueueSource(event.item?.source),
       ...(image ? { image } : {}),
       ...(note ? { note } : {}),
+      ...(specEdit ? { specEdit } : {}),
       width: dragWidth,
       workspaceId: event.workspaceId || terminalWorkspace.id,
       x: Number(event.clientX || 0) - offsetX,
@@ -5672,7 +6051,9 @@ function TerminalView({
       }
 
       {
-        const source = "tui-todo-drop";
+        const source = isSpecEditTodoQueueItem(currentDrag)
+          ? TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO
+          : "tui-todo-drop";
         const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentDrag, {
           allowGeneric: true,
           requireAvailable: false,

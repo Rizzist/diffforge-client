@@ -44,7 +44,6 @@ export default function SpecGraphWorkspaceView({
   isWorkspaceActive = false,
   onSubmitSpecEditIntent = null,
   pendingSpecEdits = [],
-  specEditAgents = [],
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
@@ -127,18 +126,12 @@ export default function SpecGraphWorkspaceView({
   const localIgnoredCount = Array.isArray(localIgnoredOverlay?.nodes)
     ? localIgnoredOverlay.nodes.length
     : 0;
-  const readySpecEditAgents = useMemo(
-    () => (Array.isArray(specEditAgents) ? specEditAgents : [])
-      .filter((agent) => agent?.ready !== false && agent?.paneId && agent?.instanceId),
-    [specEditAgents],
-  );
   const specEditDisabledReason = useMemo(() => {
     if (!isWorkspaceActive) return "Activate this workspace to edit specs.";
-    if (!readySpecEditAgents.length) return "Start an agent terminal to edit specs.";
     if (state === "loading" || state === "syncing") return "Wait for the Spec Graph to finish syncing.";
     if (error) return "Resolve the Spec Graph sync error before editing.";
     return "";
-  }, [error, isWorkspaceActive, readySpecEditAgents.length, state]);
+  }, [error, isWorkspaceActive, state]);
   const openSpecEditDraft = useCallback((operation, spec = null) => {
     if (!selectedNode) return;
     const targetSpec = spec || null;
@@ -151,9 +144,8 @@ export default function SpecGraphWorkspaceView({
       currentStatement,
       desiredStatement: operation === "edit" ? currentStatement : "",
       userInstruction: "",
-      terminalKey: readySpecEditAgents[0]?.key || "",
     });
-  }, [readySpecEditAgents, selectedNode]);
+  }, [selectedNode]);
   const closeSpecEditDraft = useCallback(() => {
     setSpecEditDraft(null);
     setSpecEditStatus({ state: "idle", message: "" });
@@ -161,13 +153,6 @@ export default function SpecGraphWorkspaceView({
   const submitSpecEditDraft = useCallback((event) => {
     event.preventDefault();
     if (!specEditDraft || !selectedNode || !onSubmitSpecEditIntent) return;
-    const agent = readySpecEditAgents.find((candidate) => candidate.key === specEditDraft.terminalKey)
-      || readySpecEditAgents[0]
-      || null;
-    if (!agent) {
-      setSpecEditStatus({ state: "error", message: "Choose an active agent terminal." });
-      return;
-    }
     const instruction = text(specEditDraft.userInstruction, "");
     const desiredStatement = text(specEditDraft.desiredStatement, "");
     if (specEditDraft.operation !== "delete" && !desiredStatement && !instruction) {
@@ -178,9 +163,8 @@ export default function SpecGraphWorkspaceView({
       setSpecEditStatus({ state: "error", message: "Choose an active spec to delete." });
       return;
     }
-    setSpecEditStatus({ state: "submitting", message: "Sending spec edit to the agent..." });
+    setSpecEditStatus({ state: "submitting", message: "Queueing spec edit..." });
     onSubmitSpecEditIntent({
-      agent,
       baseGraphHash: text(specGraphSnapshot?.cursor, ""),
       baseNodeHash: text(specGraphSnapshot?.nodeHashes?.[selectedNode.id], ""),
       currentStatement: specEditDraft.currentStatement,
@@ -196,7 +180,7 @@ export default function SpecGraphWorkspaceView({
       .then((result) => {
         setSpecEditStatus({
           state: "sent",
-          message: result?.intentId ? `Sent to ${agent.label || agent.agentId}.` : "Sent to the agent.",
+          message: result?.intentId ? "Queued for the next available agent." : "Queued.",
         });
         window.setTimeout(() => setSpecEditDraft(null), 650);
       })
@@ -208,7 +192,6 @@ export default function SpecGraphWorkspaceView({
       });
   }, [
     onSubmitSpecEditIntent,
-    readySpecEditAgents,
     selectedNode,
     specEditDraft,
     specGraphSnapshot?.cursor,
@@ -391,7 +374,6 @@ export default function SpecGraphWorkspaceView({
       )}
       {specEditDraft && (
         <SpecEditDialog
-          agents={readySpecEditAgents}
           disabledReason={specEditDisabledReason}
           draft={specEditDraft}
           node={selectedNode}
@@ -1443,7 +1425,6 @@ function specEditOperationLabel(operation) {
 }
 
 function SpecEditDialog({
-  agents,
   disabledReason,
   draft,
   node,
@@ -1452,12 +1433,9 @@ function SpecEditDialog({
   onSubmit,
   status,
 }) {
-  const visibleAgents = Array.isArray(agents) ? agents : [];
   const operationLabel = specEditOperationLabel(draft.operation);
   const submitDisabled = Boolean(disabledReason)
     || status.state === "submitting"
-    || !visibleAgents.length
-    || !draft.terminalKey
     || (draft.operation !== "delete" && !text(draft.desiredStatement) && !text(draft.userInstruction));
   const nodeTitle = text(node?.display_title || node?.displayTitle || node?.title, "Spec node");
 
@@ -1474,23 +1452,6 @@ function SpecEditDialog({
           </SpecEditCloseButton>
         </SpecEditModalHeader>
         <SpecEditForm onSubmit={onSubmit}>
-          <SpecEditField>
-            <label htmlFor="spec-edit-agent">Agent</label>
-            <SpecEditSelect
-              id="spec-edit-agent"
-              value={draft.terminalKey}
-              onChange={(event) => onChange((current) => ({
-                ...current,
-                terminalKey: event.target.value,
-              }))}
-            >
-              {visibleAgents.map((agent) => (
-                <option key={agent.key} value={agent.key}>
-                  {agent.label || agent.agentId} #{Number(agent.terminalIndex) + 1}
-                </option>
-              ))}
-            </SpecEditSelect>
-          </SpecEditField>
           {draft.currentStatement && (
             <SpecEditField>
               <label htmlFor="spec-edit-current">Current</label>
@@ -1531,7 +1492,7 @@ function SpecEditDialog({
             </SpecEditSecondaryButton>
             <SpecEditPrimaryButton type="submit" disabled={submitDisabled}>
               <SendSpecIcon aria-hidden="true" />
-              <span>{status.state === "submitting" ? "Sending" : "Send"}</span>
+              <span>{status.state === "submitting" ? "Queueing" : "Queue"}</span>
             </SpecEditPrimaryButton>
           </SpecEditFooter>
         </SpecEditForm>
@@ -3096,26 +3057,6 @@ const SpecEditField = styled.div`
     letter-spacing: 0.05em;
     line-height: 1;
     text-transform: uppercase;
-  }
-`;
-
-const SpecEditSelect = styled.select`
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 7px;
-  background: rgba(15, 23, 42, 0.74);
-  color: var(--history-text);
-  font: inherit;
-  font-size: 12px;
-  height: 36px;
-  outline: none;
-  padding: 0 10px;
-
-  &:focus {
-    border-color: rgba(52, 211, 153, 0.48);
-  }
-
-  html[data-forge-theme="light"] & {
-    background: #ffffff;
   }
 `;
 
