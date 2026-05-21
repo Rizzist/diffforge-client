@@ -3694,6 +3694,58 @@ async fn cloud_mcp_sync_workspace(
 }
 
 #[tauri::command]
+async fn cloud_mcp_sync_agent_installations(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    agent_statuses: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let clean_option = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let workspace_id = clean_option(workspace_id);
+    let workspace_name = clean_option(workspace_name);
+    let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
+    let req = cloud_mcp_spec_graph_sync_request(
+        repo_path,
+        workspace_id.clone(),
+        workspace_name.clone(),
+    );
+    let agent_count = agent_statuses
+        .as_array()
+        .map(Vec::len)
+        .ok_or_else(|| "Agent installation sync requires an agentStatuses array.".to_string())?;
+    let snapshot_id = format!(
+        "agent-installations-{}-{}",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
+    let payload = json!({
+        "source": "rust-diffforge-agent-installation-sync",
+        "event_kind": "agent_installation_snapshot",
+        "repo_id": req.repo_id,
+        "repo_path": req.root_display,
+        "workspace_root": req.root_display,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": reason,
+        "snapshot_id": snapshot_id,
+        "agent_count": agent_count,
+        "agents": agent_statuses,
+        "summary": "Desktop installed agent inventory synced.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    cloud_mcp_post_event_endpoint(state.inner(), "agent_installation_snapshot", &payload).await
+}
+
+#[tauri::command]
 async fn cloud_mcp_record_spec_edit_intent(
     state: State<'_, CloudMcpState>,
     repo_path: String,

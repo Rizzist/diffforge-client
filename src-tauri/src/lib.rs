@@ -1298,6 +1298,7 @@ struct DeepgramRealtimeStartStatus {
 #[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartRequest {
     repo_id: Option<String>,
+    agent_statuses: Option<Value>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     workspace_root: Option<String>,
@@ -2192,6 +2193,7 @@ pub fn run() {
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
+            cloud_mcp_sync_agent_installations,
             cloud_mcp_record_spec_edit_intent,
             cloud_mcp_get_activity,
             cloud_mcp_get_cached_spec_graph,

@@ -1765,6 +1765,29 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
   return preferredAgent || readyAgents.find((agent) => agent.id === "codex") || readyAgents[0] || null;
 }
 
+function normalizeManagedAgentProviderId(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.-]+/g, "_");
+
+  if (["codex", "openai", "openai_codex"].includes(normalized)) {
+    return "codex";
+  }
+  if (["claude", "claude_code", "anthropic"].includes(normalized)) {
+    return "claude";
+  }
+  if (["opencode", "open_code", "opencode_ai"].includes(normalized)) {
+    return "opencode";
+  }
+
+  return "";
+}
+
+function getManagedAgentLabel(agentId) {
+  return getDefaultAgentStatus(agentId)?.label || agentId || "coding agent";
+}
+
 function getAgentStatusSummary(agentStatuses) {
   const codex = agentStatuses.find((agent) => agent.id === "codex");
   const claude = agentStatuses.find((agent) => agent.id === "claude");
@@ -2729,7 +2752,9 @@ export default function App() {
   const audioAutoOpenStartupKeyRef = useRef("");
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
+  const workspacesRef = useRef(workspaces);
   const workspaceSettingsRef = useRef(workspaceSettings);
+  const defaultWorkingDirectoryRef = useRef(defaultWorkingDirectory);
   const workspaceThreadsRef = useRef(workspaceThreads);
   const workspaceThreadsHydratedKeyRef = useRef("");
   const workspaceThreadsPersistenceReadyRef = useRef(false);
@@ -2747,6 +2772,7 @@ export default function App() {
   const sharedMcpActiveRepoRef = useRef("");
   const workspaceDeactivationInFlightRef = useRef("");
   const workspaceRuntimeDeactivatedRepoRef = useRef("");
+  const agentInstallationSyncKeyRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -3008,8 +3034,16 @@ export default function App() {
   }, [activatedWorkspaceId]);
 
   useEffect(() => {
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
+
+  useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
   }, [workspaceSettings]);
+
+  useEffect(() => {
+    defaultWorkingDirectoryRef.current = defaultWorkingDirectory;
+  }, [defaultWorkingDirectory]);
 
   useEffect(() => {
     workspaceThreadsRef.current = workspaceThreads;
@@ -3731,6 +3765,89 @@ export default function App() {
     }
   }, [setAuthenticated, setSignedOut]);
 
+  const resolveAgentInstallationSyncTarget = useCallback(() => {
+    const currentWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+    const targetWorkspaceId = (
+      activatedWorkspaceIdRef.current
+      || selectedWorkspaceIdRef.current
+      || workspaceLifecycleSettingsRef.current?.defaultWorkspaceId
+      || currentWorkspaces[0]?.id
+      || ""
+    );
+    const workspace = targetWorkspaceId
+      ? findWorkspaceById(currentWorkspaces, targetWorkspaceId)
+      : currentWorkspaces[0] || null;
+    const workspaceId = workspace?.id || targetWorkspaceId || "";
+    const repoPath = (
+      (workspaceId ? getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId) : "")
+      || cleanWorkspaceRootDirectory(defaultWorkingDirectoryRef.current)
+    );
+
+    if (!repoPath) {
+      return null;
+    }
+
+    return {
+      repoPath,
+      workspaceId,
+      workspaceName: workspace?.name || "",
+    };
+  }, []);
+
+  const syncAgentInstallationsToCloud = useCallback((statuses, reason = "agent_status_refresh") => {
+    const syncStatuses = Array.isArray(statuses)
+      ? statuses.filter((status) => status && typeof status === "object")
+      : [];
+    const hasCheckedStatus = syncStatuses.some((status) => (
+      !status.cached && String(status.version || "").trim() !== "Not checked"
+    ));
+    if (!syncStatuses.length || !hasCheckedStatus || syncStatuses.every((status) => status.cached)) {
+      return;
+    }
+
+    const target = resolveAgentInstallationSyncTarget();
+    if (!target) {
+      return;
+    }
+
+    const syncKey = JSON.stringify({
+      repoPath: target.repoPath,
+      workspaceId: target.workspaceId,
+      agents: syncStatuses.map((status) => ({
+        id: status.id,
+        installed: Boolean(status.installed),
+        authenticated: Boolean(status.authenticated),
+        version: status.version || "",
+        npmPackageVersion: status.npmPackageVersion || "",
+        npmLatestVersion: status.npmLatestVersion || "",
+        npmUpdateAvailable: Boolean(status.npmUpdateAvailable),
+        activeModel: status.activeModel || "",
+        activeModelSupportsImages: Boolean(status.activeModelSupportsImages),
+      })),
+    });
+    if (agentInstallationSyncKeyRef.current === syncKey) {
+      return;
+    }
+    agentInstallationSyncKeyRef.current = syncKey;
+
+    invoke("cloud_mcp_sync_agent_installations", {
+      repoPath: target.repoPath,
+      workspaceId: target.workspaceId || null,
+      workspaceName: target.workspaceName || null,
+      agentStatuses: syncStatuses,
+      reason,
+    }).catch((error) => {
+      agentInstallationSyncKeyRef.current = "";
+      logBigViewSyncDiagnosticEvent("cloud_mcp.agent_installations_sync.failed", {
+        message: getErrorMessage(error, "Unable to sync installed agent inventory."),
+        repoPath: target.repoPath,
+        workspaceId: target.workspaceId,
+        agentCount: syncStatuses.length,
+        reason,
+      });
+    });
+  }, [resolveAgentInstallationSyncTarget]);
+
   const refreshAgentStatuses = useCallback(async () => {
     const agentStatusStartedAt = performance.now();
     setAgentStatusState("checking");
@@ -3746,6 +3863,7 @@ export default function App() {
       }));
       persistAgentStatusCache(nextStatuses);
       setAgentStatuses(nextStatuses);
+      syncAgentInstallationsToCloud(nextStatuses, "agent_status_refresh");
       setAgentStatusState("idle");
       return nextStatuses;
     } catch (error) {
@@ -3753,7 +3871,20 @@ export default function App() {
       setAgentStatusError(getErrorMessage(error, "Unable to check terminal CLIs."));
       return null;
     }
-  }, []);
+  }, [syncAgentInstallationsToCloud]);
+
+  useEffect(() => {
+    syncAgentInstallationsToCloud(agentStatuses, "workspace_context_ready");
+  }, [
+    activatedWorkspaceId,
+    agentStatuses,
+    defaultWorkingDirectory,
+    selectedWorkspaceId,
+    syncAgentInstallationsToCloud,
+    workspaceLifecycleSettings,
+    workspaceSettings,
+    workspaces,
+  ]);
 
   const refreshAudioModelStatus = useCallback(async () => {
     setAudioStatusState("checking");
@@ -3887,7 +4018,7 @@ export default function App() {
           message: result?.message || `${result?.label || "Terminal CLI"} disconnected from this machine.`,
         },
       }));
-      setAgentStatuses((statuses) => statuses.map((agent) => (
+      const nextStatuses = agentStatuses.map((agent) => (
         agent.id === provider
           ? {
             ...agent,
@@ -3895,7 +4026,10 @@ export default function App() {
             authMessage: result?.message || `${agent.label} disconnected from this machine.`,
           }
           : agent
-      )));
+      ));
+      setAgentStatuses(nextStatuses);
+      persistAgentStatusCache(nextStatuses);
+      syncAgentInstallationsToCloud(nextStatuses, "agent_disconnect");
     } catch (error) {
       setAgentActionResults((results) => ({
         ...results,
@@ -3907,7 +4041,7 @@ export default function App() {
     } finally {
       setAgentDisconnectState((state) => ({ ...state, [provider]: "idle" }));
     }
-  }, []);
+  }, [agentStatuses, syncAgentInstallationsToCloud]);
 
   const installAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
@@ -5150,6 +5284,186 @@ export default function App() {
       });
     }
   }, [
+    workspaceSettingsModalId,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
+
+  const manageWorkspaceAgents = useCallback(async (intent = {}) => {
+    const action = String(intent.action || "").trim().toLowerCase();
+    const requestedWorkspaceId = String(intent.workspaceId || activatedWorkspaceIdRef.current || "").trim();
+    const workspace = requestedWorkspaceId
+      ? findWorkspaceById(workspacesRef.current, requestedWorkspaceId)
+      : null;
+    const workspaceId = workspace?.id || requestedWorkspaceId;
+
+    if (!workspaceId || activatedWorkspaceIdRef.current !== workspaceId) {
+      throw new Error("Open the workspace before managing coding agents.");
+    }
+
+    const currentStatuses = Array.isArray(agentStatuses) ? agentStatuses : [];
+    let agentId = normalizeManagedAgentProviderId(intent.agentType || intent.agent_type || intent.provider);
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+    const currentRoles = getWorkspaceTerminalRoles(
+      currentSettings,
+      workspaceId,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const roleByIndex = Object.fromEntries(currentIndexes.map((index, orderIndex) => ([
+      index,
+      currentRoles[orderIndex] || workspaceTerminalFallbackRole,
+    ])));
+
+    if (action === "status") {
+      const roleCounts = getWorkspaceTerminalRoleCountMap(currentRoles, workspaceTerminalRoleOptions);
+      const readyStatuses = currentStatuses.filter((agent) => agent.installed && agent.authenticated);
+      const scopedReadyStatuses = agentId
+        ? readyStatuses.filter((agent) => agent.id === agentId)
+        : readyStatuses;
+      const readyLabels = scopedReadyStatuses.map((agent) => agent.label || getManagedAgentLabel(agent.id));
+      const label = agentId ? getManagedAgentLabel(agentId) : "Coding agents";
+      return {
+        action,
+        agentId: agentId || "any",
+        agentStatuses: currentStatuses.map((agent) => ({
+          authenticated: Boolean(agent.authenticated),
+          id: agent.id,
+          installed: Boolean(agent.installed),
+          label: agent.label || getManagedAgentLabel(agent.id),
+          version: agent.version || "",
+        })),
+        label,
+        message: readyLabels.length
+          ? `${currentIndexes.length} terminal${currentIndexes.length === 1 ? "" : "s"} open. Ready: ${readyLabels.join(", ")}.`
+          : `${currentIndexes.length} terminal${currentIndexes.length === 1 ? "" : "s"} open. No installed and signed-in coding agents are ready.`,
+        roleCounts,
+        totalTerminals: currentIndexes.length,
+      };
+    }
+
+    if (!agentId) {
+      agentId = getReadyAgent(currentStatuses)?.id || "";
+    }
+    if (!agentId) {
+      throw new Error("No installed and signed-in coding agents are available.");
+    }
+
+    const status = currentStatuses.find((agent) => agent.id === agentId);
+    const label = status?.label || getManagedAgentLabel(agentId);
+    if (!status?.installed) {
+      throw new Error(`${label} is not installed on this machine.`);
+    }
+    if (!status?.authenticated) {
+      throw new Error(`${label} is installed but not signed in.`);
+    }
+
+    if (!["ensure_count", "spawn_count"].includes(action)) {
+      throw new Error("Unsupported coding-agent management action.");
+    }
+
+    const requestedCount = Math.max(0, Math.min(
+      MAX_WORKSPACE_TERMINAL_COUNT,
+      Number.parseInt(intent.count, 10) || 0,
+    ));
+    if (requestedCount <= 0) {
+      throw new Error("Choose at least one coding agent to launch.");
+    }
+
+    const existingAgentCount = currentIndexes.filter((index) => roleByIndex[index] === agentId).length;
+    const desiredAddCount = action === "spawn_count"
+      ? requestedCount
+      : Math.max(0, requestedCount - existingAgentCount);
+    if (desiredAddCount <= 0) {
+      return {
+        action,
+        addedCount: 0,
+        agentId,
+        existingCount: existingAgentCount,
+        label,
+        message: `${label} already has ${existingAgentCount} terminal${existingAgentCount === 1 ? "" : "s"} open.`,
+        totalForAgent: existingAgentCount,
+      };
+    }
+
+    const freeIndexes = [];
+    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      if (!currentIndexes.includes(index)) {
+        freeIndexes.push(index);
+      }
+    }
+    const addedIndexes = freeIndexes.slice(0, desiredAddCount);
+    if (!addedIndexes.length) {
+      throw new Error(`Terminal limit reached. Diff Forge supports up to ${MAX_WORKSPACE_TERMINAL_COUNT} workspace terminals.`);
+    }
+
+    const nextIndexes = normalizeWorkspaceTerminalSlotIndexes(currentIndexes.concat(addedIndexes));
+    const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+    const nextRoles = nextIndexes.map((index) => (
+      addedIndexes.includes(index) ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
+    ));
+    const currentRows = getWorkspaceDisplayTerminalRows(
+      currentDisplayLayouts,
+      workspaceId,
+      currentIndexes,
+    );
+    const nextRows = currentRows.length
+      ? currentRows.map((row) => row.terminalIndexes.slice())
+      : currentIndexes.map((index) => [index]);
+    addedIndexes.forEach((index) => {
+      nextRows.push([index]);
+    });
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      terminalCount: nextTerminalCount,
+      terminalRoles: nextRoles,
+    });
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
+      [workspaceId]: nextIndexes,
+    };
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextRows,
+    };
+
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+
+    if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
+      setWorkspaceTerminalRolesDraft(nextRoles);
+    }
+
+    const addedCount = addedIndexes.length;
+    const totalForAgent = existingAgentCount + addedCount;
+    return {
+      action,
+      addedCount,
+      agentId,
+      capacityReached: addedCount < desiredAddCount,
+      existingCount: existingAgentCount,
+      label,
+      message: `Started ${addedCount} ${label} terminal${addedCount === 1 ? "" : "s"}.`,
+      requestedCount,
+      terminalIndexes: addedIndexes,
+      totalForAgent,
+    };
+  }, [
+    agentStatuses,
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
@@ -8616,6 +8930,7 @@ export default function App() {
                         createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                         createFirstWorkspace={createFirstWorkspace}
                         handlePreparedTerminalChange={handlePreparedTerminalChange}
+                        manageWorkspaceAgents={manageWorkspaceAgents}
                         onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
                         onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
                         onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}

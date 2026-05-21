@@ -3431,10 +3431,17 @@ async fn start_cloud_voice_agent_stream(
         return Err("Deepgram realtime transcription is already active.".to_string());
     }
 
-    let workspace_id = clean_cloud_voice_agent_text(request.workspace_id, 120);
-    let workspace_name = clean_cloud_voice_agent_text(request.workspace_name, 240);
-    let workspace_root = clean_cloud_voice_agent_text(request.workspace_root, 2048);
-    let repo_id = clean_cloud_voice_agent_text(request.repo_id, 160);
+    let CloudVoiceAgentStartRequest {
+        repo_id,
+        agent_statuses,
+        workspace_id,
+        workspace_name,
+        workspace_root,
+    } = request;
+    let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
+    let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
+    let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
+    let repo_id = clean_cloud_voice_agent_text(repo_id, 160);
     let repo_id = if !repo_id.is_empty() {
         repo_id
     } else if !workspace_root.is_empty() {
@@ -3442,6 +3449,7 @@ async fn start_cloud_voice_agent_stream(
     } else {
         "default-repo".to_string()
     };
+    let agent_statuses = agent_statuses.unwrap_or_else(|| json!([]));
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
@@ -3452,6 +3460,7 @@ async fn start_cloud_voice_agent_stream(
         "workspace_name": workspace_name,
         "workspace_root": workspace_root,
         "repo_id": repo_id,
+        "agent_statuses": agent_statuses,
         "audio": {
             "encoding": "linear16",
             "sample_rate": status.sample_rate,

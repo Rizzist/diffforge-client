@@ -58,6 +58,7 @@ import {
   createWorkspaceThreadPromptAcceptedWaiter,
   getActiveWorkspaceFileDrag,
   getDraggedWorkspaceFile,
+  getErrorMessage,
   getTerminalSubmitSequence,
   getThreadComposerSyncKey,
   getWorkspaceThreadComposerAttachments,
@@ -2229,6 +2230,63 @@ function normalizeVoiceAgentQueueArguments(value) {
   return value && typeof value === "object" ? value : {};
 }
 
+function normalizeVoiceAgentManagementAgent(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.-]+/g, "_");
+
+  if (["codex", "openai", "openai_codex"].includes(normalized)) return "codex";
+  if (["claude", "claude_code", "anthropic"].includes(normalized)) return "claude";
+  if (["opencode", "open_code", "opencode_ai"].includes(normalized)) return "opencode";
+  return "";
+}
+
+function normalizeVoiceAgentManagementAction(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (["ensure", "ensure_count", "set_count", "launch_count"].includes(normalized)) {
+    return "ensure_count";
+  }
+  if (["spawn", "spawn_count", "add", "create", "launch"].includes(normalized)) {
+    return "spawn_count";
+  }
+  if (["close_idle_by_agent", "close_agent_idle"].includes(normalized)) {
+    return "close_idle_by_agent";
+  }
+  if (["close", "close_idle", "remove_idle"].includes(normalized)) {
+    return "close_idle";
+  }
+  return "status";
+}
+
+function getVoiceAgentManagementRequestSummary(args = {}) {
+  const action = normalizeVoiceAgentManagementAction(args.action);
+  const agentId = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
+  const count = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
+  const agentLabel = agentId || "agent";
+
+  if (action === "ensure_count") {
+    return `Ensure ${count} ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
+  }
+  if (action === "spawn_count") {
+    return `Launch ${count} ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
+  }
+  if (action === "close_idle" || action === "close_idle_by_agent") {
+    return `Close ${count > 0 ? count : "all"} idle ${agentLabel === "agent" ? "agent" : agentLabel} terminal${count === 1 ? "" : "s"}.`;
+  }
+  return "Check coding-agent terminal status.";
+}
+
+function getVoiceAgentToolCallSignature(toolCall) {
+  const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
+  const fallbackSignature = JSON.stringify(toolCall?.arguments || toolCall?.args || {});
+  return callId || fallbackSignature;
+}
+
 function cleanPublicVoiceAgentText(value) {
   let text = String(value || "")
     .replace(/\r\n/g, "\n")
@@ -3211,13 +3269,32 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const recordVoiceHistoryToolCall = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
     const turnKey = getVoiceHistoryTurnKey(event, sessionId);
+    const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
     const args = normalizeVoiceAgentQueueArguments(event?.arguments || event?.args);
-    updateVoiceHistoryTurn(turnKey, {
-      queued: true,
+    const patch = {
+      queued: toolName !== "manage_agents",
       queuedText: normalizeVoiceHistoryText(
-        cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
+        toolName === "manage_agents"
+          ? getVoiceAgentManagementRequestSummary(args)
+          : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
         600,
       ),
+      turnIndex: getVoiceHistoryTurnIndex(event),
+    };
+    if (toolName === "manage_agents") {
+      patch.llmFeedback = `Managing agents: ${getVoiceAgentManagementRequestSummary(args)}`;
+      patch.llmFinal = false;
+    }
+    updateVoiceHistoryTurn(turnKey, patch);
+  }, [updateVoiceHistoryTurn]);
+
+  const recordVoiceHistoryManagementResult = useCallback((event, message, status = "ready") => {
+    const sessionId = orchestratorVoiceSessionRef.current;
+    const turnKey = getVoiceHistoryTurnKey(event, sessionId);
+    updateVoiceHistoryTurn(turnKey, {
+      llmFeedback: normalizeVoiceHistoryText(message, 1600),
+      llmFinal: true,
+      llmStatus: status,
       turnIndex: getVoiceHistoryTurnIndex(event),
     });
   }, [updateVoiceHistoryTurn]);
@@ -3289,6 +3366,15 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
 
       await startCloudVoiceAgentStream({
+        agentStatuses: (Array.isArray(agentStatuses) ? agentStatuses : []).map((agent) => ({
+          activeModel: agent?.activeModel || "",
+          authenticated: Boolean(agent?.authenticated),
+          binary: agent?.binary || agent?.id || "",
+          id: agent?.id || "",
+          installed: Boolean(agent?.installed),
+          label: agent?.label || agent?.id || "",
+          version: agent?.version || "",
+        })),
         workspaceId: workspaceId || workspace?.id || "",
         workspaceName: workspace?.name || "",
         workspaceRoot: rootDirectory || defaultWorkingDirectory || "",
@@ -3318,7 +3404,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         "Unable to start the cloud voice agent.",
       ));
     }
-  }, [defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+  }, [agentStatuses, defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
 
   const toggleOrchestratorVoiceMonitor = useCallback(() => {
     if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
@@ -3648,11 +3734,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           return;
         }
         const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
-        if (toolName === "queue") {
+        if (toolName === "queue" || toolName === "manage_agents") {
           recordVoiceHistoryToolCall(event);
           onVoiceAgentToolCall?.(event);
           setOrchestratorVoiceError("");
-          setOrchestratorVoiceFeedback("Queued voice todo.");
+          setOrchestratorVoiceFeedback(toolName === "manage_agents" ? "Managing agents..." : "Queued voice todo.");
         }
         return;
       }
@@ -4055,6 +4141,7 @@ function TerminalView({
   createWorkspaceThreadTerminal,
   createFirstWorkspace,
   handlePreparedTerminalChange,
+  manageWorkspaceAgents,
   onOpenWorkspaceSettings,
   onArchiveWorkspaceThread,
   onSelectWorkspaceThread,
@@ -5586,23 +5673,148 @@ function TerminalView({
     setTodoQueueDispatchRevision((revision) => revision + 1);
   }, [setTodoQueueItemPending, terminalWorkspace?.id, todoQueueItems]);
 
-  const queueVoiceAgentToolCall = useCallback((toolCall) => {
-    const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
-    if (toolName && toolName !== "queue") {
-      return null;
-    }
-
-    const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
-    const fallbackSignature = JSON.stringify(toolCall?.arguments || toolCall?.args || {});
-    const toolCallSignature = callId || fallbackSignature;
+  const claimVoiceAgentToolCall = useCallback((toolCall) => {
+    const toolCallSignature = getVoiceAgentToolCallSignature(toolCall);
     if (toolCallSignature) {
       if (voiceAgentToolCallIdsRef.current.has(toolCallSignature)) {
-        return null;
+        return false;
       }
       if (voiceAgentToolCallIdsRef.current.size > 200) {
         voiceAgentToolCallIdsRef.current.clear();
       }
       voiceAgentToolCallIdsRef.current.add(toolCallSignature);
+    }
+    return true;
+  }, []);
+
+  const closeIdleWorkspaceAgentsForVoice = useCallback(async (args = {}) => {
+    if (!terminalWorkspace?.id) {
+      throw new Error("Open a workspace before closing idle coding agents.");
+    }
+
+    const agentId = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
+    const requestedCount = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
+    const candidates = logicalTerminalIndexes
+      .map((terminalIndex) => getTodoQueueTerminalSendTarget(terminalIndex, null, {
+        allowGeneric: false,
+        requireAvailable: true,
+        reservationItemId: `voice-agent-manage-${terminalIndex}`,
+      }))
+      .filter((candidate) => (
+        candidate.available
+        && TODO_QUEUE_AGENT_ROLES.has(candidate.targetRole)
+        && (!agentId || candidate.targetRole === agentId)
+      ))
+      .sort((left, right) => Number(right.targetTerminalIndex) - Number(left.targetTerminalIndex));
+    const maxClosable = Math.max(0, logicalTerminalIndexes.length - 1);
+    const closeCount = Math.min(
+      requestedCount > 0 ? requestedCount : candidates.length,
+      candidates.length,
+      maxClosable,
+    );
+    if (closeCount <= 0) {
+      return {
+        closedCount: 0,
+        message: agentId
+          ? `No idle ${agentId} terminals are safe to close.`
+          : "No idle coding-agent terminals are safe to close.",
+      };
+    }
+
+    const closed = [];
+    for (const target of candidates.slice(0, closeCount)) {
+      const instanceId = Number(target.targetBinding?.instanceId || 0);
+      await invoke("terminal_close", {
+        paneId: target.paneId,
+        instanceId: Number.isFinite(instanceId) && instanceId > 0 ? instanceId : undefined,
+      });
+      closeWorkspaceTerminal?.({
+        paneId: target.paneId,
+        threadId: target.targetThread?.id || "",
+        terminalIndex: target.targetTerminalIndex,
+        workspaceId: terminalWorkspace.id,
+      });
+      closed.push(target);
+    }
+
+    const label = agentId || "coding-agent";
+    return {
+      closedCount: closed.length,
+      message: `Closed ${closed.length} idle ${label} terminal${closed.length === 1 ? "" : "s"}.`,
+      terminalIndexes: closed.map((target) => target.targetTerminalIndex),
+    };
+  }, [
+    closeWorkspaceTerminal,
+    getTodoQueueTerminalSendTarget,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+  ]);
+
+  const executeVoiceAgentManagementToolCall = useCallback(async (toolCall) => {
+    const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
+    const action = normalizeVoiceAgentManagementAction(args.action);
+    const agentType = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
+    const count = Math.max(0, Math.min(12, Number.parseInt(args.count, 10) || 0));
+
+    try {
+      const result = action === "close_idle" || action === "close_idle_by_agent"
+        ? await closeIdleWorkspaceAgentsForVoice({ ...args, action, agent_type: agentType, count })
+        : await manageWorkspaceAgents?.({
+          action,
+          agentType,
+          count,
+          source: "voice-agent-manage-agents",
+          workspaceId: terminalWorkspace?.id || "",
+        });
+      const message = result?.message || "Coding-agent terminals updated.";
+      recordVoiceHistoryManagementResult(toolCall, message, "ready");
+      setOrchestratorVoiceError("");
+      setOrchestratorVoiceFeedback(message);
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.manage_agents", {
+        action,
+        agentType,
+        count,
+        result,
+        surface: "tui_orchestrator_voice",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return result;
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to manage coding agents.");
+      recordVoiceHistoryManagementResult(toolCall, message, "error");
+      setOrchestratorVoiceError(message);
+      setOrchestratorVoiceFeedback("");
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.manage_agents_error", {
+        action,
+        agentType,
+        count,
+        message,
+        surface: "tui_orchestrator_voice",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return null;
+    }
+  }, [
+    closeIdleWorkspaceAgentsForVoice,
+    manageWorkspaceAgents,
+    recordVoiceHistoryManagementResult,
+    terminalWorkspace?.id,
+  ]);
+
+  const handleVoiceAgentToolCall = useCallback((toolCall) => {
+    const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
+    if (toolName === "manage_agents") {
+      if (!claimVoiceAgentToolCall(toolCall)) {
+        return null;
+      }
+      void executeVoiceAgentManagementToolCall(toolCall);
+      return null;
+    }
+    if (toolName && toolName !== "queue") {
+      return null;
+    }
+    if (!claimVoiceAgentToolCall(toolCall)) {
+      return null;
     }
 
     const item = createTodoQueueItemFromVoiceAgentToolCall(toolCall);
@@ -5629,7 +5841,13 @@ function TerminalView({
     });
 
     return item;
-  }, [setTodoQueueItemPending, terminalWorkspace?.id, updateTodoQueueItems]);
+  }, [
+    claimVoiceAgentToolCall,
+    executeVoiceAgentManagementToolCall,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
 
   useEffect(() => {
     const handleSpecEditQueueEvent = (event) => {
@@ -6879,7 +7097,7 @@ function TerminalView({
                         onReorderItem={reorderTodoQueueItem}
                         onSubmitDraft={submitTodoQueueDraft}
                         onUpdateItem={updateTodoQueueItemText}
-                        onVoiceAgentToolCall={queueVoiceAgentToolCall}
+                        onVoiceAgentToolCall={handleVoiceAgentToolCall}
                         pendingItems={todoQueuePendingItems}
                         rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
                         workspace={terminalWorkspace}
