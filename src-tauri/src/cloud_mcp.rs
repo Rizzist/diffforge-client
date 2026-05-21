@@ -3779,6 +3779,37 @@ async fn cloud_mcp_record_spec_edit_intent(
 }
 
 #[tauri::command]
+async fn cloud_mcp_record_voice_plan_task_status(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    status: Value,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = match status {
+        Value::Object(object) => Value::Object(object),
+        _ => return Err("Voice plan task status payload must be an object.".to_string()),
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_kind".to_string(), json!("voice_plan_task_status"));
+        object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
+        object.insert("repo_path".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_root".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_id".to_string(), json!(workspace_id));
+        if let Some(name) = workspace_name {
+            object.insert("workspace_name".to_string(), json!(name));
+        }
+    }
+
+    cloud_mcp_post_event_endpoint(state.inner(), "voice_plan_task_status", &payload).await
+}
+
+#[tauri::command]
 async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
     let root = resolve_workspace_root_directory(Some(&repo_path))
         .unwrap_or_else(|_| PathBuf::from(&repo_path));

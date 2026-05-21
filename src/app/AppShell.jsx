@@ -496,6 +496,7 @@ const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-promp
 const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
 const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
 const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
+const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 
 function getThreadDiagnosticTextLength(value) {
   return String(value ?? "").length;
@@ -7443,6 +7444,19 @@ export default function App() {
             });
             return nextThreads;
           });
+          if (turnCompleteSeen && promptEventId.startsWith("voice-plan-")) {
+            window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
+              detail: {
+                agentId,
+                matchedBy,
+                pendingPromptId: promptEventId,
+                promptEventId,
+                threadId,
+                type: "provider-turn-completed",
+                workspaceId,
+              },
+            }));
+          }
           if (pollUntilTurnComplete) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = !turnCompleteSeen
@@ -7587,6 +7601,26 @@ export default function App() {
         ...lifecycleEvent,
         nativeSessionId: lifecycleNativeSessionId,
       };
+    }
+    const lifecyclePromptEventId = String(
+      lifecycleEvent.promptEventId
+        || lifecycleEvent.pendingPromptId
+        || lifecycleEvent.promptId
+        || "",
+    ).trim();
+    if (
+      lifecyclePromptEventId.startsWith("voice-plan-")
+      && (
+        lifecycleEvent.type === "provider-turn-completed"
+        || lifecycleEvent.type === "provider-turn-error"
+      )
+    ) {
+      window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
+        detail: {
+          ...lifecycleEvent,
+          promptEventId: lifecyclePromptEventId,
+        },
+      }));
     }
     setPendingSpecEditIntents((current) => {
       let changed = false;
