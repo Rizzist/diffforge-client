@@ -999,6 +999,41 @@ fn default_terminal_working_directory() -> PathBuf {
         })
 }
 
+fn path_is_inside_agent_worktree(path: &Path) -> bool {
+    let mut saw_agents = false;
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            continue;
+        };
+        let name = value.to_string_lossy().to_ascii_lowercase();
+        if saw_agents && name == "worktrees" {
+            return true;
+        }
+        saw_agents = name == ".agents";
+    }
+    false
+}
+
+fn safe_background_command_working_directory() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(env::temp_dir)
+}
+
+fn configure_safe_process_current_directory() {
+    let Ok(current_dir) = env::current_dir() else {
+        return;
+    };
+    if !path_is_inside_agent_worktree(&current_dir) {
+        return;
+    }
+
+    let safe_dir = safe_background_command_working_directory();
+    let _ = env::set_current_dir(safe_dir);
+}
+
 const TERMINAL_EMULATION_TERM: &str = "xterm-256color";
 const TERMINAL_EMULATION_COLORTERM: &str = "truecolor";
 const TERMINAL_EMULATION_FORCE_COLOR: &str = "1";
@@ -1075,24 +1110,124 @@ fn spawn_terminal_pty(
     mut command: CommandBuilder,
     context: &str,
 ) -> Result<WarmPty, String> {
+    log_terminal_crash_forensics_event(
+        "backend.pty.open.begin",
+        json!({
+            "cols": size.cols,
+            "context": clean_terminal_diagnostic_log_text(context),
+            "pty_backend": if cfg!(windows) { "conpty" } else { "native" },
+            "rows": size.rows,
+            "windows_build_number": terminal_windows_build_number(),
+        }),
+    );
     let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|error| format!("Unable to open {context} PTY: {error}"))?;
+    let pair = match pty_system.openpty(size) {
+        Ok(pair) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.open.done",
+                json!({
+                    "cols": size.cols,
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "rows": size.rows,
+                }),
+            );
+            pair
+        }
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.open.error",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                }),
+            );
+            return Err(format!("Unable to open {context} PTY: {error}"));
+        }
+    };
     apply_terminal_emulation_env(&mut command);
 
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("Unable to start {context}: {error}"))?;
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| format!("Unable to read {context} output: {error}"))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|error| format!("Unable to write {context} input: {error}"))?;
+    log_terminal_crash_forensics_event(
+        "backend.pty.spawn_command.begin",
+        json!({
+            "context": clean_terminal_diagnostic_log_text(context),
+        }),
+    );
+    let child = match pair.slave.spawn_command(command) {
+        Ok(child) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.spawn_command.done",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "pid": child.process_id(),
+                }),
+            );
+            child
+        }
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.spawn_command.error",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                }),
+            );
+            return Err(format!("Unable to start {context}: {error}"));
+        }
+    };
+    log_terminal_crash_forensics_event(
+        "backend.pty.clone_reader.begin",
+        json!({
+            "context": clean_terminal_diagnostic_log_text(context),
+        }),
+    );
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.clone_reader.done",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                }),
+            );
+            reader
+        }
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.clone_reader.error",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                }),
+            );
+            return Err(format!("Unable to read {context} output: {error}"));
+        }
+    };
+    log_terminal_crash_forensics_event(
+        "backend.pty.take_writer.begin",
+        json!({
+            "context": clean_terminal_diagnostic_log_text(context),
+        }),
+    );
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.take_writer.done",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                }),
+            );
+            writer
+        }
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.pty.take_writer.error",
+                json!({
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                }),
+            );
+            return Err(format!("Unable to write {context} input: {error}"));
+        }
+    };
 
     Ok(WarmPty {
         child,
@@ -1138,6 +1273,7 @@ fn create_agent_terminal_pty(
 }
 
 fn cleanup_warm_pty_with_context(warm_pty: WarmPty) {
+    log_terminal_crash_forensics_event("backend.warm_pty_cleanup.begin", json!({}));
     let WarmPty {
         mut child,
         master,
@@ -1145,13 +1281,28 @@ fn cleanup_warm_pty_with_context(warm_pty: WarmPty) {
         reader,
         size: _,
     } = warm_pty;
-    kill_terminal_process_tree(child.as_mut());
+    log_terminal_crash_forensics_event("backend.warm_pty_cleanup.kill.begin", json!({}));
+    let report = kill_terminal_process_tree(child.as_mut());
+    log_terminal_crash_forensics_event(
+        "backend.warm_pty_cleanup.kill.done",
+        json!({
+            "report": terminal_kill_report_json(&report),
+        }),
+    );
     poll_terminal_child_exit(child.as_mut());
     thread::spawn(move || {
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_child.begin", json!({}));
         drop(child);
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_child.done", json!({}));
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_reader.begin", json!({}));
         drop(reader);
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_reader.done", json!({}));
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_writer.begin", json!({}));
         drop(writer);
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_writer.done", json!({}));
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_master.begin", json!({}));
         drop(master);
+        log_terminal_crash_forensics_event("backend.warm_pty_cleanup.drop_master.done", json!({}));
     });
 }
 
@@ -1747,6 +1898,7 @@ fn kill_login_terminal_child(child: &mut std::process::Child) -> TerminalKillRep
         .arg(child.id().to_string())
         .arg("/T")
         .arg("/F")
+        .current_dir(safe_background_command_working_directory())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

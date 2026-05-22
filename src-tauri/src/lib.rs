@@ -106,8 +106,10 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
+const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = true;
+const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
 const WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
@@ -147,6 +149,7 @@ static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
 #[cfg(windows)]
@@ -190,6 +193,7 @@ const DEEPGRAM_DEFAULT_LANGUAGE: &str = "en";
 const DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS: u64 = 90;
 const DEEPGRAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
+const CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS: u64 = 55;
 const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
 const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
 const AUDIO_REALTIME_TRANSCRIPT_EVENT: &str = "forge-audio-realtime-transcript";
@@ -255,8 +259,8 @@ pub(crate) fn app_shutdown_requested() -> bool {
     APP_SHUTDOWN_PHASE.load(Ordering::Acquire) >= APP_SHUTDOWN_PHASE_QUIESCING
 }
 
-pub(crate) fn app_shutdown_phase_label() -> &'static str {
-    match APP_SHUTDOWN_PHASE.load(Ordering::Acquire) {
+fn app_shutdown_phase_label_for(phase: u8) -> &'static str {
+    match phase {
         APP_SHUTDOWN_PHASE_RUNNING => "running",
         APP_SHUTDOWN_PHASE_QUIESCING => "quiescing",
         APP_SHUTDOWN_PHASE_STOPPING_WATCHERS => "stopping_watchers",
@@ -265,6 +269,10 @@ pub(crate) fn app_shutdown_phase_label() -> &'static str {
         APP_SHUTDOWN_PHASE_EXITING => "exiting",
         _ => "unknown",
     }
+}
+
+pub(crate) fn app_shutdown_phase_label() -> &'static str {
+    app_shutdown_phase_label_for(APP_SHUTDOWN_PHASE.load(Ordering::Acquire))
 }
 
 pub(crate) fn app_shutdown_blocked_message(operation: &str) -> String {
@@ -283,14 +291,23 @@ pub(crate) fn ensure_app_not_shutting_down(operation: &str) -> Result<(), String
 }
 
 fn begin_app_shutdown() -> bool {
-    APP_SHUTDOWN_PHASE
+    let changed = APP_SHUTDOWN_PHASE
         .compare_exchange(
             APP_SHUTDOWN_PHASE_RUNNING,
             APP_SHUTDOWN_PHASE_QUIESCING,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .is_ok()
+        .is_ok();
+    if changed {
+        log_terminal_crash_forensics_event(
+            "backend.app_shutdown.phase",
+            json!({
+                "phase": app_shutdown_phase_label_for(APP_SHUTDOWN_PHASE_QUIESCING),
+            }),
+        );
+    }
+    changed
 }
 
 fn advance_app_shutdown_phase(phase: u8) {
@@ -304,6 +321,13 @@ fn advance_app_shutdown_phase(phase: u8) {
             .compare_exchange(current, phase, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            log_terminal_crash_forensics_event(
+                "backend.app_shutdown.phase",
+                json!({
+                    "from": app_shutdown_phase_label_for(current),
+                    "phase": app_shutdown_phase_label_for(phase),
+                }),
+            );
             return;
         }
     }
@@ -428,7 +452,13 @@ struct AudioState {
 }
 
 struct CloudVoiceAgentSession {
+    control_tx: mpsc::UnboundedSender<CloudVoiceAgentControl>,
     finished_rx: oneshot::Receiver<Result<(), String>>,
+}
+
+enum CloudVoiceAgentControl {
+    FinishInput,
+    Stop,
 }
 
 struct DeepgramRealtimeSession {
@@ -519,6 +549,7 @@ struct TerminalParkedPrompt {
     title: String,
     prompt: String,
     waiting_on: Vec<TerminalParkedWaitingOn>,
+    voice_plan_prompt: Option<CloudMcpVoicePlanPromptMetadata>,
     coordination: TerminalCoordinationSession,
     working_directory: PathBuf,
 }
@@ -544,6 +575,12 @@ struct TerminalParkedPromptPayload {
     status: String,
     waiting_on: Vec<TerminalParkedWaitingOn>,
     reason: Option<String>,
+    prompt_event_id: Option<String>,
+    prompt_event_source: Option<String>,
+    terminal_index: Option<u16>,
+    thread_id: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -1411,6 +1448,10 @@ fn terminal_status_log_path() -> PathBuf {
     diagnostic_log_path(TERMINAL_STATUS_LOG_FILE)
 }
 
+fn terminal_crash_forensics_log_path() -> PathBuf {
+    diagnostic_log_path(TERMINAL_CRASH_FORENSICS_LOG_FILE)
+}
+
 fn windows_terminal_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE)
 }
@@ -1547,6 +1588,38 @@ fn write_terminal_status_log_entry(entry: Value) {
     let _ = writeln!(file, "{entry}");
 }
 
+fn write_terminal_crash_forensics_log_entry(entry: Value) {
+    if !TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = terminal_crash_forensics_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = TERMINAL_CRASH_FORENSICS_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+    let _ = file.flush();
+    let _ = file.sync_data();
+}
+
 fn write_windows_terminal_diagnostic_log_entry(entry: Value) {
     let log_path = windows_terminal_diagnostic_log_path();
     let Some(log_dir) = log_path.parent() else {
@@ -1603,6 +1676,18 @@ fn log_terminal_status_event(phase: &str, fields: Value) {
         "source": "backend",
         "app_pid": std::process::id(),
         "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+}
+
+fn log_terminal_crash_forensics_event(phase: &str, fields: Value) {
+    write_terminal_crash_forensics_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "shutdown_phase": app_shutdown_phase_label(),
         "fields": fields,
     }));
 }
@@ -1790,6 +1875,7 @@ fn install_app_panic_log_hook() {
                 "thread_id": thread_id,
                 "thread_name": clean_terminal_telemetry_text(&thread_name),
             });
+            log_terminal_crash_forensics_event("backend.app_panic", fields.clone());
             log_audio_diagnostic_event("app.panic", fields);
             previous_hook(panic_info);
         }));
@@ -2142,10 +2228,20 @@ fn restore_main_window_after_reopen(app: AppHandle, has_visible_windows: bool) {
 
 pub fn run() {
     configure_windows_process_error_mode();
+    configure_safe_process_current_directory();
     install_app_panic_log_hook();
 
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
+    log_terminal_crash_forensics_event(
+        "backend.process_start",
+        json!({
+            "log_file": terminal_crash_forensics_log_path().display().to_string(),
+            "terminal_status_logging_enabled": TERMINAL_STATUS_LOGGING_ENABLED,
+            "windows": cfg!(windows),
+            "windows_build_number": terminal_windows_build_number(),
+        }),
+    );
     log_audio_diagnostic_event(
         "audio.debug.process_start",
         json!({

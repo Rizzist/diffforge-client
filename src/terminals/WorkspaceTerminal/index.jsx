@@ -3097,14 +3097,71 @@ function WorkspaceTerminal({
       }
 
       const promptKey = `${Number(payload.instanceId || 0)}:${payload.taskId || ""}`;
+      const promptEventId = String(payload.promptEventId || payload.prompt_event_id || "").trim();
+      const lifecycleThreadId = String(payload.threadId || payload.thread_id || terminalThreadIdRef.current || thread?.id || "").trim();
+      const lifecycleWorkspaceId = String(payload.workspaceId || payload.workspace_id || workspace?.id || thread?.workspaceId || "").trim();
+      const lifecycleTerminalIndex = Number.isFinite(Number(payload.terminalIndex ?? payload.terminal_index))
+        ? Number(payload.terminalIndex ?? payload.terminal_index)
+        : terminalIndex;
       if (payload.status === "parked") {
         if (cancellingParkedPromptKeysRef.current.has(promptKey)) {
           return;
         }
         setParkedPrompt(payload);
+        if (lifecycleThreadId && lifecycleWorkspaceId) {
+          onThreadTerminalLifecycle?.({
+            activityStatus: "idle",
+            agentId: terminalAgentKind,
+            instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
+            inputReady: false,
+            paneId,
+            pendingPromptId: promptEventId,
+            promptEventId,
+            source: "terminal-parked",
+            status: "parked",
+            terminalIndex: lifecycleTerminalIndex,
+            threadId: lifecycleThreadId,
+            type: "agent-output",
+            workspaceId: lifecycleWorkspaceId,
+          });
+        }
       } else {
         cancellingParkedPromptKeysRef.current.delete(promptKey);
         setParkedPrompt(null);
+        if (
+          payload.status === "resumed"
+          && String(payload.reason || "").trim() !== "task_terminal"
+          && lifecycleThreadId
+          && lifecycleWorkspaceId
+        ) {
+          const startedAt = new Date().toISOString();
+          const userMessageId = promptEventId || String(payload.taskId || "").trim() || createThreadProjectionToken("message-user");
+          const turnId = `turn-${userMessageId}`;
+          onThreadTerminalLifecycle?.({
+            activityStatus: "thinking",
+            agentId: terminalAgentKind,
+            instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
+            inputReady: false,
+            paneId,
+            pendingPromptId: promptEventId || userMessageId,
+            promptEventId: promptEventId || userMessageId,
+            projectionEvents: buildProviderTurnStartProjectionEvents({
+              agentId: terminalAgentKind,
+              includeUserMessage: false,
+              source: "terminal-parked-resume",
+              startedAt,
+              text: payload.title ? `Resume parked task: ${payload.title}` : "Resume parked task.",
+              turnId,
+              userMessageId,
+            }),
+            source: "terminal-parked-resume",
+            status: "active",
+            terminalIndex: lifecycleTerminalIndex,
+            threadId: lifecycleThreadId,
+            type: "provider-turn-started",
+            workspaceId: lifecycleWorkspaceId,
+          });
+        }
       }
     })
       .then((nextUnlisten) => {
@@ -3122,7 +3179,7 @@ function WorkspaceTerminal({
         unlisten();
       }
     };
-  }, [paneId]);
+  }, [onThreadTerminalLifecycle, paneId, terminalAgentKind, terminalIndex, thread?.id, thread?.workspaceId, workspace?.id]);
 
   useEffect(() => {
     if (!agent) {
@@ -9424,7 +9481,11 @@ function WorkspaceTerminal({
 
         if (isDisposed) {
           startupControlReplyBridgeOpen = false;
-          invoke("terminal_close", { paneId, instanceId: terminalInstanceId }).catch(() => {});
+          invoke("terminal_close", {
+            paneId,
+            instanceId: terminalInstanceId,
+            waitForCleanup: true,
+          }).catch(() => {});
           return;
         }
 
@@ -9701,6 +9762,7 @@ function WorkspaceTerminal({
         paneId,
         instanceId: terminalInstanceId,
         preserveCoordinationSession,
+        waitForCleanup: true,
       }).catch(() => {});
       terminal.dispose();
     };
@@ -10464,6 +10526,7 @@ function WorkspaceTerminal({
       await invoke("terminal_close", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
+        waitForCleanup: true,
       });
     } catch (error) {
       terminalClosingRef.current = false;

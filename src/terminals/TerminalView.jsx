@@ -79,8 +79,9 @@ import {
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
-const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
+const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [];
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
+const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
 const TODO_QUEUE_BUSY_REASONS = new Set([
@@ -91,6 +92,7 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "agent_not_ready",
   "pending_prompt",
   "reserved",
+  "submitted_prompt_active",
   "terminal_starting",
 ]);
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
@@ -112,6 +114,7 @@ const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
 const TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO = "tui-spec-edit-auto-queue";
 const TODO_QUEUE_SOURCE_VOICE_PLAN = "tui-voice-plan-queue";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
+const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
 const ORCHESTRATOR_VOICE_RING_CENTER = 50;
 const ORCHESTRATOR_VOICE_RING_MIN_RADIUS = 35.8;
@@ -2625,8 +2628,21 @@ function getVoiceHistoryTurnKey(event, sessionId) {
 }
 
 function getVoiceHistoryTurnStatus(item) {
+  const llmStatus = String(item?.llmStatus || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (llmStatus === "failed" || llmStatus === "error") {
+    return "Failed";
+  }
+  if (llmStatus === "timed_out" || llmStatus === "timeout") {
+    return "Timed out";
+  }
   if (item?.plan) {
     return getVoicePlanStatusLabel(item.plan);
+  }
+  if (llmStatus === "planned") {
+    return "Planned";
+  }
+  if (llmStatus === "ready") {
+    return "Done";
   }
   if (!item?.transcriptFinal) {
     return "Pending";
@@ -2656,9 +2672,10 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
   const id = String(item.id || "").trim();
   const transcript = normalizeVoiceHistoryText(item.transcript);
   const llmFeedback = normalizeVoiceHistoryText(item.llmFeedback, 1600);
+  const llmError = normalizeVoiceHistoryText(item.llmError, 1600);
   const queuedText = normalizeVoiceHistoryText(item.queuedText, 600);
   const plan = normalizeVoicePlanSnapshot(item.plan);
-  if (!id || (!transcript && !llmFeedback && !queuedText && !plan)) {
+  if (!id || (!transcript && !llmFeedback && !llmError && !queuedText && !plan)) {
     return null;
   }
 
@@ -2670,6 +2687,7 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
     createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : Date.now(),
     id,
     llmFeedback,
+    llmError,
     llmFinal: Boolean(item.llmFinal),
     llmStatus: String(item.llmStatus || "").trim().slice(0, 48),
     ...(plan ? { plan } : {}),
@@ -2759,6 +2777,15 @@ function getVoicePlanStatusLabel(plan) {
   const status = String(plan?.status || "").trim().replace(/_/g, " ");
   if (status === "completed") {
     return "Complete";
+  }
+  if (status === "planned") {
+    return "Planned";
+  }
+  if (status === "failed") {
+    return "Failed";
+  }
+  if (status === "cancelled" || status === "canceled") {
+    return "Cancelled";
   }
   const currentStep = Number(plan?.currentStepOrdinal || 0) + 1;
   const currentStage = String(plan?.currentStage || "").trim();
@@ -4020,6 +4047,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorVoiceMonitorRef = useRef(null);
   const orchestratorVoiceRunRef = useRef(0);
   const orchestratorVoiceSessionRef = useRef(Date.now());
+  const orchestratorVoiceHistoryItemsRef = useRef([]);
+  const orchestratorVoiceTurnTimeoutsRef = useRef(new Map());
   const orchestratorVoiceTtsPlayerRef = useRef(null);
   const orchestratorVoiceHistoryStoreKeyRef = useRef(orchestratorVoiceHistoryStoreKey);
   const orchestratorVoiceHistoryLoadedRef = useRef(false);
@@ -4079,7 +4108,108 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   useEffect(() => {
+    orchestratorVoiceHistoryItemsRef.current = orchestratorVoiceHistoryItems;
+  }, [orchestratorVoiceHistoryItems]);
+
+  const clearVoiceHistoryTurnTimeout = useCallback((turnKey) => {
+    const safeTurnKey = String(turnKey || "").trim();
+    if (!safeTurnKey) {
+      return;
+    }
+    const timeoutId = orchestratorVoiceTurnTimeoutsRef.current.get(safeTurnKey);
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      orchestratorVoiceTurnTimeoutsRef.current.delete(safeTurnKey);
+    }
+  }, []);
+
+  const clearAllVoiceHistoryTurnTimeouts = useCallback(() => {
+    orchestratorVoiceTurnTimeoutsRef.current.forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    orchestratorVoiceTurnTimeoutsRef.current.clear();
+  }, []);
+
+  const markVoiceHistoryTurnTerminal = useCallback((turnKey, status, message) => {
+    const safeTurnKey = String(turnKey || "").trim();
+    const normalizedStatus = String(status || "failed").trim() || "failed";
+    const normalizedMessage = normalizeVoiceHistoryText(
+      message || "The orchestrator did not return a final response.",
+      1600,
+    );
+    if (!safeTurnKey) {
+      return;
+    }
+    clearVoiceHistoryTurnTimeout(safeTurnKey);
+    updateVoiceHistoryTurn(safeTurnKey, (currentItem) => {
+      if (currentItem.llmFinal || currentItem.queued || currentItem.plan) {
+        if (normalizedStatus === "failed" || normalizedStatus === "error") {
+          return {
+            llmError: normalizedMessage,
+            llmFeedback: currentItem.llmFeedback || normalizedMessage,
+            llmFinal: true,
+            llmStatus: normalizedStatus,
+          };
+        }
+        return currentItem;
+      }
+      return {
+        llmError: normalizedMessage,
+        llmFeedback: currentItem.llmFeedback || normalizedMessage,
+        llmFinal: true,
+        llmStatus: normalizedStatus,
+        transcriptFinal: currentItem.transcriptFinal,
+      };
+    });
+  }, [clearVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
+
+  const markPendingVoiceHistoryTurnsTerminal = useCallback((status, message) => {
+    const sessionPrefix = `${Number(orchestratorVoiceSessionRef.current || 0)}:`;
+    const pendingTurnKeys = orchestratorVoiceHistoryItemsRef.current
+      .filter((item) => (
+        String(item.id || "").startsWith(sessionPrefix)
+        && item.transcriptFinal
+        && !item.llmFinal
+        && !item.queued
+        && !item.plan
+      ))
+      .map((item) => item.id);
+    pendingTurnKeys.forEach((turnKey) => {
+      markVoiceHistoryTurnTerminal(turnKey, status, message);
+    });
+  }, [markVoiceHistoryTurnTerminal]);
+
+  const scheduleVoiceHistoryTurnTimeout = useCallback((turnKey) => {
+    const safeTurnKey = String(turnKey || "").trim();
+    if (!safeTurnKey || orchestratorVoiceTurnTimeoutsRef.current.has(safeTurnKey)) {
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      orchestratorVoiceTurnTimeoutsRef.current.delete(safeTurnKey);
+      const currentItem = orchestratorVoiceHistoryItemsRef.current.find((item) => item.id === safeTurnKey) || null;
+      markVoiceHistoryTurnTerminal(
+        safeTurnKey,
+        "timed_out",
+        "The orchestrator timed out before returning a final response, plan, or error.",
+      );
+      logTerminalStatus("frontend.voice_history.turn_timeout", {
+        hasFinalTranscript: Boolean(currentItem?.transcriptFinal),
+        hasLlmFeedback: Boolean(currentItem?.llmFeedback),
+        hasPlan: Boolean(currentItem?.plan),
+        llmFinal: Boolean(currentItem?.llmFinal),
+        llmStatus: String(currentItem?.llmStatus || ""),
+        transcriptLength: String(currentItem?.transcript || "").length,
+        timeoutMs: ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS,
+        turnKey: safeTurnKey,
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    }, ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS);
+    orchestratorVoiceTurnTimeoutsRef.current.set(safeTurnKey, timeoutId);
+  }, [markVoiceHistoryTurnTerminal, orchestratorPanelWorkspaceId]);
+
+  useEffect(() => {
     let disposed = false;
+    clearAllVoiceHistoryTurnTimeouts();
     orchestratorVoiceHistoryStoreKeyRef.current = orchestratorVoiceHistoryStoreKey;
     orchestratorVoiceHistoryLoadedRef.current = false;
     setOrchestratorVoiceHistoryItems([]);
@@ -4101,7 +4231,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     return () => {
       disposed = true;
     };
-  }, [orchestratorPanelWorkspaceId, orchestratorVoiceHistoryStoreKey, rootDirectory]);
+  }, [clearAllVoiceHistoryTurnTimeouts, orchestratorPanelWorkspaceId, orchestratorVoiceHistoryStoreKey, rootDirectory]);
 
   useEffect(() => {
     if (!orchestratorVoiceHistoryLoadedRef.current) {
@@ -4158,7 +4288,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       transcriptFinal: currentItem.transcriptFinal || isFinal,
       turnIndex: getVoiceHistoryTurnIndex(event),
     }));
-  }, [orchestratorPanelWorkspaceId, updateVoiceHistoryTurn]);
+    if (isFinal) {
+      scheduleVoiceHistoryTurnTimeout(turnKey);
+    }
+  }, [orchestratorPanelWorkspaceId, scheduleVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryLlmFeedback = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -4182,7 +4315,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       llmStatus: String(event?.status || "").trim(),
       turnIndex: getVoiceHistoryTurnIndex(event),
     });
-  }, [orchestratorPanelWorkspaceId, updateVoiceHistoryTurn]);
+    if (event?.final) {
+      clearVoiceHistoryTurnTimeout(turnKey);
+    } else {
+      scheduleVoiceHistoryTurnTimeout(turnKey);
+    }
+  }, [clearVoiceHistoryTurnTimeout, orchestratorPanelWorkspaceId, scheduleVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryToolCall = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -4216,7 +4354,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       llmFinal: currentItem.llmFeedback ? currentItem.llmFinal : Boolean(patch.llmFinal),
       llmStatus: currentItem.llmStatus || patch.llmStatus || "",
     }));
-  }, [updateVoiceHistoryTurn]);
+    if (toolName === "create_plan") {
+      scheduleVoiceHistoryTurnTimeout(turnKey);
+    } else {
+      clearVoiceHistoryTurnTimeout(turnKey);
+    }
+  }, [clearVoiceHistoryTurnTimeout, scheduleVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryOpenCodingAgentsResult = useCallback((event, message, status = "ready") => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -4227,7 +4370,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       llmStatus: status,
       turnIndex: getVoiceHistoryTurnIndex(event),
     });
-  }, [updateVoiceHistoryTurn]);
+    clearVoiceHistoryTurnTimeout(turnKey);
+  }, [clearVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryPlanSnapshot = useCallback((event) => {
     const snapshot = getVoicePlanSnapshotFromPayload(event);
@@ -4245,10 +4389,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       ? getVoiceHistoryTurnKey(event, sessionId)
       : `plan:${snapshot.runId}`;
     setOrchestratorVoiceHistoryItems((currentItems) => {
-      const currentIndex = currentItems.findIndex((item) => (
-        item.id === turnKey
-        || item.plan?.runId === snapshot.runId
-      ));
+      const exactTurnIndex = currentItems.findIndex((item) => item.id === turnKey);
+      const planIndex = currentItems.findIndex((item) => item.plan?.runId === snapshot.runId);
+      const currentIndex = exactTurnIndex >= 0 ? exactTurnIndex : planIndex;
       const currentItem = currentIndex >= 0
         ? currentItems[currentIndex]
         : {
@@ -4267,8 +4410,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         ...currentItem,
         id: currentItem.id || turnKey,
         llmFeedback: currentItem.llmFeedback || `Plan: ${snapshot.title}`,
-        llmFinal: snapshot.status === "completed",
-        llmStatus: snapshot.status || currentItem.llmStatus,
+        llmFinal: true,
+        llmStatus: snapshot.status === "completed" ? "ready" : "planned",
         plan: snapshot,
         transcriptFinal: currentItem.transcriptFinal || !hasTurnIndex,
         turnIndex: hasTurnIndex ? getVoiceHistoryTurnIndex(event) : currentItem.turnIndex,
@@ -4282,7 +4425,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         : [nextItem].concat(currentItems);
       return nextItems.slice(0, ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
     });
-  }, [orchestratorPanelWorkspaceId]);
+    clearVoiceHistoryTurnTimeout(turnKey);
+  }, [clearVoiceHistoryTurnTimeout, orchestratorPanelWorkspaceId]);
 
   const resetOrchestratorFastResponseGate = useCallback(() => {
     const gate = orchestratorVoiceFastResponseGateRef.current;
@@ -4389,8 +4533,15 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [orchestratorPanelWorkspaceId, recordVoiceHistoryLlmFeedback]);
 
   const stopOrchestratorVoiceMonitor = useCallback(async () => {
+    if (orchestratorVoiceEventsActiveRef.current) {
+      markPendingVoiceHistoryTurnsTerminal(
+        "failed",
+        "Voice orchestration stopped before a final response, plan, or error arrived.",
+      );
+    }
     orchestratorVoiceRunRef.current += 1;
     cancelOrchestratorFastResponseGate("stop");
+    clearAllVoiceHistoryTurnTimeouts();
     orchestratorVoiceInputFinishRequestedRef.current = false;
     const monitor = orchestratorVoiceMonitorRef.current;
     orchestratorVoiceMonitorRef.current = null;
@@ -4405,7 +4556,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate]);
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, markPendingVoiceHistoryTurnsTerminal]);
 
   const finishOrchestratorVoiceInput = useCallback(async () => {
     orchestratorVoiceInputFinishRequestedRef.current = true;
@@ -4428,6 +4579,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const completeOrchestratorVoiceSession = useCallback(async () => {
     orchestratorVoiceRunRef.current += 1;
     cancelOrchestratorFastResponseGate("finished");
+    clearAllVoiceHistoryTurnTimeouts();
     orchestratorVoiceInputFinishRequestedRef.current = false;
     const monitor = orchestratorVoiceMonitorRef.current;
     orchestratorVoiceMonitorRef.current = null;
@@ -4439,11 +4591,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate]);
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts]);
 
   const startOrchestratorVoiceMonitor = useCallback(async () => {
     const runId = orchestratorVoiceRunRef.current + 1;
     orchestratorVoiceRunRef.current = runId;
+    clearAllVoiceHistoryTurnTimeouts();
     resetOrchestratorFastResponseGate();
     orchestratorVoiceInputFinishRequestedRef.current = false;
     orchestratorVoiceSessionRef.current = Date.now();
@@ -4559,7 +4712,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         "Unable to start the cloud voice agent.",
       ));
     }
-  }, [agentStatuses, defaultWorkingDirectory, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+  }, [agentStatuses, clearAllVoiceHistoryTurnTimeouts, defaultWorkingDirectory, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
 
   const toggleOrchestratorVoiceMonitor = useCallback(() => {
     if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
@@ -4832,6 +4985,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   useEffect(() => () => {
     orchestratorVoiceRunRef.current += 1;
     cancelOrchestratorFastResponseGate("unmount");
+    clearAllVoiceHistoryTurnTimeouts();
     orchestratorVoiceInputFinishRequestedRef.current = false;
     const monitor = orchestratorVoiceMonitorRef.current;
     orchestratorVoiceMonitorRef.current = null;
@@ -4842,7 +4996,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     monitor?.finishCapture?.().catch(() => null);
     monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate]);
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts]);
 
   useEffect(() => {
     let disposed = false;
@@ -4860,6 +5014,22 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         }
         cancelOrchestratorFastResponseGate("error");
         const message = String(event?.error?.message || event?.message || "Cloud voice agent stopped.");
+        const hasTurnIndex = event?.turn_index != null || event?.turnIndex != null;
+        if (hasTurnIndex) {
+          markVoiceHistoryTurnTerminal(
+            getVoiceHistoryTurnKey(event, orchestratorVoiceSessionRef.current),
+            "failed",
+            message,
+          );
+        } else {
+          markPendingVoiceHistoryTurnsTerminal("failed", message);
+        }
+        logTerminalStatus("frontend.voice_history.error_arrived", {
+          code: String(event?.error?.code || event?.code || "").trim(),
+          hasTurnIndex,
+          message,
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
         void stopOrchestratorVoiceMonitor().finally(() => {
           if (disposed) {
             return;
@@ -4951,14 +5121,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           snapshot: getVoicePlanSnapshotLogSummary(getVoicePlanSnapshotFromPayload(event)),
           workspaceId: orchestratorPanelWorkspaceId,
         });
+        recordVoiceHistoryPlanSnapshot(event);
         const handledPlanResult = onVoicePlanServerResult?.(event);
         logTerminalStatus("frontend.voice_agent.plan_snapshot_routed", {
           handledPlanResult: Boolean(handledPlanResult),
           workspaceId: orchestratorPanelWorkspaceId,
         });
-        if (!handledPlanResult) {
-          recordVoiceHistoryPlanSnapshot(event);
-        }
         const snapshot = getVoicePlanSnapshotFromPayload(event);
         if (snapshot) {
           setOrchestratorVoiceError("");
@@ -5000,6 +5168,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
       if (kind === "voice_agent_finished" && orchestratorVoiceEventsActiveRef.current) {
         cancelOrchestratorFastResponseGate("finished_event");
+        markPendingVoiceHistoryTurnsTerminal(
+          "failed",
+          "The orchestrator stream finished before returning a final response, plan, or error.",
+        );
         void completeOrchestratorVoiceSession();
       }
     }).then((nextUnlisten) => {
@@ -5023,6 +5195,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     recordVoiceHistoryToolCall,
     recordVoiceHistoryTranscript,
     onVoicePlanServerResult,
+    markPendingVoiceHistoryTurnsTerminal,
+    markVoiceHistoryTurnTerminal,
     completeOrchestratorVoiceSession,
     stopOrchestratorVoiceMonitor,
     orchestratorPanelWorkspaceId,
@@ -5400,7 +5574,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                           && !item.queued
                           && !item.plan,
                       );
-                      const llmLabel = item.llmFinal || item.queued
+                      const llmLabel = item.llmFinal || item.queued || item.plan || item.llmError
                         ? "LLM response"
                         : "LLM response pending";
 
@@ -5586,6 +5760,7 @@ function TerminalView({
   const todoQueueItemsRef = useRef([]);
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
+  const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
   const voiceAgentToolCallIdsRef = useRef(new Set());
   const voicePlanDeferredTasksRef = useRef(new Map());
@@ -5974,6 +6149,33 @@ function TerminalView({
     if (activeReservation && String(activeReservation.itemId || "") !== itemId) {
       return unavailable("reserved", "Another queued todo is already sending to this terminal.", targetFields);
     }
+    const activeInFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex);
+    if (
+      activeInFlightPrompt
+      && Number(activeInFlightPrompt.startedAtMs || 0) > 0
+      && Date.now() - Number(activeInFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS
+    ) {
+      todoQueueTerminalInFlightPromptsRef.current.delete(targetTerminalIndex);
+      logTerminalStatus("frontend.todo_queue.in_flight_prompt_expired", {
+        promptEventId: activeInFlightPrompt.promptId || "",
+        reason: "timeout",
+        source: activeInFlightPrompt.source || "",
+        targetTerminalIndex,
+        threadId: activeInFlightPrompt.threadId || "",
+        workspaceId,
+      });
+    }
+    const blockingInFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex);
+    if (blockingInFlightPrompt) {
+      return unavailable(
+        "submitted_prompt_active",
+        "This agent is still working on the submitted prompt.",
+        {
+          ...targetFields,
+          blockingPromptId: blockingInFlightPrompt.promptId || "",
+        },
+      );
+    }
     if (!liveTerminal || !["active", "running"].includes(terminalStatus)) {
       return unavailable("terminal_starting", "This terminal is still starting.", targetFields);
     }
@@ -6139,6 +6341,85 @@ function TerminalView({
       unsubscribeAttachments();
     };
   }, []);
+
+  useEffect(() => {
+    const inFlightPrompts = todoQueueTerminalInFlightPromptsRef.current;
+    if (!inFlightPrompts.size || !workspaceThreadEntry?.terminals) {
+      return;
+    }
+
+    let changed = false;
+    const nowMs = Date.now();
+    inFlightPrompts.forEach((inFlightPrompt, terminalIndex) => {
+      const promptId = String(inFlightPrompt?.promptId || "").trim();
+      const liveTerminal = Object.values(workspaceThreadEntry.terminals || {}).find((candidate) => (
+        Number(candidate?.terminalIndex) === Number(terminalIndex)
+      )) || null;
+      const targetThread = inFlightPrompt?.threadId
+        ? workspaceThreadEntry?.threads?.[inFlightPrompt.threadId] || null
+        : liveTerminal?.threadId
+          ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
+          : null;
+      const targetRole = String(liveTerminal?.agentId || targetThread?.currentAgent || "").trim().toLowerCase();
+      const providerBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+      const latestTurn = targetThread?.latestTurn || null;
+      const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+      const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+      const latestMessageId = String(latestTurn?.messageId || "").trim();
+      const submittedAtMs = Number(inFlightPrompt?.submittedAtMs || 0);
+      const terminalInputReadyAtMs = Date.parse(
+        liveTerminal?.inputReadyAt
+          || providerBinding?.inputReadyAt
+          || "",
+      ) || 0;
+      const promptTurnMatches = Boolean(
+        promptId
+          && (
+            latestTurnId.includes(promptId)
+            || latestMessageId === promptId
+          ),
+      );
+      const completedMatchingTurn = Boolean(
+        promptTurnMatches
+          && ["completed", "error", "interrupted"].includes(latestTurnState),
+      );
+      const freshInputReady = Boolean(
+        (liveTerminal?.inputReady || providerBinding?.inputReady)
+          && submittedAtMs
+          && terminalInputReadyAtMs
+          && terminalInputReadyAtMs >= submittedAtMs,
+      );
+      const expired = Number(inFlightPrompt?.startedAtMs || 0) > 0
+        && nowMs - Number(inFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
+
+      if (!completedMatchingTurn && !freshInputReady && !expired) {
+        return;
+      }
+
+      inFlightPrompts.delete(terminalIndex);
+      changed = true;
+      logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
+        completedMatchingTurn,
+        expired,
+        freshInputReady,
+        latestTurnState,
+        promptEventId: promptId,
+        reason: completedMatchingTurn
+          ? "matching_turn_completed"
+          : freshInputReady
+            ? "terminal_input_ready"
+            : "timeout",
+        source: inFlightPrompt?.source || "",
+        targetTerminalIndex: terminalIndex,
+        threadId: targetThread?.id || inFlightPrompt?.threadId || "",
+        workspaceId: targetThread?.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+      });
+    });
+
+    if (changed) {
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    }
+  }, [terminalWorkspace?.id, workspaceThreadEntry]);
 
   useEffect(() => {
     const element = terminalWorkspaceMainRef.current;
@@ -6663,12 +6944,13 @@ function TerminalView({
       const statusPayload = payload.statusPayload || {};
       const promptEventId = String(statusPayload.promptEventId || statusPayload.prompt_event_id || "").trim();
       if (promptEventId) {
-        logTerminalStatus("frontend.voice_plan.backend_prompt_ready_not_lifecycle", {
+        logTerminalStatus("frontend.voice_plan.backend_status_payload_not_lifecycle", {
           agentId: statusPayload.agentId || statusPayload.agent_id || "",
           promptEventId,
-          source: payload.source || "backend_terminal_prompt_ready",
+          source: payload.source || "backend_voice_plan_status",
           targetTerminalIndex: statusPayload.terminalIndex ?? statusPayload.terminal_index ?? "",
-          reason: "backend_prompt_ready_is_not_provider_turn_complete",
+          reason: "backend_status_result_updates_snapshot_without_inferred_completion",
+          status: statusPayload.status || "",
           threadId: statusPayload.threadId || statusPayload.thread_id || "",
           workspaceId: terminalWorkspace?.id || eventWorkspaceId,
         });
@@ -7199,6 +7481,52 @@ function TerminalView({
         const promptId = getTodoQueueItemPlanTask(currentItem)?.taskId
           || getTodoQueueItemSpecEdit(currentItem)?.intentId
           || createThreadProjectionToken("todo-drop-prompt");
+        const registerInFlightPrompt = (submittedAt) => {
+          if (!Number.isInteger(Number(target.targetTerminalIndex))) {
+            return;
+          }
+
+          todoQueueTerminalInFlightPromptsRef.current.set(Number(target.targetTerminalIndex), {
+            itemId: currentItem.id || currentItem.itemId || "",
+            promptId,
+            source,
+            startedAtMs: Date.now(),
+            submittedAt,
+            submittedAtMs: Date.parse(submittedAt) || Date.now(),
+            threadId: targetThread.id,
+            workspaceId,
+          });
+          setTodoQueueDispatchRevision((revision) => revision + 1);
+          logTerminalStatus("frontend.todo_queue.in_flight_prompt_registered", {
+            item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+            promptEventId: promptId,
+            source,
+            targetTerminalIndex: target.targetTerminalIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+        };
+        const clearInFlightPromptOnError = (reason) => {
+          if (!Number.isInteger(Number(target.targetTerminalIndex))) {
+            return;
+          }
+
+          const inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(Number(target.targetTerminalIndex));
+          if (String(inFlightPrompt?.promptId || "") !== promptId) {
+            return;
+          }
+
+          todoQueueTerminalInFlightPromptsRef.current.delete(Number(target.targetTerminalIndex));
+          setTodoQueueDispatchRevision((revision) => revision + 1);
+          logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
+            promptEventId: promptId,
+            reason,
+            source,
+            targetTerminalIndex: target.targetTerminalIndex,
+            threadId: targetThread.id,
+            workspaceId,
+          });
+        };
         const syncData = buildTerminalComposerDraftInput(previousDraft, terminalText, true);
         const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
           requestTerminalSubmitDiagnosticSnapshot({
@@ -7266,6 +7594,7 @@ function TerminalView({
           instanceId: targetBinding?.instanceId,
           paneId,
           promptId,
+          requirePromptMatch: true,
           threadId: targetThread.id,
           workspaceId,
         });
@@ -7280,6 +7609,7 @@ function TerminalView({
         try {
           const submittedAt = new Date().toISOString();
           const promptEventSource = getTodoQueuePromptEventSource(source, currentItem);
+          registerInFlightPrompt(submittedAt);
           logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
             agentId: targetRole,
             paneId,
@@ -7315,10 +7645,12 @@ function TerminalView({
           requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
             submitSequenceLength: terminalSubmitSequence.length,
           });
-          await submittedWaiter.promise;
+          const submittedPayload = await submittedWaiter.promise;
           logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
             agentId: targetRole,
             paneId,
+            promptMatch: submittedPayload?.promptMatch !== false,
+            promptSource: submittedPayload?.promptSource || "",
             promptId,
             source,
             syncKey,
@@ -7341,6 +7673,7 @@ function TerminalView({
                 ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
                 : terminalText
             ),
+            allowEnterRetry: false,
             isGenericTerminal: false,
             logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
             promptId,
@@ -7362,10 +7695,57 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
+          if (syncKey) {
+            setWorkspaceThreadComposerDraft(syncKey, "");
+          }
+          const clearInputData = buildTerminalComposerDraftInput(terminalText, "", true);
+          if (clearInputData) {
+            try {
+              logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear_start", {
+                agentId: targetRole,
+                paneId,
+                promptId,
+                source,
+                syncKey,
+                targetTerminalIndex: targetLogIndex,
+                threadId: targetThread.id,
+                workspaceId,
+              });
+              await invoke("terminal_write", {
+                data: clearInputData,
+                instanceId: targetBinding?.instanceId,
+                paneId,
+                threadId: targetThread.id,
+              });
+              logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear_done", {
+                agentId: targetRole,
+                paneId,
+                promptId,
+                source,
+                syncKey,
+                targetTerminalIndex: targetLogIndex,
+                threadId: targetThread.id,
+                workspaceId,
+              });
+            } catch (clearError) {
+              logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear_error", {
+                agentId: targetRole,
+                message: clearError?.message || String(clearError || ""),
+                paneId,
+                promptId,
+                source,
+                syncKey,
+                targetTerminalIndex: targetLogIndex,
+                threadId: targetThread.id,
+                workspaceId,
+              });
+            }
+          }
           dropResult = {
             acceptedDetail,
             confirmedSubmit: true,
             promptId,
+            promptEventSubmittedAt: submittedAt,
             syncKey,
             targetBinding,
             targetThread,
@@ -7374,6 +7754,7 @@ function TerminalView({
             writeResult,
           };
         } catch (submitError) {
+          clearInFlightPromptOnError("submit_error");
           submittedWaiter.cancel();
           acceptedWaiter.cancel();
           requestTerminalSubmitDiagnosticSnapshot({
@@ -7437,10 +7818,13 @@ function TerminalView({
       onThreadTerminalLifecycle?.({
         agentId: targetRole,
         instanceId: targetBinding?.instanceId || "",
+        messageCreatedAt: dropResult?.promptEventSubmittedAt || "",
+        messageId: dropResult?.promptId || "",
         messageSource: lifecycleSource,
         paneId,
         pendingPromptId: dropResult?.promptId || "",
         promptEventId: dropResult?.promptId || "",
+        promptEventSubmittedAt: dropResult?.promptEventSubmittedAt || "",
         repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
         slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
         source: lifecycleSource,

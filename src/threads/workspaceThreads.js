@@ -1326,7 +1326,13 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
 
   const projectionEvents = ensureThreadProjectionEvents(thread);
   const messages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
-  const createdAt = cleanText(event.messageCreatedAt, nowIso());
+  const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  const createdAt = cleanText(
+    event.messageCreatedAt
+      || event.promptEventSubmittedAt
+      || event.submittedAt,
+    nowIso(),
+  );
   const createdMs = Date.parse(createdAt);
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
   if (
@@ -1341,7 +1347,10 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
     return [];
   }
 
-  const messageId = cleanText(event.messageId, createRandomId(`message-${safeKey(thread?.id, "thread")}`));
+  const messageId = cleanText(
+    event.messageId || promptEventId,
+    createRandomId(`message-${safeKey(thread?.id, "thread")}`),
+  );
   const turnId = cleanText(event.turnId || event.turn_id, createTurnIdForMessage(thread, messageId));
   const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
   const source = cleanText(event.source || event.messageSource, "local-submit");
@@ -1370,6 +1379,18 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
 function createProjectionEventsFromTranscript(thread, incomingMessages, event = {}) {
   const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
   const source = cleanText(event.source, `${agentId || "agent"}-session`);
+  const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  const expectedUserMessage = cleanSubmittedUserMessage(
+    event.expectedUserMessage
+      || event.userMessage
+      || event.message,
+  );
+  const expectedMessageCreatedAt = cleanText(
+    event.expectedMessageCreatedAt
+      || event.messageCreatedAt
+      || event.promptEventSubmittedAt
+      || event.submittedAt,
+  );
   let projectionEvents = ensureThreadProjectionEvents(thread);
   let projectedMessages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
   const events = [];
@@ -1379,9 +1400,30 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
 
   normalizeThreadMessages(incomingMessages).forEach((message) => {
     const eventStartCount = events.length;
-    const projectedMessage = findMatchingProjectedMessage(projectedMessages, message);
-    const messageId = cleanText(message.id, createRandomId("message"));
-    const createdAt = cleanText(message.createdAt, nowIso());
+    const canonicalPromptUserMessage = Boolean(
+      promptEventId
+        && message.role === "user"
+        && expectedUserMessage
+        && cleanSubmittedUserMessage(message.text) === expectedUserMessage,
+    );
+    const matchCandidate = canonicalPromptUserMessage
+      ? {
+        ...message,
+        createdAt: expectedMessageCreatedAt || message.createdAt,
+        id: promptEventId,
+      }
+      : message;
+    const projectedMessage = findMatchingProjectedMessage(projectedMessages, matchCandidate);
+    const messageId = cleanText(
+      canonicalPromptUserMessage ? promptEventId : message.id,
+      createRandomId("message"),
+    );
+    const createdAt = cleanText(
+      canonicalPromptUserMessage
+        ? expectedMessageCreatedAt || message.createdAt
+        : message.createdAt,
+      nowIso(),
+    );
     const messageTurnId = cleanText(
       message.turnId
         || message.turn_id
@@ -2943,13 +2985,17 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       transcriptSessionId: entry.threads[threadId].transcriptSessionId,
     });
     const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
+    const submittedPromptActive = cleanText(event.type).toLowerCase() === "message-submitted"
+      && hasSubmittedPrompt;
     const activityStatus = activityStatusForLatestTurn(
       latestTurn,
       shouldClearOrphanRunning
         ? "idle"
-        : messageAdded || pendingPrompt
-        ? entry.threads[threadId].activityStatus
-        : previousActivityStatus,
+        : submittedPromptActive
+          ? "thinking"
+          : messageAdded || pendingPrompt
+            ? entry.threads[threadId].activityStatus
+            : previousActivityStatus,
     );
     let providerBindings = normalizeProviderBindings(
       entry.threads[threadId].providerBindings,
@@ -3555,8 +3601,13 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     createProjectionEventsFromTranscript(existing, event.messages, {
       agentId,
       completedAt: event.completedAt,
+      expectedMessageCreatedAt: event.expectedMessageCreatedAt,
+      expectedUserMessage: event.expectedUserMessage,
       latestTimestamp: event.latestTimestamp,
+      promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
+      promptEventSubmittedAt: event.promptEventSubmittedAt,
       source: cleanText(event.source, `${agentId}-session`),
+      submittedAt: event.submittedAt,
       turnCompleteSeen: event.turnCompleteSeen,
     }),
   );

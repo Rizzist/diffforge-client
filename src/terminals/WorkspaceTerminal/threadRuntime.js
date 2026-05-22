@@ -1158,6 +1158,7 @@ export async function createTerminalPromptSubmittedWaiter({
   instanceId,
   paneId,
   promptId,
+  requirePromptMatch = false,
   threadId,
   timeoutMs = 6000,
   workspaceId = "",
@@ -1207,8 +1208,23 @@ export async function createTerminalPromptSubmittedWaiter({
       const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
       const instanceMatches = !Number.isFinite(Number(instanceId))
         || eventInstanceId === Number(instanceId);
+      const submittedPromptMatchesExpected = payload.promptMatch !== false;
 
       if (!promptMatches || !paneMatches || !threadMatches || !instanceMatches || settled) {
+        return;
+      }
+      if (requirePromptMatch && !submittedPromptMatchesExpected) {
+        logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
+          agentId,
+          expectedPromptLength: safeExpectedPrompt.length,
+          instanceId: eventInstanceId,
+          observedPromptLength: String(payload.observedPrompt || payload.prompt || "").trim().length,
+          paneId: eventPaneId,
+          promptId: eventPromptId,
+          promptSource: payload.promptSource || "",
+          threadId: eventThreadId,
+          workspaceId: payload.workspaceId || workspaceId || "",
+        });
         return;
       }
 
@@ -1220,7 +1236,9 @@ export async function createTerminalPromptSubmittedWaiter({
         instanceId: eventInstanceId,
         observedPromptLength: String(payload.prompt || "").trim().length,
         paneId: eventPaneId,
+        promptMatch: payload.promptMatch !== false,
         promptId: eventPromptId,
+        promptSource: payload.promptSource || "",
         threadId: eventThreadId,
         workspaceId: payload.workspaceId || workspaceId || "",
       });
@@ -1367,6 +1385,7 @@ export function requestTerminalSubmitDiagnosticSnapshot(fields = {}) {
 export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
   acceptedWaiter,
   agentId = "",
+  allowEnterRetry = true,
   binding,
   expectedPrompt = "",
   getDraftValue,
@@ -1402,6 +1421,23 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
 
     if (outcome.kind === "accepted") {
       return outcome.detail;
+    }
+
+    if (!allowEnterRetry) {
+      logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_blocked`, {
+        agentId: safeAgentId,
+        bindingInstanceId: binding?.instanceId || "",
+        bindingPaneId: binding?.paneId || "",
+        expectedPromptLength: safePrompt.length,
+        promptId: safePromptId,
+        reason: "enter_retry_disabled_after_submit",
+        retryDelayMs,
+        retryIndex: retryIndex + 1,
+        sendPolicy: "terminal-confirmed-and-session-accepted",
+        threadId: safeThreadId,
+        workspaceId,
+      });
+      continue;
     }
 
     const currentDraft = String(

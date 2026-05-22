@@ -3326,6 +3326,13 @@ fn cloud_voice_agent_event_kind(payload: &Value) -> &str {
         .unwrap_or_default()
 }
 
+fn cloud_voice_agent_event_completes_request(payload: &Value) -> bool {
+    matches!(
+        cloud_voice_agent_event_kind(payload),
+        "voice_agent_finished" | "voice_agent_error"
+    )
+}
+
 fn cloud_voice_agent_tts_suppression_active(deadline: Option<Instant>) -> bool {
     match deadline {
         Some(deadline) => deadline > Instant::now(),
@@ -3369,6 +3376,7 @@ async fn run_cloud_voice_agent_stream(
     repo_id: String,
     sample_rate: u32,
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut control_rx: mpsc::UnboundedReceiver<CloudVoiceAgentControl>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     finished_tx: oneshot::Sender<Result<(), String>>,
 ) {
@@ -3461,14 +3469,82 @@ async fn run_cloud_voice_agent_stream(
 
     let mut stream_error: Option<String> = None;
     let mut client_stop_requested = false;
+    let mut input_finished_sent = false;
+    let mut result_received = false;
     let mut tts_suppression_until: Option<Instant> = None;
     let mut suppressed_audio_chunks = 0u64;
     let mut suppressed_audio_bytes = 0u64;
     loop {
         tokio::select! {
+            maybe_control = control_rx.recv() => {
+                match maybe_control {
+                    Some(CloudVoiceAgentControl::FinishInput) => {
+                        if !input_finished_sent {
+                            let finish_message = json!({
+                                "kind": "finish_input",
+                                "contract": "diffforge.voice_agent.v1",
+                            });
+                            if let Err(error) = write
+                                .send(Message::Text(finish_message.to_string().into()))
+                                .await
+                            {
+                                stream_error = Some(format!(
+                                    "Unable to finish cloud voice agent input: {error}"
+                                ));
+                            } else {
+                                input_finished_sent = true;
+                                log_audio_diagnostic_event(
+                                    "audio.cloud_voice.finish_input.sent",
+                                    json!({
+                                        "repo_id": repo_id,
+                                        "workspace_id": workspace_id,
+                                    }),
+                                );
+                            }
+                        }
+                        break;
+                    }
+                    Some(CloudVoiceAgentControl::Stop) | None => {
+                        client_stop_requested = true;
+                        break;
+                    }
+                }
+            }
             maybe_audio = audio_rx.recv() => {
                 let Some(audio_bytes) = maybe_audio else {
-                    client_stop_requested = true;
+                    match control_rx.try_recv() {
+                        Ok(CloudVoiceAgentControl::Stop)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => {
+                            client_stop_requested = true;
+                            break;
+                        }
+                        Ok(CloudVoiceAgentControl::FinishInput)
+                        | Err(mpsc::error::TryRecvError::Empty) => {}
+                    }
+                    if !input_finished_sent {
+                        let finish_message = json!({
+                            "kind": "finish_input",
+                            "contract": "diffforge.voice_agent.v1",
+                        });
+                        if let Err(error) = write
+                            .send(Message::Text(finish_message.to_string().into()))
+                            .await
+                        {
+                            stream_error = Some(format!(
+                                "Unable to finish cloud voice agent input after audio closed: {error}"
+                            ));
+                        } else {
+                            input_finished_sent = true;
+                            log_audio_diagnostic_event(
+                                "audio.cloud_voice.finish_input.sent",
+                                json!({
+                                    "reason": "audio_channel_closed",
+                                    "repo_id": repo_id,
+                                    "workspace_id": workspace_id,
+                                }),
+                            );
+                        }
+                    }
                     break;
                 };
                 if !audio_bytes.is_empty() {
@@ -3501,21 +3577,32 @@ async fn run_cloud_voice_agent_stream(
                 match maybe_message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
+                            let request_complete = cloud_voice_agent_event_completes_request(&payload);
                             update_cloud_voice_agent_tts_suppression(
                                 &payload,
                                 &mut tts_suppression_until,
                             );
                             emit_cloud_voice_agent_event(&app, payload);
+                            if request_complete {
+                                result_received = true;
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                             if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                                let request_complete =
+                                    cloud_voice_agent_event_completes_request(&payload);
                                 update_cloud_voice_agent_tts_suppression(
                                     &payload,
                                     &mut tts_suppression_until,
                                 );
                                 emit_cloud_voice_agent_event(&app, payload);
+                                if request_complete {
+                                    result_received = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3540,23 +3627,143 @@ async fn run_cloud_voice_agent_stream(
         }
     }
 
-    if stream_error.is_none() {
-        let stop_message = json!({
-            "kind": "stop",
-            "contract": "diffforge.voice_agent.v1",
-        });
-        if let Err(error) = write
-            .send(Message::Text(stop_message.to_string().into()))
-            .await
-        {
-            let error_text = error.to_string();
-            if client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text) {
-                stream_error = None;
-            } else {
+    if stream_error.is_none() && !client_stop_requested && !result_received {
+        if !input_finished_sent {
+            let finish_message = json!({
+                "kind": "finish_input",
+                "contract": "diffforge.voice_agent.v1",
+            });
+            if let Err(error) = write
+                .send(Message::Text(finish_message.to_string().into()))
+                .await
+            {
                 stream_error = Some(format!(
-                    "Unable to stop cloud voice agent stream: {error_text}"
+                    "Unable to finish cloud voice agent input before waiting for result: {error}"
                 ));
+            } else {
+                log_audio_diagnostic_event(
+                    "audio.cloud_voice.finish_input.sent",
+                    json!({
+                        "reason": "result_wait_started",
+                        "repo_id": repo_id,
+                        "workspace_id": workspace_id,
+                    }),
+                );
             }
+        }
+    }
+
+    if stream_error.is_none() && !client_stop_requested && !result_received {
+        log_audio_diagnostic_event(
+            "audio.cloud_voice.result_wait.start",
+            json!({
+                "repo_id": repo_id,
+                "timeout_secs": CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS,
+                "workspace_id": workspace_id,
+            }),
+        );
+        let result_deadline = sleep(Duration::from_secs(CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS));
+        tokio::pin!(result_deadline);
+        loop {
+            tokio::select! {
+                maybe_control = control_rx.recv() => {
+                    if matches!(maybe_control, Some(CloudVoiceAgentControl::Stop) | None) {
+                        client_stop_requested = true;
+                        break;
+                    }
+                }
+                maybe_message = read.next() => {
+                    match maybe_message {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
+                                let request_complete =
+                                    cloud_voice_agent_event_completes_request(&payload);
+                                update_cloud_voice_agent_tts_suppression(
+                                    &payload,
+                                    &mut tts_suppression_until,
+                                );
+                                emit_cloud_voice_agent_event(&app, payload);
+                                if request_complete {
+                                    result_received = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                                    let request_complete =
+                                        cloud_voice_agent_event_completes_request(&payload);
+                                    update_cloud_voice_agent_tts_suppression(
+                                        &payload,
+                                        &mut tts_suppression_until,
+                                    );
+                                    emit_cloud_voice_agent_event(&app, payload);
+                                    if request_complete {
+                                        result_received = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            if let Err(error) = write.send(Message::Pong(payload)).await {
+                                stream_error =
+                                    Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            stream_error = Some(
+                                "Cloud voice agent connection closed before final response, plan, or error."
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            let error_text = error.to_string();
+                            stream_error = Some(format!(
+                                "Cloud voice agent stream failed: {error_text}"
+                            ));
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = &mut result_deadline => {
+                    stream_error = Some(format!(
+                        "Cloud voice agent did not return a final response, plan, or error within {CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS} seconds after input finished."
+                    ));
+                    break;
+                }
+            }
+        }
+        log_audio_diagnostic_event(
+            "audio.cloud_voice.result_wait.done",
+            json!({
+                "error": stream_error.as_deref().unwrap_or_default(),
+                "received": result_received,
+                "repo_id": repo_id,
+                "workspace_id": workspace_id,
+            }),
+        );
+    }
+
+    let stop_message = json!({
+        "kind": "stop",
+        "contract": "diffforge.voice_agent.v1",
+    });
+    if let Err(error) = write
+        .send(Message::Text(stop_message.to_string().into()))
+        .await
+    {
+        let error_text = error.to_string();
+        if stream_error.is_none()
+            && !(client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text))
+        {
+            stream_error = Some(format!(
+                "Unable to stop cloud voice agent stream: {error_text}"
+            ));
         }
     }
 
@@ -3726,6 +3933,7 @@ async fn start_cloud_voice_agent_stream(
     });
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel::<CloudVoiceAgentControl>();
     tauri::async_runtime::spawn(run_cloud_voice_agent_stream(
         app,
         cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
@@ -3734,6 +3942,7 @@ async fn start_cloud_voice_agent_stream(
         repo_id.clone(),
         status.sample_rate,
         audio_rx,
+        control_rx,
         ready_tx,
         finished_tx,
     ));
@@ -3754,7 +3963,10 @@ async fn start_cloud_voice_agent_stream(
         }
     }
 
-    *session_guard = Some(CloudVoiceAgentSession { finished_rx });
+    *session_guard = Some(CloudVoiceAgentSession {
+        control_tx,
+        finished_rx,
+    });
 
     Ok(CloudVoiceAgentStartStatus {
         active: true,
@@ -3777,6 +3989,7 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
         return Ok(());
     };
 
+    let _ = session.control_tx.send(CloudVoiceAgentControl::Stop);
     audio_state.input_worker.detach_realtime_stream()?;
 
     timeout(
@@ -3794,11 +4007,16 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
 async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> Result<(), String> {
     log_audio_diagnostic_event("audio.cloud_voice.finish_input.command", json!({}));
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
-    if audio_state.cloud_voice_agent_stream.lock().await.is_none() {
-        log_audio_diagnostic_event("audio.cloud_voice.finish_input.inactive", json!({}));
-        return Ok(());
-    }
+    let control_tx = {
+        let session_guard = audio_state.cloud_voice_agent_stream.lock().await;
+        let Some(session) = session_guard.as_ref() else {
+            log_audio_diagnostic_event("audio.cloud_voice.finish_input.inactive", json!({}));
+            return Ok(());
+        };
+        session.control_tx.clone()
+    };
 
+    let _ = control_tx.send(CloudVoiceAgentControl::FinishInput);
     audio_state.input_worker.detach_realtime_stream()?;
     log_audio_diagnostic_event("audio.cloud_voice.finish_input.done", json!({}));
     Ok(())

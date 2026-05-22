@@ -323,19 +323,65 @@ async fn write_terminal_input(
     else {
         return Ok(false);
     };
+    let input_kind = terminal_input_forensics_kind(data);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_input.write.begin",
+        json!({
+            "bytes": data.len(),
+            "input_kind": input_kind,
+            "instance_id": instance.id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+        }),
+    );
     let lock_started_at = Instant::now();
     let mut writer = instance.writer.lock().await;
     let lock_wait_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
     let write_started_at = Instant::now();
 
-    writer
-        .write_all(data.as_bytes())
-        .map_err(|error| format!("Unable to write terminal input: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
+    if let Err(error) = writer.write_all(data.as_bytes()) {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_input.write.error",
+            json!({
+                "bytes": data.len(),
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "input_kind": input_kind,
+                "instance_id": instance.id,
+                "lock_wait_ms": lock_wait_ms,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "stage": "write_all",
+            }),
+        );
+        return Err(format!("Unable to write terminal input: {error}"));
+    }
+    if let Err(error) = writer.flush() {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_input.write.error",
+            json!({
+                "bytes": data.len(),
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "input_kind": input_kind,
+                "instance_id": instance.id,
+                "lock_wait_ms": lock_wait_ms,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "stage": "flush",
+            }),
+        );
+        return Err(format!("Unable to flush terminal input: {error}"));
+    }
     let write_ms = terminal_diagnostic_elapsed_ms(write_started_at);
     let elapsed_ms = lock_wait_ms + write_ms;
+    log_terminal_crash_forensics_event(
+        "backend.terminal_input.write.done",
+        json!({
+            "bytes": data.len(),
+            "elapsed_ms": elapsed_ms,
+            "input_kind": input_kind,
+            "instance_id": instance.id,
+            "lock_wait_ms": lock_wait_ms,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "write_ms": write_ms,
+        }),
+    );
 
     if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
         if let Some(app) = app {
@@ -422,6 +468,40 @@ struct TerminalKillReport {
     child_kill_error: Option<String>,
 }
 
+fn terminal_kill_report_json(report: &TerminalKillReport) -> Value {
+    json!({
+        "child_kill_error": report.child_kill_error.clone(),
+        "child_kill_ok": report.child_kill_ok,
+        "pid": report.pid,
+        "taskkill_error": report.taskkill_error.clone(),
+        "taskkill_exit_code": report.taskkill_exit_code,
+        "taskkill_success": report.taskkill_success,
+    })
+}
+
+fn terminal_metadata_forensics_json(metadata: &TerminalInstanceMetadata) -> Value {
+    json!({
+        "agent_id": clean_terminal_diagnostic_log_text(&metadata.agent_id),
+        "agent_kind": clean_terminal_diagnostic_log_text(&metadata.agent_kind),
+        "pane_id": clean_terminal_diagnostic_log_text(&metadata.pane_id),
+        "terminal_index": metadata.terminal_index,
+        "thread_id": clean_terminal_diagnostic_log_text(&metadata.thread_id),
+        "workspace_id": clean_terminal_diagnostic_log_text(&metadata.workspace_id),
+        "workspace_name": clean_terminal_diagnostic_log_text(&metadata.workspace_name),
+    })
+}
+
+fn terminal_input_forensics_kind(data: &str) -> &'static str {
+    match data {
+        "\r" | "\n" | "\r\n" => "enter",
+        TERMINAL_ENTER_SEQUENCE | TERMINAL_ENTER_SEQUENCE_MOD1 | TERMINAL_SHIFT_ENTER_SEQUENCE => {
+            "enter_escape_sequence"
+        }
+        _ if data.chars().any(|character| character.is_control()) => "control_or_escape",
+        _ => "text",
+    }
+}
+
 #[cfg(windows)]
 fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     let mut report = TerminalKillReport {
@@ -435,6 +515,7 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
             .arg(pid.to_string())
             .arg("/T")
             .arg("/F")
+            .current_dir(safe_background_command_working_directory())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -604,6 +685,16 @@ enum TerminalCoordinationCleanupMode {
     DeferToShutdownBatch,
 }
 
+impl TerminalCoordinationCleanupMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            TerminalCoordinationCleanupMode::InterruptAfterProcess => "interrupt_after_process",
+            TerminalCoordinationCleanupMode::Preserve => "preserve",
+            TerminalCoordinationCleanupMode::DeferToShutdownBatch => "defer_to_shutdown_batch",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TerminalShutdownCoordinationCleanup {
     repo_path: String,
@@ -700,7 +791,7 @@ fn cleanup_terminal_instance_with_context(
     coordination_cleanup_mode: TerminalCoordinationCleanupMode,
 ) {
     let TerminalInstance {
-        id: _,
+        id,
         child,
         master,
         writer,
@@ -713,14 +804,60 @@ fn cleanup_terminal_instance_with_context(
         coordination,
         metadata,
     } = instance;
+    let metadata_fields = terminal_metadata_forensics_json(&metadata);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.begin",
+        json!({
+            "coordination_cleanup_mode": coordination_cleanup_mode.as_str(),
+            "instance_id": id,
+            "kill_first": kill_first,
+            "metadata": metadata_fields,
+            "reason": reason,
+        }),
+    );
 
     let maybe_child = {
         let mut child = child.blocking_lock();
         child.take()
     };
     let Some(mut child) = maybe_child else {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.no_child",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.drop_writer.begin",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
         drop(writer);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.drop_writer.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.drop_master.begin",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
         drop(master);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.drop_master.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
         drop(size);
         drop(working_directory);
         drop(agent_started);
@@ -734,22 +871,122 @@ fn cleanup_terminal_instance_with_context(
             coordination_cleanup_mode,
         );
         drop(coordination);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+            }),
+        );
         return;
     };
     if kill_first {
-        kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.begin",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "stage": "initial_kill_first",
+            }),
+        );
+        let report = kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "report": terminal_kill_report_json(&report),
+                "stage": "initial_kill_first",
+            }),
+        );
     } else if !poll_terminal_child_exit(child.as_mut()) {
-        kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.begin",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "stage": "poll_timeout",
+            }),
+        );
+        let report = kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "report": terminal_kill_report_json(&report),
+                "stage": "poll_timeout",
+            }),
+        );
     }
 
     if !poll_terminal_child_exit(child.as_mut()) {
-        kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.begin",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "stage": "final_poll_timeout",
+            }),
+        );
+        let report = kill_terminal_process_tree(child.as_mut());
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup.kill.done",
+            json!({
+                "instance_id": id,
+                "reason": reason,
+                "report": terminal_kill_report_json(&report),
+                "stage": "final_poll_timeout",
+            }),
+        );
         poll_terminal_child_exit(child.as_mut());
     }
 
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_child.begin",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
     drop(child);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_child.done",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_writer.begin",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
     drop(writer);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_writer.done",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_master.begin",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
     drop(master);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.drop_master.done",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
     drop(size);
     drop(working_directory);
     drop(agent_started);
@@ -763,6 +1000,13 @@ fn cleanup_terminal_instance_with_context(
         coordination_cleanup_mode,
     );
     drop(coordination);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_cleanup.done",
+        json!({
+            "instance_id": id,
+            "reason": reason,
+        }),
+    );
 }
 
 fn cleanup_terminal_instance_async(
@@ -1095,7 +1339,21 @@ fn spawn_terminal_reader(
 
     let reader_pane_id = pane_id.clone();
 
+    log_terminal_crash_forensics_event(
+        "backend.terminal_reader.spawn",
+        json!({
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+        }),
+    );
     thread::spawn(move || {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_reader.begin",
+            json!({
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+            }),
+        );
         let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
         let mut stats_started_at = Instant::now();
         let mut stats_chunks: u64 = 0;
@@ -1106,10 +1364,25 @@ fn spawn_terminal_reader(
         let mut stats_slow_observer_schedules: u64 = 0;
         let mut stats_total_observer_schedule_ms = 0.0f64;
         let mut stats_max_observer_schedule_ms = 0.0f64;
-
-        loop {
+        let mut forensics_started_at = Instant::now();
+        let mut forensics_chunks: u64 = 0;
+        let mut forensics_bytes: u64 = 0;
+        let mut forensics_total_chunks: u64 = 0;
+        let mut forensics_total_bytes: u64 = 0;
+        let exit_reason = loop {
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    log_terminal_crash_forensics_event(
+                        "backend.terminal_reader.eof",
+                        json!({
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                            "total_bytes": forensics_total_bytes,
+                            "total_chunks": forensics_total_chunks,
+                        }),
+                    );
+                    break "eof";
+                }
                 Ok(bytes_read) => {
                     let chunk = &buffer[..bytes_read];
 
@@ -1121,6 +1394,29 @@ fn spawn_terminal_reader(
                         &cloud_mcp_state,
                         &output_channel,
                     );
+                    forensics_chunks += 1;
+                    forensics_bytes += bytes_read as u64;
+                    forensics_total_chunks += 1;
+                    forensics_total_bytes += bytes_read as u64;
+                    if forensics_started_at.elapsed() >= Duration::from_secs(2) {
+                        log_terminal_crash_forensics_event(
+                            "backend.terminal_reader.output_window",
+                            json!({
+                                "bytes": forensics_bytes,
+                                "chunks": forensics_chunks,
+                                "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
+                                "instance_id": instance_id,
+                                "last_send_ms": send_ms,
+                                "last_observer_schedule_ms": observer_schedule_ms,
+                                "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                "total_bytes": forensics_total_bytes,
+                                "total_chunks": forensics_total_chunks,
+                            }),
+                        );
+                        forensics_started_at = Instant::now();
+                        forensics_chunks = 0;
+                        forensics_bytes = 0;
+                    }
                     if terminal_diagnostics_enabled_for_app(&app) {
                         stats_chunks += 1;
                         stats_bytes += bytes_read as u64;
@@ -1187,14 +1483,46 @@ fn spawn_terminal_reader(
                     }
 
                     if !sent {
-                        break;
+                        log_terminal_crash_forensics_event(
+                            "backend.terminal_reader.output_channel_closed",
+                            json!({
+                                "bytes": bytes_read,
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                "total_bytes": forensics_total_bytes,
+                                "total_chunks": forensics_total_chunks,
+                            }),
+                        );
+                        break "output_channel_closed";
                     }
                 }
-                Err(_) => {
-                    break;
+                Err(error) => {
+                    log_terminal_crash_forensics_event(
+                        "backend.terminal_reader.read_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                            "total_bytes": forensics_total_bytes,
+                            "total_chunks": forensics_total_chunks,
+                        }),
+                    );
+                    break "read_error";
                 }
             }
-        }
+        };
+        log_terminal_crash_forensics_event(
+            "backend.terminal_reader.exit",
+            json!({
+                "exit_reason": exit_reason,
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                "trailing_window_bytes": forensics_bytes,
+                "trailing_window_chunks": forensics_chunks,
+                "total_bytes": forensics_total_bytes,
+                "total_chunks": forensics_total_chunks,
+            }),
+        );
 
         let cleanup_app = app.clone();
         let cleanup_terminals = Arc::clone(&terminals);
@@ -1247,6 +1575,15 @@ async fn close_terminal_session(
     wait_for_cleanup: bool,
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
+    log_terminal_crash_forensics_event(
+        "backend.terminal_close.begin",
+        json!({
+            "expected_instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "preserve_coordination_session": preserve_coordination_session,
+            "wait_for_cleanup": wait_for_cleanup,
+        }),
+    );
 
     let instance = {
         let mut terminals = state.terminals.write().await;
@@ -1258,6 +1595,14 @@ async fn close_terminal_session(
                 .unwrap_or(false);
 
             if !is_current {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close.skip",
+                    json!({
+                        "expected_instance_id": expected_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                        "reason": "instance_mismatch_or_missing",
+                    }),
+                );
                 return Ok(false);
             }
         }
@@ -1267,6 +1612,14 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
+        log_terminal_crash_forensics_event(
+            "backend.terminal_close.removed",
+            json!({
+                "instance_id": cleanup_instance_id,
+                "metadata": terminal_metadata_forensics_json(&instance.metadata),
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            }),
+        );
         if let Some(cloud_mcp_state) = cloud_mcp_state {
             let notify_state = cloud_mcp_state.clone();
             let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
@@ -1306,6 +1659,15 @@ async fn close_terminal_session(
                 )
                 .await;
             });
+            log_terminal_crash_forensics_event(
+                "backend.terminal_close.done",
+                json!({
+                    "cleanup_joined": false,
+                    "instance_id": cleanup_instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "wait_for_cleanup": wait_for_cleanup,
+                }),
+            );
             return Ok(true);
         }
         let _ = tokio::time::timeout(
@@ -1314,9 +1676,26 @@ async fn close_terminal_session(
         )
         .await;
 
+        log_terminal_crash_forensics_event(
+            "backend.terminal_close.done",
+            json!({
+                "instance_id": cleanup_instance_id,
+                "cleanup_joined": true,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "wait_for_cleanup": wait_for_cleanup,
+            }),
+        );
         return Ok(true);
     }
 
+    log_terminal_crash_forensics_event(
+        "backend.terminal_close.skip",
+        json!({
+            "expected_instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "reason": "not_running",
+        }),
+    );
     Ok(false)
 }
 
@@ -1336,6 +1715,13 @@ async fn close_all_terminal_sessions(
     let closed = instances.len();
     let total = closed;
     let warm_total = warm_ptys.len();
+    log_terminal_crash_forensics_event(
+        "backend.terminal_close_all.begin",
+        json!({
+            "active_count": closed,
+            "warm_count": warm_total,
+        }),
+    );
     let coordination_cleanups = instances
         .iter()
         .filter_map(|(_, instance)| terminal_shutdown_coordination_cleanup_from_instance(instance))
@@ -1385,12 +1771,26 @@ async fn close_all_terminal_sessions(
 
             thread::spawn(move || {
                 let instance_id = instance.id;
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.active_cleanup_thread.begin",
+                    json!({
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
+                );
 
                 cleanup_terminal_instance_with_context(
                     instance,
                     true,
                     "close_all",
                     TerminalCoordinationCleanupMode::DeferToShutdownBatch,
+                );
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.active_cleanup_thread.done",
+                    json!({
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
                 );
                 let closed = closed_count.fetch_add(1, Ordering::Relaxed) + 1;
                 emit_terminal_close_all_progress(
@@ -1408,7 +1808,15 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.warm_cleanup_thread.begin",
+                    json!({}),
+                );
                 cleanup_warm_pty_with_context(warm_pty);
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.warm_cleanup_thread.done",
+                    json!({}),
+                );
                 let _ = cleanup_tx.send(CleanupSignal::Warm);
             });
         }
@@ -1417,7 +1825,15 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.login_cleanup_thread.begin",
+                    json!({}),
+                );
                 cleanup_login_terminal_children();
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close_all.login_cleanup_thread.done",
+                    json!({}),
+                );
                 let _ = cleanup_tx.send(CleanupSignal::Login);
             });
         }
@@ -1468,6 +1884,17 @@ async fn close_all_terminal_sessions(
             pty_pool.wait_for_refill_idle();
         }
         cleanup_windows_headless_console_hosts();
+        log_terminal_crash_forensics_event(
+            "backend.terminal_close_all.done",
+            json!({
+                "active_done": active_done,
+                "active_total": total,
+                "login_done": login_closed.is_some(),
+                "timed_out": timed_out,
+                "warm_done": warm_done,
+                "warm_total": warm_total,
+            }),
+        );
     })
     .await
     .map_err(|error| format!("Unable to join terminal shutdown cleanup: {error}"))?;
@@ -1488,12 +1915,47 @@ fn write_agent_start_input_to_writer(
     input: &str,
     context: &str,
 ) -> Result<(), String> {
-    writer
-        .write_all(input.as_bytes())
-        .map_err(|error| format!("Unable to write {context}: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Unable to flush {context}: {error}"))
+    log_terminal_crash_forensics_event(
+        "backend.agent_start_input.write.begin",
+        json!({
+            "bytes": input.len(),
+            "context": clean_terminal_diagnostic_log_text(context),
+            "input_kind": terminal_input_forensics_kind(input),
+        }),
+    );
+    if let Err(error) = writer.write_all(input.as_bytes()) {
+        log_terminal_crash_forensics_event(
+            "backend.agent_start_input.write.error",
+            json!({
+                "bytes": input.len(),
+                "context": clean_terminal_diagnostic_log_text(context),
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "stage": "write_all",
+            }),
+        );
+        return Err(format!("Unable to write {context}: {error}"));
+    }
+    if let Err(error) = writer.flush() {
+        log_terminal_crash_forensics_event(
+            "backend.agent_start_input.write.error",
+            json!({
+                "bytes": input.len(),
+                "context": clean_terminal_diagnostic_log_text(context),
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "stage": "flush",
+            }),
+        );
+        return Err(format!("Unable to flush {context}: {error}"));
+    }
+    log_terminal_crash_forensics_event(
+        "backend.agent_start_input.write.done",
+        json!({
+            "bytes": input.len(),
+            "context": clean_terminal_diagnostic_log_text(context),
+            "input_kind": terminal_input_forensics_kind(input),
+        }),
+    );
+    Ok(())
 }
 
 fn terminal_request_is_plain_shell(
@@ -1577,6 +2039,24 @@ async fn terminal_open(
     let requested_slot_key = request.slot_key;
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
+    log_terminal_crash_forensics_event(
+        "backend.terminal_open.begin",
+        json!({
+            "fresh_session": request.fresh_session.unwrap_or(false),
+            "kind": clean_terminal_diagnostic_log_text(&kind),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "provider": provider
+                .as_deref()
+                .map(clean_terminal_diagnostic_log_text),
+            "requested_cols": requested_cols,
+            "requested_rows": requested_rows,
+            "requested_instance_id": request.instance_id,
+            "terminal_index": terminal_index,
+            "thread_id": thread_id
+                .as_deref()
+                .map(clean_terminal_diagnostic_log_text),
+        }),
+    );
 
     let preserve_coordination_session =
         request.preserve_coordination_session.unwrap_or(false) && !plain_shell && !fresh_session;
@@ -1732,6 +2212,7 @@ async fn terminal_open(
             kind.clone()
         },
     };
+    let terminal_metadata_for_log = terminal_metadata.clone();
 
     let (instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
@@ -1747,6 +2228,15 @@ async fn terminal_open(
         .write()
         .await
         .insert(pane_id.clone(), instance);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_open.inserted",
+        json!({
+            "displaced_instance_id": displaced_instance.as_ref().map(|instance| instance.id),
+            "instance_id": instance_id,
+            "metadata": terminal_metadata_forensics_json(&terminal_metadata_for_log),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+        }),
+    );
     if let Some(displaced_instance) = displaced_instance {
         cleanup_terminal_instance_async(
             displaced_instance,
@@ -1766,6 +2256,20 @@ async fn terminal_open(
         reader,
     );
 
+    log_terminal_crash_forensics_event(
+        "backend.terminal_open.done",
+        json!({
+            "agent_started": agent_started,
+            "cols": size.cols,
+            "elapsed_ms": terminal_diagnostic_elapsed_ms(open_started_at),
+            "instance_id": instance_id,
+            "kind": clean_terminal_diagnostic_log_text(&kind),
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "plain_shell": plain_shell,
+            "rows": size.rows,
+            "shell_pty": shell_pty,
+        }),
+    );
     log_terminal_diagnostic_event(
         &app,
         "backend.terminal_open.done",
@@ -3596,6 +4100,30 @@ fn emit_terminal_parked_prompt_event(
             status: status.to_string(),
             waiting_on: parked.waiting_on.clone(),
             reason: reason.map(str::to_string),
+            prompt_event_id: parked
+                .voice_plan_prompt
+                .as_ref()
+                .map(|metadata| metadata.prompt_event_id.clone()),
+            prompt_event_source: parked
+                .voice_plan_prompt
+                .as_ref()
+                .and_then(|metadata| metadata.prompt_event_source.clone()),
+            terminal_index: parked
+                .voice_plan_prompt
+                .as_ref()
+                .and_then(|metadata| metadata.terminal_index),
+            thread_id: parked
+                .voice_plan_prompt
+                .as_ref()
+                .and_then(|metadata| metadata.thread_id.clone()),
+            workspace_id: parked
+                .voice_plan_prompt
+                .as_ref()
+                .map(|metadata| metadata.workspace_id.clone()),
+            workspace_name: parked
+                .voice_plan_prompt
+                .as_ref()
+                .map(|metadata| metadata.workspace_name.clone()),
         },
     );
 }
@@ -4151,6 +4679,13 @@ async fn terminal_register_parked_prompt_from_snapshot(
     let task_id = snapshot.task_id.clone();
     let title = snapshot.title.clone();
     let parked_key = terminal_parked_prompt_key(&pane_id, instance.id, &task_id);
+    let voice_plan_prompt = cloud_mcp_voice_plan_prompt_metadata_for_terminal_task(
+        &cloud_mcp_state,
+        &pane_id,
+        instance.id,
+        &task_id,
+    )
+    .await;
 
     if snapshot.terminal {
         if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
@@ -4204,6 +4739,10 @@ async fn terminal_register_parked_prompt_from_snapshot(
                 existing.prompt = snapshot.prompt.clone();
                 changed = true;
             }
+            if existing.voice_plan_prompt.is_none() && voice_plan_prompt.is_some() {
+                existing.voice_plan_prompt = voice_plan_prompt.clone();
+                changed = true;
+            }
             if changed {
                 prompt_to_emit = Some(existing.clone());
             }
@@ -4218,6 +4757,7 @@ async fn terminal_register_parked_prompt_from_snapshot(
                 title,
                 prompt: snapshot.prompt.clone(),
                 waiting_on,
+                voice_plan_prompt: voice_plan_prompt.clone(),
                 coordination,
                 working_directory: instance.working_directory.as_ref().clone(),
             };
@@ -4236,9 +4776,10 @@ async fn terminal_register_parked_prompt_from_snapshot(
 
     if let Some(parked) = prompt_to_mark {
         mark_terminal_parked_prompt_lifecycle_in_cloud(
+            &app,
             &cloud_mcp_state,
             &parked,
-            if ready { "active" } else { "blocked" },
+            if ready { "resume_ready" } else { "parked" },
             if ready {
                 "Dependency completed; the parked task is being resumed automatically."
             } else {
@@ -4261,7 +4802,7 @@ async fn terminal_emit_parked_prompt_interrupted(
     reason: &str,
     body: &str,
 ) {
-    mark_terminal_parked_prompt_lifecycle_in_cloud(cloud_mcp_state, parked, "interrupted", body)
+    mark_terminal_parked_prompt_lifecycle_in_cloud(app, cloud_mcp_state, parked, "interrupted", body)
         .await;
     emit_terminal_parked_prompt_event(app, parked, "interrupted", Some(reason));
 }
@@ -4398,7 +4939,25 @@ async fn terminal_resume_parked_prompt_once(
 
     {
         let mut writer = instance.writer.lock().await;
+        log_terminal_crash_forensics_event(
+            "backend.parked_resume.write_prompt.begin",
+            json!({
+                "bytes": resume_request.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+            }),
+        );
         if writer.write_all(resume_request.as_bytes()).is_err() || writer.flush().is_err() {
+            log_terminal_crash_forensics_event(
+                "backend.parked_resume.write_prompt.error",
+                json!({
+                    "bytes": resume_request.len(),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                    "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+                }),
+            );
             terminal_emit_parked_prompt_interrupted(
                 &app,
                 &cloud_mcp_state,
@@ -4409,6 +4968,15 @@ async fn terminal_resume_parked_prompt_once(
             .await;
             return false;
         }
+        log_terminal_crash_forensics_event(
+            "backend.parked_resume.write_prompt.done",
+            json!({
+                "bytes": resume_request.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+            }),
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(
@@ -4435,11 +5003,29 @@ async fn terminal_resume_parked_prompt_once(
     }
     {
         let mut writer = instance.writer.lock().await;
+        log_terminal_crash_forensics_event(
+            "backend.parked_resume.submit.begin",
+            json!({
+                "bytes": TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+            }),
+        );
         if writer
             .write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes())
             .is_err()
             || writer.flush().is_err()
         {
+            log_terminal_crash_forensics_event(
+                "backend.parked_resume.submit.error",
+                json!({
+                    "bytes": TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len(),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                    "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+                }),
+            );
             terminal_emit_parked_prompt_interrupted(
                 &app,
                 &cloud_mcp_state,
@@ -4450,6 +5036,15 @@ async fn terminal_resume_parked_prompt_once(
             .await;
             return false;
         }
+        log_terminal_crash_forensics_event(
+            "backend.parked_resume.submit.done",
+            json!({
+                "bytes": TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+            }),
+        );
     }
 
     if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
@@ -4464,9 +5059,10 @@ async fn terminal_resume_parked_prompt_once(
     }
 
     mark_terminal_parked_prompt_lifecycle_in_cloud(
+        &app,
         &cloud_mcp_state,
         &parked,
-        "active",
+        "running",
         "Dependency completed; the parked task is resuming in the terminal.",
     )
     .await;
@@ -4622,6 +5218,7 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
 }
 
 async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
+    app: &AppHandle,
     cloud_mcp_state: &CloudMcpState,
     parked: &TerminalParkedPrompt,
     status: &str,
@@ -4640,6 +5237,8 @@ async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
         body,
     )
     .await;
+    cloud_mcp_record_voice_plan_terminal_lifecycle(app, cloud_mcp_state, parked, status, body)
+        .await;
 }
 
 async fn terminal_write_inner(
@@ -5253,12 +5852,48 @@ async fn terminal_delete_selection(
 
     {
         let mut writer = instance.writer.lock().await;
-        writer
-            .write_all(rewrite_input.as_bytes())
-            .map_err(|error| format!("Unable to write terminal selection delete: {error}"))?;
-        writer
-            .flush()
-            .map_err(|error| format!("Unable to flush terminal selection delete: {error}"))?;
+        log_terminal_crash_forensics_event(
+            "backend.terminal_selection_delete.write.begin",
+            json!({
+                "bytes": rewrite_input.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+        if let Err(error) = writer.write_all(rewrite_input.as_bytes()) {
+            log_terminal_crash_forensics_event(
+                "backend.terminal_selection_delete.write.error",
+                json!({
+                    "bytes": rewrite_input.len(),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "stage": "write_all",
+                }),
+            );
+            return Err(format!("Unable to write terminal selection delete: {error}"));
+        }
+        if let Err(error) = writer.flush() {
+            log_terminal_crash_forensics_event(
+                "backend.terminal_selection_delete.write.error",
+                json!({
+                    "bytes": rewrite_input.len(),
+                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "stage": "flush",
+                }),
+            );
+            return Err(format!("Unable to flush terminal selection delete: {error}"));
+        }
+        log_terminal_crash_forensics_event(
+            "backend.terminal_selection_delete.write.done",
+            json!({
+                "bytes": rewrite_input.len(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
     }
 
     gate.current_line = next_line;
@@ -5316,18 +5951,14 @@ async fn terminal_cancel_parked_task(
 
     emit_terminal_parked_prompt_event(&app, &parked, "cancelled", Some("cancel_button"));
 
+    let app_for_cloud = app.clone();
     let cloud_state = cloud_mcp_state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        cloud_mcp_mark_terminal_task_lifecycle(
+        mark_terminal_parked_prompt_lifecycle_in_cloud(
+            &app_for_cloud,
             &cloud_state,
-            &parked.pane_id,
-            parked.instance_id,
-            &parked.working_directory,
-            Some(&parked.coordination),
-            Some(&parked.task_id),
-            Some(&parked.title),
+            &parked,
             "cancelled",
-            "terminal-agent",
             "Cancelled before resuming: the parked task was cancelled from the terminal bar.",
         )
         .await;
@@ -5338,12 +5969,46 @@ async fn terminal_cancel_parked_task(
 
 async fn write_terminal_interrupt_escape(instance: &TerminalInstance) -> Result<(), String> {
     let mut writer = instance.writer.lock().await;
-    writer
-        .write_all(b"\x1b")
-        .map_err(|error| format!("Unable to send terminal interrupt: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Unable to flush terminal interrupt: {error}"))
+    log_terminal_crash_forensics_event(
+        "backend.terminal_interrupt.write.begin",
+        json!({
+            "bytes": 1,
+            "instance_id": instance.id,
+            "metadata": terminal_metadata_forensics_json(&instance.metadata),
+        }),
+    );
+    if let Err(error) = writer.write_all(b"\x1b") {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_interrupt.write.error",
+            json!({
+                "bytes": 1,
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "instance_id": instance.id,
+                "stage": "write_all",
+            }),
+        );
+        return Err(format!("Unable to send terminal interrupt: {error}"));
+    }
+    if let Err(error) = writer.flush() {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_interrupt.write.error",
+            json!({
+                "bytes": 1,
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "instance_id": instance.id,
+                "stage": "flush",
+            }),
+        );
+        return Err(format!("Unable to flush terminal interrupt: {error}"));
+    }
+    log_terminal_crash_forensics_event(
+        "backend.terminal_interrupt.write.done",
+        json!({
+            "bytes": 1,
+            "instance_id": instance.id,
+        }),
+    );
+    Ok(())
 }
 
 async fn mark_terminal_active_task_interrupted(
@@ -5516,19 +6181,55 @@ async fn resize_terminal_instance(
     force: bool,
 ) -> Result<(), String> {
     let resize_started_at = Instant::now();
+    log_terminal_crash_forensics_event(
+        "backend.terminal_resize.begin",
+        json!({
+            "cols": size.cols,
+            "force": force,
+            "instance_id": instance.id,
+            "rows": size.rows,
+        }),
+    );
     let mut current_size = instance.size.lock().await;
 
     if *current_size == size && !force {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_resize.skip",
+            json!({
+                "cols": size.cols,
+                "instance_id": instance.id,
+                "reason": "unchanged",
+                "rows": size.rows,
+            }),
+        );
         return Ok(());
     }
 
     let master = instance.master.lock().await;
 
-    master
-        .resize(size)
-        .map_err(|error| format!("Unable to resize terminal: {error}"))?;
+    if let Err(error) = master.resize(size) {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_resize.error",
+            json!({
+                "cols": size.cols,
+                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "instance_id": instance.id,
+                "rows": size.rows,
+            }),
+        );
+        return Err(format!("Unable to resize terminal: {error}"));
+    }
     *current_size = size;
     let elapsed_ms = terminal_diagnostic_elapsed_ms(resize_started_at);
+    log_terminal_crash_forensics_event(
+        "backend.terminal_resize.done",
+        json!({
+            "cols": size.cols,
+            "elapsed_ms": elapsed_ms,
+            "instance_id": instance.id,
+            "rows": size.rows,
+        }),
+    );
     if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
         if let Some(app) = app {
             log_terminal_diagnostic_event(

@@ -7562,6 +7562,7 @@ export default function App() {
           }
           const sessionMatchedByProviderId = matchedBy === "sessionid";
           const promptDiscoveryAccepted = discoveredByPrompt && promptAccepted;
+          const voicePlanPromptEventId = String(promptEventId || "").trim();
           if (!sessionMatchedByProviderId && !promptDiscoveryAccepted) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = pollUntilTurnComplete
@@ -7598,13 +7599,19 @@ export default function App() {
             }
             return;
           }
+          const trustedVoicePlanTerminalFinish = Boolean(
+            pollUntilTurnComplete
+              && turnCompleteSeen
+              && sessionMatchedByProviderId
+              && voicePlanPromptEventId.startsWith("voice-plan-"),
+          );
           const requiresExactPromptEvidence = (
             pollUntilTurnComplete
             && Boolean(expectedUserMessage)
             && !matchedBy.includes("timestamp")
             && !matchedBy.includes("recovery")
           );
-          if (requiresExactPromptEvidence && !promptAccepted) {
+          if (requiresExactPromptEvidence && !promptAccepted && !trustedVoicePlanTerminalFinish) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -7636,6 +7643,33 @@ export default function App() {
               }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
             }
             return;
+          }
+          if (requiresExactPromptEvidence && !promptAccepted && trustedVoicePlanTerminalFinish) {
+            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch_bypassed", {
+              agentId,
+              matchedBy,
+              messageCount: messages.length,
+              pollUntilTurnComplete,
+              promptEventId: voicePlanPromptEventId,
+              reason: "voice_plan_terminal_finish_session_match",
+              requestKey,
+              sessionIdPresent: Boolean(sessionId),
+              threadId,
+              turnCompleteSeen,
+              workspaceId,
+            });
+            logTerminalStatus("frontend.voice_plan.terminal_finish_prompt_mismatch_bypassed", {
+              agentId,
+              matchedBy,
+              promptAccepted,
+              promptEventId: voicePlanPromptEventId,
+              reason: "terminal_finished_for_voice_plan_prompt",
+              requestKey,
+              terminalGroundTruthStatus: "idle_or_done",
+              threadId,
+              turnCompleteSeen,
+              workspaceId,
+            });
           }
           if (promptAccepted && promptEventId) {
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_accepted", {
@@ -7699,9 +7733,13 @@ export default function App() {
             );
             const nextThreads = hydrateWorkspaceThreadSessionTranscript(threads, {
               agentId,
+              expectedMessageCreatedAt,
+              expectedUserMessage,
               latestTimestamp: result?.latestTimestamp || "",
               messages,
               matchedBy: result?.matchedBy || "",
+              promptEventId,
+              promptEventSubmittedAt: event.promptEventSubmittedAt || submittedAt || expectedMessageCreatedAt,
               providerSessionId: sessionId,
               requestedProviderSessionId: sessionId || providerSessionId,
               rolloutPath: result?.rolloutPath || "",
@@ -7709,6 +7747,7 @@ export default function App() {
               sessionTitle: result?.sessionTitle || "",
               source: `${agentId}-session`,
               sourcePath: result?.rolloutPath || "",
+              submittedAt,
               threadId,
               turnCompleteSeen,
               workspaceId,
@@ -7730,12 +7769,16 @@ export default function App() {
             });
             return nextThreads;
           });
-          if (turnCompleteSeen && promptEventId.startsWith("voice-plan-")) {
+          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-")) {
             logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
               agentId,
+              completionSource: trustedVoicePlanTerminalFinish
+                ? "transcript_session_terminal_finish"
+                : "transcript_turn_complete",
               matchedBy,
-              pendingPromptId: promptEventId,
-              promptEventId,
+              pendingPromptId: voicePlanPromptEventId,
+              promptAccepted,
+              promptEventId: voicePlanPromptEventId,
               reason: "transcript_turn_complete_seen",
               threadId,
               type: "provider-turn-completed",
@@ -7744,9 +7787,13 @@ export default function App() {
             window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
               detail: {
                 agentId,
+                completionSource: trustedVoicePlanTerminalFinish
+                  ? "transcript_session_terminal_finish"
+                  : "transcript_turn_complete",
                 matchedBy,
-                pendingPromptId: promptEventId,
-                promptEventId,
+                pendingPromptId: voicePlanPromptEventId,
+                promptAccepted,
+                promptEventId: voicePlanPromptEventId,
                 threadId,
                 turnCompleteSeen: true,
                 type: "provider-turn-completed",
@@ -7874,10 +7921,23 @@ export default function App() {
           event.workspaceId,
           event.terminalIndex,
         );
+      const promptEventId = String(
+        event.promptEventId
+          || event.pendingPromptId
+          || event.promptId
+          || "",
+      ).trim();
+      const messageCreatedAt = event.messageCreatedAt
+        || event.promptEventSubmittedAt
+        || event.submittedAt
+        || new Date().toISOString();
       lifecycleEvent = {
         ...event,
-        messageCreatedAt: event.messageCreatedAt || new Date().toISOString(),
-        messageId: event.messageId || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+        messageCreatedAt,
+        messageId: event.messageId || promptEventId || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+        pendingPromptId: event.pendingPromptId || promptEventId,
+        promptEventId: event.promptEventId || promptEventId,
+        promptEventSubmittedAt: event.promptEventSubmittedAt || messageCreatedAt,
         threadId: event.threadId
           || existingThread?.id
           || createWorkspaceThreadId(event.workspaceId, event.terminalIndex),

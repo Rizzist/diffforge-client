@@ -11,6 +11,7 @@ const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT: &str = "cloud-mcp-knowledge-graph-cache";
+const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_KNOWLEDGE_GRAPH_DEBOUNCE_MS: u64 = 650;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
@@ -90,6 +91,25 @@ struct CloudMcpTerminalContextState {
 #[derive(Clone)]
 struct CloudMcpTerminalPromptMetadata {
     prompt_event_id: Option<String>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    terminal_index: Option<u16>,
+    thread_id: Option<String>,
+    workspace_id: String,
+    workspace_name: String,
+}
+
+#[derive(Clone)]
+struct CloudMcpVoicePlanPromptParts {
+    run_id: String,
+    stage: String,
+    step_ordinal: i64,
+    task_id: String,
+}
+
+#[derive(Clone)]
+struct CloudMcpVoicePlanPromptMetadata {
+    prompt_event_id: String,
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     terminal_index: Option<u16>,
@@ -2654,10 +2674,11 @@ async fn cloud_mcp_sync_terminal_agent_status(
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
     match status {
         "starting" => "starting",
-        "active" | "busy" => "active",
+        "active" | "busy" | "running" | "resume_requested" => "active",
         "merged" | "completed" => "done",
         "blocked" => "blocked",
         "parked" => "parked",
+        "resume_ready" => "waiting",
         "waiting" => "waiting",
         "review" => "review",
         "done" => "done",
@@ -2670,8 +2691,214 @@ fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
     }
 }
 
+fn cloud_mcp_parse_voice_plan_prompt_event_id(value: &str) -> Option<CloudMcpVoicePlanPromptParts> {
+    let task_id = value.trim();
+    if !task_id.starts_with("voice-plan-") {
+        return None;
+    }
+
+    let (before_task, _) = task_id.rsplit_once("-t")?;
+    let (before_stage, stage) = before_task.rsplit_once('-')?;
+    if !matches!(stage, "execution" | "revision") {
+        return None;
+    }
+    let (run_id, step_text) = before_stage.rsplit_once("-s")?;
+    let step_ordinal = step_text.parse::<i64>().ok()?;
+    if run_id.trim().is_empty() {
+        return None;
+    }
+
+    Some(CloudMcpVoicePlanPromptParts {
+        run_id: run_id.to_string(),
+        stage: stage.to_string(),
+        step_ordinal,
+        task_id: task_id.to_string(),
+    })
+}
+
+async fn cloud_mcp_voice_plan_prompt_metadata_for_terminal_task(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    _local_task_id: &str,
+) -> Option<CloudMcpVoicePlanPromptMetadata> {
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let runtime = state.inner.lock().await;
+    let entry = runtime.terminal_contexts.get(&terminal_key)?;
+    let prompt_event_id = entry
+        .prompt_event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| cloud_mcp_parse_voice_plan_prompt_event_id(value).is_some())?
+        .to_string();
+
+    Some(CloudMcpVoicePlanPromptMetadata {
+        prompt_event_id,
+        prompt_event_source: entry.prompt_event_source.clone(),
+        prompt_event_submitted_at: entry.prompt_event_submitted_at.clone(),
+        terminal_index: entry.terminal_index,
+        thread_id: entry.thread_id.clone(),
+        workspace_id: entry.workspace_id.clone(),
+        workspace_name: entry.workspace_name.clone(),
+    })
+}
+
+fn cloud_mcp_voice_plan_status_for_terminal_lifecycle(status: &str) -> Option<&'static str> {
+    match status.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+        "parked" | "blocked" | "waiting_on_dependency" => Some("parked"),
+        "resume_ready" | "ready_to_resume" => Some("resume_ready"),
+        "resume_requested" | "resuming" => Some("resume_requested"),
+        "active" | "busy" | "running" | "starting" => Some("running"),
+        "cancelled" | "canceled" | "interrupted" => Some("cancelled"),
+        _ => None,
+    }
+}
+
+async fn cloud_mcp_record_voice_plan_terminal_lifecycle(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    parked: &TerminalParkedPrompt,
+    status: &str,
+    body: &str,
+) {
+    let Some(metadata) = parked.voice_plan_prompt.as_ref() else {
+        log_terminal_status_event(
+            "backend.voice_plan_task_status.terminal_lifecycle_skip",
+            json!({
+                "reason": "missing_voice_plan_prompt_metadata",
+                "status": status,
+                "task_id": parked.task_id.as_str(),
+                "terminal_id": parked.pane_id.as_str(),
+                "terminal_instance_id": parked.instance_id,
+            }),
+        );
+        return;
+    };
+    let Some(parts) = cloud_mcp_parse_voice_plan_prompt_event_id(&metadata.prompt_event_id) else {
+        return;
+    };
+    let Some(plan_status) = cloud_mcp_voice_plan_status_for_terminal_lifecycle(status) else {
+        log_terminal_status_event(
+            "backend.voice_plan_task_status.terminal_lifecycle_skip",
+            json!({
+                "prompt_event_id": metadata.prompt_event_id.as_str(),
+                "reason": "unsupported_terminal_lifecycle_status",
+                "status": status,
+                "task_id": parked.task_id.as_str(),
+            }),
+        );
+        return;
+    };
+
+    let req = cloud_mcp_spec_graph_sync_request(
+        parked.working_directory.display().to_string(),
+        if metadata.workspace_id.trim().is_empty() {
+            None
+        } else {
+            Some(metadata.workspace_id.clone())
+        },
+        if metadata.workspace_name.trim().is_empty() {
+            None
+        } else {
+            Some(metadata.workspace_name.clone())
+        },
+    );
+    let agent_id = cloud_mcp_terminal_agent_id(
+        &parked.pane_id,
+        parked.instance_id,
+        Some(&parked.coordination),
+    );
+    let payload = json!({
+        "agentId": agent_id,
+        "event_kind": "voice_plan_task_status",
+        "lifecycleSource": "terminal_parked_lifecycle",
+        "runId": parts.run_id.clone(),
+        "run_id": parts.run_id.clone(),
+        "planRunId": parts.run_id.clone(),
+        "plan_run_id": parts.run_id.clone(),
+        "planStage": parts.stage.clone(),
+        "plan_stage": parts.stage.clone(),
+        "planStepOrdinal": parts.step_ordinal,
+        "plan_step_ordinal": parts.step_ordinal,
+        "stage": parts.stage.clone(),
+        "stepOrdinal": parts.step_ordinal,
+        "step_ordinal": parts.step_ordinal,
+        "taskId": parts.task_id.clone(),
+        "task_id": parts.task_id.clone(),
+        "planTaskId": parts.task_id.clone(),
+        "plan_task_id": parts.task_id.clone(),
+        "promptEventId": metadata.prompt_event_id.as_str(),
+        "prompt_event_id": metadata.prompt_event_id.as_str(),
+        "promptEventSource": metadata.prompt_event_source.as_deref().unwrap_or_default(),
+        "prompt_event_source": metadata.prompt_event_source.as_deref().unwrap_or_default(),
+        "promptEventSubmittedAt": metadata.prompt_event_submitted_at.as_deref().unwrap_or_default(),
+        "prompt_event_submitted_at": metadata.prompt_event_submitted_at.as_deref().unwrap_or_default(),
+        "repo_id": req.repo_id,
+        "repo_path": req.root_display.clone(),
+        "status": plan_status,
+        "summary": body,
+        "terminalId": parked.pane_id.as_str(),
+        "terminal_id": parked.pane_id.as_str(),
+        "terminalIndex": metadata.terminal_index,
+        "terminal_index": metadata.terminal_index,
+        "terminalInstanceId": parked.instance_id,
+        "terminal_instance_id": parked.instance_id,
+        "threadId": metadata.thread_id.as_deref().unwrap_or_default(),
+        "thread_id": metadata.thread_id.as_deref().unwrap_or_default(),
+        "workspace_id": metadata.workspace_id.as_str(),
+        "workspaceId": metadata.workspace_id.as_str(),
+        "workspace_name": metadata.workspace_name.as_str(),
+        "workspace_root": req.root_display.clone(),
+    });
+
+    log_terminal_status_event(
+        "backend.voice_plan_task_status.terminal_lifecycle_send",
+        json!({
+            "payload": payload.clone(),
+            "reason": "terminal_parked_or_resume_lifecycle",
+            "terminal_lifecycle_status": status,
+            "voice_plan_status": plan_status,
+        }),
+    );
+    let result = cloud_mcp_post_event_endpoint(state, "voice_plan_task_status", &payload).await;
+    match &result {
+        Ok(value) => {
+            log_terminal_status_event(
+                "backend.voice_plan_task_status.terminal_lifecycle_result",
+                json!({
+                    "ok": true,
+                    "prompt_event_id": metadata.prompt_event_id.as_str(),
+                    "result": value,
+                    "voice_plan_status": plan_status,
+                }),
+            );
+            let _ = app.emit(
+                VOICE_PLAN_SERVER_RESULT_EVENT,
+                json!({
+                    "result": value,
+                    "source": "backend_terminal_parked_lifecycle",
+                    "statusPayload": payload,
+                    "workspaceId": metadata.workspace_id.as_str(),
+                }),
+            );
+        }
+        Err(error) => log_terminal_status_event(
+            "backend.voice_plan_task_status.terminal_lifecycle_error",
+            json!({
+                "error": clean_terminal_telemetry_text(error),
+                "payload": payload,
+                "prompt_event_id": metadata.prompt_event_id.as_str(),
+                "voice_plan_status": plan_status,
+            }),
+        ),
+    }
+}
+
 fn cloud_mcp_lifecycle_status_releases_lane(status: &str) -> bool {
-    !matches!(status, "starting" | "active" | "busy")
+    !matches!(
+        status,
+        "starting" | "active" | "busy" | "running" | "parked" | "resume_ready" | "resume_requested"
+    )
 }
 
 fn cloud_mcp_lifecycle_status_resyncs_main_filetree(status: &str) -> bool {
