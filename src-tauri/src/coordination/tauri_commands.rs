@@ -118,6 +118,121 @@ pub fn coordination_get_workspace_mcp_status(
 }
 
 #[tauri::command]
+pub fn coordination_workspace_mcp_registry(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .workspace_mcp_registry(
+                req_text(&workspace_id, "workspace_id")?,
+                workspace_name.as_deref(),
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_add_workspace_mcp_marketplace(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    input: Value,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .add_workspace_mcp_marketplace(req_text(&workspace_id, "workspace_id")?, &input)
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_remove_workspace_mcp_marketplace(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    marketplace_id: String,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .remove_workspace_mcp_marketplace(
+                req_text(&workspace_id, "workspace_id")?,
+                req_text(&marketplace_id, "marketplace_id")?,
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_index_workspace_mcp_marketplace(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    marketplace_id: String,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .index_workspace_mcp_marketplace(
+                req_text(&workspace_id, "workspace_id")?,
+                req_text(&marketplace_id, "marketplace_id")?,
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_install_workspace_mcp_server(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    input: Value,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .install_workspace_mcp_server(req_text(&workspace_id, "workspace_id")?, &input)
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_update_workspace_mcp_server(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    server_id: String,
+    input: Value,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .update_workspace_mcp_server(
+                req_text(&workspace_id, "workspace_id")?,
+                req_text(&server_id, "server_id")?,
+                &input,
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_uninstall_workspace_mcp_server(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    server_id: String,
+) -> Result<Value, String> {
+    result(
+        kernel(repo_path, db_path)?
+            .uninstall_workspace_mcp_server(
+                req_text(&workspace_id, "workspace_id")?,
+                req_text(&server_id, "server_id")?,
+            )
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
 pub fn coordination_activate_shared_mcp_daemon(
     repo_path: Option<String>,
     db_path: Option<String>,

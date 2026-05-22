@@ -2873,6 +2873,7 @@ export default function App() {
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const sharedMcpActiveRepoRef = useRef("");
+  const workspaceMcpStartupIndexKeysRef = useRef(new Set());
   const workspaceDeactivationInFlightRef = useRef("");
   const workspaceRuntimeDeactivatedRepoRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
@@ -6744,6 +6745,57 @@ export default function App() {
     workspaceThreads,
     workspaces,
   ]);
+
+  useEffect(() => {
+    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+      return;
+    }
+
+    const targets = [];
+    const seen = new Set();
+    const addTarget = (workspace, repoPath) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      const workingDirectory = String(repoPath || "").trim();
+      if (!workspaceId || !workingDirectory) {
+        return;
+      }
+      const key = `${workspaceId}:${workingDirectory}`;
+      if (seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
+        return;
+      }
+      seen.add(key);
+      targets.push({
+        key,
+        repoPath: workingDirectory,
+        workspaceId,
+        workspaceName: workspace?.name || "",
+      });
+    };
+
+    addTarget(selectedWorkspace, selectedWorkspaceRootDirectory || defaultWorkingDirectory);
+    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
+      addTarget(descriptor.workspace, descriptor.workingDirectory);
+    });
+
+    targets.forEach((target) => {
+      workspaceMcpStartupIndexKeysRef.current.add(target.key);
+      invoke("coordination_workspace_mcp_registry", {
+        repoPath: target.repoPath,
+        workspaceId: target.workspaceId,
+        workspaceName: target.workspaceName,
+      }).catch(() => {
+        workspaceMcpStartupIndexKeysRef.current.delete(target.key);
+      });
+    });
+  }, [
+    defaultWorkingDirectory,
+    enabledWorkspaceRuntimeDescriptors,
+    selectedWorkspace,
+    selectedWorkspaceRootDirectory,
+    shouldShowWorkspaceSetup,
+    workspaceSyncState,
+  ]);
+
   useEffect(() => {
     if (!activatedWorkspace || !activatedWorkspaceTerminalWorkingDirectory) {
       return undefined;

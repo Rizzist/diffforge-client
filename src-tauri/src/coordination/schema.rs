@@ -20,6 +20,11 @@ pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION: i64 = 9;
 pub const TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME: &str = "coordination_kernel_terminal_launch_epoch";
 pub const SUBMIT_JOB_MIGRATION_VERSION: i64 = 10;
 pub const SUBMIT_JOB_MIGRATION_NAME: &str = "coordination_kernel_async_submit_jobs";
+pub const WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION: i64 = 11;
+pub const WORKSPACE_MCP_REGISTRY_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_registry";
+pub const WORKSPACE_MCP_INDEX_MIGRATION_VERSION: i64 = 12;
+pub const WORKSPACE_MCP_INDEX_MIGRATION_NAME: &str = "coordination_kernel_workspace_mcp_index";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -861,4 +866,97 @@ CREATE INDEX IF NOT EXISTS idx_submit_jobs_idempotency ON submit_jobs(idempotenc
 CREATE UNIQUE INDEX IF NOT EXISTS idx_submit_jobs_client_request
 ON submit_jobs(client_request_id)
 WHERE client_request_id IS NOT NULL AND client_request_id <> '';
+"#;
+
+pub const WORKSPACE_MCP_REGISTRY_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_marketplaces(
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'workspace',
+  status TEXT NOT NULL DEFAULT 'added',
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(workspace_id, provider, source)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_mcp_servers(
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  server_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_label TEXT NOT NULL,
+  package_ref TEXT,
+  version TEXT,
+  transport TEXT NOT NULL DEFAULT 'stdio',
+  command TEXT,
+  args_json TEXT NOT NULL DEFAULT '[]',
+  url TEXT,
+  env_schema_json TEXT NOT NULL DEFAULT '[]',
+  config_values_json TEXT NOT NULL DEFAULT '{}',
+  tools_json TEXT NOT NULL DEFAULT '[]',
+  install_state TEXT NOT NULL DEFAULT 'installed',
+  workspace_enabled INTEGER NOT NULL DEFAULT 0,
+  last_probe_status TEXT,
+  last_probe_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(workspace_id, server_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_marketplaces_workspace
+ON workspace_mcp_marketplaces(workspace_id, provider, status);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_servers_workspace
+ON workspace_mcp_servers(workspace_id, workspace_enabled, install_state);
+"#;
+
+pub const WORKSPACE_MCP_INDEX_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_marketplace_indexes(
+  marketplace_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cache_path TEXT,
+  source_hash TEXT,
+  plugin_count INTEGER NOT NULL DEFAULT 0,
+  mcp_count INTEGER NOT NULL DEFAULT 0,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  indexed_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_mcp_catalog_items(
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  marketplace_id TEXT NOT NULL,
+  item_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  source_kind TEXT NOT NULL,
+  source_label TEXT NOT NULL,
+  package_ref TEXT,
+  version TEXT,
+  transport TEXT NOT NULL DEFAULT 'stdio',
+  command TEXT,
+  args_json TEXT NOT NULL DEFAULT '[]',
+  url TEXT,
+  env_schema_json TEXT NOT NULL DEFAULT '[]',
+  tools_json TEXT NOT NULL DEFAULT '[]',
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(workspace_id, marketplace_id, item_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_catalog_workspace
+ON workspace_mcp_catalog_items(workspace_id, marketplace_id, name);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_indexes_workspace
+ON workspace_mcp_marketplace_indexes(workspace_id, status);
 "#;

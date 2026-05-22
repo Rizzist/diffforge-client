@@ -8071,6 +8071,7 @@ export const McpLayout = styled.div`
 `;
 
 export const McpRegistryPanel = styled.aside`
+  container-type: inline-size;
   display: grid;
   min-width: 0;
   min-height: 82px;
@@ -8103,6 +8104,18 @@ export const McpPanelTopline = styled.div`
 
   strong {
     color: var(--forge-text-soft);
+  }
+
+  @container (max-width: 300px) {
+    display: grid;
+    justify-content: start;
+
+    strong {
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   }
 `;
 
@@ -8162,6 +8175,15 @@ export const McpServerButton = styled.button`
 
   html[data-forge-theme="light"] &[data-active="true"]::before {
     background: var(--forge-blue);
+  }
+
+  @container (max-width: 300px) {
+    grid-template-columns: 28px minmax(0, 1fr);
+
+    > :nth-child(3) {
+      grid-column: 2;
+      justify-self: start;
+    }
   }
 `;
 
@@ -8467,7 +8489,7 @@ export const McpJsonTextarea = styled(McpTextarea)`
 
 export const McpTransportTabs = styled.div`
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   border: 1px solid var(--forge-border);
@@ -8481,17 +8503,24 @@ export const McpTransportTabs = styled.div`
   @media (max-width: 620px) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  @container (max-width: 300px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 export const McpTransportButton = styled.button`
   min-width: 0;
   min-height: 34px;
+  overflow: hidden;
   border: 1px solid transparent;
   border-radius: 6px;
   color: var(--forge-text-soft);
   background: transparent;
   font-size: 12px;
   font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 
   &[data-active="true"],
   &:hover {
@@ -8603,6 +8632,7 @@ export const McpToolChip = styled.span`
 
 export const McpInlineActions = styled.span`
   display: inline-flex;
+  align-items: center;
   gap: 5px;
 
   button {

@@ -54,6 +54,13 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "submit_patch_status",
 ];
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
+const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
+    "start_task",
+    "acquire_lease",
+    "checkpoint",
+    "submit_patch",
+    "submit_patch_status",
+];
 
 #[derive(Clone)]
 struct SessionSlotOptions {
@@ -138,6 +145,604 @@ fn bool_i64(value: bool) -> i64 {
     } else {
         0
     }
+}
+
+fn required_trimmed<'a>(value: &'a str, key: &str) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("{key} is required."))
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn required_json_text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
+    input[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{key} is required."))
+}
+
+fn json_text_or_default(value: Option<&Value>, default: Value) -> Result<String, String> {
+    match value {
+        Some(value) if !value.is_null() => serde_json::to_string(value),
+        _ => serde_json::to_string(&default),
+    }
+    .map_err(|error| format!("Unable to serialize workspace MCP JSON: {error}"))
+}
+
+fn workspace_mcp_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for ch in value.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            previous_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '-' | '_' | '.') {
+            previous_dash = ch == '-';
+            Some(ch)
+        } else if ch.is_whitespace() || matches!(ch, '/' | ':' | '@') {
+            if previous_dash || out.is_empty() {
+                None
+            } else {
+                previous_dash = true;
+                Some('-')
+            }
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            out.push(next);
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "mcp-server".to_string()
+    } else {
+        out
+    }
+}
+
+fn config_value_present(config_values: &Value, key: &str) -> bool {
+    let Some(value) = config_values.get(key) else {
+        return false;
+    };
+    if let Some(text) = value.as_str() {
+        return !text.trim().is_empty();
+    }
+    if let Some(object) = value.as_object() {
+        return object
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    !value.is_null()
+}
+
+fn missing_required_config(env_schema: &Value, config_values: &Value) -> Vec<Value> {
+    env_schema
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["required"].as_bool() == Some(true))
+        .filter_map(|entry| {
+            let key = entry["key"].as_str()?.trim();
+            if key.is_empty() || config_value_present(config_values, key) {
+                None
+            } else {
+                Some(json!({
+                    "key": key,
+                    "label": entry["label"].as_str().unwrap_or(key),
+                    "secret": entry["secret"].as_bool().unwrap_or(false),
+                }))
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn mcp_badge_state(status: &str) -> &'static str {
+    match status {
+        "healthy" | "enabled" | "installed" | "seeing_mcp" | "confirmed" | "configured" => {
+            "enabled"
+        }
+        "failed" | "auth_required" | "config_required" | "error" => "blocked",
+        _ => "planned",
+    }
+}
+
+fn workspace_mcp_visibility(
+    enabled: bool,
+    configured: bool,
+    client_mount_summary: &Value,
+    built_in: bool,
+) -> Vec<Value> {
+    client_mount_summary["mounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|mount| {
+            let base_status = mount["status"].as_str().unwrap_or("not_seen");
+            let status = if built_in {
+                base_status.to_string()
+            } else if !enabled {
+                "workspace_disabled".to_string()
+            } else if !configured {
+                "config_required".to_string()
+            } else {
+                "gateway_pending".to_string()
+            };
+            let message = if built_in {
+                "Coordination Kernel mount reported by the active agent.".to_string()
+            } else if !enabled {
+                "This MCP is installed but disabled for the workspace.".to_string()
+            } else if !configured {
+                "Required workspace configuration is missing.".to_string()
+            } else {
+                "Ready for the future workspace MCP gateway; not exposed to agents yet.".to_string()
+            };
+            json!({
+                "session_id": mount["session_id"].clone(),
+                "agent_kind": mount["agent_kind"].clone(),
+                "agent_name": mount["agent_name"].clone(),
+                "slot_key": mount["slot_key"].clone(),
+                "status": status,
+                "badge_state": mcp_badge_state(&status),
+                "message": message,
+                "last_seen_event": mount["last_event_type"].clone(),
+                "last_seen_at": mount["last_event_at"].clone(),
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+fn coordination_workspace_mcp_server(status: &Value) -> Value {
+    let health = &status["health"];
+    let client_mount_summary = &health["agent_client_mount_summary"];
+    let status_text = health["status"].as_str().unwrap_or("warning");
+    json!({
+        "id": "coordination-kernel",
+        "server_key": "coordination-kernel",
+        "name": "Coordination Kernel",
+        "description": "Built-in task coordination, leases, checkpoints, and patch submission.",
+        "built_in": true,
+        "toggleable": false,
+        "source_kind": "built_in",
+        "source_label": "Diff Forge",
+        "package_ref": "internal",
+        "version": "",
+        "transport": "stdio",
+        "command": status["command"].clone(),
+        "args_json": status["args"].clone(),
+        "url": Value::Null,
+        "env_schema_json": [],
+        "config_values_json": {},
+        "missing_required_config": [],
+        "tools_json": COORDINATION_WORKSPACE_MCP_TOOLS,
+        "install_state": "installed",
+        "workspace_enabled": true,
+        "status": status_text,
+        "badge_state": mcp_badge_state(status_text),
+        "config_status": "configured",
+        "last_probe_status": health["spawn_probe"]["status"].clone(),
+        "last_probe_message": health["spawn_probe"]["error"].clone(),
+        "agent_visibility": workspace_mcp_visibility(true, true, client_mount_summary, true),
+        "runtime_note": "Always mounted as a required Diff Forge coordination server.",
+    })
+}
+
+fn workspace_mcp_public_server(row: Value, client_mount_summary: &Value) -> Value {
+    let env_schema = row["env_schema_json"].clone();
+    let config_values = row["config_values_json"].clone();
+    let missing = missing_required_config(&env_schema, &config_values);
+    let workspace_enabled = row["workspace_enabled"].as_i64().unwrap_or_default() != 0;
+    let install_state = row["install_state"].as_str().unwrap_or("installed");
+    let configured = missing.is_empty();
+    let status = if install_state != "installed" {
+        install_state.to_string()
+    } else if !workspace_enabled {
+        "disabled".to_string()
+    } else if !configured {
+        "config_required".to_string()
+    } else {
+        row["last_probe_status"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("not_connected")
+            .to_string()
+    };
+    let config_status = if configured {
+        "configured"
+    } else {
+        "config_required"
+    };
+
+    json!({
+        "id": row["id"].clone(),
+        "server_key": row["server_key"].clone(),
+        "name": row["name"].clone(),
+        "description": "",
+        "built_in": false,
+        "toggleable": true,
+        "source_kind": row["source_kind"].clone(),
+        "source_label": row["source_label"].clone(),
+        "package_ref": row["package_ref"].clone(),
+        "version": row["version"].clone(),
+        "transport": row["transport"].clone(),
+        "command": row["command"].clone(),
+        "args_json": row["args_json"].clone(),
+        "url": row["url"].clone(),
+        "env_schema_json": env_schema,
+        "config_values_json": config_values,
+        "missing_required_config": missing,
+        "tools_json": row["tools_json"].clone(),
+        "install_state": install_state,
+        "workspace_enabled": workspace_enabled,
+        "status": status,
+        "badge_state": mcp_badge_state(&status),
+        "config_status": config_status,
+        "last_probe_status": row["last_probe_status"].clone(),
+        "last_probe_message": row["last_probe_message"].clone(),
+        "agent_visibility": workspace_mcp_visibility(
+            workspace_enabled,
+            configured,
+            client_mount_summary,
+            false,
+        ),
+        "runtime_note": "Installed and configurable; external exposure waits for the workspace MCP gateway.",
+        "created_at": row["created_at"].clone(),
+        "updated_at": row["updated_at"].clone(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct IndexedWorkspaceMcpItem {
+    item_key: String,
+    server_key: String,
+    name: String,
+    description: String,
+    source_kind: String,
+    source_label: String,
+    package_ref: String,
+    version: String,
+    transport: String,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    env_schema: Value,
+    tools: Value,
+    raw: Value,
+}
+
+fn workspace_mcp_catalog_item_public(row: Value) -> Value {
+    json!({
+        "id": row["id"],
+        "marketplace_id": row["marketplace_id"],
+        "item_key": row["item_key"],
+        "server_key": row["item_key"],
+        "name": row["name"],
+        "description": row["description"],
+        "source_kind": row["source_kind"],
+        "source_label": row["source_label"],
+        "package_ref": row["package_ref"],
+        "version": row["version"],
+        "transport": row["transport"],
+        "command": row["command"],
+        "args": row["args_json"],
+        "url": row["url"],
+        "env_schema": row["env_schema_json"],
+        "tools": row["tools_json"],
+        "raw": row["raw_json"],
+    })
+}
+
+fn workspace_mcp_title(value: &str) -> String {
+    value
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn workspace_mcp_server_display_name(plugin_name: &str, server_name: &str) -> String {
+    let plugin_title = workspace_mcp_title(plugin_name);
+    let mut server_text = server_name.to_string();
+    let normalized_plugin = workspace_mcp_key(plugin_name);
+    if let Some(rest) = workspace_mcp_key(server_name).strip_prefix(&normalized_plugin) {
+        server_text = rest.trim_start_matches('-').to_string();
+    }
+    let server_title = workspace_mcp_title(&server_text);
+    if server_title.is_empty() || server_title.eq_ignore_ascii_case(&plugin_title) {
+        plugin_title
+    } else {
+        format!("{plugin_title} {server_title}")
+    }
+}
+
+fn workspace_mcp_source_label(provider: &str, marketplace_name: &str) -> String {
+    let provider_label = match provider {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "mcp_registry" => "MCP Registry",
+        _ => "Marketplace",
+    };
+    if marketplace_name.trim().is_empty() {
+        provider_label.to_string()
+    } else {
+        format!("{} · {}", provider_label, marketplace_name)
+    }
+}
+
+fn workspace_mcp_source_kind(provider: &str) -> String {
+    match provider {
+        "claude" => "claude_marketplace",
+        "codex" => "codex_marketplace",
+        "mcp_registry" => "mcp_registry",
+        _ => "marketplace",
+    }
+    .to_string()
+}
+
+fn workspace_mcp_github_url(source: &str) -> String {
+    let trimmed = source.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else if trimmed.starts_with("git@") {
+        trimmed.to_string()
+    } else {
+        format!(
+            "https://github.com/{}.git",
+            trimmed.trim_end_matches(".git")
+        )
+    }
+}
+
+fn workspace_mcp_plugin_source_path(root: &Path, plugin: &Value) -> PathBuf {
+    if let Some(path) = plugin["source"]["path"].as_str() {
+        return root.join(path);
+    }
+    if let Some(path) = plugin["source"].as_str() {
+        return root.join(path);
+    }
+    root.to_path_buf()
+}
+
+fn workspace_mcp_read_json(path: &Path) -> Result<Option<Value>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    serde_json::from_str::<Value>(&body)
+        .map(Some)
+        .map_err(|error| format!("Unable to parse {}: {error}", path.display()))
+}
+
+fn workspace_mcp_find_mcp_json_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for candidate in [root.join(".mcp.json"), root.join("mcp.json")] {
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    for dirname in [".codex", ".claude-plugin"] {
+        let dir = root.join(dirname);
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| format!("Unable to inspect {}: {error}", dir.display()))?
+        {
+            let entry = entry
+                .map_err(|error| format!("Unable to inspect {} entry: {error}", dir.display()))?;
+            let path = entry.path();
+            if path.file_name().and_then(|value| value.to_str()) == Some(".mcp.json")
+                || path.file_name().and_then(|value| value.to_str()) == Some("mcp.json")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn workspace_mcp_user_config(plugin_root: &Path) -> Result<Value, String> {
+    for candidate in [
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+        plugin_root.join("plugin.json"),
+    ] {
+        if let Some(value) = workspace_mcp_read_json(&candidate)? {
+            return Ok(value["userConfig"].clone());
+        }
+    }
+    Ok(json!({}))
+}
+
+fn workspace_mcp_placeholder_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let rest = trimmed.strip_prefix("${user_config.")?;
+    rest.strip_suffix('}').map(str::to_string)
+}
+
+fn workspace_mcp_env_schema(server: &Value, user_config: &Value) -> Value {
+    let mut values = Vec::new();
+    let Some(env) = server["env"].as_object() else {
+        return json!([]);
+    };
+    for (env_key, env_value) in env {
+        let env_text = env_value.as_str().unwrap_or_default();
+        let config_key = workspace_mcp_placeholder_key(env_text);
+        let config = config_key
+            .as_deref()
+            .and_then(|key| user_config.get(key))
+            .unwrap_or(&Value::Null);
+        let required = config_key.is_some() || env_text.contains("${");
+        if !required {
+            continue;
+        }
+        let title = config["title"].as_str().unwrap_or(env_key);
+        let description = config["description"].as_str().unwrap_or("");
+        let sensitive = config["sensitive"].as_bool().unwrap_or_else(|| {
+            let lower = env_key.to_ascii_lowercase();
+            lower.contains("key") || lower.contains("token") || lower.contains("secret")
+        });
+        values.push(json!({
+            "key": env_key,
+            "label": title,
+            "description": description,
+            "required": required,
+            "secret": sensitive,
+            "source": config_key.unwrap_or_else(|| env_key.to_string()),
+        }));
+    }
+    Value::Array(values)
+}
+
+fn workspace_mcp_server_args(server: &Value) -> Vec<String> {
+    server["args"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn workspace_mcp_items_from_plugin(
+    marketplace_id: &str,
+    provider: &str,
+    marketplace_name: &str,
+    marketplace_source: &str,
+    plugin_name: &str,
+    plugin_root: &Path,
+    plugin_metadata: &Value,
+) -> Result<Vec<IndexedWorkspaceMcpItem>, String> {
+    let user_config = workspace_mcp_user_config(plugin_root)?;
+    let source_kind = workspace_mcp_source_kind(provider);
+    let source_label = workspace_mcp_source_label(provider, marketplace_name);
+    let description = plugin_metadata["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let version = plugin_metadata["version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut items = Vec::new();
+    for mcp_path in workspace_mcp_find_mcp_json_files(plugin_root)? {
+        let Some(mcp_config) = workspace_mcp_read_json(&mcp_path)? else {
+            continue;
+        };
+        let Some(servers) = mcp_config["mcpServers"].as_object() else {
+            continue;
+        };
+        for (server_name, server) in servers {
+            let server_key = workspace_mcp_key(&format!("{provider}-{plugin_name}-{server_name}"));
+            let item_key = format!("{}:{}", workspace_mcp_key(plugin_name), server_key);
+            let transport = if server["url"].as_str().is_some()
+                || server["type"].as_str().is_some_and(|value| {
+                    value.eq_ignore_ascii_case("http")
+                        || value.eq_ignore_ascii_case("streamable-http")
+                }) {
+                "http"
+            } else {
+                "stdio"
+            };
+            items.push(IndexedWorkspaceMcpItem {
+                item_key,
+                server_key,
+                name: workspace_mcp_server_display_name(plugin_name, server_name),
+                description: description.clone(),
+                source_kind: source_kind.clone(),
+                source_label: source_label.clone(),
+                package_ref: format!("{marketplace_source}#{plugin_name}"),
+                version: version.clone(),
+                transport: transport.to_string(),
+                command: server["command"].as_str().map(str::to_string),
+                args: workspace_mcp_server_args(server),
+                url: server["url"].as_str().map(str::to_string),
+                env_schema: workspace_mcp_env_schema(server, &user_config),
+                tools: json!([]),
+                raw: json!({
+                    "marketplace_id": marketplace_id,
+                    "plugin_name": plugin_name,
+                    "server_name": server_name,
+                    "mcp_path": process_path_text(&mcp_path),
+                    "server": server,
+                }),
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn workspace_mcp_index_source(
+    marketplace_id: &str,
+    provider: &str,
+    marketplace_name: &str,
+    marketplace_source: &str,
+    source_root: &Path,
+) -> Result<(usize, Vec<IndexedWorkspaceMcpItem>), String> {
+    let mut plugin_roots = Vec::<(String, PathBuf, Value)>::new();
+    let marketplace_candidates = [
+        source_root
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json"),
+        source_root.join(".claude-plugin").join("marketplace.json"),
+        source_root.join("marketplace.json"),
+    ];
+    for candidate in marketplace_candidates {
+        let Some(marketplace) = workspace_mcp_read_json(&candidate)? else {
+            continue;
+        };
+        if let Some(plugins) = marketplace["plugins"].as_array() {
+            for plugin in plugins {
+                let plugin_name = plugin["name"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(marketplace_name)
+                    .to_string();
+                let plugin_root = workspace_mcp_plugin_source_path(source_root, plugin);
+                plugin_roots.push((plugin_name, plugin_root, plugin.clone()));
+            }
+        }
+    }
+    if plugin_roots.is_empty() {
+        plugin_roots.push((
+            marketplace_name.to_string(),
+            source_root.to_path_buf(),
+            json!({ "name": marketplace_name }),
+        ));
+    }
+
+    let mut items = Vec::new();
+    for (plugin_name, plugin_root, plugin_metadata) in &plugin_roots {
+        let mut plugin_items = workspace_mcp_items_from_plugin(
+            marketplace_id,
+            provider,
+            marketplace_name,
+            marketplace_source,
+            plugin_name,
+            plugin_root,
+            plugin_metadata,
+        )?;
+        items.append(&mut plugin_items);
+    }
+    Ok((plugin_roots.len(), items))
 }
 
 fn submit_job_public_value(job: &Value) -> Value {
@@ -4303,6 +4908,756 @@ impl CoordinationKernel {
             object.insert("health".to_string(), health);
         }
         Ok(status)
+    }
+
+    pub fn workspace_mcp_registry(
+        &self,
+        workspace_id: &str,
+        workspace_name: Option<&str>,
+    ) -> Result<Value, String> {
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() {
+            return Err("workspace_id is required.".to_string());
+        }
+
+        self.auto_index_workspace_mcp_marketplaces(workspace_id)?;
+
+        let coordination_status =
+            self.get_workspace_mcp_status(Some(workspace_id), workspace_name)?;
+        let client_mount_summary =
+            coordination_status["health"]["agent_client_mount_summary"].clone();
+        let marketplaces = self.query_json(
+            "SELECT m.*,
+                    COALESCE(i.status, m.status) AS index_status,
+                    COALESCE(i.plugin_count, 0) AS plugin_count,
+                    COALESCE(i.mcp_count, 0) AS mcp_count,
+                    i.cache_path AS cache_path,
+                    i.source_hash AS source_hash,
+                    i.details_json AS index_details_json,
+                    i.last_error AS index_error,
+                    i.indexed_at AS indexed_at
+             FROM workspace_mcp_marketplaces m
+             LEFT JOIN workspace_mcp_marketplace_indexes i ON i.marketplace_id = m.id
+             WHERE m.workspace_id=?1
+             ORDER BY m.updated_at DESC, m.name ASC",
+            &[&workspace_id],
+        )?;
+        let installed_rows = self.query_json(
+            "SELECT * FROM workspace_mcp_servers
+             WHERE workspace_id=?1
+             ORDER BY workspace_enabled DESC, name ASC",
+            &[&workspace_id],
+        )?;
+
+        let mut servers = vec![coordination_workspace_mcp_server(&coordination_status)];
+        for row in installed_rows {
+            servers.push(workspace_mcp_public_server(row, &client_mount_summary));
+        }
+        let catalog = self.workspace_mcp_catalog(workspace_id)?;
+
+        let installed_count = servers
+            .iter()
+            .filter(|server| server["install_state"].as_str() == Some("installed"))
+            .count();
+        let enabled_count = servers
+            .iter()
+            .filter(|server| server["workspace_enabled"].as_bool() == Some(true))
+            .count();
+        let config_required_count = servers
+            .iter()
+            .filter(|server| server["status"].as_str() == Some("config_required"))
+            .count();
+        let active_agent_count = client_mount_summary["active_session_count"]
+            .as_i64()
+            .unwrap_or_default();
+
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name.unwrap_or("Workspace"),
+            "servers": servers,
+            "marketplaces": marketplaces,
+            "available_catalog": catalog,
+            "summary": {
+                "installed_count": installed_count,
+                "enabled_count": enabled_count,
+                "config_required_count": config_required_count,
+                "active_agent_count": active_agent_count,
+            },
+            "coordination_kernel": coordination_status,
+        }))
+    }
+
+    fn auto_index_workspace_mcp_marketplaces(&self, workspace_id: &str) -> Result<(), String> {
+        let marketplaces = self.query_json(
+            "SELECT m.*
+             FROM workspace_mcp_marketplaces m
+             LEFT JOIN workspace_mcp_marketplace_indexes i ON i.marketplace_id = m.id
+             WHERE m.workspace_id=?1
+               AND m.status != 'failed'
+               AND (
+                    m.status IN ('added', 'indexing')
+                    OR i.marketplace_id IS NULL
+               )
+             ORDER BY m.updated_at ASC, m.name ASC",
+            &[&workspace_id],
+        )?;
+
+        let stale_before_ms = now_epoch_millis().saturating_sub(10 * 60 * 1000);
+        let stale_before = format!("{}.{:03}", stale_before_ms / 1000, stale_before_ms % 1000);
+        for marketplace in marketplaces {
+            let Some(marketplace_id) = marketplace["id"].as_str().filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let now = now_rfc3339();
+            let claimed = self
+                .conn
+                .execute(
+                    "UPDATE workspace_mcp_marketplaces
+                     SET status='indexing', last_error=NULL, updated_at=?1
+                     WHERE workspace_id=?2
+                       AND id=?3
+                       AND (
+                            status != 'indexing'
+                            OR CAST(REPLACE(updated_at, 'Z', '') AS REAL) <= CAST(?4 AS REAL)
+                       )",
+                    params![now, workspace_id, marketplace_id, stale_before],
+                )
+                .map_err(|error| format!("Unable to mark MCP marketplace indexing: {error}"))?;
+            if claimed == 0 {
+                continue;
+            }
+
+            match self.index_workspace_mcp_marketplace_inner(workspace_id, &marketplace) {
+                Ok(indexed) => {
+                    self.emit_event(
+                        "workspace_mcp_marketplace_auto_indexed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs::default(),
+                        json!({
+                            "workspace_id": workspace_id,
+                            "marketplace_id": marketplace_id,
+                            "plugin_count": indexed["plugin_count"],
+                            "mcp_count": indexed["mcp_count"],
+                        }),
+                    )?;
+                }
+                Err(error) => {
+                    let _ = self.mark_workspace_mcp_marketplace_index_failed(
+                        workspace_id,
+                        marketplace_id,
+                        &error,
+                    );
+                    let _ = self.emit_event(
+                        "workspace_mcp_marketplace_auto_index_failed",
+                        "kernel",
+                        REPO_ID,
+                        EventRefs::default(),
+                        json!({
+                            "workspace_id": workspace_id,
+                            "marketplace_id": marketplace_id,
+                            "error": error,
+                        }),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn workspace_mcp_catalog(&self, workspace_id: &str) -> Result<Vec<Value>, String> {
+        self.query_json(
+            "SELECT * FROM workspace_mcp_catalog_items
+             WHERE workspace_id=?1
+             ORDER BY name ASC",
+            &[&workspace_id],
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(workspace_mcp_catalog_item_public)
+                .collect::<Vec<_>>()
+        })
+    }
+
+    pub fn add_workspace_mcp_marketplace(
+        &self,
+        workspace_id: &str,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let provider = required_json_text(input, "provider")?;
+        let source_type = input["source_type"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("git");
+        let name = required_json_text(input, "name")?;
+        let source = required_json_text(input, "source")?;
+        let scope = input["scope"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace");
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM workspace_mcp_marketplaces
+                 WHERE workspace_id=?1 AND provider=?2 AND source=?3",
+                params![workspace_id, provider, source],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to inspect workspace MCP marketplace: {error}"))?
+            .unwrap_or_else(uuid);
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_marketplaces(
+                    id, workspace_id, provider, source_type, name, source, scope,
+                    status, last_error, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'added', NULL, ?8, ?8)
+                ON CONFLICT(workspace_id, provider, source) DO UPDATE SET
+                    source_type=excluded.source_type,
+                    name=excluded.name,
+                    scope=excluded.scope,
+                    status='added',
+                    last_error=NULL,
+                    updated_at=excluded.updated_at",
+                params![
+                    id,
+                    workspace_id,
+                    provider,
+                    source_type,
+                    name,
+                    source,
+                    scope,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to save workspace MCP marketplace: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_marketplace_added",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "provider": provider,
+                "source_type": source_type,
+                "name": name,
+                "source": source,
+                "scope": scope,
+            }),
+        )?;
+        self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
+    }
+
+    pub fn index_workspace_mcp_marketplace(
+        &self,
+        workspace_id: &str,
+        marketplace_id: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let marketplace_id = required_trimmed(marketplace_id, "marketplace_id")?;
+        let marketplace = self.query_one(
+            "SELECT * FROM workspace_mcp_marketplaces WHERE workspace_id=?1 AND id=?2",
+            &[&workspace_id, &marketplace_id],
+            "Workspace MCP marketplace does not exist.",
+        )?;
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_marketplaces
+                 SET status='indexing', last_error=NULL, updated_at=?1
+                 WHERE workspace_id=?2 AND id=?3",
+                params![now, workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to mark MCP marketplace indexing: {error}"))?;
+
+        match self.index_workspace_mcp_marketplace_inner(workspace_id, &marketplace) {
+            Ok(indexed) => {
+                self.emit_event(
+                    "workspace_mcp_marketplace_indexed",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs::default(),
+                    json!({
+                        "workspace_id": workspace_id,
+                        "marketplace_id": marketplace_id,
+                        "plugin_count": indexed["plugin_count"],
+                        "mcp_count": indexed["mcp_count"],
+                    }),
+                )?;
+                self.workspace_mcp_registry(workspace_id, None)
+            }
+            Err(error) => {
+                let _ = self.mark_workspace_mcp_marketplace_index_failed(
+                    workspace_id,
+                    marketplace_id,
+                    &error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn mark_workspace_mcp_marketplace_index_failed(
+        &self,
+        workspace_id: &str,
+        marketplace_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let failed_at = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_marketplaces
+                 SET status='failed', last_error=?1, updated_at=?2
+                 WHERE workspace_id=?3 AND id=?4",
+                params![error, failed_at, workspace_id, marketplace_id],
+            )
+            .map_err(|failure| format!("Unable to mark MCP marketplace failed: {failure}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_marketplace_indexes(
+                    marketplace_id, workspace_id, status, cache_path, source_hash,
+                    plugin_count, mcp_count, details_json, last_error, indexed_at, updated_at
+                 ) VALUES(?1, ?2, 'failed', NULL, NULL, 0, 0, '{}', ?3, NULL, ?4)
+                 ON CONFLICT(marketplace_id) DO UPDATE SET
+                    status='failed',
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at",
+                params![marketplace_id, workspace_id, error, failed_at],
+            )
+            .map_err(|failure| format!("Unable to save MCP marketplace failure: {failure}"))?;
+        Ok(())
+    }
+
+    fn index_workspace_mcp_marketplace_inner(
+        &self,
+        workspace_id: &str,
+        marketplace: &Value,
+    ) -> Result<Value, String> {
+        let marketplace_id = marketplace["id"].as_str().unwrap_or_default();
+        let provider = marketplace["provider"].as_str().unwrap_or("manual");
+        let source_type = marketplace["source_type"].as_str().unwrap_or("git");
+        let marketplace_name = marketplace["name"].as_str().unwrap_or("Marketplace");
+        let marketplace_source = marketplace["source"].as_str().unwrap_or_default();
+        let (source_root, cache_path, source_hash) = self
+            .prepare_workspace_mcp_marketplace_source(
+                marketplace_id,
+                source_type,
+                marketplace_source,
+            )?;
+        let (plugin_count, items) = workspace_mcp_index_source(
+            marketplace_id,
+            provider,
+            marketplace_name,
+            marketplace_source,
+            &source_root,
+        )?;
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_catalog_items
+                 WHERE workspace_id=?1 AND marketplace_id=?2",
+                params![workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to clear old MCP catalog items: {error}"))?;
+        for item in &items {
+            let id = uuid();
+            let args_json = serde_json::to_string(&Value::Array(
+                item.args.iter().map(|arg| json!(arg)).collect::<Vec<_>>(),
+            ))
+            .map_err(|error| format!("Unable to serialize MCP args: {error}"))?;
+            let env_schema_json = serde_json::to_string(&item.env_schema)
+                .map_err(|error| format!("Unable to serialize MCP env schema: {error}"))?;
+            let tools_json = serde_json::to_string(&item.tools)
+                .map_err(|error| format!("Unable to serialize MCP tools: {error}"))?;
+            let raw_json = serde_json::to_string(&item.raw)
+                .map_err(|error| format!("Unable to serialize MCP raw index: {error}"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_mcp_catalog_items(
+                        id, workspace_id, marketplace_id, item_key, name, description,
+                        source_kind, source_label, package_ref, version, transport,
+                        command, args_json, url, env_schema_json, tools_json, raw_json,
+                        created_at, updated_at
+                    ) VALUES(
+                        ?1, ?2, ?3, ?4, ?5, ?6,
+                        ?7, ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15, ?16, ?17,
+                        ?18, ?18
+                    )",
+                    params![
+                        id,
+                        workspace_id,
+                        marketplace_id,
+                        item.server_key,
+                        item.name,
+                        item.description,
+                        item.source_kind,
+                        item.source_label,
+                        item.package_ref,
+                        item.version,
+                        item.transport,
+                        item.command,
+                        args_json,
+                        item.url,
+                        env_schema_json,
+                        tools_json,
+                        raw_json,
+                        now
+                    ],
+                )
+                .map_err(|error| format!("Unable to save MCP catalog item: {error}"))?;
+        }
+        let details = json!({
+            "source_root": process_path_text(&source_root),
+            "source": marketplace_source,
+            "provider": provider,
+            "items": items.iter().map(|item| {
+                json!({
+                    "item_key": item.item_key,
+                    "server_key": item.server_key,
+                    "name": item.name,
+                    "transport": item.transport,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let details_json = serde_json::to_string(&details)
+            .map_err(|error| format!("Unable to serialize MCP index details: {error}"))?;
+        let cache_path_text = cache_path
+            .as_ref()
+            .map(|path| process_path_text(path))
+            .unwrap_or_else(|| process_path_text(&source_root));
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_marketplace_indexes(
+                    marketplace_id, workspace_id, status, cache_path, source_hash,
+                    plugin_count, mcp_count, details_json, last_error, indexed_at, updated_at
+                ) VALUES(?1, ?2, 'indexed', ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8)
+                ON CONFLICT(marketplace_id) DO UPDATE SET
+                    status='indexed',
+                    cache_path=excluded.cache_path,
+                    source_hash=excluded.source_hash,
+                    plugin_count=excluded.plugin_count,
+                    mcp_count=excluded.mcp_count,
+                    details_json=excluded.details_json,
+                    last_error=NULL,
+                    indexed_at=excluded.indexed_at,
+                    updated_at=excluded.updated_at",
+                params![
+                    marketplace_id,
+                    workspace_id,
+                    cache_path_text,
+                    source_hash,
+                    plugin_count as i64,
+                    items.len() as i64,
+                    details_json,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to save MCP marketplace index: {error}"))?;
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_marketplaces
+                 SET status='indexed', last_error=NULL, updated_at=?1
+                 WHERE workspace_id=?2 AND id=?3",
+                params![now, workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to mark MCP marketplace indexed: {error}"))?;
+        Ok(json!({
+            "marketplace_id": marketplace_id,
+            "plugin_count": plugin_count,
+            "mcp_count": items.len(),
+        }))
+    }
+
+    fn prepare_workspace_mcp_marketplace_source(
+        &self,
+        marketplace_id: &str,
+        source_type: &str,
+        source: &str,
+    ) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
+        if source_type == "local_path" {
+            let path = PathBuf::from(source);
+            if !path.exists() {
+                return Err(format!("Marketplace source path does not exist: {source}"));
+            }
+            return Ok((path, None, None));
+        }
+
+        let cache_root = self.paths.mcp_root.join("marketplaces");
+        fs::create_dir_all(&cache_root)
+            .map_err(|error| format!("Unable to create MCP marketplace cache: {error}"))?;
+        let cache_dir = cache_root.join(workspace_mcp_key(marketplace_id));
+        if cache_dir.exists() {
+            if !path_text_under_path(&process_path_text(&cache_dir), &self.paths.mcp_root) {
+                return Err("Refusing to clean MCP marketplace cache outside MCP root.".to_string());
+            }
+            fs::remove_dir_all(&cache_dir).map_err(|error| {
+                format!(
+                    "Unable to clear MCP marketplace cache {}: {error}",
+                    cache_dir.display()
+                )
+            })?;
+        }
+        let url = workspace_mcp_github_url(source);
+        let cache_path_text = process_path_text(&cache_dir);
+        run_git(
+            &self.paths.repo_path,
+            &["clone", "--depth", "1", &url, &cache_path_text],
+        )?;
+        let source_hash = run_git(&cache_dir, &["rev-parse", "HEAD"])
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Ok((cache_dir.clone(), Some(cache_dir), source_hash))
+    }
+
+    pub fn remove_workspace_mcp_marketplace(
+        &self,
+        workspace_id: &str,
+        marketplace_id: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let marketplace_id = required_trimmed(marketplace_id, "marketplace_id")?;
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_catalog_items WHERE workspace_id=?1 AND marketplace_id=?2",
+                params![workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to remove workspace MCP catalog items: {error}"))?;
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_marketplace_indexes WHERE workspace_id=?1 AND marketplace_id=?2",
+                params![workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to remove workspace MCP marketplace index: {error}"))?;
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_marketplaces WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, marketplace_id],
+            )
+            .map_err(|error| format!("Unable to remove workspace MCP marketplace: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_marketplace_removed",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({"workspace_id": workspace_id, "marketplace_id": marketplace_id}),
+        )?;
+        self.workspace_mcp_registry(workspace_id, None)
+    }
+
+    pub fn install_workspace_mcp_server(
+        &self,
+        workspace_id: &str,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let name = required_json_text(input, "name")?;
+        let server_key = input["server_key"]
+            .as_str()
+            .map(workspace_mcp_key)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| workspace_mcp_key(name));
+        let source_kind = input["source_kind"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("manual");
+        let source_label = input["source_label"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Manual");
+        let transport = input["transport"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("stdio");
+        let args_json = json_text_or_default(input.get("args"), json!([]))?;
+        let env_schema_json = json_text_or_default(input.get("env_schema"), json!([]))?;
+        let config_values_json = json_text_or_default(input.get("config_values"), json!({}))?;
+        let tools_json = json_text_or_default(input.get("tools"), json!([]))?;
+        let workspace_enabled = bool_i64(input["workspace_enabled"].as_bool().unwrap_or(false));
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM workspace_mcp_servers
+                 WHERE workspace_id=?1 AND server_key=?2",
+                params![workspace_id, server_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to inspect workspace MCP server: {error}"))?
+            .unwrap_or_else(uuid);
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_servers(
+                    id, workspace_id, server_key, name, source_kind, source_label,
+                    package_ref, version, transport, command, args_json, url,
+                    env_schema_json, config_values_json, tools_json, install_state,
+                    workspace_enabled, last_probe_status, last_probe_message,
+                    created_at, updated_at
+                ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, 'installed',
+                    ?16, ?17, ?18,
+                    ?19, ?19
+                )
+                ON CONFLICT(workspace_id, server_key) DO UPDATE SET
+                    name=excluded.name,
+                    source_kind=excluded.source_kind,
+                    source_label=excluded.source_label,
+                    package_ref=excluded.package_ref,
+                    version=excluded.version,
+                    transport=excluded.transport,
+                    command=excluded.command,
+                    args_json=excluded.args_json,
+                    url=excluded.url,
+                    env_schema_json=excluded.env_schema_json,
+                    config_values_json=excluded.config_values_json,
+                    tools_json=excluded.tools_json,
+                    install_state='installed',
+                    workspace_enabled=excluded.workspace_enabled,
+                    last_probe_status=excluded.last_probe_status,
+                    last_probe_message=excluded.last_probe_message,
+                    updated_at=excluded.updated_at",
+                params![
+                    id,
+                    workspace_id,
+                    server_key,
+                    name,
+                    source_kind,
+                    source_label,
+                    input["package_ref"].as_str(),
+                    input["version"].as_str(),
+                    transport,
+                    input["command"].as_str(),
+                    args_json,
+                    input["url"].as_str(),
+                    env_schema_json,
+                    config_values_json,
+                    tools_json,
+                    workspace_enabled,
+                    "not_connected",
+                    "Workspace gateway is not installed yet.",
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to install workspace MCP server: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_server_installed",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "server_key": server_key,
+                "name": name,
+                "source_kind": source_kind,
+                "workspace_enabled": workspace_enabled,
+            }),
+        )?;
+        self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
+    }
+
+    pub fn update_workspace_mcp_server(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let server_id = required_trimmed(server_id, "server_id")?;
+        if server_id == "coordination-kernel" {
+            return Err("The Coordination Kernel MCP is built in and always enabled.".to_string());
+        }
+        let current = self.query_one(
+            "SELECT * FROM workspace_mcp_servers WHERE workspace_id=?1 AND id=?2",
+            &[&workspace_id, &server_id],
+            "Workspace MCP server does not exist.",
+        )?;
+        let workspace_enabled = input["workspace_enabled"]
+            .as_bool()
+            .map(bool_i64)
+            .or_else(|| input["workspace_enabled"].as_i64())
+            .unwrap_or_else(|| current["workspace_enabled"].as_i64().unwrap_or_default());
+        let config_values_json = if input.get("config_values").is_some() {
+            json_text_or_default(input.get("config_values"), json!({}))?
+        } else {
+            serde_json::to_string(&current["config_values_json"])
+                .map_err(|error| format!("Unable to serialize MCP config values: {error}"))?
+        };
+        let tools_json = if input.get("tools").is_some() {
+            json_text_or_default(input.get("tools"), json!([]))?
+        } else {
+            serde_json::to_string(&current["tools_json"])
+                .map_err(|error| format!("Unable to serialize MCP tools: {error}"))?
+        };
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_servers
+                 SET workspace_enabled=?1,
+                     config_values_json=?2,
+                     tools_json=?3,
+                     updated_at=?4
+                 WHERE workspace_id=?5 AND id=?6",
+                params![
+                    workspace_enabled,
+                    config_values_json,
+                    tools_json,
+                    now,
+                    workspace_id,
+                    server_id
+                ],
+            )
+            .map_err(|error| format!("Unable to update workspace MCP server: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_server_updated",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "server_id": server_id,
+                "workspace_enabled": workspace_enabled,
+            }),
+        )?;
+        self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
+    }
+
+    pub fn uninstall_workspace_mcp_server(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let server_id = required_trimmed(server_id, "server_id")?;
+        if server_id == "coordination-kernel" {
+            return Err("The Coordination Kernel MCP cannot be uninstalled.".to_string());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_servers WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, server_id],
+            )
+            .map_err(|error| format!("Unable to uninstall workspace MCP server: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_server_uninstalled",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({"workspace_id": workspace_id, "server_id": server_id}),
+        )?;
+        self.workspace_mcp_registry(workspace_id, None)
     }
 
     fn workspace_mcp_health(&self, status: &Value) -> Value {

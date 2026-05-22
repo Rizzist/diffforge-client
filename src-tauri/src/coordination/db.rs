@@ -18,6 +18,9 @@ use super::schema::{
     SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
+    WORKSPACE_MCP_INDEX_MIGRATION_NAME, WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
+    WORKSPACE_MCP_INDEX_SCHEMA_SQL, WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
+    WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION, WORKSPACE_MCP_REGISTRY_SCHEMA_SQL,
 };
 
 pub const REPO_ID: &str = "local";
@@ -306,6 +309,8 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_integrator_policy_migration(connection)?);
     diagnostics.push(apply_terminal_launch_epoch_migration(connection)?);
     diagnostics.push(apply_submit_job_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_registry_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_index_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -594,6 +599,60 @@ fn apply_submit_job_migration(
     migration.details.splice(
         0..0,
         ["SUBMIT_JOB_SCHEMA_SQL executed idempotently".to_string()],
+    );
+    Ok(migration)
+}
+
+fn apply_workspace_mcp_registry_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION,
+            WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry("Unable to initialize workspace MCP registry schema", || {
+        connection.execute_batch(WORKSPACE_MCP_REGISTRY_SCHEMA_SQL)
+    })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION,
+        WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        ["WORKSPACE_MCP_REGISTRY_SCHEMA_SQL executed idempotently".to_string()],
+    );
+    Ok(migration)
+}
+
+fn apply_workspace_mcp_index_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, WORKSPACE_MCP_INDEX_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
+            WORKSPACE_MCP_INDEX_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry("Unable to initialize workspace MCP index schema", || {
+        connection.execute_batch(WORKSPACE_MCP_INDEX_SCHEMA_SQL)
+    })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
+        WORKSPACE_MCP_INDEX_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        ["WORKSPACE_MCP_INDEX_SCHEMA_SQL executed idempotently".to_string()],
     );
     Ok(migration)
 }

@@ -38,6 +38,7 @@
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^4.11.0",
+    "react-select": "^5.10.2",
     "remark-gfm": "^4.0.1",
     "styled-components": "^6.4.1",
     "styled-icons": "^10.47.1"
