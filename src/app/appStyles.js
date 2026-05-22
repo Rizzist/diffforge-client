@@ -7864,6 +7864,7 @@ export const AudioWidgetActions = styled.div`
 `;
 
 export const McpWorkspaceSurface = styled.section`
+  container-type: inline-size;
   display: grid;
   width: 100%;
   height: 100%;
@@ -7871,7 +7872,7 @@ export const McpWorkspaceSurface = styled.section`
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
-  overflow: hidden;
+  overflow: auto;
   padding: 16px;
   background:
     linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
@@ -7950,6 +7951,20 @@ export const McpTitleRow = styled.div`
 
   @media (max-width: 760px) {
     grid-template-columns: 36px minmax(0, 1fr);
+
+    > button {
+      grid-column: 1 / -1;
+      width: 100%;
+    }
+  }
+
+  @container (max-width: 760px) {
+    grid-template-columns: 36px minmax(0, 1fr);
+
+    > [aria-label="MCP summary"] {
+      grid-column: 1 / -1;
+      justify-content: flex-start;
+    }
 
     > button {
       grid-column: 1 / -1;
@@ -8040,22 +8055,29 @@ export const McpLayout = styled.div`
   min-width: 0;
   min-height: 0;
   grid-template-columns: minmax(216px, 260px) minmax(0, 1fr);
+  align-items: stretch;
   gap: 10px;
-  overflow: hidden;
+  overflow: visible;
 
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
-    overflow: auto;
+    overflow: visible;
+  }
+
+  @container (max-width: 920px) {
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
   }
 `;
 
 export const McpRegistryPanel = styled.aside`
   display: grid;
   min-width: 0;
-  min-height: 0;
+  min-height: 82px;
+  grid-template-rows: auto minmax(42px, max-content);
   align-content: start;
   gap: 8px;
-  overflow: hidden;
+  overflow: visible;
   padding: 10px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
@@ -8087,9 +8109,9 @@ export const McpPanelTopline = styled.div`
 export const McpServerList = styled.div`
   display: grid;
   min-width: 0;
-  min-height: 0;
+  min-height: 42px;
   gap: 4px;
-  overflow: auto;
+  overflow: visible;
 `;
 
 export const McpServerButton = styled.button`
@@ -8494,6 +8516,10 @@ export const McpAccessGrid = styled.div`
 
   @media (max-width: 820px) {
     grid-template-columns: 1fr;
+  }
+
+  @container (max-width: 820px) {
+    grid-template-columns: minmax(0, 1fr);
   }
 `;
 

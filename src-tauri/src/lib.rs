@@ -1346,6 +1346,18 @@ struct CloudVoiceAgentStartRequest {
     workspace_root: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudVoiceAgentTextMessageRequest {
+    text: String,
+    turn_index: Option<u64>,
+    repo_id: Option<String>,
+    agent_statuses: Option<Value>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    workspace_root: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartStatus {
@@ -2368,6 +2380,7 @@ pub fn run() {
             start_cloud_voice_agent_stream,
             finish_cloud_voice_agent_input,
             stop_cloud_voice_agent_stream,
+            send_cloud_voice_agent_text_message,
             read_orchestrator_voice_history,
             write_orchestrator_voice_history,
             audio_shortcuts_status,
@@ -2417,6 +2430,7 @@ pub fn run() {
             terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,
+            terminal_provider_turn_completed,
             terminal_delete_selection,
             terminal_cancel_parked_task,
             terminal_interrupt_agent,

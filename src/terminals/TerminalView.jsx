@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AddToQueue } from "@styled-icons/material-rounded/AddToQueue";
+import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
+import { North } from "@styled-icons/material-rounded/North";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
@@ -31,6 +34,7 @@ import {
 import {
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
+  sendCloudVoiceAgentTextMessage,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -703,6 +707,11 @@ const VOICE_PLAN_CLIENT_RELEASE_STATUSES = new Set([
   "released",
   "sent_to_client",
 ]);
+const VOICE_PLAN_PARKED_STATUSES = new Set([
+  "parked",
+  "resume_ready",
+  "resume_requested",
+]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
   { id: "files", label: "Files" },
@@ -1016,18 +1025,29 @@ const OrchestratorContent = styled.div`
 `;
 
 const OrchestratorHistoryView = styled.div`
-  display: flex;
+  display: grid;
   width: 100%;
   height: 100%;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 12px;
-  padding: 18px;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto;
   color: #7f8da1;
   background: rgba(2, 4, 8, 0.76);
   font-size: 12px;
   font-weight: 720;
+  overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    color: #7a7a7a;
+    background: #ffffff;
+  }
+`;
+
+const OrchestratorHistoryScroll = styled.div`
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
 
   html[data-forge-theme="light"] & {
     color: #7a7a7a;
@@ -1039,14 +1059,13 @@ const OrchestratorHistoryError = styled.div`
   display: grid;
   gap: 6px;
   width: 100%;
-  padding: 10px 12px;
-  border: 1px solid rgba(239, 68, 68, 0.28);
-  border-radius: 8px;
+  padding: 11px 14px;
+  border-bottom: 1px solid rgba(239, 68, 68, 0.28);
   color: #fecaca;
   background: rgba(127, 29, 29, 0.2);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(185, 28, 28, 0.24);
+    border-bottom-color: rgba(185, 28, 28, 0.24);
     color: #7f1d1d;
     background: rgba(254, 226, 226, 0.72);
   }
@@ -1074,39 +1093,137 @@ const OrchestratorHistoryErrorText = styled.div`
 
 const OrchestratorHistoryEmpty = styled.div`
   display: grid;
-  min-height: 120px;
+  min-height: 100%;
   place-items: center;
+  padding: 22px 14px;
+  color: #7f8da1;
+  text-align: center;
 `;
 
 const OrchestratorHistoryList = styled.div`
   display: grid;
   min-width: 0;
-  gap: 10px;
+  min-height: 100%;
+  align-content: start;
+  gap: 14px;
+  padding: 14px 12px 16px;
 `;
 
 const OrchestratorHistoryTurn = styled.article`
   display: grid;
   min-width: 0;
-  gap: 8px;
-  padding: 11px 12px;
-  border: 1px solid rgba(230, 236, 245, 0.08);
-  border-radius: 8px;
-  background: rgba(8, 12, 18, 0.7);
+  gap: 9px;
+  background: transparent;
 
   &[data-pending="true"] {
-    border-color: rgba(125, 176, 255, 0.22);
-    background: rgba(15, 23, 42, 0.72);
+    background: transparent;
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.08);
-    background: #fafafc;
+    background: transparent;
   }
 
   html[data-forge-theme="light"] &[data-pending="true"] {
-    border-color: rgba(0, 102, 204, 0.18);
-    background: rgba(241, 247, 255, 0.8);
+    background: transparent;
   }
+`;
+
+const OrchestratorHistoryUserMessage = styled.div`
+  display: grid;
+  min-width: 0;
+  justify-items: end;
+  gap: 5px;
+`;
+
+const OrchestratorHistoryAssistantMessage = styled.div`
+  display: grid;
+  width: min(88%, 540px);
+  min-width: 0;
+  gap: 5px;
+  justify-self: start;
+`;
+
+const OrchestratorHistoryMessageActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  color: #a7a7a7;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+
+  &[data-align="right"] {
+    justify-content: flex-end;
+    padding-right: 8px;
+  }
+
+  &[data-align="left"] {
+    justify-content: flex-start;
+    padding-left: 4px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #7a7a7a;
+  }
+`;
+
+const OrchestratorHistoryMessageTime = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 22px;
+`;
+
+const OrchestratorHistoryCopyButton = styled.button`
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: #a7a7a7;
+  background: transparent;
+  cursor: pointer;
+  line-height: 1;
+  outline: none;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
+
+  &:hover {
+    color: #f2f2f2;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  &[data-copied="true"] {
+    color: #f2f2f2;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #777777;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &[data-copied="true"] {
+    color: #20242b;
+    background: rgba(0, 0, 0, 0.06);
+  }
+`;
+
+const OrchestratorHistoryCopyIcon = styled(ContentCopy)`
+  display: block;
+  width: 15px;
+  height: 15px;
+`;
+
+const OrchestratorHistoryCopiedIcon = styled(Check)`
+  display: block;
+  width: 16px;
+  height: 16px;
 `;
 
 const OrchestratorHistoryTurnHeader = styled.div`
@@ -1115,6 +1232,7 @@ const OrchestratorHistoryTurnHeader = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  padding: 9px 14px 6px;
 `;
 
 const OrchestratorHistoryTurnLabel = styled.div`
@@ -1147,22 +1265,33 @@ const OrchestratorHistoryTurnStatus = styled.div`
 
 const OrchestratorHistoryTranscript = styled.div`
   min-width: 0;
-  color: #eef4ff;
-  font-size: 12px;
-  font-weight: 690;
+  max-width: min(86%, 460px);
+  padding: 11px 14px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  border-radius: 20px;
+  color: #dedede;
+  background: #242424;
+  font-size: 11.5px;
+  font-weight: 660;
   line-height: 1.42;
   overflow-wrap: anywhere;
+  box-shadow: none;
 
   &[data-pending="true"] {
-    color: #b9c7d9;
+    color: #d2d2d2;
+    background: #242424;
   }
 
   html[data-forge-theme="light"] & {
-    color: #20242b;
+    border-color: rgba(0, 0, 0, 0.05);
+    color: #242424;
+    background: #eeeeee;
+    box-shadow: none;
   }
 
   html[data-forge-theme="light"] &[data-pending="true"] {
-    color: #56616f;
+    color: #343434;
+    background: #eeeeee;
   }
 `;
 
@@ -1170,11 +1299,11 @@ const OrchestratorHistoryLlm = styled.div`
   display: grid;
   min-width: 0;
   gap: 5px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(230, 236, 245, 0.08);
+  padding: 1px 4px 3px;
+  background: transparent;
 
   html[data-forge-theme="light"] & {
-    border-top-color: rgba(0, 0, 0, 0.08);
+    background: transparent;
   }
 `;
 
@@ -1192,20 +1321,30 @@ const OrchestratorHistoryLlmLabel = styled.div`
 
 const OrchestratorHistoryLlmText = styled.div`
   min-width: 0;
-  color: #d8e2f0;
+  color: #dfe7f2;
   font-size: 12px;
   font-weight: 680;
-  line-height: 1.38;
+  line-height: 1.46;
   overflow-wrap: anywhere;
 
   html[data-forge-theme="light"] & {
-    color: #343a46;
+    color: #20242b;
   }
 `;
 
 const orchestratorHistorySpinner = keyframes`
   to {
     transform: rotate(360deg);
+  }
+`;
+
+const orchestratorHistorySendPulse = keyframes`
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.22);
+  }
+
+  50% {
+    box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.06);
   }
 `;
 
@@ -1235,13 +1374,17 @@ const OrchestratorHistoryInlineSpinner = styled.span`
 
 const OrchestratorHistoryPlan = styled.div`
   display: grid;
+  width: min(94%, 560px);
   min-width: 0;
   gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(230, 236, 245, 0.08);
+  justify-self: start;
+  padding: 9px 4px 4px;
+  border-top: 1px solid rgba(45, 212, 191, 0.2);
+  background: transparent;
 
   html[data-forge-theme="light"] & {
-    border-top-color: rgba(0, 0, 0, 0.08);
+    border-top-color: rgba(13, 148, 136, 0.2);
+    background: transparent;
   }
 `;
 
@@ -1304,24 +1447,21 @@ const OrchestratorHistoryPlanStep = styled.div`
   display: grid;
   min-width: 0;
   gap: 6px;
-  padding: 8px 9px;
-  border: 1px solid rgba(230, 236, 245, 0.08);
-  border-radius: 8px;
-  background: rgba(3, 7, 13, 0.52);
+  padding: 8px 0 0;
+  border-top: 1px solid rgba(230, 236, 245, 0.08);
+  background: transparent;
 
   &[data-active="true"] {
-    border-color: rgba(45, 212, 191, 0.26);
-    background: rgba(13, 24, 31, 0.7);
+    border-top-color: rgba(45, 212, 191, 0.26);
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.08);
-    background: #ffffff;
+    border-top-color: rgba(0, 0, 0, 0.08);
+    background: transparent;
   }
 
   html[data-forge-theme="light"] &[data-active="true"] {
-    border-color: rgba(13, 148, 136, 0.22);
-    background: #f0fdfa;
+    border-top-color: rgba(13, 148, 136, 0.22);
   }
 `;
 
@@ -1400,6 +1540,148 @@ const OrchestratorHistoryPlanTask = styled.div`
   html[data-forge-theme="light"] & span {
     color: #6b7280;
   }
+`;
+
+const OrchestratorHistoryComposer = styled.form`
+  display: flex;
+  min-width: 0;
+  justify-content: center;
+  padding: 10px 12px 12px;
+  border-top: 1px solid rgba(230, 236, 245, 0.08);
+  background: rgba(3, 7, 13, 0.92);
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(0, 0, 0, 0.08);
+    background: #ffffff;
+  }
+`;
+
+const OrchestratorHistoryInputFrame = styled.div`
+  position: relative;
+  width: min(440px, 100%);
+  min-width: 0;
+`;
+
+const OrchestratorHistoryInput = styled.textarea`
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 46px;
+  max-height: 104px;
+  padding: 12px 48px 12px 16px;
+  border: 1px solid rgba(230, 236, 245, 0.11);
+  border-radius: 23px;
+  color: #eef4ff;
+  background: rgba(8, 12, 18, 0.82);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 1.35;
+  outline: none;
+  resize: none;
+
+  &::placeholder {
+    color: #657386;
+  }
+
+  &:focus {
+    border-color: rgba(125, 176, 255, 0.45);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.56;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: #20242b;
+    background: #f7f8fb;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #8a94a3;
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(0, 102, 204, 0.38);
+  }
+`;
+
+const OrchestratorHistorySendButton = styled.button`
+  position: absolute;
+  right: 7px;
+  bottom: 7px;
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  color: #8d9aac;
+  background: rgba(21, 27, 36, 0.94);
+  line-height: 1;
+  outline: none;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
+
+  &:not(:disabled):hover {
+    border-color: rgba(255, 255, 255, 0.42);
+    color: #05070a;
+    background: #ffffff;
+  }
+
+  &[data-ready="true"],
+  &[data-animated="true"] {
+    border-color: rgba(255, 255, 255, 0.5);
+    color: #05070a;
+    background: #ffffff;
+  }
+
+  &[data-animated="true"] {
+    animation: ${orchestratorHistorySendPulse} 900ms ease-in-out infinite;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.68;
+  }
+
+  &[data-animated="true"]:disabled {
+    opacity: 1;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.11);
+    color: #8a94a3;
+    background: #e9edf4;
+  }
+
+  html[data-forge-theme="light"] &:not(:disabled):hover {
+    border-color: rgba(0, 0, 0, 0.14);
+    color: #05070a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-ready="true"],
+  html[data-forge-theme="light"] &[data-animated="true"] {
+    border-color: rgba(0, 0, 0, 0.14);
+    color: #05070a;
+    background: #ffffff;
+  }
+`;
+
+const OrchestratorHistorySendIcon = styled(North)`
+  display: block;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
 `;
 
 const WorkspaceToolSurface = styled.div`
@@ -2461,34 +2743,22 @@ function normalizeVoiceAgentQueueArguments(value) {
 }
 
 function normalizeVoiceAgentManagementAgent(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s.-]+/g, "_");
-
-  if (["codex", "openai", "openai_codex"].includes(normalized)) return "codex";
-  if (["claude", "claude_code", "anthropic"].includes(normalized)) return "claude";
-  if (["opencode", "open_code", "opencode_ai"].includes(normalized)) return "opencode";
+  const agentType = String(value || "").trim();
+  if (["any", "codex", "claude", "opencode"].includes(agentType)) return agentType;
   return "";
 }
 
 function normalizeVoiceAgentOpenCodingAgentsAction(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s-]+/g, "_");
-
-  if (["ensure", "ensure_count", "set_count", "launch_count"].includes(normalized)) {
-    return "ensure_count";
-  }
-  return "spawn_count";
+  const action = String(value || "").trim();
+  if (action === "ensure_count" || action === "spawn_count") return action;
+  return "";
 }
 
 function getVoiceAgentOpenCodingAgentsRequestSummary(args = {}) {
   const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
-  const agentId = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
+  const agentId = normalizeVoiceAgentManagementAgent(args.agent_type);
   const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
-  const agentLabel = agentId || "agent";
+  const agentLabel = agentId && agentId !== "any" ? agentId : "agent";
 
   if (action === "ensure_count") {
     return `Open ${count} total ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
@@ -2617,6 +2887,45 @@ function normalizeVoiceHistoryText(value, maxLength = TODO_QUEUE_MAX_TEXT_LENGTH
     .slice(0, maxLength);
 }
 
+function formatVoiceHistoryMessageTime(value) {
+  const timestamp = Number(value || 0);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return "";
+  }
+
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+async function copyTextToClipboard(text) {
+  const safeText = String(text || "");
+  if (!safeText || typeof window === "undefined") {
+    return false;
+  }
+
+  if (window.navigator?.clipboard?.writeText) {
+    await window.navigator.clipboard.writeText(safeText);
+    return true;
+  }
+
+  const textarea = window.document.createElement("textarea");
+  textarea.value = safeText;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  window.document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    return window.document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+}
+
 function getVoiceHistoryTurnIndex(event) {
   const value = event?.turn_index ?? event?.turnIndex;
   const numericValue = Number(value);
@@ -2661,6 +2970,9 @@ function getVoiceHistoryTurnLabel(item) {
   if (item?.plan?.title && !item.transcript) {
     return "Voice plan";
   }
+  if (item?.source === "chat") {
+    return `Chat turn ${turnIndex + 1}`;
+  }
   return `Voice turn ${turnIndex + 1}`;
 }
 
@@ -2693,6 +3005,7 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
     ...(plan ? { plan } : {}),
     queued: Boolean(item.queued),
     queuedText,
+    source: String(item.source || "").trim().slice(0, 32),
     transcript,
     transcriptFinal: Boolean(item.transcriptFinal),
     turnIndex: Number.isFinite(turnIndex) ? turnIndex : 0,
@@ -2914,8 +3227,11 @@ function normalizeOrchestratorVoiceHistoryItems(items) {
   return (Array.isArray(items) ? items : [])
     .map(normalizeOrchestratorVoiceHistoryItem)
     .filter(Boolean)
-    .sort((left, right) => Number(right.updatedAtMs || 0) - Number(left.updatedAtMs || 0))
-    .slice(0, ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
+    .sort((left, right) => (
+      Number(left.createdAtMs || left.updatedAtMs || 0)
+      - Number(right.createdAtMs || right.updatedAtMs || 0)
+    ))
+    .slice(-ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
 }
 
 function getTodoQueueItemNote(item) {
@@ -2970,14 +3286,7 @@ function isVoicePlanBoundaryQueueItem(item) {
 }
 
 function normalizeVoicePlanStageName(value) {
-  const stage = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
-  if (stage === "execute" || stage === "implementation" || stage === "implement") {
-    return "execution";
-  }
-  if (stage === "review" || stage === "verify" || stage === "verification") {
-    return "revision";
-  }
-  return stage;
+  return String(value || "").trim();
 }
 
 function getVoicePlanStageIndex(value) {
@@ -3026,6 +3335,21 @@ function getVoicePlanStageTasks(step, stageName) {
   return [];
 }
 
+function getVoicePlanSnapshotTask(snapshot, planTask) {
+  const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
+  if (!snapshot?.runId || !normalizedPlanTask) {
+    return null;
+  }
+  const taskStepOrdinal = Number(normalizedPlanTask.stepOrdinal || 0);
+  const taskStage = normalizeVoicePlanStageName(
+    normalizedPlanTask.stage || snapshot.currentStage || "execution",
+  );
+  const step = getVoicePlanStepByOrdinal(snapshot, taskStepOrdinal);
+  return getVoicePlanStageTasks(step, taskStage).find((task) => (
+    String(task?.id || task?.taskId || "").trim() === normalizedPlanTask.taskId
+  )) || null;
+}
+
 function isVoicePlanStageComplete(step, stageName) {
   if (!step) {
     return false;
@@ -3060,11 +3384,14 @@ function getVoicePlanTaskReleaseDecision(task, snapshot = null) {
   const taskStepOrdinal = Number(planTask.stepOrdinal || 0);
   const taskStage = normalizeVoicePlanStageName(planTask.stage || snapshot?.currentStage || "execution");
   const taskStageIndex = getVoicePlanStageIndex(taskStage);
+  if (taskStageIndex < 0) {
+    return { eligible: false, reason: "invalid_stage" };
+  }
   if (isVoicePlanCompletedStatus(snapshot?.status)) {
     return { eligible: false, reason: "plan_complete" };
   }
   if (!snapshot?.runId) {
-    return taskStepOrdinal === 0 && (taskStageIndex <= 0)
+    return taskStepOrdinal === 0 && taskStageIndex === 0
       ? { eligible: true, reason: "first_slot_without_snapshot" }
       : { eligible: false, reason: "missing_plan_snapshot" };
   }
@@ -3213,28 +3540,6 @@ function getVoicePlanReleasedTasksFromSnapshot(snapshot) {
   return releasedTasks
     .map((task) => normalizeVoicePlanReleasedTask(task, snapshot))
     .filter(Boolean);
-}
-
-function isPlaceholderVoicePlanTaskText(value) {
-  const normalized = String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, "")
-    .toLowerCase();
-  return [
-    "",
-    "voice plan",
-    "execute request",
-    "step",
-    "step 1",
-    "task",
-    "todo",
-    "plan",
-  ].includes(normalized);
-}
-
-function isUnsafeVoicePlanQueueItem(item) {
-  return Boolean(getTodoQueueItemPlanTask(item) && isPlaceholderVoicePlanTaskText(item?.text));
 }
 
 function isSpecEditTodoQueueItem(item) {
@@ -4040,6 +4345,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
   const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
+  const [orchestratorChatDraft, setOrchestratorChatDraft] = useState("");
+  const [orchestratorChatSubmitting, setOrchestratorChatSubmitting] = useState(false);
+  const [orchestratorHistoryCopiedKey, setOrchestratorHistoryCopiedKey] = useState("");
   const [reorderingItemId, setReorderingItemId] = useState("");
   const [todoListOffset, setTodoListOffset] = useState(0);
   const orchestratorVoiceEventsActiveRef = useRef(false);
@@ -4053,6 +4361,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorVoiceHistoryStoreKeyRef = useRef(orchestratorVoiceHistoryStoreKey);
   const orchestratorVoiceHistoryLoadedRef = useRef(false);
   const orchestratorVoiceHistoryWriteTimerRef = useRef(0);
+  const orchestratorHistoryCopyTimerRef = useRef(0);
   const orchestratorVoiceFastResponseGateRef = useRef({
     cancelled: false,
     pendingFeedback: null,
@@ -4067,6 +4376,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const draftTextAreaRef = useRef(null);
   const editingTextAreaRef = useRef(null);
   const todoListRef = useRef(null);
+  const orchestratorHistoryScrollRef = useRef(null);
   const skipEditBlurCommitRef = useRef(false);
 
   const updateVoiceHistoryTurn = useCallback((turnKey, updater) => {
@@ -4101,15 +4411,71 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
       const nextItems = currentIndex >= 0
         ? currentItems.map((item, index) => (index === currentIndex ? nextItem : item))
-        : [nextItem].concat(currentItems);
+        : currentItems.concat([nextItem]);
 
-      return nextItems.slice(0, ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
+      return nextItems.slice(-ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
     });
   }, []);
 
   useEffect(() => {
     orchestratorVoiceHistoryItemsRef.current = orchestratorVoiceHistoryItems;
   }, [orchestratorVoiceHistoryItems]);
+
+  useLayoutEffect(() => {
+    if (activeOrchestratorSection !== "history") {
+      return undefined;
+    }
+    const scrollElement = orchestratorHistoryScrollRef.current;
+    if (!scrollElement) {
+      return undefined;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    activeOrchestratorSection,
+    orchestratorChatSubmitting,
+    orchestratorVoiceError,
+    orchestratorVoiceHistoryItems,
+  ]);
+
+  useEffect(() => () => {
+    if (orchestratorHistoryCopyTimerRef.current) {
+      window.clearTimeout(orchestratorHistoryCopyTimerRef.current);
+      orchestratorHistoryCopyTimerRef.current = 0;
+    }
+  }, []);
+
+  const handleOrchestratorHistoryCopy = useCallback(async (copyKey, text) => {
+    const safeCopyKey = String(copyKey || "");
+    const safeText = String(text || "");
+    if (!safeCopyKey || !safeText) {
+      return;
+    }
+
+    try {
+      const copied = await copyTextToClipboard(safeText);
+      if (!copied) {
+        return;
+      }
+      setOrchestratorHistoryCopiedKey(safeCopyKey);
+      if (orchestratorHistoryCopyTimerRef.current) {
+        window.clearTimeout(orchestratorHistoryCopyTimerRef.current);
+      }
+      orchestratorHistoryCopyTimerRef.current = window.setTimeout(() => {
+        setOrchestratorHistoryCopiedKey((currentKey) => (
+          currentKey === safeCopyKey ? "" : currentKey
+        ));
+        orchestratorHistoryCopyTimerRef.current = 0;
+      }, 1400);
+    } catch (error) {
+      logBigViewSyncDiagnosticEvent("tui.voice_history.copy_failed", {
+        message: String(error?.message || error || "Unable to copy message."),
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    }
+  }, [orchestratorPanelWorkspaceId]);
 
   const clearVoiceHistoryTurnTimeout = useCallback((turnKey) => {
     const safeTurnKey = String(turnKey || "").trim();
@@ -4284,6 +4650,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       workspaceId: orchestratorPanelWorkspaceId,
     });
     updateVoiceHistoryTurn(turnKey, (currentItem) => ({
+      source: event?.provider === "desktop_text" ? "chat" : currentItem.source || "voice",
       transcript: transcript || currentItem.transcript,
       transcriptFinal: currentItem.transcriptFinal || isFinal,
       turnIndex: getVoiceHistoryTurnIndex(event),
@@ -4422,8 +4789,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
       const nextItems = currentIndex >= 0
         ? currentItems.map((item, index) => (index === currentIndex ? nextItem : item))
-        : [nextItem].concat(currentItems);
-      return nextItems.slice(0, ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
+        : currentItems.concat([nextItem]);
+      return nextItems.slice(-ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
     });
     clearVoiceHistoryTurnTimeout(turnKey);
   }, [clearVoiceHistoryTurnTimeout, orchestratorPanelWorkspaceId]);
@@ -4532,6 +4899,21 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     return "released";
   }, [orchestratorPanelWorkspaceId, recordVoiceHistoryLlmFeedback]);
 
+  const getCloudVoiceAgentRequestContext = useCallback(() => ({
+    agentStatuses: (Array.isArray(agentStatuses) ? agentStatuses : []).map((agent) => ({
+      activeModel: agent?.activeModel || "",
+      authenticated: Boolean(agent?.authenticated),
+      binary: agent?.binary || agent?.id || "",
+      id: agent?.id || "",
+      installed: Boolean(agent?.installed),
+      label: agent?.label || agent?.id || "",
+      version: agent?.version || "",
+    })),
+    workspaceId: workspaceId || workspace?.id || "",
+    workspaceName: workspace?.name || "",
+    workspaceRoot: rootDirectory || defaultWorkingDirectory || "",
+  }), [agentStatuses, defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+
   const stopOrchestratorVoiceMonitor = useCallback(async () => {
     if (orchestratorVoiceEventsActiveRef.current) {
       markPendingVoiceHistoryTurnsTerminal(
@@ -4551,6 +4933,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorChatSubmitting(false);
     await ttsPlayer?.close?.().catch(() => {});
     await stopCloudVoiceAgentStream().catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
@@ -4587,6 +4970,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorChatSubmitting(false);
     await stopCloudVoiceAgentStream().catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
@@ -4660,20 +5044,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
-      await startCloudVoiceAgentStream({
-        agentStatuses: (Array.isArray(agentStatuses) ? agentStatuses : []).map((agent) => ({
-          activeModel: agent?.activeModel || "",
-          authenticated: Boolean(agent?.authenticated),
-          binary: agent?.binary || agent?.id || "",
-          id: agent?.id || "",
-          installed: Boolean(agent?.installed),
-          label: agent?.label || agent?.id || "",
-          version: agent?.version || "",
-        })),
-        workspaceId: workspaceId || workspace?.id || "",
-        workspaceName: workspace?.name || "",
-        workspaceRoot: rootDirectory || defaultWorkingDirectory || "",
-      });
+      await startCloudVoiceAgentStream(getCloudVoiceAgentRequestContext());
       cloudStarted = true;
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
@@ -4712,7 +5083,93 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         "Unable to start the cloud voice agent.",
       ));
     }
-  }, [agentStatuses, clearAllVoiceHistoryTurnTimeouts, defaultWorkingDirectory, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+  }, [clearAllVoiceHistoryTurnTimeouts, getCloudVoiceAgentRequestContext, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate]);
+
+  const handleOrchestratorChatSubmit = useCallback(async (event) => {
+    event?.preventDefault?.();
+    const text = orchestratorChatDraft.trim();
+    if (
+      !text
+      || orchestratorChatSubmitting
+      || orchestratorVoiceState === "starting"
+      || orchestratorVoiceState === "listening"
+      || orchestratorVoiceState === "processing"
+    ) {
+      return;
+    }
+
+    const runId = orchestratorVoiceRunRef.current + 1;
+    const sessionId = Date.now();
+    const turnKey = `${sessionId}:0`;
+    orchestratorVoiceRunRef.current = runId;
+    clearAllVoiceHistoryTurnTimeouts();
+    resetOrchestratorFastResponseGate();
+    orchestratorVoiceInputFinishRequestedRef.current = false;
+    orchestratorVoiceSessionRef.current = sessionId;
+    orchestratorVoiceEventsActiveRef.current = true;
+    setActiveOrchestratorSection("history");
+    setOrchestratorChatDraft("");
+    setOrchestratorChatSubmitting(true);
+    setOrchestratorVoiceState("processing");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    setOrchestratorVoiceFeedback("");
+    const previousTtsPlayer = orchestratorVoiceTtsPlayerRef.current;
+    orchestratorVoiceTtsPlayerRef.current = null;
+    await previousTtsPlayer?.close?.().catch(() => {});
+
+    updateVoiceHistoryTurn(turnKey, {
+      source: "chat",
+      transcript: normalizeVoiceHistoryText(text, 1600),
+      transcriptFinal: true,
+      turnIndex: 0,
+    });
+    scheduleVoiceHistoryTurnTimeout(turnKey);
+
+    try {
+      await sendCloudVoiceAgentTextMessage({
+        ...getCloudVoiceAgentRequestContext(),
+        text,
+        turnIndex: 0,
+      });
+      if (orchestratorVoiceRunRef.current === runId) {
+        logTerminalStatus("frontend.voice_agent.text_message_sent", {
+          textLength: text.length,
+          workspaceId: orchestratorPanelWorkspaceId,
+        });
+      }
+    } catch (error) {
+      if (orchestratorVoiceRunRef.current !== runId) {
+        return;
+      }
+      const message = getAudioInputErrorMessage(error, "Unable to send message to the voice agent.");
+      markVoiceHistoryTurnTerminal(turnKey, "failed", message);
+      orchestratorVoiceEventsActiveRef.current = false;
+      setOrchestratorVoiceState("error");
+      setOrchestratorVoiceError(message);
+      setOrchestratorVoiceFeedback("");
+      setOrchestratorChatSubmitting(false);
+    }
+  }, [
+    clearAllVoiceHistoryTurnTimeouts,
+    getCloudVoiceAgentRequestContext,
+    markVoiceHistoryTurnTerminal,
+    orchestratorChatDraft,
+    orchestratorChatSubmitting,
+    orchestratorPanelWorkspaceId,
+    orchestratorVoiceState,
+    resetOrchestratorFastResponseGate,
+    scheduleVoiceHistoryTurnTimeout,
+    updateVoiceHistoryTurn,
+  ]);
+
+  const handleOrchestratorChatKeyDown = useCallback((event) => {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+    event.preventDefault();
+    void handleOrchestratorChatSubmit(event);
+  }, [handleOrchestratorChatSubmit]);
 
   const toggleOrchestratorVoiceMonitor = useCallback(() => {
     if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
@@ -5323,6 +5780,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         : orchestratorVoiceState === "processing"
           ? "Waiting for the voice response"
           : "Start listening");
+  const orchestratorChatBusy = orchestratorChatSubmitting
+    || orchestratorVoiceState === "starting"
+    || orchestratorVoiceState === "listening"
+    || orchestratorVoiceState === "processing";
+  const orchestratorChatCanSend = Boolean(orchestratorChatDraft.trim()) && !orchestratorChatBusy;
 
   return (
     <TodoQueueSurface aria-label="Orchestrator">
@@ -5556,118 +6018,191 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               </TodoQueueComposer>
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
-                {orchestratorVoiceError && (
-                  <OrchestratorHistoryError role="alert">
-                    <OrchestratorHistoryErrorTitle>Voice agent error</OrchestratorHistoryErrorTitle>
-                    <OrchestratorHistoryErrorText>{orchestratorVoiceError}</OrchestratorHistoryErrorText>
-                  </OrchestratorHistoryError>
-                )}
-                {orchestratorVoiceHistoryItems.length > 0 ? (
-                  <OrchestratorHistoryList>
-                    {orchestratorVoiceHistoryItems.map((item) => {
-                      const status = getVoiceHistoryTurnStatus(item);
-                      const pending = status === "Pending" || status === "Thinking";
-                      const llmPending = Boolean(
-                        item.transcriptFinal
-                          && !item.llmFeedback
-                          && !item.llmFinal
-                          && !item.queued
-                          && !item.plan,
-                      );
-                      const llmLabel = item.llmFinal || item.queued || item.plan || item.llmError
-                        ? "LLM response"
-                        : "LLM response pending";
+                <OrchestratorHistoryScroll ref={orchestratorHistoryScrollRef}>
+                  {orchestratorVoiceError && (
+                    <OrchestratorHistoryError role="alert">
+                      <OrchestratorHistoryErrorTitle>Voice agent error</OrchestratorHistoryErrorTitle>
+                      <OrchestratorHistoryErrorText>{orchestratorVoiceError}</OrchestratorHistoryErrorText>
+                    </OrchestratorHistoryError>
+                  )}
+                  {orchestratorVoiceHistoryItems.length > 0 ? (
+                    <OrchestratorHistoryList>
+                      {orchestratorVoiceHistoryItems.map((item) => {
+                        const status = getVoiceHistoryTurnStatus(item);
+                        const pending = status === "Pending" || status === "Thinking";
+                        const llmPending = Boolean(
+                          item.transcriptFinal
+                            && !item.llmFeedback
+                            && !item.llmFinal
+                            && !item.queued
+                            && !item.plan,
+                        );
+                        const userCopyKey = `${item.id}:user`;
+                        const assistantCopyKey = `${item.id}:assistant`;
+                        const userCopied = orchestratorHistoryCopiedKey === userCopyKey;
+                        const assistantCopied = orchestratorHistoryCopiedKey === assistantCopyKey;
+                        const userTime = formatVoiceHistoryMessageTime(item.createdAtMs);
+                        const assistantTime = formatVoiceHistoryMessageTime(item.updatedAtMs);
 
-                      return (
-                        <OrchestratorHistoryTurn data-pending={pending ? "true" : undefined} key={item.id}>
-                          <OrchestratorHistoryTurnHeader>
-                            <OrchestratorHistoryTurnLabel>{getVoiceHistoryTurnLabel(item)}</OrchestratorHistoryTurnLabel>
-                            <OrchestratorHistoryTurnStatus>{status}</OrchestratorHistoryTurnStatus>
-                          </OrchestratorHistoryTurnHeader>
-                          {item.transcript && (
-                            <OrchestratorHistoryTranscript data-pending={pending ? "true" : undefined}>
-                              {item.transcript}
-                            </OrchestratorHistoryTranscript>
-                          )}
-                          {(item.llmFeedback || llmPending) && (
-                            <OrchestratorHistoryLlm>
-                              <OrchestratorHistoryLlmLabel>{llmLabel}</OrchestratorHistoryLlmLabel>
-                              <OrchestratorHistoryLlmText>
-                                {item.llmFeedback || (
-                                  <OrchestratorHistoryPendingLine>
-                                    <OrchestratorHistoryInlineSpinner aria-hidden="true" />
-                                    <span>Waiting for orchestrator response...</span>
-                                  </OrchestratorHistoryPendingLine>
+                        return (
+                          <OrchestratorHistoryTurn data-pending={pending ? "true" : undefined} key={item.id}>
+                            {item.transcript && (
+                              <OrchestratorHistoryUserMessage>
+                                <OrchestratorHistoryTranscript data-pending={pending ? "true" : undefined}>
+                                  {item.transcript}
+                                </OrchestratorHistoryTranscript>
+                                <OrchestratorHistoryMessageActions data-align="right">
+                                  {userTime && (
+                                    <OrchestratorHistoryMessageTime>{userTime}</OrchestratorHistoryMessageTime>
+                                  )}
+                                  <OrchestratorHistoryCopyButton
+                                    aria-label={userCopied ? "Copied" : "Copy message"}
+                                    data-copied={userCopied ? "true" : undefined}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      void handleOrchestratorHistoryCopy(userCopyKey, item.transcript);
+                                    }}
+                                    title={userCopied ? "Copied" : "Copy"}
+                                    type="button"
+                                  >
+                                    {userCopied ? (
+                                      <OrchestratorHistoryCopiedIcon aria-hidden="true" />
+                                    ) : (
+                                      <OrchestratorHistoryCopyIcon aria-hidden="true" />
+                                    )}
+                                  </OrchestratorHistoryCopyButton>
+                                </OrchestratorHistoryMessageActions>
+                              </OrchestratorHistoryUserMessage>
+                            )}
+                            {(item.llmFeedback || llmPending) && (
+                              <OrchestratorHistoryAssistantMessage>
+                                <OrchestratorHistoryLlm>
+                                  <OrchestratorHistoryLlmText>
+                                    {item.llmFeedback || (
+                                      <OrchestratorHistoryPendingLine aria-label="Waiting for orchestrator response" role="status">
+                                        <OrchestratorHistoryInlineSpinner aria-hidden="true" />
+                                      </OrchestratorHistoryPendingLine>
+                                    )}
+                                  </OrchestratorHistoryLlmText>
+                                </OrchestratorHistoryLlm>
+                                {item.llmFeedback && (
+                                  <OrchestratorHistoryMessageActions data-align="left">
+                                    {assistantTime && (
+                                      <OrchestratorHistoryMessageTime>{assistantTime}</OrchestratorHistoryMessageTime>
+                                    )}
+                                    <OrchestratorHistoryCopyButton
+                                      aria-label={assistantCopied ? "Copied" : "Copy response"}
+                                      data-copied={assistantCopied ? "true" : undefined}
+                                      onClick={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        void handleOrchestratorHistoryCopy(assistantCopyKey, item.llmFeedback);
+                                      }}
+                                      title={assistantCopied ? "Copied" : "Copy"}
+                                      type="button"
+                                    >
+                                      {assistantCopied ? (
+                                        <OrchestratorHistoryCopiedIcon aria-hidden="true" />
+                                      ) : (
+                                        <OrchestratorHistoryCopyIcon aria-hidden="true" />
+                                      )}
+                                    </OrchestratorHistoryCopyButton>
+                                  </OrchestratorHistoryMessageActions>
                                 )}
-                              </OrchestratorHistoryLlmText>
-                            </OrchestratorHistoryLlm>
-                          )}
-                          {item.plan && (
-                            <OrchestratorHistoryPlan>
-                              <OrchestratorHistoryPlanHeader>
-                                <OrchestratorHistoryPlanTitle>{item.plan.title}</OrchestratorHistoryPlanTitle>
-                                <OrchestratorHistoryPlanStatus>
-                                  {getVoicePlanStatusLabel(item.plan)}
-                                </OrchestratorHistoryPlanStatus>
-                              </OrchestratorHistoryPlanHeader>
-                              {item.plan.steps.length > 0 && (
-                                <OrchestratorHistoryPlanSteps>
-                                  {item.plan.steps.map((step) => {
-                                    const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
-                                    const activeStage = isActiveStep ? item.plan.currentStage : "";
-                                    const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
-                                      const normalizedStageStatus = String(stageStatus || "").trim().toLowerCase();
-                                      if (!tasks.length && !stageStatus) {
-                                        return null;
-                                      }
-                                      if (!tasks.length && (normalizedStageStatus === "draft" || normalizedStageStatus === "planned")) {
-                                        return null;
-                                      }
-                                      const isActiveStage = isActiveStep && activeStage === stageName;
-                                      return (
-                                        <OrchestratorHistoryPlanStage key={stageName}>
-                                          <OrchestratorHistoryPlanStageHeader data-active={isActiveStage ? "true" : undefined}>
-                                            <span>{getVoicePlanStageLabel(stageLabel, policy, doneWhen)}</span>
-                                            <span>{stageStatus || "waiting"}</span>
-                                          </OrchestratorHistoryPlanStageHeader>
-                                          {tasks.length > 0 && (
-                                            <OrchestratorHistoryPlanTaskList>
-                                              {tasks.map((task) => (
-                                                <OrchestratorHistoryPlanTask key={task.id || `${stageName}-${task.ordinal}`}>
-                                                  <span>{getVoicePlanTaskStatusLabel(task)}</span>
-                                                  <div title={task.text}>{task.title || task.text}</div>
-                                                </OrchestratorHistoryPlanTask>
-                                              ))}
-                                            </OrchestratorHistoryPlanTaskList>
-                                          )}
-                                        </OrchestratorHistoryPlanStage>
-                                      );
-                                    };
+                              </OrchestratorHistoryAssistantMessage>
+                            )}
+                            {item.plan && (
+                              <OrchestratorHistoryPlan>
+                                <OrchestratorHistoryPlanHeader>
+                                  <OrchestratorHistoryPlanTitle>{item.plan.title}</OrchestratorHistoryPlanTitle>
+                                  <OrchestratorHistoryPlanStatus>
+                                    {getVoicePlanStatusLabel(item.plan)}
+                                  </OrchestratorHistoryPlanStatus>
+                                </OrchestratorHistoryPlanHeader>
+                                {item.plan.steps.length > 0 && (
+                                  <OrchestratorHistoryPlanSteps>
+                                    {item.plan.steps.map((step) => {
+                                      const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
+                                      const activeStage = isActiveStep ? item.plan.currentStage : "";
+                                      const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
+                                        const normalizedStageStatus = String(stageStatus || "").trim().toLowerCase();
+                                        if (!tasks.length && !stageStatus) {
+                                          return null;
+                                        }
+                                        if (!tasks.length && (normalizedStageStatus === "draft" || normalizedStageStatus === "planned")) {
+                                          return null;
+                                        }
+                                        const isActiveStage = isActiveStep && activeStage === stageName;
+                                        return (
+                                          <OrchestratorHistoryPlanStage key={stageName}>
+                                            <OrchestratorHistoryPlanStageHeader data-active={isActiveStage ? "true" : undefined}>
+                                              <span>{getVoicePlanStageLabel(stageLabel, policy, doneWhen)}</span>
+                                              <span>{stageStatus || "waiting"}</span>
+                                            </OrchestratorHistoryPlanStageHeader>
+                                            {tasks.length > 0 && (
+                                              <OrchestratorHistoryPlanTaskList>
+                                                {tasks.map((task) => (
+                                                  <OrchestratorHistoryPlanTask key={task.id || `${stageName}-${task.ordinal}`}>
+                                                    <span>{getVoicePlanTaskStatusLabel(task)}</span>
+                                                    <div title={task.text}>{task.title || task.text}</div>
+                                                  </OrchestratorHistoryPlanTask>
+                                                ))}
+                                              </OrchestratorHistoryPlanTaskList>
+                                            )}
+                                          </OrchestratorHistoryPlanStage>
+                                        );
+                                      };
 
-                                    return (
-                                      <OrchestratorHistoryPlanStep
-                                        data-active={isActiveStep ? "true" : undefined}
-                                        key={step.ordinal}
-                                      >
-                                        <OrchestratorHistoryPlanStepTitle>
-                                          {step.ordinal + 1}. {step.title}
-                                        </OrchestratorHistoryPlanStepTitle>
-                                        {renderStage("execution", "Execution", step.executionStatus, step.executionTasks, step.executionPolicy, step.executionDoneWhen)}
-                                        {renderStage("revision", "Revision", step.revisionStatus, step.revisionTasks, step.revisionPolicy, step.revisionDoneWhen)}
-                                      </OrchestratorHistoryPlanStep>
-                                    );
-                                  })}
-                                </OrchestratorHistoryPlanSteps>
-                              )}
-                            </OrchestratorHistoryPlan>
-                          )}
-                        </OrchestratorHistoryTurn>
-                      );
-                    })}
-                  </OrchestratorHistoryList>
-                ) : (
-                  <OrchestratorHistoryEmpty>Voice history</OrchestratorHistoryEmpty>
-                )}
+                                      return (
+                                        <OrchestratorHistoryPlanStep
+                                          data-active={isActiveStep ? "true" : undefined}
+                                          key={step.ordinal}
+                                        >
+                                          <OrchestratorHistoryPlanStepTitle>
+                                            {step.ordinal + 1}. {step.title}
+                                          </OrchestratorHistoryPlanStepTitle>
+                                          {renderStage("execution", "Execution", step.executionStatus, step.executionTasks, step.executionPolicy, step.executionDoneWhen)}
+                                          {renderStage("revision", "Revision", step.revisionStatus, step.revisionTasks, step.revisionPolicy, step.revisionDoneWhen)}
+                                        </OrchestratorHistoryPlanStep>
+                                      );
+                                    })}
+                                  </OrchestratorHistoryPlanSteps>
+                                )}
+                              </OrchestratorHistoryPlan>
+                            )}
+                          </OrchestratorHistoryTurn>
+                        );
+                      })}
+                    </OrchestratorHistoryList>
+                  ) : (
+                    <OrchestratorHistoryEmpty>Voice history</OrchestratorHistoryEmpty>
+                  )}
+                </OrchestratorHistoryScroll>
+                <OrchestratorHistoryComposer onSubmit={handleOrchestratorChatSubmit}>
+                  <OrchestratorHistoryInputFrame>
+                    <OrchestratorHistoryInput
+                      aria-label="Message orchestrator"
+                      disabled={orchestratorChatBusy}
+                      maxLength={12000}
+                      onChange={(event) => setOrchestratorChatDraft(event.target.value)}
+                      onKeyDown={handleOrchestratorChatKeyDown}
+                      placeholder="Message orchestrator"
+                      rows={1}
+                      spellCheck="true"
+                      value={orchestratorChatDraft}
+                    />
+                    <OrchestratorHistorySendButton
+                      aria-label="Send message"
+                      data-animated={orchestratorChatSubmitting ? "true" : undefined}
+                      data-ready={orchestratorChatCanSend ? "true" : undefined}
+                      disabled={!orchestratorChatCanSend}
+                      type="submit"
+                    >
+                      <OrchestratorHistorySendIcon aria-hidden="true" />
+                    </OrchestratorHistorySendButton>
+                  </OrchestratorHistoryInputFrame>
+                </OrchestratorHistoryComposer>
               </OrchestratorHistoryView>
             )}
           </OrchestratorContent>
@@ -7121,6 +7656,28 @@ function TerminalView({
         });
         return;
       }
+      const currentSnapshot = voicePlanSnapshotsRef.current.get(planTask.runId) || null;
+      const snapshotTask = getVoicePlanSnapshotTask(currentSnapshot, planTask);
+      const snapshotTaskStatus = normalizeVoicePlanStatus(snapshotTask?.status);
+      const lifecycleStatus = normalizeVoicePlanStatus(detail.status || detail.taskStatus || detail.task_status);
+      if (
+        eventType === "provider-turn-completed"
+        && (
+          VOICE_PLAN_PARKED_STATUSES.has(snapshotTaskStatus)
+          || VOICE_PLAN_PARKED_STATUSES.has(lifecycleStatus)
+        )
+      ) {
+        logTerminalStatus("frontend.voice_plan.lifecycle_event_ignored", {
+          eventType,
+          lifecycleStatus,
+          planTask,
+          promptEventId,
+          reason: "parked_task_completion_is_not_final",
+          snapshotStatus: snapshotTaskStatus,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
       logTerminalStatus("frontend.voice_plan.lifecycle_event_recording_status", {
         eventType,
         planTask,
@@ -8426,7 +8983,7 @@ function TerminalView({
   const executeVoiceAgentOpenCodingAgentsToolCall = useCallback(async (toolCall) => {
     const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
     const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
-    const agentType = normalizeVoiceAgentManagementAgent(args.agent_type || args.agentType || args.provider);
+    const agentType = normalizeVoiceAgentManagementAgent(args.agent_type);
     const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
 
     try {
@@ -8544,26 +9101,6 @@ function TerminalView({
       });
       return null;
     }
-    if (isUnsafeVoicePlanQueueItem(item)) {
-      const planTask = getTodoQueueItemPlanTask(item);
-      const message = "Voice plan produced placeholder task text, so it was not queued.";
-      setTodoDropError(message);
-      if (planTask) {
-        void recordVoicePlanTaskStatus(planTask, "failed", {
-          clientTodoId: item.id || "",
-          error: message,
-        });
-      }
-      logBigViewSyncDiagnosticEvent("tui.voice_plan.placeholder_blocked", {
-        callId: String(toolCall?.call_id || toolCall?.callId || "").trim(),
-        item: getTodoQueueItemLogSummary([item])[0] || null,
-        message,
-        surface: "tui_todo_queue",
-        workspaceId: terminalWorkspace?.id || "",
-      });
-      return null;
-    }
-
     const planTask = getTodoQueueItemPlanTask(item);
     if (planTask) {
       logTerminalStatus("frontend.voice_plan.tool_call_release", {
@@ -8796,31 +9333,6 @@ function TerminalView({
         pendingCount: Object.keys(todoQueuePendingItemsRef.current || {}).length,
         queueItemCount: todoQueueItems.length,
         reason: isAppClosing ? "app_shutdown_in_progress" : "workspace_deactivation_in_progress",
-        workspaceId: terminalWorkspace?.id || "",
-      });
-      return;
-    }
-    if (isUnsafeVoicePlanQueueItem(queuedItem)) {
-      const planTask = getTodoQueueItemPlanTask(queuedItem);
-      const message = "Voice plan produced placeholder task text, so it was blocked before dispatch.";
-      clearTodoQueueItemPending(queuedItem.id, "error", {
-        message,
-        source: getTodoQueueItemAutoQueueSource(queuedItem),
-      });
-      updateTodoQueueItems((currentItems) => (
-        currentItems.filter((item) => item.id !== queuedItem.id)
-      ));
-      setTodoDropError(message);
-      if (planTask) {
-        void recordVoicePlanTaskStatus(planTask, "failed", {
-          clientTodoId: queuedItem.id || "",
-          error: message,
-        });
-      }
-      logBigViewSyncDiagnosticEvent("tui.voice_plan.placeholder_dispatch_blocked", {
-        item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
-        message,
-        surface: "tui_todo_queue",
         workspaceId: terminalWorkspace?.id || "",
       });
       return;

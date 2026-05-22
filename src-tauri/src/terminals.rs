@@ -3742,17 +3742,6 @@ fn terminal_parking_snapshot_from_kernel(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let terminal = terminal_task_status_is_terminal(&task_status);
-    let active_lease_count = kernel
-        .query_json(
-            "SELECT COUNT(1) AS active_lease_count
-             FROM leases
-             WHERE task_id=?1 AND status='active'",
-            &[&task_id],
-        )?
-        .first()
-        .and_then(|row| row["active_lease_count"].as_i64())
-        .unwrap_or(0);
-
     let blocking_dependencies = kernel.query_json(
         "SELECT d.task_id,
                 d.depends_on_task_id,
@@ -3845,7 +3834,6 @@ fn terminal_parking_snapshot_from_kernel(
     let ready = !terminal
         && blocking_dependencies.is_empty()
         && !parked_resource_intents.is_empty()
-        && active_lease_count == 0
         && matches!(task_status.as_str(), "ready" | "claimed")
         && session_status == "active";
 
@@ -4171,6 +4159,8 @@ pub(crate) fn observe_terminal_coordination_event(
             | "mcp_agent_tool_called"
             | "task_parked_for_resource_queue"
             | "active_file_lease_queue_waiter_released"
+            | "task_resume_ready"
+            | "task_unblocked"
             | "patch_submitted"
             | "task_noop_submitted"
             | "task_cancelled"
@@ -4218,6 +4208,8 @@ pub(crate) fn observe_workspace_notification_coordination_event(
             | "db_change_rejected"
             | "task_parked_for_resource_queue"
             | "active_file_lease_queue_waiter_released"
+            | "task_resume_ready"
+            | "task_unblocked"
             | "patch_submitted"
             | "task_noop_submitted"
             | "task_cancelled"
@@ -4251,7 +4243,9 @@ pub(crate) fn observe_workspace_notification_coordination_event(
             "approval.resolved"
         }
         "task_parked_for_resource_queue" => "task.parked",
-        "active_file_lease_queue_waiter_released" => "task.resume_ready",
+        "active_file_lease_queue_waiter_released" | "task_resume_ready" | "task_unblocked" => {
+            "task.resume_ready"
+        }
         "patch_submitted" => "task.patch_submitted",
         "task_noop_submitted" => "task.skipped",
         "merge_succeeded" => "task.completed",
@@ -4335,7 +4329,7 @@ async fn terminal_handle_coordination_event(
             )
             .await;
         }
-        "active_file_lease_queue_waiter_released" => {
+        "active_file_lease_queue_waiter_released" | "task_resume_ready" | "task_unblocked" => {
             terminal_handle_resume_ready_event(
                 app,
                 cloud_mcp_state,
@@ -4772,6 +4766,7 @@ async fn terminal_register_parked_prompt_from_snapshot(
             }
             if ready {
                 prompt_to_resume = Some(existing.clone());
+                prompt_to_mark = Some(existing.clone());
             }
         } else {
             let parked = TerminalParkedPrompt {
@@ -5086,7 +5081,7 @@ async fn terminal_resume_parked_prompt_once(
         &app,
         &cloud_mcp_state,
         &parked,
-        "running",
+        "dispatched",
         "Dependency completed; the parked task is resuming in the terminal.",
     )
     .await;
@@ -5908,6 +5903,92 @@ async fn terminal_write(
         thread_id,
     )
     .await
+}
+
+#[tauri::command]
+async fn terminal_provider_turn_completed(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        return Ok(json!({
+            "ok": true,
+            "status": "skipped",
+            "reason": "stale_or_missing_terminal",
+        }));
+    };
+    let Some(coordination) = instance.coordination.clone() else {
+        return Ok(json!({
+            "ok": true,
+            "status": "skipped",
+            "reason": "terminal_has_no_coordination_session",
+        }));
+    };
+    let kernel = crate::coordination::CoordinationKernel::open(
+        &coordination.repo_path,
+        Some(PathBuf::from(&coordination.db_path)),
+    )?;
+    let active_task_id = {
+        let active_task = instance.active_task.lock().await;
+        active_task.as_ref().map(|task| task.task_id.clone())
+    };
+    let session_task_id = kernel
+        .query_json(
+            "SELECT task_id
+             FROM agent_sessions
+             WHERE id=?1
+             LIMIT 1",
+            &[&coordination.session_id],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row["task_id"].as_str().map(str::to_string));
+    let latest_session_task_id = kernel
+        .query_json(
+            "SELECT id
+             FROM tasks
+             WHERE claimed_session_id=?1
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1",
+            &[&coordination.session_id],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row["id"].as_str().map(str::to_string));
+    let Some(task_id) = active_task_id
+        .or(session_task_id)
+        .or(latest_session_task_id)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(json!({
+            "ok": true,
+            "status": "skipped",
+            "reason": "terminal_has_no_known_coordination_task",
+        }));
+    };
+
+    let result = kernel.reconcile_provider_turn_completed(
+        &task_id,
+        Some(&coordination.session_id),
+        reason.as_deref(),
+    )?;
+    log_terminal_diagnostic_event(
+        &app,
+        "backend.provider_turn_completed.reconciled",
+        json!({
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "session_id": coordination.session_id,
+            "task_id": task_id,
+            "result": result.clone(),
+        }),
+    );
+    Ok(result)
 }
 
 #[tauri::command]

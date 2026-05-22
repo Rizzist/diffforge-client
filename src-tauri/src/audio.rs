@@ -3198,12 +3198,46 @@ fn clean_cloud_voice_agent_text(value: Option<String>, max_chars: usize) -> Stri
         .collect()
 }
 
+fn clean_cloud_voice_agent_message_text(value: String, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
+        .take(max_chars)
+        .collect()
+}
+
 fn cloud_voice_agent_header(value: &str, label: &str) -> Result<HeaderValue, String> {
     HeaderValue::from_str(value).map_err(|error| format!("Invalid {label} header: {error}"))
 }
 
 fn emit_cloud_voice_agent_event(app: &AppHandle, payload: Value) {
     let _ = app.emit(CLOUD_VOICE_AGENT_EVENT, payload);
+}
+
+fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
+    json!({
+        "mode": "respond_or_create_plan",
+        "disable_search": true,
+        "disabled_tools": [
+            "search",
+            "web_search",
+            "web_search_preview",
+            "browser_search",
+            "file_search"
+        ],
+        "allowed_tools": ["create_plan", "open_coding_agents"],
+        "tool_choice": "auto",
+        "response_contract": {
+            "immediate_feedback_required": true,
+            "main_response_required": true,
+            "main_response_may_call_tool": true,
+            "regular_response_kind": "voice_agent_llm_feedback",
+            "plan_tool_name": "create_plan",
+            "agent_open_tool_name": "open_coding_agents",
+            "plan_snapshot_kind": "voice_agent_plan_snapshot"
+        }
+    })
 }
 
 fn voice_history_safe_workspace_id(value: &str) -> String {
@@ -3836,6 +3870,194 @@ async fn run_cloud_voice_agent_stream(
     }
 }
 
+async fn run_cloud_voice_agent_text_message(
+    app: AppHandle,
+    ws_url: String,
+    text_request: Value,
+    workspace_id: String,
+    repo_id: String,
+    ready_tx: oneshot::Sender<Result<(), String>>,
+) {
+    let mut request = match ws_url.into_client_request() {
+        Ok(request) => request,
+        Err(error) => {
+            let message = format!("Unable to prepare cloud voice agent chat: {error}");
+            let _ = ready_tx.send(Err(message));
+            return;
+        }
+    };
+    request.headers_mut().insert(
+        "x-diffforge-client-id",
+        HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    request.headers_mut().insert(
+        "x-diffforge-actor",
+        HeaderValue::from_static("orchestrator-voice"),
+    );
+    if !workspace_id.is_empty() {
+        match cloud_voice_agent_header(&workspace_id, "workspace id") {
+            Ok(header) => {
+                request
+                    .headers_mut()
+                    .insert("x-diffforge-workspace-id", header);
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        }
+    }
+    if !repo_id.is_empty() {
+        match cloud_voice_agent_header(&repo_id, "repo id") {
+            Ok(header) => {
+                request.headers_mut().insert("x-diffforge-repo-id", header);
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        }
+    }
+    if let Some(token) = cloud_mcp_dev_auth_token() {
+        match HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(header) => {
+                request.headers_mut().insert("authorization", header);
+            }
+            Err(error) => {
+                let message = format!("Invalid Cloud MCP dev token header: {error}");
+                let _ = ready_tx.send(Err(message));
+                return;
+            }
+        }
+    }
+
+    let (ws_stream, _) = match connect_async(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let message = format!("Unable to open cloud voice agent chat WebSocket: {error}");
+            let _ = ready_tx.send(Err(message));
+            return;
+        }
+    };
+    let (mut write, mut read) = ws_stream.split();
+    if let Err(error) = write
+        .send(Message::Text(text_request.to_string().into()))
+        .await
+    {
+        let message = format!("Unable to send cloud voice agent chat message: {error}");
+        let _ = ready_tx.send(Err(message));
+        return;
+    }
+    let _ = ready_tx.send(Ok(()));
+
+    log_audio_diagnostic_event(
+        "audio.cloud_voice.text_message.sent",
+        json!({
+            "repo_id": repo_id,
+            "workspace_id": workspace_id,
+        }),
+    );
+
+    let mut stream_error: Option<String> = None;
+    let mut result_received = false;
+    let mut tts_suppression_until: Option<Instant> = None;
+    let result_deadline = sleep(Duration::from_secs(CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS));
+    tokio::pin!(result_deadline);
+
+    loop {
+        tokio::select! {
+            maybe_message = read.next() => {
+                match maybe_message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
+                            let request_complete =
+                                cloud_voice_agent_event_completes_request(&payload);
+                            update_cloud_voice_agent_tts_suppression(
+                                &payload,
+                                &mut tts_suppression_until,
+                            );
+                            emit_cloud_voice_agent_event(&app, payload);
+                            if request_complete {
+                                result_received = true;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                            if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                                let request_complete =
+                                    cloud_voice_agent_event_completes_request(&payload);
+                                update_cloud_voice_agent_tts_suppression(
+                                    &payload,
+                                    &mut tts_suppression_until,
+                                );
+                                emit_cloud_voice_agent_event(&app, payload);
+                                if request_complete {
+                                    result_received = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Err(error) = write.send(Message::Pong(payload)).await {
+                            stream_error =
+                                Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        stream_error = Some(
+                            "Cloud voice agent chat connection closed before final response, plan, or error."
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        stream_error = Some(format!(
+                            "Cloud voice agent chat failed: {}",
+                            error
+                        ));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut result_deadline => {
+                stream_error = Some(format!(
+                    "Cloud voice agent chat did not return a final response, plan, or error within {CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS} seconds."
+                ));
+                break;
+            }
+        }
+    }
+
+    if result_received {
+        let stop_message = json!({
+            "kind": "stop",
+            "contract": "diffforge.voice_agent.v1",
+        });
+        let _ = write
+            .send(Message::Text(stop_message.to_string().into()))
+            .await;
+    }
+
+    if let Some(error) = stream_error {
+        emit_cloud_voice_agent_event(
+            &app,
+            json!({
+                "kind": "voice_agent_error",
+                "contract": "diffforge.voice_agent.v1",
+                "error": {
+                    "code": "desktop_cloud_voice_chat_failed",
+                    "message": error,
+                },
+            }),
+        );
+    }
+}
+
 #[tauri::command]
 async fn start_cloud_voice_agent_stream(
     app: AppHandle,
@@ -3974,6 +4196,80 @@ async fn start_cloud_voice_agent_stream(
         sample_rate: status.sample_rate,
         workspace_id,
     })
+}
+
+#[tauri::command]
+async fn send_cloud_voice_agent_text_message(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    request: CloudVoiceAgentTextMessageRequest,
+) -> Result<(), String> {
+    log_audio_diagnostic_event("audio.cloud_voice.text_message.command", json!({}));
+    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+    if audio_state.cloud_voice_agent_stream.lock().await.is_some() {
+        return Err("Cloud voice agent stream is already active.".to_string());
+    }
+    if audio_state.deepgram_stream.lock().await.is_some() {
+        return Err("Deepgram realtime transcription is already active.".to_string());
+    }
+
+    let CloudVoiceAgentTextMessageRequest {
+        text,
+        turn_index,
+        repo_id,
+        agent_statuses,
+        workspace_id,
+        workspace_name,
+        workspace_root,
+    } = request;
+    let text = clean_cloud_voice_agent_message_text(text, 12_000);
+    if text.is_empty() {
+        return Err("Message is empty.".to_string());
+    }
+    let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
+    let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
+    let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
+    let resolved_workspace_root = if workspace_root.is_empty() {
+        resolve_workspace_root_directory(None)?
+    } else {
+        resolve_workspace_root_directory(Some(&workspace_root))?
+    };
+    let workspace_root = workspace_path_display(&resolved_workspace_root);
+    let repo_id = clean_cloud_voice_agent_text(repo_id, 160);
+    let repo_id = if !repo_id.is_empty() {
+        repo_id
+    } else {
+        cloud_mcp_repo_id_for_root(&resolved_workspace_root)
+    };
+    let agent_statuses = agent_statuses.unwrap_or_else(|| json!([]));
+    let text_request = json!({
+        "kind": "text_message",
+        "contract": "diffforge.voice_agent.v1",
+        "text": text,
+        "turn_index": turn_index.unwrap_or(0),
+        "workspace_id": workspace_id.clone(),
+        "workspace_name": workspace_name,
+        "workspace_root": workspace_root,
+        "repo_id": repo_id.clone(),
+        "agent_statuses": agent_statuses,
+        "llm_orchestrator_policy": cloud_voice_agent_llm_orchestrator_policy(),
+    });
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tauri::async_runtime::spawn(run_cloud_voice_agent_text_message(
+        app,
+        cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
+        text_request,
+        workspace_id,
+        repo_id,
+        ready_tx,
+    ));
+
+    match timeout(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS), ready_rx).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_closed)) => Err("Cloud voice agent chat closed before it was ready.".to_string()),
+        Err(_elapsed) => Err("Cloud voice agent chat timed out while connecting.".to_string()),
+    }
 }
 
 #[tauri::command]

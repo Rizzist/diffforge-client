@@ -1858,22 +1858,8 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
 }
 
 function normalizeManagedAgentProviderId(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s.-]+/g, "_");
-
-  if (["codex", "openai", "openai_codex"].includes(normalized)) {
-    return "codex";
-  }
-  if (["claude", "claude_code", "anthropic"].includes(normalized)) {
-    return "claude";
-  }
-  if (["opencode", "open_code", "opencode_ai"].includes(normalized)) {
-    return "opencode";
-  }
-
-  return "";
+  const providerId = String(value || "").trim();
+  return ["codex", "claude", "opencode"].includes(providerId) ? providerId : "";
 }
 
 function getManagedAgentLabel(agentId) {
@@ -8238,6 +8224,31 @@ export default function App() {
           pendingPromptId: lifecycleEvent.pendingPromptId || lifecyclePromptEventId,
         };
       }
+    }
+    if (lifecycleEvent.type === "provider-turn-completed" && lifecycleEvent.paneId) {
+      invoke("terminal_provider_turn_completed", {
+        paneId: lifecycleEvent.paneId,
+        instanceId: Number.isFinite(Number(lifecycleEvent.instanceId))
+          ? Number(lifecycleEvent.instanceId)
+          : null,
+        reason: lifecycleEvent.source || lifecycleEvent.completionSource || "provider-turn-completed",
+      }).then((result) => {
+        logTerminalStatus("frontend.provider_turn_completed.reconcile_result", {
+          paneId: lifecycleEvent.paneId || "",
+          promptEventId: lifecyclePromptEventId,
+          result,
+          threadId: lifecycleThreadId,
+          workspaceId: lifecycleWorkspaceId,
+        });
+      }).catch((error) => {
+        logTerminalStatus("frontend.provider_turn_completed.reconcile_error", {
+          message: error?.message || String(error || ""),
+          paneId: lifecycleEvent.paneId || "",
+          promptEventId: lifecyclePromptEventId,
+          threadId: lifecycleThreadId,
+          workspaceId: lifecycleWorkspaceId,
+        });
+      });
     }
     if (
       lifecyclePromptEventId.startsWith("voice-plan-")

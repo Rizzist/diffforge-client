@@ -2116,6 +2116,115 @@ impl CoordinationKernel {
         Ok(())
     }
 
+    pub fn reconcile_provider_turn_completed(
+        &self,
+        task_id: &str,
+        session_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<Value, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("Provider turn completion requires a task id.".to_string());
+        }
+        let task = self.query_one(
+            "SELECT id, status, claimed_session_id, context_run_id FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| task["claimed_session_id"].as_str());
+        let session = session_id
+            .and_then(|value| {
+                self.query_json(
+                    "SELECT id, agent_id, agent_slot_id FROM agent_sessions WHERE id=?1 LIMIT 1",
+                    &[&value],
+                )
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+            })
+            .unwrap_or_else(|| json!({}));
+        let actor_id = session["agent_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(REPO_ID);
+        self.emit_event(
+            "provider_turn_completed",
+            "terminal",
+            actor_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: session["agent_id"].as_str().map(str::to_string),
+                agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                session_id: session_id.map(str::to_string),
+                context_run_id: task["context_run_id"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "reason": reason.unwrap_or("provider_turn_completed"),
+                "task_status": task["status"].clone(),
+                "resume_policy": "provider_turn_completion_reconciles_resource_queue",
+            }),
+        )?;
+
+        self.refresh_dependent_tasks(task_id)?;
+
+        let candidates = self.query_json(
+            "SELECT DISTINCT s.id AS session_id, s.task_id
+             FROM agent_sessions s
+             JOIN task_resource_intents i ON i.task_id=s.task_id
+             JOIN tasks t ON t.id=s.task_id
+             WHERE s.status='active'
+               AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
+               AND t.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
+             ORDER BY s.updated_at DESC, i.updated_at ASC",
+            &[],
+        )?;
+        let mut resume_checks = Vec::new();
+        for candidate in candidates {
+            let Some(candidate_task_id) = candidate["task_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(candidate_session_id) = candidate["session_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let resume_state = match self.task_resume_state(candidate_task_id, candidate_session_id)
+            {
+                Ok(state) => state,
+                Err(error) => api_error(
+                    "task_resume_state_failed",
+                    "Unable to inspect a parked task after provider turn completion.",
+                    json!({
+                        "task_id": candidate_task_id,
+                        "session_id": candidate_session_id,
+                        "error": error,
+                    }),
+                ),
+            };
+            resume_checks.push(json!({
+                "task_id": candidate_task_id,
+                "session_id": candidate_session_id,
+                "resume_state": resume_state,
+            }));
+        }
+
+        Ok(api_ok(json!({
+            "task_id": task_id,
+            "session_id": session_id,
+            "resume_checks": resume_checks,
+            "resume_policy": "provider_turn_completion_reconciles_resource_queue",
+        })))
+    }
+
     pub fn task_resume_state(&self, task_id: &str, session_id: &str) -> Result<Value, String> {
         let _ = self.refresh_task_dependency_blocked_status(task_id, "kernel", REPO_ID);
         let task = self.query_one(
@@ -2206,7 +2315,6 @@ impl CoordinationKernel {
         let ready = blockers.is_empty()
             && predicate_blockers.is_empty()
             && !has_cycle_prevented_slices
-            && active_lease_count == 0
             && matches!(status, "ready" | "claimed")
             && session["status"].as_str() == Some("active");
         let refreshes = if ready {

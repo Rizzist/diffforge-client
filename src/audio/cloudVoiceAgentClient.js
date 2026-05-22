@@ -15,6 +15,10 @@ export function finishCloudVoiceAgentInput() {
   return invoke("finish_cloud_voice_agent_input");
 }
 
+export function sendCloudVoiceAgentTextMessage(request = {}) {
+  return invoke("send_cloud_voice_agent_text_message", { request });
+}
+
 export function subscribeCloudVoiceAgentEvents(handler) {
   return listen(CLOUD_VOICE_AGENT_EVENT, (event) => {
     handler(event.payload || {});

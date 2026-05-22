@@ -2675,7 +2675,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
     match status {
         "starting" => "starting",
-        "active" | "busy" | "running" | "resume_requested" => "active",
+        "active" | "busy" | "running" | "dispatched" | "resume_requested" => "active",
         "merged" | "completed" => "done",
         "blocked" => "blocked",
         "parked" => "parked",
@@ -2750,6 +2750,7 @@ fn cloud_mcp_voice_plan_status_for_terminal_lifecycle(status: &str) -> Option<&'
         "resume_ready" | "ready_to_resume" => Some("resume_ready"),
         "resume_requested" | "resuming" => Some("resume_requested"),
         "active" | "busy" | "running" | "starting" => Some("running"),
+        "dispatched" | "redispatched" => Some("dispatched"),
         "cancelled" | "canceled" | "interrupted" => Some("cancelled"),
         _ => None,
     }
@@ -2898,7 +2899,14 @@ async fn cloud_mcp_record_voice_plan_terminal_lifecycle(
 fn cloud_mcp_lifecycle_status_releases_lane(status: &str) -> bool {
     !matches!(
         status,
-        "starting" | "active" | "busy" | "running" | "parked" | "resume_ready" | "resume_requested"
+        "starting"
+            | "active"
+            | "busy"
+            | "running"
+            | "dispatched"
+            | "parked"
+            | "resume_ready"
+            | "resume_requested"
     )
 }
 
