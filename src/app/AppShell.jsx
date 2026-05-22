@@ -590,7 +590,9 @@ function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
       return index > userIndex;
     }
     const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
-    return !submittedAtMs || !messageTimestampMs || messageTimestampMs >= submittedAtMs - 30000;
+    return submittedAtMs
+      ? Boolean(messageTimestampMs && messageTimestampMs >= submittedAtMs - 30000)
+      : true;
   });
   if (hasExplicitCompletion) {
     return true;
@@ -599,13 +601,25 @@ function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
   return false;
 }
 
+function workspaceThreadProjectionHash(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
 function workspaceThreadProjectionIdPart(value, fallback = "event") {
-  const clean = normalizeWorkspaceThreadProjectionText(value)
+  const text = String(value || fallback);
+  const clean = normalizeWorkspaceThreadProjectionText(text)
     .toLowerCase()
     .replace(/[^a-z0-9_.:-]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 96);
-  return clean || fallback;
+    .slice(0, 72);
+  return `${clean || fallback}-${workspaceThreadProjectionHash(text)}`;
 }
 
 function getLatestWorkspaceThreadUserMessage(thread) {
@@ -2306,15 +2320,36 @@ function persistWorkspaceSettings(settings) {
   }
 }
 
+function normalizeEnabledWorkspaceIds(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const ids = [];
+
+  value.forEach((workspaceId) => {
+    const id = String(workspaceId || "").trim();
+    if (!id || seen.has(id)) {
+      return;
+    }
+    seen.add(id);
+    ids.push(id);
+  });
+
+  return ids;
+}
+
 function normalizeWorkspaceLifecycleSettings(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { defaultWorkspaceId: "" };
+    return { defaultWorkspaceId: "", enabledWorkspaceIds: [] };
   }
 
   return {
     defaultWorkspaceId: typeof value.defaultWorkspaceId === "string"
       ? value.defaultWorkspaceId.trim()
       : "",
+    enabledWorkspaceIds: normalizeEnabledWorkspaceIds(value.enabledWorkspaceIds),
   };
 }
 
@@ -2324,7 +2359,7 @@ function readWorkspaceLifecycleSettings() {
       JSON.parse(window.localStorage.getItem(WORKSPACE_LIFECYCLE_STORAGE_KEY) || "{}"),
     );
   } catch {
-    return { defaultWorkspaceId: "" };
+    return { defaultWorkspaceId: "", enabledWorkspaceIds: [] };
   }
 }
 
@@ -3699,8 +3734,16 @@ export default function App() {
   const setDefaultWorkspace = useCallback((workspaceId, source = "settings") => {
     const nextDefaultWorkspace = workspaceId ? findWorkspaceById(workspaces, workspaceId) : null;
     const nextDefaultWorkspaceId = nextDefaultWorkspace?.id || "";
+    const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    );
 
-    updateWorkspaceLifecycleSettings({ defaultWorkspaceId: nextDefaultWorkspaceId });
+    updateWorkspaceLifecycleSettings({
+      defaultWorkspaceId: nextDefaultWorkspaceId,
+      enabledWorkspaceIds: nextDefaultWorkspaceId && !enabledWorkspaceIds.includes(nextDefaultWorkspaceId)
+        ? [...enabledWorkspaceIds, nextDefaultWorkspaceId]
+        : enabledWorkspaceIds,
+    });
   }, [updateWorkspaceLifecycleSettings, workspaces]);
 
   const updateAppTheme = useCallback((theme) => {
@@ -3730,13 +3773,17 @@ export default function App() {
     }
 
     const previousActivatedWorkspaceId = activatedWorkspaceIdRef.current;
+    const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    );
 
     setSelectedWorkspaceId(workspace.id);
     setActivatedWorkspaceId(workspace.id);
-
-    if (previousActivatedWorkspaceId && previousActivatedWorkspaceId !== workspace.id) {
-      clearPreparedWorkspaceTerminals(previousActivatedWorkspaceId);
-    }
+    updateWorkspaceLifecycleSettings({
+      enabledWorkspaceIds: enabledWorkspaceIds.includes(workspace.id)
+        ? enabledWorkspaceIds
+        : [...enabledWorkspaceIds, workspace.id],
+    });
 
     if (previousActivatedWorkspaceId !== workspace.id) {
       workspaceAgentLaunchKeyRef.current = "";
@@ -3744,7 +3791,7 @@ export default function App() {
       setWorkspaceAgentBatchSentKey("");
     }
 
-  }, [activeView, clearPreparedWorkspaceTerminals, visibleView, workspaces]);
+  }, [activeView, updateWorkspaceLifecycleSettings, visibleView, workspaces]);
 
   const activateWorkspaceFromRail = useCallback((workspaceId) => {
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
@@ -3758,7 +3805,7 @@ export default function App() {
   const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
 
-    if (!targetWorkspaceId || activatedWorkspaceIdRef.current !== targetWorkspaceId) {
+    if (!targetWorkspaceId) {
       return;
     }
 
@@ -3768,7 +3815,14 @@ export default function App() {
 
     const runtimeRepoPath = getWorkspaceRootDirectory(workspaceSettingsRef.current, targetWorkspaceId)
       || defaultWorkingDirectory;
-    const expectedTerminalTotal = normalizeCloseCount(workspaceCloseExpectedTotalRef.current);
+    const targetTerminalCount = getWorkspaceTerminalCount(workspaceSettingsRef.current, targetWorkspaceId);
+    const expectedTerminalTotal = normalizeCloseCount(
+      getWorkspaceLogicalTerminalIndexes(
+        workspaceTerminalLogicalIndexesRef.current,
+        targetWorkspaceId,
+        targetTerminalCount,
+      ).length || targetTerminalCount,
+    );
     let unlistenCloseProgress = null;
     let runtimeCleanupCompleted = false;
 
@@ -3835,14 +3889,35 @@ export default function App() {
         }
       }
 
+      const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+      const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+        previousLifecycleSettings.enabledWorkspaceIds,
+      ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
+      updateWorkspaceLifecycleSettings({
+        defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
+          ? ""
+          : previousLifecycleSettings.defaultWorkspaceId,
+        enabledWorkspaceIds: nextEnabledWorkspaceIds,
+      });
+
       if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
-        setActivatedWorkspaceId("");
+        const nextActivatedWorkspace = nextEnabledWorkspaceIds
+          .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
+          .find(Boolean);
+        const nextActivatedWorkspaceId = nextActivatedWorkspace?.id || "";
+        setActivatedWorkspaceId(nextActivatedWorkspaceId);
+      }
+      if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
+        const nextSelectedWorkspace = nextEnabledWorkspaceIds
+          .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
+          .find(Boolean);
+        setSelectedWorkspaceId(nextSelectedWorkspace?.id || "");
       }
 
       workspaceDeactivationInFlightRef.current = "";
       setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
     }
-  }, [clearPreparedWorkspaceTerminals, defaultWorkingDirectory]);
+  }, [clearPreparedWorkspaceTerminals, defaultWorkingDirectory, updateWorkspaceLifecycleSettings]);
 
   const completeAuthStartup = useCallback(() => {
     if (authStartupFinishedRef.current) {
@@ -4534,16 +4609,36 @@ export default function App() {
       }
       const currentSelectedId = selectedWorkspaceIdRef.current;
       const currentActivatedId = activatedWorkspaceIdRef.current;
-      const configuredDefaultWorkspaceId = workspaceLifecycleSettingsRef.current.defaultWorkspaceId;
+      const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+      const configuredDefaultWorkspaceId = currentLifecycleSettings.defaultWorkspaceId;
+      const configuredEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+        currentLifecycleSettings.enabledWorkspaceIds,
+      );
       const defaultWorkspace = findWorkspaceById(nextWorkspaces, configuredDefaultWorkspaceId);
       const nextDefaultWorkspaceId = defaultWorkspace?.id || "";
-      const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId) || defaultWorkspace;
-      const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId) || defaultWorkspace;
+      const existingEnabledWorkspaceIds = configuredEnabledWorkspaceIds.filter((workspaceId) => (
+        Boolean(findWorkspaceById(nextWorkspaces, workspaceId))
+      ));
+      const firstEnabledWorkspace = existingEnabledWorkspaceIds
+        .map((workspaceId) => findWorkspaceById(nextWorkspaces, workspaceId))
+        .find(Boolean);
+      const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId)
+        || defaultWorkspace
+        || firstEnabledWorkspace
+        || null;
+      const nextEnabledWorkspaceIds = nextActivated?.id && !existingEnabledWorkspaceIds.includes(nextActivated.id)
+        ? [...existingEnabledWorkspaceIds, nextActivated.id]
+        : existingEnabledWorkspaceIds;
 
-      if (configuredDefaultWorkspaceId && !nextDefaultWorkspaceId) {
+      if (
+        (configuredDefaultWorkspaceId && !nextDefaultWorkspaceId)
+        || nextEnabledWorkspaceIds.length !== configuredEnabledWorkspaceIds.length
+        || nextEnabledWorkspaceIds.some((workspaceId, index) => workspaceId !== configuredEnabledWorkspaceIds[index])
+      ) {
         const nextLifecycleSettings = normalizeWorkspaceLifecycleSettings({
           ...workspaceLifecycleSettingsRef.current,
-          defaultWorkspaceId: "",
+          defaultWorkspaceId: nextDefaultWorkspaceId,
+          enabledWorkspaceIds: nextEnabledWorkspaceIds,
         });
 
         workspaceLifecycleSettingsRef.current = nextLifecycleSettings;
@@ -4557,15 +4652,13 @@ export default function App() {
 
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId((currentSelectedId) => {
-        const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId) || defaultWorkspace;
+        const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId)
+          || nextActivated
+          || defaultWorkspace;
 
         return nextSelected?.id || "";
       });
-      setActivatedWorkspaceId((currentActivatedId) => {
-        const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId) || defaultWorkspace;
-
-        return nextActivated?.id || "";
-      });
+      setActivatedWorkspaceId(nextActivated?.id || "");
 
       setWorkspaceSyncState("idle");
     } catch (error) {
@@ -5886,6 +5979,10 @@ export default function App() {
     }
 
     if (workspaceCloseInFlightRef.current) {
+      logTerminalStatus("frontend.app_close.requested", {
+        expectedTerminalTotal: normalizeCloseCount(workspaceCloseExpectedTotalRef.current),
+        reason: "app_close_retry",
+      });
       workspaceCloseAllowNativeRef.current = true;
       requestWorkspaceWebClose("app_close_retry");
       runWindowAction(() => closeWorkspaceWindowDirectly(appWindow));
@@ -5895,6 +5992,10 @@ export default function App() {
     workspaceCloseInFlightRef.current = true;
     workspaceCloseAllowNativeRef.current = false;
     const expectedTerminalTotal = normalizeCloseCount(workspaceCloseExpectedTotalRef.current);
+    logTerminalStatus("frontend.app_close.requested", {
+      expectedTerminalTotal,
+      reason: "app_close",
+    });
     const browserClosePromise = requestWorkspaceWebClose("app_close");
     setWorkspaceCloseState({ isActive: true, closed: 0, total: expectedTerminalTotal });
 
@@ -5937,6 +6038,9 @@ export default function App() {
         workspaceCloseAllowNativeRef.current = true;
         await closeWorkspaceWindowAfterTerminalShutdown(appWindow);
       } catch (closeError) {
+        logTerminalStatus("frontend.app_close.error", {
+          message: closeError?.message || String(closeError || ""),
+        });
         workspaceCloseAllowNativeRef.current = false;
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
@@ -6547,6 +6651,113 @@ export default function App() {
     : null;
   const selectedWorkspaceRootDisplay = selectedWorkspaceRootDirectory || defaultWorkingDirectory || "App directory";
   const activatedWorkspaceTerminalWorkingDirectory = activatedWorkspaceRootDirectory || defaultWorkingDirectory;
+  const enabledRuntimeWorkspaceIds = useMemo(() => {
+    const ids = [];
+    const seen = new Set();
+    const addWorkspaceId = (workspaceId) => {
+      const id = String(workspaceId || "").trim();
+      if (!id || seen.has(id) || !findWorkspaceById(workspaces, id)) {
+        return;
+      }
+      seen.add(id);
+      ids.push(id);
+    };
+
+    normalizeEnabledWorkspaceIds(workspaceLifecycleSettings.enabledWorkspaceIds).forEach(addWorkspaceId);
+    addWorkspaceId(activatedWorkspaceId);
+
+    return ids;
+  }, [activatedWorkspaceId, workspaceLifecycleSettings.enabledWorkspaceIds, workspaces]);
+  const enabledWorkspaceRuntimeDescriptors = useMemo(() => {
+    if (shouldShowWorkspaceSetup) {
+      return [];
+    }
+
+    return enabledRuntimeWorkspaceIds
+      .map((workspaceId) => findWorkspaceById(workspaces, workspaceId))
+      .filter(Boolean)
+      .map((runtimeWorkspace) => {
+        const rootDirectory = getWorkspaceRootDirectory(workspaceSettings, runtimeWorkspace.id);
+        const terminalCount = getWorkspaceTerminalCount(workspaceSettings, runtimeWorkspace.id);
+        const terminalRoles = getWorkspaceTerminalRoles(
+          workspaceSettings,
+          runtimeWorkspace.id,
+          terminalCount,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        );
+        const logicalTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
+          workspaceTerminalLogicalIndexes,
+          runtimeWorkspace.id,
+          terminalCount,
+        );
+        const terminalRoleEntries = logicalTerminalIndexes.map((terminalIndex, index) => ({
+          role: normalizeWorkspaceTerminalRole(
+            terminalRoles[index] || terminalRoles[terminalIndex],
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          ),
+          terminalIndex,
+        }));
+        const terminalAgentsByIndex = Object.fromEntries(terminalRoleEntries.map(({ role, terminalIndex }) => (
+          [terminalIndex, getReadyWorkspaceTerminalAgent(agentStatuses, role)]
+        )));
+        const terminalRolesByIndex = Object.fromEntries(terminalRoleEntries.map(({ role, terminalIndex }) => (
+          [terminalIndex, normalizeWorkspaceTerminalRole(
+            role,
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          )]
+        )));
+        const threadsByIndex = getWorkspaceThreadsByTerminalIndex(
+          workspaceThreads,
+          runtimeWorkspace.id,
+          logicalTerminalIndexes,
+        );
+        const agentTerminalEntries = terminalRoleEntries.filter(({ role, terminalIndex }) => (
+          normalizeWorkspaceTerminalRole(
+            role,
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          ) !== WORKSPACE_TERMINAL_ROLE_GENERIC
+          && Boolean(terminalAgentsByIndex[terminalIndex])
+        ));
+
+        return {
+          agentTerminalEntries,
+          displayRows: logicalTerminalIndexes.length
+            ? getWorkspaceDisplayTerminalRows(
+              workspaceTerminalDisplayLayouts,
+              runtimeWorkspace.id,
+              logicalTerminalIndexes,
+            )
+            : [],
+          logicalTerminalCount: logicalTerminalIndexes.length,
+          logicalTerminalIndexes,
+          renderAgent: getReadyWorkspaceTerminalAgent(
+            agentStatuses,
+            terminalRoles[0] || workspaceTerminalFallbackRole,
+          ),
+          terminalAgentsByIndex,
+          terminalRolesByIndex,
+          threadsByIndex,
+          workingDirectory: rootDirectory || defaultWorkingDirectory,
+          workspace: runtimeWorkspace,
+        };
+      });
+  }, [
+    agentStatuses,
+    defaultWorkingDirectory,
+    enabledRuntimeWorkspaceIds,
+    shouldShowWorkspaceSetup,
+    workspaceSettings,
+    workspaceTerminalDisplayLayouts,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalLogicalIndexes,
+    workspaceTerminalRoleOptions,
+    workspaceThreads,
+    workspaces,
+  ]);
   useEffect(() => {
     if (!activatedWorkspace || !activatedWorkspaceTerminalWorkingDirectory) {
       return undefined;
@@ -6679,7 +6890,9 @@ export default function App() {
     workspaces,
   ]);
   const hasSelectedWorkspace = Boolean(selectedWorkspace);
-  const shouldKeepWorkspaceTerminalMounted = Boolean(shouldShowWorkspaceSetup || activatedWorkspace);
+  const shouldKeepWorkspaceTerminalMounted = Boolean(
+    shouldShowWorkspaceSetup || enabledWorkspaceRuntimeDescriptors.length > 0,
+  );
   const shouldRevealWorkspaceTerminal = Boolean(
     shouldKeepWorkspaceTerminalMounted
       && (shouldShowWorkspaceSetup || hasSelectedWorkspace),
@@ -7599,11 +7812,19 @@ export default function App() {
             }
             return;
           }
+          const staleVoicePlanCompletionWithoutPrompt = Boolean(
+            pollUntilTurnComplete
+              && turnCompleteSeen
+              && sessionMatchedByProviderId
+              && voicePlanPromptEventId.startsWith("voice-plan-")
+              && !promptAccepted,
+          );
           const trustedVoicePlanTerminalFinish = Boolean(
             pollUntilTurnComplete
               && turnCompleteSeen
               && sessionMatchedByProviderId
-              && voicePlanPromptEventId.startsWith("voice-plan-"),
+              && voicePlanPromptEventId.startsWith("voice-plan-")
+              && promptAccepted,
           );
           const requiresExactPromptEvidence = (
             pollUntilTurnComplete
@@ -7611,7 +7832,11 @@ export default function App() {
             && !matchedBy.includes("timestamp")
             && !matchedBy.includes("recovery")
           );
-          if (requiresExactPromptEvidence && !promptAccepted && !trustedVoicePlanTerminalFinish) {
+          if (
+            (staleVoicePlanCompletionWithoutPrompt || requiresExactPromptEvidence)
+            && !promptAccepted
+            && !trustedVoicePlanTerminalFinish
+          ) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -7621,13 +7846,30 @@ export default function App() {
               messageCount: messages.length,
               pollUntilTurnComplete,
               promptEventIdPresent: Boolean(promptEventId),
-              reason: "exact_prompt_not_seen_for_session",
+              reason: staleVoicePlanCompletionWithoutPrompt
+                ? "voice_plan_completion_without_prompt_evidence"
+                : "exact_prompt_not_seen_for_session",
               requestKey,
               sessionIdPresent: Boolean(sessionId),
               shouldContinuePolling,
               threadId,
               workspaceId,
             });
+            if (staleVoicePlanCompletionWithoutPrompt) {
+              logTerminalStatus("frontend.voice_plan.stale_completion_ignored", {
+                agentId,
+                elapsedMs,
+                matchedBy,
+                messageCount: messages.length,
+                promptAccepted,
+                promptEventId: voicePlanPromptEventId,
+                reason: "completion_seen_before_submitted_prompt",
+                requestKey,
+                threadId,
+                turnCompleteSeen,
+                workspaceId,
+              });
+            }
             if (shouldContinuePolling) {
               window.setTimeout(() => {
                 requestWorkspaceThreadTranscript({
@@ -7643,33 +7885,6 @@ export default function App() {
               }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
             }
             return;
-          }
-          if (requiresExactPromptEvidence && !promptAccepted && trustedVoicePlanTerminalFinish) {
-            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch_bypassed", {
-              agentId,
-              matchedBy,
-              messageCount: messages.length,
-              pollUntilTurnComplete,
-              promptEventId: voicePlanPromptEventId,
-              reason: "voice_plan_terminal_finish_session_match",
-              requestKey,
-              sessionIdPresent: Boolean(sessionId),
-              threadId,
-              turnCompleteSeen,
-              workspaceId,
-            });
-            logTerminalStatus("frontend.voice_plan.terminal_finish_prompt_mismatch_bypassed", {
-              agentId,
-              matchedBy,
-              promptAccepted,
-              promptEventId: voicePlanPromptEventId,
-              reason: "terminal_finished_for_voice_plan_prompt",
-              requestKey,
-              terminalGroundTruthStatus: "idle_or_done",
-              threadId,
-              turnCompleteSeen,
-              workspaceId,
-            });
           }
           if (promptAccepted && promptEventId) {
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_accepted", {
@@ -7740,6 +7955,7 @@ export default function App() {
               matchedBy: result?.matchedBy || "",
               promptEventId,
               promptEventSubmittedAt: event.promptEventSubmittedAt || submittedAt || expectedMessageCreatedAt,
+              promptAccepted,
               providerSessionId: sessionId,
               requestedProviderSessionId: sessionId || providerSessionId,
               rolloutPath: result?.rolloutPath || "",
@@ -7769,7 +7985,7 @@ export default function App() {
             });
             return nextThreads;
           });
-          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-")) {
+          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-") && promptAccepted) {
             logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
               agentId,
               completionSource: trustedVoicePlanTerminalFinish
@@ -7803,7 +8019,10 @@ export default function App() {
           }
           if (pollUntilTurnComplete) {
             const elapsedMs = Date.now() - pollStartedAt;
-            const shouldContinuePolling = !turnCompleteSeen
+            const shouldContinuePolling = (
+              !turnCompleteSeen
+              || (voicePlanPromptEventId.startsWith("voice-plan-") && !promptAccepted)
+            )
               && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.poll", {
               agentId,
@@ -7821,7 +8040,9 @@ export default function App() {
               promptEventId,
               requestKey,
               shouldContinuePolling,
-              terminalGroundTruthStatus: turnCompleteSeen ? "idle_or_done" : "processing_or_unknown",
+              terminalGroundTruthStatus: turnCompleteSeen && (
+                !voicePlanPromptEventId.startsWith("voice-plan-") || promptAccepted
+              ) ? "idle_or_done" : "processing_or_unknown",
               threadId,
               turnCompleteSeen,
               workspaceId,
@@ -9490,53 +9711,129 @@ export default function App() {
                   data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                 >
                   {shouldKeepWorkspaceTerminalMounted && (
-                    <WorkspaceRuntimeLayer
-                      aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !shouldRevealWorkspaceTerminal}
-                      data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
-                    >
-                      <TerminalView
-                        defaultWorkingDirectory={defaultWorkingDirectory}
-                        terminalWorkspace={activatedWorkspace}
-                        terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
-                        terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
-                        terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
-                        terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
-                        terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
-                        agentStatusError={agentStatusError}
-                        agentStatuses={agentStatuses}
-                        agentStatusState={agentStatusState}
-                        closeWorkspaceTerminal={closeWorkspaceTerminal}
-                        changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
-                        createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
-                        createFirstWorkspace={createFirstWorkspace}
-                        handlePreparedTerminalChange={handlePreparedTerminalChange}
-                        manageWorkspaceAgents={manageWorkspaceAgents}
-                        onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
-                        onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
-                        onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
-                        onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
-                        onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
-                        onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
-                        refreshAgentStatuses={refreshAgentStatuses}
-                        reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
-                        setWorkspaceName={setWorkspaceName}
-                        shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
-                        shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
-                        showSettingsView={showSettingsView}
-                        splitWorkspaceTerminal={splitWorkspaceTerminal}
-                        terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
-                        terminalThreadsByIndex={activatedWorkspaceThreadsByIndex}
-                        viewMotion={viewMotion}
-                        workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
-                        workspaceError={workspaceError}
-                        workspaceName={workspaceName}
-                        workspaceSyncState={workspaceSyncState}
-                        workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
-                        workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
-                        workspaceThreads={workspaceThreads}
-                        workspaces={workspaces}
-                      />
-                    </WorkspaceRuntimeLayer>
+                    shouldShowWorkspaceSetup ? (
+                      <WorkspaceRuntimeLayer
+                        aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !shouldRevealWorkspaceTerminal}
+                        data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
+                      >
+                        <TerminalView
+                          defaultWorkingDirectory={defaultWorkingDirectory}
+                          terminalWorkspace={activatedWorkspace}
+                          terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
+                          terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
+                          terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
+                          terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
+                          terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
+                          agentStatusError={agentStatusError}
+                          agentStatuses={agentStatuses}
+                          agentStatusState={agentStatusState}
+                          closeWorkspaceTerminal={closeWorkspaceTerminal}
+                          changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
+                          createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
+                          createFirstWorkspace={createFirstWorkspace}
+                          handlePreparedTerminalChange={handlePreparedTerminalChange}
+                          isAppClosing={workspaceCloseState.isActive}
+                          isWorkspaceRuntimeDeactivating={Boolean(
+                            workspaceDeactivationState.isActive
+                              && workspaceDeactivationState.workspaceId === activatedWorkspace?.id,
+                          )}
+                          manageWorkspaceAgents={manageWorkspaceAgents}
+                          onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
+                          onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
+                          onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
+                          onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
+                          onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
+                          onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
+                          refreshAgentStatuses={refreshAgentStatuses}
+                          reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
+                          setWorkspaceName={setWorkspaceName}
+                          shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
+                          shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
+                          showSettingsView={showSettingsView}
+                          splitWorkspaceTerminal={splitWorkspaceTerminal}
+                          terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
+                          terminalThreadsByIndex={activatedWorkspaceThreadsByIndex}
+                          viewMotion={viewMotion}
+                          workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
+                          workspaceError={workspaceError}
+                          workspaceName={workspaceName}
+                          workspaceSyncState={workspaceSyncState}
+                          workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
+                          workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
+                          workspaceThreads={workspaceThreads}
+                          workspaces={workspaces}
+                        />
+                      </WorkspaceRuntimeLayer>
+                    ) : enabledWorkspaceRuntimeDescriptors.map((runtimeDescriptor) => {
+                      const runtimeWorkspace = runtimeDescriptor.workspace;
+                      const runtimeVisible = Boolean(
+                        runtimeWorkspace?.id
+                          && runtimeWorkspace.id === activatedWorkspace?.id
+                          && shouldRevealWorkspaceTerminal,
+                      );
+                      const runtimeIsDeactivating = Boolean(
+                        workspaceDeactivationState.isActive
+                          && workspaceDeactivationState.workspaceId === runtimeWorkspace?.id,
+                      );
+                      const runtimeAgentLaunchReady = Boolean(
+                        workspaceState === "ready"
+                          && !runtimeIsDeactivating
+                          && runtimeDescriptor.agentTerminalEntries.length > 0,
+                      );
+
+                      return (
+                        <WorkspaceRuntimeLayer
+                          aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !runtimeVisible}
+                          data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeVisible}
+                          key={runtimeWorkspace.id}
+                        >
+                          <TerminalView
+                            defaultWorkingDirectory={defaultWorkingDirectory}
+                            terminalWorkspace={runtimeWorkspace}
+                            terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
+                            terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
+                            terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
+                            terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
+                            terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
+                            agentStatusError={agentStatusError}
+                            agentStatuses={agentStatuses}
+                            agentStatusState={agentStatusState}
+                            closeWorkspaceTerminal={closeWorkspaceTerminal}
+                            changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
+                            createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
+                            createFirstWorkspace={createFirstWorkspace}
+                            handlePreparedTerminalChange={handlePreparedTerminalChange}
+                            isAppClosing={workspaceCloseState.isActive}
+                            isWorkspaceRuntimeDeactivating={runtimeIsDeactivating}
+                            manageWorkspaceAgents={manageWorkspaceAgents}
+                            onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
+                            onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
+                            onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
+                            onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
+                            onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
+                            onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
+                            refreshAgentStatuses={refreshAgentStatuses}
+                            reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
+                            setWorkspaceName={setWorkspaceName}
+                            shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
+                            shouldShowWorkspaceSetup={false}
+                            showSettingsView={showSettingsView}
+                            splitWorkspaceTerminal={splitWorkspaceTerminal}
+                            terminalDisplayRows={runtimeDescriptor.displayRows}
+                            terminalThreadsByIndex={runtimeDescriptor.threadsByIndex}
+                            viewMotion={viewMotion}
+                            workspaceAgentLaunchEpoch={runtimeVisible ? workspaceAgentLaunchEpoch : 0}
+                            workspaceError={workspaceError}
+                            workspaceName={runtimeWorkspace.name || workspaceName}
+                            workspaceSyncState={workspaceSyncState}
+                            workspaceTerminalAgentLaunchReady={runtimeAgentLaunchReady}
+                            workspaceTerminalRenderAgent={runtimeDescriptor.renderAgent}
+                            workspaceThreads={workspaceThreads}
+                            workspaces={workspaces}
+                          />
+                        </WorkspaceRuntimeLayer>
+                      );
+                    })
                   )}
                   {shouldShowDefaultWorkspaceIdle && (
                     <WorkspaceRuntimeLayer

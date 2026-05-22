@@ -801,6 +801,11 @@ function stableProjectionHash(value) {
   return (hash >>> 0).toString(36);
 }
 
+function stableProjectionKey(value, fallback = "event") {
+  const text = String(value || fallback);
+  return `${safeKey(text, fallback)}-${stableProjectionHash(text)}`;
+}
+
 function normalizeProjectionEventType(value) {
   const type = cleanText(value)
     .toLowerCase()
@@ -1357,7 +1362,7 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   return [{
     agentId,
     createdAt,
-    id: `projection-user-${safeKey(messageId, "message")}`,
+    id: `projection-user-${stableProjectionKey(messageId, "message")}`,
     messageId,
     source,
     status: "submitted",
@@ -1367,7 +1372,7 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   }, {
     agentId: cleanAgentId(event.agentId || event.currentAgent, ""),
     createdAt,
-    id: `projection-turn-started-${safeKey(turnId, "turn")}`,
+    id: `projection-turn-started-${stableProjectionKey(turnId, "turn")}`,
     messageId,
     source,
     status: "running",
@@ -1396,7 +1401,10 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   const events = [];
   const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
   const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
+  const expectedPromptTurnId = promptEventId ? createTurnIdForMessage(thread, promptEventId) : "";
+  const promptAccepted = event.promptAccepted === true;
   let currentTurnId = cleanText(latestTurn?.turnId);
+  let transcriptAdvancedTurn = false;
 
   normalizeThreadMessages(incomingMessages).forEach((message) => {
     const eventStartCount = events.length;
@@ -1452,11 +1460,12 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           || projectedMessage?.turnId
           || createTurnIdForMessage(thread, messageId),
       );
+      transcriptAdvancedTurn = true;
       eventBase.turnId = currentTurnId;
       if (!projectionHasTurnEvent(projectionEvents, "thread.turn.started", currentTurnId)) {
         events.push({
           ...eventBase,
-          id: `projection-provider-turn-started-${safeKey(currentTurnId, "turn")}`,
+          id: `projection-provider-turn-started-${stableProjectionKey(currentTurnId, "turn")}`,
           status: "running",
           type: "thread.turn.started",
         });
@@ -1466,7 +1475,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       } else {
         events.push({
           ...eventBase,
-          id: `projection-provider-user-${safeKey(messageId, "message")}`,
+          id: `projection-provider-user-${stableProjectionKey(messageId, "message")}`,
           role: "user",
           status: message.status || "submitted",
           text: message.text,
@@ -1481,7 +1490,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           events.push({
             ...eventBase,
             completedAt: createdAt,
-            id: `projection-provider-turn-completed-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+            id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
             status: "completed",
             type: "thread.turn.completed",
           });
@@ -1545,7 +1554,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           ...eventBase,
           assistantMessageId: duplicateFinalAssistant?.id || messageId,
           completedAt: createdAt,
-          id: `projection-provider-turn-completed-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+          id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
           status: "completed",
           type: "thread.turn.completed",
         });
@@ -1573,7 +1582,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         events.push({
           ...eventBase,
           completedAt: createdAt,
-          id: `projection-provider-turn-error-${safeKey(messageTurnId, "turn")}-${safeKey(messageId, "message")}`,
+          id: `projection-provider-turn-error-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
           status: "error",
           text: message.text,
           type: "thread.turn.error",
@@ -1587,7 +1596,14 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     }
   });
 
-  const completedTurnId = runningLatestTurnId || currentTurnId;
+  const completedTurnId = runningLatestTurnId
+    && expectedPromptTurnId
+    && expectedPromptTurnId === runningLatestTurnId
+    && promptAccepted
+    ? runningLatestTurnId
+    : transcriptAdvancedTurn
+      ? currentTurnId
+      : "";
   if (
     event.turnCompleteSeen === true
     && completedTurnId
@@ -1605,7 +1621,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       createdAt: completedAt,
       id: [
         "projection-provider-turn-completed",
-        safeKey(completedTurnId, "turn"),
+        stableProjectionKey(completedTurnId, "turn"),
         "fallback",
         stableProjectionHash(completedAt),
       ].join("-"),
@@ -2686,7 +2702,20 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       updatedAt: existing.updatedAt,
     },
   );
-  const providerBinding = normalizeProviderBinding(existingProviderBindings[agentId], agentId, {
+  const shouldClearOrphanRunning = !options.incrementMessageCount && isOrphanRunningThreadState({
+    latestTurn: existing.latestTurn,
+    messageCount: existing.messageCount,
+    messages: normalizeThreadMessages(existing.messages),
+    pendingPrompt: existing.pendingPrompt,
+    projectionEvents: normalizeThreadProjectionEvents(existing.projectionEvents),
+    providerBindings: existingProviderBindings,
+    transcriptSessionId: existing.transcriptSessionId,
+  });
+  const baseProviderBindings = shouldClearOrphanRunning
+    ? clearOrphanRunningProviderBindings(existingProviderBindings)
+    : existingProviderBindings;
+  const latestTurn = shouldClearOrphanRunning ? null : normalizeThreadLatestTurn(existing.latestTurn);
+  const providerBinding = normalizeProviderBinding(baseProviderBindings[agentId], agentId, {
     coordination,
     inputReady: Boolean(activeTerminal?.inputReady),
     inputReadyAt: activeTerminal?.inputReadyAt || "",
@@ -2700,14 +2729,16 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
   });
   const activityStatus = options.incrementMessageCount
     ? "thinking"
-    : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
+    : shouldClearOrphanRunning
+      ? "idle"
+      : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
   const eventSessionName = cleanThreadLabelCandidate(event.sessionName);
   const eventTitle = eventSessionName
     || getWorkspaceThreadPromptLabel(event.title || event.userMessage, "");
   const existingSessionName = cleanThreadLabelCandidate(existing.sessionName);
   const existingTitle = cleanThreadLabelCandidate(existing.title);
   const providerBindings = {
-    ...existingProviderBindings,
+    ...baseProviderBindings,
     [agentId]: {
       ...providerBinding,
       activityStatus,
@@ -2741,6 +2772,7 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     materialized: true,
     messageCount: nextMessageCount,
     messages: existing.messages,
+    latestTurn,
     preferredAgent: cleanAgentId(event.preferredAgent || existing.preferredAgent || agentId),
     providerBindings,
     sessionName: eventSessionName || existingSessionName || eventTitle || existingTitle,

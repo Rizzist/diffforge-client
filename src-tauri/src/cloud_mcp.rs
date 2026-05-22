@@ -81,6 +81,7 @@ struct CloudMcpTerminalContextState {
     last_checkpoint_ms: u64,
     local_task_id: Option<String>,
     reported_change: bool,
+    stable_review_reported: bool,
     stable_change_cycles: u8,
     saw_agent_activity: bool,
     work_brief: String,
@@ -3604,6 +3605,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 last_checkpoint_ms: 0,
                 local_task_id: local_task_id.clone(),
                 reported_change: false,
+                stable_review_reported: false,
                 stable_change_cycles: 0,
                 saw_agent_activity: false,
                 work_brief: String::new(),
@@ -3835,6 +3837,7 @@ async fn cloud_mcp_track_terminal_file_changes(
             if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
                 entry.last_changed_hash.clear();
                 entry.reported_change = false;
+                entry.stable_review_reported = false;
                 entry.stable_change_cycles = 0;
             } else {
                 break;
@@ -3846,6 +3849,10 @@ async fn cloud_mcp_track_terminal_file_changes(
             if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
                 if entry.local_task_id.as_deref() != Some(local_task_id_for_scope.as_str()) {
                     entry.local_task_id = Some(local_task_id_for_scope.clone());
+                    entry.last_changed_hash.clear();
+                    entry.reported_change = false;
+                    entry.stable_review_reported = false;
+                    entry.stable_change_cycles = 0;
                 }
             } else {
                 break;
@@ -3884,7 +3891,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                     Some((
                         false,
                         entry.reported_change
-                            && !entry.done_reported
+                            && !entry.stable_review_reported
                             && entry.stable_change_cycles >= 4,
                         work_brief,
                     ))
@@ -3892,6 +3899,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                     entry.last_changed_hash = changed_hash.clone();
                     entry.last_checkpoint_ms = cloud_mcp_now_ms();
                     entry.reported_change = true;
+                    entry.stable_review_reported = false;
                     entry.stable_change_cycles = 0;
                     Some((true, false, work_brief))
                 }
@@ -3909,7 +3917,7 @@ async fn cloud_mcp_track_terminal_file_changes(
         };
         if should_complete {
             let brief = format!(
-                "Ready for patch submission: {}",
+                "Changes look stable; waiting for terminal prompt: {}",
                 fallback_title.as_deref().unwrap_or(&work_subject)
             );
             let _ = cloud_mcp_workspace_log(
@@ -3923,8 +3931,8 @@ async fn cloud_mcp_track_terminal_file_changes(
                     "instance_id": instance_id,
                     "repo_id": repo_id,
                     "local_task_id": local_task_id_for_scope.as_str(),
-                    "status": "review",
-                    "completion_gate": "submit_patch_required",
+                    "status": "active",
+                    "completion_gate": "terminal_prompt_ready_required",
                     "changed_file_count": changed_files.len(),
                 }),
             );
@@ -3933,7 +3941,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                 &repo_id,
                 &agent_id,
                 &lane,
-                "review",
+                "active",
                 None,
                 &brief,
                 &working_directory,
@@ -3944,23 +3952,13 @@ async fn cloud_mcp_track_terminal_file_changes(
                 "stable_file_changes_ready",
             )
             .await;
-            cloud_mcp_release_terminal_lane(
-                &state,
-                &repo_id,
-                &agent_id,
-                &lane,
-                &working_directory,
-                &pane_id,
-                instance_id,
-                "stable_file_changes_ready",
-            )
-            .await;
             let mut runtime = state.inner.lock().await;
             if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
-                entry.done_reported = true;
+                entry.reported_change = false;
+                entry.stable_review_reported = true;
+                entry.stable_change_cycles = 0;
             }
-            runtime.terminal_contexts.remove(&terminal_key);
-            break;
+            continue;
         }
         if !should_report {
             continue;

@@ -41,7 +41,10 @@ function detectTerminalWebglRendererDefault() {
 
 export const TERMINAL_ENABLE_WEBGL_RENDERER = detectTerminalWebglRendererDefault();
 export const TERMINAL_START_LAYOUT_WAIT_MS = 4000;
+export const TERMINAL_START_LAYOUT_HIDDEN_POLL_MS = 120;
+export const TERMINAL_START_LAYOUT_STILL_WAITING_LOG_MS = 4000;
 export const TERMINAL_START_METRIC_WAIT_MS = 900;
+export const TERMINAL_START_METRIC_STILL_WAITING_LOG_MS = 4000;
 export const TERMINAL_START_METRIC_POLL_MS = 16;
 export const TERMINAL_START_GEOMETRY_WAIT_MS = 1400;
 export const TERMINAL_START_GEOMETRY_POLL_MS = 16;

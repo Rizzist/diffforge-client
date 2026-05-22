@@ -4595,7 +4595,7 @@ function WorkspaceThreadDetail({
       bindingPaneId: activeTerminalBinding?.paneId || "",
       model: nextModel,
       modelLabel: option?.label || "",
-      requestIncludesThinkingPower: false,
+      requestIncludesThinkingPower: Boolean(activeAgentId === "codex" && thinkingPower.thinkingPower),
       surface: "thread_detail",
       thinkingPower: thinkingPower.thinkingPower,
       thinkingPowerSource: thinkingPower.source,
@@ -4606,6 +4606,8 @@ function WorkspaceThreadDetail({
       agentId: activeAgentId,
       model: nextModel,
       thread,
+      thinkingPower: thinkingPower.thinkingPower,
+      thinkingPowerSource: thinkingPower.source,
       workspace,
     })).then(() => {
       logBigViewSyncDiagnosticEvent("bigview.model_change.done", {

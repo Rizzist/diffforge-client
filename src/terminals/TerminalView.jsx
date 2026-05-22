@@ -5694,6 +5694,8 @@ function TerminalView({
   createWorkspaceThreadTerminal,
   createFirstWorkspace,
   handlePreparedTerminalChange,
+  isAppClosing = false,
+  isWorkspaceRuntimeDeactivating = false,
   manageWorkspaceAgents,
   onOpenWorkspaceSettings,
   onArchiveWorkspaceThread,
@@ -6005,6 +6007,7 @@ function TerminalView({
         reason,
         recordedAgentInputReady: Boolean(fields.recordedAgentInputReady),
         completedTurnLooksSendable: Boolean(fields.completedTurnLooksSendable),
+        orphanRunningLooksIdle: Boolean(fields.orphanRunningLooksIdle),
         requiresAgentInputReady: Boolean(fields.requiresAgentInputReady),
         sourceItem: getTodoQueueItemLogSummary(item ? [item] : [])[0] || null,
         targetRole: fields.targetRole || "",
@@ -6071,6 +6074,27 @@ function TerminalView({
         || targetProviderBinding?.activityStatus
         || "",
     ).trim().toLowerCase();
+    const targetMessageCount = Number.parseInt(targetThread?.messageCount || 0, 10);
+    const providerBindings = targetThread?.providerBindings
+      && typeof targetThread.providerBindings === "object"
+      && !Array.isArray(targetThread.providerBindings)
+      ? targetThread.providerBindings
+      : {};
+    const providerBindingsHaveNativeSession = Object.values(providerBindings).some((binding) => (
+      Boolean(String(binding?.nativeSessionId || "").trim())
+    ));
+    const orphanRunningLooksIdle = Boolean(
+      latestTurnState === "running"
+        && (!Number.isInteger(targetMessageCount) || targetMessageCount <= 0)
+        && !(Array.isArray(targetThread?.messages) && targetThread.messages.length > 0)
+        && !(Array.isArray(targetThread?.projectionEvents) && targetThread.projectionEvents.length > 0)
+        && !targetThread?.pendingPrompt
+        && !String(targetThread?.transcriptSessionId || "").trim()
+        && !providerBindingsHaveNativeSession
+    );
+    const effectiveActivityStatus = orphanRunningLooksIdle && activityStatus === "thinking"
+      ? "idle"
+      : activityStatus;
     const shouldAutoSubmit = Boolean(
       !image
         && targetRole
@@ -6081,8 +6105,8 @@ function TerminalView({
     const completedTurnLooksSendable = Boolean(
       requiresAgentInputReady
         && !recordedAgentInputReady
-        && ["completed", "error", "interrupted"].includes(latestTurnState)
-        && activityStatus !== "thinking"
+        && (["completed", "error", "interrupted"].includes(latestTurnState) || orphanRunningLooksIdle)
+        && effectiveActivityStatus !== "thinking"
         && !targetThread?.pendingPrompt
         && ["active", "running"].includes(terminalStatus),
     );
@@ -6091,7 +6115,7 @@ function TerminalView({
       || completedTurnLooksSendable;
     const targetFields = {
       agentInputReady,
-      activityStatus,
+      activityStatus: effectiveActivityStatus,
       completedTurnLooksSendable,
       image,
       latestTurnState,
@@ -6099,6 +6123,7 @@ function TerminalView({
       paneId,
       recordedAgentInputReady,
       requiresAgentInputReady,
+      orphanRunningLooksIdle,
       shouldAutoSubmit,
       syncKey,
       targetBinding: resolvedBinding,
@@ -6188,10 +6213,10 @@ function TerminalView({
     if (targetThread?.pendingPrompt) {
       return unavailable("pending_prompt", "This terminal already has a prompt waiting to send.", targetFields);
     }
-    if (latestTurnState === "running") {
+    if (latestTurnState === "running" && !orphanRunningLooksIdle) {
       return unavailable("busy_turn", "This agent is already working.", targetFields);
     }
-    if (activityStatus === "thinking") {
+    if (activityStatus === "thinking" && !orphanRunningLooksIdle) {
       return unavailable("busy_activity", "This agent is already working.", targetFields);
     }
     if (requiresAgentInputReady && !agentInputReady) {
@@ -7278,6 +7303,7 @@ function TerminalView({
     targetTerminalIndex,
   } = {}) => {
     const currentItem = item && typeof item === "object" ? item : {};
+    const itemLogSummary = getTodoQueueItemLogSummary([currentItem])[0] || null;
     const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentItem, {
       allowGeneric,
       requireAvailable,
@@ -7291,10 +7317,32 @@ function TerminalView({
     const targetLogIndex = Number.isInteger(target.targetTerminalIndex)
       ? target.targetTerminalIndex
       : targetTerminalIndex ?? "";
+    const terminalWriteLogBase = {
+      item: itemLogSummary,
+      paneId,
+      source,
+      targetRole,
+      targetTerminalIndex: targetLogIndex,
+      workspaceId,
+    };
+    const planTask = getTodoQueueItemPlanTask(currentItem);
+    const planTaskDoneWhen = String(planTask?.doneWhen || "").trim().toLowerCase();
+    const shouldCompletePlanTaskOnSubmitObserved = Boolean(
+      planTask && planTaskDoneWhen === "confirmed_running",
+    );
+
+    logTerminalStatus("frontend.todo_queue.send_start", {
+      ...terminalWriteLogBase,
+      allowGeneric,
+      focusReason,
+      requireAvailable,
+      targetAvailable: Boolean(target.available),
+      targetReason: target.reason || "",
+    });
 
     logBigViewSyncDiagnosticEvent("tui.image.drop_start", {
       hasImage: Boolean(image),
-      item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+      item: itemLogSummary,
       paneId,
       shouldAutoSubmit,
       source,
@@ -7330,9 +7378,19 @@ function TerminalView({
       }
 
       if (requireAvailable) {
+        logTerminalStatus("frontend.todo_queue.send_blocked", {
+          ...terminalWriteLogBase,
+          message: target.message || "",
+          reason: target.reason || "terminal_unavailable",
+        });
         throw createTodoQueueBusyError(target.reason || "terminal_unavailable", target.message);
       }
 
+      logTerminalStatus("frontend.todo_queue.send_blocked", {
+        ...terminalWriteLogBase,
+        message: target.message || "",
+        reason: target.reason || "terminal_unavailable",
+      });
       throw new Error(target.message || "Choose an agent terminal for this todo.");
     }
 
@@ -7350,6 +7408,124 @@ function TerminalView({
 
     const terminalText = await prepareTodoTerminalText(currentItem);
     const threadMessageText = getTodoQueueItemThreadMessageText(currentItem, terminalText);
+    const lifecycleSource = getTodoQueueLifecycleSource(source, currentItem);
+    let threadMessageLifecycleDispatched = false;
+    const dispatchThreadMessageLifecycle = ({
+      promptId = "",
+      reason = "submit_observed",
+      submittedAt = "",
+      terminalText: lifecycleTerminalText = terminalText,
+      threadMessageText: lifecycleThreadMessageText = threadMessageText,
+    } = {}) => {
+      const safePromptId = String(promptId || "").trim();
+      const safeThreadMessageText = String(lifecycleThreadMessageText || "");
+      const canDispatch = Boolean(
+        shouldAutoSubmit
+          && !image
+          && safeThreadMessageText.trim()
+          && targetThread?.id
+          && targetRole
+          && targetRole !== "generic"
+          && targetRole !== "terminal"
+          && targetRole !== "shell"
+          && onThreadTerminalLifecycle,
+      );
+      if (!canDispatch) {
+        const skipReason = !shouldAutoSubmit
+          ? "manual_draft"
+          : image
+            ? "image_submission"
+            : !safeThreadMessageText.trim()
+              ? "empty_message"
+              : !targetThread?.id
+                ? "missing_thread"
+                : !onThreadTerminalLifecycle
+                  ? "missing_lifecycle_handler"
+                  : "unsupported_target_role";
+        logTerminalStatus("frontend.terminal_status.lifecycle_send_skip", {
+          confirmedSubmit: true,
+          hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
+          hasTargetThread: Boolean(targetThread?.id),
+          hasThreadMessageText: Boolean(safeThreadMessageText.trim()),
+          item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+          promptId: safePromptId,
+          reason: skipReason,
+          source: lifecycleSource,
+          targetRole,
+          targetTerminalIndex: targetLogIndex,
+          workspaceId,
+        });
+        logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_skip", {
+          confirmedSubmit: true,
+          hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
+          hasTargetThread: Boolean(targetThread?.id),
+          hasThreadMessageText: Boolean(safeThreadMessageText.trim()),
+          paneId,
+          promptId: safePromptId,
+          reason: skipReason,
+          source: lifecycleSource,
+          surface: "tui_terminal_grid",
+          targetRole,
+          targetTerminalIndex: targetLogIndex,
+          workspaceId,
+        });
+        return false;
+      }
+
+      threadMessageLifecycleDispatched = true;
+      logTerminalStatus("frontend.terminal_status.lifecycle_send", {
+        agentId: targetRole,
+        eventStatus: "active",
+        eventType: "message-submitted",
+        item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+        pendingPromptId: safePromptId,
+        promptEventId: safePromptId,
+        reason,
+        source: lifecycleSource,
+        targetTerminalIndex: target.targetTerminalIndex,
+        terminalGroundTruthStatus: "processing_request_submitted",
+        threadId: targetThread.id,
+        workspaceId,
+      });
+      onThreadTerminalLifecycle?.({
+        agentId: targetRole,
+        instanceId: targetBinding?.instanceId || "",
+        messageCreatedAt: submittedAt || "",
+        messageId: safePromptId,
+        messageSource: lifecycleSource,
+        paneId,
+        pendingPromptId: safePromptId,
+        promptEventId: safePromptId,
+        promptEventSubmittedAt: submittedAt || "",
+        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
+        source: lifecycleSource,
+        status: "active",
+        terminalIndex: target.targetTerminalIndex,
+        expectedUserMessage: String(lifecycleTerminalText || ""),
+        threadId: targetThread.id,
+        type: "message-submitted",
+        userMessage: safeThreadMessageText,
+        workspaceId,
+        workspaceName: terminalWorkspace?.name || "",
+      });
+      logBigViewSyncDiagnosticEvent("tui.text.drop_lifecycle_dispatched", {
+        agentId: targetRole,
+        paneId,
+        promptId: safePromptId,
+        reason,
+        source: lifecycleSource,
+        surface: "tui_terminal_grid",
+        syncKey,
+        submitConfirmed: true,
+        targetTerminalIndex: targetLogIndex,
+        terminalText: getBigViewTextDiagnosticFields(lifecycleTerminalText || ""),
+        threadId: targetThread.id,
+        threadMessageText: getBigViewTextDiagnosticFields(safeThreadMessageText),
+        workspaceId,
+      });
+      return true;
+    };
     const attachmentSource = getTodoQueueAttachmentSource(source);
     const queuedAttachment = image
       ? todoImageToComposerAttachment(image, 0, attachmentSource)
@@ -7462,12 +7638,39 @@ function TerminalView({
         workspaceId,
       });
       if (!shouldConfirmAutoSubmit) {
-        const writeResult = await invoke("terminal_write", {
-          data: terminalText,
-          instanceId: targetBinding?.instanceId,
-          paneId,
+        const draftWriteStartedAt = performance.now();
+        logTerminalStatus("frontend.todo_queue.terminal_write.draft_start", {
+          ...terminalWriteLogBase,
+          dataLength: terminalText.length,
+          instanceId: targetBinding?.instanceId || "",
           threadId: targetThread?.id || "",
         });
+        let writeResult = null;
+        try {
+          writeResult = await invoke("terminal_write", {
+            data: terminalText,
+            instanceId: targetBinding?.instanceId,
+            paneId,
+            threadId: targetThread?.id || "",
+          });
+          logTerminalStatus("frontend.todo_queue.terminal_write.draft_done", {
+            ...terminalWriteLogBase,
+            dataLength: terminalText.length,
+            elapsedMs: Math.round(performance.now() - draftWriteStartedAt),
+            instanceId: targetBinding?.instanceId || "",
+            threadId: targetThread?.id || "",
+          });
+        } catch (error) {
+          logTerminalStatus("frontend.todo_queue.terminal_write.draft_error", {
+            ...terminalWriteLogBase,
+            dataLength: terminalText.length,
+            elapsedMs: Math.round(performance.now() - draftWriteStartedAt),
+            instanceId: targetBinding?.instanceId || "",
+            message: error?.message || String(error || ""),
+            threadId: targetThread?.id || "",
+          });
+          throw error;
+        }
         dropResult = {
           confirmedSubmit: false,
           syncKey,
@@ -7563,10 +7766,46 @@ function TerminalView({
         });
         const syncWriteStartedAt = performance.now();
         if (syncData) {
-          await invoke("terminal_write", {
-            data: syncData,
-            instanceId: targetBinding?.instanceId,
-            paneId,
+          logTerminalStatus("frontend.todo_queue.terminal_write.sync_start", {
+            ...terminalWriteLogBase,
+            instanceId: targetBinding?.instanceId || "",
+            promptEventId: promptId,
+            syncDataLength: syncData.length,
+            threadId: targetThread.id,
+          });
+          try {
+            await invoke("terminal_write", {
+              data: syncData,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              threadId: targetThread.id,
+            });
+            logTerminalStatus("frontend.todo_queue.terminal_write.sync_done", {
+              ...terminalWriteLogBase,
+              elapsedMs: Math.round(performance.now() - syncWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              syncDataLength: syncData.length,
+              threadId: targetThread.id,
+            });
+          } catch (error) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.sync_error", {
+              ...terminalWriteLogBase,
+              elapsedMs: Math.round(performance.now() - syncWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              message: error?.message || String(error || ""),
+              promptEventId: promptId,
+              syncDataLength: syncData.length,
+              threadId: targetThread.id,
+            });
+            throw error;
+          }
+        } else {
+          logTerminalStatus("frontend.todo_queue.terminal_write.sync_skip", {
+            ...terminalWriteLogBase,
+            instanceId: targetBinding?.instanceId || "",
+            promptEventId: promptId,
+            reason: "empty_sync_data",
             threadId: targetThread.id,
           });
         }
@@ -7623,16 +7862,55 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
-          const writeResult = await invoke("terminal_write", {
-            data: terminalSubmitSequence,
-            instanceId: targetBinding?.instanceId,
-            paneId,
+          const submitWriteStartedAt = performance.now();
+          logTerminalStatus("frontend.todo_queue.terminal_write.submit_start", {
+            ...terminalWriteLogBase,
+            instanceId: targetBinding?.instanceId || "",
             promptEventId: promptId,
             promptEventSource,
             promptEventSubmittedAt: submittedAt,
-            promptEventText: terminalText,
+            promptTextLength: terminalText.length,
+            submitSequenceLength: terminalSubmitSequence.length,
             threadId: targetThread.id,
           });
+          let writeResult = null;
+          try {
+            writeResult = await invoke("terminal_write", {
+              data: terminalSubmitSequence,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              promptEventId: promptId,
+              promptEventSource,
+              promptEventSubmittedAt: submittedAt,
+              promptEventText: terminalText,
+              threadId: targetThread.id,
+            });
+            logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
+              ...terminalWriteLogBase,
+              elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              promptEventSource,
+              promptEventSubmittedAt: submittedAt,
+              promptTextLength: terminalText.length,
+              submitSequenceLength: terminalSubmitSequence.length,
+              threadId: targetThread.id,
+            });
+          } catch (error) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.submit_error", {
+              ...terminalWriteLogBase,
+              elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              message: error?.message || String(error || ""),
+              promptEventId: promptId,
+              promptEventSource,
+              promptEventSubmittedAt: submittedAt,
+              promptTextLength: terminalText.length,
+              submitSequenceLength: terminalSubmitSequence.length,
+              threadId: targetThread.id,
+            });
+            throw error;
+          }
           requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
             submitSequenceLength: terminalSubmitSequence.length,
           });
@@ -7646,6 +7924,14 @@ function TerminalView({
             submitSequenceLength: terminalSubmitSequence.length,
           });
           const submittedPayload = await submittedWaiter.promise;
+          logTerminalStatus("frontend.todo_queue.terminal_write.submit_observed", {
+            ...terminalWriteLogBase,
+            instanceId: targetBinding?.instanceId || "",
+            promptEventId: promptId,
+            promptMatch: submittedPayload?.promptMatch !== false,
+            promptSource: submittedPayload?.promptSource || "",
+            threadId: targetThread.id,
+          });
           logBigViewSyncDiagnosticEvent("tui.text.drop_submit_observed", {
             agentId: targetRole,
             paneId,
@@ -7659,42 +7945,100 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
-          const acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
-            acceptedWaiter,
-            agentId: targetRole,
-            binding: {
-              instanceId: targetBinding?.instanceId,
+          const lifecycleDispatchedAtSubmit = dispatchThreadMessageLifecycle({
+            promptId,
+            reason: "submit_observed",
+            submittedAt,
+            terminalText,
+            threadMessageText,
+          });
+          if (planTask && lifecycleDispatchedAtSubmit) {
+            clearTodoQueueItemPending(currentItem.id || currentItem.itemId || "", "submit_observed", {
+              promptId,
+              source,
+              submitConfirmed: true,
+              targetRole,
+              targetTerminalIndex: target.targetTerminalIndex,
+            });
+          }
+          let acceptedDetail = null;
+          let acceptedBySubmitObservation = false;
+          if (shouldCompletePlanTaskOnSubmitObserved) {
+            acceptedBySubmitObservation = true;
+            acceptedWaiter.cancel();
+            logTerminalStatus("frontend.todo_queue.terminal_write.accept_skip", {
+              ...terminalWriteLogBase,
+              doneWhen: planTaskDoneWhen,
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              reason: "confirmed_running_submit_observed",
+              threadId: targetThread.id,
+            });
+          } else {
+            try {
+              acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
+                acceptedWaiter,
+                agentId: targetRole,
+                binding: {
+                  instanceId: targetBinding?.instanceId,
+                  paneId,
+                  terminalIndex: target.targetTerminalIndex,
+                },
+                expectedPrompt: terminalText,
+                getDraftValue: () => (
+                  syncKey
+                    ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+                    : terminalText
+                ),
+                allowEnterRetry: false,
+                isGenericTerminal: false,
+                logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
+                promptId,
+                retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
+                submitSequence: terminalSubmitSequence,
+                threadId: targetThread.id,
+                workspaceId,
+              });
+            } catch (acceptError) {
+              if (!planTask || !lifecycleDispatchedAtSubmit) {
+                throw acceptError;
+              }
+
+              acceptedBySubmitObservation = true;
+              logTerminalStatus("frontend.todo_queue.terminal_write.accept_timeout_ignored", {
+                ...terminalWriteLogBase,
+                doneWhen: planTaskDoneWhen,
+                instanceId: targetBinding?.instanceId || "",
+                message: acceptError?.message || String(acceptError || ""),
+                promptEventId: promptId,
+                reason: "voice_plan_submit_observed",
+                threadId: targetThread.id,
+              });
+            }
+          }
+          if (acceptedDetail) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.accepted", {
+              ...terminalWriteLogBase,
+              acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
+              threadId: targetThread.id,
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
+              acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+              agentId: targetRole,
               paneId,
-              terminalIndex: target.targetTerminalIndex,
-            },
-            expectedPrompt: terminalText,
-            getDraftValue: () => (
-              syncKey
-                ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-                : terminalText
-            ),
-            allowEnterRetry: false,
-            isGenericTerminal: false,
-            logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
-            promptId,
-            retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
-            submitSequence: terminalSubmitSequence,
-            threadId: targetThread.id,
-            workspaceId,
-          });
-          logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
-            acceptedMatchedBy: acceptedDetail?.matchedBy || "",
-            agentId: targetRole,
-            paneId,
-            promptId,
-            sessionIdPresent: Boolean(acceptedDetail?.sessionId),
-            source,
-            syncKey,
-            surface: "tui_terminal_grid",
-            targetTerminalIndex: targetLogIndex,
-            threadId: targetThread.id,
-            workspaceId,
-          });
+              promptId,
+              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
+              source,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetLogIndex,
+              threadId: targetThread.id,
+              workspaceId,
+            });
+          }
           if (syncKey) {
             setWorkspaceThreadComposerDraft(syncKey, "");
           }
@@ -7743,7 +8087,9 @@ function TerminalView({
           }
           dropResult = {
             acceptedDetail,
+            acceptedBySubmitObservation,
             confirmedSubmit: true,
+            lifecycleDispatchedAtSubmit,
             promptId,
             promptEventSubmittedAt: submittedAt,
             syncKey,
@@ -7781,6 +8127,13 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
+          logTerminalStatus("frontend.todo_queue.terminal_write.confirm_error", {
+            ...terminalWriteLogBase,
+            instanceId: targetBinding?.instanceId || "",
+            message: submitError?.message || String(submitError || ""),
+            promptEventId: promptId,
+            threadId: targetThread.id,
+          });
           throw submitError;
         }
       }
@@ -7788,9 +8141,9 @@ function TerminalView({
 
     const writeResult = dropResult?.writeResult || null;
     const resultThreadMessageText = String(dropResult?.threadMessageText || "");
-    const lifecycleSource = getTodoQueueLifecycleSource(source, currentItem);
     const shouldDispatchThreadMessage = Boolean(
-      dropResult?.confirmedSubmit
+      !threadMessageLifecycleDispatched
+        && dropResult?.confirmedSubmit
         && shouldAutoSubmit
         && !image
         && resultThreadMessageText.trim()
@@ -7851,7 +8204,7 @@ function TerminalView({
         threadMessageText: getBigViewTextDiagnosticFields(resultThreadMessageText),
         workspaceId,
       });
-    } else if (shouldAutoSubmit && !image) {
+    } else if (shouldAutoSubmit && !image && !threadMessageLifecycleDispatched) {
       logTerminalStatus("frontend.terminal_status.lifecycle_send_skip", {
         confirmedSubmit: Boolean(dropResult?.confirmedSubmit),
         hasLifecycleHandler: Boolean(onThreadTerminalLifecycle),
@@ -7901,11 +8254,12 @@ function TerminalView({
         workspaceId,
       });
     }
-    const planTask = getTodoQueueItemPlanTask(currentItem);
     if (dropResult?.confirmedSubmit && planTask) {
       await recordVoicePlanTaskStatus(planTask, "dispatched", {
+        acceptedBySubmitObservation: Boolean(dropResult?.acceptedBySubmitObservation),
         agentId: targetRole,
         clientTodoId: currentItem.id || "",
+        lifecycleDispatchedAtSubmit: Boolean(dropResult?.lifecycleDispatchedAtSubmit),
         promptEventId: dropResult?.promptId || planTask.taskId,
         terminalId: paneId,
         terminalIndex: target.targetTerminalIndex,
@@ -7930,9 +8284,18 @@ function TerminalView({
       threadMessageText: getBigViewTextDiagnosticFields(resultThreadMessageText),
       workspaceId,
     });
+    logTerminalStatus("frontend.todo_queue.send_done", {
+      ...terminalWriteLogBase,
+      imageOnlyQueued: Boolean(dropResult?.imageOnly || writeResult?.imageOnly),
+      promptEventId: dropResult?.promptId || "",
+      submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+      terminalTextLength: String(dropResult?.terminalText || "").length,
+      threadId: targetThread?.id || "",
+    });
 
     return dropResult;
   }, [
+    clearTodoQueueItemPending,
     defaultWorkingDirectory,
     getTodoQueueTerminalSendTarget,
     onThreadTerminalLifecycle,
@@ -8427,6 +8790,16 @@ function TerminalView({
       queuedItemCount: queuedItems.length,
       workspaceId: terminalWorkspace?.id || "",
     });
+    if (isAppClosing || isWorkspaceRuntimeDeactivating) {
+      logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+        item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+        pendingCount: Object.keys(todoQueuePendingItemsRef.current || {}).length,
+        queueItemCount: todoQueueItems.length,
+        reason: isAppClosing ? "app_shutdown_in_progress" : "workspace_deactivation_in_progress",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return;
+    }
     if (isUnsafeVoicePlanQueueItem(queuedItem)) {
       const planTask = getTodoQueueItemPlanTask(queuedItem);
       const message = "Voice plan produced placeholder task text, so it was blocked before dispatch.";
@@ -8520,6 +8893,7 @@ function TerminalView({
     logTerminalStatus("frontend.todo_queue.dispatch_start", {
       item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
       source,
+      orphanRunningLooksIdle: Boolean(target.orphanRunningLooksIdle),
       targetRole: target.targetRole,
       targetTerminalIndex,
       terminalStatus: target.terminalStatus || "",
@@ -8645,6 +9019,8 @@ function TerminalView({
   }, [
     clearTodoQueueItemPending,
     getTodoQueueTerminalSendTarget,
+    isAppClosing,
+    isWorkspaceRuntimeDeactivating,
     logicalTerminalIndexes,
     recordTodoQueueSpecEditCancelled,
     recordVoicePlanTaskStatus,
@@ -9578,7 +9954,7 @@ function TerminalView({
               style={getTerminalSlotStyle(terminalIndex)}
             >
               <WorkspaceTerminal
-                key={`${terminalWorkspace.id}-${terminalIndex}-${getTerminalRole(terminalIndex)}-${terminalWorkspaceWorkingDirectory || ""}`}
+                key={`${terminalWorkspace.id}-${terminalIndex}`}
                 agent={getTerminalAgent(terminalIndex)}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
@@ -9631,7 +10007,7 @@ function TerminalView({
     </WorkspaceTerminalPanels>
   ) : !hasWorkspaceTerminals ? (
     <WorkspaceTerminal
-      key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}-${getTerminalRole(logicalTerminalIndexes[0] || 0)}-${terminalWorkspaceWorkingDirectory || ""}`}
+      key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}`}
       agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
       agentLaunchEpoch={workspaceAgentLaunchEpoch}
       agentLaunchReady={workspaceTerminalAgentLaunchReady}

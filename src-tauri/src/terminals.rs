@@ -3462,18 +3462,42 @@ fn is_numbered_terminal_model_picker_row(text: &str) -> bool {
         && rest.trim_start().to_ascii_lowercase().starts_with("gpt-")
 }
 
+fn is_numbered_terminal_reasoning_picker_row(text: &str) -> bool {
+    let Some((index, rest)) = text.split_once('.') else {
+        return false;
+    };
+    if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+        return false;
+    }
+
+    matches!(
+        rest.trim_start().to_ascii_lowercase().as_str(),
+        value if value.starts_with("low")
+            || value.starts_with("medium")
+            || value.starts_with("high")
+            || value.starts_with("xhigh")
+            || value.starts_with("extra high")
+    )
+}
+
 fn is_terminal_model_picker_ui_prompt(prompt: &str) -> bool {
     let text = normalize_terminal_control_prompt_text(prompt);
     if text.is_empty() {
         return false;
     }
 
-    if is_numbered_terminal_model_picker_row(&text) {
+    if is_numbered_terminal_model_picker_row(&text)
+        || is_numbered_terminal_reasoning_picker_row(&text)
+    {
         return true;
     }
 
     let lower = text.to_ascii_lowercase();
-    lower.contains("press enter to confirm") && lower.contains("esc") && lower.contains("go back")
+    lower.contains("select model and effort")
+        || lower.contains("access legacy models by running codex -m")
+        || (lower.contains("select model") && lower.contains("gpt-"))
+        || lower.contains("select reasoning level")
+        || (lower.contains("press enter to confirm") && lower.contains("esc") && lower.contains("go back"))
 }
 
 fn terminal_prompt_task_title(prompt: &str) -> String {
@@ -5300,6 +5324,21 @@ async fn terminal_write_inner(
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     if prompt_submission_requested {
+        log_terminal_status_event(
+            "backend.terminal_write.prompt_start",
+            json!({
+                "data": terminal_write_data_diagnostic(&data),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            }),
+        );
+    }
+    if prompt_submission_requested {
         if let Some(coordination) = instance.coordination.clone() {
             let readiness = tauri::async_runtime::spawn_blocking(move || {
                 ensure_terminal_coordination_ready_for_prompt(&coordination)
@@ -5309,6 +5348,19 @@ async fn terminal_write_inner(
                 format!("Unable to validate coordination session before prompt submit: {error}")
             })?;
             if let Err(error) = readiness {
+                log_terminal_status_event(
+                    "backend.terminal_write.prompt_coordination_not_ready",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    }),
+                );
                 write_thread_bridge_diagnostic_log_entry(json!({
                     "ts_ms": current_time_ms(),
                     "phase": "backend.bridge.terminal_write.coordination_not_ready",
@@ -5410,7 +5462,7 @@ async fn terminal_write_inner(
     }
 
     let input_write_started_at = Instant::now();
-    let input_write_result = write_terminal_input(
+    let input_write_result = match write_terminal_input(
         Some(&app),
         state,
         &pane_id,
@@ -5418,8 +5470,46 @@ async fn terminal_write_inner(
         &data,
         "terminal.write.skipped_stale_or_missing",
     )
-    .await?;
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            if prompt_submission_requested {
+                log_terminal_status_event(
+                    "backend.terminal_write.prompt_write_error",
+                    json!({
+                        "elapsed_ms": terminal_diagnostic_elapsed_ms(input_write_started_at),
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    }),
+                );
+            }
+            return Err(error);
+        }
+    };
     let input_write_elapsed_ms = terminal_diagnostic_elapsed_ms(input_write_started_at);
+    if prompt_submission_requested {
+        log_terminal_status_event(
+            "backend.terminal_write.prompt_write_done",
+            json!({
+                "elapsed_ms": input_write_elapsed_ms,
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+                "wrote": input_write_result,
+            }),
+        );
+    }
     write_thread_bridge_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": "backend.bridge.input_write_any_done",
@@ -5511,6 +5601,27 @@ async fn terminal_write_inner(
                 "observed_input_gate_mismatch"
             },
             thread_id.as_deref(),
+        );
+        log_terminal_status_event(
+            "backend.terminal_write.prompt_observed",
+            json!({
+                "event_prompt_len": event_prompt.len(),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "input_gate_after": input_gate_after,
+                "input_gate_before": input_gate_before,
+                "instance_id": instance.id,
+                "observed_prompt_len": prompt.len(),
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
+                "submitted_event_prompt_source": if prompt_event_text_matches_observed {
+                    "observed_input_gate"
+                } else {
+                    "observed_input_gate_mismatch"
+                },
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            }),
         );
         write_thread_bridge_diagnostic_log_entry(json!({
             "ts_ms": current_time_ms(),
@@ -5606,12 +5717,65 @@ async fn terminal_write_inner(
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             },
         }));
+        log_terminal_status_event(
+            "backend.terminal_write.prompt_not_observed",
+            json!({
+                "data_len": data.len(),
+                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "input_gate_after": input_gate_after,
+                "input_gate_before": input_gate_before,
+                "instance_id": instance.id,
+                "observer_reason": observer_reason,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            }),
+        );
         if let Some(event_prompt) = prompt_event_text
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
         {
+            if observer_reason == "submit_with_empty_input_gate" {
+                log_terminal_status_event(
+                    "backend.terminal_write.prompt_event_text_empty_gate_skip",
+                    json!({
+                        "data_len": data.len(),
+                        "instance_id": instance.id,
+                        "observer_reason": observer_reason,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": event_prompt.len(),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    }),
+                );
+                write_thread_bridge_diagnostic_log_entry(json!({
+                    "ts_ms": current_time_ms(),
+                    "phase": "backend.bridge.prompt_event_text_empty_gate_skip",
+                    "source": "backend",
+                    "app_pid": std::process::id(),
+                    "thread": terminal_diagnostic_thread_label(),
+                    "fields": {
+                        "data_len": data.len(),
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "has_prompt_event_text": true,
+                        "instance_id": instance.id,
+                        "normalized_data": normalized_data_diagnostic.clone(),
+                        "observer_reason": observer_reason,
+                        "original_data": original_data_diagnostic.clone(),
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": event_prompt.len(),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    },
+                }));
+                return Ok(());
+            }
             if is_terminal_control_prompt(&event_prompt) {
                 write_thread_bridge_diagnostic_log_entry(json!({
                     "ts_ms": current_time_ms(),
