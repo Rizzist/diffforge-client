@@ -1,9 +1,11 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
@@ -26,6 +28,11 @@ pub const TOOL_NAMES: &[&str] = &[
     "checkpoint",
     "submit_patch",
     "submit_patch_status",
+];
+const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
+    "workspace_mcp__sync_manifest",
+    "workspace_mcp__list_servers",
+    "workspace_mcp__get_server_status",
 ];
 const SHARED_DAEMON_INFO_RELATIVE_PATH: &[&str] = &[".agents", "mcp", "coordination.daemon.json"];
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
@@ -732,10 +739,1043 @@ pub fn run_stdio_server(context: McpContext) -> Result<(), String> {
     Ok(())
 }
 
+pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), String> {
+    record_mcp_client_event(
+        &context,
+        "mcp_agent_server_started",
+        json!({
+            "transport": "stdio",
+            "server_name": "diffforge-workspace-mcp-gateway",
+            "workspace_id": context.workspace_id,
+        }),
+    );
+
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut stdout = io::stdout();
+
+    while let Some(read_result) = read_rpc_message(&mut reader)? {
+        let (request, transport) = match read_result {
+            Ok(value) => value,
+            Err((transport, message)) => {
+                write_rpc_response(
+                    &mut stdout,
+                    transport,
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":message}}),
+                )?;
+                continue;
+            }
+        };
+        let response = handle_workspace_gateway_json_rpc(&context, request);
+        if !response.is_null() {
+            write_rpc_response(&mut stdout, transport, &response)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Value {
+    let id_value = request.get("id").cloned();
+    let id = id_value.clone().unwrap_or(Value::Null);
+    let method = request["method"].as_str().unwrap_or("");
+    if id_value.is_none() && method.starts_with("notifications/") {
+        return Value::Null;
+    }
+    match method {
+        "initialize" => {
+            record_mcp_client_event_async(
+                context,
+                "mcp_agent_client_initialized",
+                json!({
+                    "method": "initialize",
+                    "protocol_version": "2024-11-05",
+                    "server_name": "diffforge-workspace-mcp-gateway",
+                }),
+            );
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "diffforge-workspace-mcp-gateway", "version": "0.1.0"},
+                    "capabilities": {"tools": {"listChanged": true}}
+                }
+            })
+        }
+        "tools/list" => {
+            let tools = workspace_gateway_tools(context);
+            let tool_count = tools.len();
+            record_mcp_client_event_async(
+                context,
+                "mcp_agent_tools_listed",
+                json!({
+                    "method": "tools/list",
+                    "server_name": "diffforge-workspace-mcp-gateway",
+                    "tool_count": tool_count,
+                }),
+            );
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"tools": tools}
+            })
+        }
+        "tools/call" => {
+            let params = &request["params"];
+            let name = params["name"].as_str().unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let result = workspace_gateway_dispatch_tool(context, name, args);
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            })
+        }
+        "notifications/initialized" | "initialized" => Value::Null,
+        "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
+        _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}),
+    }
+}
+
+fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
+    let mut tools = WORKSPACE_GATEWAY_BUILTIN_TOOLS
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "description": workspace_gateway_builtin_tool_description(name),
+                "inputSchema": workspace_gateway_builtin_tool_input_schema(name),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let Ok((kernel, workspace_id)) = workspace_gateway_kernel(context) else {
+        return tools;
+    };
+    let Ok(servers) = workspace_gateway_servers(&kernel, &workspace_id) else {
+        return tools;
+    };
+
+    for server in servers
+        .iter()
+        .filter(|server| workspace_gateway_server_runtime_enabled(server))
+    {
+        let server_key = server["server_key"].as_str().unwrap_or_default();
+        if server_key.is_empty() {
+            continue;
+        }
+        let child_tools = match workspace_gateway_child_list_tools(server) {
+            Ok(child_tools) => {
+                let tools = child_tools
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str().filter(|value| !value.is_empty()))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let _ = kernel.record_workspace_mcp_probe_result(
+                    &workspace_id,
+                    server_key,
+                    "healthy",
+                    &format!(
+                        "Workspace gateway listed {} tool{} from this MCP.",
+                        tools.len(),
+                        if tools.len() == 1 { "" } else { "s" }
+                    ),
+                    Some(json!(tools)),
+                );
+                child_tools
+            }
+            Err(error) => {
+                let _ = kernel.record_workspace_mcp_probe_result(
+                    &workspace_id,
+                    server_key,
+                    workspace_gateway_connection_error_status(&error),
+                    &error,
+                    Some(json!([])),
+                );
+                continue;
+            }
+        };
+        for tool in child_tools {
+            let Some(tool_name) = tool["name"].as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let name = workspace_gateway_tool_name(server_key, tool_name);
+            let server_name = server["name"].as_str().unwrap_or(server_key);
+            let description = tool["description"].as_str().unwrap_or("");
+            tools.push(json!({
+                "name": name,
+                "description": if description.is_empty() {
+                    format!("{server_name} workspace MCP tool.")
+                } else {
+                    format!("{server_name}: {description}")
+                },
+                "inputSchema": tool.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"})),
+            }));
+        }
+    }
+    tools
+}
+
+fn workspace_gateway_dispatch_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+    let result = if WORKSPACE_GATEWAY_BUILTIN_TOOLS.contains(&tool) {
+        workspace_gateway_builtin_tool(context, tool, input)
+    } else {
+        workspace_gateway_external_tool(context, tool, input)
+    };
+    let ok = result["isError"].as_bool() != Some(true);
+    record_mcp_client_event(
+        context,
+        if ok {
+            "mcp_agent_tool_called"
+        } else {
+            "mcp_agent_tool_failed"
+        },
+        json!({
+            "method": "tools/call",
+            "server_name": "diffforge-workspace-mcp-gateway",
+            "tool": tool,
+            "ok": ok,
+        }),
+    );
+    result
+}
+
+fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+    match tool {
+        "workspace_mcp__sync_manifest" => match workspace_gateway_manifest(context) {
+            Ok(manifest) => {
+                let text = workspace_gateway_manifest_text(&manifest);
+                workspace_gateway_content(json!({
+                    "ok": true,
+                    "manifest": manifest,
+                    "message": text,
+                }))
+            }
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__list_servers" => match workspace_gateway_manifest(context) {
+            Ok(manifest) => workspace_gateway_content(json!({
+                "ok": true,
+                "generation": manifest["generation"],
+                "servers": manifest["servers"],
+            })),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__get_server_status" => match workspace_gateway_manifest(context) {
+            Ok(manifest) => {
+                let key = input["server_key"].as_str().unwrap_or_default();
+                let server = manifest["servers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|server| server["server_key"].as_str() == Some(key))
+                    .cloned();
+                match server {
+                    Some(server) => workspace_gateway_content(json!({
+                        "ok": true,
+                        "generation": manifest["generation"],
+                        "server": server,
+                    })),
+                    None => workspace_gateway_error_content(format!(
+                        "Unknown workspace MCP server: {key}"
+                    )),
+                }
+            }
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        _ => workspace_gateway_error_content(format!("Unknown gateway tool: {tool}")),
+    }
+}
+
+fn workspace_gateway_external_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+    let Some((server_key, child_tool)) = tool.split_once("__") else {
+        return workspace_gateway_error_content(format!(
+            "Unknown workspace MCP tool `{tool}`. Call workspace_mcp__sync_manifest for the current manifest."
+        ));
+    };
+    let (kernel, workspace_id) = match workspace_gateway_kernel(context) {
+        Ok(value) => value,
+        Err(error) => return workspace_gateway_error_content(error),
+    };
+    let server = match workspace_gateway_server_by_key(&kernel, &workspace_id, server_key) {
+        Ok(Some(server)) => server,
+        Ok(None) => {
+            return workspace_gateway_error_content(format!(
+                "Workspace MCP `{server_key}` is not installed. Call workspace_mcp__sync_manifest for current MCPs."
+            ));
+        }
+        Err(error) => return workspace_gateway_error_content(error),
+    };
+    if !workspace_gateway_server_runtime_enabled(&server) {
+        return workspace_gateway_error_content(format!(
+            "Workspace MCP `{server_key}` is not enabled or configured for this workspace. Call workspace_mcp__sync_manifest for current MCPs."
+        ));
+    }
+    match workspace_gateway_child_call_tool(&server, child_tool, input) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = kernel.record_workspace_mcp_probe_result(
+                &workspace_id,
+                server_key,
+                workspace_gateway_connection_error_status(&error),
+                &error,
+                None,
+            );
+            workspace_gateway_error_content(error)
+        }
+    }
+}
+
+fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
+    match tool {
+        "workspace_mcp__sync_manifest" => {
+            "Refresh the agent's knowledge of enabled workspace MCPs, their namespaces, and config status."
+        }
+        "workspace_mcp__list_servers" => "List installed workspace MCP servers and runtime status.",
+        "workspace_mcp__get_server_status" => "Inspect one workspace MCP server by server_key.",
+        _ => "Workspace MCP gateway tool.",
+    }
+}
+
+fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
+    match tool {
+        "workspace_mcp__get_server_status" => json!({
+            "type": "object",
+            "properties": {
+                "server_key": {"type": "string", "description": "The workspace MCP server key."}
+            },
+            "required": ["server_key"]
+        }),
+        _ => json!({"type": "object", "properties": {}}),
+    }
+}
+
+fn workspace_gateway_kernel(context: &McpContext) -> Result<(CoordinationKernel, String), String> {
+    let Some(repo_path) = context.repo_path.as_deref() else {
+        return Err("Workspace MCP gateway requires repo_path.".to_string());
+    };
+    let db_path = context.db_path.as_deref().map(PathBuf::from);
+    let kernel = CoordinationKernel::open(repo_path, db_path)?;
+    let workspace_id = workspace_gateway_workspace_id(&kernel, context)?;
+    Ok((kernel, workspace_id))
+}
+
+fn workspace_gateway_workspace_id(
+    kernel: &CoordinationKernel,
+    context: &McpContext,
+) -> Result<String, String> {
+    if let Some(workspace_id) = context
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(workspace_id.to_string());
+    }
+    let rows = kernel.query_json(
+        "SELECT workspace_id FROM workspace_mcp_servers
+         UNION
+         SELECT workspace_id FROM workspace_mcp_marketplaces
+         ORDER BY workspace_id ASC",
+        &[],
+    )?;
+    let ids = rows
+        .iter()
+        .filter_map(|row| row["workspace_id"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    match ids.as_slice() {
+        [workspace_id] => Ok((*workspace_id).to_string()),
+        [] => Err("No workspace MCP registry exists yet for this repo.".to_string()),
+        _ => Err(
+            "Multiple workspace MCP registries exist; launch the gateway with --workspace-id."
+                .to_string(),
+        ),
+    }
+}
+
+fn workspace_gateway_servers(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+) -> Result<Vec<Value>, String> {
+    kernel.query_json(
+        "SELECT * FROM workspace_mcp_servers
+         WHERE workspace_id=?1 AND install_state='installed'
+         ORDER BY workspace_enabled DESC, name ASC",
+        &[&workspace_id],
+    )
+}
+
+fn workspace_gateway_server_by_key(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+    server_key: &str,
+) -> Result<Option<Value>, String> {
+    let mut rows = kernel.query_json(
+        "SELECT * FROM workspace_mcp_servers
+         WHERE workspace_id=?1 AND server_key=?2 AND install_state='installed'
+         ORDER BY updated_at DESC LIMIT 1",
+        &[&workspace_id, &server_key],
+    )?;
+    Ok(rows.pop())
+}
+
+fn workspace_gateway_generation(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+) -> Result<String, String> {
+    let rows = kernel.query_json(
+        "SELECT MAX(updated_at) AS generation FROM (
+            SELECT updated_at FROM workspace_mcp_servers WHERE workspace_id=?1
+            UNION ALL
+            SELECT updated_at FROM workspace_mcp_marketplaces WHERE workspace_id=?1
+            UNION ALL
+            SELECT updated_at FROM workspace_mcp_marketplace_indexes WHERE workspace_id=?1
+         )",
+        &[&workspace_id],
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| row["generation"].as_str())
+        .unwrap_or("0")
+        .to_string())
+}
+
+fn workspace_gateway_manifest(context: &McpContext) -> Result<Value, String> {
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let servers = workspace_gateway_servers(&kernel, &workspace_id)?;
+    let public_servers = servers
+        .iter()
+        .map(workspace_gateway_server_public)
+        .collect::<Vec<_>>();
+    let enabled_count = public_servers
+        .iter()
+        .filter(|server| server["runtime_status"].as_str() == Some("enabled"))
+        .count();
+    let config_required_count = public_servers
+        .iter()
+        .filter(|server| server["runtime_status"].as_str() == Some("config_required"))
+        .count();
+    Ok(json!({
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "gateway": {
+            "server_name": "diffforge-workspace-mcp-gateway",
+            "tool_namespace_separator": "__",
+            "hot_reload": "enabled",
+        },
+        "summary": {
+            "installed_count": public_servers.len(),
+            "enabled_count": enabled_count,
+            "config_required_count": config_required_count,
+        },
+        "servers": public_servers,
+    }))
+}
+
+fn workspace_gateway_server_public(server: &Value) -> Value {
+    let missing = workspace_gateway_missing_required_config(server);
+    let workspace_enabled = server["workspace_enabled"].as_i64().unwrap_or_default() != 0;
+    let runtime_status = if !workspace_enabled {
+        "disabled"
+    } else if !missing.is_empty() {
+        "config_required"
+    } else if (server["transport"].as_str() == Some("stdio")
+        && server["command"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty()))
+        || (matches!(
+            server["transport"].as_str(),
+            Some("http" | "streamable-http")
+        ) && server["url"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty()))
+    {
+        "config_required"
+    } else {
+        "enabled"
+    };
+    let server_key = server["server_key"].as_str().unwrap_or_default();
+    json!({
+        "id": server["id"].clone(),
+        "server_key": server_key,
+        "name": server["name"].clone(),
+        "source_kind": server["source_kind"].clone(),
+        "source_label": server["source_label"].clone(),
+        "package_ref": server["package_ref"].clone(),
+        "transport": server["transport"].clone(),
+        "workspace_enabled": workspace_enabled,
+        "runtime_status": runtime_status,
+        "missing_required_config": missing,
+        "tool_namespace": server_key,
+        "tool_prefix": format!("{server_key}__"),
+    })
+}
+
+fn workspace_gateway_manifest_text(manifest: &Value) -> String {
+    let enabled = manifest["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|server| server["runtime_status"].as_str() == Some("enabled"))
+        .map(|server| {
+            format!(
+                "{} under `{}`",
+                server["name"].as_str().unwrap_or("Workspace MCP"),
+                server["tool_prefix"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return format!(
+            "Workspace MCP manifest generation {} is current. No enabled workspace MCPs are available.",
+            manifest["generation"].as_str().unwrap_or("0")
+        );
+    }
+    format!(
+        "Workspace MCP manifest generation {} is current. Enabled MCPs: {}.",
+        manifest["generation"].as_str().unwrap_or("0"),
+        enabled.join(", ")
+    )
+}
+
+fn workspace_gateway_server_runtime_enabled(server: &Value) -> bool {
+    server["workspace_enabled"].as_i64().unwrap_or_default() != 0
+        && workspace_gateway_missing_required_config(server).is_empty()
+        && server["install_state"].as_str().unwrap_or("installed") == "installed"
+}
+
+fn workspace_gateway_missing_required_config(server: &Value) -> Vec<Value> {
+    server["env_schema_json"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["required"].as_bool() == Some(true))
+        .filter_map(|entry| {
+            let key = entry["key"].as_str()?.trim();
+            if key.is_empty()
+                || workspace_gateway_config_value(&server["config_values_json"], key)
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                None
+            } else {
+                Some(json!({
+                    "key": key,
+                    "label": entry["label"].as_str().unwrap_or(key),
+                    "secret": entry["secret"].as_bool().unwrap_or(false),
+                }))
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn workspace_gateway_config_value(config_values: &Value, key: &str) -> Option<String> {
+    let value = config_values.get(key)?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(object) = value.as_object() {
+        return object
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    None
+}
+
+pub(super) fn probe_workspace_mcp_server_connection(server: &Value) -> Value {
+    match workspace_gateway_child_list_tools(server) {
+        Ok(child_tools) => {
+            let tools = child_tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().filter(|value| !value.is_empty()))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            json!({
+                "status": "healthy",
+                "message": format!(
+                    "Workspace gateway listed {} tool{} from this MCP.",
+                    tools.len(),
+                    if tools.len() == 1 { "" } else { "s" }
+                ),
+                "tools": tools,
+            })
+        }
+        Err(error) => json!({
+            "status": workspace_gateway_connection_error_status(&error),
+            "message": error,
+            "tools": [],
+        }),
+    }
+}
+
+fn workspace_gateway_connection_error_status(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("unable to start")
+        || lower.contains("no such file or directory")
+        || lower.contains("os error 2")
+        || lower.contains("not found")
+    {
+        "spawn_failed"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("closed before")
+        || lower.contains("initialize")
+        || lower.contains("handshake")
+        || lower.contains("parse error")
+        || lower.contains("content-length")
+        || lower.contains("framed")
+    {
+        "handshake_failed"
+    } else {
+        "not_connected"
+    }
+}
+
+fn workspace_gateway_child_list_tools(server: &Value) -> Result<Vec<Value>, String> {
+    let result = workspace_gateway_child_request(server, "tools/list", json!({}))?;
+    Ok(result["tools"].as_array().cloned().unwrap_or_default())
+}
+
+fn workspace_gateway_child_call_tool(
+    server: &Value,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    workspace_gateway_child_request(
+        server,
+        "tools/call",
+        json!({
+            "name": tool,
+            "arguments": arguments,
+        }),
+    )
+}
+
+fn workspace_gateway_child_request(
+    server: &Value,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let timeout = if method == "tools/list" {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(180)
+    };
+    let transport = server["transport"].as_str().unwrap_or("stdio");
+    if transport == "stdio" {
+        let mut errors = Vec::new();
+        for rpc_transport in [RpcTransport::JsonLine, RpcTransport::ContentLength] {
+            match workspace_gateway_child_request_with_timeout(
+                server.clone(),
+                method.to_string(),
+                params.clone(),
+                timeout,
+                rpc_transport,
+            ) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    errors.push(format!("{}: {error}", rpc_transport_label(rpc_transport)));
+                }
+            }
+        }
+        return Err(format!(
+            "Workspace MCP stdio request `{method}` failed with JSON-line and Content-Length framing. {}",
+            errors.join(" | ")
+        ));
+    }
+    workspace_gateway_child_request_with_timeout(
+        server.clone(),
+        method.to_string(),
+        params,
+        timeout,
+        RpcTransport::ContentLength,
+    )
+}
+
+fn workspace_gateway_child_request_with_timeout(
+    server: Value,
+    method: String,
+    params: Value,
+    timeout: Duration,
+    rpc_transport: RpcTransport,
+) -> Result<Value, String> {
+    let (result_tx, result_rx) = mpsc::channel();
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let worker_method = method.clone();
+    thread::spawn(move || {
+        let result = workspace_gateway_child_request_blocking(
+            &server,
+            &worker_method,
+            params,
+            pid_tx,
+            rpc_transport,
+        );
+        let _ = result_tx.send(result);
+    });
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Ok(pid) = pid_rx.try_recv() {
+                terminate_workspace_gateway_child(pid);
+            }
+            Err(format!(
+                "Workspace MCP child timed out while handling `{method}`."
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("Workspace MCP child request `{method}` failed."))
+        }
+    }
+}
+
+fn workspace_gateway_child_request_blocking(
+    server: &Value,
+    method: &str,
+    params: Value,
+    pid_tx: mpsc::Sender<u32>,
+    rpc_transport: RpcTransport,
+) -> Result<Value, String> {
+    let transport = server["transport"].as_str().unwrap_or("stdio");
+    if matches!(transport, "http" | "streamable-http") {
+        return workspace_gateway_http_request(server, method, params);
+    }
+    if transport != "stdio" {
+        return Err(format!(
+            "Workspace MCP gateway supports stdio and streamable HTTP MCPs. `{}` uses `{transport}`.",
+            server["name"].as_str().unwrap_or("Workspace MCP")
+        ));
+    }
+    let command = server["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Workspace MCP `{}` has no command configured.",
+                server["name"].as_str().unwrap_or("unknown")
+            )
+        })?;
+    let args = server["args_json"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    let mut child = Command::new(command)
+        .args(&args)
+        .envs(workspace_gateway_child_env(server))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Unable to start workspace MCP `{}` with `{command}`: {error}",
+                server["name"].as_str().unwrap_or(command)
+            )
+        })?;
+    let _ = pid_tx.send(child.id());
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Workspace MCP child stdin was unavailable.".to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Workspace MCP child stdout was unavailable.".to_string())?;
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut text);
+            text
+        })
+    });
+    let mut child_reader = BufReader::new(child_stdout);
+    let result = (|| {
+        workspace_gateway_child_send(
+            &mut child_stdin,
+            &mut child_reader,
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "diffforge-workspace-mcp-gateway", "version": "0.1.0"}
+            }),
+            rpc_transport,
+        )?;
+        write_rpc_response(
+            &mut child_stdin,
+            rpc_transport,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        )?;
+        workspace_gateway_child_send(
+            &mut child_stdin,
+            &mut child_reader,
+            2,
+            method,
+            params,
+            rpc_transport,
+        )
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(workspace_gateway_error_with_stderr(error, stderr_reader)),
+    }
+}
+
+fn workspace_gateway_error_with_stderr(
+    error: String,
+    stderr_reader: Option<thread::JoinHandle<String>>,
+) -> String {
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(stderr) = stderr else {
+        return error;
+    };
+    let snippet = if stderr.chars().count() > 1200 {
+        format!("{}...", stderr.chars().take(1200).collect::<String>())
+    } else {
+        stderr
+    };
+    format!("{error}. Child stderr: {snippet}")
+}
+
+fn workspace_gateway_http_request(
+    server: &Value,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let url = server["url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Workspace MCP `{}` has no HTTP URL configured.",
+                server["name"].as_str().unwrap_or("unknown")
+            )
+        })?
+        .to_string();
+    let method = method.to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Unable to create HTTP MCP runtime: {error}"))?;
+    runtime.block_on(async move {
+        let client = reqwest::Client::new();
+        let (initialize, session_id) = workspace_gateway_http_post(
+            &client,
+            &url,
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "diffforge-workspace-mcp-gateway", "version": "0.1.0"}
+                }
+            }),
+        )
+        .await?;
+        if !initialize["error"].is_null() {
+            return Err(format!(
+                "HTTP MCP initialize failed: {}",
+                initialize["error"]
+            ));
+        }
+        let _ = workspace_gateway_http_post(
+            &client,
+            &url,
+            session_id.as_deref(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        )
+        .await;
+        let (response, _) = workspace_gateway_http_post(
+            &client,
+            &url,
+            session_id.as_deref(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": method,
+                "params": params,
+            }),
+        )
+        .await?;
+        if !response["error"].is_null() {
+            return Err(format!("HTTP MCP request failed: {}", response["error"]));
+        }
+        Ok(response["result"].clone())
+    })
+}
+
+async fn workspace_gateway_http_post(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: Option<&str>,
+    request: Value,
+) -> Result<(Value, Option<String>), String> {
+    let mut builder = client
+        .post(url)
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .json(&request);
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        builder = builder.header("mcp-session-id", session_id);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("Unable to contact HTTP MCP {url}: {error}"))?;
+    let status = response.status();
+    let next_session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Unable to read HTTP MCP response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP MCP {url} returned {status}: {body}"));
+    }
+    if body.trim().is_empty() {
+        return Ok((Value::Null, next_session_id));
+    }
+    let value = workspace_gateway_parse_http_rpc_response(&body)?;
+    Ok((value, next_session_id))
+}
+
+fn workspace_gateway_parse_http_rpc_response(body: &str) -> Result<Value, String> {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        return Ok(value);
+    }
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some(data) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            return Ok(value);
+        }
+    }
+    Err("HTTP MCP response was not JSON or JSON SSE data.".to_string())
+}
+
+fn terminate_workspace_gateway_child(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+fn workspace_gateway_child_send(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    id: i64,
+    method: &str,
+    params: Value,
+    transport: RpcTransport,
+) -> Result<Value, String> {
+    write_rpc_response(
+        stdin,
+        transport,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )?;
+    for _ in 0..50 {
+        let Some(read) = read_rpc_message(reader)? else {
+            return Err(format!("MCP child closed before responding to {method}."));
+        };
+        let (message, _) = read.map_err(|(_, error)| error)?;
+        if message["id"].as_i64() != Some(id) {
+            continue;
+        }
+        if !message["error"].is_null() {
+            return Err(format!("MCP child {method} failed: {}", message["error"]));
+        }
+        return Ok(message["result"].clone());
+    }
+    Err(format!("MCP child did not answer {method}."))
+}
+
+fn workspace_gateway_child_env(server: &Value) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for entry in server["env_schema_json"].as_array().into_iter().flatten() {
+        let Some(key) = entry["key"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if let Some(value) = workspace_gateway_config_value(&server["config_values_json"], key) {
+            env.insert(key.to_string(), value);
+        }
+    }
+    env
+}
+
+fn workspace_gateway_tool_name(server_key: &str, tool_name: &str) -> String {
+    format!("{server_key}__{tool_name}")
+}
+
+fn workspace_gateway_content(value: Value) -> Value {
+    json!({
+        "content": [{"type": "text", "text": value.to_string()}],
+        "isError": value["ok"].as_bool() == Some(false),
+    })
+}
+
+fn workspace_gateway_error_content(error: impl Into<String>) -> Value {
+    workspace_gateway_content(json!({
+        "ok": false,
+        "error": error.into(),
+    }))
+}
+
 #[derive(Clone, Copy)]
 enum RpcTransport {
     JsonLine,
     ContentLength,
+}
+
+fn rpc_transport_label(transport: RpcTransport) -> &'static str {
+    match transport {
+        RpcTransport::JsonLine => "JSON-line",
+        RpcTransport::ContentLength => "Content-Length",
+    }
 }
 
 type RpcReadResult = Result<(Value, RpcTransport), (RpcTransport, String)>;

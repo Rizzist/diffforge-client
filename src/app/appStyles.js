@@ -7973,6 +7973,85 @@ export const McpTitleRow = styled.div`
   }
 `;
 
+export const McpButtonSpinner = styled.i`
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(125, 160, 205, 0.24);
+  border-top-color: var(--forge-blue-soft);
+  border-right-color: var(--forge-amber);
+  border-radius: 50%;
+  animation: ${workspaceCloseSpin} 760ms linear infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    border-top-color: var(--forge-blue);
+    border-right-color: var(--forge-blue-soft);
+  }
+`;
+
+export const McpActionStatus = styled.div`
+  position: relative;
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  overflow: hidden;
+  padding: 9px 10px;
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  border-radius: 8px;
+  color: var(--forge-blue-soft);
+  background: rgba(59, 130, 246, 0.08);
+
+  &::before {
+    position: absolute;
+    inset: 0 auto 0 -38%;
+    width: 38%;
+    background: linear-gradient(90deg, transparent, rgba(125, 176, 255, 0.16), transparent);
+    animation: ${loadingOrangeSweep} 1.35s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+    content: "";
+  }
+
+  > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  span {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  strong,
+  small {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 820;
+  }
+
+  small {
+    color: var(--forge-text-soft);
+    font-size: 11px;
+    font-weight: 650;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.18);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.055);
+  }
+`;
+
 export const McpHeaderMetrics = styled.div`
   display: flex;
   min-width: 0;
@@ -8058,6 +8137,11 @@ export const McpLayout = styled.div`
   align-items: stretch;
   gap: 10px;
   overflow: visible;
+  transition: opacity 160ms ease;
+
+  &[data-busy="true"] {
+    opacity: 0.82;
+  }
 
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
@@ -8214,6 +8298,12 @@ export const McpServerIcon = styled.span`
     background: rgba(21, 27, 35, 0.72);
   }
 
+  &[data-state="blocked"] {
+    border-color: rgba(239, 107, 107, 0.34);
+    color: #ffb4b4;
+    background: rgba(239, 107, 107, 0.1);
+  }
+
   html[data-forge-theme="light"] &,
   html[data-forge-theme="light"] &[data-state="planned"] {
     border-color: var(--forge-border);
@@ -8225,6 +8315,12 @@ export const McpServerIcon = styled.span`
     border-color: rgba(0, 102, 204, 0.2);
     color: var(--forge-blue);
     background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.07);
   }
 `;
 
@@ -8636,7 +8732,11 @@ export const McpInlineActions = styled.span`
   gap: 5px;
 
   button {
+    display: inline-flex;
     min-height: 26px;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
     padding: 0 7px;
     border: 1px solid var(--forge-border);
     border-radius: 6px;
@@ -8722,6 +8822,18 @@ export const McpEmptyAccess = styled.p`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
+  }
+
+  &[data-state="blocked"] {
+    border-color: rgba(239, 107, 107, 0.3);
+    color: #ffb4b4;
+    background: rgba(239, 107, 107, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(180, 35, 24, 0.2);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.06);
   }
 `;
 
@@ -8853,8 +8965,12 @@ export const McpEditorActions = styled.div`
   flex-wrap: wrap;
 
   button {
+    display: inline-flex;
     min-height: 40px;
     min-width: 112px;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
   }
 
   @media (max-width: 680px) {

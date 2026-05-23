@@ -657,6 +657,7 @@ fn terminal_args_with_codex_mcp_identity(
     }
     if is_codex {
         apply_codex_terminal_display_args(&mut next);
+        apply_codex_managed_runtime_isolation_args(&mut next);
     }
     let Some(coordination) = coordination else {
         return next;
@@ -751,6 +752,13 @@ fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
     }
 }
 
+fn apply_codex_managed_runtime_isolation_args(args: &mut Vec<String>) {
+    if !terminal_args_have_option_value(args, "--disable", "", "apps") {
+        args.push("--disable".to_string());
+        args.push("apps".to_string());
+    }
+}
+
 fn apply_codex_coordinated_auto_approval_args(args: &mut Vec<String>, write_root: Option<&str>) {
     if !terminal_args_have_option(args, "--ask-for-approval", "-a") {
         args.push("--ask-for-approval".to_string());
@@ -788,6 +796,15 @@ fn apply_claude_coordinated_auto_approval_args(
     if !terminal_args_have_any_option(args, &["--mcp-config"]) {
         args.push("--mcp-config".to_string());
         args.push(claude_coordination_mcp_config_arg(coordination, coordination_args));
+    }
+    apply_claude_managed_mcp_isolation_args(args);
+}
+
+fn apply_claude_managed_mcp_isolation_args(args: &mut Vec<String>) {
+    if terminal_args_have_any_option(args, &["--mcp-config"])
+        && !terminal_args_have_any_option(args, &["--strict-mcp-config"])
+    {
+        args.push("--strict-mcp-config".to_string());
     }
 }
 
@@ -886,6 +903,22 @@ fn terminal_args_have_option(args: &[String], long: &str, short: &str) -> bool {
         arg == long
             || (!short.is_empty() && arg == short)
             || (!long.is_empty() && arg.starts_with(&format!("{long}=")))
+    })
+}
+
+fn terminal_args_have_option_value(args: &[String], long: &str, short: &str, value: &str) -> bool {
+    let value = value.trim();
+    args.windows(2).any(|pair| {
+        (pair[0] == long || (!short.is_empty() && pair[0] == short)) && pair[1].trim() == value
+    }) || args.iter().any(|arg| {
+        (!long.is_empty()
+            && arg
+                .strip_prefix(&format!("{long}="))
+                .is_some_and(|candidate| candidate.trim() == value))
+            || (!short.is_empty()
+                && arg
+                    .strip_prefix(&format!("{short}="))
+                    .is_some_and(|candidate| candidate.trim() == value))
     })
 }
 

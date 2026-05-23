@@ -6885,6 +6885,9 @@ mod terminal_tests {
             .any(|pair| pair == ["--ask-for-approval", "never"]));
         assert!(args
             .windows(2)
+            .any(|pair| pair == ["--disable", "apps"]));
+        assert!(args
+            .windows(2)
             .any(|pair| pair == ["--sandbox", "workspace-write"]));
         assert!(args
             .windows(2)
@@ -6962,6 +6965,7 @@ mod terminal_tests {
             .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
             .unwrap();
         assert_eq!(mcp_config, claude_config_path);
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(!mcp_config.contains("\"coordination-kernel\""));
         assert!(!mcp_config.contains("terminal_launch_args"));
         assert!(!args
@@ -6993,6 +6997,25 @@ mod terminal_tests {
         );
 
         assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
+        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+    }
+
+    #[test]
+    fn codex_launch_args_do_not_duplicate_apps_disable() {
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &["--disable".to_string(), "apps".to_string()],
+            None,
+            "pane-auto",
+            42,
+        );
+
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--disable" && pair[1] == "apps")
+                .count(),
+            1
+        );
     }
 
     #[test]

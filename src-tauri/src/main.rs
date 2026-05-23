@@ -21,6 +21,17 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--workspace-mcp-gateway") {
+        let mcp_args = args.drain(2..).collect::<Vec<_>>();
+        let context = rust_diffforge_lib::coordination::mcp::McpContext::from_args(&mcp_args);
+        if let Err(error) =
+            rust_diffforge_lib::coordination::mcp::run_workspace_gateway_stdio_server(context)
+        {
+            eprintln!("workspace mcp gateway error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--cloud-mcp-proxy") {
         let proxy_args = args.drain(2..).collect::<Vec<_>>();
         if let Err(error) = rust_diffforge_lib::run_cloud_mcp_stdio_proxy(proxy_args) {

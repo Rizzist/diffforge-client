@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 
 import {
   ButtonHubIcon,
   ButtonKeyIcon,
+  McpActionStatus,
+  McpButtonSpinner,
   McpAccessGrid,
   McpAccessPanel,
   McpAccessTopline,
@@ -288,6 +290,100 @@ function serverStatus(server, draftValues) {
   };
 }
 
+function enabledConnectionIssue(server, statusInfo, draftValues) {
+  if (!server || server.built_in || !server.workspace_enabled) return false;
+  if (!hasRequiredConfig(server, draftValues || server.config_values_json)) return false;
+  return statusInfo?.state === "blocked";
+}
+
+function connectionMessage(server, statusInfo) {
+  if (!server) return "";
+  const explicit = String(server.connection_message || server.last_probe_message || "").trim();
+  if (explicit) return explicit;
+  if (!server.workspace_enabled) {
+    return "This MCP is installed but disabled for this workspace.";
+  }
+  if (statusInfo?.label === "Config required") {
+    return "Required workspace configuration is missing.";
+  }
+  if (statusInfo?.state === "blocked") {
+    return "This MCP is enabled, but the workspace gateway could not connect to it yet.";
+  }
+  return "The workspace gateway can expose this MCP to active coding agents.";
+}
+
+function actionCopy(actionState, context = {}) {
+  const name = context.name || context.source || "MCP";
+  switch (actionState) {
+    case "adding_marketplace":
+      return {
+        title: `Adding ${name}`,
+        detail: "Saving the marketplace, indexing its plugins, and refreshing discovered MCPs.",
+      };
+    case "indexing_marketplace":
+      return {
+        title: `Indexing ${name}`,
+        detail: "Refreshing the source cache and rebuilding the MCP catalog.",
+      };
+    case "installing_catalog":
+      return {
+        title: `Adding ${name}`,
+        detail: "Binding the global MCP to this workspace and refreshing connection status.",
+      };
+    case "installing_manual":
+      return {
+        title: `Adding ${name}`,
+        detail: "Saving the global MCP definition and checking this workspace.",
+      };
+    case "enabling_mcp":
+      return {
+        title: `Enabling ${name}`,
+        detail: "Saving workspace enablement and checking the MCP connection.",
+      };
+    case "disabling_mcp":
+      return {
+        title: `Disabling ${name}`,
+        detail: "Updating workspace enablement and refreshing available MCPs.",
+      };
+    case "saving_config":
+      return {
+        title: `Saving ${name}`,
+        detail: "Updating workspace configuration and checking the MCP connection.",
+      };
+    case "removing_marketplace":
+      return {
+        title: `Removing ${name}`,
+        detail: "Updating sources and refreshing discovered MCPs.",
+      };
+    case "uninstalling_mcp":
+      return {
+        title: `Uninstalling ${name}`,
+        detail: "Removing the MCP from this workspace and refreshing the registry.",
+      };
+    case "refreshing":
+    case "loading":
+      return {
+        title: "Refreshing MCP registry",
+        detail: "Loading installed MCPs, sources, catalog entries, and connection status.",
+      };
+    default:
+      return {
+        title: "Working on MCPs",
+        detail: "Updating the workspace MCP registry.",
+      };
+  }
+}
+
+function buttonContent(isWorking, label, workingLabel = "Working") {
+  if (!isWorking) return label;
+  return (
+    <>
+      <McpButtonSpinner aria-hidden="true" />
+      {workingLabel}
+    </>
+  );
+}
+
 function isInstalled(catalogItem, servers) {
   return servers.some((server) => server.server_key === catalogItem.server_key);
 }
@@ -438,12 +534,20 @@ function parseMcpAddCommand(value) {
   const optionTokens = tokens.slice(addIndex + 1, separatorIndex >= 0 ? separatorIndex : undefined);
   const commandTokens = separatorIndex >= 0 ? tokens.slice(separatorIndex + 1) : [];
   const envPairs = [];
+  const positionalTokens = [];
   let name = "";
   let transport = "stdio";
   let url = "";
 
   for (let index = 0; index < optionTokens.length; index += 1) {
     const token = optionTokens[index];
+    if (token === "--scope" || token === "-s" || token === "--config" || token === "-c") {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("--scope=") || token.startsWith("--config=")) {
+      continue;
+    }
     if (token === "--env" || token === "-e") {
       const pair = parseEnvPair(optionTokens[index + 1]);
       if (pair) envPairs.push(pair);
@@ -479,13 +583,21 @@ function parseMcpAddCommand(value) {
       transport = token.slice("--type=".length) || transport;
       continue;
     }
-    if (!token.startsWith("-") && !name) {
-      name = token;
+    if (!token.startsWith("-")) {
+      positionalTokens.push(token);
     }
   }
 
   const provider = cli === "claude" ? "claude" : "codex";
   const providerText = providerLabel(provider);
+  name = name || positionalTokens[0] || "";
+  if (!commandTokens.length && positionalTokens.length > 1) {
+    if (transport === "http" || transport === "sse" || transport === "streamable-http") {
+      url = url || positionalTokens[1] || "";
+    } else {
+      commandTokens.push(...positionalTokens.slice(1));
+    }
+  }
   const command = commandTokens[0] || "";
   const args = commandTokens.slice(1);
   const sourceKind = `${provider}_custom_mcp`;
@@ -606,6 +718,22 @@ export default function McpsWorkspaceView({
   const [manualDraft, setManualDraft] = useState(EMPTY_MANUAL);
   const [marketplaceDraft, setMarketplaceDraft] = useState(EMPTY_MARKETPLACE);
   const [actionState, setActionState] = useState("idle");
+  const [actionContext, setActionContext] = useState({});
+  const selectedIdRef = useRef(selectedId);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  const beginAction = useCallback((nextState, nextContext = {}) => {
+    setActionContext(nextContext);
+    setActionState(nextState);
+  }, []);
+
+  const finishAction = useCallback(() => {
+    setActionState("idle");
+    setActionContext({});
+  }, []);
 
   const refresh = useCallback(async () => {
     setError("");
@@ -626,14 +754,14 @@ export default function McpsWorkspaceView({
       setRegistry(data);
       setStatus("ready");
       const servers = asArray(data.servers);
-      if (!servers.some((server) => server.id === selectedId)) {
+      if (!servers.some((server) => server.id === selectedIdRef.current)) {
         setSelectedId(servers[0]?.id || "coordination-kernel");
       }
     } catch (caught) {
       setStatus("error");
       setError(errorMessage(caught));
     }
-  }, [commandBase, repoPath, selectedId, workspaceId, workspaceName]);
+  }, [commandBase, repoPath, workspaceId, workspaceName]);
 
   useEffect(() => {
     refresh();
@@ -680,7 +808,7 @@ export default function McpsWorkspaceView({
   const installCatalogItem = useCallback(
     async (item) => {
       if (!workspaceId || !item) return;
-      setActionState("installing");
+      beginAction("installing_catalog", { name: item.name });
       setError("");
       try {
         const response = await invoke("coordination_install_workspace_mcp_server", {
@@ -707,22 +835,22 @@ export default function McpsWorkspaceView({
         const installed = asArray(data.servers).find(
           (server) => server.server_key === item.server_key,
         );
-        setSelectedId(installed?.id || selectedId);
+        setSelectedId(installed?.id || selectedIdRef.current);
         setView(VIEW_INSTALLED);
         setEditorMode(EDITOR_DETAILS);
       } catch (caught) {
         setError(errorMessage(caught));
       } finally {
-        setActionState("idle");
+        finishAction();
       }
     },
-    [commandBase, replaceRegistry, selectedId, workspaceId, workspaceName],
+    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
   );
 
   const indexMarketplace = useCallback(
     async (marketplace) => {
       if (!workspaceId || !marketplace?.id) return null;
-      setActionState("indexing");
+      beginAction("indexing_marketplace", { name: marketplace.name });
       setError("");
       try {
         const response = await invoke("coordination_index_workspace_mcp_marketplace", {
@@ -736,16 +864,17 @@ export default function McpsWorkspaceView({
         await refresh();
         return null;
       } finally {
-        setActionState("idle");
+        finishAction();
       }
     },
-    [commandBase, refresh, replaceRegistry, workspaceId],
+    [beginAction, commandBase, finishAction, refresh, replaceRegistry, workspaceId],
   );
 
   const installManual = useCallback(async () => {
     if (!workspaceId || !manualDraft.name.trim()) return;
     const envSchema = safeJsonArray(manualDraft.envSchema, []);
-    setActionState("installing");
+    const manualName = manualDraft.name.trim();
+    beginAction("installing_manual", { name: manualName });
     setError("");
     try {
       const response = await invoke("coordination_install_workspace_mcp_server", {
@@ -753,7 +882,7 @@ export default function McpsWorkspaceView({
         workspaceId,
         input: {
           workspace_name: workspaceName,
-          name: manualDraft.name.trim(),
+          name: manualName,
           source_kind: manualDraft.sourceKind || "manual",
           source_label: manualDraft.sourceLabel.trim() || "Manual",
           package_ref: manualDraft.packageRef.trim(),
@@ -769,25 +898,25 @@ export default function McpsWorkspaceView({
       });
       const data = replaceRegistry(response);
       const installed = asArray(data.servers).find(
-        (server) => server.name === manualDraft.name.trim(),
+        (server) => server.name === manualName,
       );
-      setSelectedId(installed?.id || selectedId);
+      setSelectedId(installed?.id || selectedIdRef.current);
       setManualDraft(EMPTY_MANUAL);
       setView(VIEW_INSTALLED);
       setEditorMode(EDITOR_DETAILS);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
-      setActionState("idle");
+      finishAction();
     }
-  }, [commandBase, manualDraft, replaceRegistry, selectedId, workspaceId, workspaceName]);
+  }, [beginAction, commandBase, finishAction, manualDraft, replaceRegistry, workspaceId, workspaceName]);
 
   const saveMarketplace = useCallback(async () => {
     const parsed = parseMarketplaceCommand(marketplaceDraft.provider, marketplaceDraft.command);
     if (!workspaceId || !parsed.source) {
       return;
     }
-    setActionState("saving");
+    beginAction("adding_marketplace", { name: parsed.name, source: parsed.source });
     setError("");
     try {
       const response = await invoke("coordination_add_workspace_mcp_marketplace", {
@@ -809,10 +938,12 @@ export default function McpsWorkspaceView({
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
-      setActionState("idle");
+      finishAction();
     }
   }, [
+    beginAction,
     commandBase,
+    finishAction,
     marketplaceDraft,
     replaceRegistry,
     workspaceId,
@@ -822,7 +953,7 @@ export default function McpsWorkspaceView({
   const removeMarketplace = useCallback(
     async (marketplace) => {
       if (!workspaceId || !marketplace?.id) return;
-      setActionState("saving");
+      beginAction("removing_marketplace", { name: marketplace.name });
       setError("");
       try {
         await invoke("coordination_remove_workspace_mcp_marketplace", {
@@ -833,16 +964,26 @@ export default function McpsWorkspaceView({
       } catch (caught) {
         setError(errorMessage(caught));
       } finally {
-        setActionState("idle");
+        finishAction();
       }
     },
-    [commandBase, replaceRegistry, workspaceId],
+    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId],
   );
 
   const updateSelected = useCallback(
     async (next) => {
       if (!workspaceId || !selectedServer || selectedServer.built_in) return;
-      setActionState("saving");
+      const nextEnabled =
+        typeof next.workspace_enabled === "boolean"
+          ? next.workspace_enabled
+          : selectedServer.workspace_enabled;
+      const nextActionState =
+        typeof next.workspace_enabled === "boolean"
+          ? nextEnabled
+            ? "enabling_mcp"
+            : "disabling_mcp"
+          : "saving_config";
+      beginAction(nextActionState, { name: selectedServer.name });
       setError("");
       try {
         const response = await invoke("coordination_update_workspace_mcp_server", {
@@ -860,15 +1001,15 @@ export default function McpsWorkspaceView({
       } catch (caught) {
         setError(errorMessage(caught));
       } finally {
-        setActionState("idle");
+        finishAction();
       }
     },
-    [commandBase, configDraft, replaceRegistry, selectedServer, workspaceId, workspaceName],
+    [beginAction, commandBase, configDraft, finishAction, replaceRegistry, selectedServer, workspaceId, workspaceName],
   );
 
   const uninstallSelected = useCallback(async () => {
     if (!workspaceId || !selectedServer || selectedServer.built_in) return;
-    setActionState("saving");
+    beginAction("uninstalling_mcp", { name: selectedServer.name });
     setError("");
     try {
       const response = await invoke("coordination_uninstall_workspace_mcp_server", {
@@ -881,9 +1022,9 @@ export default function McpsWorkspaceView({
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
-      setActionState("idle");
+      finishAction();
     }
-  }, [commandBase, replaceRegistry, selectedServer, workspaceId]);
+  }, [beginAction, commandBase, finishAction, replaceRegistry, selectedServer, workspaceId]);
 
   const renderInstalledList = () => (
     <McpServerList>
@@ -923,6 +1064,8 @@ export default function McpsWorkspaceView({
       />
       {filteredCatalog.map((item) => {
         const installed = isInstalled(item, servers);
+        const installingThis =
+          actionState === "installing_catalog" && actionContext.name === item.name;
         return (
           <McpServerButton
             as="div"
@@ -945,7 +1088,9 @@ export default function McpsWorkspaceView({
                 onClick={() => installCatalogItem(item)}
                 type="button"
               >
-                {installed ? "Installed" : "Install"}
+                {installed
+                  ? "Added"
+                  : buttonContent(installingThis, "Add", "Adding")}
               </button>
             </McpInlineActions>
           </McpServerButton>
@@ -955,11 +1100,12 @@ export default function McpsWorkspaceView({
         <McpEmptyAccess>
           {marketplaces.length
             ? "No MCPs discovered yet. Refresh indexed sources or check source errors."
-            : "Add a source to discover workspace MCPs."}
+            : "Add a global source to discover MCPs."}
         </McpEmptyAccess>
       )}
       <McpInlineActions>
         <button
+          disabled={actionState !== "idle"}
           onClick={() => {
             setEditorMode(EDITOR_MANUAL);
             setView(VIEW_DISCOVER);
@@ -975,46 +1121,53 @@ export default function McpsWorkspaceView({
   const renderMarketplaceList = () => (
     <McpServerList>
       {marketplaces.length ? (
-        marketplaces.map((marketplace) => (
-          <McpServerButton as="div" data-active="false" key={marketplace.id}>
-            <McpServerIcon
-              data-state={marketplace.index_status === "failed" ? "blocked" : "enabled"}
-            >
-              <ButtonKeyIcon aria-hidden="true" />
-            </McpServerIcon>
-            <McpServerCopy>
-              <strong>{marketplace.name}</strong>
-              <span>
-                {providerLabel(marketplace.provider)} marketplace · {marketplace.source} ·{" "}
-                {titleCase(marketplace.index_status || marketplace.status)}
-                {Number(marketplace.mcp_count || 0) > 0
-                  ? ` · ${marketplace.mcp_count} MCPs`
-                  : ""}
-              </span>
-            </McpServerCopy>
-            <McpInlineActions>
-              <button
-                disabled={actionState !== "idle"}
-                onClick={() => indexMarketplace(marketplace)}
-                type="button"
+        marketplaces.map((marketplace) => {
+          const indexingThis =
+            actionState === "indexing_marketplace" && actionContext.name === marketplace.name;
+          const removingThis =
+            actionState === "removing_marketplace" && actionContext.name === marketplace.name;
+          return (
+            <McpServerButton as="div" data-active="false" key={marketplace.id}>
+              <McpServerIcon
+                data-state={marketplace.index_status === "failed" ? "blocked" : "enabled"}
               >
-                Refresh
-              </button>
-              <button
-                disabled={actionState !== "idle"}
-                onClick={() => removeMarketplace(marketplace)}
-                type="button"
-              >
-                Remove
-              </button>
-            </McpInlineActions>
-          </McpServerButton>
-        ))
+                <ButtonKeyIcon aria-hidden="true" />
+              </McpServerIcon>
+              <McpServerCopy>
+                <strong>{marketplace.name}</strong>
+                <span>
+                  {providerLabel(marketplace.provider)} marketplace · {marketplace.source} ·{" "}
+                  {titleCase(marketplace.index_status || marketplace.status)}
+                  {Number(marketplace.mcp_count || 0) > 0
+                    ? ` · ${marketplace.mcp_count} MCPs`
+                    : ""}
+                </span>
+              </McpServerCopy>
+              <McpInlineActions>
+                <button
+                  disabled={actionState !== "idle"}
+                  onClick={() => indexMarketplace(marketplace)}
+                  type="button"
+                >
+                  {buttonContent(indexingThis, "Refresh", "Indexing")}
+                </button>
+                <button
+                  disabled={actionState !== "idle"}
+                  onClick={() => removeMarketplace(marketplace)}
+                  type="button"
+                >
+                  {buttonContent(removingThis, "Remove", "Removing")}
+                </button>
+              </McpInlineActions>
+            </McpServerButton>
+          );
+        })
       ) : (
-        <McpEmptyAccess>No workspace marketplaces added yet.</McpEmptyAccess>
+        <McpEmptyAccess>No global marketplaces added yet.</McpEmptyAccess>
       )}
       <McpInlineActions>
         <button
+          disabled={actionState !== "idle"}
           onClick={() => {
             setEditorMode(EDITOR_MARKETPLACE);
             setView(VIEW_MARKETPLACES);
@@ -1034,8 +1187,8 @@ export default function McpsWorkspaceView({
         <McpEditorHeader>
           <div>
             <PanelKicker>Manual MCP</PanelKicker>
-            <PanelHeading>Install workspace MCP</PanelHeading>
-            <PageSubline>Paste a Codex or Claude Code MCP command, then adjust the generated fields.</PageSubline>
+            <PanelHeading>Add global MCP</PanelHeading>
+            <PageSubline>Paste a Codex or Claude Code MCP command, then keep enablement and config workspace-local.</PageSubline>
           </div>
         </McpEditorHeader>
         <McpFieldGrid>
@@ -1190,13 +1343,19 @@ export default function McpsWorkspaceView({
         </McpWideField>
         </McpFieldGrid>
         <McpEditorActions>
-          <button onClick={() => setEditorMode(EDITOR_DETAILS)} type="button">Cancel</button>
+          <button
+            disabled={actionState !== "idle"}
+            onClick={() => setEditorMode(EDITOR_DETAILS)}
+            type="button"
+          >
+            Cancel
+          </button>
           <button
             disabled={!manualDraft.name.trim() || actionState !== "idle"}
             onClick={installManual}
             type="button"
           >
-            Install
+            {buttonContent(actionState === "installing_manual", "Add MCP", "Adding")}
           </button>
         </McpEditorActions>
       </McpEditorPanel>
@@ -1247,13 +1406,19 @@ export default function McpsWorkspaceView({
         )}
       </McpFieldGrid>
       <McpEditorActions>
-        <button onClick={() => setEditorMode(EDITOR_DETAILS)} type="button">Cancel</button>
+        <button
+          disabled={actionState !== "idle"}
+          onClick={() => setEditorMode(EDITOR_DETAILS)}
+          type="button"
+        >
+          Cancel
+        </button>
         <button
           disabled={!parsedMarketplace.source || actionState !== "idle"}
           onClick={saveMarketplace}
           type="button"
         >
-          Add Marketplace
+          {buttonContent(actionState === "adding_marketplace", "Add Marketplace", "Adding")}
         </button>
       </McpEditorActions>
     </McpEditorPanel>
@@ -1267,6 +1432,12 @@ export default function McpsWorkspaceView({
         </McpEditorPanel>
       );
     }
+    const showConnectionIssue = enabledConnectionIssue(
+      selectedServer,
+      selectedStatus,
+      configDraft,
+    );
+    const selectedConnectionMessage = connectionMessage(selectedServer, selectedStatus);
 
     return (
       <McpEditorPanel>
@@ -1285,11 +1456,15 @@ export default function McpsWorkspaceView({
               actionState !== "idle" ||
               (!selectedServer.workspace_enabled && !canEnableSelected)
             }
-            onClick={() => updateSelected({ workspace_enabled: !selectedServer.workspace_enabled })}
-            type="button"
-          >
-            <span aria-hidden="true" />
-            {selectedServer.workspace_enabled ? "Enabled" : "Disabled"}
+              onClick={() => updateSelected({ workspace_enabled: !selectedServer.workspace_enabled })}
+              type="button"
+            >
+              <span aria-hidden="true" />
+            {buttonContent(
+              actionState === "enabling_mcp" || actionState === "disabling_mcp",
+              selectedServer.workspace_enabled ? "Enabled" : "Disabled",
+              actionState === "enabling_mcp" ? "Enabling" : "Disabling",
+            )}
           </McpSwitchButton>
         </McpEditorHeader>
 
@@ -1308,7 +1483,7 @@ export default function McpsWorkspaceView({
                 <ButtonHubIcon aria-hidden="true" />
                 Workspace status
               </span>
-              <McpStatusBadge data-state={selectedStatus.state}>
+              <McpStatusBadge data-state={selectedStatus.state} title={selectedConnectionMessage}>
                 {selectedStatus.label}
               </McpStatusBadge>
             </McpAccessTopline>
@@ -1317,6 +1492,11 @@ export default function McpsWorkspaceView({
               <McpToolChip>{selectedServer.config_status || "configured"}</McpToolChip>
               <McpToolChip>{selectedServer.install_state || "installed"}</McpToolChip>
             </McpToolList>
+            {showConnectionIssue && (
+              <McpEmptyAccess data-state="blocked" role="alert">
+                {selectedConnectionMessage}
+              </McpEmptyAccess>
+            )}
           </McpAccessPanel>
           <McpAccessPanel>
             <McpAccessTopline>
@@ -1384,7 +1564,7 @@ export default function McpsWorkspaceView({
                 onClick={() => updateSelected({ config_values: configDraft })}
                 type="button"
               >
-                Save Config
+                {buttonContent(actionState === "saving_config", "Save Config", "Saving")}
               </button>
             </McpEditorActions>
           )}
@@ -1453,7 +1633,7 @@ export default function McpsWorkspaceView({
               onClick={uninstallSelected}
               type="button"
             >
-              Uninstall
+              {buttonContent(actionState === "uninstalling_mcp", "Uninstall", "Uninstalling")}
             </button>
           </McpEditorActions>
         )}
@@ -1463,6 +1643,9 @@ export default function McpsWorkspaceView({
 
   const summary = registry?.summary || {};
   const isLoading = status === "loading";
+  const isActionBusy = actionState !== "idle";
+  const isBusy = isActionBusy || isLoading;
+  const busyCopy = actionCopy(isActionBusy ? actionState : "loading", actionContext);
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
@@ -1474,7 +1657,7 @@ export default function McpsWorkspaceView({
           <div>
             <PanelKicker>MCPs</PanelKicker>
             <PanelHeading>{workspaceName} context servers</PanelHeading>
-            <PageSubline>Workspace-scoped install, configuration, and enablement.</PageSubline>
+            <PageSubline>Global discovery with workspace-scoped configuration and enablement.</PageSubline>
           </div>
           <McpHeaderMetrics aria-label="MCP summary">
             <McpMetricPill data-state="enabled">
@@ -1491,6 +1674,7 @@ export default function McpsWorkspaceView({
             </McpMetricPill>
             <McpInlineActions>
               <button
+                disabled={isBusy}
                 onClick={() => {
                   setView(VIEW_DISCOVER);
                   setEditorMode(EDITOR_DETAILS);
@@ -1500,6 +1684,7 @@ export default function McpsWorkspaceView({
                 Add MCP
               </button>
               <button
+                disabled={isBusy}
                 onClick={() => {
                   setView(VIEW_MARKETPLACES);
                   setEditorMode(EDITOR_MARKETPLACE);
@@ -1508,15 +1693,24 @@ export default function McpsWorkspaceView({
               >
                 Add Marketplace
               </button>
-              <button disabled={isLoading} onClick={refresh} type="button">
-                Refresh
+              <button disabled={isBusy} onClick={refresh} type="button">
+                {buttonContent(isLoading && !isActionBusy, "Refresh", "Refreshing")}
               </button>
             </McpInlineActions>
           </McpHeaderMetrics>
         </McpTitleRow>
+        {isBusy && (
+          <McpActionStatus aria-live="polite">
+            <McpButtonSpinner aria-hidden="true" />
+            <span>
+              <strong>{busyCopy.title}</strong>
+              <small>{busyCopy.detail}</small>
+            </span>
+          </McpActionStatus>
+        )}
       </McpHeaderPanel>
 
-      <McpLayout>
+      <McpLayout data-busy={isBusy ? "true" : "false"}>
         <McpRegistryPanel>
           <McpPanelTopline>
             <span>Registry</span>
