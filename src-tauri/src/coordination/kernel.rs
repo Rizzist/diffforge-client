@@ -4282,10 +4282,18 @@ impl CoordinationKernel {
             .execute(
                 "UPDATE task_resource_intents
                  SET status='resume_requested', updated_at=?1
-                 WHERE task_id=?2 AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+                 WHERE task_id=?2 AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready')",
                 params![now, task_id],
             )
             .map_err(|error| format!("Unable to mark task resume requested: {error}"))?;
+        if updated == 0 {
+            return Ok(api_ok(json!({
+                "task_id": task_id,
+                "status": "resume_requested",
+                "updated_resource_intents": updated,
+                "idempotent": true,
+            })));
+        }
         let session = self
             .query_json(
                 "SELECT agent_id, agent_slot_id FROM agent_sessions WHERE id=?1 LIMIT 1",
@@ -23711,13 +23719,32 @@ APPWRITE_PROJECT_ID = "project"
                 params![uuid(), &task_id, now_rfc3339()],
             )
             .unwrap();
-        kernel
+        let first_resume_requested = kernel
             .mark_task_resume_requested(
                 &task_id,
                 &session_id,
                 "test_terminal_resume_prompt_written",
             )
             .unwrap();
+        assert_eq!(
+            first_resume_requested["data"]["updated_resource_intents"].as_i64(),
+            Some(1)
+        );
+        let duplicate_resume_requested = kernel
+            .mark_task_resume_requested(
+                &task_id,
+                &session_id,
+                "test_duplicate_terminal_resume_prompt_written",
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_resume_requested["data"]["updated_resource_intents"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            duplicate_resume_requested["data"]["idempotent"].as_bool(),
+            Some(true)
+        );
         let resume_intent = kernel
             .query_one(
                 "SELECT status FROM task_resource_intents WHERE task_id=?1 LIMIT 1",

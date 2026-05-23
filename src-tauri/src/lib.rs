@@ -552,6 +552,7 @@ struct TerminalParkedPrompt {
     voice_plan_prompt: Option<CloudMcpVoicePlanPromptMetadata>,
     coordination: TerminalCoordinationSession,
     working_directory: PathBuf,
+    resume_claimed: bool,
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]

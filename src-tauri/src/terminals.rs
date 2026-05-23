@@ -4626,7 +4626,7 @@ async fn terminal_find_parked_prompt_for_task(
     let guard = parked_prompts.read().await;
     guard
         .values()
-        .find(|parked| parked.task_id == task_id)
+        .find(|parked| parked.task_id == task_id && !parked.resume_claimed)
         .cloned()
 }
 
@@ -4807,7 +4807,7 @@ async fn terminal_register_parked_prompt_from_snapshot(
             if changed {
                 prompt_to_emit = Some(existing.clone());
             }
-            if ready {
+            if ready && !existing.resume_claimed {
                 prompt_to_resume = Some(existing.clone());
                 prompt_to_mark = Some(existing.clone());
             }
@@ -4822,6 +4822,7 @@ async fn terminal_register_parked_prompt_from_snapshot(
                 voice_plan_prompt: voice_plan_prompt.clone(),
                 coordination,
                 working_directory: instance.working_directory.as_ref().clone(),
+                resume_claimed: false,
             };
             guard.insert(parked_key, parked.clone());
             prompt_to_emit = Some(parked.clone());
@@ -4918,7 +4919,27 @@ async fn terminal_resume_parked_prompt_once(
         return false;
     }
 
-    let Some(parked) = parked_prompts.read().await.get(&parked_key).cloned() else {
+    let Some(parked) = ({
+        let mut guard = parked_prompts.write().await;
+        match guard.get_mut(&parked_key) {
+            Some(parked) if parked.resume_claimed => {
+                log_terminal_crash_forensics_event(
+                    "backend.parked_resume.duplicate_claim_skipped",
+                    json!({
+                        "instance_id": parked.instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                        "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
+                    }),
+                );
+                None
+            }
+            Some(parked) => {
+                parked.resume_claimed = true;
+                Some(parked.clone())
+            }
+            None => None,
+        }
+    }) else {
         return false;
     };
 
@@ -5132,6 +5153,70 @@ async fn terminal_resume_parked_prompt_once(
                 "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
             }),
         );
+    }
+
+    let resumed_prompt_submitted_at = crate::coordination::kernel::now_rfc3339();
+    let prompt_metadata = parked.voice_plan_prompt.as_ref();
+    let resumed_prompt_event_id = prompt_metadata.map(|metadata| metadata.prompt_event_id.as_str());
+    let resumed_prompt_event_source = prompt_metadata
+        .and_then(|metadata| metadata.prompt_event_source.as_deref())
+        .or(Some("terminal-parked-resume"));
+    let resumed_thread_id = prompt_metadata.and_then(|metadata| metadata.thread_id.as_deref());
+    emit_terminal_prompt_submitted(
+        &app,
+        &instance,
+        &resume_request,
+        resumed_prompt_event_id,
+        None,
+        resumed_prompt_event_source,
+        Some(&resumed_prompt_submitted_at),
+        Some(&resume_request),
+        Some(&resume_request),
+        true,
+        "parked_resume_backend_submit",
+        resumed_thread_id,
+    );
+    if *instance.agent_started.lock().await {
+        let cloud_state = cloud_mcp_state.clone();
+        let pane_id_for_context = parked.pane_id.clone();
+        let working_directory = parked.working_directory.clone();
+        let coordination = Some(parked.coordination.clone());
+        let terminal_instance_id = instance.id;
+        let local_task_id = Some(parked.task_id.clone());
+        let local_task_title = Some(parked.title.clone());
+        let metadata = instance.metadata.clone();
+        let prompt_metadata = CloudMcpTerminalPromptMetadata {
+            prompt_event_id: resumed_prompt_event_id.map(str::to_string),
+            prompt_event_source: resumed_prompt_event_source.map(str::to_string),
+            prompt_event_submitted_at: Some(resumed_prompt_submitted_at.clone()),
+            terminal_index: prompt_metadata
+                .and_then(|metadata| metadata.terminal_index)
+                .or(metadata.terminal_index),
+            thread_id: resumed_thread_id
+                .map(str::to_string)
+                .or_else(|| Some(metadata.thread_id.clone())),
+            workspace_id: prompt_metadata
+                .map(|metadata| metadata.workspace_id.clone())
+                .unwrap_or_else(|| metadata.workspace_id.clone()),
+            workspace_name: prompt_metadata
+                .map(|metadata| metadata.workspace_name.clone())
+                .unwrap_or_else(|| metadata.workspace_name.clone()),
+        };
+        let prompt_for_cloud = resume_request.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_terminal_context_pack_for_prompt(
+                cloud_state,
+                pane_id_for_context,
+                terminal_instance_id,
+                working_directory,
+                coordination,
+                local_task_id,
+                local_task_title,
+                prompt_for_cloud,
+                Some(prompt_metadata),
+            )
+            .await;
+        });
     }
 
     if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
