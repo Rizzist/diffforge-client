@@ -45,6 +45,9 @@ import {
   logBigViewSyncDiagnosticEvent,
   logFileDragDiagnosticEvent,
 } from "../threads/bigViewSyncDiagnostics";
+import {
+  getThreadTerminalGroundTruth,
+} from "../threads/threadTerminalGroundTruth.js";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
@@ -6538,17 +6541,23 @@ function TerminalView({
         hasPendingPrompt: Boolean(fields.targetThread?.pendingPrompt),
         hasResolvedBinding: Boolean(fields.targetBinding?.instanceId),
         hasTargetThread: Boolean(fields.targetThread?.id),
+        inputReadyAt: fields.inputReadyAt || "",
         latestTurnState: fields.latestTurnState || "",
+        effectiveLatestTurnState: fields.effectiveLatestTurnState || "",
         message,
         reason,
         recordedAgentInputReady: Boolean(fields.recordedAgentInputReady),
         completedTurnLooksSendable: Boolean(fields.completedTurnLooksSendable),
+        inputReadyIsFreshForTurn: Boolean(fields.inputReadyIsFreshForTurn),
         orphanRunningLooksIdle: Boolean(fields.orphanRunningLooksIdle),
         requiresAgentInputReady: Boolean(fields.requiresAgentInputReady),
+        runningTurnLooksIdle: Boolean(fields.runningTurnLooksIdle),
         sourceItem: getTodoQueueItemLogSummary(item ? [item] : [])[0] || null,
         targetRole: fields.targetRole || "",
         targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
+        terminalGroundTruthStatus: fields.terminalGroundTruthStatus || "",
         terminalStatus: fields.terminalStatus || "",
+        turnStartedAt: fields.turnStartedAt || "",
         workspaceId: fields.workspaceId || baseWorkspaceId,
       });
     };
@@ -6603,63 +6612,49 @@ function TerminalView({
       paneId: resolvedBinding?.paneId || paneId,
     });
     const workspaceId = targetThread?.workspaceId || baseWorkspaceId;
-    const terminalStatus = String(liveTerminal?.status || "").trim().toLowerCase();
-    const latestTurnState = String(targetThread?.latestTurn?.state || "").trim().toLowerCase();
-    const activityStatus = String(
-      targetThread?.activityStatus
-        || targetProviderBinding?.activityStatus
-        || "",
-    ).trim().toLowerCase();
-    const targetMessageCount = Number.parseInt(targetThread?.messageCount || 0, 10);
-    const providerBindings = targetThread?.providerBindings
-      && typeof targetThread.providerBindings === "object"
-      && !Array.isArray(targetThread.providerBindings)
-      ? targetThread.providerBindings
-      : {};
-    const providerBindingsHaveNativeSession = Object.values(providerBindings).some((binding) => (
-      Boolean(String(binding?.nativeSessionId || "").trim())
-    ));
-    const orphanRunningLooksIdle = Boolean(
-      latestTurnState === "running"
-        && (!Number.isInteger(targetMessageCount) || targetMessageCount <= 0)
-        && !(Array.isArray(targetThread?.messages) && targetThread.messages.length > 0)
-        && !(Array.isArray(targetThread?.projectionEvents) && targetThread.projectionEvents.length > 0)
-        && !targetThread?.pendingPrompt
-        && !String(targetThread?.transcriptSessionId || "").trim()
-        && !providerBindingsHaveNativeSession
-    );
-    const effectiveActivityStatus = orphanRunningLooksIdle && activityStatus === "thinking"
-      ? "idle"
-      : activityStatus;
+    const terminalGroundTruth = getThreadTerminalGroundTruth({
+      liveTerminal,
+      providerBinding: targetProviderBinding,
+      targetRole,
+      thread: targetThread,
+    });
+    const {
+      activityStatus,
+      agentInputReady,
+      completedTurnLooksSendable,
+      effectiveActivityStatus,
+      effectiveLatestTurnState,
+      inputReadyAt,
+      inputReadyIsFreshForTurn,
+      latestTurnState,
+      orphanRunningLooksIdle,
+      recordedAgentInputReady,
+      requiresAgentInputReady,
+      runningTurnLooksIdle,
+      terminalGroundTruthStatus,
+      terminalStatus,
+      turnStartedAt,
+    } = terminalGroundTruth;
     const shouldAutoSubmit = Boolean(
       !image
         && targetRole
         && !["generic", "terminal", "shell"].includes(targetRole),
     );
-    const requiresAgentInputReady = TODO_QUEUE_AGENT_ROLES.has(targetRole);
-    const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || targetProviderBinding?.inputReady);
-    const completedTurnLooksSendable = Boolean(
-      requiresAgentInputReady
-        && !recordedAgentInputReady
-        && (["completed", "error", "interrupted"].includes(latestTurnState) || orphanRunningLooksIdle)
-        && effectiveActivityStatus !== "thinking"
-        && !targetThread?.pendingPrompt
-        && ["active", "running"].includes(terminalStatus),
-    );
-    const agentInputReady = !requiresAgentInputReady
-      || recordedAgentInputReady
-      || completedTurnLooksSendable;
     const targetFields = {
       agentInputReady,
       activityStatus: effectiveActivityStatus,
       completedTurnLooksSendable,
       image,
+      inputReadyAt,
       latestTurnState,
+      effectiveLatestTurnState,
       liveTerminal,
       paneId,
       recordedAgentInputReady,
       requiresAgentInputReady,
       orphanRunningLooksIdle,
+      inputReadyIsFreshForTurn,
+      runningTurnLooksIdle,
       shouldAutoSubmit,
       syncKey,
       targetBinding: resolvedBinding,
@@ -6668,7 +6663,9 @@ function TerminalView({
       targetTerminalIndex,
       targetThread,
       terminalAgent,
+      terminalGroundTruthStatus,
       terminalStatus,
+      turnStartedAt,
       workspaceId,
     };
 
@@ -6749,10 +6746,10 @@ function TerminalView({
     if (targetThread?.pendingPrompt) {
       return unavailable("pending_prompt", "This terminal already has a prompt waiting to send.", targetFields);
     }
-    if (latestTurnState === "running" && !orphanRunningLooksIdle) {
+    if (latestTurnState === "running") {
       return unavailable("busy_turn", "This agent is already working.", targetFields);
     }
-    if (activityStatus === "thinking" && !orphanRunningLooksIdle) {
+    if (activityStatus === "thinking") {
       return unavailable("busy_activity", "This agent is already working.", targetFields);
     }
     if (requiresAgentInputReady && !agentInputReady) {
@@ -6950,10 +6947,11 @@ function TerminalView({
           && terminalInputReadyAtMs
           && terminalInputReadyAtMs >= submittedAtMs,
       );
+      const terminalConfirmedFinished = Boolean(completedMatchingTurn && freshInputReady);
       const expired = Number(inFlightPrompt?.startedAtMs || 0) > 0
         && nowMs - Number(inFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
 
-      if (!completedMatchingTurn && !freshInputReady && !expired) {
+      if (!terminalConfirmedFinished && !expired) {
         return;
       }
 
@@ -6961,17 +6959,31 @@ function TerminalView({
       changed = true;
       logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
         completedMatchingTurn,
+        completionSignal: terminalConfirmedFinished
+          ? "terminal_confirmed_finished"
+          : "timeout",
         expired,
         freshInputReady,
+        latestMessageId,
+        latestTurnId,
         latestTurnState,
         promptEventId: promptId,
-        reason: completedMatchingTurn
-          ? "matching_turn_completed"
-          : freshInputReady
-            ? "terminal_input_ready"
-            : "timeout",
+        promptTurnMatches,
+        reason: terminalConfirmedFinished
+          ? "terminal_confirmed_finished"
+          : "timeout",
         source: inFlightPrompt?.source || "",
+        submittedAt: inFlightPrompt?.submittedAt || "",
+        submittedAtMs,
         targetTerminalIndex: terminalIndex,
+        terminalInputReady: Boolean(liveTerminal?.inputReady || providerBinding?.inputReady),
+        terminalInputReadyAt: liveTerminal?.inputReadyAt
+          || liveTerminal?.promptReadyAt
+          || providerBinding?.inputReadyAt
+          || providerBinding?.promptReadyAt
+          || "",
+        terminalInputReadyAtMs,
+        terminalConfirmedFinished,
         threadId: targetThread?.id || inFlightPrompt?.threadId || "",
         workspaceId: targetThread?.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
       });
@@ -8262,6 +8274,7 @@ function TerminalView({
             item: getTodoQueueItemLogSummary([currentItem])[0] || null,
             promptEventId: promptId,
             source,
+            submittedAt,
             targetTerminalIndex: target.targetTerminalIndex,
             threadId: targetThread.id,
             workspaceId,
@@ -9404,14 +9417,21 @@ function TerminalView({
     const targetTerminalIndex = target.targetTerminalIndex;
     todoQueueDispatchingRef.current = true;
     logTerminalStatus("frontend.todo_queue.dispatch_start", {
+      agentInputReady: Boolean(target.agentInputReady),
+      effectiveLatestTurnState: target.effectiveLatestTurnState || "",
+      inputReadyAt: target.inputReadyAt || "",
+      inputReadyIsFreshForTurn: Boolean(target.inputReadyIsFreshForTurn),
       item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
       source,
       orphanRunningLooksIdle: Boolean(target.orphanRunningLooksIdle),
+      runningTurnLooksIdle: Boolean(target.runningTurnLooksIdle),
       targetRole: target.targetRole,
       targetTerminalIndex,
+      terminalGroundTruthStatus: target.terminalGroundTruthStatus || "",
       terminalStatus: target.terminalStatus || "",
       threadActivityStatus: target.activityStatus || "",
       threadLatestTurnState: target.latestTurnState || "",
+      turnStartedAt: target.turnStartedAt || "",
       workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
     });
     todoQueueTerminalReservationsRef.current.set(targetTerminalIndex, {

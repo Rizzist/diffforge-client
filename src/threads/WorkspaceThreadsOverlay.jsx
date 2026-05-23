@@ -8,6 +8,7 @@ import { Search } from "@styled-icons/material-rounded/Search";
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
+import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
   getWorkspaceThreadCanArchive,
@@ -1083,6 +1084,7 @@ function WorkspaceThreadsOverlay({
   const railCollapsed = safeViewState.railCollapsed === true;
   const newChatActive = safeViewState.newChatActive === true;
   const searchInputRef = useRef(null);
+  const selectionDiagnosticRef = useRef("");
   const [searchActive, setSearchActive] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const deferredSearchQuery = useDeferredValue(searchQuery);
@@ -1212,6 +1214,62 @@ function WorkspaceThreadsOverlay({
     || null;
   const visibleActiveWorkspaceId = newChatActive ? "" : activeWorkspaceId;
   const visibleActiveThreadId = newChatActive ? "" : activeThreadId;
+  useEffect(() => {
+    const selectedThreadVisible = isThreadVisibleInOverlay(selectedThreadFromLocal, selectedThreadEntry);
+    const activeThreadState = activeThread && activeWorkspaceId
+      ? getThreadState(activeThread, workspaceThreads?.[activeWorkspaceId])
+      : null;
+    const selectedThreadState = selectedThreadFromLocal && localSelection.workspaceId
+      ? getThreadState(selectedThreadFromLocal, selectedThreadEntry)
+      : null;
+    const fallbackThread = fallbackSelection.thread || null;
+    const snapshot = {
+      activeThreadId,
+      activeThreadLatestTurnState: String(activeThread?.latestTurn?.state || ""),
+      activeThreadMessageCount: Array.isArray(activeThread?.messages) ? activeThread.messages.length : 0,
+      activeThreadRawActivityStatus: String(activeThread?.activityStatus || ""),
+      activeThreadRawStatus: String(activeThread?.status || ""),
+      activeThreadState,
+      activeWorkspaceId,
+      fallbackThreadId: String(fallbackThread?.id || ""),
+      localSelectionThreadId: localSelection.threadId,
+      localSelectionWorkspaceId: localSelection.workspaceId,
+      newChatActive,
+      open,
+      selectedThreadId: selectedThreadId || "",
+      selectedThreadLatestTurnState: String(selectedThreadFromLocal?.latestTurn?.state || ""),
+      selectedThreadRawActivityStatus: String(selectedThreadFromLocal?.activityStatus || ""),
+      selectedThreadRawStatus: String(selectedThreadFromLocal?.status || ""),
+      selectedThreadState,
+      selectedThreadVisible,
+      selectedWorkspaceId: selectedWorkspaceId || "",
+      visibleActiveThreadId,
+      visibleActiveWorkspaceId,
+    };
+    const signature = JSON.stringify(snapshot);
+    if (selectionDiagnosticRef.current === signature) {
+      return;
+    }
+
+    selectionDiagnosticRef.current = signature;
+    logBigViewSyncDiagnosticEvent("bigview.overlay.selection_state", snapshot);
+  }, [
+    activeThread,
+    activeThreadId,
+    activeWorkspaceId,
+    fallbackSelection.thread,
+    localSelection.threadId,
+    localSelection.workspaceId,
+    newChatActive,
+    open,
+    selectedThreadEntry,
+    selectedThreadFromLocal,
+    selectedThreadId,
+    selectedWorkspaceId,
+    visibleActiveThreadId,
+    visibleActiveWorkspaceId,
+    workspaceThreads,
+  ]);
   const selectThread = (workspaceId, threadId) => {
     commitViewState(workspaceId, {
       newChatActive: false,

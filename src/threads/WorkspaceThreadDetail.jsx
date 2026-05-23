@@ -7,7 +7,7 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
-import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import Prism from "prismjs";
 import "prismjs/components/prism-markup";
 import "prismjs/components/prism-css";
@@ -45,6 +45,14 @@ import {
   logBigViewSyncDiagnosticEvent,
   logFileDragDiagnosticEvent,
 } from "./bigViewSyncDiagnostics";
+import {
+  getLiveTerminalForThread,
+  getThreadTerminalGroundTruth,
+  getThreadTerminalReadinessSnapshot,
+  getThreadTerminalReadinessVersion,
+  subscribeThreadTerminalReadiness,
+  threadLooksEffectivelyThinking,
+} from "./threadTerminalGroundTruth.js";
 import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
@@ -1726,45 +1734,6 @@ function normalizeAgentId(value) {
   return THREAD_AGENT_IDS.has(agentId) ? agentId : "codex";
 }
 
-function getLiveTerminalBindingForThread(thread, providerBinding, workspaceThreadEntry) {
-  if (!thread) {
-    return null;
-  }
-
-  const storedBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
-  const terminalIndex = storedBinding?.terminalIndex ?? thread?.terminalIndex;
-  const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
-  const terminal = terminalKey ? workspaceThreadEntry?.terminals?.[terminalKey] : null;
-  if (!terminal) {
-    return null;
-  }
-
-  if (
-    terminal.threadId !== thread?.id
-    || !["active", "starting"].includes(String(terminal.status || "").toLowerCase())
-  ) {
-    return null;
-  }
-
-  if (storedBinding?.paneId && terminal.paneId && storedBinding.paneId !== terminal.paneId) {
-    return null;
-  }
-
-  if (
-    storedBinding?.instanceId
-    && terminal.instanceId
-    && Number(storedBinding.instanceId) !== Number(terminal.instanceId)
-  ) {
-    return null;
-  }
-
-  return {
-    instanceId: terminal.instanceId,
-    paneId: terminal.paneId,
-    terminalIndex: terminal.terminalIndex,
-  };
-}
-
 function findAgentStatus(agentStatuses, agentId) {
   const normalizedAgentId = normalizeAgentId(agentId);
   return (Array.isArray(agentStatuses) ? agentStatuses : []).find((status) => (
@@ -3274,15 +3243,19 @@ function getLatestTurnUserMessage(messages, turnId) {
   )) || null;
 }
 
-function buildActivityItems(thread, messages = []) {
+function buildActivityItems(thread, messages = [], groundTruth = null) {
   if (!thread) {
     return [];
   }
 
   const items = [];
   const latestTurn = thread.latestTurn || null;
-  const turnState = threadLatestTurnState(thread);
-  const isThinking = turnState === "running" || thread.activityStatus === "thinking";
+  const rawTurnState = groundTruth?.effectiveLatestTurnState
+    || groundTruth?.latestTurnState
+    || threadLatestTurnState(thread);
+  const isThinking = groundTruth
+    ? threadLooksEffectivelyThinking(groundTruth)
+    : rawTurnState === "running" || thread.activityStatus === "thinking";
   const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turnId);
   const latestTurnIsSlashCommand = isSlashCommandPrompt(latestTurnUserMessage?.text);
 
@@ -3290,7 +3263,7 @@ function buildActivityItems(thread, messages = []) {
     return items;
   }
 
-  if (turnState === "running") {
+  if (isThinking && rawTurnState === "running") {
     items.push({
       id: `turn-${latestTurn?.turnId || "latest"}-running`,
       live: true,
@@ -3307,6 +3280,187 @@ function buildActivityItems(thread, messages = []) {
   }
 
   return items;
+}
+
+function getMessageDiagnosticSummary(message) {
+  if (!message) {
+    return null;
+  }
+
+  return {
+    id: String(message.id || ""),
+    kind: String(message.kind || ""),
+    role: String(message.role || ""),
+    status: String(message.status || ""),
+    text: getBigViewTextDiagnosticFields(message.text || "", { previewLength: 96 }),
+    timestamp: String(message.timestamp || message.createdAt || message.updatedAt || ""),
+    title: String(message.title || ""),
+    turnId: String(message.turnId || ""),
+  };
+}
+
+function getTerminalDiagnosticSummary(terminal) {
+  if (!terminal) {
+    return null;
+  }
+
+  return {
+    inputReady: terminal.inputReady === true,
+    inputReadyAt: String(terminal.inputReadyAt || ""),
+    inputReadyConfidence: String(terminal.inputReadyConfidence || ""),
+    instanceId: terminal.instanceId ?? "",
+    paneId: String(terminal.paneId || ""),
+    promptReadyAt: String(terminal.promptReadyAt || ""),
+    status: String(terminal.status || ""),
+    terminalIndex: terminal.terminalIndex ?? "",
+    threadId: String(terminal.threadId || ""),
+    workspaceId: String(terminal.workspaceId || ""),
+  };
+}
+
+function getProviderBindingDiagnosticSummary(binding) {
+  if (!binding) {
+    return null;
+  }
+
+  return {
+    activityStatus: String(binding.activityStatus || ""),
+    inputReady: binding.inputReady === true,
+    inputReadyAt: String(binding.inputReadyAt || ""),
+    modelId: String(
+      binding.modelId
+        || binding.model
+        || binding.activeModel
+        || binding.nativeModel
+        || binding.selectedModel
+        || binding.configuredModel
+        || "",
+    ),
+    nativeSessionIdPresent: Boolean(binding.nativeSessionId),
+    promptReadyAt: String(binding.promptReadyAt || ""),
+    terminalBinding: getTerminalDiagnosticSummary(binding.terminalBinding),
+  };
+}
+
+function getActivityDiagnosticSummary(item) {
+  if (!item) {
+    return null;
+  }
+
+  return {
+    id: String(item.id || ""),
+    live: item.live === true,
+    text: String(item.text || ""),
+  };
+}
+
+function getThreadDetailRenderDiagnosticSnapshot({
+  activeAgentId,
+  activeLiveTerminal,
+  activeProviderBinding,
+  activityItems,
+  effectiveLiveTerminal,
+  latestActivity,
+  messages,
+  terminalReadinessSnapshot,
+  terminalReadinessVersion,
+  thread,
+  threadGroundTruth,
+  transcriptItems,
+  workspace,
+  workspaceThreadEntry,
+}) {
+  const safeMessages = Array.isArray(messages) ? messages : [];
+  const safeActivityItems = Array.isArray(activityItems) ? activityItems : [];
+  const latestTurn = thread?.latestTurn || null;
+  const providerBindings = thread?.providerBindings
+    && typeof thread.providerBindings === "object"
+    && !Array.isArray(thread.providerBindings)
+    ? thread.providerBindings
+    : {};
+  const terminalCount = workspaceThreadEntry?.terminals
+    && typeof workspaceThreadEntry.terminals === "object"
+    ? Object.keys(workspaceThreadEntry.terminals).length
+    : 0;
+  const latestMessage = safeMessages[safeMessages.length - 1] || null;
+  const liveActivityVisible = safeActivityItems.some((item) => (
+    item?.live === true
+      && /thinking|working|starting/i.test(String(item?.text || ""))
+  ));
+
+  return {
+    activeAgentId: String(activeAgentId || ""),
+    activeLiveTerminal: getTerminalDiagnosticSummary(activeLiveTerminal),
+    activeProviderBinding: getProviderBindingDiagnosticSummary(activeProviderBinding),
+    activityItemCount: safeActivityItems.length,
+    activityItems: safeActivityItems.map(getActivityDiagnosticSummary),
+    effectiveLiveTerminal: getTerminalDiagnosticSummary(effectiveLiveTerminal),
+    filteredMessageCount: safeMessages.length,
+    groundTruth: threadGroundTruth ? {
+      activityStatus: String(threadGroundTruth.activityStatus || ""),
+      agentInputReady: threadGroundTruth.agentInputReady === true,
+      completedTurnLooksSendable: threadGroundTruth.completedTurnLooksSendable === true,
+      effectiveActivityStatus: String(threadGroundTruth.effectiveActivityStatus || ""),
+      effectiveLatestTurnState: String(threadGroundTruth.effectiveLatestTurnState || ""),
+      hasPendingPrompt: threadGroundTruth.hasPendingPrompt === true,
+      inputReadyAt: String(threadGroundTruth.inputReadyAt || ""),
+      inputReadyIsFreshForTurn: threadGroundTruth.inputReadyIsFreshForTurn === true,
+      latestTurnState: String(threadGroundTruth.latestTurnState || ""),
+      recordedAgentInputReady: threadGroundTruth.recordedAgentInputReady === true,
+      runningTurnLooksIdle: threadGroundTruth.runningTurnLooksIdle === true,
+      terminalGroundTruthStatus: String(threadGroundTruth.terminalGroundTruthStatus || ""),
+      terminalLooksActive: threadGroundTruth.terminalLooksActive === true,
+      terminalStatus: String(threadGroundTruth.terminalStatus || ""),
+      turnStartedAt: String(threadGroundTruth.turnStartedAt || ""),
+    } : null,
+    latestActivity: getActivityDiagnosticSummary(latestActivity),
+    latestMessage: getMessageDiagnosticSummary(latestMessage),
+    latestTurn: latestTurn ? {
+      completedAt: String(latestTurn.completedAt || ""),
+      error: String(latestTurn.error || ""),
+      messageId: String(latestTurn.messageId || ""),
+      requestedAt: String(latestTurn.requestedAt || ""),
+      startedAt: String(latestTurn.startedAt || ""),
+      state: String(latestTurn.state || ""),
+      turnId: String(latestTurn.turnId || ""),
+      updatedAt: String(latestTurn.updatedAt || ""),
+    } : null,
+    liveActivityVisible,
+    materialized: thread?.materialized === true,
+    messageCount: Number(thread?.messageCount || 0),
+    pendingPromptPresent: Boolean(thread?.pendingPrompt),
+    projectionEventCount: Array.isArray(thread?.projectionEvents) ? thread.projectionEvents.length : 0,
+    providerBindingKeys: Object.keys(providerBindings),
+    rawActivityStatus: String(thread?.activityStatus || ""),
+    rawStatus: String(thread?.status || ""),
+    rawTurnState: threadLatestTurnState(thread),
+    terminalCount,
+    terminalReadinessSnapshot: getTerminalDiagnosticSummary(terminalReadinessSnapshot),
+    terminalReadinessVersion,
+    threadId: String(thread?.id || ""),
+    transcriptItemCount: Array.isArray(transcriptItems) ? transcriptItems.length : 0,
+    workspaceId: String(workspace?.id || thread?.workspaceId || ""),
+  };
+}
+
+function getThreadDetailRenderDiagnosticSignature(snapshot) {
+  return JSON.stringify({
+    activityItems: snapshot?.activityItems || [],
+    activeTerminal: snapshot?.activeLiveTerminal,
+    effectiveActivityStatus: snapshot?.groundTruth?.effectiveActivityStatus || "",
+    effectiveTerminal: snapshot?.effectiveLiveTerminal,
+    groundTruthStatus: snapshot?.groundTruth?.terminalGroundTruthStatus || "",
+    latestActivity: snapshot?.latestActivity,
+    latestMessageHash: snapshot?.latestMessage?.text?.textHash || "",
+    latestMessageId: snapshot?.latestMessage?.id || "",
+    latestTurnState: snapshot?.latestTurn?.state || "",
+    liveActivityVisible: snapshot?.liveActivityVisible === true,
+    rawActivityStatus: snapshot?.rawActivityStatus || "",
+    rawStatus: snapshot?.rawStatus || "",
+    readinessVersion: snapshot?.terminalReadinessVersion || 0,
+    threadId: snapshot?.threadId || "",
+    workspaceId: snapshot?.workspaceId || "",
+  });
 }
 
 function getToolCallLabel(message) {
@@ -3879,11 +4033,11 @@ function WorkspaceThreadDetail({
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
   const copyResetTimeoutRef = useRef(null);
+  const detailRenderDiagnosticRef = useRef("");
   const messages = Array.isArray(thread?.messages)
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
-  const activityItems = useMemo(() => buildActivityItems(thread, messages), [messages, thread]);
   const latestAssistantBlockId = useMemo(() => {
     for (let index = transcriptItems.length - 1; index >= 0; index -= 1) {
       const item = transcriptItems[index];
@@ -3895,13 +4049,130 @@ function WorkspaceThreadDetail({
     return "";
   }, [transcriptItems]);
   const latestMessage = messages[messages.length - 1] || null;
-  const latestActivity = activityItems[activityItems.length - 1] || null;
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
   const activeAgentStatus = useMemo(
     () => findAgentStatus(agentStatuses, activeAgentId),
     [activeAgentId, agentStatuses],
   );
   const activeProviderBinding = getWorkspaceThreadProviderBinding(thread, activeAgentId);
+  const activeLiveTerminal = getLiveTerminalForThread(
+    thread,
+    activeProviderBinding,
+    workspaceThreadEntry,
+  );
+  const terminalReadinessHint = activeLiveTerminal
+    || activeProviderBinding?.terminalBinding
+    || thread?.terminalBinding
+    || { terminalIndex: thread?.terminalIndex };
+  const terminalReadinessVersion = useSyncExternalStore(
+    subscribeThreadTerminalReadiness,
+    getThreadTerminalReadinessVersion,
+    getThreadTerminalReadinessVersion,
+  );
+  const terminalReadinessSnapshot = useMemo(() => getThreadTerminalReadinessSnapshot(
+    workspace?.id || thread?.workspaceId || "",
+    thread?.id || "",
+    terminalReadinessHint,
+  ), [
+    terminalReadinessHint,
+    terminalReadinessVersion,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+  const effectiveLiveTerminal = useMemo(() => {
+    if (!terminalReadinessSnapshot) {
+      return activeLiveTerminal;
+    }
+
+    if (
+      activeLiveTerminal?.paneId
+      && terminalReadinessSnapshot.paneId
+      && activeLiveTerminal.paneId !== terminalReadinessSnapshot.paneId
+    ) {
+      return activeLiveTerminal;
+    }
+
+    if (
+      activeLiveTerminal?.instanceId
+      && terminalReadinessSnapshot.instanceId
+      && Number(activeLiveTerminal.instanceId) !== Number(terminalReadinessSnapshot.instanceId)
+    ) {
+      return activeLiveTerminal;
+    }
+
+    return {
+      ...(activeLiveTerminal || {}),
+      inputReady: true,
+      inputReadyAt: terminalReadinessSnapshot.inputReadyAt || activeLiveTerminal?.inputReadyAt || "",
+      inputReadyConfidence: terminalReadinessSnapshot.inputReadyConfidence
+        || activeLiveTerminal?.inputReadyConfidence
+        || "",
+      instanceId: activeLiveTerminal?.instanceId || terminalReadinessSnapshot.instanceId || "",
+      paneId: activeLiveTerminal?.paneId || terminalReadinessSnapshot.paneId || "",
+      promptReadyAt: terminalReadinessSnapshot.promptReadyAt
+        || terminalReadinessSnapshot.inputReadyAt
+        || activeLiveTerminal?.promptReadyAt
+        || "",
+      status: activeLiveTerminal?.status || terminalReadinessSnapshot.status || "active",
+      terminalIndex: activeLiveTerminal?.terminalIndex ?? terminalReadinessSnapshot.terminalIndex,
+      threadId: activeLiveTerminal?.threadId || terminalReadinessSnapshot.threadId || thread?.id || "",
+    };
+  }, [activeLiveTerminal, terminalReadinessSnapshot, thread?.id]);
+  const threadGroundTruth = useMemo(() => getThreadTerminalGroundTruth({
+    liveTerminal: effectiveLiveTerminal,
+    providerBinding: activeProviderBinding,
+    targetRole: activeAgentId,
+    thread,
+  }), [activeAgentId, effectiveLiveTerminal, activeProviderBinding, thread]);
+  const activityItems = useMemo(
+    () => buildActivityItems(thread, messages, threadGroundTruth),
+    [messages, thread, threadGroundTruth],
+  );
+  const latestActivity = activityItems[activityItems.length - 1] || null;
+  useEffect(() => {
+    const snapshot = getThreadDetailRenderDiagnosticSnapshot({
+      activeAgentId,
+      activeLiveTerminal,
+      activeProviderBinding,
+      activityItems,
+      effectiveLiveTerminal,
+      latestActivity,
+      messages,
+      terminalReadinessSnapshot,
+      terminalReadinessVersion,
+      thread,
+      threadGroundTruth,
+      transcriptItems,
+      workspace,
+      workspaceThreadEntry,
+    });
+    const signature = getThreadDetailRenderDiagnosticSignature(snapshot);
+    if (detailRenderDiagnosticRef.current === signature) {
+      return;
+    }
+
+    detailRenderDiagnosticRef.current = signature;
+    logBigViewSyncDiagnosticEvent("bigview.thread_detail.render_state", snapshot);
+    if (snapshot.liveActivityVisible) {
+      logBigViewSyncDiagnosticEvent("bigview.thread_detail.live_activity_visible", snapshot);
+    }
+  }, [
+    activeAgentId,
+    activeLiveTerminal,
+    activeProviderBinding,
+    activityItems,
+    effectiveLiveTerminal,
+    latestActivity,
+    messages,
+    terminalReadinessSnapshot,
+    terminalReadinessVersion,
+    thread,
+    threadGroundTruth,
+    transcriptItems,
+    workspace,
+    workspaceThreadEntry,
+  ]);
   const activeProviderModelId = String(
     activeProviderBinding?.modelId
       || activeProviderBinding?.model
@@ -3916,11 +4187,13 @@ function WorkspaceThreadDetail({
     () => getModelOptions(activeAgentId, activeAgentStatus, { modelId: activeProviderModelId }),
     [activeAgentId, activeAgentStatus, activeProviderModelId],
   );
-  const activeTerminalBinding = getLiveTerminalBindingForThread(
-    thread,
-    activeProviderBinding,
-    workspaceThreadEntry,
-  );
+  const activeTerminalBinding = effectiveLiveTerminal
+    ? {
+      instanceId: effectiveLiveTerminal.instanceId,
+      paneId: effectiveLiveTerminal.paneId,
+      terminalIndex: effectiveLiveTerminal.terminalIndex,
+    }
+    : null;
   const hasActiveTerminalBinding = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
   const hasProviderSession = getWorkspaceThreadHasSession(thread);
   const composerSyncKey = [
