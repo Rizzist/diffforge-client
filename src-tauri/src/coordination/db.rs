@@ -18,6 +18,9 @@ use super::schema::{
     SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
+    WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
+    WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
+    WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME, WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
     WORKSPACE_MCP_INDEX_MIGRATION_NAME, WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
     WORKSPACE_MCP_INDEX_SCHEMA_SQL, WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
     WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION, WORKSPACE_MCP_REGISTRY_SCHEMA_SQL,
@@ -311,6 +314,10 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_submit_job_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_registry_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_index_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_approval_policy_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_agent_config_access_migration(
+        connection,
+    )?);
 
     Ok(diagnostics)
 }
@@ -654,6 +661,79 @@ fn apply_workspace_mcp_index_migration(
         0..0,
         ["WORKSPACE_MCP_INDEX_SCHEMA_SQL executed idempotently".to_string()],
     );
+    Ok(migration)
+}
+
+fn apply_workspace_mcp_approval_policy_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
+            WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let added = ensure_column(
+        connection,
+        "workspace_mcp_servers",
+        "approval_policy",
+        "TEXT NOT NULL DEFAULT 'always_allow'",
+    )?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
+        WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        [format!(
+            "workspace_mcp_servers.approval_policy {}",
+            if added { "added" } else { "already_present" }
+        )],
+    );
+    Ok(migration)
+}
+
+fn apply_workspace_mcp_agent_config_access_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(
+        connection,
+        WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
+    )? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
+            WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let columns = [
+        ("agent_config_access_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        (
+            "agent_secret_config_access_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("agent_env_file_write_enabled", "INTEGER NOT NULL DEFAULT 1"),
+    ];
+    let mut details = Vec::new();
+    for (column, definition) in columns {
+        let added = ensure_column(connection, "workspace_mcp_servers", column, definition)?;
+        details.push(format!(
+            "workspace_mcp_servers.{column} {}",
+            if added { "added" } else { "already_present" }
+        ));
+    }
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
+        WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
+    )?;
+    migration.details.splice(0..0, details);
     Ok(migration)
 }
 

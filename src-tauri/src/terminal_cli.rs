@@ -791,7 +791,7 @@ fn apply_claude_coordinated_auto_approval_args(
     }
     if !terminal_args_have_any_option(args, &["--allowedTools", "--allowed-tools"]) {
         args.push("--allowedTools".to_string());
-        args.push(claude_auto_approved_tools_arg());
+        args.push(claude_auto_approved_tools_arg(coordination));
     }
     if !terminal_args_have_any_option(args, &["--mcp-config"]) {
         args.push("--mcp-config".to_string());
@@ -808,7 +808,7 @@ fn apply_claude_managed_mcp_isolation_args(args: &mut Vec<String>) {
     }
 }
 
-fn claude_auto_approved_tools_arg() -> String {
+fn claude_auto_approved_tools_arg(coordination: &TerminalCoordinationSession) -> String {
     let mut tools = ["Read", "Glob", "Grep", "LS"]
         .into_iter()
         .map(str::to_string)
@@ -818,6 +818,28 @@ fn claude_auto_approved_tools_arg() -> String {
             .iter()
             .map(|tool| format!("mcp__coordination-kernel__{tool}")),
     );
+    tools.extend(
+        [
+            "workspace_mcp__sync_manifest",
+            "workspace_mcp__list_servers",
+            "workspace_mcp__get_server_status",
+            "workspace_mcp__get_server_config",
+            "workspace_mcp__write_env_file",
+        ]
+        .into_iter()
+        .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),
+    );
+    if let Some(value) =
+        terminal_coordination_env_value(coordination, "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS")
+    {
+        tools.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),
+        );
+    }
     tools.join(",")
 }
 

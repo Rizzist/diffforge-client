@@ -2815,6 +2815,7 @@ export default function App() {
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
+  const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
@@ -2904,6 +2905,15 @@ export default function App() {
     () => getWorkspaceNotificationSummaries(workspaceNotifications, workspaceThreads),
     [workspaceNotifications, workspaceThreads],
   );
+  const workspaceThreadStoreTargets = useMemo(
+    () => getWorkspaceThreadStoreTargets(workspaces, workspaceSettings, defaultWorkingDirectory),
+    [defaultWorkingDirectory, workspaceSettings, workspaces],
+  );
+  const workspaceThreadStoreKey = useMemo(
+    () => getWorkspaceThreadStoreKey(workspaceThreadStoreTargets),
+    [workspaceThreadStoreTargets],
+  );
+  const workspaceThreadsHydrated = workspaceThreadsHydratedKey === workspaceThreadStoreKey;
   const workspaceCloseAllowNativeRef = useRef(false);
 
   const setWorkspaceGraphStatus = useCallback((repoPath, workspaceId, statusPatch) => {
@@ -2995,26 +3005,25 @@ export default function App() {
   }, [applyWorkspaceGraphSnapshot]);
 
   useEffect(() => {
-    const targets = getWorkspaceThreadStoreTargets(
-      workspaces,
-      workspaceSettings,
-      defaultWorkingDirectory,
-    );
-    const storeKey = getWorkspaceThreadStoreKey(targets);
+    const targets = workspaceThreadStoreTargets;
+    const storeKey = workspaceThreadStoreKey;
 
     if (!targets.length) {
       workspaceThreadsHydratedKeyRef.current = storeKey;
       workspaceThreadsPersistenceReadyRef.current = Boolean(workspaces.length === 0);
+      setWorkspaceThreadsHydratedKey(storeKey);
       return undefined;
     }
 
     if (workspaceThreadsHydratedKeyRef.current === storeKey) {
       workspaceThreadsPersistenceReadyRef.current = true;
+      setWorkspaceThreadsHydratedKey(storeKey);
       return undefined;
     }
 
     let disposed = false;
     workspaceThreadsPersistenceReadyRef.current = false;
+    setWorkspaceThreadsHydratedKey((currentKey) => (currentKey === storeKey ? currentKey : ""));
 
     invoke("workspace_threads_read", {
       request: { workspaces: targets },
@@ -3074,6 +3083,7 @@ export default function App() {
         });
         workspaceThreadsHydratedKeyRef.current = storeKey;
         workspaceThreadsPersistenceReadyRef.current = true;
+        setWorkspaceThreadsHydratedKey(storeKey);
       })
       .catch((error) => {
         if (disposed) {
@@ -3081,6 +3091,7 @@ export default function App() {
         }
         workspaceThreadsHydratedKeyRef.current = storeKey;
         workspaceThreadsPersistenceReadyRef.current = true;
+        setWorkspaceThreadsHydratedKey(storeKey);
         logThreadBridgeDiagnosticEvent("frontend.workspace_threads_sqlite_read.failed", {
           message: getErrorMessage(error, "Unable to load workspace threads from SQLite."),
           workspaceCount: targets.length,
@@ -3091,7 +3102,8 @@ export default function App() {
       disposed = true;
     };
   }, [
-    defaultWorkingDirectory,
+    workspaceThreadStoreKey,
+    workspaceThreadStoreTargets,
     workspaceSettings,
     workspaceTerminalFallbackRole,
     workspaceTerminalLogicalIndexes,
@@ -6874,6 +6886,7 @@ export default function App() {
   );
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && Boolean(activatedWorkspace)
+    && workspaceThreadsHydrated
     && !isActivatedWorkspaceDeactivating
     && activatedWorkspaceAgentTerminalEntries.length > 0;
   const workspaceAgentLaunchKey = workspaceTerminalAgentLaunchReady && activatedWorkspace
@@ -9821,6 +9834,7 @@ export default function App() {
                           workspaceError={workspaceError}
                           workspaceName={workspaceName}
                           workspaceSyncState={workspaceSyncState}
+                          workspaceThreadRestoreReady={workspaceThreadsHydrated}
                           workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
                           workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
                           workspaceThreads={workspaceThreads}
@@ -9840,6 +9854,7 @@ export default function App() {
                       );
                       const runtimeAgentLaunchReady = Boolean(
                         workspaceState === "ready"
+                          && workspaceThreadsHydrated
                           && !runtimeIsDeactivating
                           && runtimeDescriptor.agentTerminalEntries.length > 0,
                       );
@@ -9889,6 +9904,7 @@ export default function App() {
                             workspaceError={workspaceError}
                             workspaceName={runtimeWorkspace.name || workspaceName}
                             workspaceSyncState={workspaceSyncState}
+                            workspaceThreadRestoreReady={workspaceThreadsHydrated}
                             workspaceTerminalAgentLaunchReady={runtimeAgentLaunchReady}
                             workspaceTerminalRenderAgent={runtimeDescriptor.renderAgent}
                             workspaceThreads={workspaceThreads}

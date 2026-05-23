@@ -884,6 +884,100 @@ const TranscriptActivityBody = styled.pre`
   }
 `;
 
+const TranscriptActivityMetaBody = styled(TranscriptActivityBody)`
+  max-height: 120px;
+  margin-bottom: 4px;
+  color: var(--thread-muted-soft);
+`;
+
+const TranscriptActivityJsonBody = styled.pre`
+  max-height: 360px;
+  min-width: 0;
+  margin: 3px 0 7px;
+  overflow-x: auto;
+  overflow-y: auto;
+  border: 1px solid rgba(114, 161, 255, 0.16);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #d9e7ff;
+  background: linear-gradient(135deg, rgba(40, 57, 88, 0.24), rgba(12, 15, 22, 0.36));
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--thread-detail-small-font-size);
+  font-weight: 520;
+  line-height: 1.55;
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+
+  .token.property {
+    color: #91c5ff;
+  }
+
+  .token.string {
+    color: #8ee6b1;
+  }
+
+  .token.number {
+    color: #ffd37a;
+  }
+
+  .token.boolean,
+  .token.null {
+    color: #ff9fba;
+  }
+
+  .token.punctuation,
+  .token.operator {
+    color: rgba(224, 236, 255, 0.56);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: #12314f;
+    background: linear-gradient(135deg, rgba(0, 102, 204, 0.055), rgba(255, 255, 255, 0.82));
+  }
+
+  html[data-forge-theme="light"] & .token.property {
+    color: #005cb8;
+  }
+
+  html[data-forge-theme="light"] & .token.string {
+    color: #107d45;
+  }
+
+  html[data-forge-theme="light"] & .token.number {
+    color: #935f00;
+  }
+
+  html[data-forge-theme="light"] & .token.boolean,
+  html[data-forge-theme="light"] & .token.null {
+    color: #b0184d;
+  }
+
+  html[data-forge-theme="light"] & .token.punctuation,
+  html[data-forge-theme="light"] & .token.operator {
+    color: rgba(18, 49, 79, 0.54);
+  }
+
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(170, 196, 255, 0.2);
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(0, 102, 204, 0.2);
+  }
+`;
+
 const ActivityCell = styled.article`
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
@@ -3411,6 +3505,135 @@ function getActivityGroupStatus(messages) {
   return normalizedStatuses.size === 1 ? statuses[0] : "";
 }
 
+const ACTIVITY_JSON_PARSE_MAX_CHARS = 180_000;
+const ACTIVITY_JSON_EXPAND_MAX_DEPTH = 6;
+
+function stripJsonCodeFence(text) {
+  const trimmed = String(text || "").trim();
+  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : trimmed;
+}
+
+function looksLikeJsonContainer(text) {
+  const trimmed = stripJsonCodeFence(text);
+  if (!trimmed || trimmed.length > ACTIVITY_JSON_PARSE_MAX_CHARS) {
+    return false;
+  }
+
+  return (
+    (trimmed.startsWith("{") && trimmed.endsWith("}"))
+    || (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    || (trimmed.startsWith("\"{") && trimmed.endsWith("}\""))
+    || (trimmed.startsWith("\"[") && trimmed.endsWith("]\""))
+  );
+}
+
+function tryParseJsonText(text) {
+  const trimmed = stripJsonCodeFence(text);
+  if (!looksLikeJsonContainer(trimmed)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function expandNestedJsonStrings(value, depth = 0) {
+  if (depth >= ACTIVITY_JSON_EXPAND_MAX_DEPTH) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = tryParseJsonText(value);
+    return parsed == null ? value : expandNestedJsonStrings(parsed, depth + 1);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => expandNestedJsonStrings(item, depth + 1));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entryValue]) => [
+        key,
+        expandNestedJsonStrings(entryValue, depth + 1),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function parseActivityJsonCandidate(text, prefix = "") {
+  const parsed = tryParseJsonText(text);
+  if (parsed == null) {
+    return null;
+  }
+
+  const expanded = expandNestedJsonStrings(parsed);
+  return {
+    jsonText: JSON.stringify(expanded, null, 2),
+    prefix: String(prefix || "").trim(),
+  };
+}
+
+function parseActivityJsonBody(body) {
+  const text = String(body || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const direct = parseActivityJsonCandidate(text);
+  if (direct) {
+    return direct;
+  }
+
+  const outputMatch = text.match(/\bOutput:\s*\n/i);
+  if (outputMatch) {
+    const candidate = text.slice(outputMatch.index + outputMatch[0].length).trim();
+    const parsed = parseActivityJsonCandidate(candidate, text.slice(0, outputMatch.index + outputMatch[0].length));
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const jsonLineMatch = text.match(/(?:^|\n)\s*([{[])/);
+  if (!jsonLineMatch || jsonLineMatch.index == null) {
+    return null;
+  }
+
+  const startIndex = jsonLineMatch.index + jsonLineMatch[0].lastIndexOf(jsonLineMatch[1]);
+  return parseActivityJsonCandidate(text.slice(startIndex), text.slice(0, startIndex));
+}
+
+function ActivityToolBody({ body, expanded }) {
+  const parsedJson = useMemo(
+    () => (expanded ? parseActivityJsonBody(body) : null),
+    [body, expanded],
+  );
+
+  if (!parsedJson) {
+    return <TranscriptActivityBody>{body}</TranscriptActivityBody>;
+  }
+
+  return (
+    <>
+      {parsedJson.prefix ? (
+        <TranscriptActivityMetaBody>{parsedJson.prefix}</TranscriptActivityMetaBody>
+      ) : null}
+      <TranscriptActivityJsonBody
+        className="language-json"
+        dangerouslySetInnerHTML={{
+          __html: getHighlightedMarkdownCode(parsedJson.jsonText, "json"),
+        }}
+      />
+    </>
+  );
+}
+
 function ActivityToolRow({ message }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -3451,7 +3674,7 @@ function ActivityToolRow({ message }) {
           data-expanded={expanded ? "true" : "false"}
         >
           <TranscriptActivityDisclosureInner>
-            <TranscriptActivityBody>{body}</TranscriptActivityBody>
+            <ActivityToolBody body={body} expanded={expanded} />
           </TranscriptActivityDisclosureInner>
         </TranscriptActivityDisclosure>
       ) : null}

@@ -8351,6 +8351,9 @@ export const McpServerCopy = styled.span`
 `;
 
 export const McpStatusBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 3px 6px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
@@ -8378,6 +8381,19 @@ export const McpStatusBadge = styled.span`
     background: rgba(239, 107, 107, 0.1);
   }
 
+  &[data-pending="true"]::before {
+    content: "";
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    flex: 0 0 auto;
+    border: 1.5px solid rgba(125, 160, 205, 0.24);
+    border-top-color: var(--forge-blue-soft);
+    border-right-color: var(--forge-amber);
+    border-radius: 50%;
+    animation: ${workspaceCloseSpin} 760ms linear infinite;
+  }
+
   html[data-forge-theme="light"] &,
   html[data-forge-theme="light"] &[data-state="planned"] {
     border-color: rgba(0, 0, 0, 0.12);
@@ -8396,6 +8412,12 @@ export const McpStatusBadge = styled.span`
     border-color: rgba(180, 35, 24, 0.22);
     color: var(--forge-red);
     background: rgba(180, 35, 24, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-pending="true"]::before {
+    border-color: rgba(0, 102, 204, 0.16);
+    border-top-color: var(--forge-blue);
+    border-right-color: var(--forge-blue-soft);
   }
 `;
 
@@ -8584,8 +8606,9 @@ export const McpJsonTextarea = styled(McpTextarea)`
 `;
 
 export const McpTransportTabs = styled.div`
+  --mcp-tab-count: 3;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--mcp-tab-count), minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   border: 1px solid var(--forge-border);
@@ -8594,6 +8617,10 @@ export const McpTransportTabs = styled.div`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
+  }
+
+  &[data-columns="2"] {
+    --mcp-tab-count: 2;
   }
 
   @media (max-width: 620px) {

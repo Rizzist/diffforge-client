@@ -33,6 +33,8 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
     "workspace_mcp__get_server_status",
+    "workspace_mcp__get_server_config",
+    "workspace_mcp__write_env_file",
 ];
 const SHARED_DAEMON_INFO_RELATIVE_PATH: &[&str] = &[".agents", "mcp", "coordination.daemon.json"];
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
@@ -920,7 +922,11 @@ fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
     tools
 }
 
-fn workspace_gateway_dispatch_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+pub(crate) fn workspace_gateway_dispatch_tool(
+    context: &McpContext,
+    tool: &str,
+    input: Value,
+) -> Value {
     let result = if WORKSPACE_GATEWAY_BUILTIN_TOOLS.contains(&tool) {
         workspace_gateway_builtin_tool(context, tool, input)
     } else {
@@ -987,6 +993,18 @@ fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value
             }
             Err(error) => workspace_gateway_error_content(error),
         },
+        "workspace_mcp__get_server_config" => {
+            match workspace_gateway_get_server_config(context, &input) {
+                Ok(config) => workspace_gateway_content(config),
+                Err(error) => workspace_gateway_error_content(error),
+            }
+        }
+        "workspace_mcp__write_env_file" => {
+            match workspace_gateway_write_env_file(context, &input) {
+                Ok(result) => workspace_gateway_content(result),
+                Err(error) => workspace_gateway_error_content(error),
+            }
+        }
         _ => workspace_gateway_error_content(format!("Unknown gateway tool: {tool}")),
     }
 }
@@ -1037,21 +1055,389 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
         }
         "workspace_mcp__list_servers" => "List installed workspace MCP servers and runtime status.",
         "workspace_mcp__get_server_status" => "Inspect one workspace MCP server by server_key.",
+        "workspace_mcp__get_server_config" => {
+            "Read agent-visible workspace MCP configuration. Non-secret values are exposed by default; secret values are redacted unless explicitly enabled for that MCP."
+        }
+        "workspace_mcp__write_env_file" => {
+            "Write agent-visible workspace MCP configuration into an env file without returning secret values in the tool result."
+        }
         _ => "Workspace MCP gateway tool.",
     }
 }
 
 fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
     match tool {
-        "workspace_mcp__get_server_status" => json!({
+        "workspace_mcp__get_server_status" | "workspace_mcp__get_server_config" => json!({
             "type": "object",
             "properties": {
                 "server_key": {"type": "string", "description": "The workspace MCP server key."}
             },
             "required": ["server_key"]
         }),
+        "workspace_mcp__write_env_file" => json!({
+            "type": "object",
+            "properties": {
+                "server_key": {"type": "string", "description": "The workspace MCP server key."},
+                "path": {
+                    "type": "string",
+                    "description": "Env file path relative to the agent worktree when available. Defaults to .env.local."
+                },
+                "include_secrets": {
+                    "type": "boolean",
+                    "description": "Also write secret config values. Requires secret config access to be enabled for the MCP."
+                },
+                "include_public_aliases": {
+                    "type": "boolean",
+                    "description": "Also write known public frontend aliases such as NEXT_PUBLIC_APPWRITE_PROJECT_ID. Defaults to true."
+                }
+            },
+            "required": ["server_key"]
+        }),
         _ => json!({"type": "object", "properties": {}}),
     }
+}
+
+fn workspace_gateway_builtin_server(
+    context: &McpContext,
+    input: &Value,
+) -> Result<(CoordinationKernel, String, String, Value), String> {
+    let server_key = input["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "server_key is required.".to_string())?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let server = workspace_gateway_server_by_key(&kernel, &workspace_id, server_key)?
+        .ok_or_else(|| format!("Unknown workspace MCP server: {server_key}"))?;
+    Ok((kernel, workspace_id, generation, server))
+}
+
+fn workspace_gateway_get_server_config(
+    context: &McpContext,
+    input: &Value,
+) -> Result<Value, String> {
+    let (_kernel, workspace_id, generation, server) =
+        workspace_gateway_builtin_server(context, input)?;
+    if !workspace_gateway_agent_config_access_enabled(&server) {
+        return Err(format!(
+            "Agent config access is disabled for workspace MCP `{}`.",
+            server["server_key"].as_str().unwrap_or("unknown")
+        ));
+    }
+    let reveal_secrets = workspace_gateway_agent_secret_config_access_enabled(&server);
+    let variables = workspace_gateway_config_variables(&server, reveal_secrets);
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server": workspace_gateway_server_public(&server),
+        "access": workspace_gateway_config_access_summary(&server),
+        "variables": variables,
+        "env_file": {
+            "write_enabled": workspace_gateway_agent_env_file_write_enabled(&server),
+            "default_path": ".env.local",
+            "include_public_aliases_by_default": true,
+            "secret_values_are_redacted_unless_enabled": true
+        },
+    }))
+}
+
+fn workspace_gateway_write_env_file(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let (_kernel, workspace_id, generation, server) =
+        workspace_gateway_builtin_server(context, input)?;
+    if !workspace_gateway_agent_config_access_enabled(&server) {
+        return Err(format!(
+            "Agent config access is disabled for workspace MCP `{}`.",
+            server["server_key"].as_str().unwrap_or("unknown")
+        ));
+    }
+    if !workspace_gateway_agent_env_file_write_enabled(&server) {
+        return Err(format!(
+            "Env file writes are disabled for workspace MCP `{}`.",
+            server["server_key"].as_str().unwrap_or("unknown")
+        ));
+    }
+    let include_secrets = input["include_secrets"].as_bool().unwrap_or(false);
+    if include_secrets && !workspace_gateway_agent_secret_config_access_enabled(&server) {
+        return Err(format!(
+            "Secret config access is disabled for workspace MCP `{}`; refusing to write secret values.",
+            server["server_key"].as_str().unwrap_or("unknown")
+        ));
+    }
+    let include_public_aliases = input["include_public_aliases"].as_bool().unwrap_or(true);
+    let target = workspace_gateway_env_file_path(context, input["path"].as_str())?;
+    let updates =
+        workspace_gateway_env_file_updates(&server, include_secrets, include_public_aliases);
+    if updates.is_empty() {
+        return Err("No configured MCP values are available to write.".to_string());
+    }
+    workspace_gateway_write_env_updates(&target, &updates)?;
+    let written = updates
+        .iter()
+        .map(|update| {
+            json!({
+                "key": update.key,
+                "source_key": update.source_key,
+                "secret": update.secret,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server_key": server["server_key"],
+        "path": target.display().to_string(),
+        "written": written,
+        "secret_values_returned": false,
+    }))
+}
+
+fn workspace_gateway_config_access_summary(server: &Value) -> Value {
+    json!({
+        "non_secret_config_read_enabled": workspace_gateway_agent_config_access_enabled(server),
+        "secret_config_read_enabled": workspace_gateway_agent_secret_config_access_enabled(server),
+        "env_file_write_enabled": workspace_gateway_agent_env_file_write_enabled(server),
+    })
+}
+
+fn workspace_gateway_agent_config_access_enabled(server: &Value) -> bool {
+    server["agent_config_access_enabled"].as_i64().unwrap_or(1) != 0
+}
+
+fn workspace_gateway_agent_secret_config_access_enabled(server: &Value) -> bool {
+    server["agent_secret_config_access_enabled"]
+        .as_i64()
+        .unwrap_or_default()
+        != 0
+}
+
+fn workspace_gateway_agent_env_file_write_enabled(server: &Value) -> bool {
+    server["agent_env_file_write_enabled"].as_i64().unwrap_or(1) != 0
+}
+
+fn workspace_gateway_config_variables(server: &Value, reveal_secrets: bool) -> Vec<Value> {
+    server["env_schema_json"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let key = entry["key"].as_str()?.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let secret = entry["secret"].as_bool().unwrap_or(false);
+            let value = workspace_gateway_config_value(&server["config_values_json"], key);
+            let public_alias = (!secret)
+                .then(|| workspace_gateway_public_env_alias(key))
+                .flatten();
+            Some(json!({
+                "key": key,
+                "label": entry["label"].as_str().unwrap_or(key),
+                "required": entry["required"].as_bool().unwrap_or(false),
+                "secret": secret,
+                "available": value.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "value": if secret && !reveal_secrets {
+                    Value::Null
+                } else {
+                    value.clone().map(Value::String).unwrap_or(Value::Null)
+                },
+                "redacted": secret && !reveal_secrets && value.is_some(),
+                "public_env_alias": public_alias,
+            }))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGatewayEnvUpdate {
+    key: String,
+    source_key: String,
+    value: String,
+    secret: bool,
+}
+
+fn workspace_gateway_env_file_updates(
+    server: &Value,
+    include_secrets: bool,
+    include_public_aliases: bool,
+) -> Vec<WorkspaceGatewayEnvUpdate> {
+    let mut updates = Vec::new();
+    for entry in server["env_schema_json"].as_array().into_iter().flatten() {
+        let Some(key) = entry["key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        else {
+            continue;
+        };
+        let secret = entry["secret"].as_bool().unwrap_or(false);
+        if secret && !include_secrets {
+            continue;
+        }
+        let Some(value) = workspace_gateway_config_value(&server["config_values_json"], key)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        updates.push(WorkspaceGatewayEnvUpdate {
+            key: key.to_string(),
+            source_key: key.to_string(),
+            value: value.clone(),
+            secret,
+        });
+        if include_public_aliases && !secret {
+            if let Some(alias) =
+                workspace_gateway_public_env_alias(key).filter(|alias| alias != key)
+            {
+                updates.push(WorkspaceGatewayEnvUpdate {
+                    key: alias,
+                    source_key: key.to_string(),
+                    value,
+                    secret: false,
+                });
+            }
+        }
+    }
+    updates
+}
+
+fn workspace_gateway_public_env_alias(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.starts_with("NEXT_PUBLIC_") {
+        return Some(key.to_string());
+    }
+    match key {
+        "APPWRITE_ENDPOINT" => Some("NEXT_PUBLIC_APPWRITE_ENDPOINT".to_string()),
+        "APPWRITE_PROJECT_ID" => Some("NEXT_PUBLIC_APPWRITE_PROJECT_ID".to_string()),
+        _ => None,
+    }
+}
+
+fn workspace_gateway_env_file_path(
+    context: &McpContext,
+    requested: Option<&str>,
+) -> Result<PathBuf, String> {
+    let base = context
+        .worktree_path
+        .as_deref()
+        .or(context.repo_path.as_deref())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "Workspace MCP gateway needs a repo or worktree path to write env files.".to_string()
+        })?;
+    let requested = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".env.local");
+    if requested.contains('\0') {
+        return Err("Env file path contains an invalid NUL byte.".to_string());
+    }
+    let requested_path = PathBuf::from(requested);
+    let target = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        if requested_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err("Env file path cannot contain `..`.".to_string());
+        }
+        base.join(requested_path)
+    };
+    let base_canonical = base.canonicalize().map_err(|error| {
+        format!(
+            "Unable to resolve env file base {}: {error}",
+            base.display()
+        )
+    })?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Env file path must have a parent directory.".to_string())?;
+    if !parent.exists() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create env file directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let parent_canonical = parent.canonicalize().map_err(|error| {
+        format!(
+            "Unable to resolve env file directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !parent_canonical.starts_with(&base_canonical) {
+        return Err(format!(
+            "Refusing to write env file outside {}.",
+            base_canonical.display()
+        ));
+    }
+    Ok(target)
+}
+
+fn workspace_gateway_write_env_updates(
+    path: &Path,
+    updates: &[WorkspaceGatewayEnvUpdate],
+) -> Result<(), String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut lines = existing.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut applied = HashMap::new();
+    for update in updates {
+        applied.insert(update.key.clone(), false);
+    }
+
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !trimmed.contains('=') {
+            continue;
+        }
+        let Some((raw_key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if let Some(update) = updates.iter().find(|update| update.key == key) {
+            *line = format!(
+                "{}={}",
+                update.key,
+                workspace_gateway_env_escape(&update.value)
+            );
+            applied.insert(update.key.clone(), true);
+        }
+    }
+
+    if !lines.is_empty() && lines.last().is_some_and(|line| !line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    for update in updates {
+        if applied.get(&update.key).copied() == Some(true) {
+            continue;
+        }
+        lines.push(format!(
+            "{}={}",
+            update.key,
+            workspace_gateway_env_escape(&update.value)
+        ));
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    fs::write(path, body).map_err(|error| format!("Unable to write {}: {error}", path.display()))
+}
+
+fn workspace_gateway_env_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '@'))
+    {
+        return value.to_string();
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
 }
 
 fn workspace_gateway_kernel(context: &McpContext) -> Result<(CoordinationKernel, String), String> {
@@ -1210,6 +1596,10 @@ fn workspace_gateway_server_public(server: &Value) -> Value {
         "package_ref": server["package_ref"].clone(),
         "transport": server["transport"].clone(),
         "workspace_enabled": workspace_enabled,
+        "approval_policy": server["approval_policy"].clone(),
+        "agent_config_access_enabled": workspace_gateway_agent_config_access_enabled(server),
+        "agent_secret_config_access_enabled": workspace_gateway_agent_secret_config_access_enabled(server),
+        "agent_env_file_write_enabled": workspace_gateway_agent_env_file_write_enabled(server),
         "runtime_status": runtime_status,
         "missing_required_config": missing,
         "tool_namespace": server_key,

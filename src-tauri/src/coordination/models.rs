@@ -43,6 +43,7 @@ pub struct TerminalCoordinationContext {
     pub claude_mcp_config_path: String,
     pub mcp_command: String,
     pub workspace_id: Option<String>,
+    pub workspace_mcp_allowed_tools: Vec<String>,
     pub objective_key: String,
     pub context_run_id: Option<String>,
     pub context_role: Option<String>,
@@ -152,6 +153,10 @@ impl TerminalCoordinationContext {
                 self.objective_key.clone(),
             ),
             ("COORDINATION_MCP_ALWAYS_ON".to_string(), "1".to_string()),
+            (
+                "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS".to_string(),
+                self.workspace_mcp_allowed_tools.join(","),
+            ),
         ];
 
         if let Some(value) = &self.workspace_id {

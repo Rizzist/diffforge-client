@@ -25,6 +25,12 @@ pub const WORKSPACE_MCP_REGISTRY_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_registry";
 pub const WORKSPACE_MCP_INDEX_MIGRATION_VERSION: i64 = 12;
 pub const WORKSPACE_MCP_INDEX_MIGRATION_NAME: &str = "coordination_kernel_workspace_mcp_index";
+pub const WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION: i64 = 13;
+pub const WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_approval_policy";
+pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION: i64 = 14;
+pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_agent_config_access";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -902,6 +908,10 @@ CREATE TABLE IF NOT EXISTS workspace_mcp_servers(
   tools_json TEXT NOT NULL DEFAULT '[]',
   install_state TEXT NOT NULL DEFAULT 'installed',
   workspace_enabled INTEGER NOT NULL DEFAULT 0,
+  approval_policy TEXT NOT NULL DEFAULT 'always_allow',
+  agent_config_access_enabled INTEGER NOT NULL DEFAULT 1,
+  agent_secret_config_access_enabled INTEGER NOT NULL DEFAULT 0,
+  agent_env_file_write_enabled INTEGER NOT NULL DEFAULT 1,
   last_probe_status TEXT,
   last_probe_message TEXT,
   created_at TEXT NOT NULL,

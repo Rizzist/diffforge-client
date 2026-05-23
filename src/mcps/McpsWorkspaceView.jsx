@@ -53,6 +53,21 @@ const VIEW_MARKETPLACES = "marketplaces";
 const EDITOR_DETAILS = "details";
 const EDITOR_MANUAL = "manual";
 const EDITOR_MARKETPLACE = "marketplace";
+const APPROVAL_ALWAYS_ALLOW = "always_allow";
+const APPROVAL_PROMPT = "prompt";
+
+const APPROVAL_POLICY_OPTIONS = [
+  {
+    value: APPROVAL_ALWAYS_ALLOW,
+    label: "Always allow",
+    description: "Run this MCP's tools without per-call confirmation.",
+  },
+  {
+    value: APPROVAL_PROMPT,
+    label: "Prompt",
+    description: "Ask before running tools from this MCP.",
+  },
+];
 
 const EMPTY_MANUAL = {
   customCommand: "",
@@ -270,12 +285,32 @@ function hasRequiredConfig(server, draftValues) {
   });
 }
 
+function isPendingMcpStatus(status) {
+  return ["added", "checking", "indexing", "installing", "queued"].includes(
+    String(status || "").toLowerCase(),
+  );
+}
+
 function serverStatus(server, draftValues) {
   if (!server) return { label: "Unknown", state: "planned" };
   if (server.built_in) {
     return {
       label: titleCase(server.status || "healthy"),
       state: server.badge_state || "enabled",
+    };
+  }
+  const pendingStatus = [server.status, server.last_probe_status].find(isPendingMcpStatus);
+  if (pendingStatus) {
+    return {
+      label: titleCase(pendingStatus),
+      state: server.badge_state || "planned",
+      pending: true,
+    };
+  }
+  if (server.badge_state === "blocked" && String(server.status || "").trim()) {
+    return {
+      label: titleCase(server.status),
+      state: "blocked",
     };
   }
   if (!server.workspace_enabled) {
@@ -310,6 +345,15 @@ function connectionMessage(server, statusInfo) {
     return "This MCP is enabled, but the workspace gateway could not connect to it yet.";
   }
   return "The workspace gateway can expose this MCP to active coding agents.";
+}
+
+function approvalPolicy(server) {
+  return server?.approval_policy === APPROVAL_PROMPT ? APPROVAL_PROMPT : APPROVAL_ALWAYS_ALLOW;
+}
+
+function booleanSetting(server, key, fallback = true) {
+  if (!server || typeof server[key] === "undefined" || server[key] === null) return fallback;
+  return Boolean(server[key]);
 }
 
 function actionCopy(actionState, context = {}) {
@@ -350,6 +394,16 @@ function actionCopy(actionState, context = {}) {
         title: `Saving ${name}`,
         detail: "Updating workspace configuration and checking the MCP connection.",
       };
+    case "saving_approval":
+      return {
+        title: `Saving ${name}`,
+        detail: "Updating tool approval policy for this workspace MCP.",
+      };
+    case "saving_access":
+      return {
+        title: `Saving ${name}`,
+        detail: "Updating what agents can read or write from this MCP configuration.",
+      };
     case "removing_marketplace":
       return {
         title: `Removing ${name}`,
@@ -386,6 +440,22 @@ function buttonContent(isWorking, label, workingLabel = "Working") {
 
 function isInstalled(catalogItem, servers) {
   return servers.some((server) => server.server_key === catalogItem.server_key);
+}
+
+function hasPendingMcpWork(registry) {
+  const marketplaces = asArray(registry?.marketplaces);
+  const servers = asArray(registry?.servers);
+  return (
+    marketplaces.some((marketplace) => {
+      const status = String(marketplace.index_status || marketplace.status || "").toLowerCase();
+      return isPendingMcpStatus(status);
+    }) ||
+    servers.some((server) => {
+      if (server.built_in) return false;
+      const status = String(server.last_probe_status || server.status || "").toLowerCase();
+      return isPendingMcpStatus(status);
+    })
+  );
 }
 
 function parseArgs(value) {
@@ -735,7 +805,8 @@ export default function McpsWorkspaceView({
     setActionContext({});
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
     setError("");
     if (!repoPath || !workspaceId) {
       setStatus("missing_workspace");
@@ -743,7 +814,9 @@ export default function McpsWorkspaceView({
       return;
     }
 
-    setStatus("loading");
+    if (!silent) {
+      setStatus("loading");
+    }
     try {
       const response = await invoke("coordination_workspace_mcp_registry", {
         ...commandBase,
@@ -758,7 +831,9 @@ export default function McpsWorkspaceView({
         setSelectedId(servers[0]?.id || "coordination-kernel");
       }
     } catch (caught) {
-      setStatus("error");
+      if (!silent) {
+        setStatus("error");
+      }
       setError(errorMessage(caught));
     }
   }, [commandBase, repoPath, workspaceId, workspaceName]);
@@ -770,6 +845,7 @@ export default function McpsWorkspaceView({
   const servers = asArray(registry?.servers);
   const marketplaces = asArray(registry?.marketplaces);
   const catalog = asArray(registry?.available_catalog);
+  const pendingMcpWork = hasPendingMcpWork(registry);
   const selectedServer = servers.find((server) => server.id === selectedId) || servers[0] || null;
   const selectedStatus = serverStatus(selectedServer, configDraft);
   const parsedMarketplace = parseMarketplaceCommand(
@@ -797,6 +873,16 @@ export default function McpsWorkspaceView({
       setConfigDraft(configValuesFromServer(selectedServer));
     }
   }, [selectedServer?.id]);
+
+  useEffect(() => {
+    if (!pendingMcpWork || status !== "ready") {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      refresh({ silent: true });
+    }, 1400);
+    return () => window.clearInterval(timer);
+  }, [pendingMcpWork, refresh, status]);
 
   const replaceRegistry = useCallback((response) => {
     const data = unwrapData(response);
@@ -829,6 +915,10 @@ export default function McpsWorkspaceView({
             env_schema: item.env_schema || [],
             tools: item.tools || [],
             workspace_enabled: false,
+            approval_policy: APPROVAL_ALWAYS_ALLOW,
+            agent_config_access_enabled: true,
+            agent_secret_config_access_enabled: false,
+            agent_env_file_write_enabled: true,
           },
         });
         const data = replaceRegistry(response);
@@ -894,6 +984,10 @@ export default function McpsWorkspaceView({
           config_values: manualDraft.configValues || {},
           tools: parseTools(manualDraft.tools),
           workspace_enabled: false,
+          approval_policy: APPROVAL_ALWAYS_ALLOW,
+          agent_config_access_enabled: true,
+          agent_secret_config_access_enabled: false,
+          agent_env_file_write_enabled: true,
         },
       });
       const data = replaceRegistry(response);
@@ -982,6 +1076,14 @@ export default function McpsWorkspaceView({
           ? nextEnabled
             ? "enabling_mcp"
             : "disabling_mcp"
+          : typeof next.approval_policy === "string"
+            ? "saving_approval"
+            : [
+                  "agent_config_access_enabled",
+                  "agent_secret_config_access_enabled",
+                  "agent_env_file_write_enabled",
+                ].some((key) => typeof next[key] === "boolean")
+              ? "saving_access"
           : "saving_config";
       beginAction(nextActionState, { name: selectedServer.name });
       setError("");
@@ -1047,7 +1149,12 @@ export default function McpsWorkspaceView({
               <strong>{server.name}</strong>
               <span>{displaySourceLabel(server.source_kind, server.source_label)}</span>
             </McpServerCopy>
-            <McpStatusBadge data-state={statusInfo.state}>{statusInfo.label}</McpStatusBadge>
+            <McpStatusBadge
+              data-pending={statusInfo.pending ? "true" : undefined}
+              data-state={statusInfo.state}
+            >
+              {statusInfo.label}
+            </McpStatusBadge>
           </McpServerButton>
         );
       })}
@@ -1438,6 +1545,22 @@ export default function McpsWorkspaceView({
       configDraft,
     );
     const selectedConnectionMessage = connectionMessage(selectedServer, selectedStatus);
+    const currentApprovalPolicy = approvalPolicy(selectedServer);
+    const configAccessEnabled = booleanSetting(
+      selectedServer,
+      "agent_config_access_enabled",
+      true,
+    );
+    const secretConfigAccessEnabled = booleanSetting(
+      selectedServer,
+      "agent_secret_config_access_enabled",
+      false,
+    );
+    const envFileWriteEnabled = booleanSetting(
+      selectedServer,
+      "agent_env_file_write_enabled",
+      true,
+    );
 
     return (
       <McpEditorPanel>
@@ -1483,7 +1606,11 @@ export default function McpsWorkspaceView({
                 <ButtonHubIcon aria-hidden="true" />
                 Workspace status
               </span>
-              <McpStatusBadge data-state={selectedStatus.state} title={selectedConnectionMessage}>
+              <McpStatusBadge
+                data-pending={selectedStatus.pending ? "true" : undefined}
+                data-state={selectedStatus.state}
+                title={selectedConnectionMessage}
+              >
                 {selectedStatus.label}
               </McpStatusBadge>
             </McpAccessTopline>
@@ -1513,6 +1640,95 @@ export default function McpsWorkspaceView({
             </McpEmptyAccess>
           </McpAccessPanel>
         </McpAccessGrid>
+
+        {!selectedServer.built_in && (
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonKeyIcon aria-hidden="true" />
+                Tool approval
+              </span>
+              <McpStatusBadge
+                data-state={currentApprovalPolicy === APPROVAL_PROMPT ? "planned" : "enabled"}
+              >
+                {currentApprovalPolicy === APPROVAL_PROMPT ? "Prompt" : "Always allow"}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            <McpTransportTabs aria-label="MCP tool approval policy" data-columns="2">
+              {APPROVAL_POLICY_OPTIONS.map((option) => (
+                <McpTransportButton
+                  data-active={currentApprovalPolicy === option.value}
+                  disabled={actionState !== "idle" || currentApprovalPolicy === option.value}
+                  key={option.value}
+                  onClick={() => updateSelected({ approval_policy: option.value })}
+                  title={option.description}
+                  type="button"
+                >
+                  {buttonContent(
+                    actionState === "saving_approval" && currentApprovalPolicy !== option.value,
+                    option.label,
+                    "Saving",
+                  )}
+                </McpTransportButton>
+              ))}
+            </McpTransportTabs>
+          </McpAccessPanel>
+        )}
+
+        {!selectedServer.built_in && (
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonKeyIcon aria-hidden="true" />
+                Agent config access
+              </span>
+              <McpStatusBadge data-state={configAccessEnabled ? "enabled" : "planned"}>
+                {configAccessEnabled ? "Readable" : "Locked"}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            <McpToolList>
+              <McpSwitchButton
+                aria-pressed={configAccessEnabled ? "true" : "false"}
+                disabled={actionState !== "idle"}
+                onClick={() =>
+                  updateSelected({ agent_config_access_enabled: !configAccessEnabled })
+                }
+                type="button"
+              >
+                <span aria-hidden="true" />
+                Non-secret config
+              </McpSwitchButton>
+              <McpSwitchButton
+                aria-pressed={envFileWriteEnabled ? "true" : "false"}
+                disabled={actionState !== "idle" || !configAccessEnabled}
+                onClick={() =>
+                  updateSelected({ agent_env_file_write_enabled: !envFileWriteEnabled })
+                }
+                type="button"
+              >
+                <span aria-hidden="true" />
+                Env file writes
+              </McpSwitchButton>
+              <McpSwitchButton
+                aria-pressed={secretConfigAccessEnabled ? "true" : "false"}
+                disabled={actionState !== "idle" || !configAccessEnabled}
+                onClick={() =>
+                  updateSelected({
+                    agent_secret_config_access_enabled: !secretConfigAccessEnabled,
+                  })
+                }
+                type="button"
+              >
+                <span aria-hidden="true" />
+                Secret values
+              </McpSwitchButton>
+            </McpToolList>
+            <McpEmptyAccess>
+              Agents can read configured non-secret values and write safe env files. Secret
+              values stay redacted unless explicitly enabled here.
+            </McpEmptyAccess>
+          </McpAccessPanel>
+        )}
 
         <McpAccessPanel>
           <McpAccessTopline>

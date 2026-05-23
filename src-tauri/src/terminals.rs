@@ -6929,6 +6929,10 @@ mod terminal_tests {
         coordination
             .env_vars
             .push(("CLAUDE_MCP_CONFIG".to_string(), claude_config_path.clone()));
+        coordination.env_vars.push((
+            "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS".to_string(),
+            "appwrite-api__appwrite_search_tools".to_string(),
+        ));
 
         let args = terminal_args_with_codex_mcp_identity(
             "claude",
@@ -6957,6 +6961,8 @@ mod terminal_tests {
             "mcp__coordination-kernel__acquire_lease",
             "mcp__coordination-kernel__checkpoint",
             "mcp__coordination-kernel__submit_patch",
+            "mcp__workspace-mcp-gateway__workspace_mcp__sync_manifest",
+            "mcp__workspace-mcp-gateway__appwrite-api__appwrite_search_tools",
         ] {
             assert!(allowed_tools.split(',').any(|allowed| allowed == tool));
         }

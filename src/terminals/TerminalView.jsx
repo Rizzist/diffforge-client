@@ -6251,6 +6251,7 @@ function TerminalView({
   workspaceError,
   workspaceName,
   workspaceSyncState,
+  workspaceThreadRestoreReady = true,
   workspaceTerminalAgentLaunchReady,
   workspaceTerminalRenderAgent,
   workspaceThreads = {},
@@ -10492,6 +10493,7 @@ function TerminalView({
                 onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
+                startupReady={workspaceThreadRestoreReady}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
@@ -10544,6 +10546,7 @@ function TerminalView({
       onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
+      startupReady={workspaceThreadRestoreReady}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
       terminalIndex={logicalTerminalIndexes[0] || 0}
       terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}

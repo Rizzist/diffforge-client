@@ -65,7 +65,11 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
     "workspace_mcp__get_server_status",
+    "workspace_mcp__get_server_config",
+    "workspace_mcp__write_env_file",
 ];
+const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
+const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
 
 #[derive(Clone)]
 struct SessionSlotOptions {
@@ -211,6 +215,19 @@ fn workspace_mcp_key(value: &str) -> String {
     }
 }
 
+fn workspace_mcp_approval_policy(value: Option<&str>) -> &'static str {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "prompt" | "ask" | "manual" | "confirm" => WORKSPACE_MCP_APPROVAL_PROMPT,
+        _ => WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+    }
+}
+
 fn config_value_present(config_values: &Value, key: &str) -> bool {
     let Some(value) = config_values.get(key) else {
         return false;
@@ -277,6 +294,16 @@ fn workspace_mcp_connection_message(
         .filter(|value| !value.is_empty());
     if install_state != "installed" {
         return format!("Install state is `{install_state}`.");
+    }
+    if matches!(status, "installing" | "checking" | "queued") {
+        return last_probe_message
+            .unwrap_or("Workspace MCP connection work is still running.")
+            .to_string();
+    }
+    if matches!(status, "spawn_failed" | "failed") {
+        return last_probe_message
+            .unwrap_or("Workspace MCP connection failed.")
+            .to_string();
     }
     if !workspace_enabled {
         return "This MCP is installed but disabled for this workspace.".to_string();
@@ -367,6 +394,10 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
         "tools_json": COORDINATION_WORKSPACE_MCP_TOOLS,
         "install_state": "installed",
         "workspace_enabled": true,
+        "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+        "agent_config_access_enabled": true,
+        "agent_secret_config_access_enabled": false,
+        "agent_env_file_write_enabled": true,
         "status": status_text,
         "badge_state": mcp_badge_state(status_text),
         "config_status": "configured",
@@ -384,18 +415,23 @@ fn workspace_mcp_public_server(row: Value, client_mount_summary: &Value) -> Valu
     let workspace_enabled = row["workspace_enabled"].as_i64().unwrap_or_default() != 0;
     let install_state = row["install_state"].as_str().unwrap_or("installed");
     let configured = missing.is_empty();
+    let last_probe_status = row["last_probe_status"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("not_connected");
     let status = if install_state != "installed" {
         install_state.to_string()
+    } else if matches!(
+        last_probe_status,
+        "installing" | "queued" | "spawn_failed" | "failed"
+    ) {
+        last_probe_status.to_string()
     } else if !workspace_enabled {
         "disabled".to_string()
     } else if !configured {
         "config_required".to_string()
     } else {
-        row["last_probe_status"]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("not_connected")
-            .to_string()
+        last_probe_status.to_string()
     };
     let config_status = if configured {
         "configured"
@@ -424,6 +460,10 @@ fn workspace_mcp_public_server(row: Value, client_mount_summary: &Value) -> Valu
         "tools_json": row["tools_json"].clone(),
         "install_state": install_state,
         "workspace_enabled": workspace_enabled,
+        "approval_policy": workspace_mcp_approval_policy(row["approval_policy"].as_str()),
+        "agent_config_access_enabled": row["agent_config_access_enabled"].as_i64().unwrap_or(1) != 0,
+        "agent_secret_config_access_enabled": row["agent_secret_config_access_enabled"].as_i64().unwrap_or_default() != 0,
+        "agent_env_file_write_enabled": row["agent_env_file_write_enabled"].as_i64().unwrap_or(1) != 0,
         "status": status,
         "badge_state": mcp_badge_state(&status),
         "config_status": config_status,
@@ -501,6 +541,11 @@ fn global_mcp_root() -> PathBuf {
 
 fn global_mcp_registry_path() -> PathBuf {
     global_mcp_root().join("registry.json")
+}
+
+fn workspace_mcp_background_jobs() -> &'static Mutex<HashSet<String>> {
+    static JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn global_mcp_empty_registry() -> Value {
@@ -946,6 +991,7 @@ fn install_native_global_mcp_server(
     source_kind: &str,
     server_key: &str,
     name: &str,
+    approval_policy: &str,
     transport: &str,
     command: Option<&str>,
     args: &[String],
@@ -967,7 +1013,9 @@ fn install_native_global_mcp_server(
             cli_args.push(command.to_string());
             cli_args.extend(args.iter().cloned());
         }
-        run_mcp_cli("codex", &cli_args).map(|_| ())
+        run_mcp_cli("codex", &cli_args).and_then(|_| {
+            ensure_native_global_mcp_approval_policy(source_kind, server_key, approval_policy)
+        })
     } else if source_kind.contains("claude") {
         run_mcp_cli_ignore(
             "claude",
@@ -1003,11 +1051,141 @@ fn install_native_global_mcp_server(
             cli_args.push(command.to_string());
             cli_args.extend(args.iter().cloned());
         }
-        run_mcp_cli("claude", &cli_args).map(|_| ())
+        run_mcp_cli("claude", &cli_args).and_then(|_| {
+            ensure_native_global_mcp_approval_policy(source_kind, server_key, approval_policy)
+        })
     } else {
         let _ = name;
         Ok(())
     }
+}
+
+fn ensure_native_global_mcp_approval_policy(
+    source_kind: &str,
+    server_key: &str,
+    approval_policy: &str,
+) -> Result<(), String> {
+    let approval_policy = workspace_mcp_approval_policy(Some(approval_policy));
+    if source_kind.contains("codex") {
+        ensure_codex_mcp_server_approval_policy(server_key, approval_policy)?;
+    }
+    if source_kind.contains("claude") {
+        ensure_claude_user_mcp_server_approval_policy(server_key, approval_policy)?;
+    }
+    Ok(())
+}
+
+fn codex_global_config_path() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".codex").join("config.toml"))
+}
+
+fn ensure_codex_mcp_server_approval_policy(
+    server_key: &str,
+    approval_policy: &str,
+) -> Result<(), String> {
+    let Some(path) = codex_global_config_path() else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let body = fs::read_to_string(&path)
+        .map_err(|error| format!("Unable to read Codex config {}: {error}", path.display()))?;
+    let approval_mode = if workspace_mcp_approval_policy(Some(approval_policy))
+        == WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW
+    {
+        "approve"
+    } else {
+        "prompt"
+    };
+    let Some(next) = codex_config_with_mcp_server_approval_mode(&body, server_key, approval_mode)
+    else {
+        return Ok(());
+    };
+    if next != body {
+        write_text_file_atomic(&path, &next)?;
+    }
+    Ok(())
+}
+
+fn codex_config_with_mcp_server_approval_mode(
+    body: &str,
+    server_key: &str,
+    approval_mode: &str,
+) -> Option<String> {
+    let server_key = server_key.trim();
+    if server_key.is_empty() {
+        return None;
+    }
+    let approval_mode = if approval_mode == "approve" {
+        "approve"
+    } else {
+        "prompt"
+    };
+    let header = format!("[mcp_servers.{server_key}]");
+    let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+    let section_start = lines.iter().position(|line| line.trim() == header)?;
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.starts_with('[') && trimmed.ends_with(']')).then_some(index)
+        })
+        .unwrap_or(lines.len());
+
+    let mut index = section_start + 1;
+    while index < section_end && index < lines.len() {
+        if lines[index]
+            .trim_start()
+            .starts_with("default_tools_approval_mode")
+        {
+            lines.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    lines.insert(
+        section_start + 1,
+        format!("default_tools_approval_mode = \"{approval_mode}\""),
+    );
+
+    let mut next = lines.join("\n");
+    if body.ends_with('\n') || !next.is_empty() {
+        next.push('\n');
+    }
+    Some(next)
+}
+
+fn claude_user_settings_path() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".claude").join("settings.json"))
+}
+
+fn claude_mcp_server_allow_rule(server_key: &str) -> Option<String> {
+    let server_key = server_key.trim();
+    (!server_key.is_empty()).then(|| format!("mcp__{server_key}"))
+}
+
+fn ensure_claude_user_mcp_server_approval_policy(
+    server_key: &str,
+    approval_policy: &str,
+) -> Result<(), String> {
+    let Some(rule) = claude_mcp_server_allow_rule(server_key) else {
+        return Ok(());
+    };
+    let Some(path) = claude_user_settings_path() else {
+        return Ok(());
+    };
+    set_claude_permission_allow_rules(
+        &path,
+        &[rule],
+        workspace_mcp_approval_policy(Some(approval_policy)) == WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+    )
 }
 
 fn install_native_global_mcp_marketplace(provider: &str, source: &str) -> Result<(), String> {
@@ -1767,6 +1945,7 @@ fn workspace_mcp_activation_cache_key(
     workspace_name: Option<&str>,
     command: &str,
     args: &[String],
+    gateway_approved_tools: &[String],
     config_hash: &str,
 ) -> String {
     let payload = json!({
@@ -1776,6 +1955,7 @@ fn workspace_mcp_activation_cache_key(
         "workspace_name": workspace_name,
         "command": command,
         "args": args,
+        "gateway_approved_tools": gateway_approved_tools,
         "config_hash": config_hash,
     });
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
@@ -4784,6 +4964,8 @@ impl CoordinationKernel {
             .to_string();
 
         let (mcp_command, _) = self.coordination_mcp_command_spec();
+        let workspace_mcp_allowed_tools =
+            self.workspace_mcp_gateway_approved_tool_names(workspace_id);
 
         Ok(TerminalCoordinationContext {
             agent_id,
@@ -4804,6 +4986,7 @@ impl CoordinationKernel {
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
+            workspace_mcp_allowed_tools,
             objective_key,
             context_run_id: context_run_id.map(str::to_string),
             context_role: context_role.map(str::to_string),
@@ -4908,6 +5091,8 @@ impl CoordinationKernel {
             .to_string();
 
         let (mcp_command, _) = self.coordination_mcp_command_spec();
+        let workspace_mcp_allowed_tools =
+            self.workspace_mcp_gateway_approved_tool_names(workspace_id);
 
         Ok(TerminalCoordinationContext {
             agent_id,
@@ -4928,6 +5113,7 @@ impl CoordinationKernel {
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
+            workspace_mcp_allowed_tools,
             objective_key,
             context_run_id: context_run_id.map(str::to_string),
             context_role: context_role.map(str::to_string),
@@ -5653,6 +5839,7 @@ impl CoordinationKernel {
         if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
             args.extend(["--workspace-id".to_string(), value.to_string()]);
         }
+        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(workspace_id);
         let (gateway_command, gateway_args) =
             self.workspace_gateway_mcp_command_spec(workspace_id, Some(&objective_key));
         let generic_config = json!({
@@ -5712,11 +5899,15 @@ impl CoordinationKernel {
             workspace_name,
             &command,
             &args,
+            &gateway_approved_tools,
             &config_hash,
         );
         if telemetry_pane_id.is_some() {
             if let Some(cached) = cached_workspace_mcp_activation(&cache_key) {
                 let cached_response = cached.response;
+                if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
+                    let _ = self.apply_workspace_mcp_allow_policies(workspace_id);
+                }
                 return Ok(cached_response);
             }
         }
@@ -5728,11 +5919,18 @@ impl CoordinationKernel {
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
         write_json_file_atomic(&generic_path, &generic_config)?;
-        write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+        write_text_file_atomic(
+            &codex_path,
+            &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
+        )?;
         write_json_file_atomic(&claude_path, &generic_config)?;
         self.write_agent_contract_files(&self.paths.repo_path)?;
-        let (repo_mcp_path, repo_codex_path) =
-            self.write_repo_root_mcp_activation_files(&generic_config, &command, &args)?;
+        let (repo_mcp_path, repo_codex_path) = self.write_repo_root_mcp_activation_files(
+            &generic_config,
+            &command,
+            &args,
+            &gateway_approved_tools,
+        )?;
 
         let response = json!({
             "server_name": "coordination-kernel",
@@ -5755,6 +5953,9 @@ impl CoordinationKernel {
             "repo_codex_config_path": process_path_text(&repo_codex_path),
         });
         remember_workspace_mcp_activation(cache_key, &response);
+        if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
+            let _ = self.apply_workspace_mcp_allow_policies(workspace_id);
+        }
         Ok(response)
     }
 
@@ -5763,7 +5964,11 @@ impl CoordinationKernel {
         workspace_id: Option<&str>,
         workspace_name: Option<&str>,
     ) -> Result<Value, String> {
-        let mut status = self.ensure_workspace_mcp_config(workspace_id, workspace_name)?;
+        let mut status = self.ensure_workspace_mcp_config_with_telemetry(
+            workspace_id,
+            workspace_name,
+            Some("workspace-mcp-registry"),
+        )?;
         let health = self.workspace_mcp_health(&status);
         self.emit_event(
             "mcp_health_checked",
@@ -5782,6 +5987,65 @@ impl CoordinationKernel {
         Ok(status)
     }
 
+    fn get_workspace_mcp_status_cached(
+        &self,
+        workspace_id: Option<&str>,
+        workspace_name: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut status = self.workspace_mcp_status_snapshot(workspace_id, workspace_name)?;
+        let health = self.workspace_mcp_health_cached(&status);
+        if let Some(object) = status.as_object_mut() {
+            object.insert("health".to_string(), health);
+        }
+        Ok(status)
+    }
+
+    fn workspace_mcp_status_snapshot(
+        &self,
+        workspace_id: Option<&str>,
+        workspace_name: Option<&str>,
+    ) -> Result<Value, String> {
+        let objective_key = require_workspace_objective_key(workspace_id)?;
+        let (command, mut args) = self.coordination_mcp_command_spec();
+        args.extend([
+            "--repo-path".to_string(),
+            process_path_text(&self.paths.repo_path),
+            "--db-path".to_string(),
+            process_path_text(&self.paths.db_path),
+            "--objective-key".to_string(),
+            objective_key.clone(),
+        ]);
+        if let Some(value) = workspace_id.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--workspace-id".to_string(), value.to_string()]);
+        }
+        let generic_path = self.paths.mcp_root.join("coordination.json");
+        let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
+        let claude_path = self.paths.mcp_root.join("coordination.claude.json");
+        let repo_mcp_path = self.paths.repo_path.join(".mcp.json");
+        let repo_codex_path = self.paths.repo_path.join(".codex").join("config.toml");
+
+        Ok(json!({
+            "server_name": "coordination-kernel",
+            "scope": "workspace",
+            "enabled": true,
+            "always_on": true,
+            "toggleable": false,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "objective_key": objective_key,
+            "repo_path": process_path_text(&self.paths.repo_path),
+            "db_path": process_path_text(&self.paths.db_path),
+            "daemon": Value::Null,
+            "command": command,
+            "args": args,
+            "config_path": process_path_text(&generic_path),
+            "codex_config_path": process_path_text(&codex_path),
+            "claude_config_path": process_path_text(&claude_path),
+            "repo_mcp_path": process_path_text(&repo_mcp_path),
+            "repo_codex_config_path": process_path_text(&repo_codex_path),
+        }))
+    }
+
     pub fn workspace_mcp_registry(
         &self,
         workspace_id: &str,
@@ -5792,14 +6056,12 @@ impl CoordinationKernel {
             return Err("workspace_id is required.".to_string());
         }
 
-        self.sync_native_global_mcp_servers()?;
-        self.auto_index_global_mcp_marketplaces()?;
+        self.schedule_workspace_mcp_registry_background_refresh(workspace_id, workspace_name);
 
         let coordination_status =
-            self.get_workspace_mcp_status(Some(workspace_id), workspace_name)?;
+            self.get_workspace_mcp_status_cached(Some(workspace_id), workspace_name)?;
         let client_mount_summary =
             coordination_status["health"]["agent_client_mount_summary"].clone();
-        self.refresh_workspace_mcp_connection_statuses(workspace_id)?;
         let marketplaces = self.global_mcp_marketplaces()?;
         let installed_rows = self.query_json(
             "SELECT * FROM workspace_mcp_servers
@@ -5844,6 +6106,342 @@ impl CoordinationKernel {
             },
             "coordination_kernel": coordination_status,
         }))
+    }
+
+    fn spawn_workspace_mcp_background_job<F>(
+        &self,
+        job_key: String,
+        job_type: &'static str,
+        workspace_id: Option<String>,
+        job: F,
+    ) -> bool
+    where
+        F: FnOnce(&CoordinationKernel) -> Result<(), String> + Send + 'static,
+    {
+        let claimed = workspace_mcp_background_jobs()
+            .lock()
+            .map(|mut jobs| jobs.insert(job_key.clone()))
+            .unwrap_or(false);
+        if !claimed {
+            return false;
+        }
+
+        let paths = self.paths.clone();
+        thread::spawn(move || {
+            let cleanup_key = job_key.clone();
+            let result = (|| {
+                let kernel =
+                    CoordinationKernel::open(paths.repo_path.clone(), Some(paths.db_path.clone()))?;
+                let _ = kernel.emit_event(
+                    "workspace_mcp_background_job_started",
+                    "kernel",
+                    REPO_ID,
+                    EventRefs::default(),
+                    json!({
+                        "job_key": job_key,
+                        "job_type": job_type,
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                let result = job(&kernel);
+                match &result {
+                    Ok(_) => {
+                        let _ = kernel.emit_event(
+                            "workspace_mcp_registry_changed",
+                            "kernel",
+                            REPO_ID,
+                            EventRefs::default(),
+                            json!({
+                                "job_key": job_key,
+                                "job_type": job_type,
+                                "workspace_id": workspace_id,
+                                "status": "completed",
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = kernel.emit_event(
+                            "workspace_mcp_background_job_failed",
+                            "kernel",
+                            REPO_ID,
+                            EventRefs::default(),
+                            json!({
+                                "job_key": job_key,
+                                "job_type": job_type,
+                                "workspace_id": workspace_id,
+                                "status": "failed",
+                                "error": error,
+                            }),
+                        );
+                    }
+                }
+                result
+            })();
+            let _ = result;
+            if let Ok(mut jobs) = workspace_mcp_background_jobs().lock() {
+                jobs.remove(&cleanup_key);
+            }
+        });
+
+        true
+    }
+
+    fn schedule_workspace_mcp_registry_background_refresh(
+        &self,
+        workspace_id: &str,
+        workspace_name: Option<&str>,
+    ) {
+        self.schedule_workspace_mcp_config_ensure(workspace_id, workspace_name);
+        self.schedule_native_global_mcp_sync();
+        self.schedule_global_mcp_auto_index();
+        self.schedule_workspace_mcp_pending_probes(workspace_id);
+        self.schedule_workspace_mcp_allow_policies(workspace_id);
+    }
+
+    fn schedule_workspace_mcp_config_ensure(
+        &self,
+        workspace_id: &str,
+        workspace_name: Option<&str>,
+    ) {
+        let needs_ensure = self
+            .workspace_mcp_status_snapshot(Some(workspace_id), workspace_name)
+            .map(|status| {
+                let health = self.workspace_mcp_health_cached(&status);
+                health["config_generated"].as_bool() != Some(true)
+            })
+            .unwrap_or(true);
+        if !needs_ensure {
+            return;
+        }
+
+        let workspace_id = workspace_id.to_string();
+        let workspace_name = workspace_name.map(str::to_string);
+        self.spawn_workspace_mcp_background_job(
+            format!("workspace_mcp:ensure_config:{workspace_id}"),
+            "ensure_workspace_mcp_config",
+            Some(workspace_id.clone()),
+            move |kernel| {
+                kernel
+                    .ensure_workspace_mcp_config(Some(&workspace_id), workspace_name.as_deref())
+                    .map(|_| ())
+            },
+        );
+    }
+
+    fn schedule_workspace_mcp_config_rewrite(
+        &self,
+        workspace_id: &str,
+        workspace_name: Option<&str>,
+        reason: &'static str,
+    ) {
+        let workspace_id = workspace_id.to_string();
+        let workspace_name = workspace_name.map(str::to_string);
+        self.spawn_workspace_mcp_background_job(
+            format!("workspace_mcp:rewrite_config:{workspace_id}:{reason}"),
+            "rewrite_workspace_mcp_config",
+            Some(workspace_id.clone()),
+            move |kernel| {
+                kernel
+                    .ensure_workspace_mcp_config(Some(&workspace_id), workspace_name.as_deref())
+                    .map(|_| ())
+            },
+        );
+    }
+
+    fn schedule_native_global_mcp_sync(&self) {
+        self.spawn_workspace_mcp_background_job(
+            "global_mcp:sync_native".to_string(),
+            "sync_native_global_servers",
+            None,
+            |kernel| kernel.sync_native_global_mcp_servers(),
+        );
+    }
+
+    fn schedule_global_mcp_auto_index(&self) {
+        let needs_index = global_mcp_load_registry()
+            .map(|registry| {
+                let indexes = global_mcp_array(&registry, "marketplace_indexes");
+                global_mcp_array(&registry, "marketplaces")
+                    .into_iter()
+                    .any(|marketplace| {
+                        let status = marketplace["status"].as_str().unwrap_or("added");
+                        let marketplace_id = marketplace["id"].as_str().unwrap_or_default();
+                        let has_index = indexes
+                            .iter()
+                            .any(|index| index["marketplace_id"].as_str() == Some(marketplace_id));
+                        status != "failed" && (status != "indexed" || !has_index)
+                    })
+            })
+            .unwrap_or(false);
+        if !needs_index {
+            return;
+        }
+        self.spawn_workspace_mcp_background_job(
+            "global_mcp:auto_index".to_string(),
+            "auto_index_global_marketplaces",
+            None,
+            |kernel| kernel.auto_index_global_mcp_marketplaces(),
+        );
+    }
+
+    fn schedule_workspace_mcp_pending_probes(&self, workspace_id: &str) {
+        let rows = self
+            .query_json(
+                "SELECT * FROM workspace_mcp_servers
+                 WHERE workspace_id=?1
+                   AND install_state='installed'
+                   AND workspace_enabled=1
+                   AND COALESCE(last_probe_status, '') IN ('', 'checking', 'queued')",
+                &[&workspace_id],
+            )
+            .unwrap_or_default();
+        for row in rows {
+            let Some(server_key) = row["server_key"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            self.schedule_workspace_mcp_probe(workspace_id, &server_key);
+        }
+    }
+
+    fn schedule_workspace_mcp_probe(&self, workspace_id: &str, server_key: &str) {
+        let workspace_id = workspace_id.to_string();
+        let server_key = server_key.to_string();
+        let job_key = format!("workspace_mcp:probe:{workspace_id}:{server_key}");
+        self.spawn_workspace_mcp_background_job(
+            job_key,
+            "probe_workspace_server",
+            Some(workspace_id.clone()),
+            move |kernel| kernel.probe_one_workspace_mcp_server(&workspace_id, &server_key),
+        );
+    }
+
+    fn schedule_global_mcp_allow_policy(
+        &self,
+        workspace_id: &str,
+        source_kind: &str,
+        server_key: &str,
+        approval_policy: &str,
+    ) {
+        if !source_kind.contains("codex") && !source_kind.contains("claude") {
+            return;
+        }
+        let source_kind = source_kind.to_string();
+        let server_key = server_key.to_string();
+        let approval_policy = workspace_mcp_approval_policy(Some(approval_policy)).to_string();
+        let workspace_id = workspace_id.to_string();
+        self.spawn_workspace_mcp_background_job(
+            format!("global_mcp:allow_policy:{source_kind}:{server_key}"),
+            "apply_global_mcp_allow_policy",
+            Some(workspace_id),
+            move |_kernel| {
+                ensure_native_global_mcp_approval_policy(
+                    &source_kind,
+                    &server_key,
+                    &approval_policy,
+                )
+            },
+        );
+    }
+
+    fn schedule_workspace_mcp_allow_policies(&self, workspace_id: &str) {
+        for row in self.workspace_mcp_allow_policy_rows(workspace_id) {
+            let Some(server_key) = row["server_key"].as_str() else {
+                continue;
+            };
+            let Some(source_kind) = row["source_kind"].as_str() else {
+                continue;
+            };
+            let approval_policy = workspace_mcp_approval_policy(row["approval_policy"].as_str());
+            self.schedule_global_mcp_allow_policy(
+                workspace_id,
+                source_kind,
+                server_key,
+                approval_policy,
+            );
+        }
+    }
+
+    fn apply_workspace_mcp_allow_policies(&self, workspace_id: &str) -> Result<(), String> {
+        for row in self.workspace_mcp_allow_policy_rows(workspace_id) {
+            let Some(server_key) = row["server_key"].as_str() else {
+                continue;
+            };
+            let Some(source_kind) = row["source_kind"].as_str() else {
+                continue;
+            };
+            let approval_policy = workspace_mcp_approval_policy(row["approval_policy"].as_str());
+            ensure_native_global_mcp_approval_policy(source_kind, server_key, approval_policy)?;
+        }
+        Ok(())
+    }
+
+    fn workspace_mcp_allow_policy_rows(&self, workspace_id: &str) -> Vec<Value> {
+        self.query_json(
+            "SELECT server_key, source_kind, approval_policy FROM workspace_mcp_servers
+             WHERE workspace_id=?1
+               AND install_state='installed'
+               AND workspace_enabled=1",
+            &[&workspace_id],
+        )
+        .unwrap_or_default()
+    }
+
+    fn workspace_mcp_gateway_approved_tool_names(&self, workspace_id: Option<&str>) -> Vec<String> {
+        let rows = if let Some(workspace_id) = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.query_json(
+                "SELECT server_key, tools_json FROM workspace_mcp_servers
+                 WHERE workspace_id=?1
+                   AND install_state='installed'
+                   AND workspace_enabled=1
+                   AND COALESCE(approval_policy, 'always_allow')='always_allow'",
+                &[&workspace_id],
+            )
+        } else {
+            self.query_json(
+                "SELECT server_key, tools_json FROM workspace_mcp_servers
+                 WHERE install_state='installed'
+                   AND workspace_enabled=1
+                   AND COALESCE(approval_policy, 'always_allow')='always_allow'",
+                &[],
+            )
+        }
+        .unwrap_or_default();
+
+        let mut seen = HashSet::new();
+        let mut names = Vec::new();
+        for row in rows {
+            let Some(server_key) = row["server_key"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            for tool in row["tools_json"].as_array().into_iter().flatten() {
+                let tool_name = tool
+                    .as_str()
+                    .or_else(|| tool["name"].as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let Some(tool_name) = tool_name else {
+                    continue;
+                };
+                let full_name = format!("{server_key}__{tool_name}");
+                if seen.insert(full_name.clone()) {
+                    names.push(full_name);
+                }
+            }
+        }
+        names.sort();
+        names
     }
 
     fn global_mcp_marketplaces(&self) -> Result<Vec<Value>, String> {
@@ -5919,7 +6517,11 @@ impl CoordinationKernel {
                 indexing.clone(),
             );
             global_mcp_save_registry(&registry)?;
-            match self.index_global_mcp_marketplace_inner(&mut registry, &indexing) {
+            let provider = indexing["provider"].as_str().unwrap_or_default();
+            let source = indexing["source"].as_str().unwrap_or_default();
+            let index_result = install_native_global_mcp_marketplace(provider, source)
+                .and_then(|_| self.index_global_mcp_marketplace_inner(&mut registry, &indexing));
+            match index_result {
                 Ok(indexed) => {
                     self.emit_event(
                         "workspace_mcp_marketplace_auto_indexed",
@@ -5994,7 +6596,6 @@ impl CoordinationKernel {
             .unwrap_or("git");
         let name = required_json_text(input, "name")?;
         let source = required_json_text(input, "source")?;
-        install_native_global_mcp_marketplace(provider, source)?;
         let mut registry = global_mcp_load_registry()?;
         let id = global_mcp_array(&registry, "marketplaces")
             .into_iter()
@@ -6017,7 +6618,7 @@ impl CoordinationKernel {
                 "name": name,
                 "source": source,
                 "scope": "global",
-                "status": "added",
+                "status": "indexing",
                 "last_error": Value::Null,
                 "created_at": now,
                 "updated_at": now,
@@ -6066,33 +6667,13 @@ impl CoordinationKernel {
         );
         global_mcp_save_registry(&registry)?;
 
-        match self.index_global_mcp_marketplace_inner(&mut registry, &indexing) {
-            Ok(indexed) => {
-                self.emit_event(
-                    "workspace_mcp_marketplace_indexed",
-                    "kernel",
-                    REPO_ID,
-                    EventRefs::default(),
-                    json!({
-                        "workspace_id": workspace_id,
-                        "storage_scope": "global",
-                        "marketplace_id": marketplace_id,
-                        "plugin_count": indexed["plugin_count"],
-                        "mcp_count": indexed["mcp_count"],
-                    }),
-                )?;
-                self.workspace_mcp_registry(workspace_id, None)
-            }
-            Err(error) => {
-                self.mark_global_mcp_marketplace_index_failed(
-                    &mut registry,
-                    marketplace_id,
-                    &error,
-                );
-                let _ = global_mcp_save_registry(&registry);
-                Err(error)
-            }
-        }
+        self.spawn_workspace_mcp_background_job(
+            "global_mcp:auto_index".to_string(),
+            "auto_index_global_marketplaces",
+            Some(workspace_id.to_string()),
+            |kernel| kernel.auto_index_global_mcp_marketplaces(),
+        );
+        self.workspace_mcp_registry(workspace_id, None)
     }
 
     fn mark_global_mcp_marketplace_index_failed(
@@ -6346,18 +6927,6 @@ impl CoordinationKernel {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let env_pairs = global_mcp_env_pairs(&env_schema_value, &config_values_value);
-        if source_kind.contains("custom_mcp") {
-            install_native_global_mcp_server(
-                source_kind,
-                &server_key,
-                name,
-                transport,
-                input["command"].as_str(),
-                &args,
-                input["url"].as_str(),
-                &env_pairs,
-            )?;
-        }
         let mut registry = global_mcp_load_registry()?;
         let server_definition = global_mcp_server_definition_from_input(&server_key, input);
         global_mcp_upsert(
@@ -6372,6 +6941,37 @@ impl CoordinationKernel {
         let config_values_json = json_text_or_default(input.get("config_values"), json!({}))?;
         let tools_json = json_text_or_default(input.get("tools"), json!([]))?;
         let workspace_enabled = bool_i64(input["workspace_enabled"].as_bool().unwrap_or(false));
+        let approval_policy = workspace_mcp_approval_policy(input["approval_policy"].as_str());
+        let agent_config_access_enabled = bool_i64(
+            input["agent_config_access_enabled"]
+                .as_bool()
+                .unwrap_or(true),
+        );
+        let agent_secret_config_access_enabled = bool_i64(
+            input["agent_secret_config_access_enabled"]
+                .as_bool()
+                .unwrap_or(false),
+        );
+        let agent_env_file_write_enabled = bool_i64(
+            input["agent_env_file_write_enabled"]
+                .as_bool()
+                .unwrap_or(true),
+        );
+        let is_custom_mcp = source_kind.contains("custom_mcp");
+        let initial_probe_status = if is_custom_mcp {
+            "installing"
+        } else if workspace_enabled == 1 {
+            "checking"
+        } else {
+            "not_connected"
+        };
+        let initial_probe_message = if is_custom_mcp {
+            "Global native MCP install queued."
+        } else if workspace_enabled == 1 {
+            "Workspace MCP probe queued."
+        } else {
+            "This MCP is installed but disabled for this workspace."
+        };
         let id = self
             .conn
             .query_row(
@@ -6390,14 +6990,16 @@ impl CoordinationKernel {
                     id, workspace_id, server_key, name, source_kind, source_label,
                     package_ref, version, transport, command, args_json, url,
                     env_schema_json, config_values_json, tools_json, install_state,
-                    workspace_enabled, last_probe_status, last_probe_message,
+                    workspace_enabled, approval_policy,
+                    agent_config_access_enabled, agent_secret_config_access_enabled,
+                    agent_env_file_write_enabled, last_probe_status, last_probe_message,
                     created_at, updated_at
                 ) VALUES(
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11, ?12,
                     ?13, ?14, ?15, 'installed',
-                    ?16, ?17, ?18,
-                    ?19, ?19
+                    ?16, ?17, ?18, ?19,
+                    ?20, ?21, ?22, ?23, ?23
                 )
                 ON CONFLICT(workspace_id, server_key) DO UPDATE SET
                     name=excluded.name,
@@ -6414,6 +7016,10 @@ impl CoordinationKernel {
                     tools_json=excluded.tools_json,
                     install_state='installed',
                     workspace_enabled=excluded.workspace_enabled,
+                    approval_policy=excluded.approval_policy,
+                    agent_config_access_enabled=excluded.agent_config_access_enabled,
+                    agent_secret_config_access_enabled=excluded.agent_secret_config_access_enabled,
+                    agent_env_file_write_enabled=excluded.agent_env_file_write_enabled,
                     last_probe_status=excluded.last_probe_status,
                     last_probe_message=excluded.last_probe_message,
                     updated_at=excluded.updated_at",
@@ -6434,12 +7040,121 @@ impl CoordinationKernel {
                     config_values_json,
                     tools_json,
                     workspace_enabled,
-                    "not_connected",
-                    "Workspace gateway is not installed yet.",
+                    approval_policy,
+                    agent_config_access_enabled,
+                    agent_secret_config_access_enabled,
+                    agent_env_file_write_enabled,
+                    initial_probe_status,
+                    initial_probe_message,
                     now
                 ],
             )
             .map_err(|error| format!("Unable to install workspace MCP server: {error}"))?;
+        if is_custom_mcp {
+            let workspace_id_owned = workspace_id.to_string();
+            let source_kind_owned = source_kind.to_string();
+            let server_key_owned = server_key.clone();
+            let name_owned = name.to_string();
+            let transport_owned = transport.to_string();
+            let command_owned = input["command"].as_str().map(str::to_string);
+            let url_owned = input["url"].as_str().map(str::to_string);
+            let args_owned = args.clone();
+            let env_pairs_owned = env_pairs.clone();
+            self.spawn_workspace_mcp_background_job(
+                format!("global_mcp:install_server:{source_kind_owned}:{server_key_owned}"),
+                "install_global_mcp_server",
+                Some(workspace_id_owned.clone()),
+                move |kernel| {
+                    let install_result = install_native_global_mcp_server(
+                        &source_kind_owned,
+                        &server_key_owned,
+                        &name_owned,
+                        approval_policy,
+                        &transport_owned,
+                        command_owned.as_deref(),
+                        &args_owned,
+                        url_owned.as_deref(),
+                        &env_pairs_owned,
+                    );
+                    if let Err(error) = install_result {
+                        let message =
+                            format!("Unable to install global native MCP `{name_owned}`: {error}");
+                        let _ = kernel.record_workspace_mcp_probe_result(
+                            &workspace_id_owned,
+                            &server_key_owned,
+                            "spawn_failed",
+                            &message,
+                            None,
+                        );
+                        return Err(message);
+                    }
+
+                    let row = kernel
+                        .query_json(
+                            "SELECT * FROM workspace_mcp_servers
+                             WHERE workspace_id=?1 AND server_key=?2",
+                            &[&workspace_id_owned, &server_key_owned],
+                        )?
+                        .into_iter()
+                        .next();
+                    let Some(row) = row else {
+                        return Ok(());
+                    };
+                    let workspace_enabled =
+                        row["workspace_enabled"].as_i64().unwrap_or_default() != 0;
+                    let configured =
+                        missing_required_config(&row["env_schema_json"], &row["config_values_json"])
+                            .is_empty();
+
+                    if workspace_enabled && configured {
+                        kernel.record_workspace_mcp_probe_result(
+                            &workspace_id_owned,
+                            &server_key_owned,
+                            "checking",
+                            "Global native MCP install completed; workspace probe queued.",
+                            None,
+                        )?;
+                        kernel.probe_one_workspace_mcp_server(
+                            &workspace_id_owned,
+                            &server_key_owned,
+                        )
+                    } else if workspace_enabled {
+                        kernel.record_workspace_mcp_probe_result(
+                            &workspace_id_owned,
+                            &server_key_owned,
+                            "config_required",
+                            "Global native MCP install completed. Required workspace configuration is missing.",
+                            None,
+                        )
+                    } else {
+                        kernel.record_workspace_mcp_probe_result(
+                            &workspace_id_owned,
+                            &server_key_owned,
+                            "not_connected",
+                            "Global native MCP install completed. This MCP is disabled for this workspace.",
+                            None,
+                        )
+                    }
+                },
+            );
+        } else {
+            self.schedule_global_mcp_allow_policy(
+                workspace_id,
+                source_kind,
+                &server_key,
+                approval_policy,
+            );
+        }
+        if workspace_enabled == 1
+            && missing_required_config(&env_schema_value, &config_values_value).is_empty()
+        {
+            self.schedule_workspace_mcp_probe(workspace_id, &server_key);
+        }
+        self.schedule_workspace_mcp_config_rewrite(
+            workspace_id,
+            input["workspace_name"].as_str(),
+            "server_installed",
+        );
         self.emit_event(
             "workspace_mcp_server_installed",
             "kernel",
@@ -6451,6 +7166,7 @@ impl CoordinationKernel {
                 "name": name,
                 "source_kind": source_kind,
                 "workspace_enabled": workspace_enabled,
+                "approval_policy": approval_policy,
             }),
         )?;
         self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
@@ -6477,6 +7193,34 @@ impl CoordinationKernel {
             .map(bool_i64)
             .or_else(|| input["workspace_enabled"].as_i64())
             .unwrap_or_else(|| current["workspace_enabled"].as_i64().unwrap_or_default());
+        let approval_policy = input
+            .get("approval_policy")
+            .and_then(Value::as_str)
+            .map(|value| workspace_mcp_approval_policy(Some(value)))
+            .unwrap_or_else(|| workspace_mcp_approval_policy(current["approval_policy"].as_str()));
+        let agent_config_access_enabled = input["agent_config_access_enabled"]
+            .as_bool()
+            .map(bool_i64)
+            .or_else(|| input["agent_config_access_enabled"].as_i64())
+            .unwrap_or_else(|| current["agent_config_access_enabled"].as_i64().unwrap_or(1));
+        let agent_secret_config_access_enabled = input["agent_secret_config_access_enabled"]
+            .as_bool()
+            .map(bool_i64)
+            .or_else(|| input["agent_secret_config_access_enabled"].as_i64())
+            .unwrap_or_else(|| {
+                current["agent_secret_config_access_enabled"]
+                    .as_i64()
+                    .unwrap_or_default()
+            });
+        let agent_env_file_write_enabled = input["agent_env_file_write_enabled"]
+            .as_bool()
+            .map(bool_i64)
+            .or_else(|| input["agent_env_file_write_enabled"].as_i64())
+            .unwrap_or_else(|| {
+                current["agent_env_file_write_enabled"]
+                    .as_i64()
+                    .unwrap_or(1)
+            });
         let config_values_json = if input.get("config_values").is_some() {
             json_text_or_default(input.get("config_values"), json!({}))?
         } else {
@@ -6489,6 +7233,27 @@ impl CoordinationKernel {
             serde_json::to_string(&current["tools_json"])
                 .map_err(|error| format!("Unable to serialize MCP tools: {error}"))?
         };
+        let config_values_value = serde_json::from_str::<Value>(&config_values_json)
+            .unwrap_or_else(|_| current["config_values_json"].clone());
+        let should_probe = workspace_enabled == 1
+            && missing_required_config(&current["env_schema_json"], &config_values_value)
+                .is_empty();
+        let next_probe_status = if should_probe {
+            "checking"
+        } else if workspace_enabled == 0 {
+            "not_connected"
+        } else {
+            current["last_probe_status"]
+                .as_str()
+                .unwrap_or("config_required")
+        };
+        let next_probe_message = if should_probe {
+            "Workspace MCP probe queued."
+        } else if workspace_enabled == 0 {
+            "This MCP is installed but disabled for this workspace."
+        } else {
+            "Required workspace configuration is missing."
+        };
         let now = now_rfc3339();
         self.conn
             .execute(
@@ -6496,18 +7261,51 @@ impl CoordinationKernel {
                  SET workspace_enabled=?1,
                      config_values_json=?2,
                      tools_json=?3,
-                     updated_at=?4
-                 WHERE workspace_id=?5 AND id=?6",
+                     approval_policy=?4,
+                     agent_config_access_enabled=?5,
+                     agent_secret_config_access_enabled=?6,
+                     agent_env_file_write_enabled=?7,
+                     last_probe_status=?8,
+                     last_probe_message=?9,
+                     updated_at=?10
+                 WHERE workspace_id=?11 AND id=?12",
                 params![
                     workspace_enabled,
                     config_values_json,
                     tools_json,
+                    approval_policy,
+                    agent_config_access_enabled,
+                    agent_secret_config_access_enabled,
+                    agent_env_file_write_enabled,
+                    next_probe_status,
+                    next_probe_message,
                     now,
                     workspace_id,
                     server_id
                 ],
             )
             .map_err(|error| format!("Unable to update workspace MCP server: {error}"))?;
+        if should_probe {
+            if let Some(server_key) = current["server_key"].as_str() {
+                self.schedule_workspace_mcp_probe(workspace_id, server_key);
+            }
+        }
+        if let (Some(source_kind), Some(server_key)) = (
+            current["source_kind"].as_str(),
+            current["server_key"].as_str(),
+        ) {
+            self.schedule_global_mcp_allow_policy(
+                workspace_id,
+                source_kind,
+                server_key,
+                approval_policy,
+            );
+        }
+        self.schedule_workspace_mcp_config_rewrite(
+            workspace_id,
+            input["workspace_name"].as_str(),
+            "server_updated",
+        );
         self.emit_event(
             "workspace_mcp_server_updated",
             "kernel",
@@ -6517,6 +7315,10 @@ impl CoordinationKernel {
                 "workspace_id": workspace_id,
                 "server_id": server_id,
                 "workspace_enabled": workspace_enabled,
+                "approval_policy": approval_policy,
+                "agent_config_access_enabled": agent_config_access_enabled,
+                "agent_secret_config_access_enabled": agent_secret_config_access_enabled,
+                "agent_env_file_write_enabled": agent_env_file_write_enabled,
             }),
         )?;
         self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
@@ -6591,41 +7393,52 @@ impl CoordinationKernel {
         Ok(())
     }
 
-    fn refresh_workspace_mcp_connection_statuses(&self, workspace_id: &str) -> Result<(), String> {
-        let rows = self.query_json(
+    fn probe_one_workspace_mcp_server(
+        &self,
+        workspace_id: &str,
+        server_key: &str,
+    ) -> Result<(), String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let server_key = required_trimmed(server_key, "server_key")?;
+        let row = self.query_one(
             "SELECT * FROM workspace_mcp_servers
              WHERE workspace_id=?1
+               AND server_key=?2
                AND install_state='installed'
                AND workspace_enabled=1",
-            &[&workspace_id],
+            &[&workspace_id, &server_key],
+            "Workspace MCP server is not enabled.",
         )?;
-        for row in rows {
-            if !missing_required_config(&row["env_schema_json"], &row["config_values_json"])
-                .is_empty()
-            {
-                continue;
-            }
-            let Some(server_key) = row["server_key"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let probe = super::mcp::probe_workspace_mcp_server_connection(&row);
-            let status = probe["status"].as_str().unwrap_or("not_connected");
-            let message = probe["message"]
-                .as_str()
-                .unwrap_or("Unable to connect workspace MCP.");
-            let tools = probe.get("tools").cloned().or_else(|| Some(json!([])));
+        if !missing_required_config(&row["env_schema_json"], &row["config_values_json"]).is_empty()
+        {
             self.record_workspace_mcp_probe_result(
                 workspace_id,
                 server_key,
-                status,
-                message,
-                tools,
+                "config_required",
+                "Required workspace configuration is missing.",
+                None,
             )?;
+            return Ok(());
         }
+        let probe = super::mcp::probe_workspace_mcp_server_connection(&row);
+        let status = probe["status"].as_str().unwrap_or("not_connected");
+        let message = probe["message"]
+            .as_str()
+            .unwrap_or("Unable to connect workspace MCP.");
+        let tools = probe.get("tools").cloned().or_else(|| Some(json!([])));
+        self.record_workspace_mcp_probe_result(workspace_id, server_key, status, message, tools)?;
+        let _ = self.ensure_workspace_mcp_config(Some(workspace_id), None);
+        self.emit_event(
+            "workspace_mcp_server_probe_completed",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "server_key": server_key,
+                "status": status,
+            }),
+        )?;
         Ok(())
     }
 
@@ -6671,6 +7484,47 @@ impl CoordinationKernel {
             "command": command,
             "command_exists_or_path_resolvable": command_exists,
             "spawn_probe": probe,
+            "agent_client_mount": client_mount["status"].clone(),
+            "agent_client_mount_summary": client_mount,
+        })
+    }
+
+    fn workspace_mcp_health_cached(&self, status: &Value) -> Value {
+        let command = status["command"].as_str().unwrap_or_default();
+        let config_path = status["config_path"].as_str().unwrap_or_default();
+        let codex_config_path = status["codex_config_path"].as_str().unwrap_or_default();
+        let claude_config_path = status["claude_config_path"].as_str().unwrap_or_default();
+        let config_files_exist = Path::new(config_path).exists()
+            && Path::new(codex_config_path).exists()
+            && Path::new(claude_config_path).exists();
+        let command_exists = mcp_command_can_be_spawned(command);
+        let healthy = config_files_exist && command_exists;
+        let client_mount = self.mcp_client_mount_summary().unwrap_or_else(|error| {
+            json!({
+                "status": "error",
+                "error": error,
+                "active_session_count": 0,
+                "confirmed_session_count": 0,
+                "mounts": [],
+                "events": [],
+            })
+        });
+
+        json!({
+            "status": if healthy { "healthy" } else { "warning" },
+            "config_generated": config_files_exist,
+            "configured_always_on": status["always_on"].as_bool() == Some(true),
+            "toggleable": status["toggleable"].clone(),
+            "authority": "local_coordination_kernel",
+            "command": command,
+            "command_exists_or_path_resolvable": command_exists,
+            "spawn_probe": {
+                "responded": Value::Null,
+                "status": if healthy { "cached" } else { "not_checked" },
+                "error": Value::Null,
+                "tool_count": COORDINATION_WORKSPACE_MCP_TOOLS.len(),
+                "deferred": true,
+            },
             "agent_client_mount": client_mount["status"].clone(),
             "agent_client_mount_summary": client_mount,
         })
@@ -6828,6 +7682,7 @@ impl CoordinationKernel {
         if let Some(value) = worktree_path {
             args.extend(["--worktree-path".to_string(), value.to_string()]);
         }
+        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
         let gateway_args = workspace_gateway_args_from_coordination_args(&args);
         let generic_config = json!({
             "mcpServers": {
@@ -6909,6 +7764,7 @@ impl CoordinationKernel {
             &claude_config,
             &command,
             &args,
+            &gateway_approved_tools,
             worktree_path,
         );
         let repo_activation_ready = self.repo_root_mcp_activation_files_exist();
@@ -6922,7 +7778,10 @@ impl CoordinationKernel {
         if files_reused {
         } else {
             write_json_file_atomic(&generic_path, &generic_config)?;
-            write_text_file_atomic(&codex_path, &codex_config_toml(&command, &args))?;
+            write_text_file_atomic(
+                &codex_path,
+                &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
+            )?;
             write_json_file_atomic(&claude_path, &claude_config)?;
             self.write_repo_root_dynamic_mcp_activation_files()?;
             if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
@@ -6936,6 +7795,7 @@ impl CoordinationKernel {
                     &generic_config,
                     &command,
                     &args,
+                    &gateway_approved_tools,
                 )?;
             }
         }
@@ -7047,6 +7907,7 @@ impl CoordinationKernel {
     }
 
     fn repo_root_mcp_activation_files_exist(&self) -> bool {
+        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
         self.paths.repo_path.join(".mcp.json").exists()
             && self
                 .paths
@@ -7054,9 +7915,10 @@ impl CoordinationKernel {
                 .join(".codex")
                 .join("config.toml")
                 .exists()
-            && claude_settings_file_has_required_policy(&claude_settings_path(
-                &self.paths.repo_path,
-            ))
+            && claude_settings_file_has_required_policy_with_gateway_tools(
+                &claude_settings_path(&self.paths.repo_path),
+                &gateway_approved_tools,
+            )
     }
 
     fn slot_mcp_activation_files_match(
@@ -7068,10 +7930,14 @@ impl CoordinationKernel {
         claude_config: &Value,
         command: &str,
         args: &[String],
+        gateway_approved_tools: &[String],
         worktree_path: Option<&str>,
     ) -> bool {
         if !json_file_matches(generic_path, generic_config)
-            || !text_file_matches(codex_path, &codex_config_toml(command, args))
+            || !text_file_matches(
+                codex_path,
+                &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
+            )
             || !json_file_matches(claude_path, claude_config)
         {
             return false;
@@ -7090,9 +7956,12 @@ impl CoordinationKernel {
             )
             && text_file_matches(
                 &worktree.join(".codex").join("config.toml"),
-                &codex_config_toml(command, args),
+                &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
             )
-            && claude_settings_file_has_required_policy(&claude_settings_path(&worktree))
+            && claude_settings_file_has_required_policy_with_gateway_tools(
+                &claude_settings_path(&worktree),
+                gateway_approved_tools,
+            )
     }
 
     fn write_worktree_mcp_activation_files(
@@ -7101,6 +7970,7 @@ impl CoordinationKernel {
         generic_config: &Value,
         command: &str,
         args: &[String],
+        gateway_approved_tools: &[String],
     ) -> Result<(), String> {
         let worktree = PathBuf::from(worktree_path);
         if !worktree.exists() {
@@ -7126,9 +7996,9 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         write_text_file_atomic(
             &codex_dir.join("config.toml"),
-            &codex_config_toml(command, args),
+            &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
         )?;
-        write_claude_settings_file(&worktree)?;
+        write_claude_settings_file_with_gateway_tools(&worktree, gateway_approved_tools)?;
         self.write_agent_contract_files(&worktree)?;
         Ok(())
     }
@@ -7141,6 +8011,7 @@ impl CoordinationKernel {
             "--db-path".to_string(),
             process_path_text(&self.paths.db_path),
         ]);
+        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
         let gateway_args = workspace_gateway_args_from_coordination_args(&args);
 
         let generic_config = json!({
@@ -7182,7 +8053,12 @@ impl CoordinationKernel {
             }
         });
 
-        self.write_repo_root_mcp_activation_files(&generic_config, &command, &args)
+        self.write_repo_root_mcp_activation_files(
+            &generic_config,
+            &command,
+            &args,
+            &gateway_approved_tools,
+        )
     }
 
     fn write_repo_root_mcp_activation_files(
@@ -7190,6 +8066,7 @@ impl CoordinationKernel {
         generic_config: &Value,
         command: &str,
         args: &[String],
+        gateway_approved_tools: &[String],
     ) -> Result<(PathBuf, PathBuf), String> {
         self.ensure_repo_root_mcp_files_ignored()?;
 
@@ -7200,8 +8077,14 @@ impl CoordinationKernel {
         fs::create_dir_all(&codex_dir)
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         let codex_path = codex_dir.join("config.toml");
-        write_text_file_atomic(&codex_path, &codex_config_toml(command, args))?;
-        write_claude_settings_file(&self.paths.repo_path)?;
+        write_text_file_atomic(
+            &codex_path,
+            &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
+        )?;
+        write_claude_settings_file_with_gateway_tools(
+            &self.paths.repo_path,
+            gateway_approved_tools,
+        )?;
         self.write_agent_contract_files(&self.paths.repo_path)?;
 
         Ok((mcp_path, codex_path))
@@ -19961,7 +20844,11 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn codex_config_toml(command: &str, args: &[String]) -> String {
+fn codex_config_toml_with_gateway_tools(
+    command: &str,
+    args: &[String],
+    gateway_approved_tools: &[String],
+) -> String {
     let coordination_args = args
         .iter()
         .map(|arg| format!("\"{}\"", toml_escape(arg)))
@@ -19990,6 +20877,12 @@ fn codex_config_toml(command: &str, args: &[String]) -> String {
         ));
     }
     for tool in WORKSPACE_MCP_GATEWAY_TOOLS {
+        config.push_str(&format!(
+            "\n[mcp_servers.workspace-mcp-gateway.tools.{}]\napproval_mode = \"approve\"\n",
+            tool
+        ));
+    }
+    for tool in gateway_approved_tools {
         config.push_str(&format!(
             "\n[mcp_servers.workspace-mcp-gateway.tools.{}]\napproval_mode = \"approve\"\n",
             tool
@@ -20032,7 +20925,7 @@ fn claude_settings_path(root: &Path) -> PathBuf {
     root.join(".claude").join("settings.local.json")
 }
 
-fn claude_auto_approved_tools() -> Vec<String> {
+fn claude_auto_approved_tools_with_gateway_tools(gateway_approved_tools: &[String]) -> Vec<String> {
     let mut tools = CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS
         .iter()
         .map(|tool| (*tool).to_string())
@@ -20047,10 +20940,18 @@ fn claude_auto_approved_tools() -> Vec<String> {
             .iter()
             .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),
     );
+    tools.extend(
+        gateway_approved_tools
+            .iter()
+            .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),
+    );
     tools
 }
 
-fn claude_settings_with_required_policy(existing: Value) -> Value {
+fn claude_settings_with_required_policy_and_gateway_tools(
+    existing: Value,
+    gateway_approved_tools: &[String],
+) -> Value {
     let mut settings = existing.as_object().cloned().unwrap_or_default();
 
     let mut enabled_servers = settings
@@ -20083,11 +20984,21 @@ fn claude_settings_with_required_policy(existing: Value) -> Value {
         .remove("allow")
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
+    let desired_tools = claude_auto_approved_tools_with_gateway_tools(gateway_approved_tools);
+    let desired_set = desired_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    allow.retain(|value| {
+        value.as_str().is_none_or(|tool| {
+            !tool.starts_with("mcp__workspace-mcp-gateway__") || desired_set.contains(tool)
+        })
+    });
     let mut seen = allow
         .iter()
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect::<HashSet<_>>();
-    for tool in claude_auto_approved_tools() {
+    for tool in desired_tools {
         if seen.insert(tool.clone()) {
             allow.push(json!(tool));
         }
@@ -20098,7 +21009,55 @@ fn claude_settings_with_required_policy(existing: Value) -> Value {
     Value::Object(settings)
 }
 
+fn set_claude_permission_allow_rules(
+    path: &Path,
+    rules: &[String],
+    enabled: bool,
+) -> Result<(), String> {
+    if rules.is_empty() {
+        return Ok(());
+    }
+    let existing = fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .unwrap_or_else(|| json!({}));
+    let mut settings = existing.as_object().cloned().unwrap_or_default();
+    let mut permissions = settings
+        .remove("permissions")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut allow = permissions
+        .remove("allow")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut seen = allow
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<HashSet<_>>();
+    if enabled {
+        for rule in rules {
+            if seen.insert(rule.clone()) {
+                allow.push(json!(rule));
+            }
+        }
+    } else {
+        let to_remove = rules.iter().map(String::as_str).collect::<HashSet<_>>();
+        allow.retain(|value| value.as_str().is_none_or(|rule| !to_remove.contains(rule)));
+    }
+    permissions.insert("allow".to_string(), Value::Array(allow));
+    settings.insert("permissions".to_string(), Value::Object(permissions));
+    write_json_file_atomic(path, &Value::Object(settings))
+}
+
+#[cfg(test)]
 fn claude_settings_file_has_required_policy(path: &Path) -> bool {
+    claude_settings_file_has_required_policy_with_gateway_tools(path, &[])
+}
+
+fn claude_settings_file_has_required_policy_with_gateway_tools(
+    path: &Path,
+    gateway_approved_tools: &[String],
+) -> bool {
     let Ok(body) = fs::read_to_string(path) else {
         return false;
     };
@@ -20132,18 +21091,22 @@ fn claude_settings_file_has_required_policy(path: &Path) -> bool {
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    claude_auto_approved_tools()
+    claude_auto_approved_tools_with_gateway_tools(gateway_approved_tools)
         .iter()
         .all(|tool| allowed.contains(tool.as_str()))
 }
 
-fn write_claude_settings_file(root: &Path) -> Result<PathBuf, String> {
+fn write_claude_settings_file_with_gateway_tools(
+    root: &Path,
+    gateway_approved_tools: &[String],
+) -> Result<PathBuf, String> {
     let path = claude_settings_path(root);
     let existing = fs::read_to_string(&path)
         .ok()
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .unwrap_or_else(|| json!({}));
-    let settings = claude_settings_with_required_policy(existing);
+    let settings =
+        claude_settings_with_required_policy_and_gateway_tools(existing, gateway_approved_tools);
     write_json_file_atomic(&path, &settings)?;
     Ok(path)
 }
@@ -21814,6 +22777,7 @@ mod tests {
         let claude_settings_path = repo.join(".claude").join("settings.local.json");
 
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
+        assert!(config.contains("[mcp_servers.workspace-mcp-gateway]\ncommand = "));
         for tool in [
             "start_task",
             "acquire_lease",
@@ -21823,6 +22787,11 @@ mod tests {
         ] {
             assert!(config.contains(&format!(
                 "[mcp_servers.coordination-kernel.tools.{tool}]\napproval_mode = \"approve\""
+            )));
+        }
+        for tool in WORKSPACE_MCP_GATEWAY_TOOLS {
+            assert!(config.contains(&format!(
+                "[mcp_servers.workspace-mcp-gateway.tools.{tool}]\napproval_mode = \"approve\""
             )));
         }
         assert!(claude_settings_file_has_required_policy(
@@ -21846,6 +22815,9 @@ mod tests {
             "mcp__coordination-kernel__checkpoint",
             "mcp__coordination-kernel__submit_patch",
             "mcp__coordination-kernel__submit_patch_status",
+            "mcp__workspace-mcp-gateway__workspace_mcp__sync_manifest",
+            "mcp__workspace-mcp-gateway__workspace_mcp__list_servers",
+            "mcp__workspace-mcp-gateway__workspace_mcp__get_server_status",
         ] {
             assert!(claude_allow.contains(tool));
         }
@@ -21870,6 +22842,226 @@ mod tests {
                 "[mcp_servers.coordination-kernel.tools.{prompt_gated_tool}]"
             )));
         }
+    }
+
+    #[test]
+    fn codex_global_mcp_server_approval_policy_updates_existing_server() {
+        let config = r#"[model]
+name = "gpt-5.5"
+
+[mcp_servers.appwrite-api]
+command = "uvx"
+args = ["mcp-server-appwrite"]
+
+[mcp_servers.appwrite-api.env]
+APPWRITE_PROJECT_ID = "project"
+"#;
+        let next =
+            codex_config_with_mcp_server_approval_mode(config, "appwrite-api", "approve").unwrap();
+
+        assert!(next.contains(
+            "[mcp_servers.appwrite-api]\ndefault_tools_approval_mode = \"approve\"\ncommand = \"uvx\""
+        ));
+        assert!(next.contains("[mcp_servers.appwrite-api.env]"));
+        assert_eq!(
+            next.matches("default_tools_approval_mode = \"approve\"")
+                .count(),
+            1
+        );
+
+        let prompted =
+            codex_config_with_mcp_server_approval_mode(&next, "appwrite-api", "prompt").unwrap();
+        assert!(prompted.contains(
+            "[mcp_servers.appwrite-api]\ndefault_tools_approval_mode = \"prompt\"\ncommand = \"uvx\""
+        ));
+        assert!(!prompted.contains("default_tools_approval_mode = \"approve\""));
+    }
+
+    #[test]
+    fn workspace_mcp_approval_policy_controls_gateway_tool_auto_approval() {
+        let repo = init_git_repo("workspace_mcp_gateway_approval_policy");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let now = now_rfc3339();
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO workspace_mcp_servers(
+                    id, workspace_id, server_key, name, source_kind, source_label,
+                    package_ref, version, transport, command, args_json, url,
+                    env_schema_json, config_values_json, tools_json, install_state,
+                    workspace_enabled, approval_policy, created_at, updated_at
+                 ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, 'installed',
+                    1, 'always_allow', ?16, ?16
+                 )",
+                rusqlite::params![
+                    uuid(),
+                    "workspace-server-uuid",
+                    "appwrite-api",
+                    "Appwrite API",
+                    "codex_custom_mcp",
+                    "Codex custom MCP",
+                    "uvx mcp-server-appwrite",
+                    "",
+                    "stdio",
+                    "uvx",
+                    "[\"mcp-server-appwrite\"]",
+                    "",
+                    "[]",
+                    "{}",
+                    "[\"appwrite_search_tools\"]",
+                    now,
+                ],
+            )
+            .unwrap();
+
+        let status = kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
+        let tool_section =
+            "[mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools]";
+        assert!(config.contains(tool_section));
+
+        let claude_settings_path = repo.join(".claude").join("settings.local.json");
+        let claude_settings: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_settings_path).unwrap()).unwrap();
+        assert!(claude_settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str()
+                == Some("mcp__workspace-mcp-gateway__appwrite-api__appwrite_search_tools")));
+
+        kernel
+            .conn
+            .execute(
+                "UPDATE workspace_mcp_servers
+                 SET approval_policy='prompt', updated_at=?1
+                 WHERE workspace_id='workspace-server-uuid' AND server_key='appwrite-api'",
+                rusqlite::params![now_rfc3339()],
+            )
+            .unwrap();
+        let status = kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
+        assert!(!config.contains(tool_section));
+        let claude_settings: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_settings_path).unwrap()).unwrap();
+        assert!(!claude_settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str()
+                == Some("mcp__workspace-mcp-gateway__appwrite-api__appwrite_search_tools")));
+    }
+
+    #[test]
+    fn workspace_gateway_exposes_non_secret_config_and_writes_env_file() {
+        let repo = init_git_repo("workspace_mcp_agent_config_access");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let now = now_rfc3339();
+        let env_schema = json!([
+            {"key": "APPWRITE_PROJECT_ID", "label": "Appwrite project ID", "required": true, "secret": false},
+            {"key": "APPWRITE_ENDPOINT", "label": "Appwrite endpoint", "required": true, "secret": false},
+            {"key": "APPWRITE_API_KEY", "label": "Appwrite API key", "required": true, "secret": true}
+        ]);
+        let config_values = json!({
+            "APPWRITE_PROJECT_ID": "logfast",
+            "APPWRITE_ENDPOINT": "https://cloud.appwrite.io/v1",
+            "APPWRITE_API_KEY": "test-secret-key"
+        });
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO workspace_mcp_servers(
+                    id, workspace_id, server_key, name, source_kind, source_label,
+                    package_ref, version, transport, command, args_json, url,
+                    env_schema_json, config_values_json, tools_json, install_state,
+                    workspace_enabled, approval_policy, created_at, updated_at
+                 ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, 'installed',
+                    1, 'always_allow', ?16, ?16
+                 )",
+                rusqlite::params![
+                    uuid(),
+                    "workspace-server-uuid",
+                    "appwrite-api",
+                    "Appwrite API",
+                    "codex_custom_mcp",
+                    "Codex custom MCP",
+                    "uvx mcp-server-appwrite",
+                    "",
+                    "stdio",
+                    "uvx",
+                    "[\"mcp-server-appwrite\"]",
+                    "",
+                    serde_json::to_string(&env_schema).unwrap(),
+                    serde_json::to_string(&config_values).unwrap(),
+                    "[\"appwrite_search_tools\"]",
+                    now,
+                ],
+            )
+            .unwrap();
+        let context = crate::coordination::mcp::McpContext {
+            repo_path: Some(process_path_text(&repo)),
+            db_path: Some(process_path_text(&kernel.paths.db_path)),
+            workspace_id: Some("workspace-server-uuid".to_string()),
+            worktree_path: Some(process_path_text(&repo)),
+            ..crate::coordination::mcp::McpContext::default()
+        };
+
+        let response = crate::coordination::mcp::workspace_gateway_dispatch_tool(
+            &context,
+            "workspace_mcp__get_server_config",
+            json!({"server_key": "appwrite-api"}),
+        );
+        let payload: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        let variables = payload["variables"].as_array().unwrap();
+        let project = variables
+            .iter()
+            .find(|item| item["key"].as_str() == Some("APPWRITE_PROJECT_ID"))
+            .unwrap();
+        assert_eq!(project["value"].as_str(), Some("logfast"));
+        assert_eq!(
+            project["public_env_alias"].as_str(),
+            Some("NEXT_PUBLIC_APPWRITE_PROJECT_ID")
+        );
+        let api_key = variables
+            .iter()
+            .find(|item| item["key"].as_str() == Some("APPWRITE_API_KEY"))
+            .unwrap();
+        assert!(api_key["value"].is_null());
+        assert_eq!(api_key["redacted"].as_bool(), Some(true));
+
+        let denied = crate::coordination::mcp::workspace_gateway_dispatch_tool(
+            &context,
+            "workspace_mcp__write_env_file",
+            json!({"server_key": "appwrite-api", "include_secrets": true}),
+        );
+        assert_eq!(denied["isError"].as_bool(), Some(true));
+
+        let response = crate::coordination::mcp::workspace_gateway_dispatch_tool(
+            &context,
+            "workspace_mcp__write_env_file",
+            json!({"server_key": "appwrite-api"}),
+        );
+        let payload_text = response["content"][0]["text"].as_str().unwrap();
+        assert!(!payload_text.contains("test-secret-key"));
+        let payload: Value = serde_json::from_str(payload_text).unwrap();
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        let env_body = fs::read_to_string(repo.join(".env.local")).unwrap();
+        assert!(env_body.contains("APPWRITE_PROJECT_ID=logfast"));
+        assert!(env_body.contains("NEXT_PUBLIC_APPWRITE_PROJECT_ID=logfast"));
+        assert!(env_body.contains("NEXT_PUBLIC_APPWRITE_ENDPOINT=https://cloud.appwrite.io/v1"));
+        assert!(!env_body.contains("APPWRITE_API_KEY"));
     }
 
     #[test]

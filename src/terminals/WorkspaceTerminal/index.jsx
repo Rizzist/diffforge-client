@@ -1082,6 +1082,7 @@ function WorkspaceTerminal({
   onThreadTerminalLifecycle,
   onToggleFullscreenTerminal,
   prewarmShell = false,
+  startupReady = true,
   terminalIndex = 0,
   terminalCount = 1,
   terminalRole = "",
@@ -1133,6 +1134,7 @@ function WorkspaceTerminal({
     getWorkspaceThreadComposerAttachmentSnapshot,
   );
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
+  const [terminalStartupUnblocked, setTerminalStartupUnblocked] = useState(Boolean(startupReady));
   const [terminalError, setTerminalError] = useState("");
   const [terminalStatus, setTerminalStatus] = useState(() => ({
     detail: agent ? "Preparing pane." : "No terminal agent is configured.",
@@ -1190,7 +1192,9 @@ function WorkspaceTerminal({
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const threadProviderBinding = getWorkspaceThreadProviderBinding(thread, terminalAgentKind);
-  const threadProviderSessionId = threadProviderBinding?.nativeSessionId || "";
+  const threadProviderSessionId = threadProviderBinding?.nativeSessionId
+    || (String(thread?.currentAgent || "").toLowerCase() === terminalAgentKind ? thread?.transcriptSessionId : "")
+    || "";
   const threadProviderModel = threadProviderBinding?.modelId || "";
   const terminalStartupSnapshotRef = useRef(null);
   const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
@@ -1277,6 +1281,11 @@ function WorkspaceTerminal({
     terminalThreadIdRef.current = terminalThreadId;
     terminalThreadSlotKeyRef.current = terminalThreadSlotKey;
   }, [terminalThreadId, terminalThreadSlotKey]);
+  useEffect(() => {
+    if (startupReady) {
+      setTerminalStartupUnblocked(true);
+    }
+  }, [startupReady]);
   useEffect(() => {
     terminalThreadActivityStatusRef.current = terminalThreadActivityStatus;
   }, [terminalThreadActivityStatus]);
@@ -3243,6 +3252,30 @@ function WorkspaceTerminal({
       setParkedPrompt(null);
       terminalClosingRef.current = false;
       setTerminalClosing(false);
+      return undefined;
+    }
+
+    if (!terminalStartupUnblocked) {
+      startAgentInPrewarmedTerminalRef.current = null;
+      setTerminalState("starting");
+      setTerminalError("");
+      setTerminalStatus({
+        detail: "Loading the saved thread session before launching this terminal.",
+        title: "Restoring Terminal",
+        visible: true,
+      });
+      setTerminalLaunchInfo(null);
+      setParkedPrompt(null);
+      terminalClosingRef.current = false;
+      setTerminalClosing(false);
+      logTerminalStatus("frontend.terminal_lifecycle.wait_for_thread_restore", {
+        agentId: agent?.id || terminalAgentKind,
+        paneId,
+        terminalIndex,
+        terminalRoleId,
+        threadId: terminalThreadIdRef.current || thread?.id || "",
+        workspaceId: workspace?.id || "",
+      });
       return undefined;
     }
 
@@ -9909,7 +9942,7 @@ function WorkspaceTerminal({
   // PTY lifetime must be tied to pane identity and explicit lifecycle actions only.
   // Volatile thread/global-state callbacks are intentionally excluded so ordinary
   // workspace-thread updates do not tear down live terminal processes.
-  }, [paneId, restartKey, terminalClosed, terminalIndex, terminalRoleId, workspace?.id]);
+  }, [paneId, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
 
   useEffect(() => {
     const pendingPrompt = thread?.pendingPrompt;
