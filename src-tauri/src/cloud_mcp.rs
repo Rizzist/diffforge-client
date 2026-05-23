@@ -2006,7 +2006,7 @@ fn cloud_mcp_terminal_claimed_paths(
         "SELECT resource_key, status, intent_summary
          FROM task_resource_intents
          WHERE task_id=?1
-           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready')
+           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready', 'resume_requested')
          ORDER BY updated_at DESC
          LIMIT 50",
     ) {
@@ -2675,11 +2675,15 @@ async fn cloud_mcp_sync_terminal_agent_status(
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
     match status {
         "starting" => "starting",
-        "active" | "busy" | "running" | "dispatched" | "resume_requested" => "active",
+        "active" => "active",
+        "busy" => "busy",
+        "running" => "running",
+        "dispatched" => "dispatched",
+        "resume_requested" => "resume_requested",
         "merged" | "completed" => "done",
         "blocked" => "blocked",
         "parked" => "parked",
-        "resume_ready" => "waiting",
+        "resume_ready" => "resume_ready",
         "waiting" => "waiting",
         "review" => "review",
         "done" => "done",
@@ -3184,8 +3188,36 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         "Terminal closed via {reason}; marking {} inactive.",
         cloud_mcp_work_subject(&work_subject)
     );
+    let close_preserves_parked_task =
+        matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
+    let active_task_is_parked = close_preserves_parked_task
+        && active_task.as_ref().is_some_and(|task| {
+            coordination
+                .and_then(|coordination| {
+                    crate::coordination::CoordinationKernel::open(
+                        &coordination.repo_path,
+                        Some(PathBuf::from(&coordination.db_path)),
+                    )
+                    .ok()
+                })
+                .and_then(|kernel| kernel.task_has_parked_resource_intents(&task.task_id).ok())
+                .unwrap_or(false)
+        });
 
     if let Some(active_task) = active_task.as_ref() {
+        let lifecycle_status = if active_task_is_parked {
+            "parked"
+        } else {
+            "interrupted"
+        };
+        let lifecycle_brief = if active_task_is_parked {
+            format!(
+                "Terminal closed via {reason}; parked task {} remains waiting for dependency release or session recovery.",
+                cloud_mcp_work_subject(&work_subject)
+            )
+        } else {
+            brief.clone()
+        };
         cloud_mcp_mark_terminal_task_lifecycle(
             state,
             pane_id,
@@ -3194,9 +3226,9 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
             coordination,
             Some(&active_task.task_id),
             Some(&active_task.title),
-            "interrupted",
+            lifecycle_status,
             &lane,
-            &brief,
+            &lifecycle_brief,
         )
         .await;
     }
@@ -9959,7 +9991,7 @@ fn cloud_mcp_proxy_parked_intents_for_task(
         "SELECT resource_key, status, intent_summary
          FROM task_resource_intents
          WHERE task_id=?1
-           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready')
+           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready', 'resume_requested')
          ORDER BY updated_at DESC
          LIMIT 50",
     ) {

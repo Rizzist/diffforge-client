@@ -677,6 +677,7 @@ const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
 const TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS = 250;
 const TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS = 120;
 const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
+const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_QUOTED_PATH_LINK_PATTERN = /(["'`])((?:(?:[A-Za-z]:[\\/])|(?:\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/])|(?:\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/)|(?:~[A-Za-z0-9_.-]*[\\/])|(?:\/)|(?:\.{1,2}[\\/]))(?:(?!\1).)*?\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)\1/g;
@@ -3345,11 +3346,12 @@ function WorkspaceTerminal({
       const lifecycleTerminalIndex = Number.isFinite(Number(payload.terminalIndex ?? payload.terminal_index))
         ? Number(payload.terminalIndex ?? payload.terminal_index)
         : terminalIndex;
-      if (payload.status === "parked") {
+      const parkedStatus = String(payload.status || "").trim().toLowerCase();
+      if (TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES.has(parkedStatus)) {
         if (cancellingParkedPromptKeysRef.current.has(promptKey)) {
           return;
         }
-        setParkedPrompt(payload);
+        setParkedPrompt({ ...payload, status: parkedStatus });
         if (lifecycleThreadId && lifecycleWorkspaceId) {
           onThreadTerminalLifecycle?.({
             activityStatus: "idle",
@@ -3359,8 +3361,8 @@ function WorkspaceTerminal({
             paneId,
             pendingPromptId: promptEventId,
             promptEventId,
-            source: "terminal-parked",
-            status: "parked",
+            source: parkedStatus === "parked" ? "terminal-parked" : `terminal-parked-${parkedStatus}`,
+            status: parkedStatus,
             terminalIndex: lifecycleTerminalIndex,
             threadId: lifecycleThreadId,
             type: "agent-output",

@@ -98,6 +98,8 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "composer_draft_present",
   "agent_not_ready",
   "pending_prompt",
+  "parked_task_resume_ready",
+  "parked_task_waiting",
   "reserved",
   "submitted_prompt_active",
   "terminal_starting",
@@ -6513,7 +6515,13 @@ function TerminalView({
 
     const terminal = Object.values(workspaceThreadEntry.terminals).find((candidate) => (
       candidate?.threadId === safeThreadId
-      && ["active", "starting"].includes(String(candidate.status || "").toLowerCase())
+      && [
+        "active",
+        "parked",
+        "resume_ready",
+        "resume_requested",
+        "starting",
+      ].includes(String(candidate.status || "").toLowerCase())
       && Number.isInteger(Number.parseInt(candidate.terminalIndex, 10))
     ));
 
@@ -6545,6 +6553,7 @@ function TerminalView({
         latestTurnState: fields.latestTurnState || "",
         effectiveLatestTurnState: fields.effectiveLatestTurnState || "",
         message,
+        parkedStatus: fields.parkedStatus || "",
         reason,
         recordedAgentInputReady: Boolean(fields.recordedAgentInputReady),
         completedTurnLooksSendable: Boolean(fields.completedTurnLooksSendable),
@@ -6556,6 +6565,7 @@ function TerminalView({
         targetRole: fields.targetRole || "",
         targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : "",
         terminalGroundTruthStatus: fields.terminalGroundTruthStatus || "",
+        terminalIsParked: Boolean(fields.terminalIsParked),
         terminalStatus: fields.terminalStatus || "",
         turnStartedAt: fields.turnStartedAt || "",
         workspaceId: fields.workspaceId || baseWorkspaceId,
@@ -6628,10 +6638,12 @@ function TerminalView({
       inputReadyIsFreshForTurn,
       latestTurnState,
       orphanRunningLooksIdle,
+      parkedStatus,
       recordedAgentInputReady,
       requiresAgentInputReady,
       runningTurnLooksIdle,
       terminalGroundTruthStatus,
+      terminalIsParked,
       terminalStatus,
       turnStartedAt,
     } = terminalGroundTruth;
@@ -6650,6 +6662,7 @@ function TerminalView({
       effectiveLatestTurnState,
       liveTerminal,
       paneId,
+      parkedStatus,
       recordedAgentInputReady,
       requiresAgentInputReady,
       orphanRunningLooksIdle,
@@ -6664,6 +6677,7 @@ function TerminalView({
       targetThread,
       terminalAgent,
       terminalGroundTruthStatus,
+      terminalIsParked,
       terminalStatus,
       turnStartedAt,
       workspaceId,
@@ -6693,6 +6707,16 @@ function TerminalView({
         imageInputSupport,
         reason: "",
       };
+    }
+
+    if (terminalIsParked) {
+      const reason = parkedStatus === "resume_ready"
+        ? "parked_task_resume_ready"
+        : "parked_task_waiting";
+      const message = parkedStatus === "resume_ready"
+        ? "This terminal has a parked task ready to resume."
+        : "This terminal is parked waiting on another task.";
+      return unavailable(reason, message, targetFields);
     }
 
     const reservation = todoQueueTerminalReservationsRef.current.get(targetTerminalIndex);
@@ -9368,6 +9392,8 @@ function TerminalView({
         "agent_not_ready",
         "reserved",
         "pending_prompt",
+        "parked_task_resume_ready",
+        "parked_task_waiting",
         "busy_turn",
         "busy_activity",
         "composer_draft_present",

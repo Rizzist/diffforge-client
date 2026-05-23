@@ -1,5 +1,6 @@
 const DEFAULT_AGENT_READY_ROLES = new Set(["codex", "claude", "opencode"]);
 const COMPLETED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
+export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const READINESS_MAX_AGE_MS = 10 * 60 * 1000;
 let readinessVersion = 0;
 const readinessListeners = new Set();
@@ -169,7 +170,12 @@ export function getLiveTerminalForThread(thread, providerBinding, workspaceThrea
 
   if (
     terminal.threadId !== thread?.id
-    || !["active", "running", "starting"].includes(cleanText(terminal.status).toLowerCase())
+    || ![
+      "active",
+      "running",
+      "starting",
+      ...PARKED_TERMINAL_STATUSES,
+    ].includes(cleanText(terminal.status).toLowerCase())
   ) {
     return null;
   }
@@ -197,6 +203,11 @@ export function getThreadTerminalGroundTruth({
   thread = null,
 } = {}) {
   const terminalStatus = cleanText(liveTerminal?.status).toLowerCase();
+  const providerStatus = cleanText(providerBinding?.status).toLowerCase();
+  const parkedStatus = [providerStatus, terminalStatus].find((status) => (
+    PARKED_TERMINAL_STATUSES.has(status)
+  )) || "";
+  const terminalIsParked = Boolean(parkedStatus);
   const latestTurn = thread?.latestTurn || null;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const activityStatus = cleanText(
@@ -308,6 +319,8 @@ export function getThreadTerminalGroundTruth({
     requiresAgentInputReady,
     runningTurnLooksIdle,
     terminalGroundTruthStatus,
+    terminalIsParked,
+    parkedStatus,
     terminalLooksActive,
     terminalStatus,
     turnStartedAt,

@@ -1566,6 +1566,43 @@ fn spawn_terminal_reader(
     });
 }
 
+async fn remove_terminal_parked_prompts_for_close(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+    reason: &str,
+) -> usize {
+    let removed = {
+        let mut parked = state.parked_prompts.write().await;
+        let matching_keys = parked
+            .iter()
+            .filter_map(|(key, value)| {
+                (value.pane_id == pane_id && value.instance_id == instance_id).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        let count = matching_keys.len();
+        for key in matching_keys {
+            parked.remove(&key);
+        }
+        count
+    };
+
+    if removed > 0 {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_parked_prompts.preserved_on_close",
+            json!({
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "reason": reason,
+                "removed_from_memory": removed,
+                "resume_policy": "kernel_task_preserved_for_recovery",
+            }),
+        );
+    }
+
+    removed
+}
+
 async fn close_terminal_session(
     state: &TerminalState,
     cloud_mcp_state: Option<&CloudMcpState>,
@@ -1612,6 +1649,8 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
+        remove_terminal_parked_prompts_for_close(state, pane_id, cleanup_instance_id, "terminal_close")
+            .await;
         log_terminal_crash_forensics_event(
             "backend.terminal_close.removed",
             json!({
@@ -1726,6 +1765,10 @@ async fn close_all_terminal_sessions(
         .iter()
         .filter_map(|(_, instance)| terminal_shutdown_coordination_cleanup_from_instance(instance))
         .collect::<Vec<_>>();
+
+    for (pane_id, instance) in &instances {
+        remove_terminal_parked_prompts_for_close(state, pane_id, instance.id, "close_all").await;
+    }
 
     let mut notify_tasks = Vec::new();
     for (pane_id, instance) in &instances {
@@ -4875,7 +4918,7 @@ async fn terminal_resume_parked_prompt_once(
         return false;
     }
 
-    let Some(parked) = parked_prompts.write().await.remove(&parked_key) else {
+    let Some(parked) = parked_prompts.read().await.get(&parked_key).cloned() else {
         return false;
     };
 
@@ -4894,26 +4937,31 @@ async fn terminal_resume_parked_prompt_once(
         let guard = terminals.read().await;
         guard.get(&parked.pane_id).cloned()
     }) else {
-        terminal_emit_parked_prompt_interrupted(
-            &app,
-            &cloud_mcp_state,
-            &parked,
-            "terminal_missing",
-            "Interrupted while parked: the terminal disappeared before the task could resume.",
-        )
-        .await;
+        parked_prompts.write().await.remove(&parked_key);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_parked_resume.deferred_terminal_missing",
+            json!({
+                "instance_id": parked.instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": parked.task_id,
+                "resume_policy": "leave_kernel_task_resume_ready_for_session_recovery",
+            }),
+        );
         return false;
     };
 
     if instance.id != parked.instance_id {
-        terminal_emit_parked_prompt_interrupted(
-            &app,
-            &cloud_mcp_state,
-            &parked,
-            "terminal_replaced",
-            "Interrupted while parked: the terminal session was replaced before the task could resume.",
-        )
-        .await;
+        parked_prompts.write().await.remove(&parked_key);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_parked_resume.deferred_terminal_replaced",
+            json!({
+                "expected_instance_id": parked.instance_id,
+                "actual_instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&parked.pane_id),
+                "task_id": parked.task_id,
+                "resume_policy": "leave_kernel_task_resume_ready_for_session_recovery",
+            }),
+        );
         return false;
     }
 
@@ -4925,6 +4973,7 @@ async fn terminal_resume_parked_prompt_once(
     );
     let resume_input_bytes = resume_request.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
     if resume_input_bytes > MAX_TERMINAL_WRITE_BYTES {
+        parked_prompts.write().await.remove(&parked_key);
         terminal_emit_parked_prompt_interrupted(
             &app,
             &cloud_mcp_state,
@@ -4945,6 +4994,7 @@ async fn terminal_resume_parked_prompt_once(
             .unwrap_or(false)
     };
     if !still_current {
+        parked_prompts.write().await.remove(&parked_key);
         terminal_emit_parked_prompt_interrupted(
             &app,
             &cloud_mcp_state,
@@ -4955,6 +5005,21 @@ async fn terminal_resume_parked_prompt_once(
         .await;
         return false;
     }
+
+    emit_terminal_parked_prompt_event(
+        &app,
+        &parked,
+        "resume_requested",
+        Some("dependency_ready_resume_start"),
+    );
+    mark_terminal_parked_prompt_lifecycle_in_cloud(
+        &app,
+        &cloud_mcp_state,
+        &parked,
+        "resume_requested",
+        "Dependency completed; the parked task is being sent back to the terminal.",
+    )
+    .await;
 
     {
         let mut writer = instance.writer.lock().await;
@@ -4977,6 +5042,7 @@ async fn terminal_resume_parked_prompt_once(
                     "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
                 }),
             );
+            parked_prompts.write().await.remove(&parked_key);
             terminal_emit_parked_prompt_interrupted(
                 &app,
                 &cloud_mcp_state,
@@ -5010,6 +5076,7 @@ async fn terminal_resume_parked_prompt_once(
             .unwrap_or(false)
     };
     if !still_current {
+        parked_prompts.write().await.remove(&parked_key);
         terminal_emit_parked_prompt_interrupted(
             &app,
             &cloud_mcp_state,
@@ -5045,6 +5112,7 @@ async fn terminal_resume_parked_prompt_once(
                     "task_id": clean_terminal_diagnostic_log_text(&parked.task_id),
                 }),
             );
+            parked_prompts.write().await.remove(&parked_key);
             terminal_emit_parked_prompt_interrupted(
                 &app,
                 &cloud_mcp_state,
@@ -5085,6 +5153,7 @@ async fn terminal_resume_parked_prompt_once(
         "Dependency completed; the parked task is resuming in the terminal.",
     )
     .await;
+    parked_prompts.write().await.remove(&parked_key);
     emit_terminal_parked_prompt_event(&app, &parked, "resumed", Some("dependency_ready"));
     true
 }

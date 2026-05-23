@@ -3025,6 +3025,26 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to mark task resource intents {status}: {error}"))
     }
 
+    pub fn task_has_parked_resource_intents(&self, task_id: &str) -> Result<bool, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Ok(false);
+        }
+
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM task_resource_intents
+                 WHERE task_id=?1
+                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to inspect task parked resource intents: {error}"))?;
+        Ok(count > 0)
+    }
+
     fn refresh_task_stopped_file_lease_queue(
         &self,
         task_id: &str,
@@ -4093,7 +4113,7 @@ impl CoordinationKernel {
                      FROM tasks t
                      JOIN task_resource_intents i ON i.task_id = t.id
                      LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
-                     WHERE t.status='ready'
+                     WHERE t.status IN ('ready', 'claimed', 'blocked')
                        AND t.id != COALESCE(?3, '')
                        AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
                        AND (
@@ -4101,17 +4121,6 @@ impl CoordinationKernel {
                             OR t.claimed_session_id=''
                             OR owner.status IS NULL
                             OR owner.status!='active'
-                       )
-                       AND NOT EXISTS (
-                            SELECT 1
-                            FROM events close_event
-                            WHERE close_event.event_type='agent_interrupted'
-                              AND close_event.session_id = owner.id
-                              AND (
-                                    close_event.payload_json LIKE '%\"reason\":\"terminal_close\"%'
-                                    OR close_event.payload_json LIKE '%\"reason\":\"close_all\"%'
-                                    OR close_event.payload_json LIKE '%\"reason\":\"drop_fallback\"%'
-                              )
                        )
                        AND (
                             (?1 != '' AND owner.agent_slot_id=?1)
@@ -4173,7 +4182,7 @@ impl CoordinationKernel {
              FROM tasks t
              JOIN task_resource_intents i ON i.task_id = t.id
              LEFT JOIN agent_sessions owner ON owner.id = t.claimed_session_id
-             WHERE t.status='ready'
+             WHERE t.status IN ('ready', 'claimed', 'blocked')
                AND t.id != COALESCE(?4, '')
                AND i.status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')
                AND (
@@ -4181,17 +4190,6 @@ impl CoordinationKernel {
                     OR t.claimed_session_id=''
                     OR owner.status IS NULL
                     OR owner.status!='active'
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM events close_event
-                    WHERE close_event.event_type='agent_interrupted'
-                      AND close_event.session_id = owner.id
-                      AND (
-                            close_event.payload_json LIKE '%\"reason\":\"terminal_close\"%'
-                            OR close_event.payload_json LIKE '%\"reason\":\"close_all\"%'
-                            OR close_event.payload_json LIKE '%\"reason\":\"drop_fallback\"%'
-                      )
                )
                AND (
                     (?2 != '' AND owner.agent_slot_id=?2)
@@ -4224,7 +4222,7 @@ impl CoordinationKernel {
             .execute(
                 "UPDATE tasks
                  SET claimed_session_id=?1, status='ready', updated_at=?2
-                 WHERE id=?3 AND status='ready'",
+                 WHERE id=?3 AND status IN ('ready', 'claimed', 'blocked')",
                 params![session_id, now, recovered_task_id],
             )
             .map_err(|error| format!("Unable to recover ready task to session: {error}"))?;
@@ -5387,122 +5385,105 @@ impl CoordinationKernel {
             }
         }
 
-        let close_discards_parked_task =
+        let close_preserves_parked_task =
             matches!(reason, "terminal_close" | "close_all" | "drop_fallback");
-        let mut discarded_parked_task = None;
-        if close_discards_parked_task {
-            if let Some(task_id) = session["task_id"]
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-            {
-                let parked_intent_count: i64 = self
-                    .conn
-                    .query_row(
-                        "SELECT COUNT(1)
-                         FROM task_resource_intents
-                         WHERE task_id=?1
-                           AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
-                        params![task_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if parked_intent_count > 0 {
-                    let task_updated = self
-                        .conn
-                        .execute(
-                            "UPDATE tasks
+        let session_task_id = session["task_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty());
+        let parked_session_task_intent_count: i64 = match (
+            close_preserves_parked_task,
+            session_task_id,
+        ) {
+            (true, Some(task_id)) => self
+                .conn
+                .query_row(
+                    "SELECT COUNT(1)
+                     FROM task_resource_intents
+                     WHERE task_id=?1
+                       AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let preserved_parked_task =
+            if close_preserves_parked_task && parked_session_task_intent_count > 0 {
+                session_task_id.map(|task_id| {
+                    json!({
+                        "task_id": task_id,
+                        "parked_intent_count": parked_session_task_intent_count,
+                        "resume_policy": "preserve_for_dependency_release_or_session_recovery",
+                    })
+                })
+            } else {
+                None
+            };
+        if let (Some(task_id), Some(_)) = (session_task_id, preserved_parked_task.as_ref()) {
+            self.emit_event(
+                "terminal_parked_task_preserved_on_session_close",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: session["agent_id"].as_str().map(str::to_string),
+                    agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
+                    session_id: Some(session_id.to_string()),
+                    context_run_id: session["context_run_id"].as_str().map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "reason": reason,
+                    "parked_intent_count": parked_session_task_intent_count,
+                    "resume_policy": "preserve_for_dependency_release_or_session_recovery",
+                }),
+            )?;
+        }
+
+        let (updated_resource_intents, updated_task_status, stopped_queue_refresh) =
+            match session_task_id {
+                Some(task_id) if preserved_parked_task.is_some() => (
+                    0,
+                    0,
+                    json!({
+                        "status": "skipped",
+                        "reason": "session_task_is_parked_and_preserved_on_close",
+                        "task_id": task_id,
+                    }),
+                ),
+                Some(task_id) => {
+                    let updated_resource_intents =
+                        self.mark_task_resource_intents_stopped(task_id, "interrupted", &now)?;
+                    let updated_task_status = if updated_resource_intents > 0 {
+                        let query = "UPDATE tasks
                              SET status='interrupted',
                                  finished_at=COALESCE(finished_at, ?1),
                                  updated_at=?1
                              WHERE id=?2
                                AND claimed_session_id=?3
-                               AND status IN ('ready', 'blocked', 'claimed')",
-                            params![now, task_id, session_id],
-                        )
-                        .map_err(|error| {
-                            format!("Unable to discard closed parked task: {error}")
-                        })?;
-                    if task_updated > 0 {
-                        let intent_updated = self
-                            .conn
-                            .execute(
-                                "UPDATE task_resource_intents
-                                 SET status='interrupted', updated_at=?1
-                                 WHERE task_id=?2
-                                   AND status IN ('parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
-                                params![now, task_id],
-                            )
+                               AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')";
+                        self.conn
+                            .execute(query, params![now, task_id, session_id])
                             .map_err(|error| {
-                                format!("Unable to discard closed parked task intents: {error}")
-                            })?;
-                        discarded_parked_task = Some(json!({
-                            "task_id": task_id,
-                            "parked_intent_count": parked_intent_count,
-                            "updated_resource_intents": intent_updated,
-                        }));
-                        self.emit_event(
-                            "terminal_parked_task_discarded_on_session_close",
-                            "kernel",
-                            REPO_ID,
-                            EventRefs {
-                                task_id: Some(task_id.to_string()),
-                                agent_id: session["agent_id"].as_str().map(str::to_string),
-                                agent_slot_id: session["agent_slot_id"].as_str().map(str::to_string),
-                                session_id: Some(session_id.to_string()),
-                                context_run_id: session["context_run_id"].as_str().map(str::to_string),
-                                ..EventRefs::default()
-                            },
-                            json!({
-                                "reason": reason,
-                                "parked_intent_count": parked_intent_count,
-                                "updated_resource_intents": intent_updated,
-                                "resume_policy": "do_not_resurrect_closed_terminal_parked_tasks_on_app_restart",
-                            }),
-                        )?;
-                    }
-                }
-            }
-        }
-
-        let (updated_resource_intents, updated_task_status, stopped_queue_refresh) = if let Some(
-            task_id,
-        ) = session
-            ["task_id"]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let updated_resource_intents =
-                self.mark_task_resource_intents_stopped(task_id, "interrupted", &now)?;
-            let updated_task_status = if updated_resource_intents > 0 {
-                self.conn
-                    .execute(
-                        "UPDATE tasks
-                         SET status='interrupted',
-                             finished_at=COALESCE(finished_at, ?1),
-                             updated_at=?1
-                         WHERE id=?2
-                           AND claimed_session_id=?3
-                           AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')",
-                        params![now, task_id, session_id],
+                                format!(
+                                    "Unable to mark interrupted session task interrupted: {error}"
+                                )
+                            })?
+                    } else {
+                        0
+                    };
+                    (
+                        updated_resource_intents,
+                        updated_task_status,
+                        self.refresh_task_stopped_file_lease_queue(task_id, None)?,
                     )
-                    .map_err(|error| {
-                        format!("Unable to mark interrupted session task interrupted: {error}")
-                    })?
-            } else {
-                0
+                }
+                None => (
+                    0,
+                    0,
+                    json!({"status": "skipped", "reason": "session_missing_task"}),
+                ),
             };
-            (
-                updated_resource_intents,
-                updated_task_status,
-                self.refresh_task_stopped_file_lease_queue(task_id, None)?,
-            )
-        } else {
-            (
-                0,
-                0,
-                json!({"status": "skipped", "reason": "session_missing_task"}),
-            )
-        };
 
         let mut expired_dependents = Vec::new();
         for lease in &active_leases {
@@ -5555,7 +5536,8 @@ impl CoordinationKernel {
                 "reason": reason,
                 "expired_leases": active_leases.len(),
                 "interrupted_worktrees": active_worktrees.len(),
-                "discarded_parked_task": discarded_parked_task,
+                "discarded_parked_task": null,
+                "preserved_parked_task": preserved_parked_task,
                 "updated_resource_intents": updated_resource_intents,
                 "updated_task_status": updated_task_status,
                 "stopped_queue_refresh": stopped_queue_refresh,

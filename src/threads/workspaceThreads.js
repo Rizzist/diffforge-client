@@ -17,6 +17,18 @@ const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
 const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
 const DEFAULT_AGENT_ID = "codex";
 const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
+const LIVE_TERMINAL_STATUSES = new Set([
+  "active",
+  "closed",
+  "error",
+  "exited",
+  "idle",
+  "parked",
+  "resume_ready",
+  "resume_requested",
+  "running",
+  "starting",
+]);
 const THREAD_PROJECTION_EVENT_TYPES = new Set([
   "thread.activity",
   "thread.file",
@@ -1778,7 +1790,7 @@ function normalizeActiveTerminal(value) {
   const paneId = cleanText(value.paneId);
   const instanceId = Number.parseInt(value.instanceId, 10);
   const status = cleanText(value.status, "idle").toLowerCase();
-  const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
+  const safeStatus = LIVE_TERMINAL_STATUSES.has(status)
     ? status
     : "idle";
 
@@ -1811,7 +1823,7 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
 
   const binding = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const status = cleanText(binding.status, fallback.status || "idle").toLowerCase();
-  const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
+  const safeStatus = LIVE_TERMINAL_STATUSES.has(status)
     ? status
     : "idle";
   const terminalBinding = options.stripLiveBindings
@@ -1926,7 +1938,7 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const messageCount = Math.max(normalizeMessageCount(thread.messageCount), messages.length);
   const materialized = thread.materialized === true || messageCount > 0;
   const status = cleanText(thread.status, "idle").toLowerCase();
-  const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
+  const safeStatus = LIVE_TERMINAL_STATUSES.has(status)
     ? status
     : "idle";
   const coordination = normalizeCoordination(thread.coordination);
@@ -3979,6 +3991,12 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     updatedAt: existing.updatedAt,
   });
   const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
+  const rawEventStatus = cleanText(event.status).toLowerCase();
+  const eventStatus = LIVE_TERMINAL_STATUSES.has(rawEventStatus) ? rawEventStatus : "";
+  const providerStatus = eventStatus
+    || previousProviderBinding?.status
+    || existing.status
+    || "idle";
   const marksInputReady = explicitInputReady === true
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
@@ -4005,6 +4023,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
+    status: providerStatus,
     updatedAt: now,
   };
   const terminalKey = getTerminalKeyForEvent(entry, event);
@@ -4015,6 +4034,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      status: eventStatus || terminals[terminalKey].status,
       updatedAt: now,
     };
   }
@@ -4030,6 +4050,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
           ...existing,
           activityStatus: existing.currentAgent === agentId ? activityStatus : existing.activityStatus,
           providerBindings,
+          status: existing.currentAgent === agentId && eventStatus ? eventStatus : existing.status,
           updatedAt: now,
         },
       },
