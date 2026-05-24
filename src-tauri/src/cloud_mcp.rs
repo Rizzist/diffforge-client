@@ -1613,6 +1613,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/knowledge/graph" => Some("knowledge_graph"),
         "/v1/knowledge/graph/delta" => Some("knowledge_graph_delta"),
         "/v1/knowledge/context" => Some("knowledge_context"),
+        "/v1/workspace/reset-graph-state" => Some("reset_workspace_graph_state"),
         _ => None,
     }
 }
@@ -4190,6 +4191,49 @@ async fn cloud_mcp_sync_agent_installations(
     });
 
     cloud_mcp_post_event_endpoint(state.inner(), "agent_installation_snapshot", &payload).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_reset_workspace_graph_state(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    scope: String,
+) -> Result<Value, String> {
+    let normalized_scope = match scope.trim().to_ascii_lowercase().as_str() {
+        "spec" | "spec_graph" | "spec-graph" => "spec",
+        "knowledge" | "knowledge_graph" | "knowledge-graph" => "knowledge",
+        "all" => "all",
+        _ => return Err("Reset scope must be spec, knowledge, or all.".to_string()),
+    };
+    let req = cloud_mcp_spec_graph_sync_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let payload = json!({
+        "source": "rust-diffforge-graph-reset",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id,
+        "repo_path": req.root_display,
+        "workspace_root": req.root_display,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "scope": normalized_scope,
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/reset-graph-state",
+        &payload,
+    )
+    .await?;
+    cloud_mcp_clear_graph_reset_caches(&req.root, &req.repo_id, normalized_scope)?;
+    Ok(cloud_mcp_response_data(&response))
 }
 
 #[tauri::command]
@@ -7697,6 +7741,42 @@ async fn cloud_mcp_stop_knowledge_graph_sync(
         "repoPath": req.root_display.clone(),
         "stopped": stopped,
     }))
+}
+
+fn cloud_mcp_clear_graph_reset_caches(root: &Path, repo_id: &str, scope: &str) -> Result<(), String> {
+    if scope == "spec" || scope == "all" {
+        if let Ok(path) = cloud_mcp_safe_spec_graph_repo_cache_path(root, repo_id) {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "Unable to remove Spec Graph cache {}: {error}",
+                        workspace_path_display(&path)
+                    )
+                })?;
+            }
+        }
+    }
+    if scope == "knowledge" || scope == "all" {
+        let path = cloud_mcp_knowledge_graph_cache_path(root, repo_id);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Unable to remove Knowledge Graph cache {}: {error}",
+                    workspace_path_display(&path)
+                )
+            })?;
+        }
+        let mirror_cache = cloud_mcp_knowledge_cache_dir(root);
+        if mirror_cache.exists() {
+            fs::remove_dir_all(&mirror_cache).map_err(|error| {
+                format!(
+                    "Unable to remove Knowledge Graph cache directory {}: {error}",
+                    workspace_path_display(&mirror_cache)
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

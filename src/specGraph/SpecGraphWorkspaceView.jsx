@@ -65,6 +65,8 @@ export default function SpecGraphWorkspaceView({
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedHistoryNodeId, setSelectedHistoryNodeId] = useState("");
   const [selectedKnowledgeNodeId, setSelectedKnowledgeNodeId] = useState("");
+  const [resetMenuOpen, setResetMenuOpen] = useState(false);
+  const [resetStatus, setResetStatus] = useState({ state: "idle", message: "" });
   const snapshot = specGraphSnapshot;
   const error = specGraphError;
   const state = specGraphState;
@@ -197,6 +199,39 @@ export default function SpecGraphWorkspaceView({
     specGraphSnapshot?.cursor,
     specGraphSnapshot?.nodeHashes,
   ]);
+  const runGraphReset = useCallback((scope) => {
+    if (!repoPath || !workspaceId) return;
+    const label = scope === "all" ? "all cloud graph state" : `${scope} graph state`;
+    const confirmed = window.confirm(`Reset ${label} for this workspace?`);
+    if (!confirmed) return;
+    setResetMenuOpen(false);
+    setResetStatus({ state: "running", message: "Resetting..." });
+    invoke("cloud_mcp_reset_workspace_graph_state", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+      scope,
+    })
+      .then(() => {
+        if (scope === "spec" || scope === "all") {
+          setSelectedNodeId("");
+          setSelectedTaskId("");
+          setSelectedHistoryNodeId("");
+          setLocalIgnoredOverlay(null);
+        }
+        if (scope === "knowledge" || scope === "all") {
+          setSelectedKnowledgeNodeId("");
+        }
+        setResetStatus({ state: "done", message: "Reset complete" });
+        window.setTimeout(() => setResetStatus({ state: "idle", message: "" }), 1800);
+      })
+      .catch((nextError) => {
+        setResetStatus({
+          state: "error",
+          message: nextError?.message || String(nextError || "Reset failed."),
+        });
+      });
+  }, [repoPath, workspaceId, workspaceName]);
 
   useEffect(() => {
     if (specGraph.nodes.length && !specGraph.nodes.some((node) => node.id === selectedNodeId)) {
@@ -306,6 +341,34 @@ export default function SpecGraphWorkspaceView({
             Knowledge
           </ViewToggleButton>
         </ViewToggleGroup>
+        <ResetGraphMenu>
+          <ResetGraphButton
+            type="button"
+            aria-expanded={resetMenuOpen ? "true" : "false"}
+            disabled={!repoPath || !workspaceId || resetStatus.state === "running"}
+            onClick={() => setResetMenuOpen((current) => !current)}
+          >
+            <DeleteOutline size={15} />
+            <span>Reset</span>
+            <ExpandMore size={16} />
+          </ResetGraphButton>
+          {resetMenuOpen && (
+            <ResetGraphDropdown>
+              <ResetGraphOption type="button" onClick={() => runGraphReset("spec")}>
+                Reset Spec Graph
+              </ResetGraphOption>
+              <ResetGraphOption type="button" onClick={() => runGraphReset("knowledge")}>
+                Reset Knowledge Graph
+              </ResetGraphOption>
+              <ResetGraphOption type="button" data-danger="true" onClick={() => runGraphReset("all")}>
+                Reset All
+              </ResetGraphOption>
+            </ResetGraphDropdown>
+          )}
+        </ResetGraphMenu>
+        {resetStatus.message && (
+          <ResetGraphStatus data-state={resetStatus.state}>{resetStatus.message}</ResetGraphStatus>
+        )}
       </SpecGraphToolbar>
 
       {graphKind === "knowledge" ? (
@@ -1818,6 +1881,97 @@ const ViewToggleButton = styled.button`
 
 const ToolbarSpacer = styled.div`
   flex: 1;
+`;
+
+const ResetGraphMenu = styled.div`
+  position: relative;
+`;
+
+const ResetGraphButton = styled.button`
+  align-items: center;
+  background: rgba(127, 29, 29, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.28);
+  border-radius: 7px;
+  color: #fecaca;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0;
+  min-height: 31px;
+  padding: 0 8px;
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(180, 35, 24, 0.07);
+    border-color: rgba(180, 35, 24, 0.2);
+    color: var(--history-red);
+  }
+`;
+
+const ResetGraphDropdown = styled.div`
+  background: rgba(12, 16, 24, 0.98);
+  border: 1px solid var(--history-border);
+  border-radius: 8px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  min-width: 190px;
+  overflow: hidden;
+  padding: 4px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, 0.14);
+  }
+`;
+
+const ResetGraphOption = styled.button`
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  color: var(--history-text);
+  cursor: pointer;
+  display: block;
+  font-size: 12px;
+  font-weight: 720;
+  letter-spacing: 0;
+  padding: 8px 9px;
+  text-align: left;
+  width: 100%;
+
+  &:hover {
+    background: rgba(148, 163, 184, 0.12);
+  }
+
+  &[data-danger="true"] {
+    color: #fecaca;
+  }
+
+  html[data-forge-theme="light"] &[data-danger="true"] {
+    color: var(--history-red);
+  }
+`;
+
+const ResetGraphStatus = styled.span`
+  color: var(--history-muted);
+  font-size: 11px;
+  font-weight: 760;
+
+  &[data-state="error"] {
+    color: var(--history-red);
+  }
+
+  &[data-state="done"] {
+    color: var(--history-green);
+  }
 `;
 
 const KnowledgeToolbarSummary = styled.div`

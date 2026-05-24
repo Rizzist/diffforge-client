@@ -1473,11 +1473,21 @@ fn cleanup_windows_headless_console_hosts() -> usize {
     let process_ids = app_child_process_ids_by_name(app_pid, "conhost.exe");
     let mut closed_process_ids = Vec::new();
 
-    for process_id in process_ids {
-        if terminate_windows_process(process_id) {
-            closed_process_ids.push(process_id);
+    for process_id in &process_ids {
+        if terminate_windows_process(*process_id) {
+            closed_process_ids.push(*process_id);
         }
     }
+
+    log_terminal_crash_forensics_event(
+        "backend.windows_headless_console_hosts.cleanup",
+        json!({
+            "app_pid": app_pid,
+            "closed_count": closed_process_ids.len(),
+            "closed_process_ids": closed_process_ids,
+            "found_count": process_ids.len(),
+        }),
+    );
 
     closed_process_ids.len()
 }
@@ -1943,12 +1953,19 @@ fn poll_login_terminal_child_exit(child: &mut std::process::Child) -> bool {
 
 #[cfg(windows)]
 fn kill_login_terminal_child(child: &mut std::process::Child) -> TerminalKillReport {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     let mut report = TerminalKillReport {
         pid: Some(child.id()),
         ..TerminalKillReport::default()
     };
 
-    match Command::new("taskkill")
+    let mut taskkill = Command::new("taskkill");
+    taskkill.creation_flags(CREATE_NO_WINDOW);
+
+    match taskkill
         .arg("/PID")
         .arg(child.id().to_string())
         .arg("/T")

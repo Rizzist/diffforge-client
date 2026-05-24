@@ -6235,6 +6235,7 @@ function TerminalView({
   createFirstWorkspace,
   handlePreparedTerminalChange,
   isAppClosing = false,
+  isWorkspaceRuntimeVisible = true,
   isWorkspaceRuntimeDeactivating = false,
   manageWorkspaceAgents,
   onOpenWorkspaceSettings,
@@ -6263,6 +6264,12 @@ function TerminalView({
   workspaces = [],
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
+  const terminalStartupReady = Boolean(
+    workspaceThreadRestoreReady
+      && isWorkspaceRuntimeVisible
+      && !isAppClosing
+      && !isWorkspaceRuntimeDeactivating,
+  );
   const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
     ? terminalWorkspaceLogicalIndexes
     : [];
@@ -10539,7 +10546,7 @@ function TerminalView({
                 onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
-                startupReady={workspaceThreadRestoreReady}
+                startupReady={terminalStartupReady}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
@@ -10592,7 +10599,7 @@ function TerminalView({
       onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-      startupReady={workspaceThreadRestoreReady}
+      startupReady={terminalStartupReady}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
       terminalIndex={logicalTerminalIndexes[0] || 0}
       terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}

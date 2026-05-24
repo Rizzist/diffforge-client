@@ -504,13 +504,20 @@ fn terminal_input_forensics_kind(data: &str) -> &'static str {
 
 #[cfg(windows)]
 fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     let mut report = TerminalKillReport {
         pid: child.process_id(),
         ..TerminalKillReport::default()
     };
 
     if let Some(pid) = report.pid {
-        match Command::new("taskkill")
+        let mut taskkill = Command::new("taskkill");
+        taskkill.creation_flags(CREATE_NO_WINDOW);
+
+        match taskkill
             .arg("/PID")
             .arg(pid.to_string())
             .arg("/T")
@@ -1014,8 +1021,13 @@ fn cleanup_terminal_instance_async(
     kill_first: bool,
     reason: &'static str,
     preserve_coordination_session: bool,
+    cleanup_tracker: Option<Arc<TerminalCleanupTracker>>,
 ) {
     thread::spawn(move || {
+        let instance_id = instance.id;
+        let _cleanup_guard = cleanup_tracker
+            .as_ref()
+            .map(|tracker| tracker.begin(reason, Some(instance_id)));
         let coordination_cleanup_mode = if preserve_coordination_session {
             TerminalCoordinationCleanupMode::Preserve
         } else {
@@ -1293,6 +1305,7 @@ async fn prepare_terminal_coordination_launch(
 fn spawn_terminal_reader(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cleanup_tracker: Arc<TerminalCleanupTracker>,
     pane_id: String,
     instance_id: u64,
     cloud_mcp_state: CloudMcpState,
@@ -1526,6 +1539,7 @@ fn spawn_terminal_reader(
 
         let cleanup_app = app.clone();
         let cleanup_terminals = Arc::clone(&terminals);
+        let cleanup_tracker = Arc::clone(&cleanup_tracker);
         let cleanup_state = cloud_mcp_state.clone();
         let cleanup_pane_id = reader_pane_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1550,7 +1564,13 @@ fn spawn_terminal_reader(
                     .await;
                 });
                 let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
-                cleanup_terminal_instance_async(instance, false, "reader_exit", false);
+                cleanup_terminal_instance_async(
+                    instance,
+                    false,
+                    "reader_exit",
+                    false,
+                    Some(cleanup_tracker),
+                );
             }
 
             let _ = cleanup_app.emit(
@@ -1677,7 +1697,9 @@ async fn close_terminal_session(
                 let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
             }
         }
+        let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
+            let _cleanup_guard = cleanup_tracker.begin("terminal_close", Some(cleanup_instance_id));
             let coordination_cleanup_mode = if preserve_coordination_session {
                 TerminalCoordinationCleanupMode::Preserve
             } else {
@@ -1691,12 +1713,34 @@ async fn close_terminal_session(
             );
         });
         if !wait_for_cleanup {
+            let cleanup_pane_id = pane_id.to_string();
             tauri::async_runtime::spawn(async move {
-                let _ = tokio::time::timeout(
+                let cleanup_wait_result = tokio::time::timeout(
                     Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS),
                     cleanup_task,
                 )
                 .await;
+                let (cleanup_joined, cleanup_timed_out, cleanup_join_error) =
+                    match cleanup_wait_result {
+                        Ok(Ok(())) => (true, false, None),
+                        Ok(Err(error)) => (
+                            false,
+                            false,
+                            Some(clean_terminal_telemetry_text(&error.to_string())),
+                        ),
+                        Err(_) => (false, true, None),
+                    };
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_close.cleanup_wait.done",
+                    json!({
+                        "cleanup_join_error": cleanup_join_error.as_deref(),
+                        "cleanup_joined": cleanup_joined,
+                        "cleanup_timed_out": cleanup_timed_out,
+                        "instance_id": cleanup_instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&cleanup_pane_id),
+                        "wait_for_cleanup": false,
+                    }),
+                );
             });
             log_terminal_crash_forensics_event(
                 "backend.terminal_close.done",
@@ -1709,21 +1753,39 @@ async fn close_terminal_session(
             );
             return Ok(true);
         }
-        let _ = tokio::time::timeout(
+        let cleanup_wait_result = tokio::time::timeout(
             Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS),
             cleanup_task,
         )
         .await;
 
+        let (cleanup_joined, cleanup_timed_out, cleanup_join_error) = match cleanup_wait_result {
+            Ok(Ok(())) => (true, false, None),
+            Ok(Err(error)) => (
+                false,
+                false,
+                Some(clean_terminal_telemetry_text(&error.to_string())),
+            ),
+            Err(_) => (false, true, None),
+        };
+
         log_terminal_crash_forensics_event(
             "backend.terminal_close.done",
             json!({
                 "instance_id": cleanup_instance_id,
-                "cleanup_joined": true,
+                "cleanup_join_error": cleanup_join_error.as_deref(),
+                "cleanup_joined": cleanup_joined,
+                "cleanup_timed_out": cleanup_timed_out,
                 "pane_id": clean_terminal_diagnostic_log_text(pane_id),
                 "wait_for_cleanup": wait_for_cleanup,
             }),
         );
+        if cleanup_timed_out {
+            return Err("Timed out waiting for terminal cleanup.".to_string());
+        }
+        if let Some(error) = cleanup_join_error {
+            return Err(format!("Unable to join terminal cleanup: {error}"));
+        }
         return Ok(true);
     }
 
@@ -1750,6 +1812,7 @@ async fn close_all_terminal_sessions(
             .collect::<Vec<(String, TerminalInstance)>>()
     };
     let pty_pool = Arc::clone(&state.pty_pool);
+    let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
     let warm_ptys = pty_pool.drain_for_shutdown();
     let closed = instances.len();
     let total = closed;
@@ -1811,9 +1874,11 @@ async fn close_all_terminal_sessions(
             let app = app.clone();
             let cleanup_tx = cleanup_tx.clone();
             let closed_count = Arc::clone(&closed_count);
+            let cleanup_tracker = Arc::clone(&cleanup_tracker);
 
             thread::spawn(move || {
                 let instance_id = instance.id;
+                let _cleanup_guard = cleanup_tracker.begin("close_all", Some(instance_id));
                 log_terminal_crash_forensics_event(
                     "backend.terminal_close_all.active_cleanup_thread.begin",
                     json!({
@@ -1926,12 +1991,21 @@ async fn close_all_terminal_sessions(
             );
             pty_pool.wait_for_refill_idle();
         }
-        cleanup_windows_headless_console_hosts();
+        let cleanup_tracker_active_before_sweep = cleanup_tracker.active();
+        let conhosts_closed = cleanup_windows_headless_console_hosts();
+        let cleanup_tracker_idle_after_sweep = cleanup_tracker.wait_for_idle(
+            "close_all_after_conhost_sweep",
+            Duration::from_millis(TERMINAL_CLOSE_ALL_WAIT_MS),
+        );
         log_terminal_crash_forensics_event(
             "backend.terminal_close_all.done",
             json!({
                 "active_done": active_done,
                 "active_total": total,
+                "cleanup_tracker_active_before_sweep": cleanup_tracker_active_before_sweep,
+                "cleanup_tracker_active_after_sweep": cleanup_tracker.active(),
+                "cleanup_tracker_idle_after_sweep": cleanup_tracker_idle_after_sweep,
+                "conhosts_closed": conhosts_closed,
                 "login_done": login_closed.is_some(),
                 "timed_out": timed_out,
                 "warm_done": warm_done,
@@ -2063,6 +2137,7 @@ async fn terminal_open(
     ensure_app_not_shutting_down("terminal open")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
+    ensure_app_not_shutting_down("terminal open")?;
     let pane_id = request.pane_id;
     let requested_cols = request.cols;
     let requested_rows = request.rows;
@@ -2103,16 +2178,46 @@ async fn terminal_open(
 
     let preserve_coordination_session =
         request.preserve_coordination_session.unwrap_or(false) && !plain_shell && !fresh_session;
-    let _ = close_terminal_session(
+    close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
         None,
         preserve_coordination_session,
-        fresh_session,
+        true,
     )
-    .await
-    .unwrap_or(false);
+    .await?;
+
+    if !state
+        .cleanup_tracker
+        .wait_for_idle_async(
+            "terminal_open_before_launch",
+            Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS),
+        )
+        .await
+    {
+        let conhosts_closed = cleanup_windows_headless_console_hosts();
+        log_terminal_crash_forensics_event(
+            "backend.terminal_open.cleanup_wait.sweep",
+            json!({
+                "cleanup_tracker_active": state.cleanup_tracker.active(),
+                "conhosts_closed": conhosts_closed,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+
+        if !state
+            .cleanup_tracker
+            .wait_for_idle_async(
+                "terminal_open_after_conhost_sweep",
+                Duration::from_millis(TERMINAL_DROP_CLEANUP_TRACKER_WAIT_MS),
+            )
+            .await
+        {
+            return Err("Timed out waiting for previous terminal cleanup.".to_string());
+        }
+    }
+    ensure_app_not_shutting_down("terminal open")?;
 
     let working_directory =
         match resolve_workspace_root_directory(working_directory_request.as_deref()) {
@@ -2137,6 +2242,7 @@ async fn terminal_open(
             .next_terminal_instance_id
             .fetch_add(1, Ordering::Relaxed)
     });
+    ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if plain_shell {
     } else if !is_prewarm_pty {
@@ -2174,6 +2280,7 @@ async fn terminal_open(
 
     let shell_pty = is_prewarm_pty || plain_shell;
     let warm_pty = if shell_pty {
+        ensure_app_not_shutting_down("terminal open")?;
         match create_warm_shell_pty_in_directory(size, &process_working_directory) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
@@ -2181,6 +2288,7 @@ async fn terminal_open(
             }
         }
     } else {
+        ensure_app_not_shutting_down("terminal open")?;
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
             let error = format!("{label} is not installed or not available on PATH.");
             return Err(error);
@@ -2229,6 +2337,11 @@ async fn terminal_open(
         agent_started = true;
         warm_pty
     };
+
+    if let Err(error) = ensure_app_not_shutting_down("terminal open") {
+        cleanup_warm_pty_with_context(warm_pty);
+        return Err(error);
+    }
 
     let terminal_metadata = TerminalInstanceMetadata {
         pane_id: pane_id.clone(),
@@ -2286,12 +2399,14 @@ async fn terminal_open(
             true,
             "terminal_open_displaced",
             preserve_coordination_session,
+            Some(Arc::clone(&state.cleanup_tracker)),
         );
     }
 
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
+        Arc::clone(&state.cleanup_tracker),
         pane_id.clone(),
         instance_id,
         cloud_mcp_state.inner().clone(),
@@ -2496,6 +2611,7 @@ async fn terminal_start_agent(
     ensure_app_not_shutting_down("terminal agent start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
+    ensure_app_not_shutting_down("terminal agent start")?;
     let provider = parse_agent_provider(&provider)?;
     let definition = agent_definition(provider);
     let mut args = Vec::new();
@@ -2824,6 +2940,7 @@ async fn terminal_start_agent_many(
     ensure_app_not_shutting_down("terminal agent batch start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
+    ensure_app_not_shutting_down("terminal agent batch start")?;
     if requests.len() > MAX_TERMINAL_START_AGENT_BATCH {
         return Err(format!(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."

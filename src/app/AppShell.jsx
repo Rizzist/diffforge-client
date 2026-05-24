@@ -978,7 +978,6 @@ const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
-const WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS = 1200;
 const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
 const WORKSPACE_DEACTIVATION_INITIAL_STATE = {
   isActive: false,
@@ -1743,37 +1742,6 @@ function normalizeTerminalCloseProgress(payload) {
   };
 }
 
-async function closeWorkspaceWindowDirectly(appWindow) {
-  try {
-    await withTimeout(
-      appWindow.close(),
-      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
-      "Window close timed out.",
-    );
-    return;
-  } catch (closeError) {
-
-    if (typeof appWindow.destroy !== "function") {
-      throw closeError;
-    }
-  }
-
-  if (typeof appWindow.destroy !== "function") {
-    throw new Error("Window destroy is unavailable.");
-  }
-
-  try {
-    await withTimeout(
-      appWindow.destroy(),
-      WORKSPACE_CLOSE_WINDOW_TIMEOUT_MS,
-      "Window destroy timed out.",
-    );
-  } catch (destroyError) {
-    throw destroyError;
-  }
-
-}
-
 function requestWorkspaceWebClose(reason = "app_close") {
   try {
     window.dispatchEvent(new CustomEvent(WORKSPACE_WEB_CLOSE_REQUESTED_EVENT, {
@@ -1786,24 +1754,18 @@ function requestWorkspaceWebClose(reason = "app_close") {
   return invoke("workspace_web_close_all").catch(() => 0);
 }
 
-async function closeWorkspaceWindowAfterTerminalShutdown(appWindow) {
+async function closeWorkspaceWindowAfterTerminalShutdown() {
   await withTimeout(
     requestWorkspaceWebClose("native_app_close"),
     WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS,
     "Workspace browser close timed out.",
   ).catch(() => {});
 
-  try {
-    await withTimeout(
-      invoke("close_app_after_terminal_shutdown"),
-      WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
-      "Native app exit timed out.",
-    );
-    return;
-  } catch {
-  }
-
-  await closeWorkspaceWindowDirectly(appWindow);
+  await withTimeout(
+    invoke("close_app_after_terminal_shutdown"),
+    WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
+    "Native app exit timed out.",
+  );
 }
 
 async function readWindowFrameState(appWindow = getSafeCurrentWindow()) {
@@ -6123,9 +6085,7 @@ export default function App() {
         expectedTerminalTotal: normalizeCloseCount(workspaceCloseExpectedTotalRef.current),
         reason: "app_close_retry",
       });
-      workspaceCloseAllowNativeRef.current = true;
       requestWorkspaceWebClose("app_close_retry");
-      runWindowAction(() => closeWorkspaceWindowDirectly(appWindow));
       return;
     }
 
@@ -6175,8 +6135,8 @@ export default function App() {
           "Workspace browser close timed out.",
         ).catch(() => {});
 
+        await closeWorkspaceWindowAfterTerminalShutdown();
         workspaceCloseAllowNativeRef.current = true;
-        await closeWorkspaceWindowAfterTerminalShutdown(appWindow);
       } catch (closeError) {
         logTerminalStatus("frontend.app_close.error", {
           message: closeError?.message || String(closeError || ""),
@@ -10245,6 +10205,7 @@ export default function App() {
                           createFirstWorkspace={createFirstWorkspace}
                           handlePreparedTerminalChange={handlePreparedTerminalChange}
                           isAppClosing={workspaceCloseState.isActive}
+                          isWorkspaceRuntimeVisible={shouldRevealWorkspaceTerminal}
                           isWorkspaceRuntimeDeactivating={Boolean(
                             workspaceDeactivationState.isActive
                               && workspaceDeactivationState.workspaceId === activatedWorkspace?.id,
@@ -10318,6 +10279,7 @@ export default function App() {
                             createFirstWorkspace={createFirstWorkspace}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
+                            isWorkspaceRuntimeVisible={runtimeVisible}
                             isWorkspaceRuntimeDeactivating={runtimeIsDeactivating}
                             manageWorkspaceAgents={manageWorkspaceAgents}
                             onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}

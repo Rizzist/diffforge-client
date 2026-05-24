@@ -87,10 +87,11 @@ const TERMINAL_SHUTDOWN_POLL_INTERVAL_MS: u64 = 25;
 const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
+const TERMINAL_DROP_CLEANUP_TRACKER_WAIT_MS: u64 = 1_500;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
-const APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS: u64 = 22_000;
+const APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS: u64 = 45_000;
 const APP_SHUTDOWN_PHASE_RUNNING: u8 = 0;
 const APP_SHUTDOWN_PHASE_QUIESCING: u8 = 1;
 const APP_SHUTDOWN_PHASE_STOPPING_WATCHERS: u8 = 2;
@@ -353,7 +354,18 @@ struct TerminalState {
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
+    cleanup_tracker: Arc<TerminalCleanupTracker>,
     next_terminal_instance_id: AtomicU64,
+}
+
+struct TerminalCleanupTracker {
+    active: AtomicUsize,
+}
+
+struct TerminalCleanupGuard {
+    tracker: Arc<TerminalCleanupTracker>,
+    reason: &'static str,
+    instance_id: Option<u64>,
 }
 
 struct TerminalDiagnosticState {
@@ -391,6 +403,146 @@ impl WindowsTerminalDiagnosticState {
     }
 }
 
+impl TerminalCleanupTracker {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        reason: &'static str,
+        instance_id: Option<u64>,
+    ) -> TerminalCleanupGuard {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup_tracker.begin",
+            json!({
+                "active": active,
+                "instance_id": instance_id,
+                "reason": reason,
+            }),
+        );
+
+        TerminalCleanupGuard {
+            tracker: Arc::clone(self),
+            reason,
+            instance_id,
+        }
+    }
+
+    fn wait_for_idle(&self, reason: &'static str, timeout: Duration) -> bool {
+        let started_at = Instant::now();
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup_tracker.wait.begin",
+            json!({
+                "active": self.active(),
+                "reason": reason,
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
+
+        loop {
+            let active = self.active();
+
+            if active == 0 {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_cleanup_tracker.wait.done",
+                    json!({
+                        "active": active,
+                        "elapsed_ms": terminal_diagnostic_elapsed_ms(started_at),
+                        "reason": reason,
+                        "timed_out": false,
+                    }),
+                );
+                return true;
+            }
+
+            if started_at.elapsed() >= timeout {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_cleanup_tracker.wait.done",
+                    json!({
+                        "active": active,
+                        "elapsed_ms": terminal_diagnostic_elapsed_ms(started_at),
+                        "reason": reason,
+                        "timed_out": true,
+                    }),
+                );
+                return false;
+            }
+
+            thread::sleep(Duration::from_millis(TERMINAL_SHUTDOWN_POLL_INTERVAL_MS));
+        }
+    }
+
+    async fn wait_for_idle_async(&self, reason: &'static str, timeout: Duration) -> bool {
+        let started_at = Instant::now();
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup_tracker.wait.begin",
+            json!({
+                "active": self.active(),
+                "reason": reason,
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
+
+        loop {
+            let active = self.active();
+
+            if active == 0 {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_cleanup_tracker.wait.done",
+                    json!({
+                        "active": active,
+                        "elapsed_ms": terminal_diagnostic_elapsed_ms(started_at),
+                        "reason": reason,
+                        "timed_out": false,
+                    }),
+                );
+                return true;
+            }
+
+            if started_at.elapsed() >= timeout {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_cleanup_tracker.wait.done",
+                    json!({
+                        "active": active,
+                        "elapsed_ms": terminal_diagnostic_elapsed_ms(started_at),
+                        "reason": reason,
+                        "timed_out": true,
+                    }),
+                );
+                return false;
+            }
+
+            sleep(Duration::from_millis(TERMINAL_SHUTDOWN_POLL_INTERVAL_MS)).await;
+        }
+    }
+}
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        let active = self
+            .tracker
+            .active
+            .fetch_sub(1, Ordering::AcqRel)
+            .saturating_sub(1);
+        log_terminal_crash_forensics_event(
+            "backend.terminal_cleanup_tracker.done",
+            json!({
+                "active": active,
+                "instance_id": self.instance_id,
+                "reason": self.reason,
+            }),
+        );
+    }
+}
+
 impl Drop for TerminalState {
     fn drop(&mut self) {
         let _ = begin_app_shutdown();
@@ -420,6 +572,10 @@ impl Drop for TerminalState {
         }
 
         self.pty_pool.wait_for_refill_idle();
+        self.cleanup_tracker.wait_for_idle(
+            "terminal_state_drop",
+            Duration::from_millis(TERMINAL_DROP_CLEANUP_TRACKER_WAIT_MS),
+        );
         cleanup_login_terminal_children();
         cleanup_windows_headless_console_hosts();
     }
@@ -1904,6 +2060,7 @@ fn schedule_app_exit_after_terminal_shutdown(
         .spawn(move || {
             thread::sleep(Duration::from_millis(APP_CLOSE_EXIT_REQUEST_DELAY_MS));
             let _ = close_workspace_webviews(&app_for_exit);
+            cleanup_windows_headless_console_hosts();
             app_for_exit.exit(0);
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
@@ -1915,6 +2072,7 @@ fn schedule_app_exit_after_terminal_shutdown(
             thread::sleep(Duration::from_millis(
                 APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
             ));
+            cleanup_windows_headless_console_hosts();
             std::process::exit(0);
         })
         .map(|_| ())
@@ -1937,6 +2095,7 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
             ));
             let _ = close_workspace_webviews(&app_for_exit);
             advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
+            cleanup_windows_headless_console_hosts();
             app_for_exit.exit(0);
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
@@ -1948,6 +2107,7 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
             thread::sleep(Duration::from_millis(
                 APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
             ));
+            cleanup_windows_headless_console_hosts();
             std::process::exit(0);
         }) {
         Ok(_) => Ok(()),
@@ -2280,6 +2440,7 @@ pub fn run() {
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
+            cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
             next_terminal_instance_id: AtomicU64::new(1),
         })
         .manage(TerminalDiagnosticState::new())
@@ -2402,6 +2563,7 @@ pub fn run() {
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,
+            cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_record_spec_edit_intent,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_get_activity,
@@ -2497,14 +2659,28 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Diff Forge AI desktop")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let _ = begin_app_shutdown();
-                let _ = close_workspace_webviews(app);
-                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
-                let _ = coordination::watcher::stop_all_file_watchers("run_exit_requested");
-                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_DAEMONS);
-                let _ = coordination::mcp::stop_all_shared_daemons("run_exit_requested");
-                advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
+
+                if phase < APP_SHUTDOWN_PHASE_EXITING {
+                    api.prevent_exit();
+                    let _ = begin_app_shutdown();
+                    let _ = schedule_app_force_exit(app.clone(), "main".to_string());
+
+                    if APP_CLOSE_SHUTDOWN_IN_FLIGHT
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let app_for_shutdown = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            run_backend_app_shutdown(app_for_shutdown, "main".to_string()).await;
+                        });
+                    }
+
+                    return;
+                }
+
+                cleanup_windows_headless_console_hosts();
             }
 
             #[cfg(not(target_os = "macos"))]
