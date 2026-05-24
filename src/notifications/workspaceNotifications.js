@@ -7,6 +7,7 @@ const MAX_NOTIFICATIONS_PER_WORKSPACE = 80;
 const MAX_CUES = 24;
 const APPROVAL_CUE_COOLDOWN_MS = 5000;
 const ALL_DONE_CUE_COOLDOWN_MS = 1200;
+const NOTIFICATION_CUE_COOLDOWN_MS = 800;
 
 const ACTIVE_LIFECYCLE_TYPES = new Set([
   "agent-output",
@@ -102,6 +103,7 @@ function normalizeNotification(notification, workspaceId) {
     dedupeKey: cleanText(notification.dedupeKey || notification.dedupe_key, id),
     id,
     kind,
+    paneId: cleanText(notification.paneId || notification.pane_id),
     pendingAction: Boolean(notification.pendingAction || notification.pending_action),
     seenAt: cleanText(notification.seenAt || notification.seen_at),
     sessionId: cleanText(notification.sessionId || notification.session_id),
@@ -111,6 +113,7 @@ function normalizeNotification(notification, workspaceId) {
     status,
     taskId: cleanText(notification.taskId || notification.task_id),
     terminalIndex: notification.terminalIndex ?? notification.terminal_index ?? null,
+    threadId: cleanText(notification.threadId || notification.thread_id),
     title: cleanText(notification.title, notificationTitleForKind(kind)),
     updatedAt,
     workspaceId: cleanText(notification.workspaceId || notification.workspace_id, workspaceId),
@@ -160,6 +163,7 @@ function normalizeWorkspaceBucket(bucket, workspaceId) {
     lastCueAt: {
       allDone: safeCount(source.lastCueAt?.allDone),
       approval: safeCount(source.lastCueAt?.approval),
+      notification: safeCount(source.lastCueAt?.notification),
     },
     lastSeenAt: cleanText(source.lastSeenAt),
     notifications,
@@ -237,6 +241,8 @@ function notificationTitleForKind(kind) {
     case "task.resume.ready":
     case "task.resume_ready":
       return "Task ready to resume";
+    case "user.input.required":
+      return "User input needed";
     case "tool.failed":
       return "Tool failed";
     default:
@@ -290,8 +296,16 @@ function appendCue(state, bucket, workspaceId, kind, options = {}) {
   }
 
   const nowMs = Date.now();
-  const cueKey = kind === "all.done" ? "allDone" : "approval";
-  const cooldownMs = kind === "all.done" ? ALL_DONE_CUE_COOLDOWN_MS : APPROVAL_CUE_COOLDOWN_MS;
+  const cueKey = kind === "all.done"
+    ? "allDone"
+    : kind === "approval.required"
+      ? "approval"
+      : "notification";
+  const cooldownMs = kind === "all.done"
+    ? ALL_DONE_CUE_COOLDOWN_MS
+    : kind === "approval.required"
+      ? APPROVAL_CUE_COOLDOWN_MS
+      : NOTIFICATION_CUE_COOLDOWN_MS;
   const lastCueAt = safeCount(bucket.lastCueAt?.[cueKey]);
   if (lastCueAt && nowMs - lastCueAt < cooldownMs) {
     return { bucket, state };
@@ -318,6 +332,26 @@ function appendCue(state, bucket, workspaceId, kind, options = {}) {
       ].slice(-MAX_CUES),
     },
   };
+}
+
+function shouldCueNotification(notification, existing, options = {}) {
+  if (options.suppressCue || !notification) {
+    return false;
+  }
+  if (["dismissed", "resolved"].includes(notification.status)) {
+    return false;
+  }
+  if (existing && !["dismissed", "resolved"].includes(existing.status)) {
+    return false;
+  }
+  return true;
+}
+
+function appendNotificationCue(state, bucket, workspaceId, notification, existing, options = {}) {
+  if (!shouldCueNotification(notification, existing, options)) {
+    return { bucket, state };
+  }
+  return appendCue(state, bucket, workspaceId, notification.kind || "workspace.notification", options);
 }
 
 function eventRefs(event) {
@@ -423,7 +457,7 @@ function buildCoordinationNotification(event, workspaceId, existing, options = {
   const status = kind === "approval.resolved"
     ? "resolved"
     : pendingAction
-      ? "unread"
+      ? (existing?.status === "read" || selectedWorkspace ? "read" : "unread")
       : passiveStatus;
 
   return {
@@ -475,12 +509,9 @@ export function reduceWorkspaceNotificationEvent(state, rawEvent, options = {}) 
     },
   };
   let nextState = setWorkspaceBucket(currentState, workspaceId, nextBucket);
-
-  if (kind === "approval.required" && !existing?.pendingAction) {
-    const cueResult = appendCue(nextState, nextBucket, workspaceId, "approval.required", options);
-    nextBucket = cueResult.bucket;
-    nextState = setWorkspaceBucket(cueResult.state, workspaceId, nextBucket);
-  }
+  const cueResult = appendNotificationCue(nextState, nextBucket, workspaceId, notification, existing, options);
+  nextBucket = cueResult.bucket;
+  nextState = setWorkspaceBucket(cueResult.state, workspaceId, nextBucket);
 
   return trimWorkspaceNotifications(nextState, workspaceId);
 }
@@ -560,6 +591,135 @@ function activeTurnMatchesLifecycle(turn, event) {
   return Boolean(threadId || paneId || terminalIndex != null);
 }
 
+function lifecycleTerminalWorkState(event) {
+  return cleanText(event?.terminalWorkState || event?.terminal_work_state).toLowerCase();
+}
+
+function lifecycleTerminalIsComplete(event) {
+  const state = lifecycleTerminalWorkState(event);
+  return event?.terminalIsComplete === true
+    || event?.terminal_is_complete === true
+    || state === "complete"
+    || state === "completed";
+}
+
+function lifecycleTerminalIsPromptingUser(event) {
+  const state = lifecycleTerminalWorkState(event);
+  return event?.terminalIsPromptingUser === true
+    || event?.terminal_is_prompting_user === true
+    || event?.promptingUser === true
+    || event?.requiresUserInput === true
+    || state === "prompting_user"
+    || state === "prompting-user";
+}
+
+function lifecycleResolvesPromptingNotification(event) {
+  const type = cleanText(event?.type).toLowerCase();
+  const state = lifecycleTerminalWorkState(event);
+  return [
+    "closed",
+    "error",
+    "exited",
+    "message-submitted",
+    "pending-prompt-sent",
+    "provider-turn-started",
+    "thread-starting",
+  ].includes(type)
+    || event?.terminalIsPromptingUser === false
+    || event?.terminal_is_prompting_user === false
+    || event?.promptingUser === false
+    || event?.requiresUserInput === false
+    || ["complete", "completed", "error", "parked", "running"].includes(state);
+}
+
+function promptingNotificationId(event, workspaceId) {
+  const threadId = cleanText(event?.threadId || event?.thread_id);
+  const paneId = cleanText(event?.paneId || event?.pane_id);
+  const terminalIndex = event?.terminalIndex ?? event?.terminal_index ?? "";
+  const agentId = cleanText(event?.agentId || event?.currentAgent || event?.agent_id, "agent");
+  const turnId = cleanText(
+    event?.turnId
+      || event?.turn_id
+      || event?.promptEventId
+      || event?.pendingPromptId
+      || event?.promptId,
+  );
+  const targetId = threadId || paneId || (terminalIndex !== "" ? `terminal-${terminalIndex}` : "workspace");
+  return `user-input:${workspaceId}:${targetId}:${agentId}:${turnId || "active"}`;
+}
+
+function promptingNotificationBody(event) {
+  return cleanText(
+    event?.promptingUserText
+      || event?.promptingText
+      || event?.terminalPrompt
+      || event?.terminalText
+      || event?.outputText
+      || event?.text,
+  ).slice(0, 280);
+}
+
+function buildPromptingNotification(event, workspaceId, existing, options = {}) {
+  const createdAt = nowIso();
+  const selectedWorkspace = options.selectedWorkspaceId === workspaceId;
+  const id = promptingNotificationId(event, workspaceId);
+  return {
+    actionability: "open_thread",
+    agentId: cleanText(event?.agentId || event?.currentAgent || event?.agent_id),
+    approvalId: "",
+    body: promptingNotificationBody(event) || existing?.body || "",
+    createdAt: existing?.createdAt || createdAt,
+    dbChangeRequestId: "",
+    dedupeKey: id,
+    id,
+    kind: "user.input.required",
+    paneId: cleanText(event?.paneId || event?.pane_id),
+    pendingAction: true,
+    seenAt: selectedWorkspace ? createdAt : existing?.seenAt || "",
+    sessionId: cleanText(event?.nativeSessionId || event?.providerSessionId),
+    severity: "action_required",
+    sourceEventId: cleanText(event?.sourceEventId || event?.source_event_id),
+    sourceSeq: event?.sourceSeq ?? event?.seq ?? existing?.sourceSeq ?? null,
+    status: (existing?.status === "read" || selectedWorkspace) ? "read" : "unread",
+    taskId: "",
+    terminalIndex: event?.terminalIndex ?? event?.terminal_index ?? existing?.terminalIndex ?? null,
+    threadId: cleanText(event?.threadId || event?.thread_id),
+    title: notificationTitleForKind("user.input.required"),
+    updatedAt: createdAt,
+    workspaceId,
+  };
+}
+
+function resolvePromptingNotificationsForLifecycle(bucket, event) {
+  if (!lifecycleResolvesPromptingNotification(event)) {
+    return bucket;
+  }
+
+  let changed = false;
+  const updatedAt = nowIso();
+  const notifications = Object.fromEntries(
+    Object.entries(bucket.notifications || {}).map(([id, notification]) => {
+      if (
+        notification.kind === "user.input.required"
+        && !["dismissed", "resolved"].includes(notification.status)
+        && activeTurnMatchesLifecycle(notification, event)
+      ) {
+        changed = true;
+        return [id, {
+          ...notification,
+          pendingAction: false,
+          seenAt: notification.seenAt || updatedAt,
+          status: "resolved",
+          updatedAt,
+        }];
+      }
+      return [id, notification];
+    }),
+  );
+
+  return changed ? { ...bucket, notifications } : bucket;
+}
+
 function workspacePendingActionCount(bucket) {
   return Object.values(bucket.notifications || {}).filter((notification) => (
     notification.pendingAction
@@ -626,9 +786,43 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
 
   const { bucket, state: currentState } = getWorkspaceBucket(state, workspaceId);
   const beforeActiveCount = Object.keys(bucket.activeTurns || {}).length;
-  let nextBucket = bucket;
+  const terminalIsPromptingUser = lifecycleTerminalIsPromptingUser(lifecycleEvent);
+  const terminalIsComplete = lifecycleTerminalIsComplete(lifecycleEvent);
+  const shouldUseGroundTruthCompletion = terminalIsComplete && [
+    "closed",
+    "error",
+    "exited",
+    "provider-turn-completed",
+    "provider-turn-error",
+    "terminal-input-ready",
+    "terminal-prompt-ready",
+  ].includes(type);
+  let nextBucket = resolvePromptingNotificationsForLifecycle(bucket, lifecycleEvent);
+  let cueNotification = null;
+  let cueExistingNotification = null;
 
-  if (type === "agent-output") {
+  if (terminalIsPromptingUser) {
+    const id = promptingNotificationId(lifecycleEvent, workspaceId);
+    cueExistingNotification = nextBucket.notifications?.[id] || null;
+    cueNotification = buildPromptingNotification(
+      lifecycleEvent,
+      workspaceId,
+      cueExistingNotification,
+      options,
+    );
+    nextBucket = {
+      ...nextBucket,
+      activeTurns: Object.fromEntries(
+        Object.entries(nextBucket.activeTurns).filter(([, turn]) => (
+          !activeTurnMatchesLifecycle(turn, lifecycleEvent)
+        )),
+      ),
+      notifications: {
+        ...nextBucket.notifications,
+        [id]: cueNotification,
+      },
+    };
+  } else if (type === "agent-output") {
     const activityStatus = cleanText(lifecycleEvent?.activityStatus || lifecycleEvent?.status).toLowerCase();
     if (activityStatus && activityStatus !== "thinking" && activityStatus !== "running") {
       nextBucket = {
@@ -662,7 +856,7 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
         },
       };
     }
-  } else if (COMPLETION_LIFECYCLE_TYPES.has(type)) {
+  } else if (COMPLETION_LIFECYCLE_TYPES.has(type) || shouldUseGroundTruthCompletion) {
     nextBucket = {
       ...nextBucket,
       activeTurns: Object.fromEntries(
@@ -674,6 +868,18 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
   }
 
   let nextState = setWorkspaceBucket(currentState, workspaceId, nextBucket);
+  if (cueNotification) {
+    const cueResult = appendNotificationCue(
+      nextState,
+      nextBucket,
+      workspaceId,
+      cueNotification,
+      cueExistingNotification,
+      options,
+    );
+    nextBucket = cueResult.bucket;
+    nextState = setWorkspaceBucket(cueResult.state, workspaceId, nextBucket);
+  }
   const afterActiveCount = Object.keys(nextBucket.activeTurns || {}).length;
   if (
     beforeActiveCount > 0
@@ -690,35 +896,50 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
     const id = `agent-failed:${workspaceId}:${cleanText(lifecycleEvent.threadId || lifecycleEvent.paneId, Date.now())}`;
     const selectedWorkspace = options.selectedWorkspaceId === workspaceId;
     const failedBucket = nextState.workspaces[workspaceId] || nextBucket;
+    const existing = failedBucket.notifications?.[id] || null;
+    const notification = {
+      actionability: "open_thread",
+      agentId: cleanText(lifecycleEvent.agentId || lifecycleEvent.currentAgent),
+      approvalId: "",
+      body: cleanText(lifecycleEvent.error),
+      createdAt,
+      dbChangeRequestId: "",
+      dedupeKey: id,
+      id,
+      kind: "agent.failed",
+      pendingAction: false,
+      seenAt: selectedWorkspace ? createdAt : "",
+      sessionId: cleanText(lifecycleEvent.nativeSessionId || lifecycleEvent.providerSessionId),
+      severity: "warning",
+      sourceEventId: "",
+      sourceSeq: null,
+      status: selectedWorkspace ? "read" : "unread",
+      taskId: "",
+      terminalIndex: lifecycleEvent.terminalIndex ?? null,
+      title: notificationTitleForKind("agent.failed"),
+      updatedAt: createdAt,
+      workspaceId,
+    };
     nextState = trimWorkspaceNotifications(setWorkspaceBucket(nextState, workspaceId, {
       ...failedBucket,
       notifications: {
         ...failedBucket.notifications,
-        [id]: {
-          actionability: "open_thread",
-          agentId: cleanText(lifecycleEvent.agentId || lifecycleEvent.currentAgent),
-          approvalId: "",
-          body: cleanText(lifecycleEvent.error),
-          createdAt,
-          dbChangeRequestId: "",
-          dedupeKey: id,
-          id,
-          kind: "agent.failed",
-          pendingAction: false,
-          seenAt: selectedWorkspace ? createdAt : "",
-          sessionId: cleanText(lifecycleEvent.nativeSessionId || lifecycleEvent.providerSessionId),
-          severity: "warning",
-          sourceEventId: "",
-          sourceSeq: null,
-          status: selectedWorkspace ? "read" : "unread",
-          taskId: "",
-          terminalIndex: lifecycleEvent.terminalIndex ?? null,
-          title: notificationTitleForKind("agent.failed"),
-          updatedAt: createdAt,
-          workspaceId,
-        },
+        [id]: notification,
       },
     }), workspaceId);
+    const nextFailedBucket = nextState.workspaces[workspaceId] || failedBucket;
+    const cueResult = appendNotificationCue(
+      nextState,
+      nextFailedBucket,
+      workspaceId,
+      notification,
+      existing,
+      options,
+    );
+    nextState = trimWorkspaceNotifications(
+      setWorkspaceBucket(cueResult.state, workspaceId, cueResult.bucket),
+      workspaceId,
+    );
   }
 
   return nextState;
@@ -736,35 +957,47 @@ export function reduceTerminalParkedNotificationEvent(state, parkedEvent, option
   const id = `task-wait:${taskId}`;
   const existing = bucket.notifications[id] || null;
   const resolved = ["cancelled", "resumed", "terminal", "resolved"].includes(status);
-  return trimWorkspaceNotifications(setWorkspaceBucket(currentState, workspaceId, {
+  const selectedWorkspace = options.selectedWorkspaceId === workspaceId;
+  const notification = {
+    actionability: resolved ? "open_thread" : "resume_task",
+    agentId: "",
+    approvalId: "",
+    body: cleanText(parkedEvent?.reason || parkedEvent?.waitingOn || parkedEvent?.waiting_on),
+    createdAt: existing?.createdAt || createdAt,
+    dbChangeRequestId: "",
+    dedupeKey: id,
+    id,
+    kind: "task.parked",
+    pendingAction: false,
+    seenAt: resolved ? createdAt : existing?.seenAt || "",
+    sessionId: "",
+    severity: "warning",
+    sourceEventId: "",
+    sourceSeq: null,
+    status: resolved ? "resolved" : (existing?.status === "read" || selectedWorkspace ? "read" : "unread"),
+    taskId,
+    terminalIndex: null,
+    title: cleanText(parkedEvent?.title, notificationTitleForKind("task.parked")),
+    updatedAt: createdAt,
+    workspaceId,
+  };
+  const nextBucket = {
     ...bucket,
     notifications: {
       ...bucket.notifications,
-      [id]: {
-        actionability: resolved ? "open_thread" : "resume_task",
-        agentId: "",
-        approvalId: "",
-        body: cleanText(parkedEvent?.reason || parkedEvent?.waitingOn || parkedEvent?.waiting_on),
-        createdAt: existing?.createdAt || createdAt,
-        dbChangeRequestId: "",
-        dedupeKey: id,
-        id,
-        kind: "task.parked",
-        pendingAction: false,
-        seenAt: resolved ? createdAt : existing?.seenAt || "",
-        sessionId: "",
-        severity: "warning",
-        sourceEventId: "",
-        sourceSeq: null,
-        status: resolved ? "resolved" : "unread",
-        taskId,
-        terminalIndex: null,
-        title: cleanText(parkedEvent?.title, notificationTitleForKind("task.parked")),
-        updatedAt: createdAt,
-        workspaceId,
-      },
+      [id]: notification,
     },
-  }), workspaceId);
+  };
+  const nextState = setWorkspaceBucket(currentState, workspaceId, nextBucket);
+  const cueResult = appendNotificationCue(
+    nextState,
+    nextBucket,
+    workspaceId,
+    notification,
+    existing,
+    options,
+  );
+  return trimWorkspaceNotifications(setWorkspaceBucket(cueResult.state, workspaceId, cueResult.bucket), workspaceId);
 }
 
 export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snapshot, options = {}) {
@@ -775,6 +1008,7 @@ export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snaps
   const data = snapshot?.data && typeof snapshot.data === "object" ? snapshot.data : snapshot;
   const approvals = Array.isArray(data?.approvals) ? data.approvals : [];
   const { bucket, state: currentState } = getWorkspaceBucket(state, safeWorkspaceId);
+  const selectedWorkspace = options.selectedWorkspaceId === safeWorkspaceId;
   let notifications = { ...bucket.notifications };
   const pendingApprovalIds = new Set();
 
@@ -805,7 +1039,9 @@ export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snaps
       severity: isPending ? "action_required" : "info",
       sourceEventId: existing?.sourceEventId || "",
       sourceSeq: existing?.sourceSeq ?? null,
-      status: isPending ? "unread" : "resolved",
+      status: isPending
+        ? (existing?.status === "read" || selectedWorkspace ? "read" : "unread")
+        : "resolved",
       taskId: cleanText(approval?.task_id || approval?.taskId),
       terminalIndex: null,
       title: notificationTitleForKind(isPending ? "approval.required" : "approval.resolved"),
@@ -849,7 +1085,7 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
   const seenAt = nowIso();
   const notifications = Object.fromEntries(
     Object.entries(bucket.notifications).map(([id, notification]) => {
-      if (notification.pendingAction || notification.status !== "unread") {
+      if (notification.status !== "unread") {
         return [id, notification];
       }
       return [id, {
@@ -889,6 +1125,10 @@ export function getWorkspaceNotificationSummary(state, workspaceId, workspaceThr
     notification.pendingAction
     && !["dismissed", "resolved"].includes(notification.status)
   )).length;
+  const unacknowledgedPendingActionCount = notifications.filter((notification) => (
+    notification.pendingAction
+    && notification.status === "unread"
+  )).length;
   const unreadCount = notifications.filter((notification) => (
     !notification.pendingAction
     && notification.status === "unread"
@@ -900,11 +1140,12 @@ export function getWorkspaceNotificationSummary(state, workspaceId, workspaceThr
 
   return {
     activeAgentCount,
-    badgeCount: pendingActionCount || unreadCount,
-    badgeLabel: pendingActionCount ? "Action required" : unreadCount ? "Unread notification" : "",
-    badgeVariant: pendingActionCount ? "action" : unreadCount ? "unread" : "none",
+    badgeCount: unacknowledgedPendingActionCount || unreadCount,
+    badgeLabel: unacknowledgedPendingActionCount ? "Action required" : unreadCount ? "Unread notification" : "",
+    badgeVariant: unacknowledgedPendingActionCount ? "action" : unreadCount ? "unread" : "none",
     parkedCount,
     pendingActionCount,
+    unacknowledgedPendingActionCount,
     unreadCount,
   };
 }

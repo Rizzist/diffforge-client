@@ -1,5 +1,6 @@
 const NOTIFICATION_SFX_STORAGE_KEY = "diffforge.notificationSfx.v1";
 const DEFAULT_VOLUME = 0.32;
+const DING_SOUND_PATH = "/ding.mp3";
 
 function readSettings() {
   try {
@@ -64,7 +65,19 @@ function playSequence(context, notes, volume) {
 
 export function createWorkspaceNotificationSfx() {
   let context = null;
+  let dingAudio = null;
   let unlocked = false;
+
+  const ensureDingAudio = () => {
+    if (typeof window === "undefined" || typeof window.Audio !== "function") {
+      return null;
+    }
+    if (!dingAudio) {
+      dingAudio = new window.Audio(DING_SOUND_PATH);
+      dingAudio.preload = "auto";
+    }
+    return dingAudio;
+  };
 
   const ensureContext = async () => {
     const AudioContextConstructor = getAudioContextConstructor();
@@ -83,8 +96,49 @@ export function createWorkspaceNotificationSfx() {
     return context;
   };
 
+  const playDing = async (volume) => {
+    const audio = ensureDingAudio();
+    if (!audio) return false;
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.volume = Math.max(0.01, Math.min(0.82, volume));
+      await audio.play();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const playFallbackTone = async (kind, volume) => {
+    const activeContext = await ensureContext();
+    if (!activeContext) return;
+
+    if (kind === "all.done") {
+      playSequence(activeContext, [
+        { duration: 0.06, frequency: 523.25, offset: 0 },
+        { duration: 0.06, frequency: 659.25, offset: 0.075 },
+        { duration: 0.09, frequency: 783.99, offset: 0.15 },
+      ], volume * 0.82);
+      return;
+    }
+
+    playSequence(activeContext, [
+      { duration: 0.07, frequency: 880, offset: 0 },
+      { duration: 0.08, frequency: 1174.66, offset: 0.095 },
+    ], volume);
+  };
+
   return {
     dispose() {
+      if (dingAudio) {
+        try {
+          dingAudio.pause();
+        } catch {
+          // Audio cleanup is best effort.
+        }
+      }
+      dingAudio = null;
       if (context) {
         try {
           context.close();
@@ -99,27 +153,20 @@ export function createWorkspaceNotificationSfx() {
     async play(kind) {
       const settings = readSettings();
       if (!settings.enabled || !unlocked) return;
-      const activeContext = await ensureContext();
-      if (!activeContext) return;
-
-      if (kind === "approval.required") {
-        playSequence(activeContext, [
-          { duration: 0.07, frequency: 880, offset: 0 },
-          { duration: 0.08, frequency: 1174.66, offset: 0.095 },
-        ], settings.volume);
+      if (await playDing(settings.volume)) {
         return;
       }
-
-      if (kind === "all.done") {
-        playSequence(activeContext, [
-          { duration: 0.06, frequency: 523.25, offset: 0 },
-          { duration: 0.06, frequency: 659.25, offset: 0.075 },
-          { duration: 0.09, frequency: 783.99, offset: 0.15 },
-        ], settings.volume * 0.82);
-      }
+      await playFallbackTone(kind, settings.volume);
     },
 
     async unlock() {
+      unlocked = true;
+      const audio = ensureDingAudio();
+      try {
+        audio?.load();
+      } catch {
+        // Loading the MP3 is opportunistic; the oscillator fallback still works.
+      }
       await ensureContext();
     },
   };

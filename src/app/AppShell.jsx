@@ -2929,6 +2929,7 @@ export default function App() {
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
+  const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
@@ -2970,6 +2971,7 @@ export default function App() {
   const defaultWorkingDirectoryRef = useRef(defaultWorkingDirectory);
   const workspaceThreadsRef = useRef(workspaceThreads);
   const workspaceNotificationCueIdsRef = useRef(new Set());
+  const workspaceNotificationHighlightTimersRef = useRef(new Map());
   const workspaceNotificationSfxRef = useRef(null);
   const workspaceNotificationSnapshotKeyRef = useRef("");
   const workspaceThreadsHydratedKeyRef = useRef("");
@@ -3368,6 +3370,29 @@ export default function App() {
       }
       workspaceNotificationCueIdsRef.current.add(cue.id);
       workspaceNotificationSfxRef.current?.play(cue.kind);
+      const cueWorkspaceId = String(cue.workspaceId || "").trim();
+      if (cueWorkspaceId) {
+        const existingTimer = workspaceNotificationHighlightTimersRef.current.get(cueWorkspaceId);
+        if (existingTimer) {
+          window.clearTimeout(existingTimer);
+        }
+        setWorkspaceNotificationHighlights((current) => ({
+          ...current,
+          [cueWorkspaceId]: cue.id,
+        }));
+        const timer = window.setTimeout(() => {
+          workspaceNotificationHighlightTimersRef.current.delete(cueWorkspaceId);
+          setWorkspaceNotificationHighlights((current) => {
+            if (current[cueWorkspaceId] !== cue.id) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[cueWorkspaceId];
+            return next;
+          });
+        }, 820);
+        workspaceNotificationHighlightTimersRef.current.set(cueWorkspaceId, timer);
+      }
     });
     if (workspaceNotificationCueIdsRef.current.size > 200) {
       workspaceNotificationCueIdsRef.current = new Set(
@@ -3376,18 +3401,19 @@ export default function App() {
     }
   }, [workspaceNotifications.cues]);
 
+  useEffect(() => () => {
+    workspaceNotificationHighlightTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    workspaceNotificationHighlightTimersRef.current.clear();
+  }, []);
+
   useEffect(() => {
     if (!selectedWorkspaceId) {
-      return undefined;
+      return;
     }
 
-    const timer = window.setTimeout(() => {
-      setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
-    }, 350);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
+    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
   }, [selectedWorkspaceId]);
 
   useEffect(() => {
@@ -3418,7 +3444,10 @@ export default function App() {
           current,
           target.workspaceId,
           snapshot,
-          { suppressCue: true },
+          {
+            selectedWorkspaceId: selectedWorkspaceIdRef.current,
+            suppressCue: true,
+          },
         ));
       }).catch(() => {
         // Snapshot reconciliation is opportunistic; live events still keep the rail responsive.
@@ -8471,6 +8500,76 @@ export default function App() {
         nativeSessionId: lifecycleNativeSessionId,
       };
     }
+    const lifecycleThreadForGroundTruth = lifecycleThreadId
+      ? workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId] || null
+      : null;
+    const lifecycleProviderBindingForGroundTruth = getWorkspaceThreadProviderBinding(
+      lifecycleThreadForGroundTruth,
+      lifecycleAgentId,
+    );
+    const lifecycleLiveTerminalForGroundTruth = getLiveTerminalForThread(
+      lifecycleThreadForGroundTruth,
+      lifecycleProviderBindingForGroundTruth,
+      workspaceThreadsRef.current?.[lifecycleWorkspaceId],
+    );
+    const lifecycleEventTerminal = {
+      ...(lifecycleLiveTerminalForGroundTruth || {}),
+      inputReady: lifecycleEvent.inputReady === true
+        ? true
+        : lifecycleEvent.inputReady === false
+          ? false
+          : lifecycleLiveTerminalForGroundTruth?.inputReady,
+      inputReadyAt: lifecycleEvent.inputReadyAt
+        || lifecycleEvent.promptReadyAt
+        || lifecycleLiveTerminalForGroundTruth?.inputReadyAt
+        || "",
+      inputReadyConfidence: lifecycleEvent.inputReadyConfidence
+        || lifecycleEvent.promptReadyConfidence
+        || lifecycleLiveTerminalForGroundTruth?.inputReadyConfidence
+        || "",
+      instanceId: lifecycleEvent.instanceId || lifecycleLiveTerminalForGroundTruth?.instanceId || "",
+      paneId: lifecycleEvent.paneId || lifecycleLiveTerminalForGroundTruth?.paneId || "",
+      promptReadyAt: lifecycleEvent.promptReadyAt
+        || lifecycleEvent.inputReadyAt
+        || lifecycleLiveTerminalForGroundTruth?.promptReadyAt
+        || "",
+      status: lifecycleEvent.status || lifecycleLiveTerminalForGroundTruth?.status || "active",
+      terminalIndex: lifecycleEvent.terminalIndex ?? lifecycleLiveTerminalForGroundTruth?.terminalIndex,
+      threadId: lifecycleThreadId || lifecycleLiveTerminalForGroundTruth?.threadId || "",
+    };
+    const lifecycleGroundTruth = getThreadTerminalGroundTruth({
+      lifecycleEvent,
+      liveTerminal: lifecycleEventTerminal,
+      providerBinding: lifecycleProviderBindingForGroundTruth,
+      targetRole: lifecycleAgentId,
+      terminalOutputText: lifecycleEvent.promptingUserText
+        || lifecycleEvent.outputText
+        || lifecycleEvent.terminalText
+        || lifecycleEvent.text
+        || "",
+      thread: lifecycleThreadForGroundTruth,
+    });
+    const lifecycleStartsWork = (
+      lifecycleEvent.type === "message-submitted"
+      || lifecycleEvent.type === "provider-turn-started"
+      || lifecycleEvent.type === "thread-starting"
+      || (
+        lifecycleEvent.type === "agent-output"
+        && ["thinking", "running"].includes(String(
+          lifecycleEvent.activityStatus || lifecycleEvent.status || "",
+        ).trim().toLowerCase())
+      )
+    );
+    lifecycleEvent = {
+      ...lifecycleEvent,
+      promptingUserConfidence: lifecycleGroundTruth.promptingUserConfidence || "",
+      promptingUserKind: lifecycleGroundTruth.promptingUserKind || "",
+      promptingUserSource: lifecycleGroundTruth.promptingUserSource || "",
+      promptingUserText: lifecycleGroundTruth.promptingUserText || "",
+      terminalIsComplete: lifecycleStartsWork ? false : lifecycleGroundTruth.terminalIsComplete === true,
+      terminalIsPromptingUser: lifecycleStartsWork ? false : lifecycleGroundTruth.terminalIsPromptingUser === true,
+      terminalWorkState: lifecycleStartsWork ? "running" : lifecycleGroundTruth.terminalWorkState || "",
+    };
     logTerminalStatus("frontend.terminal_status.lifecycle_received", {
       activityStatus: lifecycleEvent.activityStatus || "",
       agentId: lifecycleAgentId,
@@ -8479,9 +8578,12 @@ export default function App() {
       instanceId: lifecycleEvent.instanceId || "",
       pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
       promptEventId: lifecycleEvent.promptEventId || "",
+      promptingUserKind: lifecycleEvent.promptingUserKind || "",
+      promptingUserSource: lifecycleEvent.promptingUserSource || "",
       source: lifecycleEvent.source || "",
       status: lifecycleEvent.status || "",
-      terminalGroundTruthStatus: lifecycleEvent.activityStatus
+      terminalGroundTruthStatus: lifecycleEvent.terminalWorkState
+        || lifecycleEvent.activityStatus
         || (lifecycleEvent.type === "terminal-input-ready" || lifecycleEvent.type === "terminal-prompt-ready"
           ? "idle"
           : lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
@@ -8489,6 +8591,8 @@ export default function App() {
             : lifecycleEvent.type === "provider-turn-completed"
               ? "idle_or_done"
               : ""),
+      terminalIsComplete: lifecycleEvent.terminalIsComplete === true,
+      terminalIsPromptingUser: lifecycleEvent.terminalIsPromptingUser === true,
       terminalIndex: lifecycleEvent.terminalIndex ?? "",
       threadId: lifecycleThreadId,
       type: lifecycleEvent.type || "",
@@ -9958,6 +10062,7 @@ export default function App() {
 
                       return (
                         <WorkspaceRow
+                          data-notification-highlight={workspaceNotificationHighlights[workspace.id] ? "true" : undefined}
                           data-runtime={workspaceRuntimeState}
                           data-selected={workspace.id === selectedWorkspaceId}
                           key={workspace.id}

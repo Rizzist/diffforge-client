@@ -60,6 +60,55 @@ function cleanText(value, fallback = "") {
   return text || fallback;
 }
 
+function promptingUserActive(value, fallback = false) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return Boolean(fallback);
+}
+
+function normalizePromptingUserKind(value, fallback = "") {
+  const kind = cleanText(value, fallback)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+  return [
+    "approval",
+    "clarification",
+    "confirmation",
+    "model-picker",
+    "permission",
+    "terminal-control",
+    "unknown",
+  ].includes(kind) ? kind : "";
+}
+
+function promptingUserFields(value = {}, fallback = {}) {
+  const active = promptingUserActive(
+    value.terminalIsPromptingUser ?? value.promptingUser ?? value.requiresUserInput,
+    fallback.terminalIsPromptingUser || fallback.promptingUser || fallback.requiresUserInput,
+  );
+  return {
+    promptingUserConfidence: active
+      ? cleanText(value.promptingUserConfidence || value.promptingConfidence, fallback.promptingUserConfidence || fallback.promptingConfidence)
+      : "",
+    promptingUserKind: active
+      ? normalizePromptingUserKind(value.promptingUserKind || value.promptingKind, fallback.promptingUserKind || fallback.promptingKind || "unknown")
+      : "",
+    promptingUserSource: active
+      ? cleanText(value.promptingUserSource || value.promptingSource || value.source, fallback.promptingUserSource || fallback.promptingSource)
+      : "",
+    promptingUserText: active
+      ? cleanText(value.promptingUserText || value.promptingText, fallback.promptingUserText || fallback.promptingText).slice(0, 420)
+      : "",
+    terminalIsPromptingUser: active,
+  };
+}
+
 function cleanMessageText(value, fallback = "") {
   const text = String(value || "")
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, " ")
@@ -1806,6 +1855,7 @@ function normalizeActiveTerminal(value) {
     inputReadyConfidence: cleanText(value.inputReadyConfidence || value.promptReadyConfidence),
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
+    ...promptingUserFields(value),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
     terminalIndex,
@@ -1848,6 +1898,11 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
         binding.inputReadyConfidence || binding.promptReadyConfidence,
         fallback.inputReadyConfidence || fallback.promptReadyConfidence,
       ),
+    ...(
+      options.stripLiveBindings
+        ? promptingUserFields({ terminalIsPromptingUser: false })
+        : promptingUserFields(binding, fallback)
+    ),
     lastActiveAt: cleanText(binding.lastActiveAt, fallback.lastActiveAt),
     lastMessageAt: cleanText(binding.lastMessageAt, fallback.lastMessageAt),
     messageCount: normalizeMessageCount(binding.messageCount ?? fallback.messageCount),
@@ -2575,6 +2630,10 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   const inputReadyConfidence = inputReady
     ? cleanText(event.inputReadyConfidence || event.promptReadyConfidence, existing.inputReadyConfidence)
     : "";
+  const terminalPromptingFields = promptingUserFields(
+    marksInputBusy ? { ...event, terminalIsPromptingUser: false } : event,
+    existing,
+  );
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
     inputReady,
@@ -2583,6 +2642,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     instanceId: event.instanceId ?? existing.instanceId,
     lastActiveAt: now,
     paneId: event.paneId || existing.paneId,
+    ...terminalPromptingFields,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
     terminalIndex,
@@ -3864,6 +3924,10 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       existingProviderBindingForAgent?.inputReadyConfidence,
     )
     : "";
+  const providerPromptingFields = promptingUserFields(
+    inputReady ? event : { ...event, terminalIsPromptingUser: false },
+    existingProviderBindingForAgent,
+  );
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
   let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
@@ -3892,6 +3956,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...providerPromptingFields,
       modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
       modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "provider-turn") : providerBindings[agentId].modelSource,
       modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBindings[agentId].modelUpdatedAt,
@@ -3907,11 +3972,16 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
+    const terminalPromptingFields = promptingUserFields(
+      inputReady ? event : { ...event, terminalIsPromptingUser: false },
+      terminals[terminalKey],
+    );
     terminals[terminalKey] = {
       ...terminals[terminalKey],
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...terminalPromptingFields,
       updatedAt: now,
     };
   }
@@ -4017,23 +4087,33 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       previousProviderBinding?.inputReadyConfidence,
     )
     : "";
+  const providerPromptingFields = promptingUserFields(
+    inputReady ? event : { ...event, terminalIsPromptingUser: false },
+    previousProviderBinding,
+  );
   providerBindings[agentId] = {
     ...previousProviderBinding,
     activityStatus,
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
+    ...providerPromptingFields,
     status: providerStatus,
     updatedAt: now,
   };
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
+    const terminalPromptingFields = promptingUserFields(
+      inputReady ? event : { ...event, terminalIsPromptingUser: false },
+      terminals[terminalKey],
+    );
     terminals[terminalKey] = {
       ...terminals[terminalKey],
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...terminalPromptingFields,
       status: eventStatus || terminals[terminalKey].status,
       updatedAt: now,
     };

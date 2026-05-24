@@ -831,6 +831,53 @@ export const panelEnter = keyframes`
   }
 `;
 
+export const workspaceNotificationPing = keyframes`
+  0% {
+    opacity: 0;
+    transform: scale(0.96);
+    box-shadow: 0 0 0 0 rgba(125, 176, 255, 0);
+  }
+
+  12% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow:
+      0 0 0 1px rgba(125, 176, 255, 0.48),
+      0 0 18px rgba(47, 128, 255, 0.22),
+      inset 0 0 0 1px rgba(255, 190, 96, 0.18);
+  }
+
+  38% {
+    opacity: 0.92;
+    box-shadow:
+      0 0 0 2px rgba(125, 176, 255, 0.2),
+      0 0 22px rgba(255, 122, 24, 0.12),
+      inset 0 0 0 1px rgba(125, 176, 255, 0.22);
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(1.035);
+    box-shadow: 0 0 0 7px rgba(125, 176, 255, 0);
+  }
+`;
+
+export const workspaceNotificationScan = keyframes`
+  0% {
+    opacity: 0;
+    transform: translateX(-84%);
+  }
+
+  20% {
+    opacity: 0.9;
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(84%);
+  }
+`;
+
 export const panelExit = keyframes`
   from {
     opacity: 1;
@@ -2243,6 +2290,46 @@ export const WorkspaceRow = styled.div`
   &:nth-child(3) {
     animation-delay: 180ms;
   }
+
+  &::before,
+  &::after {
+    position: absolute;
+    inset: -2px;
+    border-radius: 10px;
+    content: "";
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  &::before {
+    border: 1px solid rgba(125, 176, 255, 0.32);
+    background:
+      linear-gradient(90deg, rgba(47, 128, 255, 0.08), rgba(255, 122, 24, 0.07)),
+      rgba(230, 236, 245, 0.025);
+    z-index: 0;
+  }
+
+  &::after {
+    inset: 1px;
+    border-radius: 8px;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(125, 176, 255, 0.04) 35%,
+      rgba(255, 190, 96, 0.2) 50%,
+      rgba(125, 176, 255, 0.04) 65%,
+      transparent 100%
+    );
+    z-index: 1;
+  }
+
+  &[data-notification-highlight="true"]::before {
+    animation: ${workspaceNotificationPing} 800ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  &[data-notification-highlight="true"]::after {
+    animation: ${workspaceNotificationScan} 800ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
 `;
 
 export const WorkspaceButton = styled.button`
@@ -2266,7 +2353,7 @@ export const WorkspaceButton = styled.button`
   grid-template-columns: 18px minmax(0, 1fr);
   align-items: stretch;
   gap: 7px;
-  padding: 4px 34px 4px 7px;
+  padding: 4px 8px 4px 7px;
   border: 1px solid var(--workspace-card-border);
   border-radius: 8px;
   box-sizing: border-box;
@@ -2274,6 +2361,7 @@ export const WorkspaceButton = styled.button`
   background: var(--workspace-card-bg);
   overflow: hidden;
   text-align: left;
+  z-index: 2;
   transition:
     background 160ms ease,
     border-color 160ms ease,
@@ -2367,6 +2455,7 @@ export const WorkspaceButton = styled.button`
   ${WorkspaceRow}:focus-within & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
+    padding-right: 34px;
   }
 
   &[data-selected="true"] {
@@ -2394,8 +2483,14 @@ export const WorkspaceButton = styled.button`
     grid-template-columns: 18px minmax(0, 1fr);
     gap: 7px;
     justify-items: stretch;
-    padding: 4px 34px 4px 7px;
+    padding: 4px 8px 4px 7px;
     text-align: left;
+
+    &:hover,
+    ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}:focus-within & {
+      padding-right: 34px;
+    }
 
     strong {
       max-height: 16px;
@@ -2530,7 +2625,7 @@ export const WorkspaceCompactGlyph = styled.span.attrs({ "data-compact-glyph": "
 export const WorkspaceNotificationBadge = styled.span`
   position: absolute;
   top: 5px;
-  right: 36px;
+  right: 5px;
   display: inline-grid;
   min-width: 16px;
   height: 16px;
@@ -2556,6 +2651,11 @@ export const WorkspaceNotificationBadge = styled.span`
     opacity 160ms ease,
     right 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
     top 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}:focus-within & {
+    right: 36px;
+  }
 
   &[data-variant="unread"] {
     border-color: rgba(101, 161, 245, 0.36);
@@ -2588,11 +2688,16 @@ export const WorkspaceNotificationBadge = styled.span`
 
   @media (max-width: 760px) {
     top: 5px;
-    right: 36px;
+    right: 5px;
     min-width: 16px;
     height: 16px;
     padding: 0 5px;
     font-size: 9px;
+
+    ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}:focus-within & {
+      right: 36px;
+    }
   }
 `;
 
@@ -2612,6 +2717,7 @@ export const WorkspaceSettingsButton = styled.button`
   opacity: 0;
   pointer-events: none;
   transform: translate(4px, -50%);
+  z-index: 4;
   transition:
     opacity 160ms ease,
     color 160ms ease,

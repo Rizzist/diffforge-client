@@ -8010,6 +8010,7 @@ function WorkspaceTerminal({
                 nativeSessionId: capturedProviderSessionId || threadProviderSessionId || "",
                 nativeSessionKind: capturedProviderSessionId || threadProviderSessionId ? "session" : "",
                 nativeSessionSource: capturedProviderSessionId || threadProviderSessionId ? promptReadySource : "",
+                outputText: readyOutputText.slice(-1200),
                 paneId,
                 promptReadyAt: inputReadyAt,
                 providerSessionId: capturedProviderSessionId || threadProviderSessionId || "",
