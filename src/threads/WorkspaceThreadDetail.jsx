@@ -95,9 +95,54 @@ const DetailRoot = styled.main`
   --thread-detail-small-font-size: 11px;
   --thread-detail-mini-font-size: 10px;
   --thread-composer-font-size: 12px;
+  --thread-composer-width: 620px;
+  --thread-composer-shell-gap: 6px;
+  --thread-composer-shell-padding: 0 22px 18px;
+  --thread-composer-box-min-height: 70px;
+  --thread-composer-box-radius: 20px;
+  --thread-composer-input-min-height: 36px;
+  --thread-composer-input-max-height: 96px;
+  --thread-composer-input-padding: 9px 15px 0;
+  --thread-composer-footer-gap: 7px;
+  --thread-composer-footer-padding: 0 11px 5px;
+  --thread-composer-actions-gap: 7px;
+  --thread-composer-status-gap: 7px;
+  --thread-composer-status-min-height: 17px;
+  --thread-composer-status-padding: 0;
+  --thread-composer-tool-size: 28px;
+  --thread-composer-attach-size: 28px;
+  --thread-composer-attach-icon-size: 18px;
+  --thread-send-button-size: 28px;
+  --thread-send-icon-size: 16px;
   color: var(--thread-fg);
   background: var(--thread-bg);
   outline: none;
+
+  &[data-density="compact"] {
+    --thread-detail-font-size: 11px;
+    --thread-detail-small-font-size: 10px;
+    --thread-detail-mini-font-size: 9px;
+    --thread-composer-font-size: 11px;
+    --thread-composer-width: min(70%, 580px);
+    --thread-composer-shell-gap: 5px;
+    --thread-composer-shell-padding: 0 20px 10px;
+    --thread-composer-box-min-height: 58px;
+    --thread-composer-box-radius: 18px;
+    --thread-composer-input-min-height: 28px;
+    --thread-composer-input-max-height: 84px;
+    --thread-composer-input-padding: 8px 14px 0;
+    --thread-composer-footer-gap: 6px;
+    --thread-composer-footer-padding: 0 10px 1px;
+    --thread-composer-actions-gap: 6px;
+    --thread-composer-status-gap: 6px;
+    --thread-composer-status-min-height: 16px;
+    --thread-composer-status-padding: 0;
+    --thread-composer-tool-size: 26px;
+    --thread-composer-attach-size: 26px;
+    --thread-composer-attach-icon-size: 17px;
+    --thread-send-button-size: 24px;
+    --thread-send-icon-size: 15px;
+  }
 
   html[data-forge-theme="light"] & {
     --thread-bg: #f5f5f7;
@@ -1023,22 +1068,22 @@ const ActivityText = styled.div`
 
 const ComposerShell = styled.form`
   display: grid;
-  width: min(100%, 640px);
-  gap: 8px;
+  width: min(100%, var(--thread-composer-width, 640px));
+  gap: var(--thread-composer-shell-gap, 8px);
   margin: 0 auto;
-  padding: 0 22px 24px;
+  padding: var(--thread-composer-shell-padding, 0 22px 24px);
   background: var(--thread-bg);
   user-select: none;
 `;
 
 const ComposerBox = styled.div`
   display: grid;
-  min-height: 88px;
-  grid-template-rows: auto minmax(42px, auto) auto;
+  min-height: var(--thread-composer-box-min-height, 88px);
+  grid-template-rows: auto minmax(var(--thread-composer-input-min-height, 42px), auto) auto;
   position: relative;
   overflow: visible;
   border: 1px solid transparent;
-  border-radius: 22px;
+  border-radius: var(--thread-composer-box-radius, 22px);
   background: var(--thread-composer-bg);
   box-shadow: none;
   transition:
@@ -1054,10 +1099,10 @@ const ComposerBox = styled.div`
 
 const ComposerInput = styled.textarea`
   width: 100%;
-  min-height: 42px;
-  max-height: 126px;
+  min-height: var(--thread-composer-input-min-height, 42px);
+  max-height: var(--thread-composer-input-max-height, 126px);
   resize: none;
-  padding: 13px 16px 5px;
+  padding: var(--thread-composer-input-padding, 13px 16px 5px);
   border: 0;
   outline: none;
   color: #d6d6d6;
@@ -1084,8 +1129,8 @@ const ComposerFooter = styled.div`
   min-width: 0;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 0 12px 12px;
+  gap: var(--thread-composer-footer-gap, 10px);
+  padding: var(--thread-composer-footer-padding, 0 12px 12px);
   user-select: none;
 `;
 
@@ -1112,13 +1157,13 @@ const ComposerActions = styled.div`
   min-width: 0;
   align-items: center;
   justify-content: flex-end;
-  gap: 7px;
+  gap: var(--thread-composer-actions-gap, 7px);
 `;
 
 const ComposerToolButton = styled.button`
   display: inline-flex;
   min-width: 0;
-  height: 29px;
+  height: var(--thread-composer-tool-size, 29px);
   align-items: center;
   justify-content: center;
   gap: 5px;
@@ -1156,7 +1201,8 @@ const ComposerToolButton = styled.button`
 `;
 
 const ComposerAttachButton = styled(ComposerToolButton)`
-  width: 30px;
+  width: var(--thread-composer-attach-size, 30px);
+  height: var(--thread-composer-attach-size, 30px);
   flex: 0 0 auto;
   padding: 0;
   border: 0;
@@ -1171,19 +1217,19 @@ const ComposerAttachButton = styled(ComposerToolButton)`
   }
 
   svg {
-    width: 20px;
-    height: 20px;
+    width: var(--thread-composer-attach-icon-size, 20px);
+    height: var(--thread-composer-attach-icon-size, 20px);
   }
 `;
 
 const ComposerStatusLine = styled.div`
   display: flex;
   min-width: 0;
-  min-height: 18px;
+  min-height: var(--thread-composer-status-min-height, 18px);
   align-items: center;
-  gap: 8px;
+  gap: var(--thread-composer-status-gap, 8px);
   overflow: hidden;
-  padding: 2px 0;
+  padding: var(--thread-composer-status-padding, 2px 0);
   color: rgba(232, 232, 232, 0.82);
   font-size: var(--thread-detail-small-font-size, 11px);
   font-weight: 620;
@@ -1369,8 +1415,8 @@ const HiddenFileInput = styled.input`
 
 const SendButton = styled.button`
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: var(--thread-send-button-size, 34px);
+  height: var(--thread-send-button-size, 34px);
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
@@ -1396,8 +1442,9 @@ const SendButton = styled.button`
   }
 
   svg {
-    width: 19px;
-    height: 19px;
+    display: block;
+    width: var(--thread-send-icon-size, 19px);
+    height: var(--thread-send-icon-size, 19px);
   }
 `;
 
@@ -4075,6 +4122,8 @@ function WorkspaceThreadDetail({
   agentStatuses,
   composerAttachments,
   composerDrafts,
+  composerFocusToken = 0,
+  density = "default",
   newChatActive = false,
   onCreateChat,
   onDraftInput,
@@ -4100,6 +4149,7 @@ function WorkspaceThreadDetail({
   const transcriptScrollRef = useRef(null);
   const copyResetTimeoutRef = useRef(null);
   const detailRenderDiagnosticRef = useRef("");
+  const lastComposerFocusTokenRef = useRef(0);
   const messages = Array.isArray(thread?.messages)
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
@@ -4289,6 +4339,7 @@ function WorkspaceThreadDetail({
     ? String(todoDropUnsupportedMessage || "").trim()
     : "";
   const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
+  const detailDensity = density === "compact" ? "compact" : undefined;
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
@@ -4342,6 +4393,45 @@ function WorkspaceThreadDetail({
     });
     setDraft(syncedComposerDraft);
   }, [composerSyncKey, syncedComposerDraft]);
+
+  useEffect(() => {
+    const safeFocusToken = Number(composerFocusToken || 0);
+    if (
+      !safeFocusToken
+      || safeFocusToken === lastComposerFocusTokenRef.current
+      || !thread
+    ) {
+      return undefined;
+    }
+
+    lastComposerFocusTokenRef.current = safeFocusToken;
+    let secondFrame = 0;
+    const focusInput = () => {
+      const input = composerInputRef.current;
+      if (!input || input.disabled) {
+        return;
+      }
+
+      input.focus({ preventScroll: true });
+      const cursor = String(input.value || "").length;
+      try {
+        input.setSelectionRange(cursor, cursor);
+      } catch (_) {
+        // Some textarea implementations can reject selection during teardown.
+      }
+    };
+    const firstFrame = window.requestAnimationFrame(() => {
+      focusInput();
+      secondFrame = window.requestAnimationFrame(focusInput);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [composerFocusToken, thread]);
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.model_state.thread_detail", {
@@ -5338,7 +5428,12 @@ function WorkspaceThreadDetail({
 
   if (!thread) {
     return (
-      <DetailRoot ref={detailRootRef} onClick={handleDetailRootClick} tabIndex={-1}>
+      <DetailRoot
+        data-density={detailDensity}
+        ref={detailRootRef}
+        onClick={handleDetailRootClick}
+        tabIndex={-1}
+      >
         <TranscriptScroll>
           <TranscriptInner>
             <EmptyThread>Select a thread</EmptyThread>
@@ -5363,6 +5458,7 @@ function WorkspaceThreadDetail({
   return (
     <DetailRoot
       aria-label={getWorkspaceThreadLabel(thread)}
+      data-density={detailDensity}
       onClick={handleDetailRootClick}
       ref={detailRootRef}
       tabIndex={-1}

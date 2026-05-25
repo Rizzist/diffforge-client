@@ -108,6 +108,12 @@ import {
   WorkspaceCloseCounter,
   WorkspaceCloseProgressTrack,
   WorkspaceCloseProgressBar,
+  WorkspaceCloseSteps,
+  WorkspaceCloseStep,
+  WorkspaceCloseStepDot,
+  WorkspaceCloseStepCopy,
+  WorkspaceCloseStepLabel,
+  WorkspaceCloseStepMeta,
   splashPulse,
   loadingOrangeSweep,
   shellReveal,
@@ -475,6 +481,7 @@ const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "m
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
+const APP_SHUTDOWN_PROGRESS_EVENT = "forge-app-shutdown-progress";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
 const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
@@ -978,7 +985,53 @@ const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
-const WORKSPACE_CLOSE_INITIAL_STATE = { isActive: false, closed: 0, total: 0 };
+const WORKSPACE_SHUTDOWN_STEPS = [
+  {
+    detail: "Detaching embedded workspace browser views.",
+    id: "closing_webviews",
+    label: "Closing web views",
+  },
+  {
+    detail: "Stopping file watchers and workspace listeners.",
+    id: "stopping_watchers",
+    label: "Stopping watchers",
+  },
+  {
+    detail: "Stopping knowledge graph sync tasks.",
+    id: "stopping_syncs",
+    label: "Stopping syncs",
+  },
+  {
+    detail: "Stopping terminal processes and cleaning PTYs.",
+    id: "closing_terminals",
+    label: "Closing terminals",
+  },
+  {
+    detail: "Stopping shared MCP daemons for this session.",
+    id: "stopping_daemons",
+    label: "Stopping MCP daemons",
+  },
+  {
+    detail: "Finalizing shutdown.",
+    id: "exiting",
+    label: "Exiting",
+  },
+];
+const WORKSPACE_SHUTDOWN_STEP_BY_ID = new Map(WORKSPACE_SHUTDOWN_STEPS.map((step, index) => [
+  step.id,
+  { ...step, index },
+]));
+const WORKSPACE_CLOSE_INITIAL_STATE = {
+  isActive: false,
+  closed: 0,
+  total: 0,
+  phase: "idle",
+  phaseDetail: "",
+  phaseLabel: "",
+  step: 0,
+  terminalTotalKnown: false,
+  totalSteps: WORKSPACE_SHUTDOWN_STEPS.length,
+};
 const WORKSPACE_DEACTIVATION_INITIAL_STATE = {
   isActive: false,
   workspaceId: "",
@@ -1739,6 +1792,29 @@ function normalizeTerminalCloseProgress(payload) {
   return {
     closed: Math.min(closed, total || closed),
     total,
+  };
+}
+
+function normalizeShutdownProgress(payload) {
+  const rawPhase = String(payload?.phase || "").trim();
+  const fallbackStep = WORKSPACE_SHUTDOWN_STEP_BY_ID.get(rawPhase)
+    || WORKSPACE_SHUTDOWN_STEPS[0];
+  const rawStep = Number(payload?.step);
+  const rawTotalSteps = Number(payload?.totalSteps);
+
+  return {
+    closed: normalizeCloseCount(payload?.terminalClosed),
+    detail: String(payload?.detail || fallbackStep?.detail || "").trim(),
+    label: String(payload?.label || fallbackStep?.label || "Closing workspace").trim(),
+    phase: fallbackStep?.id || rawPhase || "closing_webviews",
+    step: Number.isFinite(rawStep) && rawStep > 0
+      ? Math.floor(rawStep)
+      : (fallbackStep?.index ?? 0) + 1,
+    terminalTotalKnown: payload?.terminalTotal !== undefined && payload?.terminalTotal !== null,
+    total: normalizeCloseCount(payload?.terminalTotal),
+    totalSteps: Number.isFinite(rawTotalSteps) && rawTotalSteps > 0
+      ? Math.floor(rawTotalSteps)
+      : WORKSPACE_SHUTDOWN_STEPS.length,
   };
 }
 
@@ -6097,10 +6173,21 @@ export default function App() {
       reason: "app_close",
     });
     const browserClosePromise = requestWorkspaceWebClose("app_close");
-    setWorkspaceCloseState({ isActive: true, closed: 0, total: expectedTerminalTotal });
+    setWorkspaceCloseState({
+      ...WORKSPACE_CLOSE_INITIAL_STATE,
+      isActive: true,
+      closed: 0,
+      total: expectedTerminalTotal,
+      phase: "closing_webviews",
+      phaseDetail: WORKSPACE_SHUTDOWN_STEPS[0].detail,
+      phaseLabel: WORKSPACE_SHUTDOWN_STEPS[0].label,
+      step: 1,
+      terminalTotalKnown: false,
+    });
 
     runWindowAction(async () => {
       let unlistenCloseProgress = null;
+      let unlistenShutdownProgress = null;
       let releaseCloseProgressListener = false;
 
       listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
@@ -6108,11 +6195,27 @@ export default function App() {
 
         setWorkspaceCloseState((currentCloseState) => {
           const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
+          const terminalStep = WORKSPACE_SHUTDOWN_STEP_BY_ID.get("closing_terminals");
+          const terminalStepIndex = terminalStep?.index ?? 3;
+          const currentStepIndex = WORKSPACE_SHUTDOWN_STEP_BY_ID.get(currentCloseState.phase)?.index ?? 0;
+          const shouldActivateTerminalPhase = currentStepIndex <= terminalStepIndex;
 
           return {
             isActive: true,
+            phase: shouldActivateTerminalPhase ? "closing_terminals" : currentCloseState.phase,
+            phaseDetail: shouldActivateTerminalPhase
+              ? terminalStep?.detail || ""
+              : currentCloseState.phaseDetail,
+            phaseLabel: shouldActivateTerminalPhase
+              ? terminalStep?.label || "Closing terminals"
+              : currentCloseState.phaseLabel,
+            step: shouldActivateTerminalPhase
+              ? terminalStepIndex + 1
+              : currentCloseState.step,
+            terminalTotalKnown: true,
             closed: Math.max(currentProgress.closed, nextProgress.closed),
-            total: Math.max(currentProgress.total, nextProgress.total),
+            total: nextProgress.total,
+            totalSteps: currentCloseState.totalSteps || WORKSPACE_SHUTDOWN_STEPS.length,
           };
         });
       })
@@ -6126,6 +6229,48 @@ export default function App() {
         })
         .catch(() => {
           // Missing progress events should not block the close sequence.
+        });
+      listen(APP_SHUTDOWN_PROGRESS_EVENT, (progressEvent) => {
+        const nextProgress = normalizeShutdownProgress(progressEvent.payload);
+
+        setWorkspaceCloseState((currentCloseState) => {
+          const currentProgress = normalizeTerminalCloseProgress(currentCloseState);
+          const nextStep = WORKSPACE_SHUTDOWN_STEP_BY_ID.get(nextProgress.phase);
+          const currentStepIndex = WORKSPACE_SHUTDOWN_STEP_BY_ID.get(currentCloseState.phase)?.index ?? 0;
+          const nextStepIndex = nextStep?.index ?? currentStepIndex;
+          const shouldKeepTerminalProgress = nextProgress.phase !== "closing_terminals";
+
+          return {
+            isActive: true,
+            closed: shouldKeepTerminalProgress
+              ? currentProgress.closed
+              : Math.max(currentProgress.closed, nextProgress.closed),
+            phase: nextProgress.phase,
+            phaseDetail: nextProgress.detail,
+            phaseLabel: nextProgress.label,
+            step: Math.max(currentCloseState.step || 0, nextProgress.step, nextStepIndex + 1),
+            terminalTotalKnown: currentCloseState.terminalTotalKnown || nextProgress.terminalTotalKnown,
+            total: shouldKeepTerminalProgress
+              ? currentProgress.total
+              : nextProgress.total,
+            totalSteps: Math.max(
+              currentCloseState.totalSteps || 0,
+              nextProgress.totalSteps,
+              WORKSPACE_SHUTDOWN_STEPS.length,
+            ),
+          };
+        });
+      })
+        .then((unlisten) => {
+          if (releaseCloseProgressListener && typeof unlisten === "function") {
+            unlisten();
+            return;
+          }
+
+          unlistenShutdownProgress = unlisten;
+        })
+        .catch(() => {
+          // Phase events are UI-only; backend shutdown is still authoritative.
         });
 
       try {
@@ -6148,6 +6293,9 @@ export default function App() {
         releaseCloseProgressListener = true;
         if (typeof unlistenCloseProgress === "function") {
           unlistenCloseProgress();
+        }
+        if (typeof unlistenShutdownProgress === "function") {
+          unlistenShutdownProgress();
         }
       }
     });
@@ -9779,12 +9927,42 @@ export default function App() {
   const isWindowExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
   const windowResizeLabel = isWindowExpanded ? "Restore" : windowControlPlatform === "macos" ? "Zoom" : "Maximize";
   const workspaceCloseReportedClosed = normalizeCloseCount(workspaceCloseState.closed);
+  const workspaceCloseTotalKnown = workspaceCloseState.terminalTotalKnown === true;
   const workspaceCloseTotal = Math.max(normalizeCloseCount(workspaceCloseState.total), workspaceCloseReportedClosed);
   const workspaceCloseClosed = Math.min(workspaceCloseReportedClosed, workspaceCloseTotal);
-  const workspaceCloseProgress = workspaceCloseTotal > 0
-    ? Math.min(100, Math.round((workspaceCloseClosed / workspaceCloseTotal) * 100))
-    : 0;
+  const workspaceClosePhaseId = String(workspaceCloseState.phase || "closing_webviews");
+  const workspaceClosePhaseStep = WORKSPACE_SHUTDOWN_STEP_BY_ID.get(workspaceClosePhaseId)
+    || WORKSPACE_SHUTDOWN_STEPS[0];
+  const workspaceClosePhaseIndex = Math.max(0, workspaceClosePhaseStep.index || 0);
+  const workspaceCloseTotalSteps = Math.max(
+    WORKSPACE_SHUTDOWN_STEPS.length,
+    normalizeCloseCount(workspaceCloseState.totalSteps),
+  );
+  const workspaceCloseTerminalFraction = workspaceCloseTotal > 0
+    ? workspaceCloseClosed / workspaceCloseTotal
+    : workspaceCloseTotalKnown && workspaceClosePhaseId === "closing_terminals"
+      ? 1
+      : 0;
+  const workspaceClosePhaseFraction = workspaceClosePhaseId === "exiting"
+    ? 1
+    : workspaceClosePhaseId === "closing_terminals"
+      ? (workspaceClosePhaseIndex + workspaceCloseTerminalFraction) / workspaceCloseTotalSteps
+      : (workspaceClosePhaseIndex + 0.35) / workspaceCloseTotalSteps;
+  const workspaceCloseProgress = Math.min(100, Math.max(0, Math.round(workspaceClosePhaseFraction * 100)));
   const workspaceCloseTerminalLabel = workspaceCloseTotal === 1 ? "terminal" : "terminals";
+  const workspaceClosePhaseLabel = workspaceCloseState.phaseLabel
+    || workspaceClosePhaseStep.label
+    || "Closing workspace";
+  const workspaceClosePhaseDetail = workspaceCloseState.phaseDetail
+    || workspaceClosePhaseStep.detail
+    || "Shutting down workspace runtime.";
+  const workspaceCloseCounterText = workspaceClosePhaseId === "closing_terminals"
+    ? workspaceCloseTotalKnown
+      ? workspaceCloseTotal > 0
+        ? `${workspaceCloseClosed} / ${workspaceCloseTotal} ${workspaceCloseTerminalLabel} closed`
+        : "No live terminals to close"
+      : "Counting live terminals"
+    : `Step ${Math.min(workspaceClosePhaseIndex + 1, workspaceCloseTotalSteps)} / ${workspaceCloseTotalSteps}`;
   const workspaceDeactivateReportedClosed = normalizeCloseCount(workspaceDeactivationState.closed);
   const workspaceDeactivateTotal = Math.max(
     normalizeCloseCount(workspaceDeactivationState.total),
@@ -11245,13 +11423,39 @@ export default function App() {
           <WorkspaceCloseOverlay aria-live="polite" role="status">
             <WorkspaceClosePanel aria-label="Closing workspace">
               <WorkspaceCloseSpinner aria-hidden="true" />
-              <WorkspaceCloseTitle>Closing workspace</WorkspaceCloseTitle>
+              <WorkspaceCloseTitle>{workspaceClosePhaseLabel}</WorkspaceCloseTitle>
               <WorkspaceCloseDetail>
-                Shutting down terminals before closing {BRAND_NAME}.
+                {workspaceClosePhaseDetail}
               </WorkspaceCloseDetail>
               <WorkspaceCloseCounter>
-                {workspaceCloseClosed} / {workspaceCloseTotal} {workspaceCloseTerminalLabel} closed
+                {workspaceCloseCounterText}
               </WorkspaceCloseCounter>
+              <WorkspaceCloseSteps aria-label="Shutdown sequence">
+                {WORKSPACE_SHUTDOWN_STEPS.map((step, index) => {
+                  const isComplete = index < workspaceClosePhaseIndex || workspaceClosePhaseId === "exiting";
+                  const isActive = step.id === workspaceClosePhaseId && !isComplete;
+                  const state = isComplete ? "complete" : isActive ? "active" : "pending";
+                  const meta = isComplete
+                    ? "Done"
+                    : isActive
+                      ? step.id === "closing_terminals" && workspaceCloseTotalKnown
+                        ? workspaceCloseTotal > 0
+                          ? `${workspaceCloseClosed}/${workspaceCloseTotal}`
+                          : "None"
+                        : "Now"
+                      : "Next";
+
+                  return (
+                    <WorkspaceCloseStep data-state={state} key={step.id}>
+                      <WorkspaceCloseStepDot aria-hidden="true" />
+                      <WorkspaceCloseStepCopy>
+                        <WorkspaceCloseStepLabel>{step.label}</WorkspaceCloseStepLabel>
+                        <WorkspaceCloseStepMeta>{meta}</WorkspaceCloseStepMeta>
+                      </WorkspaceCloseStepCopy>
+                    </WorkspaceCloseStep>
+                  );
+                })}
+              </WorkspaceCloseSteps>
               <WorkspaceCloseProgressTrack aria-hidden="true">
                 <WorkspaceCloseProgressBar $progress={workspaceCloseProgress} />
               </WorkspaceCloseProgressTrack>

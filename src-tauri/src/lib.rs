@@ -119,6 +119,8 @@ const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "windows-terminal-diagnostics
 const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
+const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
+const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
@@ -281,6 +283,29 @@ pub(crate) fn app_shutdown_blocked_message(operation: &str) -> String {
         "{operation} skipped because Diff Forge is shutting down ({})",
         app_shutdown_phase_label()
     )
+}
+
+fn emit_app_shutdown_progress(
+    app: &AppHandle,
+    phase: &str,
+    label: &str,
+    detail: &str,
+    step: u8,
+    terminal_closed: Option<usize>,
+    terminal_total: Option<usize>,
+) {
+    let _ = app.emit(
+        APP_SHUTDOWN_PROGRESS_EVENT,
+        AppShutdownProgressPayload {
+            phase: phase.to_string(),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            step,
+            total_steps: APP_SHUTDOWN_TOTAL_STEPS,
+            terminal_closed,
+            terminal_total,
+        },
+    );
 }
 
 pub(crate) fn ensure_app_not_shutting_down(operation: &str) -> Result<(), String> {
@@ -1311,6 +1336,18 @@ struct TerminalCloseAllProgressPayload {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct AppShutdownProgressPayload {
+    phase: String,
+    label: String,
+    detail: String,
+    step: u8,
+    total_steps: u8,
+    terminal_closed: Option<usize>,
+    terminal_total: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct AudioInputDeviceSummary {
     device_id: String,
     label: String,
@@ -2119,15 +2156,51 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
 }
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "closing_webviews",
+        "Closing web views",
+        "Detaching embedded workspace browser views.",
+        1,
+        None,
+        None,
+    );
     let _ = close_workspace_webviews(&app_for_shutdown);
 
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "stopping_watchers",
+        "Stopping watchers",
+        "Stopping file watchers and workspace listeners.",
+        2,
+        None,
+        None,
+    );
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
     let _ = coordination::watcher::stop_all_file_watchers("app_close");
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "stopping_syncs",
+        "Stopping syncs",
+        "Stopping knowledge graph sync tasks.",
+        3,
+        None,
+        None,
+    );
     {
         let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
         let _ = cloud_mcp_stop_all_knowledge_graph_syncs(cloud_mcp_state.inner()).await;
     }
 
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "closing_terminals",
+        "Closing terminals",
+        "Stopping terminal processes and cleaning PTYs.",
+        4,
+        Some(0),
+        None,
+    );
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_CLOSING_TERMINALS);
     let _ = {
         let terminal_state = app_for_shutdown.state::<TerminalState>();
@@ -2142,9 +2215,27 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
         .await
     };
 
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "stopping_daemons",
+        "Stopping MCP daemons",
+        "Stopping shared MCP daemons for this session.",
+        5,
+        None,
+        None,
+    );
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_DAEMONS);
     let _ = coordination::mcp::stop_all_shared_daemons("app_close");
 
+    emit_app_shutdown_progress(
+        &app_for_shutdown,
+        "exiting",
+        "Exiting",
+        "Finalizing shutdown.",
+        6,
+        None,
+        None,
+    );
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
     if schedule_app_exit_after_terminal_shutdown(app_for_shutdown.clone(), window_label.clone())
         .is_err()

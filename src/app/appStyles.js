@@ -750,6 +750,103 @@ export const WorkspaceCloseProgressBar = styled.div`
   }
 `;
 
+export const WorkspaceCloseSteps = styled.ol`
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 7px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+`;
+
+export const WorkspaceCloseStep = styled.li`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: rgba(226, 232, 240, 0.5);
+  font-size: 12px;
+  line-height: 1.2;
+
+  &[data-state="active"] {
+    color: #f8fbff;
+  }
+
+  &[data-state="complete"] {
+    color: rgba(203, 213, 225, 0.84);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(69, 69, 74, 0.58);
+  }
+
+  html[data-forge-theme="light"] &[data-state="active"] {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] &[data-state="complete"] {
+    color: rgba(29, 29, 31, 0.78);
+  }
+`;
+
+export const WorkspaceCloseStepDot = styled.span`
+  display: inline-flex;
+  width: 8px;
+  height: 8px;
+  justify-self: center;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.32);
+  box-shadow: none;
+
+  ${WorkspaceCloseStep}[data-state="active"] & {
+    background: #62a0ff;
+    box-shadow: 0 0 0 4px rgba(98, 160, 255, 0.16);
+  }
+
+  ${WorkspaceCloseStep}[data-state="complete"] & {
+    background: #3ccb7f;
+  }
+
+  html[data-forge-theme="light"] ${WorkspaceCloseStep}[data-state="active"] & {
+    background: var(--forge-blue);
+    box-shadow: 0 0 0 4px rgba(0, 102, 204, 0.12);
+  }
+`;
+
+export const WorkspaceCloseStepCopy = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+`;
+
+export const WorkspaceCloseStepLabel = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const WorkspaceCloseStepMeta = styled.span`
+  flex: 0 0 auto;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 10px;
+  font-weight: 850;
+  text-transform: uppercase;
+
+  ${WorkspaceCloseStep}[data-state="active"] & {
+    color: rgba(226, 232, 240, 0.88);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(69, 69, 74, 0.62);
+  }
+`;
+
 export const splashPulse = keyframes`
   0%,
   100% {
@@ -3676,6 +3773,27 @@ export const TerminalFrame = styled.section`
   }
 `;
 
+export const TerminalInlineUiView = styled.div`
+  position: absolute;
+  z-index: 42;
+  inset: 0;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #141414;
+  pointer-events: auto;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f5f7;
+  }
+
+  > * {
+    min-width: 0;
+    min-height: 0;
+  }
+`;
+
 export const TerminalParkedBar = styled.div`
   position: absolute;
   right: 12px;
@@ -4467,6 +4585,11 @@ export const TerminalRestartButton = styled.button`
     color: #fff;
     outline: none;
     filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.28));
+  }
+
+  &[data-active="true"]:not(:disabled) {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.09);
   }
 
   &:disabled {

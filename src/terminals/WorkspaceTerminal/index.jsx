@@ -107,6 +107,7 @@ import {
   ResizePanel,
   ResizeHandle,
   TerminalFrame,
+  TerminalInlineUiView,
   XtermSurface,
   TerminalClosedSurface,
   TerminalClosedLabel,
@@ -355,6 +356,7 @@ import {
   stripLiveViewControlSequences,
 } from "../liveViewSanitizer.js";
 import WorkspaceThreadsOverlay from "../../threads/WorkspaceThreadsOverlay.jsx";
+import WorkspaceThreadDetail from "../../threads/WorkspaceThreadDetail.jsx";
 import {
   getBigViewTextDiagnosticFields,
   logBigViewSyncDiagnosticEvent,
@@ -1167,6 +1169,12 @@ function WorkspaceTerminal({
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
+  const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
+  const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
+  const terminalUiViewActiveRef = useRef(false);
+  useEffect(() => {
+    terminalUiViewActiveRef.current = terminalUiViewActive;
+  }, [terminalUiViewActive]);
   const isTerminalStabilityRuntimeEnabled = useCallback(
     () => false,
     [],
@@ -1220,6 +1228,7 @@ function WorkspaceTerminal({
     || (String(thread?.currentAgent || "").toLowerCase() === terminalAgentKind ? thread?.transcriptSessionId : "")
     || "";
   const threadProviderModel = threadProviderBinding?.modelId || "";
+  const workspaceThreadEntry = workspaceThreads?.[workspace?.id || ""];
   const getTerminalCliStatusLogBase = (fields = {}) => ({
     agentId: terminalAgentKind,
     eventTime: new Date().toISOString(),
@@ -3030,10 +3039,13 @@ function WorkspaceTerminal({
       ? selection
       : null;
   }, []);
-  const activateTerminalPane = useCallback((source = "terminal_activation") => {
+  const activateTerminalPane = useCallback((source = "terminal_activation", options = {}) => {
+    const focusKeyboard = options?.focusKeyboard !== false;
     const instanceId = terminalInstanceIdRef.current || 0;
     terminalActiveRef.current = true;
-    setActiveTerminalKeyboardTarget(paneId, instanceId);
+    if (focusKeyboard) {
+      setActiveTerminalKeyboardTarget(paneId, instanceId);
+    }
     setTerminalFocused(true);
     updateTerminalInteractiveState(true);
     onActivateTerminal?.({
@@ -3043,7 +3055,9 @@ function WorkspaceTerminal({
       terminalIndex,
       workspaceId: workspace?.id || "",
     });
-    focusTerminalKeyboardInput(true);
+    if (focusKeyboard) {
+      focusTerminalKeyboardInput(true);
+    }
   }, [
     focusTerminalKeyboardInput,
     onActivateTerminal,
@@ -3095,6 +3109,14 @@ function WorkspaceTerminal({
     }
 
     activateTerminalPane("terminal_pointer");
+    requestTerminalAudioInputTarget(true);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  const handleTerminalUiViewFocusCapture = useCallback(() => {
+    activateTerminalPane("terminal_ui_view_focus", { focusKeyboard: false });
+    requestTerminalAudioInputTarget(true);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  const handleTerminalUiViewPointerDownCapture = useCallback(() => {
+    activateTerminalPane("terminal_ui_view_pointer", { focusKeyboard: false });
     requestTerminalAudioInputTarget(true);
   }, [activateTerminalPane, requestTerminalAudioInputTarget]);
 
@@ -4510,7 +4532,13 @@ function WorkspaceTerminal({
       }, 0);
     };
     const clearTerminalAudioInputTargetIfPointerOutside = (event) => {
-      if (!container.contains(event.target)) {
+      const targetNode = event.target instanceof Node ? event.target : null;
+      const surfaceElement = surfaceRef.current;
+      if (
+        targetNode
+        && !container.contains(targetNode)
+        && !surfaceElement?.contains(targetNode)
+      ) {
         clearTerminalAudioInputTarget();
       }
     };
@@ -4552,12 +4580,18 @@ function WorkspaceTerminal({
         return;
       }
 
+      const insertedText = String(event.payload?.insertedText || "");
       if (terminalActiveRef.current) {
         requestTerminalAudioInputTarget(true);
-        focusTerminalKeyboardInput();
+        if (terminalUiViewActiveRef.current) {
+          if (insertedText) {
+            setTerminalUiComposerFocusToken((token) => token + 1);
+          }
+        } else {
+          focusTerminalKeyboardInput();
+        }
       }
 
-      const insertedText = String(event.payload?.insertedText || "");
       if (!insertedText || isGenericTerminal) {
         return;
       }
@@ -11296,6 +11330,21 @@ function WorkspaceTerminal({
   ]);
 
   const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
+  const canOpenTerminalUiView = !threadsViewActive && !terminalClosed && !terminalClosing && Boolean(thread);
+  const toggleTerminalUiView = useCallback(() => {
+    if (!canOpenTerminalUiView && !terminalUiViewActive) {
+      return;
+    }
+
+    activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
+    requestTerminalAudioInputTarget(true);
+    setTerminalUiViewActive((isActiveView) => !isActiveView);
+  }, [activateTerminalPane, canOpenTerminalUiView, requestTerminalAudioInputTarget, terminalUiViewActive]);
+  useEffect(() => {
+    if (!thread || terminalClosed || terminalClosing) {
+      setTerminalUiViewActive(false);
+    }
+  }, [terminalClosed, terminalClosing, thread]);
   const splitTerminal = useCallback((direction) => {
     if (threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal) {
       return;
@@ -11484,107 +11533,127 @@ function WorkspaceTerminal({
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
       data-terminal-index={terminalIndex}
       data-threads-view={threadsViewActive ? "true" : undefined}
+      data-ui-view={terminalUiViewActive ? "true" : undefined}
       onFocusCapture={handleTerminalSurfaceFocusCapture}
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
       ref={surfaceRef}
     >
       <TerminalRestartPill data-terminal-control="true">
-        <TerminalAgentDot
-          aria-hidden="true"
-          data-agent={terminalAgentKind}
-          data-slot={getTerminalAgentColorSlot(terminalIndex)}
-          title={terminalAgentTitle}
-        />
-        <TerminalRestartButton
-          aria-label="Drag terminal"
-          data-terminal-drag-handle="true"
-          disabled={terminalClosed || terminalClosing || isFullscreen || terminalCount <= 1}
-          onPointerDown={beginTerminalDrag}
-          title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
-          type="button"
-        >
-          <ButtonDragIcon aria-hidden="true" />
-        </TerminalRestartButton>
-        <TerminalRestartButton
-          aria-label="Split terminal horizontally"
-          disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-          onClick={splitTerminalHorizontal}
-          title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
-          type="button"
-        >
-          <ButtonSplitHorizontalIcon aria-hidden="true" />
-        </TerminalRestartButton>
-        <TerminalRestartButton
-          aria-label="Split terminal vertically"
-          disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-          onClick={splitTerminalVertical}
-          title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
-          type="button"
-        >
-          <ButtonSplitVerticalIcon aria-hidden="true" />
-        </TerminalRestartButton>
-        <TerminalRestartButton
-          aria-label={isFullscreen ? "Exit terminal fullscreen" : "Open terminal threads"}
-          disabled={terminalClosed || terminalClosing}
-          onClick={toggleTerminalFullscreen}
-          title={isFullscreen ? "Exit fullscreen" : "Open terminal threads"}
-          type="button"
-        >
-          {isFullscreen ? (
-            <ButtonFullscreenExitIcon aria-hidden="true" />
-          ) : (
-            <ButtonFullscreenIcon aria-hidden="true" />
-          )}
-        </TerminalRestartButton>
-        <TerminalRestartMenu
-          data-terminal-control="true"
-          ref={restartMenuRef}
-        >
+          <TerminalAgentDot
+            aria-hidden="true"
+            data-agent={terminalAgentKind}
+            data-slot={getTerminalAgentColorSlot(terminalIndex)}
+            title={terminalAgentTitle}
+          />
           <TerminalRestartButton
-            aria-expanded={restartRoleMenuOpen ? "true" : "false"}
-            aria-haspopup="menu"
-            aria-label={threadsViewActive ? "Start new session" : "Restart terminal"}
-            disabled={terminalClosed || terminalClosing}
-            onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
-            title={threadsViewActive ? "Start a new session in this terminal" : "Restart terminal or choose runtime"}
+            aria-label="Drag terminal"
+            data-terminal-drag-handle="true"
+            disabled={terminalClosed || terminalClosing || isFullscreen || terminalCount <= 1}
+            onPointerDown={beginTerminalDrag}
+            title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
             type="button"
           >
-            <ButtonRefreshIcon aria-hidden="true" />
+            <ButtonDragIcon aria-hidden="true" />
           </TerminalRestartButton>
-          <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
-            {getTerminalRoleSwitchOptions(agentStatuses).map((option) => (
-              <TerminalRestartOption
-                data-role={option.id}
-                data-selected={option.id === restartMenuAgentKind ? "true" : "false"}
-                key={option.id}
-                onClick={() => restartTerminalAs(option.id)}
-                role="menuitem"
-                title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
-                type="button"
-              >
-                <strong>
-                  {threadsViewActive
-                    ? option.id === restartMenuAgentKind
-                      ? `Restart ${option.label}`
-                      : `New ${option.label} session`
-                    : option.id === terminalAgentKind
-                      ? `Restart ${option.label}`
-                      : option.label}
-                </strong>
-              </TerminalRestartOption>
-            ))}
-          </TerminalRestartDropdown>
-        </TerminalRestartMenu>
-        <TerminalCloseButton
-          aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
-          disabled={terminalClosed || terminalClosing}
-          onClick={handleTerminalCloseButtonClick}
-          title={threadsViewActive ? "Exit threads view" : "Close terminal"}
-          type="button"
-        >
-          <ButtonCloseIcon aria-hidden="true" />
-        </TerminalCloseButton>
-      </TerminalRestartPill>
+          <TerminalRestartButton
+            aria-label={terminalUiViewActive ? "Show terminal view" : "Show UI view"}
+            aria-pressed={terminalUiViewActive ? "true" : "false"}
+            data-active={terminalUiViewActive ? "true" : undefined}
+            disabled={!canOpenTerminalUiView && !terminalUiViewActive}
+            onClick={toggleTerminalUiView}
+            title={
+              terminalUiViewActive
+                ? "Show terminal view"
+                : canOpenTerminalUiView
+                  ? "Show UI view"
+                  : threadsViewActive
+                    ? "Exit threads view first"
+                    : "No thread available"
+            }
+            type="button"
+          >
+            <ButtonBrowserIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split terminal horizontally"
+            disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
+            onClick={splitTerminalHorizontal}
+            title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
+            type="button"
+          >
+            <ButtonSplitHorizontalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split terminal vertically"
+            disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
+            onClick={splitTerminalVertical}
+            title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
+            type="button"
+          >
+            <ButtonSplitVerticalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label={isFullscreen ? "Exit terminal fullscreen" : "Open terminal threads"}
+            disabled={terminalClosed || terminalClosing}
+            onClick={toggleTerminalFullscreen}
+            title={isFullscreen ? "Exit fullscreen" : "Open terminal threads"}
+            type="button"
+          >
+            {isFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </TerminalRestartButton>
+          <TerminalRestartMenu
+            data-terminal-control="true"
+            ref={restartMenuRef}
+          >
+            <TerminalRestartButton
+              aria-expanded={restartRoleMenuOpen ? "true" : "false"}
+              aria-haspopup="menu"
+              aria-label={threadsViewActive ? "Start new session" : "Restart terminal"}
+              disabled={terminalClosed || terminalClosing}
+              onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
+              title={threadsViewActive ? "Start a new session in this terminal" : "Restart terminal or choose runtime"}
+              type="button"
+            >
+              <ButtonRefreshIcon aria-hidden="true" />
+            </TerminalRestartButton>
+            <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
+              {getTerminalRoleSwitchOptions(agentStatuses).map((option) => (
+                <TerminalRestartOption
+                  data-role={option.id}
+                  data-selected={option.id === restartMenuAgentKind ? "true" : "false"}
+                  key={option.id}
+                  onClick={() => restartTerminalAs(option.id)}
+                  role="menuitem"
+                  title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
+                  type="button"
+                >
+                  <strong>
+                    {threadsViewActive
+                      ? option.id === restartMenuAgentKind
+                        ? `Restart ${option.label}`
+                        : `New ${option.label} session`
+                      : option.id === terminalAgentKind
+                        ? `Restart ${option.label}`
+                        : option.label}
+                  </strong>
+                </TerminalRestartOption>
+              ))}
+            </TerminalRestartDropdown>
+          </TerminalRestartMenu>
+          <TerminalCloseButton
+            aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
+            disabled={terminalClosed || terminalClosing}
+            onClick={handleTerminalCloseButtonClick}
+            title={threadsViewActive ? "Exit threads view" : "Close terminal"}
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRestartPill>
 
       <TerminalFrame
         aria-busy={terminalClosing ? "true" : "false"}
@@ -11603,6 +11672,31 @@ function WorkspaceTerminal({
         ) : (
           <>
             {xtermSurface}
+            {terminalUiViewActive && (
+              <TerminalInlineUiView
+                data-terminal-control="true"
+                onFocusCapture={handleTerminalUiViewFocusCapture}
+                onPointerDownCapture={handleTerminalUiViewPointerDownCapture}
+              >
+                <WorkspaceThreadDetail
+                  agentStatuses={agentStatuses}
+                  composerAttachments={threadComposerAttachments}
+                  composerDrafts={threadComposerDrafts}
+                  composerFocusToken={terminalUiComposerFocusToken}
+                  density="compact"
+                  onCreateChat={createWorkspaceThreadChat}
+                  onDraftInput={syncWorkspaceThreadComposerInput}
+                  onSelectModel={changeWorkspaceThreadModel}
+                  onSubmitMessage={submitWorkspaceThreadMessage}
+                  thread={thread}
+                  todoDropActive={todoDropActive}
+                  todoDropTarget={todoDropTarget}
+                  todoDropUnsupportedMessage={todoDropUnsupportedMessage}
+                  workspace={workspace}
+                  workspaceThreadEntry={workspaceThreadEntry}
+                />
+              </TerminalInlineUiView>
+            )}
             {terminalComposerAttachments.length > 0 && (
               <div
                 aria-label="Queued image attachments"
