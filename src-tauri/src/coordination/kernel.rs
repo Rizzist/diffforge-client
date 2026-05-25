@@ -4972,6 +4972,13 @@ impl CoordinationKernel {
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
             self.workspace_mcp_gateway_approved_tool_names(workspace_id);
+        let codex_home_path = prepare_managed_codex_home_for_terminal(
+            &self.paths,
+            agent_kind,
+            slot_key.as_deref(),
+            &session_id,
+            &write_root,
+        )?;
 
         Ok(TerminalCoordinationContext {
             agent_id,
@@ -4989,6 +4996,7 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
+            codex_home_path,
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
@@ -5099,6 +5107,13 @@ impl CoordinationKernel {
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
             self.workspace_mcp_gateway_approved_tool_names(workspace_id);
+        let codex_home_path = prepare_managed_codex_home_for_terminal(
+            &self.paths,
+            &agent_kind,
+            slot_key.as_deref(),
+            &session_id,
+            &write_root,
+        )?;
 
         Ok(TerminalCoordinationContext {
             agent_id,
@@ -5116,6 +5131,7 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
+            codex_home_path,
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
@@ -20781,6 +20797,214 @@ fn text_file_matches(path: &Path, value: &str) -> bool {
     bytes_file_matches(path, value.as_bytes())
 }
 
+fn prepare_managed_codex_home_for_terminal(
+    paths: &StoragePaths,
+    agent_kind: &str,
+    slot_key: Option<&str>,
+    session_id: &str,
+    write_root: &str,
+) -> Result<Option<String>, String> {
+    if !agent_kind.to_ascii_lowercase().contains("codex") {
+        return Ok(None);
+    }
+
+    let slot_segment = slot_key
+        .map(safe_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let session_segment = safe_id(session_id);
+            if session_segment.is_empty() {
+                "session".to_string()
+            } else {
+                session_segment
+            }
+        });
+    let target_home = paths
+        .agents_root
+        .join("codex-home")
+        .join("coordinated")
+        .join(slot_segment);
+    fs::create_dir_all(&target_home).map_err(|error| {
+        format!(
+            "Unable to create managed Codex home {}: {error}",
+            target_home.display()
+        )
+    })?;
+
+    let source_home = codex_source_home_for_managed_home(&target_home);
+    let source_config = source_home.as_ref().map(|home| home.join("config.toml"));
+    let source_body = source_config
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(fs::read_to_string)
+        .transpose()
+        .map_err(|error| format!("Unable to read user Codex config: {error}"))?
+        .unwrap_or_default();
+    let config = codex_managed_home_config(&source_body, &paths.repo_path, Path::new(write_root));
+    write_text_file_atomic(&target_home.join("config.toml"), &config)?;
+
+    if let Some(source_home) = source_home {
+        for file_name in [
+            "auth.json",
+            "models_cache.json",
+            "installation_id",
+            "version.json",
+            ".personality_migration",
+            ".codex-global-state.json",
+        ] {
+            ensure_managed_codex_home_file(
+                &source_home.join(file_name),
+                &target_home.join(file_name),
+            )?;
+        }
+    }
+
+    Ok(Some(process_path_text(&target_home)))
+}
+
+fn codex_source_home_for_managed_home(target_home: &Path) -> Option<PathBuf> {
+    let candidate = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    if same_path(&candidate, target_home) {
+        return env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"));
+    }
+    Some(candidate)
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn codex_managed_home_config(source_body: &str, repo_path: &Path, write_root: &Path) -> String {
+    let without_native_mcps = strip_codex_native_mcp_server_sections(source_body);
+    let mut config = ensure_codex_project_trust_entry(&without_native_mcps, repo_path);
+    config = ensure_codex_project_trust_entry(&config, write_root);
+    if !config.ends_with('\n') {
+        config.push('\n');
+    }
+    config
+}
+
+fn strip_codex_native_mcp_server_sections(body: &str) -> String {
+    let mut skip = false;
+    let mut kept = Vec::new();
+    for line in body.lines() {
+        if let Some(section) = toml_section_name(line) {
+            skip = codex_toml_section_is_mcp_servers(&section);
+        }
+        if !skip && codex_toml_line_is_mcp_servers_assignment(line) {
+            continue;
+        }
+        if !skip {
+            kept.push(line);
+        }
+    }
+    let mut next = kept.join("\n");
+    if body.ends_with('\n') && !next.is_empty() {
+        next.push('\n');
+    }
+    next
+}
+
+fn codex_toml_section_is_mcp_servers(section: &str) -> bool {
+    let section = section.trim().trim_matches('"').trim_matches('\'');
+    section == "mcp_servers" || section.starts_with("mcp_servers.")
+}
+
+fn codex_toml_line_is_mcp_servers_assignment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("mcp_servers")
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+fn toml_section_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+    (!section.is_empty()).then(|| section.to_string())
+}
+
+fn ensure_codex_project_trust_entry(body: &str, path: &Path) -> String {
+    let path = process_path_text(path);
+    if path.trim().is_empty() || codex_config_has_project_entry(body, &path) {
+        return body.to_string();
+    }
+    let mut next = body.trim_end().to_string();
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(&format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        toml_escape(&path)
+    ));
+    next
+}
+
+fn codex_config_has_project_entry(body: &str, path: &str) -> bool {
+    body.lines().any(|line| {
+        let Some(section) = toml_section_name(line) else {
+            return false;
+        };
+        section == format!("projects.\"{}\"", toml_escape(path))
+            || section == format!("projects.'{}'", path.replace('\'', "\\'"))
+            || section == format!("projects.{path}")
+    })
+}
+
+fn ensure_managed_codex_home_file(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    let source_bytes = fs::read(source)
+        .map_err(|error| format!("Unable to read {}: {error}", source.display()))?;
+    if target.exists() {
+        if same_path(source, target) || bytes_file_matches(target, &source_bytes) {
+            return Ok(());
+        }
+        if target.is_dir() {
+            return Err(format!(
+                "Unable to prepare managed Codex home file {}; target is a directory.",
+                target.display()
+            ));
+        }
+        fs::remove_file(target)
+            .map_err(|error| format!("Unable to replace {}: {error}", target.display()))?;
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
+    }
+    if create_file_symlink(source, target).is_ok() {
+        return Ok(());
+    }
+    write_bytes_atomic(target, &source_bytes)
+}
+
+#[cfg(unix)]
+fn create_file_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_file_symlink(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are unsupported on this platform",
+    ))
+}
+
 fn bytes_file_matches(path: &Path, bytes: &[u8]) -> bool {
     fs::read(path).is_ok_and(|existing| existing == bytes)
 }
@@ -22865,6 +23089,49 @@ APPWRITE_PROJECT_ID = "project"
             "[mcp_servers.appwrite-api]\ndefault_tools_approval_mode = \"prompt\"\ncommand = \"uvx\""
         ));
         assert!(!prompted.contains("default_tools_approval_mode = \"approve\""));
+    }
+
+    #[test]
+    fn managed_codex_home_config_strips_native_mcp_servers() {
+        let repo = init_git_repo("managed_codex_home_config");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let source = r#"model = "gpt-5.5"
+mcp_servers = { stale = { command = "bad" } }
+
+[projects."/tmp/existing"]
+trust_level = "trusted"
+
+[mcp_servers]
+unused = true
+
+[mcp_servers.appwrite-api]
+default_tools_approval_mode = "approve"
+command = "uvx"
+args = ["mcp-server-appwrite"]
+
+[mcp_servers.appwrite-api.env]
+APPWRITE_PROJECT_ID = "project"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+
+        let config = codex_managed_home_config(source, &repo, &worktree);
+
+        assert!(!config.contains("mcp_servers ="));
+        assert!(!config.contains("[mcp_servers]"));
+        assert!(!config.contains("[mcp_servers.appwrite-api]"));
+        assert!(!config.contains("[mcp_servers.appwrite-api.env]"));
+        assert!(config.contains("[plugins.\"browser@openai-bundled\"]"));
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            toml_escape(&process_path_text(&repo))
+        )));
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            toml_escape(&process_path_text(&worktree))
+        )));
     }
 
     #[test]

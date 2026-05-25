@@ -478,6 +478,14 @@ const WINDOW_RESIZE_EDGES = [
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
+
+function readMainWindowFocusedFallback() {
+  if (typeof document === "undefined") {
+    return true;
+  }
+  return document.visibilityState !== "hidden" && document.hasFocus();
+}
+
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
@@ -2988,6 +2996,7 @@ export default function App() {
   const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
   const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
+  const [mainWindowFocused, setMainWindowFocused] = useState(readMainWindowFocusedFallback);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
   const [workspaceDeactivationState, setWorkspaceDeactivationState] = useState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
   const authStartupFinishedRef = useRef(false);
@@ -3004,6 +3013,9 @@ export default function App() {
   const audioAutoOpenStartupKeyRef = useRef("");
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
+  const activeViewRef = useRef(activeView);
+  const visibleViewRef = useRef(visibleView);
+  const mainWindowFocusedRef = useRef(mainWindowFocused);
   const workspacesRef = useRef(workspaces);
   const workspaceSettingsRef = useRef(workspaceSettings);
   const defaultWorkingDirectoryRef = useRef(defaultWorkingDirectory);
@@ -3057,6 +3069,25 @@ export default function App() {
     () => getWorkspaceNotificationSummaries(workspaceNotifications, workspaceThreads),
     [workspaceNotifications, workspaceThreads],
   );
+  const workspaceNotificationSurfaceVisible = useCallback((workspaceId) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    return Boolean(
+      safeWorkspaceId
+        && selectedWorkspaceIdRef.current === safeWorkspaceId
+        && activeViewRef.current === DEFAULT_WORKSPACE_VIEW
+        && visibleViewRef.current === DEFAULT_WORKSPACE_VIEW
+        && mainWindowFocusedRef.current,
+    );
+  }, []);
+  const workspaceNotificationReducerOptions = useCallback((workspaceId, options = {}) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    return {
+      selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      workspaceId: safeWorkspaceId,
+      workspaceVisibleAndFocused: workspaceNotificationSurfaceVisible(safeWorkspaceId),
+      ...options,
+    };
+  }, [workspaceNotificationSurfaceVisible]);
   const workspaceThreadStoreTargets = useMemo(
     () => getWorkspaceThreadStoreTargets(workspaces, workspaceSettings, defaultWorkingDirectory),
     [defaultWorkingDirectory, workspaceSettings, workspaces],
@@ -3321,6 +3352,78 @@ export default function App() {
   }, [activatedWorkspaceId]);
 
   useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
+
+  useEffect(() => {
+    visibleViewRef.current = visibleView;
+  }, [visibleView]);
+
+  useEffect(() => {
+    mainWindowFocusedRef.current = mainWindowFocused;
+  }, [mainWindowFocused]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFocusChanged = null;
+    const currentWindow = getCurrentWindow();
+
+    const applyFocused = (focused) => {
+      const nextFocused = Boolean(focused)
+        && (typeof document === "undefined" || document.visibilityState !== "hidden");
+      mainWindowFocusedRef.current = nextFocused;
+      if (!cancelled) {
+        setMainWindowFocused(nextFocused);
+      }
+    };
+
+    const refreshFocused = () => {
+      currentWindow
+        .isFocused()
+        .then((focused) => {
+          if (!cancelled) {
+            applyFocused(focused);
+          }
+        })
+        .catch(() => {
+          applyFocused(readMainWindowFocusedFallback());
+        });
+    };
+
+    const handleWindowBlur = () => {
+      applyFocused(false);
+    };
+
+    window.addEventListener("focus", refreshFocused);
+    window.addEventListener("blur", handleWindowBlur);
+    document.addEventListener("visibilitychange", refreshFocused);
+    refreshFocused();
+
+    currentWindow
+      .onFocusChanged((event) => {
+        applyFocused(event?.payload === true);
+      })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenFocusChanged = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refreshFocused);
+      window.removeEventListener("blur", handleWindowBlur);
+      document.removeEventListener("visibilitychange", refreshFocused);
+      if (typeof unlistenFocusChanged === "function") {
+        unlistenFocusChanged();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     workspacesRef.current = workspaces;
   }, [workspaces]);
 
@@ -3447,12 +3550,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!selectedWorkspaceId) {
+    if (
+      !selectedWorkspaceId
+      || activeView !== DEFAULT_WORKSPACE_VIEW
+      || visibleView !== DEFAULT_WORKSPACE_VIEW
+      || !mainWindowFocused
+    ) {
       return;
     }
 
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
-  }, [selectedWorkspaceId]);
+  }, [activeView, mainWindowFocused, selectedWorkspaceId, visibleView]);
 
   useEffect(() => {
     const snapshotTargets = workspaceNotificationRoots.filter((entry) => (
@@ -3482,10 +3590,9 @@ export default function App() {
           current,
           target.workspaceId,
           snapshot,
-          {
-            selectedWorkspaceId: selectedWorkspaceIdRef.current,
+          workspaceNotificationReducerOptions(target.workspaceId, {
             suppressCue: true,
-          },
+          }),
         ));
       }).catch(() => {
         // Snapshot reconciliation is opportunistic; live events still keep the rail responsive.
@@ -3495,7 +3602,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [workspaceNotificationRoots]);
+  }, [workspaceNotificationReducerOptions, workspaceNotificationRoots]);
 
   useEffect(() => {
     let unlistenNotification = null;
@@ -3516,10 +3623,7 @@ export default function App() {
           ...payload,
           workspaceId,
         },
-        {
-          selectedWorkspaceId: selectedWorkspaceIdRef.current,
-          workspaceId,
-        },
+        workspaceNotificationReducerOptions(workspaceId),
       ));
     }).then((unlisten) => {
       if (cancelled) {
@@ -3535,7 +3639,7 @@ export default function App() {
         unlistenNotification();
       }
     };
-  }, [workspaceNotificationRoots]);
+  }, [workspaceNotificationReducerOptions, workspaceNotificationRoots]);
 
   useEffect(() => {
     let unlistenParkedPrompt = null;
@@ -3553,10 +3657,7 @@ export default function App() {
           ...payload,
           workspaceId,
         },
-        {
-          selectedWorkspaceId: selectedWorkspaceIdRef.current,
-          workspaceId,
-        },
+        workspaceNotificationReducerOptions(workspaceId),
       ));
     }).then((unlisten) => {
       if (cancelled) {
@@ -3572,7 +3673,7 @@ export default function App() {
         unlistenParkedPrompt();
       }
     };
-  }, []);
+  }, [workspaceNotificationReducerOptions]);
 
   useEffect(() => {
     workspaceTerminalLogicalIndexesRef.current = workspaceTerminalLogicalIndexes;
@@ -8709,10 +8810,7 @@ export default function App() {
     setWorkspaceNotifications((current) => reduceThreadLifecycleNotificationEvent(
       current,
       lifecycleEvent,
-      {
-        selectedWorkspaceId: selectedWorkspaceIdRef.current,
-        workspaceId: lifecycleWorkspaceId,
-      },
+      workspaceNotificationReducerOptions(lifecycleWorkspaceId),
     ));
     let lifecyclePromptEventId = String(
       lifecycleEvent.promptEventId
@@ -9370,6 +9468,7 @@ export default function App() {
     rejectWorkspacePromptDeliveriesForThread,
     requestWorkspaceThreadTranscript,
     settleWorkspacePromptDelivery,
+    workspaceNotificationReducerOptions,
   ]);
 
   useEffect(() => {

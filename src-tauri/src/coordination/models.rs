@@ -40,6 +40,8 @@ pub struct TerminalCoordinationContext {
     pub repo_path: String,
     pub mcp_config_path: String,
     pub codex_mcp_config_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home_path: Option<String>,
     pub claude_mcp_config_path: String,
     pub mcp_command: String,
     pub workspace_id: Option<String>,
@@ -158,6 +160,14 @@ impl TerminalCoordinationContext {
                 self.workspace_mcp_allowed_tools.join(","),
             ),
         ];
+
+        if self.agent_kind.to_ascii_lowercase().contains("codex") {
+            if let Some(path) = &self.codex_home_path {
+                if !path.trim().is_empty() {
+                    values.push(("CODEX_HOME".to_string(), path.clone()));
+                }
+            }
+        }
 
         if let Some(value) = &self.workspace_id {
             values.push(("COORDINATION_WORKSPACE_ID".to_string(), value.clone()));

@@ -2750,7 +2750,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Diff Forge AI desktop")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
                 let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
 
                 if phase < APP_SHUTDOWN_PHASE_EXITING {
