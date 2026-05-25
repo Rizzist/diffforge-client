@@ -262,6 +262,10 @@ impl CloudMcpState {
 }
 
 fn cloud_mcp_base_url() -> String {
+    if !cloud_mcp_base_url_override_allowed() {
+        return CLOUD_MCP_DEFAULT_BASE_URL.to_string();
+    }
+
     [
         "RUST_DIFFFORGE_CLOUD_MCP_URL",
         "CLOUD_DIFFFORGE_CLOUD_MCP_URL",
@@ -281,13 +285,10 @@ fn cloud_mcp_normalized_base_url(value: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if cloud_mcp_url_is_loopback(&trimmed) && !cloud_mcp_local_override_allowed() {
-        return None;
-    }
     Some(trimmed)
 }
 
-fn cloud_mcp_local_override_allowed() -> bool {
+fn cloud_mcp_base_url_override_allowed() -> bool {
     [CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV, "CLOUD_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP"]
         .iter()
         .any(|key| {
@@ -298,34 +299,6 @@ fn cloud_mcp_local_override_allowed() -> bool {
                 )
             })
         })
-}
-
-fn cloud_mcp_url_is_loopback(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    let without_scheme = lower
-        .strip_prefix("http://")
-        .or_else(|| lower.strip_prefix("https://"))
-        .or_else(|| lower.strip_prefix("ws://"))
-        .or_else(|| lower.strip_prefix("wss://"))
-        .unwrap_or(lower.as_str());
-    let authority = without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
-    };
-
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host == "::1"
-        || host == "0.0.0.0"
-        || host.starts_with("127.")
 }
 
 fn cloud_mcp_dev_auth_token() -> Option<String> {
@@ -8761,12 +8734,16 @@ impl CloudMcpProxyIdentity {
             .or_else(|| env::var("CLOUD_MCP_AGENT_LABEL").ok())
             .or_else(|| agent_id.as_deref().and_then(cloud_mcp_short_agent_label));
 
-        let base_url = values
-            .get("base-url")
-            .cloned()
-            .or_else(|| env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
-            .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok())
-            .and_then(|value| cloud_mcp_normalized_base_url(&value));
+        let base_url = cloud_mcp_base_url_override_allowed()
+            .then(|| {
+                values
+                    .get("base-url")
+                    .cloned()
+                    .or_else(|| env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
+                    .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok())
+                    .and_then(|value| cloud_mcp_normalized_base_url(&value))
+            })
+            .flatten();
 
         let client_id = values
             .get("client-id")
