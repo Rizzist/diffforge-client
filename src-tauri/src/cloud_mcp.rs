@@ -3,9 +3,15 @@ use notify::{
     RecursiveMode, Watcher,
 };
 
-const CLOUD_MCP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
+const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 3;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
+const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
+const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
+const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
+const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
+const CLOUD_MCP_APPWRITE_JWT_REFRESH_MARGIN_MS: u64 = 60_000;
+const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
 const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
@@ -23,6 +29,7 @@ const CLOUD_MCP_KNOWLEDGE_MAX_NOTE_BYTES: u64 = 384 * 1024;
 #[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
+    auth: Arc<Mutex<CloudMcpAuthRuntime>>,
     spec_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpSpecGraphSyncRuntime>>>,
     spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
     knowledge_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpKnowledgeGraphSyncRuntime>>>,
@@ -30,6 +37,20 @@ struct CloudMcpState {
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
+}
+
+#[derive(Clone, Default)]
+struct CloudMcpAuthRuntime {
+    desktop_session_token: Option<String>,
+    appwrite_jwt: Option<String>,
+    appwrite_jwt_expires_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct CloudMcpProcessAuthCache {
+    desktop_session_token: Option<String>,
+    appwrite_jwt: Option<String>,
+    appwrite_jwt_expires_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -227,6 +248,7 @@ impl CloudMcpState {
                 registered_workspaces: HashMap::new(),
                 terminal_contexts: HashMap::new(),
             })),
+            auth: Arc::new(Mutex::new(CloudMcpAuthRuntime::default())),
             spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
             spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
             knowledge_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
@@ -264,6 +286,268 @@ fn cloud_mcp_dev_auth_token() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn cloud_mcp_process_auth_cache() -> &'static StdMutex<CloudMcpProcessAuthCache> {
+    static CLOUD_MCP_PROCESS_AUTH_CACHE: OnceLock<StdMutex<CloudMcpProcessAuthCache>> =
+        OnceLock::new();
+
+    CLOUD_MCP_PROCESS_AUTH_CACHE.get_or_init(|| StdMutex::new(CloudMcpProcessAuthCache::default()))
+}
+
+fn cloud_mcp_clean_bearer_token(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty()
+        || trimmed.len() > CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH
+        || trimmed
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn cloud_mcp_static_appwrite_jwt() -> Option<String> {
+    [
+        "RUST_DIFFFORGE_APPWRITE_JWT",
+        "RUST_DIFFFORGE_BALANCER_JWT",
+        "CLOUD_DIFFFORGE_APPWRITE_JWT",
+        "BALANCER_APPWRITE_JWT",
+        "APPWRITE_JWT",
+    ]
+    .iter()
+    .find_map(|key| {
+        env::var(key)
+            .ok()
+            .and_then(|value| cloud_mcp_clean_bearer_token(&value))
+    })
+}
+
+fn cloud_mcp_jwt_is_fresh(expires_ms: Option<u64>, now_ms: u64) -> bool {
+    expires_ms.is_some_and(|expires_ms| {
+        expires_ms > now_ms.saturating_add(CLOUD_MCP_APPWRITE_JWT_REFRESH_MARGIN_MS)
+    })
+}
+
+fn cloud_mcp_bearer_header(token: &str, label: &str) -> Result<HeaderValue, String> {
+    let token = cloud_mcp_clean_bearer_token(token)
+        .ok_or_else(|| format!("{label} is invalid for an Authorization header."))?;
+
+    HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|error| format!("Invalid {label} header: {error}"))
+}
+
+fn cloud_mcp_parse_appwrite_jwt_response(body: Value) -> Result<(String, u64), String> {
+    let jwt = body
+        .get("jwt")
+        .and_then(Value::as_str)
+        .and_then(cloud_mcp_clean_bearer_token)
+        .ok_or_else(|| "Diff Forge AI API did not return a valid Appwrite JWT.".to_string())?;
+    let ttl_seconds = body
+        .get("expiresInSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS)
+        .clamp(
+            CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS,
+            CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS,
+        );
+    let expires_ms = cloud_mcp_now_ms().saturating_add(ttl_seconds.saturating_mul(1_000));
+
+    Ok((jwt, expires_ms))
+}
+
+async fn cloud_mcp_fetch_appwrite_jwt(
+    desktop_session_token: &str,
+) -> Result<(String, u64), String> {
+    validate_auth_value("Desktop session", desktop_session_token)?;
+
+    let client = http_client(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))?;
+    let response = client
+        .post(format!("{API_BASE_URL}/desktop/appwrite-jwt"))
+        .bearer_auth(desktop_session_token)
+        .send()
+        .await
+        .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
+    let body = read_api_response(response, "Unable to prepare Cloud MCP Appwrite auth.").await?;
+
+    cloud_mcp_parse_appwrite_jwt_response(body)
+}
+
+fn cloud_mcp_read_blocking_api_response(
+    response: reqwest::blocking::Response,
+    fallback_message: &str,
+) -> Result<Value, String> {
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|error| format!("Unable to read Diff Forge AI API response: {error}"))?;
+    let response_body = if response_text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&response_text).map_err(|error| {
+            if status.is_success() {
+                format!("Diff Forge AI API returned invalid JSON: {error}")
+            } else {
+                format!(
+                    "{fallback_message} Diff Forge AI API returned {status} with a non-JSON response."
+                )
+            }
+        })?
+    };
+
+    if status.is_success() {
+        return Ok(response_body);
+    }
+
+    let api_error = response_body
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| response_body.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback_message);
+
+    Err(api_error.to_string())
+}
+
+fn cloud_mcp_fetch_appwrite_jwt_blocking(
+    desktop_session_token: &str,
+) -> Result<(String, u64), String> {
+    validate_auth_value("Desktop session", desktop_session_token)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
+        .user_agent("Diff Forge AI Desktop/0.1.0")
+        .build()
+        .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
+    let response = client
+        .post(format!("{API_BASE_URL}/desktop/appwrite-jwt"))
+        .bearer_auth(desktop_session_token)
+        .send()
+        .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
+    let body =
+        cloud_mcp_read_blocking_api_response(response, "Unable to prepare Cloud MCP Appwrite auth.")?;
+
+    cloud_mcp_parse_appwrite_jwt_response(body)
+}
+
+fn cloud_mcp_update_process_auth_cache(
+    desktop_session_token: Option<String>,
+    appwrite_jwt: Option<String>,
+    appwrite_jwt_expires_ms: Option<u64>,
+) {
+    let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() else {
+        return;
+    };
+
+    if let Some(desktop_session_token) = desktop_session_token {
+        cache.desktop_session_token = Some(desktop_session_token);
+    } else if appwrite_jwt.is_none() && appwrite_jwt_expires_ms.is_none() {
+        cache.desktop_session_token = None;
+    }
+
+    if let Some(appwrite_jwt) = appwrite_jwt {
+        cache.appwrite_jwt = Some(appwrite_jwt);
+        cache.appwrite_jwt_expires_ms = appwrite_jwt_expires_ms;
+    } else if appwrite_jwt_expires_ms.is_none() {
+        cache.appwrite_jwt = None;
+        cache.appwrite_jwt_expires_ms = None;
+    }
+}
+
+async fn cloud_mcp_authorization_bearer(
+    state: &CloudMcpState,
+) -> Result<Option<String>, String> {
+    if let Some(token) = cloud_mcp_static_appwrite_jwt() {
+        return Ok(Some(token));
+    }
+
+    let now_ms = cloud_mcp_now_ms();
+    let desktop_session_token = {
+        let auth = state.auth.lock().await;
+        if auth
+            .appwrite_jwt
+            .as_ref()
+            .is_some_and(|_| cloud_mcp_jwt_is_fresh(auth.appwrite_jwt_expires_ms, now_ms))
+        {
+            return Ok(auth.appwrite_jwt.clone());
+        }
+        auth.desktop_session_token.clone()
+    };
+
+    if let Some(desktop_session_token) = desktop_session_token {
+        let (jwt, expires_ms) = cloud_mcp_fetch_appwrite_jwt(&desktop_session_token).await?;
+        {
+            let mut auth = state.auth.lock().await;
+            auth.appwrite_jwt = Some(jwt.clone());
+            auth.appwrite_jwt_expires_ms = Some(expires_ms);
+        }
+        cloud_mcp_update_process_auth_cache(
+            Some(desktop_session_token),
+            Some(jwt.clone()),
+            Some(expires_ms),
+        );
+        return Ok(Some(jwt));
+    }
+
+    if let Some(token) = cloud_mcp_process_authorization_bearer() {
+        return Ok(Some(token));
+    }
+
+    Ok(cloud_mcp_dev_auth_token())
+}
+
+fn cloud_mcp_process_authorization_bearer() -> Option<String> {
+    if let Some(token) = cloud_mcp_static_appwrite_jwt() {
+        return Some(token);
+    }
+
+    let now_ms = cloud_mcp_now_ms();
+    let desktop_session_token = {
+        let Ok(cache) = cloud_mcp_process_auth_cache().lock() else {
+            return cloud_mcp_dev_auth_token();
+        };
+        if cache
+            .appwrite_jwt
+            .as_ref()
+            .is_some_and(|_| cloud_mcp_jwt_is_fresh(cache.appwrite_jwt_expires_ms, now_ms))
+        {
+            return cache.appwrite_jwt.clone();
+        }
+        cache.desktop_session_token.clone()
+    };
+
+    if let Some(desktop_session_token) = desktop_session_token {
+        if let Ok((jwt, expires_ms)) = cloud_mcp_fetch_appwrite_jwt_blocking(&desktop_session_token)
+        {
+            cloud_mcp_update_process_auth_cache(
+                Some(desktop_session_token),
+                Some(jwt.clone()),
+                Some(expires_ms),
+            );
+            return Some(jwt);
+        }
+    }
+
+    cloud_mcp_dev_auth_token()
+}
+
+async fn cloud_mcp_runtime_env_vars(state: &CloudMcpState) -> Result<Vec<(String, String)>, String> {
+    let base_url = {
+        let runtime = state.inner.lock().await;
+        runtime.base_url.clone()
+    };
+    let mut env_vars = vec![
+        ("CLOUD_DIFFFORGE_BASE_URL".to_string(), base_url.clone()),
+        ("CLOUD_MCP_BASE_URL".to_string(), base_url),
+    ];
+
+    if let Some(token) = cloud_mcp_authorization_bearer(state).await? {
+        env_vars.push(("CLOUD_DIFFFORGE_APPWRITE_JWT".to_string(), token));
+    }
+
+    Ok(env_vars)
 }
 
 fn cloud_mcp_now_ms() -> u64 {
@@ -413,10 +697,11 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
         "x-diffforge-client-id",
         HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
     );
-    if let Some(token) = cloud_mcp_dev_auth_token() {
-        let value = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|error| format!("Invalid Cloud MCP dev token header: {error}"))?;
-        request.headers_mut().insert("authorization", value);
+    if let Some(token) = cloud_mcp_authorization_bearer(state).await? {
+        request.headers_mut().insert(
+            "authorization",
+            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+        );
     }
 
     let (stream, _) = connect_async(request)
@@ -4105,6 +4390,34 @@ async fn require_cloud_mcp_terminal_gate_for_path(
 #[tauri::command]
 async fn cloud_mcp_connect(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
     cloud_mcp_connect_state(state.inner()).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_set_desktop_session_token(
+    state: State<'_, CloudMcpState>,
+    token: Option<String>,
+) -> Result<CloudMcpStatus, String> {
+    let token = token
+        .unwrap_or_default()
+        .replace(|character: char| character.is_control(), "")
+        .trim()
+        .to_string();
+    let desktop_session_token = if token.is_empty() {
+        None
+    } else {
+        validate_auth_value("Desktop session", &token)?;
+        Some(token)
+    };
+
+    {
+        let mut auth = state.auth.lock().await;
+        auth.desktop_session_token = desktop_session_token.clone();
+        auth.appwrite_jwt = None;
+        auth.appwrite_jwt_expires_ms = None;
+    }
+    cloud_mcp_update_process_auth_cache(desktop_session_token, None, None);
+
+    Ok(cloud_mcp_status_snapshot(state.inner()).await)
 }
 
 #[tauri::command]
@@ -10377,8 +10690,6 @@ fn cloud_mcp_proxy_post_json_endpoint(
     endpoint_path: &str,
     body: &str,
 ) -> Result<String, String> {
-    use std::io::Write as _;
-
     let request_kind = if endpoint_path == "/mcp" {
         "mcp"
     } else {
@@ -10386,7 +10697,6 @@ fn cloud_mcp_proxy_post_json_endpoint(
             format!("Cloud MCP endpoint {endpoint_path} is not routed through the app websocket")
         })?
     };
-    let endpoint = cloud_mcp_proxy_parse_http_url(base_url, "/v1/app/ws")?;
     let body_value = serde_json::from_str::<Value>(body)
         .map_err(|error| format!("invalid Cloud MCP websocket JSON payload: {error}"))?;
     let client_id = cloud_mcp_proxy_payload_text(&body_value, &["client_id"])
@@ -10403,53 +10713,39 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .or_else(|| {
             cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "workspace_id"])
         });
-    let mut stream = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .map_err(|error| format!("connect failed: {error}"))?;
-    let read_poll_timeout = Duration::from_secs(1);
-    let write_timeout = Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
-    let _ = stream.set_read_timeout(Some(read_poll_timeout));
-    let _ = stream.set_write_timeout(Some(write_timeout));
-
-    let websocket_key = general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
-    let expected_accept = cloud_mcp_proxy_ws_accept_key(&websocket_key);
-    let mut headers = format!("x-diffforge-client-id: {}\r\n", client_id.trim());
+    let ws_url = cloud_mcp_proxy_websocket_url(base_url, "/v1/app/ws")?;
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
+    request.headers_mut().insert(
+        "x-diffforge-client-id",
+        HeaderValue::from_str(client_id.trim())
+            .map_err(|error| format!("Invalid Cloud MCP client id header: {error}"))?,
+    );
     if let Some(workspace_id) = workspace_id.as_deref() {
-        headers.push_str(&format!(
-            "x-diffforge-workspace-id: {}\r\n",
-            workspace_id.trim()
-        ));
+        request.headers_mut().insert(
+            "x-diffforge-workspace-id",
+            HeaderValue::from_str(workspace_id.trim())
+                .map_err(|error| format!("Invalid Cloud MCP workspace id header: {error}"))?,
+        );
     }
     if let Some(repo_id) = repo_id.as_deref() {
-        headers.push_str(&format!("x-diffforge-repo-id: {}\r\n", repo_id.trim()));
+        request.headers_mut().insert(
+            "x-diffforge-repo-id",
+            HeaderValue::from_str(repo_id.trim())
+                .map_err(|error| format!("Invalid Cloud MCP repo id header: {error}"))?,
+        );
     }
-    if let Some(token) = cloud_mcp_dev_auth_token() {
-        headers.push_str(&format!("Authorization: Bearer {}\r\n", token));
-    }
-
-    let handshake = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n{}\r\n",
-        endpoint.path,
-        endpoint.host_header,
-        websocket_key,
-        headers,
-    );
-    stream
-        .write_all(handshake.as_bytes())
-        .map_err(|error| format!("write failed: {error}"))?;
-    let head = cloud_mcp_proxy_read_http_headers(&mut stream)?;
-    if !head.starts_with("HTTP/1.1 101") && !head.starts_with("HTTP/1.0 101") {
-        return Err(format!(
-            "Cloud MCP websocket upgrade returned {}",
-            head.lines().next().unwrap_or("non-101 status")
-        ));
-    }
-    if let Some(actual_accept) = cloud_mcp_proxy_http_header(&head, "sec-websocket-accept") {
-        if actual_accept.trim() != expected_accept {
-            return Err("Cloud MCP websocket upgrade returned an invalid accept key".to_string());
-        }
+    if let Some(token) = cloud_mcp_process_authorization_bearer() {
+        request.headers_mut().insert(
+            "authorization",
+            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+        );
     }
 
-    let ready_text = cloud_mcp_proxy_read_ws_text_frame(&mut stream)?;
+    let (mut websocket, _) = tokio_tungstenite::tungstenite::connect(request)
+        .map_err(|error| format!("Unable to open Cloud MCP websocket: {error}"))?;
+    let ready_text = cloud_mcp_proxy_read_blocking_ws_text(&mut websocket)?;
     let ready = serde_json::from_str::<Value>(&ready_text)
         .map_err(|error| format!("Cloud MCP websocket ready frame was invalid JSON: {error}"))?;
     let (connection_id, message_token) = cloud_mcp_proxy_extract_ws_message_auth(&ready)?;
@@ -10467,14 +10763,16 @@ fn cloud_mcp_proxy_post_json_endpoint(
         "workspace_id": workspace_id,
         "request": body_value,
     });
-    cloud_mcp_proxy_write_ws_text_frame(&mut stream, &envelope.to_string())?;
+    websocket
+        .send(Message::Text(envelope.to_string().into()))
+        .map_err(|error| format!("Cloud MCP websocket write failed: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
     loop {
         if Instant::now() >= deadline {
             return Err("Cloud MCP websocket request timed out.".to_string());
         }
-        let response_text = cloud_mcp_proxy_read_ws_text_frame(&mut stream)?;
+        let response_text = cloud_mcp_proxy_read_blocking_ws_text(&mut websocket)?;
         let response = serde_json::from_str::<Value>(&response_text)
             .map_err(|error| format!("Cloud MCP websocket response was invalid JSON: {error}"))?;
         if response.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
@@ -10504,68 +10802,57 @@ fn cloud_mcp_proxy_post_json_endpoint(
     }
 }
 
+fn cloud_mcp_proxy_websocket_url(base_url: &str, endpoint_path: &str) -> Result<String, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let websocket_base = if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed.to_string()
+    } else {
+        return Err("Cloud MCP URL must start with http://, https://, ws://, or wss://".to_string());
+    };
+
+    Ok(format!(
+        "{}/{}",
+        websocket_base.trim_end_matches('/'),
+        endpoint_path.trim_start_matches('/')
+    ))
+}
+
+fn cloud_mcp_proxy_read_blocking_ws_text<S>(
+    websocket: &mut tokio_tungstenite::tungstenite::WebSocket<S>,
+) -> Result<String, String>
+where
+    S: Read + Write,
+{
+    loop {
+        match websocket
+            .read()
+            .map_err(|error| format!("Cloud MCP websocket read failed: {error}"))?
+        {
+            Message::Text(text) => return Ok(text.to_string()),
+            Message::Binary(bytes) => {
+                return String::from_utf8(bytes.to_vec()).map_err(|error| {
+                    format!("Cloud MCP websocket returned invalid UTF-8: {error}")
+                });
+            }
+            Message::Ping(payload) => websocket
+                .send(Message::Pong(payload))
+                .map_err(|error| format!("Cloud MCP websocket pong failed: {error}"))?,
+            Message::Close(_) => return Err("Cloud MCP websocket closed.".to_string()),
+            _ => {}
+        }
+    }
+}
+
 fn cloud_mcp_proxy_payload_text(value: &Value, path: &[&str]) -> Option<String> {
     let mut cursor = value;
     for segment in path {
         cursor = cursor.get(*segment)?;
     }
     cursor.as_str().map(str::to_string)
-}
-
-fn cloud_mcp_proxy_ws_accept_key(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    general_purpose::STANDARD.encode(hasher.finalize())
-}
-
-fn cloud_mcp_proxy_http_header(head: &str, header_name: &str) -> Option<String> {
-    head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case(header_name) {
-            Some(value.trim().to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn cloud_mcp_proxy_read_http_headers(stream: &mut std::net::TcpStream) -> Result<String, String> {
-    use std::io::Read as _;
-
-    let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS);
-    let mut response = Vec::new();
-    let mut buffer = [0u8; 1];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err("Cloud MCP websocket closed during handshake".to_string()),
-            Ok(bytes_read) => {
-                response.extend_from_slice(&buffer[..bytes_read]);
-                if response.ends_with(b"\r\n\r\n") {
-                    let header_len = response.len().saturating_sub(4);
-                    return String::from_utf8(response[..header_len].to_vec()).map_err(|error| {
-                        format!("Cloud MCP websocket returned invalid handshake headers: {error}")
-                    });
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if Instant::now() >= deadline {
-                    return Err("Cloud MCP websocket handshake timed out".to_string());
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Cloud MCP websocket handshake read failed: {error}"
-                ))
-            }
-        }
-    }
 }
 
 fn cloud_mcp_proxy_extract_ws_message_auth(ready: &Value) -> Result<(String, String), String> {
@@ -10587,181 +10874,4 @@ fn cloud_mcp_proxy_extract_ws_message_auth(ready: &Value) -> Result<(String, Str
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "Cloud MCP websocket ready frame omitted message_token".to_string())?;
     Ok((connection_id.to_string(), message_token.to_string()))
-}
-
-fn cloud_mcp_proxy_write_ws_text_frame(
-    stream: &mut std::net::TcpStream,
-    text: &str,
-) -> Result<(), String> {
-    cloud_mcp_proxy_write_ws_frame(stream, 0x1, text.as_bytes())
-}
-
-fn cloud_mcp_proxy_write_ws_pong_frame(
-    stream: &mut std::net::TcpStream,
-    payload: &[u8],
-) -> Result<(), String> {
-    cloud_mcp_proxy_write_ws_frame(stream, 0xA, payload)
-}
-
-fn cloud_mcp_proxy_write_ws_frame(
-    stream: &mut std::net::TcpStream,
-    opcode: u8,
-    payload: &[u8],
-) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x80 | (opcode & 0x0F));
-    if payload.len() <= 125 {
-        frame.push(0x80 | payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        frame.push(0x80 | 126);
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        frame.push(0x80 | 127);
-        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    let mask_seed = cloud_mcp_now_ms() ^ u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
-    let mask = (mask_seed as u32).to_be_bytes();
-    frame.extend_from_slice(&mask);
-    for (index, byte) in payload.iter().enumerate() {
-        frame.push(*byte ^ mask[index % 4]);
-    }
-    stream
-        .write_all(&frame)
-        .map_err(|error| format!("Cloud MCP websocket write failed: {error}"))
-}
-
-fn cloud_mcp_proxy_read_ws_text_frame(stream: &mut std::net::TcpStream) -> Result<String, String> {
-    loop {
-        let (opcode, payload) = cloud_mcp_proxy_read_ws_frame(stream)?;
-        match opcode {
-            0x1 => {
-                return String::from_utf8(payload).map_err(|error| {
-                    format!("Cloud MCP websocket returned invalid UTF-8 text: {error}")
-                });
-            }
-            0x8 => return Err("Cloud MCP websocket closed the connection".to_string()),
-            0x9 => {
-                cloud_mcp_proxy_write_ws_pong_frame(stream, &payload)?;
-            }
-            0xA => {}
-            _ => {}
-        }
-    }
-}
-
-fn cloud_mcp_proxy_read_ws_frame(
-    stream: &mut std::net::TcpStream,
-) -> Result<(u8, Vec<u8>), String> {
-    let mut header = [0u8; 2];
-    cloud_mcp_proxy_read_exact(stream, &mut header)?;
-    let opcode = header[0] & 0x0F;
-    let masked = header[1] & 0x80 != 0;
-    let mut length = u64::from(header[1] & 0x7F);
-    if length == 126 {
-        let mut extended = [0u8; 2];
-        cloud_mcp_proxy_read_exact(stream, &mut extended)?;
-        length = u64::from(u16::from_be_bytes(extended));
-    } else if length == 127 {
-        let mut extended = [0u8; 8];
-        cloud_mcp_proxy_read_exact(stream, &mut extended)?;
-        length = u64::from_be_bytes(extended);
-    }
-    if length > 16 * 1024 * 1024 {
-        return Err("Cloud MCP websocket frame is too large".to_string());
-    }
-    let mask = if masked {
-        let mut mask = [0u8; 4];
-        cloud_mcp_proxy_read_exact(stream, &mut mask)?;
-        Some(mask)
-    } else {
-        None
-    };
-    let mut payload = vec![0u8; length as usize];
-    if !payload.is_empty() {
-        cloud_mcp_proxy_read_exact(stream, &mut payload)?;
-    }
-    if let Some(mask) = mask {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-    Ok((opcode, payload))
-}
-
-fn cloud_mcp_proxy_read_exact(
-    stream: &mut std::net::TcpStream,
-    buffer: &mut [u8],
-) -> Result<(), String> {
-    use std::io::Read as _;
-
-    let deadline = Instant::now() + Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS);
-    let mut read = 0usize;
-    while read < buffer.len() {
-        match stream.read(&mut buffer[read..]) {
-            Ok(0) => return Err("Cloud MCP websocket closed unexpectedly".to_string()),
-            Ok(bytes_read) => read += bytes_read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if Instant::now() >= deadline {
-                    return Err("Cloud MCP websocket read timed out".to_string());
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(format!("Cloud MCP websocket read failed: {error}")),
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct CloudMcpProxyEndpoint {
-    host: String,
-    host_header: String,
-    port: u16,
-    path: String,
-}
-
-fn cloud_mcp_proxy_parse_http_url(
-    base_url: &str,
-    endpoint_path: &str,
-) -> Result<CloudMcpProxyEndpoint, String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let without_scheme = trimmed.strip_prefix("http://").ok_or_else(|| {
-        "Cloud MCP stdio proxy currently supports local http:// URLs only".to_string()
-    })?;
-    let (authority, prefix) = without_scheme
-        .split_once('/')
-        .map(|(authority, path)| (authority, format!("/{path}")))
-        .unwrap_or((without_scheme, String::new()));
-    let (host, port) = authority
-        .rsplit_once(':')
-        .and_then(|(host, port)| {
-            port.parse::<u16>()
-                .ok()
-                .map(|port| (host.to_string(), port))
-        })
-        .unwrap_or_else(|| (authority.to_string(), 80));
-    let path = format!(
-        "{}/{}",
-        prefix.trim_end_matches('/'),
-        endpoint_path.trim_start_matches('/')
-    );
-    let host_header = if port == 80 {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
-
-    Ok(CloudMcpProxyEndpoint {
-        host,
-        host_header,
-        port,
-        path,
-    })
 }

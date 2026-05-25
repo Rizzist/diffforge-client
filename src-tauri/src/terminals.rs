@@ -2312,12 +2312,13 @@ async fn terminal_open(
             instance_id,
         );
         validate_terminal_agent_launch_args_for_platform(launch_provider_id, &launch_args)?;
-        let coordination_env_vars = terminal_coordination
+        let mut coordination_env_vars = terminal_coordination
             .as_ref()
-            .map(|coordination| coordination.env_vars.as_slice())
-            .unwrap_or(&[]);
+            .map(|coordination| coordination.env_vars.clone())
+            .unwrap_or_default();
+        coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
         let launch_env_vars =
-            terminal_env_vars_with_opencode_tui_config(launch_provider_id, coordination_env_vars)?;
+            terminal_env_vars_with_opencode_tui_config(launch_provider_id, &coordination_env_vars)?;
 
         let warm_pty = match create_agent_terminal_pty(
             size,
@@ -2664,13 +2665,14 @@ async fn terminal_start_agent(
         instance.id,
     );
     validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)?;
-    let coordination_env_vars = instance
+    let mut coordination_env_vars = instance
         .coordination
         .as_ref()
-        .map(|coordination| coordination.env_vars.as_slice())
-        .unwrap_or(&[]);
+        .map(|coordination| coordination.env_vars.clone())
+        .unwrap_or_default();
+    coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
     let launch_env_vars =
-        terminal_env_vars_with_opencode_tui_config(definition.id, coordination_env_vars)?;
+        terminal_env_vars_with_opencode_tui_config(definition.id, &coordination_env_vars)?;
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
         &launch_args,
@@ -2698,7 +2700,7 @@ async fn terminal_start_agent(
 
 async fn start_terminal_agent_in_prepared_pty(
     _app: AppHandle,
-    _cloud_mcp_state: CloudMcpState,
+    cloud_mcp_state: CloudMcpState,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     _parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     request: TerminalStartAgentRequest,
@@ -2860,13 +2862,26 @@ async fn start_terminal_agent_in_prepared_pty(
                 message: error,
             };
         }
-        let coordination_env_vars = instance
+        let mut coordination_env_vars = instance
             .coordination
             .as_ref()
-            .map(|coordination| coordination.env_vars.as_slice())
-            .unwrap_or(&[]);
+            .map(|coordination| coordination.env_vars.clone())
+            .unwrap_or_default();
+        let cloud_env_vars = match cloud_mcp_runtime_env_vars(&cloud_mcp_state).await {
+            Ok(env_vars) => env_vars,
+            Err(error) => {
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
+        };
+        coordination_env_vars.extend(cloud_env_vars);
         let launch_env_vars =
-            match terminal_env_vars_with_opencode_tui_config(definition.id, coordination_env_vars)
+            match terminal_env_vars_with_opencode_tui_config(definition.id, &coordination_env_vars)
             {
                 Ok(env_vars) => env_vars,
                 Err(error) => {

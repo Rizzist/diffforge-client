@@ -3405,6 +3405,7 @@ fn update_cloud_voice_agent_tts_suppression(
 async fn run_cloud_voice_agent_stream(
     app: AppHandle,
     ws_url: String,
+    auth_bearer: Option<String>,
     start_request: Value,
     workspace_id: String,
     repo_id: String,
@@ -3457,13 +3458,13 @@ async fn run_cloud_voice_agent_stream(
             }
         }
     }
-    if let Some(token) = cloud_mcp_dev_auth_token() {
-        match HeaderValue::from_str(&format!("Bearer {token}")) {
+    if let Some(token) = auth_bearer.as_deref() {
+        match cloud_mcp_bearer_header(token, "Cloud voice agent auth token") {
             Ok(header) => {
                 request.headers_mut().insert("authorization", header);
             }
             Err(error) => {
-                let message = format!("Invalid Cloud MCP dev token header: {error}");
+                let message = error;
                 let _ = ready_tx.send(Err(message.clone()));
                 let _ = finished_tx.send(Err(message));
                 return;
@@ -3873,6 +3874,7 @@ async fn run_cloud_voice_agent_stream(
 async fn run_cloud_voice_agent_text_message(
     app: AppHandle,
     ws_url: String,
+    auth_bearer: Option<String>,
     text_request: Value,
     workspace_id: String,
     repo_id: String,
@@ -3918,13 +3920,13 @@ async fn run_cloud_voice_agent_text_message(
             }
         }
     }
-    if let Some(token) = cloud_mcp_dev_auth_token() {
-        match HeaderValue::from_str(&format!("Bearer {token}")) {
+    if let Some(token) = auth_bearer.as_deref() {
+        match cloud_mcp_bearer_header(token, "Cloud voice agent auth token") {
             Ok(header) => {
                 request.headers_mut().insert("authorization", header);
             }
             Err(error) => {
-                let message = format!("Invalid Cloud MCP dev token header: {error}");
+                let message = error;
                 let _ = ready_tx.send(Err(message));
                 return;
             }
@@ -4062,6 +4064,7 @@ async fn run_cloud_voice_agent_text_message(
 async fn start_cloud_voice_agent_stream(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     request: CloudVoiceAgentStartRequest,
 ) -> Result<CloudVoiceAgentStartStatus, String> {
     log_audio_diagnostic_event("audio.cloud_voice.start.command", json!({}));
@@ -4156,9 +4159,11 @@ async fn start_cloud_voice_agent_stream(
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel::<CloudVoiceAgentControl>();
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
     tauri::async_runtime::spawn(run_cloud_voice_agent_stream(
         app,
         cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
+        auth_bearer,
         start_request,
         workspace_id.clone(),
         repo_id.clone(),
@@ -4202,6 +4207,7 @@ async fn start_cloud_voice_agent_stream(
 async fn send_cloud_voice_agent_text_message(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
     request: CloudVoiceAgentTextMessageRequest,
 ) -> Result<(), String> {
     log_audio_diagnostic_event("audio.cloud_voice.text_message.command", json!({}));
@@ -4255,9 +4261,11 @@ async fn send_cloud_voice_agent_text_message(
         "llm_orchestrator_policy": cloud_voice_agent_llm_orchestrator_policy(),
     });
     let (ready_tx, ready_rx) = oneshot::channel();
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
     tauri::async_runtime::spawn(run_cloud_voice_agent_text_message(
         app,
         cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
+        auth_bearer,
         text_request,
         workspace_id,
         repo_id,

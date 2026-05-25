@@ -479,6 +479,16 @@ const WINDOW_RESIZE_EDGES = [
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
 
+async function syncCloudMcpDesktopSessionToken(token) {
+  try {
+    await invoke("cloud_mcp_set_desktop_session_token", {
+      token: isSafeAuthValue(token) ? token : null,
+    });
+  } catch {
+    // Cloud MCP retries after the next auth transition.
+  }
+}
+
 function readMainWindowFocusedFallback() {
   if (typeof document === "undefined") {
     return true;
@@ -3799,6 +3809,9 @@ export default function App() {
       clearSession: options.clearSession !== false,
       clearPending: options.clearPending === true,
     });
+    if (options.clearSession !== false) {
+      void syncCloudMcpDesktopSessionToken("");
+    }
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -3833,6 +3846,7 @@ export default function App() {
       sessionUser,
       isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
     );
+    void syncCloudMcpDesktopSessionToken(authStore.getToken());
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");

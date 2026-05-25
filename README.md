@@ -15,3 +15,8 @@ npm run build
 During development, Vite runs on `127.0.0.1` as a private hot-reload feed for the native WebView. That URL is not the product surface and is not used by packaged builds.
 
 Desktop login opens `https://diffforge.ai/desktop/login` in the system browser, receives a `diffforge://auth/callback` deep link, exchanges the one-time code with `https://diffforge.ai/api/desktop/sessions/exchange`, and validates stored desktop sessions on app launch.
+
+Cloud MCP traffic defaults to `https://balancer.diffforge.ai`. After desktop
+login, the app keeps the desktop session token locally and exchanges it through
+`next-diffforge` for short-lived Appwrite JWTs before opening balancer
+websockets or syncing coordination events.

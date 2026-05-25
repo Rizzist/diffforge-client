@@ -2650,6 +2650,7 @@ pub fn run() {
             note_main_window_minimize_requested,
             terminal_recover_crashed_sessions,
             cloud_mcp_connect,
+            cloud_mcp_set_desktop_session_token,
             cloud_mcp_get_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
