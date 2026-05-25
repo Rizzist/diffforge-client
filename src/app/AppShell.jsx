@@ -453,12 +453,14 @@ const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
 const PRICING_URL = "https://diffforge.ai/pricing";
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
-const AUTH_STARTUP_TIMEOUT_MS = 5000;
+const AUTH_STARTUP_TIMEOUT_MS = 30000;
 const DEEP_LINK_STARTUP_TIMEOUT_MS = 1000;
 const SESSION_RESTORE_TIMEOUT_MS = 5000;
 const SESSION_RESTORE_TIMEOUT_MESSAGE = "Secure session check timed out after 5 seconds.";
 const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
 const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
+const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
+const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
@@ -479,13 +481,35 @@ const WINDOW_RESIZE_EDGES = [
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
 
-async function syncCloudMcpDesktopSessionToken(token) {
+async function syncCloudMcpDesktopSessionToken(token, options = {}) {
   try {
-    await invoke("cloud_mcp_set_desktop_session_token", {
-      token: isSafeAuthValue(token) ? token : null,
+    const safeToken = isSafeAuthValue(token) ? token : null;
+    const status = await invoke("cloud_mcp_set_desktop_session_token", {
+      token: safeToken,
     });
-  } catch {
+
+    if (!options.requireConnected || !safeToken) {
+      return status;
+    }
+
+    const connectedStatus = await withTimeout(
+      invoke("cloud_mcp_connect"),
+      CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
+      CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
+    );
+
+    if (!connectedStatus?.connected || !connectedStatus?.globalWsConnected) {
+      throw new Error("Cloud workspace websocket is not connected yet.");
+    }
+
+    return connectedStatus;
+  } catch (error) {
+    if (options.requireConnected) {
+      throw error;
+    }
+
     // Cloud MCP retries after the next auth transition.
+    return null;
   }
 }
 
@@ -4265,6 +4289,13 @@ export default function App() {
         return;
       }
 
+      authStore.setChecking("Connecting cloud workspace...");
+      await syncCloudMcpDesktopSessionToken(token, { requireConnected: true });
+
+      if (validationFlowId !== authFlowIdRef.current) {
+        return;
+      }
+
       setAuthenticated(session.user);
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
@@ -4273,13 +4304,20 @@ export default function App() {
 
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
-      setSignedOut(
-        didTimeout
+      const didCloudMcpFail =
+        restoreError === CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE ||
+        restoreError.includes("Cloud MCP") ||
+        restoreError.includes("Cloud workspace");
+      const signedOutMessage = didCloudMcpFail
+        ? "Cloud workspace is not ready yet. Try again in a moment."
+        : didTimeout
           ? "Secure session check timed out. Sign in with the web app."
-          : "Your desktop session expired. Sign in again with the web app.",
-        restoreError,
-        { clearPending: true },
-      );
+          : "Your desktop session expired. Sign in again with the web app.";
+
+      setSignedOut(signedOutMessage, restoreError, {
+        clearPending: true,
+        clearSession: !didCloudMcpFail,
+      });
     }
   }, [setAuthenticated, setSignedOut]);
 
@@ -4314,6 +4352,13 @@ export default function App() {
         AUTH_EXCHANGE_TIMEOUT_MS,
         AUTH_EXCHANGE_TIMEOUT_MESSAGE,
       );
+
+      if (loginFlowId !== authFlowIdRef.current) {
+        return true;
+      }
+
+      authStore.setExchanging("Connecting cloud workspace...");
+      await syncCloudMcpDesktopSessionToken(session.token, { requireConnected: true });
 
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
