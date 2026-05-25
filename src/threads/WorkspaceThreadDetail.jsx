@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { AddPhotoAlternate } from "@styled-icons/material-rounded/AddPhotoAlternate";
+import { Add } from "@styled-icons/material-rounded/Add";
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
@@ -1155,6 +1155,52 @@ const ComposerToolButton = styled.button`
   }
 `;
 
+const ComposerAttachButton = styled(ComposerToolButton)`
+  width: 30px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: var(--thread-muted);
+  background: transparent;
+
+  &:hover:not(:disabled) {
+    border-color: transparent;
+    color: #f2f2f2;
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  svg {
+    width: 20px;
+    height: 20px;
+  }
+`;
+
+const ComposerStatusLine = styled.div`
+  display: flex;
+  min-width: 0;
+  min-height: 18px;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  padding: 2px 0;
+  color: rgba(232, 232, 232, 0.82);
+  font-size: var(--thread-detail-small-font-size, 11px);
+  font-weight: 620;
+  line-height: 1.35;
+  white-space: nowrap;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  span:first-child {
+    color: #f0f0f0;
+  }
+`;
+
 const ModelMenuWrap = styled.div`
   display: none;
   position: relative;
@@ -1169,31 +1215,6 @@ const ModelButton = styled(ComposerToolButton)`
   &[data-empty="true"] {
     width: 30px;
     padding: 0;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  svg {
-    width: 15px;
-    height: 15px;
-    color: var(--thread-muted-soft);
-  }
-`;
-
-const AgentButton = styled(ComposerToolButton)`
-  max-width: min(150px, 28vw);
-  color: #e6e6e6;
-  cursor: default;
-  pointer-events: none;
-
-  &:hover {
-    border-color: transparent;
-    background: rgba(255, 255, 255, 0.045);
   }
 
   span {
@@ -1623,16 +1644,9 @@ const NewChatProject = styled.div`
   white-space: nowrap;
 `;
 
-const NewChatAttachButton = styled(ComposerToolButton)`
+const NewChatAttachButton = styled(ComposerAttachButton)`
   width: 32px;
   height: 32px;
-  border-radius: 8px;
-  color: var(--thread-muted);
-  background: transparent;
-
-  &:hover:not(:disabled) {
-    background: var(--thread-accent);
-  }
 `;
 
 const NewChatSendButton = styled(SendButton)`
@@ -1700,14 +1714,14 @@ const MODEL_OPTIONS = {
   claude: [
     { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
     { detail: "Higher capability", label: "Opus", value: "opus" },
-    { detail: "Fastest Claude option", label: "Haiku", value: "haiku" },
+    { detail: "Fastest Claude option", label: "Haiku", speed: "fast", value: "haiku" },
   ],
   codex: [
-    { detail: "Latest Codex model", label: "5.5", value: "gpt-5.5" },
-    { detail: "Balanced coding model", label: "5.4", value: "gpt-5.4" },
-    { detail: "Fast coding model", label: "5.3 Codex Spark", value: "gpt-5.3-codex-spark" },
-    { detail: "Long-running work model", label: "5.2", value: "gpt-5.2" },
-    { detail: "Older Codex model", label: "5.1", value: "gpt-5.1" },
+    { detail: "Latest Codex model", label: "5.5", thinkingPower: "xhigh", value: "gpt-5.5" },
+    { detail: "Balanced coding model", label: "5.4", thinkingPower: "high", value: "gpt-5.4" },
+    { detail: "Fast coding model", label: "5.3 Codex Spark", speed: "fast", thinkingPower: "high", value: "gpt-5.3-codex-spark" },
+    { detail: "Long-running work model", label: "5.2", thinkingPower: "high", value: "gpt-5.2" },
+    { detail: "Older Codex model", label: "5.1", thinkingPower: "medium", value: "gpt-5.1" },
   ],
   opencode: [
     { detail: "Vision capable when configured in OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
@@ -1732,6 +1746,19 @@ function normalizeAgentId(value) {
   }
 
   return THREAD_AGENT_IDS.has(agentId) ? agentId : "codex";
+}
+
+function getConfiguredModelOption(agentId, model) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const normalizedModel = String(model || "").trim();
+
+  if (!normalizedModel) {
+    return null;
+  }
+
+  return (MODEL_OPTIONS[normalizedAgentId] || []).find((option) => (
+    String(option?.value || "").trim() === normalizedModel
+  )) || null;
 }
 
 function findAgentStatus(agentStatuses, agentId) {
@@ -1765,12 +1792,18 @@ function getAttachmentLogSummary(attachments) {
 function getModelThinkingPowerMetadata(agentId, option, model) {
   const normalizedAgentId = normalizeAgentId(agentId);
   const normalizedModel = String(model || option?.value || "").trim().toLowerCase();
+  const configuredOption = getConfiguredModelOption(normalizedAgentId, normalizedModel);
   const explicitValue = String(
     option?.thinkingPower
       || option?.reasoningEffort
       || option?.reasoning_effort
       || option?.thinkingBudget
       || option?.thinking_budget
+      || configuredOption?.thinkingPower
+      || configuredOption?.reasoningEffort
+      || configuredOption?.reasoning_effort
+      || configuredOption?.thinkingBudget
+      || configuredOption?.thinking_budget
       || "",
   ).trim();
 
@@ -1855,6 +1888,39 @@ function getVisibleModelLabel(option) {
 
 function getModelButtonLabel(option) {
   return getVisibleModelLabel(option) || "Model";
+}
+
+function getCompactModelLabel(agentId, option, model) {
+  return String(model || option?.value || "").trim();
+}
+
+function formatComposerMetaLabel(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function getThinkingPowerLabel(agentId, option, model) {
+  const metadata = getModelThinkingPowerMetadata(agentId, option, model);
+  return String(metadata.thinkingPower || "").trim();
+}
+
+function getModelSpeedLabel(agentId, option, model) {
+  const modelValue = String(model || option?.value || "").trim();
+  const configuredOption = getConfiguredModelOption(agentId, modelValue);
+  const value = String(option?.speed || configuredOption?.speed || "").trim();
+
+  return formatComposerMetaLabel(value);
+}
+
+function getComposerStatusItems(agentId, option, model) {
+  return [
+    AGENT_LABELS[normalizeAgentId(agentId)] || "Agent",
+    getCompactModelLabel(agentId, option, model),
+    getThinkingPowerLabel(agentId, option, model),
+    getModelSpeedLabel(agentId, option, model),
+  ].filter(Boolean);
 }
 
 function getConcreteModelValue(modelOptions) {
@@ -2798,7 +2864,7 @@ function NewChatView({
                 }
                 type="button"
               >
-                <AddPhotoAlternate aria-hidden="true" />
+                <Add aria-hidden="true" />
               </NewChatAttachButton>
               <NewChatAgentMenuWrap
                 onBlur={(event) => {
@@ -4208,7 +4274,8 @@ function WorkspaceThreadDetail({
   const canSubmit = Boolean(thread && (hasActiveTerminalBinding || hasProviderSession));
   const agentLabel = AGENT_LABELS[activeAgentId] || "agent";
   const selectedModelOption = modelOptions.find((option) => option.value === currentTuiModel) || modelOptions[0];
-  const modelButtonLabel = getModelButtonLabel(selectedModelOption);
+  const composerStatusItems = getComposerStatusItems(activeAgentId, selectedModelOption, currentTuiModel);
+  const composerStatusTitle = composerStatusItems.join(" ");
   const imageInputSupport = getImageInputSupport(activeAgentId, activeAgentStatus, currentTuiModel);
   const placeholder = hasActiveTerminalBinding
     ? `Ask ${agentLabel} to work in this thread`
@@ -5421,7 +5488,7 @@ function WorkspaceThreadDetail({
           />
           <ComposerFooter>
             <ComposerControls>
-              <ComposerToolButton
+              <ComposerAttachButton
                 aria-label="Upload image"
                 disabled={
                   !canSubmit
@@ -5437,53 +5504,15 @@ function WorkspaceThreadDetail({
                 }
                 type="button"
               >
-                <AddPhotoAlternate aria-hidden="true" />
-              </ComposerToolButton>
-              <AgentButton
-                aria-disabled="true"
-                tabIndex={-1}
-                title={AGENT_LABELS[activeAgentId] || "Agent"}
-                type="button"
-              >
-                <span>{AGENT_LABELS[activeAgentId] || "Agent"}</span>
-                <ExpandMore aria-hidden="true" />
-              </AgentButton>
+                <Add aria-hidden="true" />
+              </ComposerAttachButton>
             </ComposerControls>
             <ComposerActions>
-              <ModelMenuWrap
-                onBlur={(event) => {
-                  if (!event.currentTarget.contains(event.relatedTarget)) {
-                    setModelMenuOpen(false);
-                  }
-                }}
-              >
-                <ModelButton
-                  aria-expanded={modelMenuOpen ? "true" : "false"}
-                  aria-haspopup="menu"
-                  onClick={() => setModelMenuOpen((isOpen) => !isOpen)}
-                  title={selectedModelOption?.detail || "Model"}
-                  type="button"
-                >
-                  <span>{modelButtonLabel}</span>
-                  <ExpandMore aria-hidden="true" />
-                </ModelButton>
-                <ModelDropdown data-open={modelMenuOpen ? "true" : "false"} role="menu">
-                  {modelOptions.map((option) => (
-                    <ModelOption
-                      data-selected={option.value === selectedModel ? "true" : "false"}
-                      key={option.value || option.label}
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={() => selectModel(option)}
-                      role="menuitem"
-                      title={option.detail}
-                      type="button"
-                    >
-                      <strong>{option.label}</strong>
-                      <span>{option.detail}</span>
-                    </ModelOption>
-                  ))}
-                </ModelDropdown>
-              </ModelMenuWrap>
+              <ComposerStatusLine title={composerStatusTitle}>
+                {composerStatusItems.map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </ComposerStatusLine>
               <SendButton
                 aria-label="Send message"
                 disabled={submitDisabled}

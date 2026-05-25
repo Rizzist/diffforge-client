@@ -3784,7 +3784,7 @@ export default function App() {
 
   const clearWorkspaceSelectionFromRail = useCallback((event) => {
     const interactiveTarget = event.target.closest?.(
-      'a, button, input, select, textarea, [role="button"], [data-rail-interactive="true"]',
+      'a, button, input, select, textarea, [role="button"], [data-rail-interactive="true"], [data-rail-selection-preserve="true"]',
     );
 
     if (interactiveTarget) {
@@ -10071,7 +10071,7 @@ export default function App() {
                   </WorkspaceList>
                 </RailTop>
 
-                <RailFooter>
+                <RailFooter data-rail-selection-preserve="true">
                   {shouldShowTerminalNav && (
                     <RailActionButton
                       aria-label="Terminals"

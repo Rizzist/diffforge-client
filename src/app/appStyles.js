@@ -2261,8 +2261,8 @@ export const WorkspaceList = styled.div`
   min-width: 0;
   max-width: 100%;
   gap: 6px;
-  overflow-x: hidden;
-  overflow-y: auto;
+  /* RailTop owns scrolling; this stays a simple stack of workspace rows. */
+  overflow: visible;
   padding-right: 2px;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
