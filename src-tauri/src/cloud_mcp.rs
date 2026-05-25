@@ -4,6 +4,7 @@ use notify::{
 };
 
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
+const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 3;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
@@ -268,16 +269,63 @@ fn cloud_mcp_base_url() -> String {
     ]
     .iter()
     .find_map(|key| {
-        env::var(key).ok().and_then(|value| {
-            let trimmed = value.trim().trim_end_matches('/').to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
+        env::var(key)
+            .ok()
+            .and_then(|value| cloud_mcp_normalized_base_url(&value))
     })
     .unwrap_or_else(|| CLOUD_MCP_DEFAULT_BASE_URL.to_string())
+}
+
+fn cloud_mcp_normalized_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if cloud_mcp_url_is_loopback(&trimmed) && !cloud_mcp_local_override_allowed() {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn cloud_mcp_local_override_allowed() -> bool {
+    [CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV, "CLOUD_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP"]
+        .iter()
+        .any(|key| {
+            env::var(key).ok().is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
+}
+
+fn cloud_mcp_url_is_loopback(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .or_else(|| lower.strip_prefix("ws://"))
+        .or_else(|| lower.strip_prefix("wss://"))
+        .unwrap_or(lower.as_str());
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.starts_with("127.")
 }
 
 fn cloud_mcp_dev_auth_token() -> Option<String> {
@@ -8717,7 +8765,8 @@ impl CloudMcpProxyIdentity {
             .get("base-url")
             .cloned()
             .or_else(|| env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
-            .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok());
+            .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok())
+            .and_then(|value| cloud_mcp_normalized_base_url(&value));
 
         let client_id = values
             .get("client-id")
