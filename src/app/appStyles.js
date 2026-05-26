@@ -2232,7 +2232,7 @@ export const RailHeader = styled.div`
   display: grid;
   height: 28px;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) 28px;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
   align-items: center;
   gap: 8px;
   animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
@@ -2241,7 +2241,7 @@ export const RailHeader = styled.div`
     grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    grid-template-columns: 0 28px;
+    grid-template-columns: 0 0 28px;
     gap: 0;
     justify-content: center;
     justify-items: center;
@@ -2249,7 +2249,7 @@ export const RailHeader = styled.div`
 
   @media (max-width: 760px) {
     height: 28px;
-    grid-template-columns: minmax(0, 1fr) 28px;
+    grid-template-columns: minmax(0, 1fr) 28px 28px;
     gap: 8px;
     justify-content: stretch;
     justify-items: stretch;
@@ -2350,6 +2350,22 @@ export const RailCollapseButton = styled.button`
 
   @media (max-width: 760px) {
     justify-self: end;
+  }
+`;
+
+export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
+  color: var(--forge-text-soft);
+
+  &:hover {
+    border-color: rgba(255, 122, 24, 0.34);
+    color: #ffd0a5;
+    background:
+      linear-gradient(90deg, rgba(255, 122, 24, 0.13), rgba(47, 128, 255, 0.06)),
+      rgba(13, 17, 23, 0.78);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
   }
 `;
 

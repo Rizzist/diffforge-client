@@ -734,6 +734,13 @@ fn cloud_mcp_repo_id_for_root(root: &Path) -> String {
     )
 }
 
+fn cloud_mcp_workspace_location_fingerprint(root: &Path) -> String {
+    format!(
+        "loc-{}",
+        cloud_mcp_short_hash(&workspace_path_display(root).to_lowercase())
+    )
+}
+
 fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
     let mut registered_workspaces = runtime
         .registered_workspaces
@@ -1095,6 +1102,7 @@ async fn cloud_mcp_registered_workspace_subscriptions(state: &CloudMcpState) -> 
                 "workspace_id": workspace.workspace_id,
                 "workspace_name": workspace.workspace_name,
                 "repo_id": cloud_mcp_repo_id_for_root(Path::new(&workspace.root)),
+                "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(Path::new(&workspace.root)),
                 "workspace_root": workspace.root,
             })
         })
@@ -2282,7 +2290,7 @@ async fn cloud_mcp_register_prepared_workspace(
             "context_pack_model": true,
         }
     });
-    let server_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
+    let event_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
     if reason == "workspace_registration" {
         let reconcile_payload = json!({
             "source": "rust-diffforge-terminal-lifecycle",
@@ -2354,31 +2362,38 @@ async fn cloud_mcp_register_prepared_workspace(
         }
         runtime.last_connected_ms = Some(now_ms);
     }
-    let _ = cloud_mcp_ws_send_workspace_subscription(state, &repo_id, &workspace_status).await;
+    let registration_response =
+        cloud_mcp_ws_send_workspace_registration(state, &repo_id, &workspace_status).await?;
     let status = cloud_mcp_status_snapshot(state).await;
     Ok(CloudMcpWorkspaceRegistrationResult {
         status,
         workspace: workspace_status,
-        server_response,
+        server_response: json!({
+            "event": event_response,
+            "workspaceRegistration": registration_response,
+        }),
         synced: true,
         log_path: workspace_path_display(&log_path),
         message: "Workspace synced to Cloud MCP context ledger.".to_string(),
     })
 }
 
-async fn cloud_mcp_ws_send_workspace_subscription(
+async fn cloud_mcp_ws_send_workspace_registration(
     state: &CloudMcpState,
     repo_id: &str,
     workspace: &CloudMcpWorkspaceStatus,
 ) -> Result<Value, String> {
+    let root = Path::new(&workspace.root);
     cloud_mcp_ws_request(
         state,
-        "workspace_subscribe",
+        "workspace_register",
         &json!({
             "repo_id": repo_id,
             "workspace_id": workspace.workspace_id,
             "workspace_name": workspace.workspace_name,
+            "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(root),
             "workspace_root": workspace.root,
+            "schema_version": 1,
         }),
     )
     .await

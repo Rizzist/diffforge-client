@@ -179,6 +179,7 @@ import {
   RailTop,
   RailSectionTitle,
   RailCollapseButton,
+  RailCreateWorkspaceButton,
   WorkspaceList,
   WorkspaceRow,
   WorkspaceButton,
@@ -2196,6 +2197,20 @@ function cleanWorkspaceRootDirectory(value) {
   return collapseFunctionalRepoPathToCoreRepoPath(cleaned);
 }
 
+function getWorkspaceRootIdentity(value) {
+  const cleaned = cleanWorkspaceRootDirectory(value).replace(/\\/g, "/");
+
+  if (!cleaned) {
+    return "";
+  }
+
+  const withoutTrailingSlash = cleaned === "/"
+    ? cleaned
+    : cleaned.replace(/\/+$/g, "");
+
+  return withoutTrailingSlash.toLowerCase();
+}
+
 function isWindowsSystemRootDirectory(value) {
   const cleaned = cleanWorkspaceRootDirectory(value)
     .replace(/\\/g, "/")
@@ -2793,6 +2808,33 @@ function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
   return cleanWorkspaceRootDirectory(workspaceSettings?.[workspaceId]?.rootDirectory);
 }
 
+function findWorkspaceByEffectiveRoot(
+  workspaces,
+  workspaceSettings,
+  rootDirectory,
+  defaultWorkingDirectory,
+  exceptWorkspaceId = "",
+) {
+  const targetIdentity = getWorkspaceRootIdentity(rootDirectory);
+
+  if (!targetIdentity || !Array.isArray(workspaces)) {
+    return null;
+  }
+
+  return workspaces.find((workspace) => {
+    const workspaceId = String(workspace?.id || "").trim();
+
+    if (!workspaceId || workspaceId === exceptWorkspaceId) {
+      return false;
+    }
+
+    const candidateRoot = getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+      || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
+
+    return getWorkspaceRootIdentity(candidateRoot) === targetIdentity;
+  }) || null;
+}
+
 function getWorkspaceThreadStoreTargets(workspaces, workspaceSettings, defaultWorkingDirectory) {
   if (!Array.isArray(workspaces) || !workspaces.length) {
     return [];
@@ -3074,6 +3116,8 @@ export default function App() {
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceName, setWorkspaceName] = useState("");
+  const [newWorkspaceRootDraft, setNewWorkspaceRootDraft] = useState("");
+  const [workspaceCreateModalOpen, setWorkspaceCreateModalOpen] = useState(false);
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
@@ -5154,11 +5198,29 @@ export default function App() {
     }
   }, [expireDesktopSession]);
 
+  const openCreateWorkspaceModal = useCallback(() => {
+    setWorkspaceName("");
+    setNewWorkspaceRootDraft(defaultWorkingDirectory || "");
+    setWorkspaceError("");
+    setWorkspaceCreateModalOpen(true);
+  }, [defaultWorkingDirectory]);
+
+  const closeCreateWorkspaceModal = useCallback(() => {
+    if (workspaceSyncState === "creating") {
+      return;
+    }
+
+    setWorkspaceCreateModalOpen(false);
+    setWorkspaceError("");
+  }, [workspaceSyncState]);
+
   const createFirstWorkspace = useCallback(async (event) => {
     event.preventDefault();
 
     const token = authStore.getToken();
     const name = workspaceName.trim();
+    const requestedRoot = cleanWorkspaceRootDirectory(newWorkspaceRootDraft)
+      || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
 
     if (!isSafeAuthValue(token)) {
       expireDesktopSession("Desktop session required to create a workspace.");
@@ -5166,7 +5228,17 @@ export default function App() {
     }
 
     if (!name) {
-      setWorkspaceError("Name your first workspace.");
+      setWorkspaceError("Workspace name is required.");
+      return;
+    }
+
+    if (!requestedRoot) {
+      setWorkspaceError("Choose a workspace root directory.");
+      return;
+    }
+
+    if (requestedRoot.length > MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH) {
+      setWorkspaceError("Root directory path is too long.");
       return;
     }
 
@@ -5174,6 +5246,24 @@ export default function App() {
     setWorkspaceError("");
 
     try {
+      const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
+      const rootDirectory = normalizedRoot?.workingDirectory || "";
+
+      if (!rootDirectory) {
+        throw new Error("Workspace root directory was not returned by validation.");
+      }
+
+      const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+        workspacesRef.current,
+        workspaceSettingsRef.current,
+        rootDirectory,
+        defaultWorkingDirectoryRef.current,
+      );
+
+      if (duplicateWorkspace) {
+        throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+      }
+
       const result = await invoke("create_workspace", {
         token,
         name,
@@ -5184,12 +5274,50 @@ export default function App() {
         throw new Error("Workspace was not returned by the API.");
       }
 
-      setWorkspaces([workspace]);
+      const existingWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+      const nextWorkspaces = [
+        ...existingWorkspaces.filter((item) => item.id !== workspace.id),
+        workspace,
+      ];
+      const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
+        rootDirectory,
+      });
+      const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+      const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(currentLifecycleSettings.enabledWorkspaceIds);
+      const nextEnabledWorkspaceIds = enabledWorkspaceIds.includes(workspace.id)
+        ? enabledWorkspaceIds
+        : [...enabledWorkspaceIds, workspace.id];
+
+      workspaceSettingsRef.current = nextWorkspaceSettings;
+      persistWorkspaceSettings(nextWorkspaceSettings);
+      setWorkspaceSettings(nextWorkspaceSettings);
+      setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId(workspace.id);
       setActivatedWorkspaceId(workspace.id);
-      updateWorkspaceLifecycleSettings({ defaultWorkspaceId: workspace.id });
+      updateWorkspaceLifecycleSettings({
+        defaultWorkspaceId: currentLifecycleSettings.defaultWorkspaceId || workspace.id,
+        enabledWorkspaceIds: nextEnabledWorkspaceIds,
+      });
       setWorkspaceName("");
-      setWorkspaceSyncState("idle");
+      setNewWorkspaceRootDraft(rootDirectory);
+      setWorkspaceCreateModalOpen(false);
+
+      try {
+        await invoke("cloud_mcp_register_workspace", {
+          repoPath: rootDirectory,
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+        });
+        setWorkspaceSyncState("idle");
+      } catch (registrationError) {
+        setWorkspaceSyncState("error");
+        setWorkspaceError(
+          `Workspace created, but Cloud MCP registration failed: ${getErrorMessage(
+            registrationError,
+            "Unable to register workspace.",
+          )}`,
+        );
+      }
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -5199,7 +5327,13 @@ export default function App() {
       setWorkspaceSyncState("error");
       setWorkspaceError(getErrorMessage(error, "Unable to create workspace."));
     }
-  }, [expireDesktopSession, updateWorkspaceLifecycleSettings, workspaceName]);
+  }, [
+    defaultWorkingDirectory,
+    expireDesktopSession,
+    newWorkspaceRootDraft,
+    updateWorkspaceLifecycleSettings,
+    workspaceName,
+  ]);
 
   const openWorkspaceSettings = useCallback((workspaceId) => {
     setSelectedWorkspaceId(workspaceId);
@@ -5284,6 +5418,19 @@ export default function App() {
         ? await invoke("validate_workspace_root_directory", { path: rootValidationPath })
         : null;
       const rootDirectory = cleanedRoot ? normalizedRoot?.workingDirectory || "" : "";
+      const effectiveRootDirectory = rootDirectory || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
+      const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+        workspacesRef.current,
+        workspaceSettingsRef.current,
+        effectiveRootDirectory,
+        defaultWorkingDirectoryRef.current,
+        selectedWorkspace.id,
+      );
+
+      if (duplicateWorkspace) {
+        throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+      }
+
       const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
@@ -6343,6 +6490,30 @@ export default function App() {
     }
   }, []);
 
+  const useDefaultNewWorkspaceRoot = useCallback(() => {
+    setNewWorkspaceRootDraft(defaultWorkingDirectory);
+    setWorkspaceError("");
+  }, [defaultWorkingDirectory]);
+
+  const chooseNewWorkspaceRootDirectory = useCallback(async () => {
+    setWorkspaceError("");
+
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose workspace root directory",
+      });
+      const selectedPath = Array.isArray(selected) ? selected[0] : selected;
+
+      if (typeof selectedPath === "string" && selectedPath.trim()) {
+        setNewWorkspaceRootDraft(selectedPath);
+      }
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error, "Unable to choose root directory."));
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     authFlowIdRef.current += 1;
     const token = authStore.getToken();
@@ -6708,6 +6879,12 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!newWorkspaceRootDraft && defaultWorkingDirectory) {
+      setNewWorkspaceRootDraft(defaultWorkingDirectory);
+    }
+  }, [defaultWorkingDirectory, newWorkspaceRootDraft]);
+
   useEffect(() => () => {
     window.clearTimeout(viewTransitionTimeoutRef.current);
   }, []);
@@ -6723,6 +6900,8 @@ export default function App() {
     setActivatedWorkspaceId("");
     setWorkspaceSyncState("idle");
     setWorkspaceRootDraft("");
+    setNewWorkspaceRootDraft("");
+    setWorkspaceCreateModalOpen(false);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
@@ -10464,6 +10643,17 @@ export default function App() {
                 <RailTop>
                   <RailHeader>
                     <RailSectionTitle>Workspaces</RailSectionTitle>
+                    <RailCreateWorkspaceButton
+                      aria-label="Create workspace"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openCreateWorkspaceModal();
+                      }}
+                      title="Create workspace"
+                      type="button"
+                    >
+                      <ButtonAddIcon aria-hidden="true" />
+                    </RailCreateWorkspaceButton>
                     <RailCollapseButton
                       aria-label={workspaceRailCollapsed ? "Expand workspace drawer" : "Collapse workspace drawer"}
                       aria-pressed={workspaceRailCollapsed}
@@ -10683,6 +10873,7 @@ export default function App() {
                           changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                           createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                           createFirstWorkspace={createFirstWorkspace}
+                          chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
                           handlePreparedTerminalChange={handlePreparedTerminalChange}
                           isAppClosing={workspaceCloseState.isActive}
                           isWorkspaceRuntimeVisible={shouldRevealWorkspaceTerminal}
@@ -10700,6 +10891,7 @@ export default function App() {
                           refreshAgentStatuses={refreshAgentStatuses}
                           reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
                           setWorkspaceName={setWorkspaceName}
+                          newWorkspaceRootDraft={newWorkspaceRootDraft}
                           shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
                           shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
                           showSettingsView={showSettingsView}
@@ -10716,6 +10908,7 @@ export default function App() {
                           workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
                           workspaceThreads={workspaceThreads}
                           workspaces={workspaces}
+                          useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
                         />
                       </WorkspaceRuntimeLayer>
                     ) : enabledWorkspaceRuntimeDescriptors.map((runtimeDescriptor) => {
@@ -10757,6 +10950,7 @@ export default function App() {
                             changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                             createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                             createFirstWorkspace={createFirstWorkspace}
+                            chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
                             isWorkspaceRuntimeVisible={runtimeVisible}
@@ -10771,6 +10965,7 @@ export default function App() {
                             refreshAgentStatuses={refreshAgentStatuses}
                             reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
                             setWorkspaceName={setWorkspaceName}
+                            newWorkspaceRootDraft={newWorkspaceRootDraft}
                             shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
                             shouldShowWorkspaceSetup={false}
                             showSettingsView={showSettingsView}
@@ -10787,6 +10982,7 @@ export default function App() {
                             workspaceTerminalRenderAgent={runtimeDescriptor.renderAgent}
                             workspaceThreads={workspaceThreads}
                             workspaces={workspaces}
+                            useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
                           />
                         </WorkspaceRuntimeLayer>
                       );
@@ -11208,7 +11404,7 @@ export default function App() {
                       <SetupHeader>
                         <Kicker>First workspace</Kicker>
                         <DashboardTitle>Create your workspace</DashboardTitle>
-                        <PageSubline>Name it, then the workspace syncs through the protected API.</PageSubline>
+                        <PageSubline>Name it and choose the project root that will be bound to this workspace.</PageSubline>
                       </SetupHeader>
                       {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
                       <SetupField>
@@ -11220,6 +11416,34 @@ export default function App() {
                           value={workspaceName}
                         />
                       </SetupField>
+                      <WorkspaceRootChooser>
+                        <SettingsLabel>Root directory</SettingsLabel>
+                        <RootDirectoryInput
+                          maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+                          placeholder={defaultWorkingDirectory || "Choose project root"}
+                          readOnly
+                          title={newWorkspaceRootDraft || defaultWorkingDirectory}
+                          value={newWorkspaceRootDraft || defaultWorkingDirectory}
+                        />
+                        <WorkspaceRootActions>
+                          <SecondaryButton
+                            disabled={workspaceSyncState === "creating"}
+                            onClick={chooseNewWorkspaceRootDirectory}
+                            type="button"
+                          >
+                            <ButtonFolderIcon aria-hidden="true" />
+                            <span>Choose directory</span>
+                          </SecondaryButton>
+                          <SecondaryButton
+                            disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
+                            onClick={useDefaultNewWorkspaceRoot}
+                            type="button"
+                          >
+                            <ButtonFolderIcon aria-hidden="true" />
+                            <span>Use app dir</span>
+                          </SecondaryButton>
+                        </WorkspaceRootActions>
+                      </WorkspaceRootChooser>
                       <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
                         <ButtonForgeIcon aria-hidden="true" />
                         <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
@@ -11538,6 +11762,104 @@ export default function App() {
                       </WorkspaceSettingsBusyPanel>
                     </WorkspaceSettingsBusyOverlay>
                   )}
+                </WorkspaceSettingsOverlay>
+              )}
+              {workspaceCreateModalOpen && (
+                <WorkspaceSettingsOverlay
+                  aria-label="Create workspace modal"
+                  onMouseDown={(event) => {
+                    if (event.target === event.currentTarget) {
+                      closeCreateWorkspaceModal();
+                    }
+                  }}
+                >
+                  <WorkspaceSettingsDialog
+                    aria-busy={workspaceSyncState === "creating"}
+                    aria-labelledby="workspace-create-title"
+                    aria-modal="true"
+                    role="dialog"
+                  >
+                    <WorkspaceSettingsDialogHeader>
+                      <WorkspaceSettingsHeaderMain>
+                        <div>
+                          <PanelKicker>New workspace</PanelKicker>
+                          <PanelHeading id="workspace-create-title">Create workspace</PanelHeading>
+                        </div>
+                        <SettingsHint>
+                          Choose a project root that is not already attached to another workspace.
+                        </SettingsHint>
+                      </WorkspaceSettingsHeaderMain>
+                      <WorkspaceSettingsHeaderActions>
+                        <WorkspaceModalCloseButton
+                          aria-label="Close create workspace"
+                          disabled={workspaceSyncState === "creating"}
+                          onClick={closeCreateWorkspaceModal}
+                          title="Close"
+                          type="button"
+                        >
+                          <ButtonCloseIcon aria-hidden="true" />
+                        </WorkspaceModalCloseButton>
+                      </WorkspaceSettingsHeaderActions>
+                    </WorkspaceSettingsDialogHeader>
+
+                    <WorkspaceSettingsForm onSubmit={createFirstWorkspace}>
+                      <WorkspaceSettingsSection>
+                        <WorkspaceSettingsTopGrid>
+                          <SetupField>
+                            <SettingsLabel>Name</SettingsLabel>
+                            <WorkspaceSettingsInput
+                              disabled={workspaceSyncState === "creating"}
+                              maxLength={80}
+                              onChange={(event) => {
+                                setWorkspaceName(event.target.value);
+                                setWorkspaceError("");
+                              }}
+                              placeholder="My workspace"
+                              value={workspaceName}
+                            />
+                          </SetupField>
+                          <WorkspaceRootChooser>
+                            <SettingsLabel>Root directory</SettingsLabel>
+                            <RootDirectoryInput
+                              disabled={workspaceSyncState === "creating"}
+                              maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+                              placeholder={defaultWorkingDirectory || "Choose project root"}
+                              readOnly
+                              title={newWorkspaceRootDraft || defaultWorkingDirectory}
+                              value={newWorkspaceRootDraft || defaultWorkingDirectory}
+                            />
+                            <WorkspaceRootActions>
+                              <SecondaryButton
+                                disabled={workspaceSyncState === "creating"}
+                                onClick={chooseNewWorkspaceRootDirectory}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Choose directory</span>
+                              </SecondaryButton>
+                              <SecondaryButton
+                                disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
+                                onClick={useDefaultNewWorkspaceRoot}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Use app dir</span>
+                              </SecondaryButton>
+                            </WorkspaceRootActions>
+                          </WorkspaceRootChooser>
+                        </WorkspaceSettingsTopGrid>
+                      </WorkspaceSettingsSection>
+
+                      <WorkspaceSettingsActions>
+                        <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
+                          <ButtonAddIcon aria-hidden="true" />
+                          <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
+                        </PrimaryButton>
+                      </WorkspaceSettingsActions>
+                    </WorkspaceSettingsForm>
+
+                    {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
+                  </WorkspaceSettingsDialog>
                 </WorkspaceSettingsOverlay>
               )}
               {crashRecoveryModal?.interruptedTasks?.length > 0 && (

@@ -10,19 +10,24 @@ import styled, { keyframes } from "styled-components";
 
 import {
   ButtonForgeIcon,
+  ButtonFolderIcon,
   DashboardTitle,
   ForgeWorkspace,
   FormMessage,
   Kicker,
   PageSubline,
   PrimaryButton,
+  RootDirectoryInput,
   ResizeHandle,
   ResizePanel,
   ResizePanelGroup,
+  SecondaryButton,
   SettingsLabel,
   SetupField,
   SetupHeader,
   SetupInput,
+  WorkspaceRootActions,
+  WorkspaceRootChooser,
   WorkspaceSetupPanel,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
@@ -6233,6 +6238,7 @@ function TerminalView({
   closeWorkspaceTerminal,
   createWorkspaceThreadTerminal,
   createFirstWorkspace,
+  chooseNewWorkspaceRootDirectory = () => {},
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -6247,6 +6253,7 @@ function TerminalView({
   refreshAgentStatuses,
   reorderWorkspaceTerminalDisplayLayout,
   setWorkspaceName,
+  newWorkspaceRootDraft = "",
   shouldPrewarmWorkspaceTerminals,
   shouldShowWorkspaceSetup,
   showSettingsView,
@@ -6262,6 +6269,7 @@ function TerminalView({
   workspaceTerminalRenderAgent,
   workspaceThreads = {},
   workspaces = [],
+  useDefaultNewWorkspaceRoot = () => {},
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
   const terminalStartupReady = Boolean(
@@ -10629,7 +10637,7 @@ function TerminalView({
           <SetupHeader>
             <Kicker>First workspace</Kicker>
             <DashboardTitle>Create your workspace</DashboardTitle>
-            <PageSubline>Name it, then the workspace syncs through the protected API.</PageSubline>
+            <PageSubline>Name it and choose the project root that will be bound to this workspace.</PageSubline>
           </SetupHeader>
           {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
           <SetupField>
@@ -10641,6 +10649,33 @@ function TerminalView({
               value={workspaceName}
             />
           </SetupField>
+          <WorkspaceRootChooser>
+            <SettingsLabel>Root directory</SettingsLabel>
+            <RootDirectoryInput
+              placeholder={defaultWorkingDirectory || "Choose project root"}
+              readOnly
+              title={newWorkspaceRootDraft || defaultWorkingDirectory}
+              value={newWorkspaceRootDraft || defaultWorkingDirectory}
+            />
+            <WorkspaceRootActions>
+              <SecondaryButton
+                disabled={workspaceSyncState === "creating"}
+                onClick={chooseNewWorkspaceRootDirectory}
+                type="button"
+              >
+                <ButtonFolderIcon aria-hidden="true" />
+                <span>Choose directory</span>
+              </SecondaryButton>
+              <SecondaryButton
+                disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
+                onClick={useDefaultNewWorkspaceRoot}
+                type="button"
+              >
+                <ButtonFolderIcon aria-hidden="true" />
+                <span>Use app dir</span>
+              </SecondaryButton>
+            </WorkspaceRootActions>
+          </WorkspaceRootChooser>
           <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
             <ButtonForgeIcon aria-hidden="true" />
             <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
