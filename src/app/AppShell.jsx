@@ -17,7 +17,9 @@ import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoN
 import {
   closeWorkspaceTerminalPane,
   getDefaultTerminalIndexes,
+  getTerminalAgentColorSlot,
   getTerminalPanelRows,
+  getWorkspaceTerminalPaneId,
   normalizeWorkspaceTerminalIndexes,
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
@@ -1211,6 +1213,25 @@ const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
+const TERMINAL_PRESENCE_SYNC_INTERVAL_MS = 20000;
+const TERMINAL_AGENT_COLOR_HEX_BY_SLOT = [
+  "#62a0ff",
+  "#ff9d48",
+  "#3ccb7f",
+  "#e5c45f",
+  "#68d8d6",
+  "#f46d8a",
+  "#aac66d",
+  "#d0d7e6",
+  "#54b6ff",
+  "#ffbf66",
+  "#7bdc9d",
+  "#ff8a9c",
+  "#56d0b6",
+  "#d8b34d",
+  "#9fb6d9",
+  "#f0f4ff",
+];
 const WORKSPACE_SHUTDOWN_STEPS = [
   {
     detail: "Detaching embedded workspace browser views.",
@@ -3317,6 +3338,7 @@ export default function App() {
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
   const workspaceDeactivationInFlightRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
+  const terminalPresenceSyncKeyRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -7697,6 +7719,111 @@ export default function App() {
     workspaceTerminalRoleOptions,
     workspaceThreads,
     workspaces,
+  ]);
+  const terminalPresenceWorkspaces = useMemo(() => (
+    enabledWorkspaceRuntimeDescriptors
+      .map((descriptor) => {
+        const repoPath = String(descriptor.workingDirectory || "").trim();
+        const workspaceId = String(descriptor.workspace?.id || "").trim();
+        if (!repoPath || !workspaceId) {
+          return null;
+        }
+
+        const terminals = descriptor.agentTerminalEntries
+          .map(({ role, terminalIndex }) => {
+            const normalizedRole = normalizeWorkspaceTerminalRole(
+              role,
+              workspaceTerminalFallbackRole,
+              workspaceTerminalRoleOptions,
+            );
+            const agent = descriptor.terminalAgentsByIndex?.[terminalIndex] || null;
+            if (!agent || normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC) {
+              return null;
+            }
+            const thread = descriptor.threadsByIndex?.[terminalIndex] || null;
+            const providerBinding = getWorkspaceThreadProviderBinding(thread, normalizedRole);
+            const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || null;
+            const colorSlot = getTerminalAgentColorSlot(terminalIndex);
+            const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
+            return {
+              agentId: normalizedRole,
+              agentKind: normalizedRole,
+              agentLabel: agent.label || getManagedAgentLabel(normalizedRole),
+              color,
+              colorSlot,
+              paneId: terminalBinding?.paneId
+                || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole),
+              status: "active",
+              terminalIndex,
+              threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
+            };
+          })
+          .filter(Boolean);
+
+        return {
+          repoPath,
+          workspaceId,
+          workspaceName: descriptor.workspace?.name || workspaceId,
+          terminals,
+        };
+      })
+      .filter(Boolean)
+  ), [
+    enabledWorkspaceRuntimeDescriptors,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
+  const terminalPresenceSyncKey = useMemo(
+    () => JSON.stringify(terminalPresenceWorkspaces),
+    [terminalPresenceWorkspaces],
+  );
+
+  useEffect(() => {
+    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+      return undefined;
+    }
+
+    let disposed = false;
+    const syncPresence = (reason) => {
+      const syncKey = `${terminalPresenceSyncKey}:${reason}`;
+      if (reason === "terminal_presence_snapshot" && terminalPresenceSyncKeyRef.current === syncKey) {
+        return;
+      }
+      invoke("cloud_mcp_sync_terminal_presence", {
+        workspaces: terminalPresenceWorkspaces,
+        reason,
+      })
+        .then(() => {
+          if (!disposed) {
+            terminalPresenceSyncKeyRef.current = syncKey;
+          }
+        })
+        .catch((error) => {
+          if (!disposed) {
+            logBigViewSyncDiagnosticEvent("cloud_mcp.terminal_presence_sync.failed", {
+              message: getErrorMessage(error, "Unable to sync terminal presence."),
+              reason,
+              workspaceCount: terminalPresenceWorkspaces.length,
+            });
+          }
+        });
+    };
+
+    syncPresence("terminal_presence_snapshot");
+    const intervalId = window.setInterval(
+      () => syncPresence("terminal_presence_heartbeat"),
+      TERMINAL_PRESENCE_SYNC_INTERVAL_MS,
+    );
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    shouldShowWorkspaceSetup,
+    terminalPresenceSyncKey,
+    terminalPresenceWorkspaces,
+    workspaceSyncState,
   ]);
 
   useEffect(() => {

@@ -558,6 +558,7 @@ export {
 export {
   closeWorkspaceTerminalPane,
   getDefaultTerminalIndexes,
+  getTerminalAgentColorSlot,
   getTerminalPanelRows,
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,

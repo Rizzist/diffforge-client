@@ -4789,6 +4789,70 @@ async fn cloud_mcp_sync_agent_installations(
 }
 
 #[tauri::command]
+async fn cloud_mcp_sync_terminal_presence(
+    state: State<'_, CloudMcpState>,
+    workspaces: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let clean_option = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let reason = clean_option(reason).unwrap_or_else(|| "terminal_presence_snapshot".to_string());
+    let workspace_items = workspaces
+        .as_array()
+        .ok_or_else(|| "Terminal presence sync requires a workspaces array.".to_string())?;
+    let mut normalized_workspaces = Vec::new();
+
+    for workspace in workspace_items.iter().take(64) {
+        let repo_path = cloud_mcp_payload_text(
+            workspace,
+            &["repo_path", "repoPath", "workspace_root", "workspaceRoot"],
+        )
+        .unwrap_or_default();
+        if repo_path.trim().is_empty() {
+            continue;
+        }
+
+        let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+        let workspace_name =
+            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
+        let req = cloud_mcp_spec_graph_sync_request(
+            repo_path,
+            workspace_id.clone(),
+            workspace_name.clone(),
+        );
+        let terminals = workspace
+            .get("terminals")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().take(64).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        normalized_workspaces.push(json!({
+            "repo_id": req.repo_id,
+            "workspace_id": req.workspace_id,
+            "workspace_name": req.workspace_name,
+            "terminals": terminals,
+        }));
+    }
+
+    let payload = json!({
+        "source": "rust-diffforge-terminal-presence-sync",
+        "event_kind": "terminal_presence_snapshot",
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": reason,
+        "workspace_count": normalized_workspaces.len(),
+        "workspaces": normalized_workspaces,
+        "summary": "Desktop terminal presence synced.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    cloud_mcp_post_event_endpoint(state.inner(), "terminal_presence_snapshot", &payload).await
+}
+
+#[tauri::command]
 async fn cloud_mcp_reset_workspace_graph_state(
     state: State<'_, CloudMcpState>,
     repo_path: String,
