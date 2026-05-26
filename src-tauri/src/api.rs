@@ -145,6 +145,75 @@ async fn list_workspaces(token: String) -> Result<Value, String> {
     read_api_response(response, "Unable to fetch workspaces.").await
 }
 
+fn clean_desktop_signin_diagnostic_text(value: impl AsRef<str>, max_len: usize) -> String {
+    value
+        .as_ref()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_len)
+        .collect()
+}
+
+#[tauri::command]
+async fn record_desktop_signin_diagnostic(
+    token: String,
+    flow_id: Option<String>,
+    source: Option<String>,
+    step: String,
+    status: String,
+    message: Option<String>,
+    details: Option<Value>,
+) -> Result<Value, String> {
+    if !DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED {
+        return Ok(json!({
+            "ok": true,
+            "stored": false,
+            "enabled": false,
+        }));
+    }
+
+    validate_auth_value("Desktop session", &token)?;
+    let step = clean_desktop_signin_diagnostic_text(step, 120);
+    if step.is_empty() {
+        return Err("Desktop sign-in diagnostic step is required.".to_string());
+    }
+    let status = clean_desktop_signin_diagnostic_text(status, 40);
+    let source = clean_desktop_signin_diagnostic_text(
+        source.unwrap_or_else(|| "rust-diffforge-ui".to_string()),
+        80,
+    );
+    let flow_id = flow_id
+        .map(|value| clean_desktop_signin_diagnostic_text(value, 160))
+        .filter(|value| !value.is_empty());
+    let message = message
+        .map(|value| clean_desktop_signin_diagnostic_text(
+            value,
+            DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT,
+        ))
+        .filter(|value| !value.is_empty());
+
+    let client = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))?;
+    let response = client
+        .post(format!("{API_BASE_URL}/desktop/signin-diagnostics"))
+        .bearer_auth(token)
+        .json(&DesktopSigninDiagnosticRequest {
+            flow_id: flow_id.as_deref(),
+            source: &source,
+            step: &step,
+            status: &status,
+            message: message.as_deref(),
+            details: details.unwrap_or_else(|| json!({})),
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Unable to record desktop sign-in diagnostic: {error}"))?;
+
+    read_api_response(response, "Unable to record desktop sign-in diagnostic.").await
+}
+
 #[tauri::command]
 async fn create_workspace(token: String, name: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;

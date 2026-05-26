@@ -461,6 +461,7 @@ const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
 const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
+const CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED = true;
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
@@ -481,22 +482,86 @@ const WINDOW_RESIZE_EDGES = [
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
 
+function safeDiagnosticDetails(details) {
+  if (!details || typeof details !== "object") {
+    return {};
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(details));
+  } catch {
+    return {};
+  }
+}
+
+async function recordCloudSigninDiagnostic(token, event) {
+  if (!CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED || !isSafeAuthValue(token)) {
+    return;
+  }
+
+  try {
+    await invoke("record_desktop_signin_diagnostic", {
+      token,
+      flowId: event.flowId || "desktop-cloud-connect",
+      source: event.source || "rust-diffforge-ui",
+      step: event.step,
+      status: event.status || "ok",
+      message: event.message || "",
+      details: safeDiagnosticDetails(event.details),
+    });
+  } catch {
+    // Diagnostic logging must never block sign-in.
+  }
+}
+
 async function syncCloudMcpDesktopSessionToken(token, options = {}) {
   try {
     const safeToken = isSafeAuthValue(token) ? token : null;
+    const flowId = options.flowId || "desktop-cloud-connect";
+    await recordCloudSigninDiagnostic(safeToken, {
+      flowId,
+      step: "cloud_mcp.desktop_token.set",
+      status: "start",
+      message: "sending desktop session token to Cloud MCP runtime",
+      details: {
+        requireConnected: Boolean(options.requireConnected),
+        hasToken: Boolean(safeToken),
+      },
+    });
     const status = await invoke("cloud_mcp_set_desktop_session_token", {
       token: safeToken,
+    });
+    await recordCloudSigninDiagnostic(safeToken, {
+      flowId,
+      step: "cloud_mcp.desktop_token.set",
+      status: "ok",
+      message: "Cloud MCP runtime accepted desktop session token",
+      details: status,
     });
 
     if (!options.requireConnected || !safeToken) {
       return status;
     }
 
+    await recordCloudSigninDiagnostic(safeToken, {
+      flowId,
+      step: "cloud_mcp.connect.invoke",
+      status: "start",
+      message: "requesting Cloud MCP websocket connection",
+      details: { timeoutMs: CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS },
+    });
     const connectedStatus = await withTimeout(
       invoke("cloud_mcp_connect"),
       CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
       CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
     );
+    await recordCloudSigninDiagnostic(safeToken, {
+      flowId,
+      step: "cloud_mcp.connect.invoke",
+      status: "ok",
+      message: "Cloud MCP websocket connect command returned",
+      details: connectedStatus,
+    });
 
     if (!connectedStatus?.connected || !connectedStatus?.globalWsConnected) {
       throw new Error("Cloud workspace websocket is not connected yet.");
@@ -505,6 +570,13 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
     return connectedStatus;
   } catch (error) {
     if (options.requireConnected) {
+      await recordCloudSigninDiagnostic(token, {
+        flowId: options.flowId || "desktop-cloud-connect",
+        step: "cloud_mcp.connect.invoke",
+        status: "error",
+        message: getErrorMessage(error, "Cloud MCP connection failed."),
+        details: { requireConnected: true },
+      });
       throw error;
     }
 
@@ -4285,12 +4357,40 @@ export default function App() {
         SESSION_RESTORE_TIMEOUT_MS,
         SESSION_RESTORE_TIMEOUT_MESSAGE,
       );
+      await recordCloudSigninDiagnostic(token, {
+        flowId: `restore-${validationFlowId}`,
+        step: "desktop_session.restore",
+        status: "ok",
+        message: "saved desktop session validated",
+        details: {
+          hasUser: Boolean(session?.user),
+          email: session?.user?.email || "",
+          planStatus: session?.user?.planStatus || "",
+        },
+      });
       if (validationFlowId !== authFlowIdRef.current) {
         return;
       }
 
       authStore.setChecking("Connecting cloud workspace...");
-      await syncCloudMcpDesktopSessionToken(token, { requireConnected: true });
+      await recordCloudSigninDiagnostic(token, {
+        flowId: `restore-${validationFlowId}`,
+        step: "desktop_restore.cloud_workspace",
+        status: "start",
+        message: "starting Cloud MCP connection from saved desktop session",
+        details: {},
+      });
+      await syncCloudMcpDesktopSessionToken(token, {
+        flowId: `restore-${validationFlowId}`,
+        requireConnected: true,
+      });
+      await recordCloudSigninDiagnostic(token, {
+        flowId: `restore-${validationFlowId}`,
+        step: "desktop_restore.cloud_workspace",
+        status: "ok",
+        message: "Cloud MCP connection completed from saved desktop session",
+        details: {},
+      });
 
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -4313,6 +4413,13 @@ export default function App() {
         : didTimeout
           ? "Secure session check timed out. Sign in with the web app."
           : "Your desktop session expired. Sign in again with the web app.";
+      await recordCloudSigninDiagnostic(token, {
+        flowId: `restore-${validationFlowId}`,
+        step: didCloudMcpFail ? "desktop_restore.cloud_workspace" : "desktop_session.restore",
+        status: "error",
+        message: restoreError,
+        details: { didCloudMcpFail, didTimeout },
+      });
 
       setSignedOut(signedOutMessage, restoreError, {
         clearPending: true,
@@ -4342,6 +4449,7 @@ export default function App() {
     }
 
     authStore.setExchanging();
+    let diagnosticToken = "";
 
     try {
       const session = await withTimeout(
@@ -4352,13 +4460,42 @@ export default function App() {
         AUTH_EXCHANGE_TIMEOUT_MS,
         AUTH_EXCHANGE_TIMEOUT_MESSAGE,
       );
+      diagnosticToken = session?.token || "";
+      await recordCloudSigninDiagnostic(diagnosticToken, {
+        flowId: callback.state,
+        step: "desktop_session.exchange",
+        status: "ok",
+        message: "desktop auth code exchanged for desktop session",
+        details: {
+          hasUser: Boolean(session?.user),
+          email: session?.user?.email || "",
+          planStatus: session?.user?.planStatus || "",
+        },
+      });
 
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
       }
 
       authStore.setExchanging("Connecting cloud workspace...");
-      await syncCloudMcpDesktopSessionToken(session.token, { requireConnected: true });
+      await recordCloudSigninDiagnostic(diagnosticToken, {
+        flowId: callback.state,
+        step: "desktop_signin.cloud_workspace",
+        status: "start",
+        message: "starting Cloud MCP connection after deeplink",
+        details: {},
+      });
+      await syncCloudMcpDesktopSessionToken(session.token, {
+        flowId: callback.state,
+        requireConnected: true,
+      });
+      await recordCloudSigninDiagnostic(diagnosticToken, {
+        flowId: callback.state,
+        step: "desktop_signin.cloud_workspace",
+        status: "ok",
+        message: "Cloud MCP connection completed after deeplink",
+        details: {},
+      });
 
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
@@ -4372,6 +4509,13 @@ export default function App() {
         return true;
       }
 
+      await recordCloudSigninDiagnostic(diagnosticToken, {
+        flowId: callback?.state,
+        step: "desktop_signin.cloud_workspace",
+        status: "error",
+        message: getErrorMessage(error, "Desktop login expired. Try again."),
+        details: {},
+      });
       setSignedOut(
         DEFAULT_AUTH_MESSAGE,
         getErrorMessage(error, "Desktop login expired. Try again."),

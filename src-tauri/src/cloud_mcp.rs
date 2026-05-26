@@ -397,6 +397,60 @@ async fn cloud_mcp_fetch_appwrite_jwt(
     cloud_mcp_parse_appwrite_jwt_response(body)
 }
 
+async fn cloud_mcp_record_signin_diagnostic_with_token(
+    desktop_session_token: String,
+    step: &str,
+    status: &str,
+    message: &str,
+    details: Value,
+) {
+    if !DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED
+        || validate_auth_value("Desktop session", &desktop_session_token).is_err()
+    {
+        return;
+    }
+
+    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS)) else {
+        return;
+    };
+    let payload = DesktopSigninDiagnosticRequest {
+        flow_id: Some("cloud-mcp-connect"),
+        source: "rust-diffforge-cloud-mcp",
+        step,
+        status,
+        message: if message.trim().is_empty() {
+            None
+        } else {
+            Some(message)
+        },
+        details,
+    };
+
+    let _ = client
+        .post(format!("{API_BASE_URL}/desktop/signin-diagnostics"))
+        .bearer_auth(desktop_session_token)
+        .json(&payload)
+        .send()
+        .await;
+}
+
+async fn cloud_mcp_record_signin_diagnostic(
+    state: &CloudMcpState,
+    step: &str,
+    status: &str,
+    message: &str,
+    details: Value,
+) {
+    let token = {
+        let auth = state.auth.lock().await;
+        auth.desktop_session_token.clone()
+    };
+
+    if let Some(token) = token {
+        cloud_mcp_record_signin_diagnostic_with_token(token, step, status, message, details).await;
+    }
+}
+
 fn cloud_mcp_read_blocking_api_response(
     response: reqwest::blocking::Response,
     fallback_message: &str,
@@ -498,7 +552,36 @@ async fn cloud_mcp_authorization_bearer(
     };
 
     if let Some(desktop_session_token) = desktop_session_token {
-        let (jwt, expires_ms) = cloud_mcp_fetch_appwrite_jwt(&desktop_session_token).await?;
+        cloud_mcp_record_signin_diagnostic_with_token(
+            desktop_session_token.clone(),
+            "appwrite_jwt.request",
+            "start",
+            "requesting Appwrite JWT for Cloud MCP",
+            json!({}),
+        )
+        .await;
+        let (jwt, expires_ms) = match cloud_mcp_fetch_appwrite_jwt(&desktop_session_token).await {
+            Ok(result) => result,
+            Err(error) => {
+                cloud_mcp_record_signin_diagnostic_with_token(
+                    desktop_session_token,
+                    "appwrite_jwt.request",
+                    "error",
+                    &error,
+                    json!({}),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        cloud_mcp_record_signin_diagnostic_with_token(
+            desktop_session_token.clone(),
+            "appwrite_jwt.request",
+            "ok",
+            "Appwrite JWT received for Cloud MCP",
+            json!({"expires_ms": expires_ms}),
+        )
+        .await;
         {
             let mut auth = state.auth.lock().await;
             auth.appwrite_jwt = Some(jwt.clone());
@@ -631,11 +714,47 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
 }
 
 async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
+    cloud_mcp_record_signin_diagnostic(
+        state,
+        "cloud_mcp.connect",
+        "start",
+        "starting Cloud MCP websocket connection",
+        json!({}),
+    )
+    .await;
     cloud_mcp_start_global_ws(state).await;
     match cloud_mcp_wait_for_ws_sender(state).await {
-        Ok(_) => Ok(cloud_mcp_status_snapshot(state).await),
+        Ok(_) => {
+            let snapshot = cloud_mcp_status_snapshot(state).await;
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "cloud_mcp.connect",
+                "ok",
+                "Cloud MCP websocket connected",
+                json!({
+                    "status": snapshot.status,
+                    "global_ws_status": snapshot.global_ws_status,
+                    "connected": snapshot.connected,
+                    "global_ws_connected": snapshot.global_ws_connected,
+                }),
+            )
+            .await;
+            Ok(snapshot)
+        }
         Err(error) => {
             let snapshot = cloud_mcp_set_connection_error(state, error.clone()).await;
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "cloud_mcp.connect",
+                "error",
+                &snapshot.last_error,
+                json!({
+                    "status": snapshot.status,
+                    "global_ws_status": snapshot.global_ws_status,
+                    "global_ws_last_error": snapshot.global_ws_last_error,
+                }),
+            )
+            .await;
             Err(format!(
                 "Cloud MCP app websocket is required before terminals can start. {}",
                 snapshot.last_error
@@ -711,6 +830,14 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
 }
 
 async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result<(), String> {
+    cloud_mcp_record_signin_diagnostic(
+        state,
+        "websocket.open",
+        "start",
+        "opening Cloud MCP app websocket",
+        json!({"ws_url": ws_url}),
+    )
+    .await;
     let mut request = ws_url
         .into_client_request()
         .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
@@ -725,9 +852,29 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
         );
     }
 
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|error| format!("Unable to open Cloud MCP app websocket: {error}"))?;
+    let (stream, response) = match connect_async(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("Unable to open Cloud MCP app websocket: {error}");
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "websocket.open",
+                "error",
+                &message,
+                json!({"ws_url": ws_url}),
+            )
+            .await;
+            return Err(message);
+        }
+    };
+    cloud_mcp_record_signin_diagnostic(
+        state,
+        "websocket.open",
+        "ok",
+        "Cloud MCP app websocket opened",
+        json!({"ws_url": ws_url, "http_status": response.status().as_u16()}),
+    )
+    .await;
     let (mut write, mut read) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     {
@@ -801,6 +948,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_status = "auth_missing".to_string();
             runtime.global_ws_last_error =
                 "Cloud MCP app websocket ready message omitted message auth.".to_string();
+            drop(runtime);
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "websocket.ready",
+                "error",
+                "Cloud MCP app websocket ready message omitted message auth.",
+                json!({}),
+            )
+            .await;
             return;
         };
         {
@@ -816,6 +972,14 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_connection_id = Some(connection_id.clone());
             runtime.global_ws_message_token = Some(message_token.clone());
         }
+        cloud_mcp_record_signin_diagnostic(
+            state,
+            "websocket.ready",
+            "ok",
+            "Cloud MCP app websocket ready frame received",
+            json!({"connection_id": connection_id.clone()}),
+        )
+        .await;
         let hello = json!({
             "kind": "hello",
             "id": format!("hello-{}", cloud_mcp_now_ms()),

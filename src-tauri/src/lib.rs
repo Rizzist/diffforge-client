@@ -47,6 +47,9 @@ const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
 const AUTH_EXCHANGE_TIMEOUT_SECS: u64 = 10;
 const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
+const DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED: bool = true;
+const DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;
+const DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT: usize = 600;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
 const AGENT_INSTALL_TIMEOUT_SECS: u64 = 240;
@@ -961,6 +964,17 @@ struct BackendStatus {
 struct ExchangeDesktopSessionRequest<'a> {
     code: &'a str,
     state: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSigninDiagnosticRequest<'a> {
+    flow_id: Option<&'a str>,
+    source: &'a str,
+    step: &'a str,
+    status: &'a str,
+    message: Option<&'a str>,
+    details: Value,
 }
 
 #[derive(Serialize)]
@@ -2591,6 +2605,7 @@ pub fn run() {
             exchange_desktop_auth_code,
             validate_desktop_session,
             logout_desktop_session,
+            record_desktop_signin_diagnostic,
             list_workspaces,
             create_workspace,
             update_workspace,
