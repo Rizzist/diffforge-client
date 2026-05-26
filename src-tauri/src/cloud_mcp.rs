@@ -22,6 +22,7 @@ const CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT: &str = "cloud-mcp-knowledge-graph-c
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_KNOWLEDGE_GRAPH_DEBOUNCE_MS: u64 = 650;
+const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE: &str = "local-ignored-whitelist.json";
@@ -330,6 +331,65 @@ fn cloud_mcp_clean_bearer_token(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn cloud_mcp_is_transient_ws_error(error: &str) -> bool {
+    let normalized = error.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    [
+        "cloud mcp app websocket",
+        "websocket protocol error",
+        "connection reset",
+        "without closing handshake",
+        "websocket unavailable",
+        "websocket_retrying",
+        "websocket is not connected yet",
+        "websocket is not accepting messages",
+        "websocket response was cancelled",
+        "websocket request timed out",
+        "cloud_ws_disconnected",
+        "http error: 401 unauthorized",
+        "http error: 502",
+        "http error: 503",
+        "http error: 504",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn cloud_mcp_preserved_cache_sync_fields(
+    snapshot: &Value,
+    fallback_sync_state: &str,
+    fallback_sync_error: &str,
+) -> (String, String) {
+    let cached_state = snapshot
+        .get("syncState")
+        .or_else(|| snapshot.get("sync_state"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cached_error = snapshot
+        .get("syncError")
+        .or_else(|| snapshot.get("sync_error"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if cached_state == Some("error")
+        && cached_error.is_some_and(cloud_mcp_is_transient_ws_error)
+    {
+        return (
+            fallback_sync_state.to_string(),
+            fallback_sync_error.to_string(),
+        );
+    }
+
+    (
+        cached_state.unwrap_or(fallback_sync_state).to_string(),
+        cached_error.unwrap_or(fallback_sync_error).to_string(),
+    )
 }
 
 fn cloud_mcp_static_appwrite_jwt() -> Option<String> {
@@ -6567,22 +6627,8 @@ fn cloud_mcp_read_knowledge_graph_cache_preserving_state(
         return cloud_mcp_read_knowledge_graph_cache(req, fallback_sync_state, fallback_sync_error);
     };
 
-    let sync_state = snapshot
-        .get("syncState")
-        .or_else(|| snapshot.get("sync_state"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_sync_state)
-        .to_string();
-    let sync_error = snapshot
-        .get("syncError")
-        .or_else(|| snapshot.get("sync_error"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_sync_error)
-        .to_string();
+    let (sync_state, sync_error) =
+        cloud_mcp_preserved_cache_sync_fields(&snapshot, fallback_sync_state, fallback_sync_error);
 
     cloud_mcp_stamp_knowledge_graph_snapshot(snapshot, req, &cache_path, &sync_state, &sync_error)
 }
@@ -6913,7 +6959,7 @@ async fn cloud_mcp_sync_knowledge_graph_and_rewatch(
     watcher: &mut RecommendedWatcher,
     watched: &mut HashMap<PathBuf, bool>,
     emit_even_if_unchanged: bool,
-) {
+) -> bool {
     match cloud_mcp_sync_knowledge_graph_once(state, req).await {
         Ok((snapshot, changed)) => {
             let desired = cloud_mcp_knowledge_watch_targets(req, &snapshot);
@@ -6921,17 +6967,25 @@ async fn cloud_mcp_sync_knowledge_graph_and_rewatch(
             if emit_even_if_unchanged || changed {
                 cloud_mcp_emit_knowledge_graph_snapshot(app, snapshot);
             }
+            false
         }
         Err(error) => {
+            let retry = cloud_mcp_is_transient_ws_error(&error);
+            let error_text = if retry {
+                String::new()
+            } else {
+                clean_terminal_telemetry_text(&error)
+            };
             let snapshot = cloud_mcp_read_knowledge_graph_cache(
                 req,
-                "error",
-                &clean_terminal_telemetry_text(&error),
+                if retry { "syncing" } else { "error" },
+                &error_text,
             );
             let desired = cloud_mcp_knowledge_watch_targets(req, &snapshot);
             cloud_mcp_reconfigure_knowledge_watcher(watcher, watched, desired);
             let _ = cloud_mcp_write_knowledge_graph_cache(req, &snapshot);
             cloud_mcp_emit_knowledge_graph_snapshot(app, snapshot);
+            retry
         }
     }
 }
@@ -6992,7 +7046,7 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
         &mut watched,
         cloud_mcp_knowledge_watch_targets(&req, &initial_snapshot),
     );
-    cloud_mcp_sync_knowledge_graph_and_rewatch(
+    let mut retry_soon = cloud_mcp_sync_knowledge_graph_and_rewatch(
         &app,
         &state,
         &req,
@@ -7004,7 +7058,9 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
 
     while !crate::app_shutdown_requested() {
         let wake_signal = wake.notified();
+        let retry_signal = sleep(Duration::from_millis(CLOUD_MCP_TRANSIENT_WS_RETRY_MS));
         tokio::pin!(wake_signal);
+        tokio::pin!(retry_signal);
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -7023,6 +7079,7 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
 
         let signal = tokio::select! {
             _ = &mut wake_signal => break,
+            _ = &mut retry_signal, if retry_soon => Some(CloudMcpKnowledgeGraphSyncSignal::Server(Ok(json!({"kind": "retry"})))),
             event_result = event_rx.recv() => event_result.map(CloudMcpKnowledgeGraphSyncSignal::File),
             server_event = server_event_rx.recv() => server_event.map(CloudMcpKnowledgeGraphSyncSignal::Server),
         };
@@ -7032,7 +7089,7 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
         match signal {
             CloudMcpKnowledgeGraphSyncSignal::Server(Ok(_)) => {
                 while matches!(server_event_rx.try_recv(), Ok(Ok(_))) {}
-                cloud_mcp_sync_knowledge_graph_and_rewatch(
+                retry_soon = cloud_mcp_sync_knowledge_graph_and_rewatch(
                     &app,
                     &state,
                     &req,
@@ -7043,6 +7100,13 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
                 .await;
             }
             CloudMcpKnowledgeGraphSyncSignal::Server(Err(error)) => {
+                if cloud_mcp_is_transient_ws_error(&error) {
+                    let snapshot = cloud_mcp_read_knowledge_graph_cache(&req, "syncing", "");
+                    let _ = cloud_mcp_write_knowledge_graph_cache(&req, &snapshot);
+                    cloud_mcp_emit_knowledge_graph_snapshot(&app, snapshot);
+                    retry_soon = true;
+                    continue;
+                }
                 let snapshot = cloud_mcp_read_knowledge_graph_cache(
                     &req,
                     "error",
@@ -7086,7 +7150,7 @@ async fn cloud_mcp_knowledge_graph_watch_loop(
                     }
                 }
                 cloud_mcp_push_knowledge_atlas_file_invalidation(&state, &req, note_changes).await;
-                cloud_mcp_sync_knowledge_graph_and_rewatch(
+                retry_soon = cloud_mcp_sync_knowledge_graph_and_rewatch(
                     &app,
                     &state,
                     &req,
@@ -7379,22 +7443,8 @@ fn cloud_mcp_read_spec_graph_cache_preserving_state(
         return cloud_mcp_read_spec_graph_cache(req, fallback_sync_state, fallback_sync_error);
     };
 
-    let sync_state = snapshot
-        .get("syncState")
-        .or_else(|| snapshot.get("sync_state"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_sync_state)
-        .to_string();
-    let sync_error = snapshot
-        .get("syncError")
-        .or_else(|| snapshot.get("sync_error"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_sync_error)
-        .to_string();
+    let (sync_state, sync_error) =
+        cloud_mcp_preserved_cache_sync_fields(&snapshot, fallback_sync_state, fallback_sync_error);
 
     cloud_mcp_stamp_spec_graph_snapshot(snapshot, req, &cache_path, &sync_state, &sync_error)
 }
@@ -7752,7 +7802,7 @@ async fn cloud_mcp_sync_spec_graph_cycle(
     needs_filetree_sync: &mut bool,
     handled_filetree_request: &mut u64,
     last_gitignore_signature: &mut String,
-) {
+) -> bool {
     let requested_filetree_sync = {
         let requests = state.spec_graph_filetree_sync_requests.lock().await;
         requests.get(&req.repo_id).copied().unwrap_or(0)
@@ -7801,15 +7851,23 @@ async fn cloud_mcp_sync_spec_graph_cycle(
                 cloud_mcp_emit_spec_graph_snapshot(app, snapshot);
             }
             *first_sync = false;
+            false
         }
         Err(error) => {
+            let retry = cloud_mcp_is_transient_ws_error(&error);
+            let error_text = if retry {
+                String::new()
+            } else {
+                clean_terminal_telemetry_text(&error)
+            };
             let snapshot = cloud_mcp_read_spec_graph_cache(
                 req,
-                "error",
-                &clean_terminal_telemetry_text(&error),
+                if retry { "syncing" } else { "error" },
+                &error_text,
             );
             let _ = cloud_mcp_write_spec_graph_cache(req, &snapshot);
             cloud_mcp_emit_spec_graph_snapshot(app, snapshot);
+            retry
         }
     }
 }
@@ -7868,7 +7926,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
     let mut handled_filetree_request = 0u64;
     let mut last_gitignore_signature = String::new();
 
-    cloud_mcp_sync_spec_graph_cycle(
+    let mut retry_soon = cloud_mcp_sync_spec_graph_cycle(
         &app,
         &state,
         &req,
@@ -7882,8 +7940,10 @@ async fn cloud_mcp_spec_graph_sync_loop(
     while !crate::app_shutdown_requested() {
         let wake_signal = wake.notified();
         let request_signal = request_wake.notified();
+        let retry_signal = sleep(Duration::from_millis(CLOUD_MCP_TRANSIENT_WS_RETRY_MS));
         tokio::pin!(wake_signal);
         tokio::pin!(request_signal);
+        tokio::pin!(retry_signal);
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -7902,6 +7962,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
 
         let signal = tokio::select! {
             _ = &mut wake_signal => break,
+            _ = &mut retry_signal, if retry_soon => Some(CloudMcpSpecGraphSyncSignal::Refresh),
             _ = &mut request_signal => Some(CloudMcpSpecGraphSyncSignal::Refresh),
             file_event = file_event_rx.recv(), if filetree_watcher.is_some() => {
                 file_event.map(CloudMcpSpecGraphSyncSignal::File)
@@ -7913,10 +7974,11 @@ async fn cloud_mcp_spec_graph_sync_loop(
         let Some(signal) = signal else {
             break;
         };
+        retry_soon = false;
         match signal {
             CloudMcpSpecGraphSyncSignal::Refresh => {
                 needs_filetree_sync = true;
-                cloud_mcp_sync_spec_graph_cycle(
+                retry_soon = cloud_mcp_sync_spec_graph_cycle(
                     &app,
                     &state,
                     &req,
@@ -7929,7 +7991,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
             }
             CloudMcpSpecGraphSyncSignal::Server(Ok(_)) => {
                 while matches!(graph_event_rx.try_recv(), Ok(Ok(_))) {}
-                cloud_mcp_sync_spec_graph_cycle(
+                retry_soon = cloud_mcp_sync_spec_graph_cycle(
                     &app,
                     &state,
                     &req,
@@ -7941,6 +8003,13 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 .await;
             }
             CloudMcpSpecGraphSyncSignal::Server(Err(error)) => {
+                if cloud_mcp_is_transient_ws_error(&error) {
+                    let snapshot = cloud_mcp_read_spec_graph_cache(&req, "syncing", "");
+                    let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
+                    cloud_mcp_emit_spec_graph_snapshot(&app, snapshot);
+                    retry_soon = true;
+                    continue;
+                }
                 let snapshot = cloud_mcp_read_spec_graph_cache(
                     &req,
                     "error",
@@ -7980,7 +8049,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                         }
                     }
                 }
-                cloud_mcp_sync_spec_graph_cycle(
+                retry_soon = cloud_mcp_sync_spec_graph_cycle(
                     &app,
                     &state,
                     &req,
