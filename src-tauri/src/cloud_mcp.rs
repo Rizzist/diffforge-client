@@ -16,6 +16,7 @@ const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
 const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
+const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_KNOWLEDGE_GRAPH_CACHE_EVENT: &str = "cloud-mcp-knowledge-graph-cache";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
@@ -844,6 +845,10 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
     request.headers_mut().insert(
         "x-diffforge-client-id",
         HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    request.headers_mut().insert(
+        "user-agent",
+        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
     );
     if let Some(token) = cloud_mcp_authorization_bearer(state).await? {
         request.headers_mut().insert(
@@ -10911,6 +10916,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
         "x-diffforge-client-id",
         HeaderValue::from_str(client_id.trim())
             .map_err(|error| format!("Invalid Cloud MCP client id header: {error}"))?,
+    );
+    request.headers_mut().insert(
+        "user-agent",
+        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
     );
     if let Some(workspace_id) = workspace_id.as_deref() {
         request.headers_mut().insert(
