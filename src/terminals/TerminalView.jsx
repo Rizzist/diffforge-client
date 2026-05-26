@@ -64,6 +64,7 @@ import WorkspaceTerminal, {
 import {
   buildTerminalComposerDraftInput,
   getTerminalInputDebugFields,
+  TERMINAL_PARKED_PROMPT_EVENT,
   TERMINAL_SHIFT_ENTER_SEQUENCE,
 } from "./WorkspaceTerminal/terminalCore.js";
 import {
@@ -94,8 +95,11 @@ const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [];
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
+const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
+const TODO_QUEUE_CLOSED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
+const TODO_QUEUE_PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const TODO_QUEUE_BUSY_REASONS = new Set([
   "busy_activity",
   "busy_turn",
@@ -106,6 +110,7 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "parked_task_resume_ready",
   "parked_task_waiting",
   "reserved",
+  "resume_in_progress",
   "submitted_prompt_active",
   "terminal_starting",
 ]);
@@ -6320,6 +6325,7 @@ function TerminalView({
   const todoQueuePendingTimersRef = useRef(new Map());
   const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
+  const todoQueueTerminalResumeLocksRef = useRef(new Map());
   const voiceAgentToolCallIdsRef = useRef(new Set());
   const voicePlanDeferredTasksRef = useRef(new Map());
   const voicePlanSnapshotsRef = useRef(new Map());
@@ -6542,6 +6548,141 @@ function TerminalView({
 
     return terminal ? getTerminalPaneId(Number.parseInt(terminal.terminalIndex, 10)) : "";
   }, [getTerminalPaneId, workspaceThreadEntry]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    const resolvePayloadTerminalIndex = (payload = {}) => {
+      const directIndex = Number(payload.terminalIndex ?? payload.terminal_index);
+      if (Number.isInteger(directIndex) && logicalTerminalIndexes.includes(directIndex)) {
+        return directIndex;
+      }
+
+      const payloadPaneId = String(payload.paneId || payload.pane_id || "").trim();
+      if (!payloadPaneId) {
+        return null;
+      }
+
+      const matchingIndex = logicalTerminalIndexes.find((terminalIndex) => (
+        getTerminalPaneId(terminalIndex) === payloadPaneId
+      ));
+      return Number.isInteger(matchingIndex) ? matchingIndex : null;
+    };
+
+    listen(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
+      const payload = event?.payload || {};
+      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (
+        payloadWorkspaceId
+        && terminalWorkspace?.id
+        && payloadWorkspaceId !== terminalWorkspace.id
+      ) {
+        return;
+      }
+
+      const targetTerminalIndex = resolvePayloadTerminalIndex(payload);
+      if (!Number.isInteger(targetTerminalIndex)) {
+        return;
+      }
+
+      const status = String(payload.status || "").trim().toLowerCase();
+      const taskId = String(payload.taskId || payload.task_id || "").trim();
+      const promptEventId = String(payload.promptEventId || payload.prompt_event_id || "").trim();
+      const lockId = promptEventId || taskId || `terminal-${targetTerminalIndex}`;
+      const existingLock = todoQueueTerminalResumeLocksRef.current.get(targetTerminalIndex);
+      const nowMs = Date.now();
+
+      if (TODO_QUEUE_PARKED_TERMINAL_STATUSES.has(status)) {
+        const reason = status === "resume_requested"
+          ? "resume_in_progress"
+          : status === "resume_ready"
+          ? "parked_task_resume_ready"
+          : "parked_task_waiting";
+        todoQueueTerminalResumeLocksRef.current.set(targetTerminalIndex, {
+          lockId,
+          mode: status === "resume_requested" ? "resume_requested" : "parked",
+          paneId: String(payload.paneId || payload.pane_id || ""),
+          promptEventId,
+          reason,
+          source: `terminal-parked-${status}`,
+          startedAtMs: Number(existingLock?.startedAtMs || 0) || nowMs,
+          status,
+          taskId,
+          terminalIndex: targetTerminalIndex,
+          threadId: String(payload.threadId || payload.thread_id || ""),
+          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+        });
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+        logTerminalStatus("frontend.todo_queue.resume_lock_set", {
+          lockId,
+          reason,
+          status,
+          targetTerminalIndex,
+          threadId: payload.threadId || payload.thread_id || "",
+          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      if (status === "resumed" && String(payload.reason || "").trim() !== "task_terminal") {
+        todoQueueTerminalResumeLocksRef.current.set(targetTerminalIndex, {
+          lockId,
+          mode: "resume",
+          paneId: String(payload.paneId || payload.pane_id || ""),
+          promptEventId,
+          reason: "resume_in_progress",
+          source: "terminal-parked-resume",
+          startedAtMs: nowMs,
+          status,
+          taskId,
+          terminalIndex: targetTerminalIndex,
+          threadId: String(payload.threadId || payload.thread_id || ""),
+          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+        });
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+        logTerminalStatus("frontend.todo_queue.resume_lock_set", {
+          lockId,
+          reason: "resume_in_progress",
+          status,
+          targetTerminalIndex,
+          threadId: payload.threadId || payload.thread_id || "",
+          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      const currentLock = todoQueueTerminalResumeLocksRef.current.get(targetTerminalIndex);
+      if (currentLock && (!lockId || currentLock.lockId === lockId)) {
+        todoQueueTerminalResumeLocksRef.current.delete(targetTerminalIndex);
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+        logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
+          lockId: currentLock.lockId || lockId,
+          reason: "parked_event_released",
+          status,
+          targetTerminalIndex,
+          threadId: currentLock.threadId || "",
+          workspaceId: currentLock.workspaceId || terminalWorkspace?.id || "",
+        });
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
+
   const getTodoQueueTerminalSendTarget = useCallback((terminalIndex, item = null, options = {}) => {
     const targetTerminalIndex = Number(terminalIndex);
     const image = getTodoQueueItemImage(item);
@@ -6722,6 +6863,40 @@ function TerminalView({
         imageInputSupport,
         reason: "",
       };
+    }
+
+    const resumeLock = todoQueueTerminalResumeLocksRef.current.get(targetTerminalIndex);
+    if (resumeLock) {
+      const lockAgeMs = Date.now() - Number(resumeLock.startedAtMs || 0);
+      const staleAndReady = Boolean(
+        lockAgeMs > TODO_QUEUE_RESUME_LOCK_STALE_MS
+          && TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState || latestTurnState)
+          && agentInputReady
+      );
+      if (staleAndReady) {
+        todoQueueTerminalResumeLocksRef.current.delete(targetTerminalIndex);
+        logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
+          lockAgeMs,
+          lockId: resumeLock.lockId || "",
+          reason: "stale_but_terminal_ready",
+          targetTerminalIndex,
+          threadId: resumeLock.threadId || "",
+          workspaceId: resumeLock.workspaceId || workspaceId,
+        });
+      } else {
+        const reason = resumeLock.reason || "resume_in_progress";
+        const message = reason === "resume_in_progress"
+          ? "This terminal is resuming a parked task."
+          : reason === "parked_task_resume_ready"
+            ? "This terminal has a parked task ready to resume."
+            : "This terminal is parked waiting on another task.";
+        return unavailable(reason, message, {
+          ...targetFields,
+          resumeLockId: resumeLock.lockId || "",
+          resumeLockMode: resumeLock.mode || "",
+          resumeLockStartedAtMs: Number(resumeLock.startedAtMs || 0),
+        });
+      }
     }
 
     if (terminalIsParked) {
@@ -7026,6 +7201,156 @@ function TerminalView({
         threadId: targetThread?.id || inFlightPrompt?.threadId || "",
         workspaceId: targetThread?.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
       });
+    });
+
+    if (changed) {
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    }
+  }, [terminalWorkspace?.id, workspaceThreadEntry]);
+
+  useEffect(() => {
+    const resumeLocks = todoQueueTerminalResumeLocksRef.current;
+    if (!resumeLocks.size) {
+      return;
+    }
+
+    const terminalEntries = Object.values(workspaceThreadEntry?.terminals || {});
+    const nowMs = Date.now();
+    let changed = false;
+
+    resumeLocks.forEach((resumeLock, terminalIndex) => {
+      const liveTerminal = terminalEntries.find((candidate) => (
+        Number(candidate?.terminalIndex) === Number(terminalIndex)
+      )) || null;
+      const targetThread = resumeLock?.threadId
+        ? workspaceThreadEntry?.threads?.[resumeLock.threadId] || null
+        : liveTerminal?.threadId
+          ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
+          : null;
+      const targetRole = String(liveTerminal?.agentId || targetThread?.currentAgent || "").trim().toLowerCase();
+      const providerBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+      const latestTurn = targetThread?.latestTurn || null;
+      const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+      const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+      const latestMessageId = String(latestTurn?.messageId || "").trim();
+      const lockPromptId = String(resumeLock?.promptEventId || resumeLock?.taskId || "").trim();
+      const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
+      const terminalIsParked = TODO_QUEUE_PARKED_TERMINAL_STATUSES.has(liveStatus);
+      const lockStartedAtMs = Number(resumeLock?.startedAtMs || 0);
+      const terminalInputReadyAtMs = Date.parse(
+        liveTerminal?.inputReadyAt
+          || liveTerminal?.promptReadyAt
+          || providerBinding?.inputReadyAt
+          || providerBinding?.promptReadyAt
+          || "",
+      ) || 0;
+      const turnStartedAtMs = Date.parse(
+        latestTurn?.startedAt
+          || latestTurn?.createdAt
+          || latestTurn?.updatedAt
+          || "",
+      ) || 0;
+      const promptTurnMatches = Boolean(
+        !lockPromptId
+          || latestTurnId.includes(lockPromptId)
+          || latestMessageId === lockPromptId
+      );
+      const turnBelongsToLockWindow = Boolean(
+        !turnStartedAtMs
+          || !lockStartedAtMs
+          || turnStartedAtMs >= lockStartedAtMs - 1000
+      );
+      const freshInputReady = Boolean(
+        (liveTerminal?.inputReady || providerBinding?.inputReady)
+          && lockStartedAtMs
+          && terminalInputReadyAtMs
+          && terminalInputReadyAtMs >= lockStartedAtMs
+      );
+      const resumedTurnConfirmedFinished = Boolean(
+        resumeLock?.mode === "resume"
+          && TODO_QUEUE_CLOSED_TURN_STATES.has(latestTurnState)
+          && freshInputReady
+          && (promptTurnMatches || turnBelongsToLockWindow)
+      );
+      const lockAgeMs = lockStartedAtMs ? nowMs - lockStartedAtMs : 0;
+
+      if (!liveTerminal && lockAgeMs > TODO_QUEUE_RESUME_LOCK_STALE_MS) {
+        resumeLocks.delete(terminalIndex);
+        changed = true;
+        logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
+          lockAgeMs,
+          lockId: resumeLock?.lockId || "",
+          reason: "terminal_missing",
+          targetTerminalIndex: terminalIndex,
+          threadId: resumeLock?.threadId || "",
+          workspaceId: resumeLock?.workspaceId || terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      if (resumedTurnConfirmedFinished) {
+        resumeLocks.delete(terminalIndex);
+        changed = true;
+        logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
+          freshInputReady,
+          latestMessageId,
+          latestTurnId,
+          latestTurnState,
+          lockAgeMs,
+          lockId: resumeLock?.lockId || "",
+          promptTurnMatches,
+          reason: "resumed_turn_finished",
+          targetTerminalIndex: terminalIndex,
+          terminalInputReadyAt: liveTerminal?.inputReadyAt
+            || liveTerminal?.promptReadyAt
+            || providerBinding?.inputReadyAt
+            || providerBinding?.promptReadyAt
+            || "",
+          threadId: targetThread?.id || resumeLock?.threadId || "",
+          workspaceId: targetThread?.workspaceId || resumeLock?.workspaceId || terminalWorkspace?.id || "",
+        });
+        return;
+      }
+
+      if (
+        resumeLock?.mode !== "resume"
+        && liveTerminal
+        && !terminalIsParked
+      ) {
+        if (["active", "running"].includes(liveStatus)) {
+          resumeLocks.set(terminalIndex, {
+            ...resumeLock,
+            mode: "resume",
+            reason: "resume_in_progress",
+            source: resumeLock?.source || "terminal-parked-resume",
+            status: liveStatus,
+            threadId: resumeLock?.threadId || liveTerminal?.threadId || "",
+          });
+          changed = true;
+          logTerminalStatus("frontend.todo_queue.resume_lock_set", {
+            lockAgeMs,
+            lockId: resumeLock?.lockId || "",
+            reason: "resume_in_progress",
+            status: liveStatus,
+            targetTerminalIndex: terminalIndex,
+            threadId: resumeLock?.threadId || liveTerminal?.threadId || "",
+            workspaceId: resumeLock?.workspaceId || terminalWorkspace?.id || "",
+          });
+          return;
+        }
+
+        resumeLocks.delete(terminalIndex);
+        changed = true;
+        logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
+          lockAgeMs,
+          lockId: resumeLock?.lockId || "",
+          reason: "parked_terminal_released",
+          status: liveStatus,
+          targetTerminalIndex: terminalIndex,
+          threadId: resumeLock?.threadId || "",
+          workspaceId: resumeLock?.workspaceId || terminalWorkspace?.id || "",
+        });
+      }
     });
 
     if (changed) {
@@ -9409,6 +9734,7 @@ function TerminalView({
         "pending_prompt",
         "parked_task_resume_ready",
         "parked_task_waiting",
+        "resume_in_progress",
         "busy_turn",
         "busy_activity",
         "composer_draft_present",
