@@ -4695,7 +4695,6 @@ async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result
     let token = cloud_mcp_authorization_bearer(state.inner())
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
-    validate_auth_value("Cloud MCP auth", &token)?;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
