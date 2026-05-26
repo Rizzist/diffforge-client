@@ -2454,8 +2454,9 @@ export const WorkspaceButton = styled.button`
   --workspace-card-status-border: rgba(144, 155, 170, 0.24);
   --workspace-card-hover-bg: rgba(230, 236, 245, 0.04);
   --workspace-card-hover-border: rgba(230, 236, 245, 0.08);
-  --workspace-card-selected-bg: rgba(125, 160, 205, 0.09);
-  --workspace-card-selected-border: rgba(125, 160, 205, 0.22);
+  --workspace-card-selected-bg: rgba(59, 130, 246, 0.08);
+  --workspace-card-selected-border: rgba(125, 176, 255, 0.5);
+  --workspace-card-selected-ring: rgba(79, 163, 255, 0.24);
 
   position: relative;
   display: grid;
@@ -2535,7 +2536,8 @@ export const WorkspaceButton = styled.button`
     --workspace-card-hover-bg: rgba(0, 0, 0, 0.035);
     --workspace-card-hover-border: rgba(0, 0, 0, 0.08);
     --workspace-card-selected-bg: rgba(0, 102, 204, 0.08);
-    --workspace-card-selected-border: rgba(0, 102, 204, 0.2);
+    --workspace-card-selected-border: rgba(0, 102, 204, 0.46);
+    --workspace-card-selected-ring: rgba(0, 102, 204, 0.18);
   }
 
   html[data-forge-theme="light"] &[data-runtime="closed"] {
@@ -2574,7 +2576,9 @@ export const WorkspaceButton = styled.button`
   &[data-selected="true"] {
     border-color: var(--workspace-card-selected-border);
     background: var(--workspace-card-selected-bg);
-    box-shadow: inset 0 0 0 1px rgba(125, 160, 205, 0.04);
+    box-shadow:
+      0 0 0 1px var(--workspace-card-selected-ring),
+      inset 0 0 0 1px rgba(125, 176, 255, 0.08);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {

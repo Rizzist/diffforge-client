@@ -1903,10 +1903,12 @@ function normalizeCloseCount(value) {
 function normalizeTerminalCloseProgress(payload) {
   const total = normalizeCloseCount(payload?.total);
   const closed = normalizeCloseCount(payload?.closed);
+  const workspaceId = String(payload?.workspaceId || payload?.workspace_id || "").trim();
 
   return {
     closed: Math.min(closed, total || closed),
     total,
+    workspaceId,
   };
 }
 
@@ -2808,6 +2810,13 @@ function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
   return cleanWorkspaceRootDirectory(workspaceSettings?.[workspaceId]?.rootDirectory);
 }
 
+function workspaceRuntimeActivationKey(workspaceId, repoPath) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
+
+  return safeWorkspaceId && safeRepoPath ? `${safeWorkspaceId}:${safeRepoPath}` : "";
+}
+
 function findWorkspaceByEffectiveRoot(
   workspaces,
   workspaceSettings,
@@ -3187,10 +3196,9 @@ export default function App() {
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
-  const sharedMcpActiveRepoRef = useRef("");
+  const sharedMcpActiveRuntimeTargetsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
   const workspaceDeactivationInFlightRef = useRef("");
-  const workspaceRuntimeDeactivatedRepoRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
@@ -4284,6 +4292,9 @@ export default function App() {
           if (!currentState.isActive || currentState.workspaceId !== targetWorkspaceId) {
             return currentState;
           }
+          if (nextProgress.workspaceId && nextProgress.workspaceId !== targetWorkspaceId) {
+            return currentState;
+          }
 
           const currentProgress = normalizeTerminalCloseProgress(currentState);
 
@@ -4303,6 +4314,7 @@ export default function App() {
         invoke("deactivate_workspace_runtime", {
           repoPath: runtimeRepoPath || null,
           reason: "workspace_deactivate",
+          workspaceId: targetWorkspaceId,
         }),
         WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
         "Workspace deactivation timed out.",
@@ -4316,9 +4328,9 @@ export default function App() {
       }
 
       if (runtimeCleanupCompleted && runtimeRepoPath) {
-        workspaceRuntimeDeactivatedRepoRef.current = runtimeRepoPath;
-        if (sharedMcpActiveRepoRef.current === runtimeRepoPath) {
-          sharedMcpActiveRepoRef.current = "";
+        const runtimeKey = workspaceRuntimeActivationKey(targetWorkspaceId, runtimeRepoPath);
+        if (runtimeKey) {
+          sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
         }
       }
 
@@ -4341,11 +4353,11 @@ export default function App() {
         setActivatedWorkspaceId(nextActivatedWorkspaceId);
       }
       if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
-        const nextSelectedWorkspace = nextEnabledWorkspaceIds
-          .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
-          .find(Boolean);
-        setSelectedWorkspaceId(nextSelectedWorkspace?.id || "");
+        setSelectedWorkspaceId("");
       }
+      setWorkspaceSettingsModalId((currentModalId) => (
+        currentModalId === targetWorkspaceId ? "" : currentModalId
+      ));
 
       workspaceDeactivationInFlightRef.current = "";
       setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
@@ -5469,12 +5481,29 @@ export default function App() {
         const cleanupStartedAt = performance.now();
 
 
-        const cleanupResult = await withTimeout(
-          invoke("terminal_close_all"),
+        const cleanupResults = await withTimeout(
+          Promise.all(terminalIndexesToClose.map((terminalIndex) => {
+            const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
+
+            return closeWorkspaceTerminalPane({
+              agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
+              nextTerminalCount: terminalCount,
+              previousTerminalCount: currentTerminalCount,
+              reason: "settings_root_change",
+              terminalIndex,
+              waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
+              workspaceId: selectedWorkspace.id,
+            });
+          })),
           WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
           "Terminal cleanup timed out.",
         );
+        const failedCleanup = cleanupResults.filter((result) => !result?.closed);
 
+
+        if (failedCleanup.length) {
+          throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
+        }
 
         if (previousMcpRepoPath && previousMcpRepoPath !== nextMcpRepoPath) {
           const mcpCleanupStartedAt = performance.now();
@@ -5489,6 +5518,10 @@ export default function App() {
             "Shared MCP cleanup timed out.",
           );
           const mcpCleanupData = mcpCleanupResult?.data || mcpCleanupResult || {};
+          const previousRuntimeKey = workspaceRuntimeActivationKey(selectedWorkspace.id, previousMcpRepoPath);
+          if (previousRuntimeKey) {
+            sharedMcpActiveRuntimeTargetsRef.current.delete(previousRuntimeKey);
+          }
 
         }
       } else if (terminalIndexesToClose.length) {
@@ -5563,23 +5596,6 @@ export default function App() {
         workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
         setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
         setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
-      }
-
-      if (rootChanged && selectedWorkspace.id === activatedWorkspaceIdRef.current && nextMcpRepoPath) {
-        const mcpActivateStartedAt = performance.now();
-
-
-        const mcpActivateResult = await withTimeout(
-          invoke("coordination_activate_shared_mcp_daemon", {
-            repoPath: nextMcpRepoPath,
-            workspaceId: selectedWorkspace.id,
-            workspaceName: nextWorkspace.name,
-          }),
-          WORKSPACE_SHARED_MCP_TIMEOUT_MS,
-          "Shared MCP restart timed out.",
-        );
-        const mcpActivateData = mcpActivateResult?.data || mcpActivateResult || {};
-
       }
 
       setWorkspaceNameDraft(nextWorkspace.name);
@@ -7541,76 +7557,72 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!activatedWorkspace || !activatedWorkspaceTerminalWorkingDirectory) {
-      return undefined;
-    }
+    const desiredTargets = new Map();
 
-    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
-    const workspaceId = activatedWorkspace.id;
-    const workspaceName = activatedWorkspace.name || "";
-    let disposed = false;
-    const activateStartedAt = performance.now();
+    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
+      const workspaceId = descriptor.workspace?.id || "";
+      const repoPath = descriptor.workingDirectory || "";
+      const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
 
-    sharedMcpActiveRepoRef.current = repoPath;
-
-    withTimeout(
-      invoke("coordination_activate_shared_mcp_daemon", {
-        repoPath,
-        workspaceId,
-        workspaceName,
-      }),
-      WORKSPACE_SHARED_MCP_TIMEOUT_MS,
-      "Shared MCP activation timed out.",
-    )
-      .then((response) => {
-        if (disposed) {
-          if (sharedMcpActiveRepoRef.current !== repoPath) {
-            invoke("coordination_deactivate_shared_mcp_daemon", {
-              repoPath,
-              reason: "workspace_activation_disposed",
-            }).catch(() => {});
-          }
-          return;
-        }
-
-        const data = response?.data || response || {};
-      })
-      .catch((error) => {
-        if (disposed) {
-          return;
-        }
-
-      });
-
-    return () => {
-      disposed = true;
-
-      if (workspaceRuntimeDeactivatedRepoRef.current === repoPath) {
-        workspaceRuntimeDeactivatedRepoRef.current = "";
+      if (!runtimeKey) {
         return;
       }
 
-      if (sharedMcpActiveRepoRef.current === repoPath) {
-        sharedMcpActiveRepoRef.current = "";
+      desiredTargets.set(runtimeKey, {
+        repoPath,
+        workspaceId,
+        workspaceName: descriptor.workspace?.name || "",
+      });
+    });
+
+    desiredTargets.forEach((target, runtimeKey) => {
+      if (sharedMcpActiveRuntimeTargetsRef.current.has(runtimeKey)) {
+        return;
       }
 
-      const deactivateStartedAt = performance.now();
+      sharedMcpActiveRuntimeTargetsRef.current.set(runtimeKey, target);
+
+      withTimeout(
+        invoke("coordination_activate_shared_mcp_daemon", {
+          repoPath: target.repoPath,
+          workspaceId: target.workspaceId,
+          workspaceName: target.workspaceName,
+        }),
+        WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+        "Shared MCP activation timed out.",
+      )
+        .then(() => {
+          if (!sharedMcpActiveRuntimeTargetsRef.current.has(runtimeKey)) {
+            invoke("coordination_deactivate_shared_mcp_daemon", {
+              repoPath: target.repoPath,
+              reason: "workspace_activation_disposed",
+            }).catch(() => {});
+          }
+        })
+        .catch(() => {
+          if (sharedMcpActiveRuntimeTargetsRef.current.get(runtimeKey) === target) {
+            sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
+          }
+        });
+    });
+
+    Array.from(sharedMcpActiveRuntimeTargetsRef.current.entries()).forEach(([runtimeKey, target]) => {
+      if (desiredTargets.has(runtimeKey)) {
+        return;
+      }
+
+      sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
 
       withTimeout(
         invoke("coordination_deactivate_shared_mcp_daemon", {
-          repoPath,
+          repoPath: target.repoPath,
           reason: "workspace_deactivate",
         }),
         WORKSPACE_SHARED_MCP_TIMEOUT_MS,
         "Shared MCP deactivation timed out.",
-      )
-        .then((response) => {
-          const data = response?.data || response || {};
-        })
-        .catch((error) => {
-        });
-    };
-  }, [activatedWorkspace?.id, activatedWorkspace?.name, activatedWorkspaceTerminalWorkingDirectory]);
+      ).catch(() => {});
+    });
+  }, [enabledWorkspaceRuntimeDescriptors]);
   const isActivatedWorkspaceDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && activatedWorkspace
@@ -7689,7 +7701,9 @@ export default function App() {
     : "No workspace selected.";
   const shouldShowTerminalNav = Boolean(hasSelectedWorkspace || shouldShowWorkspaceSetup);
   const shouldShowWorkspaceDetailNav = hasSelectedWorkspace;
-  const isSelectedWorkspaceActivated = Boolean(selectedWorkspace && activatedWorkspace?.id === selectedWorkspace.id);
+  const isSelectedWorkspaceActivated = Boolean(
+    selectedWorkspace && enabledRuntimeWorkspaceIds.includes(selectedWorkspace.id),
+  );
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
@@ -10671,11 +10685,14 @@ export default function App() {
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
+                      const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
                       const workspaceRuntimeState = workspace.id === activatedWorkspaceId
                         ? workspaceState === "ready"
                           ? "activated"
                           : "activating"
-                        : "closed";
+                        : workspaceIsRuntimeEnabled
+                          ? "activated"
+                          : "closed";
                       const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
                       const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
                         notificationSummary.badgeCount,

@@ -1048,6 +1048,7 @@ fn emit_terminal_close_all_progress(
     total: usize,
     pane_id: Option<String>,
     instance_id: Option<u64>,
+    workspace_id: Option<String>,
 ) {
     let _ = app.emit(
         TERMINAL_CLOSE_ALL_PROGRESS_EVENT,
@@ -1056,8 +1057,20 @@ fn emit_terminal_close_all_progress(
             total,
             pane_id,
             instance_id,
+            workspace_id,
         },
     );
+}
+
+fn terminal_instance_matches_workspace(
+    instance: &TerminalInstance,
+    workspace_id: Option<&str>,
+) -> bool {
+    let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    instance.metadata.workspace_id == workspace_id
 }
 
 fn workspace_git_bootstrap_cache() -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrap>> {
@@ -1804,16 +1817,41 @@ async fn close_all_terminal_sessions(
     app: AppHandle,
     state: &TerminalState,
     cloud_mcp_state: &CloudMcpState,
+    workspace_id: Option<&str>,
 ) -> Result<usize, String> {
+    let target_workspace_id = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let instances = {
         let mut terminals = state.terminals.write().await;
-        terminals
-            .drain()
-            .collect::<Vec<(String, TerminalInstance)>>()
+        if target_workspace_id.is_some() {
+            let pane_ids = terminals
+                .iter()
+                .filter_map(|(pane_id, instance)| {
+                    terminal_instance_matches_workspace(instance, target_workspace_id.as_deref())
+                        .then(|| pane_id.clone())
+                })
+                .collect::<Vec<_>>();
+
+            pane_ids
+                .into_iter()
+                .filter_map(|pane_id| terminals.remove_entry(&pane_id))
+                .collect::<Vec<(String, TerminalInstance)>>()
+        } else {
+            terminals
+                .drain()
+                .collect::<Vec<(String, TerminalInstance)>>()
+        }
     };
     let pty_pool = Arc::clone(&state.pty_pool);
     let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
-    let warm_ptys = pty_pool.drain_for_shutdown();
+    let scoped_close = target_workspace_id.is_some();
+    let warm_ptys = if scoped_close {
+        Vec::new()
+    } else {
+        pty_pool.drain_for_shutdown()
+    };
     let closed = instances.len();
     let total = closed;
     let warm_total = warm_ptys.len();
@@ -1821,6 +1859,7 @@ async fn close_all_terminal_sessions(
         "backend.terminal_close_all.begin",
         json!({
             "active_count": closed,
+            "workspace_id": target_workspace_id.as_deref().unwrap_or(""),
             "warm_count": warm_total,
         }),
     );
@@ -1858,7 +1897,30 @@ async fn close_all_terminal_sessions(
         .await;
     }
 
-    emit_terminal_close_all_progress(&app, 0, total, None, None);
+    emit_terminal_close_all_progress(
+        &app,
+        0,
+        total,
+        None,
+        None,
+        target_workspace_id.clone(),
+    );
+
+    if scoped_close && total == 0 {
+        log_terminal_crash_forensics_event(
+            "backend.terminal_close_all.done",
+            json!({
+                "active_done": 0,
+                "active_total": 0,
+                "scope": "workspace",
+                "timed_out": false,
+                "workspace_id": target_workspace_id.as_deref().unwrap_or(""),
+                "warm_done": 0,
+                "warm_total": 0,
+            }),
+        );
+        return Ok(0);
+    }
 
     tauri::async_runtime::spawn_blocking(move || {
         enum CleanupSignal {
@@ -1875,6 +1937,7 @@ async fn close_all_terminal_sessions(
             let cleanup_tx = cleanup_tx.clone();
             let closed_count = Arc::clone(&closed_count);
             let cleanup_tracker = Arc::clone(&cleanup_tracker);
+            let progress_workspace_id = instance.metadata.workspace_id.clone();
 
             thread::spawn(move || {
                 let instance_id = instance.id;
@@ -1907,6 +1970,7 @@ async fn close_all_terminal_sessions(
                     total,
                     Some(pane_id),
                     Some(instance_id),
+                    Some(progress_workspace_id),
                 );
                 let _ = cleanup_tx.send(CleanupSignal::Active);
             });
@@ -1929,7 +1993,7 @@ async fn close_all_terminal_sessions(
             });
         }
 
-        {
+        if !scoped_close {
             let cleanup_tx = cleanup_tx.clone();
 
             thread::spawn(move || {
@@ -1952,7 +2016,7 @@ async fn close_all_terminal_sessions(
         let wait_timeout = Duration::from_millis(TERMINAL_CLOSE_ALL_WAIT_MS);
         let mut active_done = 0usize;
         let mut warm_done = 0usize;
-        let mut login_closed = None;
+        let mut login_closed = scoped_close.then_some(());
         let mut timed_out = false;
 
         while active_done < total || warm_done < warm_total || login_closed.is_none() {
@@ -1989,14 +2053,24 @@ async fn close_all_terminal_sessions(
                 "close_all",
                 Duration::from_millis(TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS),
             );
-            pty_pool.wait_for_refill_idle();
+            if !scoped_close {
+                pty_pool.wait_for_refill_idle();
+            }
         }
         let cleanup_tracker_active_before_sweep = cleanup_tracker.active();
-        let conhosts_closed = cleanup_windows_headless_console_hosts();
-        let cleanup_tracker_idle_after_sweep = cleanup_tracker.wait_for_idle(
-            "close_all_after_conhost_sweep",
-            Duration::from_millis(TERMINAL_CLOSE_ALL_WAIT_MS),
-        );
+        let conhosts_closed = if scoped_close {
+            0
+        } else {
+            cleanup_windows_headless_console_hosts()
+        };
+        let cleanup_tracker_idle_after_sweep = if scoped_close {
+            true
+        } else {
+            cleanup_tracker.wait_for_idle(
+                "close_all_after_conhost_sweep",
+                Duration::from_millis(TERMINAL_CLOSE_ALL_WAIT_MS),
+            )
+        };
         log_terminal_crash_forensics_event(
             "backend.terminal_close_all.done",
             json!({
@@ -2007,6 +2081,7 @@ async fn close_all_terminal_sessions(
                 "cleanup_tracker_idle_after_sweep": cleanup_tracker_idle_after_sweep,
                 "conhosts_closed": conhosts_closed,
                 "login_done": login_closed.is_some(),
+                "scope": if scoped_close { "workspace" } else { "all" },
                 "timed_out": timed_out,
                 "warm_done": warm_done,
                 "warm_total": warm_total,
@@ -6914,7 +6989,7 @@ async fn terminal_close_all(
 ) -> Result<TerminalCloseAllResult, String> {
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
-    let closed = close_all_terminal_sessions(app, &state, cloud_mcp_state.inner()).await?;
+    let closed = close_all_terminal_sessions(app, &state, cloud_mcp_state.inner(), None).await?;
 
     Ok(TerminalCloseAllResult { closed })
 }

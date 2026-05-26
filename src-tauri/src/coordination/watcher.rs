@@ -184,16 +184,48 @@ pub fn stop_all_file_watchers(reason: &str) -> Value {
             .collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
+    api_ok(stop_watcher_runtimes(runtimes, reason, json!({})))
+}
+
+pub fn stop_file_watchers_for_repo_path(repo_path: &Path, reason: &str) -> Value {
+    let target_repo_path = process_path_text(repo_path);
+    let runtimes = match watcher_runtimes().lock() {
+        Ok(mut runtimes) => {
+            let keys = runtimes
+                .iter()
+                .filter_map(|(key, runtime)| {
+                    (process_path_text(&runtime.repo_path) == target_repo_path).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+
+            keys.into_iter()
+                .filter_map(|key| runtimes.remove(&key))
+                .collect::<Vec<_>>()
+        }
+        Err(_) => Vec::new(),
+    };
+
+    api_ok(stop_watcher_runtimes(
+        runtimes,
+        reason,
+        json!({ "repo_path": target_repo_path }),
+    ))
+}
+
+fn stop_watcher_runtimes(runtimes: Vec<WatcherRuntime>, reason: &str, extra: Value) -> Value {
     let total = runtimes.len();
 
     if total == 0 {
-        return api_ok(json!({
-            "status": "stopped",
-            "reason": reason,
-            "stopped": 0,
-            "total": 0,
-            "timed_out": false,
-        }));
+        return merge_watcher_stop_extra(
+            json!({
+                "status": "stopped",
+                "reason": reason,
+                "stopped": 0,
+                "total": 0,
+                "timed_out": false,
+            }),
+            extra,
+        );
     }
 
     let (joined_tx, joined_rx) = mpsc::channel();
@@ -226,13 +258,26 @@ pub fn stop_all_file_watchers(reason: &str) -> Value {
         }
     }
 
-    api_ok(json!({
-        "status": "stopped",
-        "reason": reason,
-        "stopped": stopped,
-        "total": total,
-        "timed_out": stopped < total,
-    }))
+    merge_watcher_stop_extra(
+        json!({
+            "status": "stopped",
+            "reason": reason,
+            "stopped": stopped,
+            "total": total,
+            "timed_out": stopped < total,
+        }),
+        extra,
+    )
+}
+
+fn merge_watcher_stop_extra(mut data: Value, extra: Value) -> Value {
+    if let (Some(data), Some(extra)) = (data.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            data.insert(key.clone(), value.clone());
+        }
+    }
+
+    data
 }
 
 pub fn file_watcher_status(kernel: &CoordinationKernel) -> Result<Value, String> {

@@ -1346,6 +1346,7 @@ struct TerminalCloseAllProgressPayload {
     total: usize,
     pane_id: Option<String>,
     instance_id: Option<u64>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2225,6 +2226,7 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
             app_for_shutdown.clone(),
             &terminal_state,
             cloud_mcp_state.inner(),
+            None,
         )
         .await
     };
@@ -2263,6 +2265,7 @@ async fn deactivate_workspace_runtime(
     app: AppHandle,
     repo_path: Option<String>,
     reason: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<Value, String> {
     let started_at = Instant::now();
     let reason = reason
@@ -2276,6 +2279,11 @@ async fn deactivate_workspace_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let workspace_id = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     log_terminal_diagnostic_event(
         &app,
@@ -2283,11 +2291,16 @@ async fn deactivate_workspace_runtime(
         json!({
             "reason": reason,
             "repo_path": repo_path.as_deref().unwrap_or(""),
+            "workspace_id": workspace_id.as_deref().unwrap_or(""),
         }),
     );
 
     let watcher_started_at = Instant::now();
-    let watchers = coordination::watcher::stop_all_file_watchers(&reason);
+    let watchers = if let Some(repo_path) = repo_path.as_deref() {
+        coordination::watcher::stop_file_watchers_for_repo_path(Path::new(repo_path), &reason)
+    } else {
+        coordination::watcher::stop_all_file_watchers(&reason)
+    };
     log_terminal_diagnostic_event(
         &app,
         "workspace_deactivate_runtime.watchers_stopped",
@@ -2303,7 +2316,13 @@ async fn deactivate_workspace_runtime(
         let cloud_mcp_state = app.state::<CloudMcpState>();
         let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
         let _lifecycle_guard = lifecycle_lock.lock().await;
-        close_all_terminal_sessions(app.clone(), &terminal_state, cloud_mcp_state.inner()).await
+        close_all_terminal_sessions(
+            app.clone(),
+            &terminal_state,
+            cloud_mcp_state.inner(),
+            workspace_id.as_deref(),
+        )
+        .await
     };
     let (closed_terminals, terminal_error) = match terminal_result {
         Ok(closed) => (closed, None),
@@ -2359,6 +2378,7 @@ async fn deactivate_workspace_runtime(
         "ok": errors.is_empty(),
         "reason": reason,
         "repoPath": repo_path.as_deref().unwrap_or(""),
+        "workspaceId": workspace_id.as_deref().unwrap_or(""),
         "watchers": watchers,
         "terminals": {
             "closed": closed_terminals,
