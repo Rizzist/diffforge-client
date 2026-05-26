@@ -4691,6 +4691,24 @@ async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMc
 }
 
 #[tauri::command]
+async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result<Value, String> {
+    let token = cloud_mcp_authorization_bearer(state.inner())
+        .await?
+        .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
+    validate_auth_value("Cloud MCP auth", &token)?;
+
+    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
+    let response = client
+        .post(format!("{API_BASE_URL}/billing/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("Unable to load billing status: {error}"))?;
+
+    read_api_response(response, "Unable to load billing status.").await
+}
+
+#[tauri::command]
 async fn cloud_mcp_register_workspace(
     state: State<'_, CloudMcpState>,
     repo_path: String,

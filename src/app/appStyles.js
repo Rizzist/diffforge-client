@@ -11145,6 +11145,91 @@ export const SettingsIdentityItem = styled.div`
   }
 `;
 
+export const CreditUsageTrack = styled.div`
+  position: relative;
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  background: rgba(10, 14, 20, 0.62);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.08);
+  }
+`;
+
+export const CreditUsageFill = styled.div`
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(70, 167, 118, 0.95), rgba(223, 165, 90, 0.96));
+  transition: width 180ms ease;
+`;
+
+export const LowCreditWarningToast = styled.aside`
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 80;
+  display: flex;
+  max-width: min(440px, calc(100vw - 44px));
+  min-width: min(360px, calc(100vw - 44px));
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid rgba(223, 165, 90, 0.32);
+  border-radius: 8px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  background:
+    linear-gradient(180deg, rgba(223, 165, 90, 0.13), rgba(223, 165, 90, 0.04)),
+    rgba(20, 24, 31, 0.96);
+
+  html[data-forge-theme="light"] & {
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.16);
+    background:
+      linear-gradient(180deg, rgba(214, 137, 36, 0.12), rgba(214, 137, 36, 0.04)),
+      var(--forge-surface);
+  }
+
+  @media (max-width: 760px) {
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
+    max-width: none;
+    min-width: 0;
+    align-items: stretch;
+    flex-direction: column;
+  }
+`;
+
+export const LowCreditWarningCopy = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+`;
+
+export const LowCreditWarningActions = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+
+  button {
+    min-height: 34px;
+  }
+
+  @media (max-width: 760px) {
+    justify-content: stretch;
+
+    button {
+      flex: 1;
+    }
+  }
+`;
+
 export const AppearanceThemeGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

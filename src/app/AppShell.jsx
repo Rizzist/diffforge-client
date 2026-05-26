@@ -392,6 +392,11 @@ import {
   SettingsHint,
   SettingsIdentityGrid,
   SettingsIdentityItem,
+  CreditUsageTrack,
+  CreditUsageFill,
+  LowCreditWarningToast,
+  LowCreditWarningCopy,
+  LowCreditWarningActions,
   AppearanceThemeGrid,
   AppearanceThemeButton,
   LoginCard,
@@ -467,6 +472,9 @@ const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const PLAN_REFRESH_TIMEOUT_MS = 5000;
+const BILLING_STATUS_REFRESH_MS = 60000;
+const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
+const LOW_CREDIT_WARNING_THRESHOLD = 1000;
 const LOGOUT_TIMEOUT_MS = 5000;
 const WINDOW_FRAME_STATE_DEFAULT = { isFullscreen: false, isMaximized: false };
 const WINDOW_VIEWPORT_MARGIN_PX = 12;
@@ -482,6 +490,88 @@ const WINDOW_RESIZE_EDGES = [
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
+
+function readDismissedLowCreditWarningKey() {
+  try {
+    return window.localStorage.getItem(LOW_CREDIT_WARNING_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDismissedLowCreditWarningKey(value) {
+  try {
+    if (value) {
+      window.localStorage.setItem(LOW_CREDIT_WARNING_STORAGE_KEY, value);
+    } else {
+      window.localStorage.removeItem(LOW_CREDIT_WARNING_STORAGE_KEY);
+    }
+  } catch {
+    // Dismissal is a convenience only.
+  }
+}
+
+function formatCreditCount(value) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return "-";
+  }
+
+  return Math.max(0, Math.round(numericValue)).toLocaleString();
+}
+
+function creditResetLabel(resetAt) {
+  if (!resetAt) {
+    return "No reset date";
+  }
+
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+    }).format(new Date(resetAt));
+  } catch {
+    return "No reset date";
+  }
+}
+
+function creditUsagePercent(credits) {
+  const total = Number(credits?.termTotalCredits || 0);
+  const remaining = Number(credits?.termRemainingCredits || 0);
+
+  if (!Number.isFinite(total) || total <= 0) {
+    return 0;
+  }
+
+  return Math.min(100, Math.max(0, Math.round((remaining / total) * 100)));
+}
+
+function lowCreditWarningKey(credits) {
+  if (!credits) {
+    return "";
+  }
+
+  return [
+    credits.termId || credits.resetAt || "current",
+    credits.lowCreditState || "unknown",
+    credits.termRemainingCredits ?? "unknown",
+  ].join(":");
+}
+
+function shouldShowLowCreditWarning(credits, dismissedKey) {
+  if (!credits) {
+    return false;
+  }
+
+  const state = String(credits.lowCreditState || "").toLowerCase();
+  const remaining = Number(credits.termRemainingCredits || 0);
+  const isLow = ["low", "critical", "exhausted", "missing_term"].includes(state)
+    || (Number.isFinite(remaining) && remaining <= LOW_CREDIT_WARNING_THRESHOLD);
+  const warningKey = lowCreditWarningKey(credits);
+
+  return Boolean(isLow && warningKey && warningKey !== dismissedKey);
+}
 
 function safeDiagnosticDetails(details) {
   if (!details || typeof details !== "object") {
@@ -3158,6 +3248,12 @@ export default function App() {
   const [mainWindowFocused, setMainWindowFocused] = useState(readMainWindowFocusedFallback);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
   const [workspaceDeactivationState, setWorkspaceDeactivationState] = useState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
+  const [billingStatus, setBillingStatus] = useState(null);
+  const [billingStatusState, setBillingStatusState] = useState("idle");
+  const [billingStatusError, setBillingStatusError] = useState("");
+  const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
+    readDismissedLowCreditWarningKey,
+  );
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
   const launchStartedAtRef = useRef(Date.now());
@@ -4650,6 +4746,34 @@ export default function App() {
       );
     }
   }, [setAuthenticated, setSignedOut]);
+
+  const refreshBillingStatus = useCallback(async ({ quiet = false } = {}) => {
+    if (authState !== "authenticated") {
+      setBillingStatus(null);
+      setBillingStatusState("idle");
+      setBillingStatusError("");
+      return null;
+    }
+
+    if (!quiet) {
+      setBillingStatusState("loading");
+    } else {
+      setBillingStatusState((current) => (current === "idle" ? "loading" : current));
+    }
+
+    try {
+      const nextBillingStatus = await invoke("cloud_mcp_get_billing_status");
+      setBillingStatus(nextBillingStatus);
+      setBillingStatusState("ready");
+      setBillingStatusError("");
+      return nextBillingStatus;
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to load credit status.");
+      setBillingStatusState("error");
+      setBillingStatusError(message);
+      return null;
+    }
+  }, [authState]);
 
   const resolveAgentInstallationSyncTarget = useCallback(() => {
     const currentWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
@@ -6833,6 +6957,32 @@ export default function App() {
   }, [checkBackend]);
 
   useEffect(() => {
+    if (authState !== "authenticated") {
+      setBillingStatus(null);
+      setBillingStatusState("idle");
+      setBillingStatusError("");
+      return undefined;
+    }
+
+    let cancelled = false;
+    const refresh = async (quiet = false) => {
+      if (!cancelled) {
+        await refreshBillingStatus({ quiet });
+      }
+    };
+
+    refresh(false);
+    const intervalId = window.setInterval(() => {
+      refresh(true);
+    }, BILLING_STATUS_REFRESH_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [authState, refreshBillingStatus]);
+
+  useEffect(() => {
     let isMounted = true;
     let unlistenResize = null;
     const appWindow = getSafeCurrentWindow();
@@ -7217,6 +7367,26 @@ export default function App() {
   const displayName = user?.name || user?.email || "there";
   const userIsPaid = isPaidUser(user);
   const planLabel = userIsPaid ? "Pro" : "Free";
+  const billingCredits = billingStatus?.credits || null;
+  const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
+  const billingTotalCredits = Number(billingCredits?.termTotalCredits || 0);
+  const billingUsedCredits = Number(billingCredits?.termUsedCredits || 0);
+  const billingReservedCredits = Number(billingCredits?.termReservedCredits || 0);
+  const billingCreditPercent = creditUsagePercent(billingCredits);
+  const billingResetLabel = creditResetLabel(billingCredits?.resetAt);
+  const billingLowCreditState = String(billingCredits?.lowCreditState || "pending");
+  const lowCreditToastVisible = userIsPaid
+    && shouldShowLowCreditWarning(billingCredits, dismissedLowCreditWarningKey);
+  const dismissLowCreditWarning = useCallback(() => {
+    const nextDismissedKey = lowCreditWarningKey(billingStatus?.credits);
+
+    if (!nextDismissedKey) {
+      return;
+    }
+
+    writeDismissedLowCreditWarningKey(nextDismissedKey);
+    setDismissedLowCreditWarningKey(nextDismissedKey);
+  }, [billingStatus]);
   const connectedAgentCount = agentStatuses.filter((agent) => agent.installed && agent.authenticated).length;
   const optionalAgentCount = Math.max(0, AGENT_PROVIDERS.length - connectedAgentCount);
   const startupAgentUpdates = getAgentUpdatesAvailable(agentStatuses);
@@ -11412,6 +11582,69 @@ export default function App() {
                         </PrimaryDangerButton>
                       </AccountCardFooter>
                     </AccountCard>
+
+                    <AccountCard data-tone={billingLowCreditState === "ok" ? "blue" : "orange"}>
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Credits</SettingsLabel>
+                          <SettingsValue>
+                            {billingCredits ? `${formatCreditCount(billingRemainingCredits)} remaining` : "Checking credits"}
+                          </SettingsValue>
+                          <SettingsHint>
+                            {billingStatusState === "loading"
+                              ? "Refreshing current billing term."
+                              : billingCredits
+                                ? `Current term resets ${billingResetLabel}.`
+                                : "Credit status will appear after the account check returns."}
+                          </SettingsHint>
+                        </div>
+                        <AgentReadyPill data-tone={billingLowCreditState === "ok" ? "blue" : "orange"}>
+                          {billingStatusState === "loading" ? (
+                            <PendingIcon aria-hidden="true" />
+                          ) : billingCredits ? (
+                            <ButtonCheckIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          )}
+                          <span>{billingCredits ? billingLowCreditState : billingStatusState}</span>
+                        </AgentReadyPill>
+                      </AccountCardHeader>
+
+                      <CreditUsageTrack aria-hidden="true">
+                        <CreditUsageFill style={{ width: `${billingCreditPercent}%` }} />
+                      </CreditUsageTrack>
+
+                      <SettingsIdentityGrid>
+                        <SettingsIdentityItem>
+                          <span>Total</span>
+                          <strong>{formatCreditCount(billingTotalCredits)}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Used</span>
+                          <strong>{formatCreditCount(billingUsedCredits)}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Reserved</span>
+                          <strong>{formatCreditCount(billingReservedCredits)}</strong>
+                        </SettingsIdentityItem>
+                      </SettingsIdentityGrid>
+
+                      {billingStatusError && <FormMessage $state="error">{billingStatusError}</FormMessage>}
+
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          Active and queued cloud AI work uses the same term balance.
+                        </SettingsHint>
+                        <SecondaryButton
+                          disabled={billingStatusState === "loading"}
+                          onClick={() => refreshBillingStatus()}
+                          type="button"
+                        >
+                          <ButtonRefreshIcon aria-hidden="true" />
+                          <span>{billingStatusState === "loading" ? "Refreshing..." : "Refresh credits"}</span>
+                        </SecondaryButton>
+                      </AccountCardFooter>
+                    </AccountCard>
                   </AccountSettingsPanel>
                 </SettingsPage>
               ) : visibleView === "files" ? (
@@ -11944,6 +12177,31 @@ export default function App() {
                 </CrashRecoveryOverlay>
               )}
               </DashboardShell>
+              {lowCreditToastVisible && (
+                <LowCreditWarningToast role="status" aria-live="polite">
+                  <LowCreditWarningCopy>
+                    <SettingsLabel>Credits</SettingsLabel>
+                    <SettingsValue>
+                      {billingLowCreditState === "exhausted"
+                        ? "Cloud credits exhausted"
+                        : "Cloud credits running low"}
+                    </SettingsValue>
+                    <SettingsHint>
+                      {formatCreditCount(billingRemainingCredits)} credits remain this term.
+                    </SettingsHint>
+                  </LowCreditWarningCopy>
+                  <LowCreditWarningActions>
+                    <SecondaryButton onClick={() => refreshBillingStatus({ quiet: true })} type="button">
+                      <ButtonRefreshIcon aria-hidden="true" />
+                      <span>Refresh</span>
+                    </SecondaryButton>
+                    <SecondaryButton onClick={dismissLowCreditWarning} type="button">
+                      <ButtonCloseIcon aria-hidden="true" />
+                      <span>Close</span>
+                    </SecondaryButton>
+                  </LowCreditWarningActions>
+                </LowCreditWarningToast>
+              )}
               {isWorkspaceStartupOverlayVisible && (
                 <WorkspaceStartupOverlay aria-label={`${BRAND_NAME} is initializing workspace`}>
                   <AmbientPanel data-position="left">
