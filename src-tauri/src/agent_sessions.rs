@@ -65,6 +65,123 @@ fn codex_home_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+    let key_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let key = key_path.to_string_lossy().replace('\\', "/");
+    if key.trim().is_empty() || !seen.insert(key) {
+        return;
+    }
+    paths.push(path);
+}
+
+fn codex_worktree_root_and_slot(cwd: &Path) -> Option<(PathBuf, String)> {
+    let components: Vec<_> = cwd.components().collect();
+    for index in 0..components.len().saturating_sub(2) {
+        let component = components[index].as_os_str().to_string_lossy();
+        let next_component = components[index + 1].as_os_str().to_string_lossy();
+        if component != ".agents" || next_component != "worktrees" {
+            continue;
+        }
+
+        let slot = components[index + 2]
+            .as_os_str()
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if slot.is_empty() {
+            continue;
+        }
+
+        let mut repo_root = PathBuf::new();
+        for root_component in &components[..index] {
+            repo_root.push(root_component.as_os_str());
+        }
+        if !repo_root.as_os_str().is_empty() {
+            return Some((repo_root, slot));
+        }
+    }
+
+    None
+}
+
+fn push_codex_managed_home_candidates(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    repo_root: &Path,
+    slot: Option<&str>,
+) {
+    let coordinated_root = repo_root
+        .join(".agents")
+        .join("codex-home")
+        .join("coordinated");
+    if let Some(slot) = slot.filter(|value| !value.trim().is_empty()) {
+        push_unique_path(paths, seen, coordinated_root.join(slot));
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&coordinated_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            push_unique_path(paths, seen, path);
+        }
+    }
+}
+
+fn codex_home_candidates(cwd: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let cwd_path = PathBuf::from(cwd.trim());
+
+    if !cwd.trim().is_empty() {
+        if let Some((repo_root, slot)) = codex_worktree_root_and_slot(&cwd_path) {
+            push_codex_managed_home_candidates(&mut paths, &mut seen, &repo_root, Some(&slot));
+        }
+
+        for ancestor in cwd_path.ancestors() {
+            push_codex_managed_home_candidates(&mut paths, &mut seen, ancestor, None);
+        }
+    }
+
+    if let Some(home) = codex_home_dir() {
+        push_unique_path(&mut paths, &mut seen, home);
+    }
+
+    paths
+}
+
+fn collect_codex_rollout_candidates(cwd: &str) -> Result<Vec<PathBuf>, String> {
+    let homes = codex_home_candidates(cwd);
+    if homes.is_empty() {
+        return Err("Unable to locate Codex home.".to_string());
+    }
+
+    let mut files = Vec::new();
+    for home in &homes {
+        if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+            break;
+        }
+        let sessions_dir = home.join("sessions");
+        if sessions_dir.exists() {
+            collect_codex_rollout_files(&sessions_dir, &mut files);
+        }
+    }
+    sort_rollouts_newest_first(&mut files);
+
+    if files.is_empty() {
+        let searched = homes
+            .iter()
+            .map(|home| home.join("sessions").to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("No Codex rollout transcripts were found in: {searched}"));
+    }
+
+    Ok(files)
+}
+
 fn clean_codex_id(value: impl AsRef<str>) -> String {
     value
         .as_ref()
@@ -140,6 +257,20 @@ fn transcript_has_exact_user_prompt(
         && messages.iter().any(|message| {
             message.role.eq_ignore_ascii_case("user")
                 && normalize_prompt_match_text(&message.text) == expected
+        })
+}
+
+fn transcript_has_exact_user_prompt_at_or_after(
+    messages: &[CodexThreadTranscriptMessage],
+    expected_user_message: &str,
+    submitted_at: &str,
+) -> bool {
+    let expected = normalize_prompt_match_text(expected_user_message);
+    !expected.is_empty()
+        && messages.iter().any(|message| {
+            message.role.eq_ignore_ascii_case("user")
+                && normalize_prompt_match_text(&message.text) == expected
+                && timestamp_text_at_or_after(&message.created_at, submitted_at)
         })
 }
 
@@ -896,24 +1027,9 @@ fn parse_codex_rollout(
 
 fn find_codex_rollout(
     provider_session_id: &str,
-    _cwd: &str,
+    cwd: &str,
 ) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
-    let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
-    let sessions_dir = codex_home.join("sessions");
-    if !sessions_dir.exists() {
-        return Err(format!(
-            "Codex sessions directory does not exist: {}",
-            sessions_dir.display()
-        ));
-    }
-
-    let mut files = Vec::new();
-    collect_codex_rollout_files(&sessions_dir, &mut files);
-    sort_rollouts_newest_first(&mut files);
-
-    if files.is_empty() {
-        return Err("No Codex rollout transcripts were found.".to_string());
-    }
+    let files = collect_codex_rollout_candidates(cwd)?;
 
     let requested_session_id = clean_codex_id(provider_session_id);
     if !requested_session_id.is_empty() {
@@ -1676,18 +1792,7 @@ fn discover_codex_session_by_prompt(
     _fallback_window_ms: u64,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let codex_home = codex_home_dir().ok_or_else(|| "Unable to locate Codex home.".to_string())?;
-    let sessions_dir = codex_home.join("sessions");
-    if !sessions_dir.exists() {
-        return Err(format!(
-            "Codex sessions directory does not exist: {}",
-            sessions_dir.display()
-        ));
-    }
-
-    let mut files = Vec::new();
-    collect_codex_rollout_files(&sessions_dir, &mut files);
-    sort_rollouts_newest_first(&mut files);
+    let files = collect_codex_rollout_candidates(cwd)?;
 
     for path in files {
         let initial_meta = codex_rollout_meta(&path).unwrap_or_default();
@@ -1710,7 +1815,15 @@ fn discover_codex_session_by_prompt(
         if !cwd.trim().is_empty() && !agent_paths_match(&session_cwd, cwd) {
             continue;
         }
-        let exact_prompt_match = transcript_has_exact_user_prompt(&messages, expected_user_message);
+        let exact_prompt_match = if submitted_at.trim().is_empty() {
+            transcript_has_exact_user_prompt(&messages, expected_user_message)
+        } else {
+            transcript_has_exact_user_prompt_at_or_after(
+                &messages,
+                expected_user_message,
+                submitted_at,
+            )
+        };
         let timestamp_recovery_match = allow_timestamp_fallback
             && !submitted_at.trim().is_empty()
             && transcript_has_user_prompt_at_or_after(&messages, submitted_at);

@@ -60,12 +60,14 @@ import {
   clearWorkspaceThreadsBrowserPersistence,
   clearWorkspaceThreadPendingPrompt,
   createWorkspaceThreadId,
+  diagnoseWorkspaceThreadSessionTranscriptHydration,
   ensureWorkspaceThreadsForTerminalIndexes,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadCanArchive,
   getWorkspaceThreadProviderBinding,
   getWorkspaceThreadsByTerminalIndex,
   hydrateWorkspaceThreadSessionTranscript,
+  invalidateWorkspaceThreadProviderSession,
   markWorkspaceThreadAgentActivity,
   markWorkspaceThreadTerminalDetached,
   materializeWorkspaceThreadForTerminal,
@@ -854,10 +856,18 @@ function transcriptHasSettledAssistantResponseForPrompt(messages, event = {}) {
   }
 
   const { message, role, text } = latestPostPromptMessage;
+  const kind = String(message?.kind || "").trim().toLowerCase();
+  const status = String(message?.status || "").trim().toLowerCase();
+  const responseLooksSettled = ![
+    "in_progress",
+    "pending",
+    "running",
+    "streaming",
+  ].includes(status || kind);
   return Boolean(
     role === "assistant"
       && (
-        text
+        (text && responseLooksSettled)
         || transcriptMessageIndicatesTurnComplete(message)
       )
   );
@@ -941,6 +951,9 @@ function threadLatestRunningTurnMatchesPrompt(thread, event = {}) {
   ) {
     return false;
   }
+  if (String(event.matchedBy || "").trim().toLowerCase() === "sessionid") {
+    return true;
+  }
 
   const expectedAtMs = workspaceThreadMessageTimestampMs({
     createdAt: event.expectedMessageCreatedAt || event.messageCreatedAt || event.submittedAt || event.createdAt,
@@ -1006,6 +1019,7 @@ function transcriptSubmittedPromptIndex(messages, event = {}) {
   const allowTimestampFallback = event.allowTimestampFallback === true
     || matchedBy.includes("timestamp")
     || matchedBy.includes("recovery");
+  const sessionMatchedByProviderId = matchedBy === "sessionid";
   const requireTimestampForCwdMatch = matchedBy && matchedBy !== "sessionid";
   const transcriptMessages = Array.isArray(messages) ? messages : [];
   let userIndex = -1;
@@ -1021,7 +1035,12 @@ function transcriptSubmittedPromptIndex(messages, event = {}) {
         return;
       }
       const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
-      if (submittedAtMs && messageTimestampMs && messageTimestampMs < submittedAtMs - 30000) {
+      if (
+        submittedAtMs
+        && messageTimestampMs
+        && messageTimestampMs < submittedAtMs - 30000
+        && !sessionMatchedByProviderId
+      ) {
         return;
       }
       if (submittedAtMs && requireTimestampForCwdMatch && !messageTimestampMs) {
@@ -3471,7 +3490,6 @@ export default function App() {
         }
         const loadedThreads = normalizeWorkspaceThreads(result?.threads || {}, {
           stripLiveBindings: true,
-          stripMessages: true,
         });
         const targetIds = new Set(targets.map((target) => target.workspaceId));
         setWorkspaceThreads((currentThreads) => {
@@ -5288,9 +5306,12 @@ export default function App() {
         || defaultWorkspace
         || firstEnabledWorkspace
         || null;
-      const nextEnabledWorkspaceIds = nextActivated?.id && !existingEnabledWorkspaceIds.includes(nextActivated.id)
-        ? [...existingEnabledWorkspaceIds, nextActivated.id]
-        : existingEnabledWorkspaceIds;
+      const startupAutoActivation = !currentActivatedId && Boolean(nextActivated?.id);
+      const nextEnabledWorkspaceIds = startupAutoActivation
+        ? [nextActivated.id]
+        : nextActivated?.id && !existingEnabledWorkspaceIds.includes(nextActivated.id)
+          ? [...existingEnabledWorkspaceIds, nextActivated.id]
+          : existingEnabledWorkspaceIds;
 
       if (
         (configuredDefaultWorkspaceId && !nextDefaultWorkspaceId)
@@ -8633,7 +8654,7 @@ export default function App() {
       const transcriptRequest = providerSessionId
         ? {
           agentId,
-          cwd: "",
+          cwd: discoveryCwd,
           maxMessages: 320,
           providerSessionId,
         }
@@ -8717,6 +8738,7 @@ export default function App() {
               expectedMessageCreatedAt,
               expectedUserMessage,
               promptEventId,
+              matchedBy,
               submittedAt,
             },
           );
@@ -8733,6 +8755,16 @@ export default function App() {
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
           );
+          const assistantResponseCompletesTurn = Boolean(
+            pollUntilTurnComplete
+              && settledAssistantResponseSeen
+              && promptAccepted
+              && (
+                activeRunningTurnAtTranscriptResult
+                  ? transcriptTargetsLatestRunningTurn
+                  : true
+              )
+          );
           const turnCompleteSeen = Boolean(
             rawTurnCompleteSeen
               && (
@@ -8746,8 +8778,17 @@ export default function App() {
                 )
               ),
           );
-          const assistantResponseCompletesTurn = false;
-          const allowTranscriptTurnCompletion = turnCompleteSeen;
+          const allowTranscriptTurnCompletion = turnCompleteSeen || assistantResponseCompletesTurn;
+          const transcriptMessageDiagnostics = messages.slice(-4).map((message) => ({
+            createdAtPresent: Boolean(String(message?.createdAt || message?.created_at || "").trim()),
+            idPresent: Boolean(String(message?.id || "").trim()),
+            kind: String(message?.kind || "").trim(),
+            role: String(message?.role || "").trim(),
+            source: String(message?.source || "").trim(),
+            status: String(message?.status || "").trim(),
+            textLength: String(message?.text || message?.message || "").length,
+            turnIdPresent: Boolean(String(message?.turnId || message?.turn_id || "").trim()),
+          }));
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.result", {
             agentId,
             activeRunningTurnAtTranscriptResult,
@@ -8756,6 +8797,7 @@ export default function App() {
             latestTimestampPresent: Boolean(result?.latestTimestamp),
             matchedBy: result?.matchedBy || "",
             messageCount: messages.length,
+            messageDiagnostics: transcriptMessageDiagnostics,
             pollUntilTurnComplete,
             requestKey,
             rolloutPathPresent: Boolean(result?.rolloutPath),
@@ -8829,6 +8871,43 @@ export default function App() {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = pollUntilTurnComplete
               && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+            if (discoveredByPrompt && sessionId) {
+              setWorkspaceThreads((threads) => {
+                const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+                  threads,
+                  workspaceId,
+                  threadId,
+                  agentId,
+                );
+                const nextThreads = invalidateWorkspaceThreadProviderSession(threads, {
+                  agentId,
+                  nativeSessionId: sessionId,
+                  providerSessionId: sessionId,
+                  sessionId,
+                  threadId,
+                  workspaceId,
+                });
+                const stateChanged = nextThreads !== threads;
+                if (stateChanged) {
+                  logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.rejected_discovery_invalidated", {
+                    after: getWorkspaceThreadDiagnosticSnapshot(
+                      nextThreads,
+                      workspaceId,
+                      threadId,
+                      agentId,
+                    ),
+                    agentId,
+                    before: beforeSnapshot,
+                    matchedBy,
+                    reason: "prompt_discovery_without_prompt_evidence",
+                    requestKey,
+                    threadId,
+                    workspaceId,
+                  });
+                }
+                return nextThreads;
+              });
+            }
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
               agentId,
               elapsedMs,
@@ -8855,7 +8934,6 @@ export default function App() {
                   pollStartedAt,
                   pollUntilTurnComplete: true,
                   promptEventId,
-                  providerSessionId: sessionId || providerSessionId,
                 });
               }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
             }
@@ -8929,7 +9007,7 @@ export default function App() {
                   pollStartedAt,
                   pollUntilTurnComplete: true,
                   promptEventId,
-                  providerSessionId: sessionId || providerSessionId,
+                  providerSessionId: sessionMatchedByProviderId ? (sessionId || providerSessionId) : providerSessionId,
                 });
               }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
             }
@@ -9026,7 +9104,7 @@ export default function App() {
               threadId,
               agentId,
             );
-            const nextThreads = hydrateWorkspaceThreadSessionTranscript(threads, {
+            const hydrateEvent = {
               agentId,
               expectedMessageCreatedAt,
               expectedUserMessage,
@@ -9050,22 +9128,42 @@ export default function App() {
               threadId,
               turnCompleteSeen,
               workspaceId,
-            });
+            };
+            const hydrationDiagnostics = diagnoseWorkspaceThreadSessionTranscriptHydration(
+              threads,
+              hydrateEvent,
+            );
+            const nextThreads = hydrateWorkspaceThreadSessionTranscript(threads, hydrateEvent);
+            const afterSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+              nextThreads,
+              workspaceId,
+              threadId,
+              agentId,
+            );
+            const stateChanged = nextThreads !== threads;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.apply", {
-              after: getWorkspaceThreadDiagnosticSnapshot(
-                nextThreads,
-                workspaceId,
-                threadId,
-                agentId,
-              ),
+              after: afterSnapshot,
               agentId,
               before: beforeSnapshot,
+              hydrationDiagnostics,
               messageCount: messages.length,
               requestKey,
-              stateChanged: nextThreads !== threads,
+              stateChanged,
               threadId,
               workspaceId,
             });
+            if (!stateChanged) {
+              logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.apply_noop", {
+                after: afterSnapshot,
+                agentId,
+                before: beforeSnapshot,
+                hydrationDiagnostics,
+                messageCount: messages.length,
+                requestKey,
+                threadId,
+                workspaceId,
+              });
+            }
             return nextThreads;
           });
           if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-") && promptAccepted) {
@@ -9160,6 +9258,14 @@ export default function App() {
             providerSessionPresent: Boolean(providerSessionId),
             promptEventIdPresent: Boolean(promptEventId),
             requestKey,
+            requestedCwdPresent: Boolean(requestedCwd),
+            requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
+            snapshot: getWorkspaceThreadDiagnosticSnapshot(
+              workspaceThreadsRef.current,
+              workspaceId,
+              threadId,
+              agentId,
+            ),
             shouldContinuePolling,
             threadId,
             workspaceId,
@@ -9525,7 +9631,11 @@ export default function App() {
       ),
     });
 
-    if (lifecycleEvent.type === "provider-session" || lifecycleEvent.type === "opened") {
+    if (
+      lifecycleEvent.type === "provider-session"
+      || lifecycleEvent.type === "provider-session-invalid"
+      || lifecycleEvent.type === "opened"
+    ) {
       logWorkspaceThreadDiagnosticEvent("frontend.thread_session.input", {
         agentId: lifecycleAgentId,
         hasNativeSessionId: Boolean(lifecycleNativeSessionId),
@@ -9717,7 +9827,10 @@ export default function App() {
         });
         return buildTerminalReadyProjectionEvents(existingThread, event, groundTruth);
       };
-      if (lifecycleEvent.type === "provider-session") {
+      if (lifecycleEvent.type === "provider-session-invalid") {
+        operation = "provider_session_invalid";
+        nextThreads = invalidateWorkspaceThreadProviderSession(threads, lifecycleEvent);
+      } else if (lifecycleEvent.type === "provider-session") {
         operation = "provider_session";
         nextThreads = updateWorkspaceThreadProviderSession(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "model-selected") {
@@ -9813,8 +9926,16 @@ export default function App() {
         nextThreads = materializeWorkspaceThreadForTerminal(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "closed" || lifecycleEvent.type === "exited" || lifecycleEvent.type === "error") {
         operation = "terminal_detached";
+        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        const existingProviderBinding = getWorkspaceThreadProviderBinding(existingThread, lifecycleAgentId);
+        const shouldDeferSessionBackedRunningTurnInterruption = Boolean(
+          lifecycleEvent.type !== "error"
+            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
+            && (existingThread?.transcriptSessionId || existingProviderBinding?.nativeSessionId),
+        );
         nextThreads = markWorkspaceThreadTerminalDetached(threads, {
           agentId: lifecycleEvent.agentId || lifecycleEvent.currentAgent,
+          deferSessionBackedRunningTurnInterruption: shouldDeferSessionBackedRunningTurnInterruption,
           forgetTerminalThread: lifecycleEvent.forgetTerminalThread,
           rememberTerminalThread: lifecycleEvent.rememberTerminalThread,
           status: lifecycleEvent.type === "error" ? "error" : lifecycleEvent.type,
@@ -9900,6 +10021,7 @@ export default function App() {
         || lifecycleEvent.type === "opened"
         || lifecycleEvent.type === "provider-turn-started"
         || lifecycleEvent.type === "provider-session"
+        || lifecycleEvent.type === "provider-session-invalid"
         || lifecycleEvent.model
         || lifecycleEvent.modelId
       ) {
@@ -9923,7 +10045,11 @@ export default function App() {
           workspaceId: lifecycleWorkspaceId,
         });
       }
-      if (lifecycleEvent.type === "provider-session" || lifecycleEvent.type === "opened") {
+      if (
+        lifecycleEvent.type === "provider-session"
+        || lifecycleEvent.type === "provider-session-invalid"
+        || lifecycleEvent.type === "opened"
+      ) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_session.apply_delta", {
           afterHasSession,
           afterTerminalBindingActive: Boolean(afterSnapshot.hasTerminalBinding),
@@ -9971,7 +10097,11 @@ export default function App() {
 
     const lifecycleHasOutputText = Boolean(lifecycleEvent.outputText || lifecycleEvent.text);
     const lifecycleThreadForTranscript = workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
-    const lifecycleLatestUserMessage = lifecycleEvent.type === "terminal-prompt-ready"
+    const lifecycleLatestUserMessage = (
+      lifecycleEvent.type === "terminal-prompt-ready"
+      || lifecycleEvent.type === "closed"
+      || lifecycleEvent.type === "exited"
+    )
       ? getLatestWorkspaceThreadUserMessage(lifecycleThreadForTranscript)
       : null;
     const lifecycleTranscriptExpectedUserMessage = String(
@@ -9993,6 +10123,21 @@ export default function App() {
         || lifecycleThreadForTranscript?.latestTurn?.requestedAt
         || "",
     );
+    const lifecycleProviderBindingForTranscript = getWorkspaceThreadProviderBinding(
+      lifecycleThreadForTranscript,
+      lifecycleAgentId,
+    );
+    const lifecycleTranscriptProviderSessionId = String(
+      lifecycleThreadForTranscript?.transcriptSessionId
+        || lifecycleProviderBindingForTranscript?.nativeSessionId
+        || lifecycleNativeSessionId
+        || "",
+    ).trim();
+    const lifecycleDetachedNeedsTranscriptReconcile = Boolean(
+      ["closed", "exited"].includes(lifecycleEvent.type)
+        && lifecycleTranscriptProviderSessionId
+        && String(lifecycleThreadForTranscript?.latestTurn?.state || "").trim().toLowerCase() === "running",
+    );
     const shouldRequestTranscript = (
       ["claude", "codex", "opencode"].includes(
         lifecycleAgentId,
@@ -10002,6 +10147,7 @@ export default function App() {
         || lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "provider-session"
         || (lifecycleEvent.type === "opened" && Boolean(lifecycleNativeSessionId))
+        || lifecycleDetachedNeedsTranscriptReconcile
       )
     );
     logWorkspaceThreadDiagnosticEvent("frontend.thread_lifecycle.transcript_decision", {
@@ -10017,16 +10163,21 @@ export default function App() {
         ...lifecycleEvent,
         allowRecovery: lifecycleEvent.type === "terminal-prompt-ready",
         allowTimestampFallback: lifecycleEvent.type === "terminal-prompt-ready"
+          || lifecycleDetachedNeedsTranscriptReconcile
           || lifecycleEvent.allowTimestampFallback === true,
         delayMs: lifecycleEvent.type === "message-submitted"
           ? 240
           : lifecycleEvent.type === "terminal-prompt-ready"
             ? WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS
-            : 120,
+            : lifecycleDetachedNeedsTranscriptReconcile
+              ? 0
+              : 120,
         expectedMessageCreatedAt: lifecycleTranscriptSubmittedAt,
         expectedUserMessage: lifecycleTranscriptExpectedUserMessage,
         pollStartedAt: Date.now(),
-        pollUntilTurnComplete: lifecycleEvent.type === "message-submitted",
+        pollUntilTurnComplete: lifecycleEvent.type === "message-submitted"
+          || lifecycleDetachedNeedsTranscriptReconcile,
+        providerSessionId: lifecycleTranscriptProviderSessionId,
         submittedAt: lifecycleTranscriptSubmittedAt,
       });
     }

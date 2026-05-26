@@ -815,8 +815,8 @@ const TerminalStateDot = styled.span`
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_NO_SESSION}"] {
-    background: #fcd34d;
-    box-shadow: 0 0 10px rgba(252, 211, 77, 0.24);
+    background: #f2c24e;
+    box-shadow: 0 0 11px rgba(242, 194, 78, 0.3);
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="starting"] {
@@ -901,7 +901,7 @@ function getThreadState(thread, entry) {
   const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
   const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
   const turnState = getWorkspaceThreadTurnState(thread);
-  const hasSession = Boolean(thread?.transcriptSessionId || providerBinding?.nativeSessionId);
+  const hasProviderSession = Boolean(thread?.transcriptSessionId || providerBinding?.nativeSessionId);
   const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
@@ -916,10 +916,10 @@ function getThreadState(thread, entry) {
   );
   let threadViewState = THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
   if (isActiveTerminal) {
-    threadViewState = hasSession
+    threadViewState = hasProviderSession
       ? THREAD_VIEW_STATE.LIVE_SESSION
       : THREAD_VIEW_STATE.LIVE_NO_SESSION;
-  } else if (hasSession) {
+  } else if (hasProviderSession) {
     threadViewState = THREAD_VIEW_STATE.DETACHED_SESSION;
   }
 
@@ -936,7 +936,7 @@ function getThreadState(thread, entry) {
   return {
     canArchive: getWorkspaceThreadCanArchive(thread),
     canPin: getWorkspaceThreadCanPin(thread),
-    isLive: Boolean(hasSession && isActiveTerminal),
+    isLive: Boolean(isActiveTerminal),
     isNonSessionActive: threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION,
     label: getWorkspaceThreadLabel(thread),
     pinned: getWorkspaceThreadIsPinned(thread),

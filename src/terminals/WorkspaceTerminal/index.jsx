@@ -610,6 +610,11 @@ function readTerminalImageFile(file) {
   });
 }
 
+function extractCodexMissingSavedSessionId(value) {
+  const match = String(value || "").match(/No saved session found with ID\s+([0-9a-fA-F-]{16,})/i);
+  return String(match?.[1] || "").trim();
+}
+
 function formatSavedTerminalImageAttachments(images, startIndex = 0) {
   return (Array.isArray(images) ? images : [])
     .map((image, index) => {
@@ -3730,8 +3735,60 @@ function WorkspaceTerminal({
     xtermRef.current = terminal;
 
     let providerSessionCaptureBuffer = "";
+    let providerSessionErrorBuffer = "";
     let providerSessionCaptureMissesLogged = 0;
     let capturedProviderSessionId = startupThreadProviderSessionId || "";
+    let invalidProviderSessionEmitted = false;
+    const emitInvalidProviderSession = (sessionId, message, source = "terminal-output") => {
+      const invalidSessionId = String(sessionId || "").trim();
+      if (
+        invalidProviderSessionEmitted
+        || isDisposed
+        || isGenericTerminal
+        || terminalAgentKind !== "codex"
+        || !invalidSessionId
+        || (startupThreadProviderSessionId && invalidSessionId !== startupThreadProviderSessionId)
+      ) {
+        return false;
+      }
+
+      invalidProviderSessionEmitted = true;
+      capturedProviderSessionId = "";
+      providerSessionCaptureBuffer = "";
+      const threadId = terminalThreadIdRef.current || startupThreadId || "";
+      const errorMessage = String(
+        message || `Codex saved session ${invalidSessionId} is not available locally.`,
+      );
+      logThreadBridgeDiagnostic("frontend.thread_provider_session.invalid_resume", {
+        agentId: terminalAgentKind,
+        error: errorMessage,
+        instanceId: terminalInstanceId,
+        nativeSessionIdPresent: true,
+        paneId,
+        source,
+        startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
+        terminalIndex,
+        threadId,
+        workspaceId: workspace?.id || "",
+      });
+      onThreadTerminalLifecycle?.({
+        agentId: terminalAgentKind,
+        error: errorMessage,
+        instanceId: terminalInstanceId,
+        nativeSessionId: invalidSessionId,
+        nativeSessionKind: "session",
+        nativeSessionSource: source,
+        paneId,
+        providerSessionId: invalidSessionId,
+        sessionId: invalidSessionId,
+        status: "error",
+        terminalIndex,
+        threadId,
+        type: "provider-session-invalid",
+        workspaceId: workspace?.id || "",
+      });
+      return true;
+    };
     let codingAgentInputReadyEmitted = false;
     const emitCodingAgentInputReady = (source = "timer") => {
       if (
@@ -7872,6 +7929,15 @@ function WorkspaceTerminal({
 
           const decodedTerminalText = outputTextDecoder.decode(terminalData, { stream: true });
           const visibleTerminalText = stripLiveViewControlSequences(decodedTerminalText);
+          providerSessionErrorBuffer = `${providerSessionErrorBuffer}${visibleTerminalText}`.slice(-2000);
+          const missingSavedSessionId = extractCodexMissingSavedSessionId(providerSessionErrorBuffer);
+          if (missingSavedSessionId) {
+            emitInvalidProviderSession(
+              missingSavedSessionId,
+              providerSessionErrorBuffer,
+              "codex-resume-output",
+            );
+          }
           if (!capturedProviderSessionId && !isGenericTerminal && terminalThreadIdRef.current) {
             const captureText = visibleTerminalText;
             providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${captureText}`.slice(-2400);
@@ -8616,10 +8682,16 @@ function WorkspaceTerminal({
             return true;
           }
           if (
-            candidateCompare.includes(expectedCompare.slice(0, Math.min(24, expectedCompare.length)))
-            || expectedCompare.includes(candidateCompare.slice(0, Math.min(24, candidateCompare.length)))
+            candidateCompare.length >= expectedCompare.length
+            && candidateCompare.includes(expectedCompare.slice(0, Math.min(24, expectedCompare.length)))
           ) {
             return true;
+          }
+          const candidateCoverage = expectedCompare.length > 0
+            ? candidateCompare.length / expectedCompare.length
+            : 1;
+          if (candidateCoverage < 0.75) {
+            return false;
           }
 
           const candidateWords = getTerminalPromptWordSet(safeCandidate);
@@ -8633,7 +8705,7 @@ function WorkspaceTerminal({
               overlap += 1;
             }
           });
-          return overlap / Math.max(candidateWords.size, expectedWords.size) >= 0.35;
+          return overlap / Math.max(candidateWords.size, expectedWords.size) >= 0.6;
         };
         const stripTerminalPromptLinePrefix = (rawLine) => {
           const text = String(rawLine || "")
@@ -8767,7 +8839,24 @@ function WorkspaceTerminal({
           const safeComposerText = String(composerText || "").trim();
           const lineSnapshot = getTerminalActivePromptLineSnapshot(safeComposerText);
           const screenPrompt = String(lineSnapshot?.promptText || "").trim();
-          const useScreenPrompt = Boolean(lineSnapshot?.plausible && screenPrompt);
+          const composerCompare = normalizeTerminalPromptCompareText(safeComposerText);
+          const screenCompare = normalizeTerminalPromptCompareText(screenPrompt);
+          const screenConfirmsComposer = Boolean(
+            composerCompare
+              && screenCompare
+              && (
+                screenCompare === composerCompare
+                || (
+                  screenCompare.length >= composerCompare.length
+                  && screenCompare.includes(composerCompare)
+                )
+              ),
+          );
+          const useScreenPrompt = Boolean(
+            lineSnapshot?.plausible
+              && screenPrompt
+              && (!safeComposerText || screenConfirmsComposer),
+          );
           return {
             lineSnapshot,
             promptText: useScreenPrompt ? screenPrompt : safeComposerText,
@@ -10203,10 +10292,19 @@ function WorkspaceTerminal({
         }
         if (!isDisposed) {
           const errorMessage = getErrorMessage(error, `Unable to launch ${agent.label}.`);
+          const missingSavedSessionId = extractCodexMissingSavedSessionId(errorMessage);
+          if (missingSavedSessionId) {
+            emitInvalidProviderSession(
+              missingSavedSessionId,
+              errorMessage,
+              "terminal-open-error",
+            );
+          }
           setPaneStage("error", "Terminal Launch Failed", errorMessage);
           setTerminalError(errorMessage);
           onThreadTerminalLifecycle?.({
             agentId: agent?.id || terminalAgentKind,
+            error: errorMessage,
             paneId,
             terminalIndex,
             threadId: startupThreadId,

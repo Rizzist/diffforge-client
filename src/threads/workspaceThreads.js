@@ -391,6 +391,71 @@ function chooseProjectedMessageText(existingText, incomingText) {
   return cleanMessageText(incomingText);
 }
 
+function isLocalUserProjectionSource(source) {
+  const safeSource = cleanText(source).toLowerCase();
+  return Boolean(
+    safeSource === "local-submit"
+      || safeSource === "bigview-submit"
+      || safeSource === "tui-manual-input"
+      || safeSource === "terminal-confirmed"
+      || safeSource === "terminal-prompt-submitted"
+      || safeSource === "pending-prompt"
+      || safeSource.includes("terminal-prompt")
+      || safeSource.includes("manual-input")
+      || safeSource.includes("bigview-submit"),
+  );
+}
+
+function isProviderTranscriptProjectionSource(source) {
+  const safeSource = cleanText(source).toLowerCase();
+  return Boolean(
+    safeSource.endsWith("-session")
+      || safeSource === "codex-rollout"
+      || safeSource === "agent_thread_transcript"
+      || safeSource === "provider-api"
+      || safeSource === "provider-turn"
+      || safeSource.includes("transcript")
+      || safeSource.includes("provider"),
+  );
+}
+
+function areLocalAndProviderUserProjectionSources(leftSource, rightSource) {
+  return Boolean(
+    (
+      isLocalUserProjectionSource(leftSource)
+      && isProviderTranscriptProjectionSource(rightSource)
+    )
+      || (
+        isProviderTranscriptProjectionSource(leftSource)
+        && isLocalUserProjectionSource(rightSource)
+      ),
+  );
+}
+
+function areUserProjectionPromptDuplicates(left, right) {
+  const leftRole = cleanText(left?.role).toLowerCase();
+  const rightRole = cleanText(right?.role).toLowerCase();
+  if (leftRole !== "user" || rightRole !== "user") {
+    return false;
+  }
+
+  if (cleanText(left?.kind, "message") !== cleanText(right?.kind, "message")) {
+    return false;
+  }
+
+  if (!areThreadMessageTextsEquivalent(left?.text, right?.text)) {
+    return false;
+  }
+
+  const leftTurnId = cleanText(left?.turnId);
+  const rightTurnId = cleanText(right?.turnId);
+  if (leftTurnId && rightTurnId && leftTurnId === rightTurnId) {
+    return true;
+  }
+
+  return areLocalAndProviderUserProjectionSources(left?.source, right?.source);
+}
+
 function cleanTerminalUiText(value, fallback = "") {
   const stripped = stripLiveViewControlSequences(value);
   const text = cleanLiveViewText(stripped)
@@ -1030,16 +1095,23 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
 
   const matchingMessageId = messagesById.has(normalizedMessage.id)
     ? normalizedMessage.id
-    : messageOrder.find((messageId) => {
+    : messageOrder.find((messageId, index) => {
       const candidate = messagesById.get(messageId);
+      const isLatestProjectedMessage = index === messageOrder.length - 1;
       return candidate
         && normalizedMessage.role === "user"
         && candidate.role === normalizedMessage.role
         && cleanText(candidate.kind, "message") === cleanText(normalizedMessage.kind, "message")
-        && areThreadMessagesEquivalent(
-          candidate,
-          normalizedMessage,
-          normalizedMessage.role === "user" ? 12000 : 5000,
+        && (
+          areThreadMessagesEquivalent(
+            candidate,
+            normalizedMessage,
+            normalizedMessage.role === "user" ? 12000 : 5000,
+          )
+          || (
+            isLatestProjectedMessage
+            && areUserProjectionPromptDuplicates(candidate, normalizedMessage)
+          )
         );
     });
 
@@ -1385,11 +1457,28 @@ function findMatchingProjectedMessage(projectedMessages, message) {
     }
   }
 
+  const latestConversationIndex = role === "user" && text
+    ? projectedMessages.reduce((latestIndex, candidate, index) => (
+      ["assistant", "system", "user"].includes(candidate?.role) ? index : latestIndex
+    ), -1)
+    : -1;
+  const latestConversationMessage = latestConversationIndex >= 0
+    ? projectedMessages[latestConversationIndex]
+    : null;
+
   return projectedMessages.find((candidate) => (
     candidate.role === role
     && cleanText(candidate.kind, "message") === kind
     && areThreadMessagesEquivalent(candidate, message, role === "user" ? 12000 : 5000)
-  )) || null;
+  )) || (
+    latestConversationMessage
+      && latestConversationMessage.role === "user"
+      && cleanText(latestConversationMessage.kind, "message") === kind
+      && cleanMessageText(latestConversationMessage.text) === text
+      && areUserProjectionPromptDuplicates(latestConversationMessage, message)
+      ? latestConversationMessage
+      : null
+  ) || null;
 }
 
 function createSubmittedUserProjectionEvents(thread, event = {}) {
@@ -1491,8 +1580,12 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         ...message,
         createdAt: expectedMessageCreatedAt || message.createdAt,
         id: promptEventId,
+        source: message.source || source,
       }
-      : message;
+      : {
+        ...message,
+        source: message.source || source,
+      };
     const projectedMessage = findMatchingProjectedMessage(projectedMessages, matchCandidate);
     const messageId = cleanText(
       canonicalPromptUserMessage ? promptEventId : message.id,
@@ -2325,7 +2418,7 @@ export function readWorkspaceThreads() {
 }
 
 export function persistWorkspaceThreads(threads) {
-  return normalizeWorkspaceThreads(threads, { stripLiveBindings: true, stripMessages: true });
+  return normalizeWorkspaceThreads(threads, { stripLiveBindings: true });
 }
 
 export function clearWorkspaceThreadsBrowserPersistence() {
@@ -2691,7 +2784,14 @@ function detachThreadFromTerminalBinding(entry, threadId, event = {}) {
     terminalIndex: existing.terminalIndex,
   });
   const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
-  const latestTurn = existingLatestTurn?.state === "running"
+  const existingProviderBinding = getWorkspaceThreadProviderBinding(existing, agentId);
+  const shouldDeferRunningTurnInterruption = Boolean(
+    event.deferSessionBackedRunningTurnInterruption === true
+      && detachedStatus !== "error"
+      && existingLatestTurn?.state === "running"
+      && (existing.transcriptSessionId || existingProviderBinding?.nativeSessionId),
+  );
+  const latestTurn = existingLatestTurn?.state === "running" && !shouldDeferRunningTurnInterruption
     ? normalizeThreadLatestTurn({
       ...existingLatestTurn,
       completedAt: now,
@@ -3244,7 +3344,14 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
   if (existing) {
     const agentId = cleanAgentId(event.agentId || terminal?.agentId || existing.currentAgent, "");
     const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
-    const latestTurn = existingLatestTurn?.state === "running"
+    const existingProviderBinding = getWorkspaceThreadProviderBinding(existing, agentId);
+    const shouldDeferRunningTurnInterruption = Boolean(
+      event.deferSessionBackedRunningTurnInterruption === true
+        && safeStatus !== "error"
+        && existingLatestTurn?.state === "running"
+        && (existing.transcriptSessionId || existingProviderBinding?.nativeSessionId),
+    );
+    const latestTurn = existingLatestTurn?.state === "running" && !shouldDeferRunningTurnInterruption
       ? normalizeThreadLatestTurn({
         ...existingLatestTurn,
         completedAt: now,
@@ -3402,6 +3509,414 @@ function workspaceThreadHasProviderSession(thread, agentId, sessionId) {
     || cleanText(providerBinding?.nativeSessionId) === safeSessionId;
 }
 
+function workspaceThreadHasConversationContent(thread) {
+  const messages = normalizeThreadMessages(thread?.messages);
+  if (messages.some((message) => (
+    (message.role === "user" || message.role === "assistant")
+      && cleanMessageText(message.text)
+  ))) {
+    return true;
+  }
+
+  if (normalizeMessageCount(thread?.messageCount) > 0) {
+    return true;
+  }
+
+  return normalizeThreadProjectionEvents(thread?.projectionEvents).some((event) => (
+    event.type === "thread.message.user"
+      || event.type === "thread.message.assistant.delta"
+      || event.type === "thread.message.assistant.complete"
+  ));
+}
+
+function workspaceThreadHasAssistantConversationContent(thread) {
+  const messages = normalizeThreadMessages(thread?.messages);
+  if (messages.some((message) => message.role === "assistant" && cleanMessageText(message.text))) {
+    return true;
+  }
+
+  return normalizeThreadProjectionEvents(thread?.projectionEvents).some((event) => (
+    (event.type === "thread.message.assistant.delta" || event.type === "thread.message.assistant.complete")
+      && cleanMessageText(event.text || event.delta)
+  ));
+}
+
+function workspaceThreadIsDetachedSessionClaim(thread) {
+  const duplicateHasTerminalBinding = Boolean(normalizeTerminalBinding(thread?.terminalBinding));
+  const duplicateStatus = cleanText(thread?.status).toLowerCase();
+  return !duplicateHasTerminalBinding
+    && (!duplicateStatus || ["idle", "closed", "exited"].includes(duplicateStatus));
+}
+
+function workspaceThreadHasLiveSessionClaim(thread) {
+  const status = cleanText(thread?.status).toLowerCase();
+  return Boolean(
+    normalizeTerminalBinding(thread?.terminalBinding)
+      || status === "active"
+      || status === "starting"
+      || cleanText(thread?.activityStatus).toLowerCase() === "thinking",
+  );
+}
+
+function workspaceThreadCanClaimProviderSession(thread) {
+  return Boolean(
+    thread?.freshSessionStartedAt
+      || thread?.pendingPrompt
+      || workspaceThreadHasConversationContent(thread)
+      || normalizeThreadProjectionEvents(thread?.projectionEvents).length > 0
+      || workspaceThreadHasLiveSessionClaim(thread),
+  );
+}
+
+function workspaceThreadDuplicateProviderSessionCanYield(targetThread, duplicateThread) {
+  if (!workspaceThreadCanClaimProviderSession(targetThread)) {
+    return false;
+  }
+  const duplicateIsDetached = workspaceThreadIsDetachedSessionClaim(duplicateThread);
+  if (workspaceThreadHasAssistantConversationContent(duplicateThread)) {
+    return false;
+  }
+
+  return duplicateIsDetached || !workspaceThreadHasLiveSessionClaim(duplicateThread);
+}
+
+function releaseWorkspaceThreadProviderSession(thread, agentId, sessionId, releasedAt = nowIso()) {
+  const safeSessionId = cleanText(sessionId);
+  if (!thread || !safeSessionId) {
+    return thread;
+  }
+
+  const providerBindings = normalizeProviderBindings(
+    thread.providerBindings,
+    thread.currentAgent,
+    {
+      activityStatus: "idle",
+      coordination: thread.coordination,
+      lastActiveAt: thread.lastActiveAt,
+      lastMessageAt: thread.lastMessageAt,
+      messageCount: thread.messageCount,
+      status: thread.status,
+      terminalBinding: null,
+      updatedAt: releasedAt,
+    },
+  );
+  const providerBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
+    activityStatus: "idle",
+    coordination: thread.coordination,
+    lastActiveAt: thread.lastActiveAt,
+    lastMessageAt: thread.lastMessageAt,
+    messageCount: thread.messageCount,
+    status: thread.status,
+    terminalBinding: null,
+    updatedAt: releasedAt,
+  });
+  if (providerBinding && cleanText(providerBinding.nativeSessionId) === safeSessionId) {
+    providerBindings[agentId] = {
+      ...providerBinding,
+      activityStatus: "idle",
+      inputReady: false,
+      inputReadyAt: "",
+      inputReadyConfidence: "",
+      nativeSessionId: "",
+      nativeSessionKind: "",
+      nativeSessionSource: "",
+      nativeSessionUpdatedAt: releasedAt,
+      status: cleanText(thread.status).toLowerCase() === "active" ? "idle" : providerBinding.status,
+      terminalBinding: null,
+      updatedAt: releasedAt,
+    };
+  }
+
+  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const isDetachedClaim = workspaceThreadIsDetachedSessionClaim(thread);
+  const shouldClearRunningTurn = latestTurn?.state === "running"
+    && isDetachedClaim
+    && !workspaceThreadHasAssistantConversationContent(thread);
+  const shouldClearTranscriptSession = cleanText(thread.transcriptSessionId) === safeSessionId;
+
+  return {
+    ...thread,
+    activityStatus: "idle",
+    latestTurn: shouldClearRunningTurn ? null : thread.latestTurn,
+    providerBindings,
+    status: cleanText(thread.status).toLowerCase() === "active" ? "idle" : thread.status,
+    terminalBinding: null,
+    transcriptHydrationMode: shouldClearTranscriptSession ? "" : thread.transcriptHydrationMode,
+    transcriptSessionId: shouldClearTranscriptSession ? "" : thread.transcriptSessionId,
+    transcriptStatus: shouldClearTranscriptSession ? "idle" : thread.transcriptStatus,
+    updatedAt: releasedAt,
+  };
+}
+
+function releaseYieldingProviderSessionDuplicates(entry, agentId, sessionId, targetThreadId, releasedAt = nowIso()) {
+  const safeSessionId = cleanText(sessionId);
+  const safeTargetThreadId = cleanText(targetThreadId);
+  if (!entry?.threads || !safeSessionId || !safeTargetThreadId) {
+    return { blockingThreadId: "", entry, releasedCount: 0 };
+  }
+
+  const targetThread = entry.threads[safeTargetThreadId];
+  const nextThreads = { ...entry.threads };
+  let releasedCount = 0;
+  let blockingThreadId = "";
+
+  Object.values(entry.threads).forEach((thread) => {
+    if (
+      !thread?.id
+      || thread.id === safeTargetThreadId
+      || !workspaceThreadHasProviderSession(thread, agentId, safeSessionId)
+    ) {
+      return;
+    }
+
+    if (!workspaceThreadDuplicateProviderSessionCanYield(targetThread, thread)) {
+      blockingThreadId = blockingThreadId || thread.id;
+      return;
+    }
+
+    nextThreads[thread.id] = releaseWorkspaceThreadProviderSession(thread, agentId, safeSessionId, releasedAt);
+    releasedCount += 1;
+  });
+
+  if (blockingThreadId || releasedCount === 0) {
+    return { blockingThreadId, entry, releasedCount };
+  }
+
+  return {
+    blockingThreadId: "",
+    entry: {
+      ...entry,
+      threads: nextThreads,
+    },
+    releasedCount,
+  };
+}
+
+function summarizeTranscriptMessagesForDiagnostics(messages) {
+  const normalizedMessages = normalizeThreadMessages(messages);
+  const roleCounts = normalizedMessages.reduce((counts, message) => ({
+    ...counts,
+    [message.role]: (counts[message.role] || 0) + 1,
+  }), {});
+  return {
+    count: normalizedMessages.length,
+    roleCounts,
+    lastMessages: normalizedMessages.slice(-4).map((message) => ({
+      agentId: cleanText(message.agentId),
+      createdAtPresent: Boolean(cleanText(message.createdAt)),
+      idPresent: Boolean(cleanText(message.id)),
+      kind: cleanText(message.kind),
+      role: cleanText(message.role),
+      source: cleanText(message.source),
+      status: cleanText(message.status),
+      textLength: cleanMessageText(message.text).length,
+      turnIdPresent: Boolean(cleanText(message.turnId)),
+    })),
+  };
+}
+
+function summarizeWorkspaceThreadSessionClaimForDiagnostics(thread, agentId, sessionId, targetThread = null) {
+  if (!thread) {
+    return null;
+  }
+
+  const messages = normalizeThreadMessages(thread.messages);
+  const projectionEvents = normalizeThreadProjectionEvents(thread.projectionEvents);
+  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const binding = getWorkspaceThreadProviderBinding(thread, agentId);
+  const lastMessage = messages[messages.length - 1] || null;
+  return {
+    activityStatus: cleanText(thread.activityStatus),
+    assistantMessageCount: messages.filter((message) => message.role === "assistant").length,
+    canYieldToTarget: targetThread
+      ? workspaceThreadDuplicateProviderSessionCanYield(targetThread, thread)
+      : false,
+    hasAssistantConversationContent: workspaceThreadHasAssistantConversationContent(thread),
+    hasConversationContent: workspaceThreadHasConversationContent(thread),
+    hasLiveSessionClaim: workspaceThreadHasLiveSessionClaim(thread),
+    hasProviderSession: workspaceThreadHasProviderSession(thread, agentId, sessionId),
+    hasTerminalBinding: Boolean(normalizeTerminalBinding(thread.terminalBinding)),
+    isDetachedSessionClaim: workspaceThreadIsDetachedSessionClaim(thread),
+    lastRole: cleanText(lastMessage?.role),
+    lastTextLength: cleanMessageText(lastMessage?.text).length,
+    latestTurnState: cleanText(latestTurn?.state),
+    messageCount: messages.length,
+    providerSessionIdPresent: Boolean(cleanText(binding?.nativeSessionId)),
+    projectionEventCount: projectionEvents.length,
+    status: cleanText(thread.status),
+    threadId: cleanText(thread.id),
+    transcriptHydrationMode: cleanText(thread.transcriptHydrationMode),
+    transcriptSessionIdPresent: Boolean(cleanText(thread.transcriptSessionId)),
+    userMessageCount: messages.filter((message) => message.role === "user").length,
+  };
+}
+
+function diagnoseWorkspaceThreadSessionDuplicateClaims(entry, agentId, sessionId, targetThreadId) {
+  const safeSessionId = cleanText(sessionId);
+  const safeTargetThreadId = cleanText(targetThreadId);
+  const targetThread = entry?.threads?.[safeTargetThreadId] || null;
+  if (!entry?.threads || !safeSessionId || !safeTargetThreadId) {
+    return [];
+  }
+
+  return Object.values(entry.threads)
+    .filter((thread) => (
+      thread?.id
+      && thread.id !== safeTargetThreadId
+      && workspaceThreadHasProviderSession(thread, agentId, safeSessionId)
+    ))
+    .map((thread) => summarizeWorkspaceThreadSessionClaimForDiagnostics(
+      thread,
+      agentId,
+      safeSessionId,
+      targetThread,
+    ))
+    .filter(Boolean);
+}
+
+function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
+  const transcriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
+  const projectionEventsBefore = ensureThreadProjectionEvents(existing);
+  const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
+    agentId,
+    completedAt: event.completedAt,
+    expectedMessageCreatedAt: event.expectedMessageCreatedAt,
+    expectedUserMessage: event.expectedUserMessage,
+    latestTimestamp: event.latestTimestamp,
+    promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
+    promptAccepted: event.promptAccepted,
+    promptEventSubmittedAt: event.promptEventSubmittedAt,
+    source: cleanText(event.source, `${agentId}-session`),
+    submittedAt: event.submittedAt,
+    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
+    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
+    transcriptExplicitCompletionCanSettleTurn,
+    turnCompleteSeen: event.turnCompleteSeen,
+  });
+  const projectionEventsAfter = appendThreadProjectionEvents(
+    projectionEventsBefore,
+    projectionEventsToAdd,
+  );
+  const messagesBefore = normalizeThreadMessages(existing?.messages);
+  const messagesAfter = projectThreadProjectionMessages(projectionEventsAfter, existing?.messages);
+  const latestTurnBefore = normalizeThreadLatestTurn(existing?.latestTurn);
+  const latestTurnAfter = projectLatestTurnFromEvents(projectionEventsAfter, existing?.latestTurn);
+  const lastBefore = messagesBefore[messagesBefore.length - 1] || null;
+  const lastAfter = messagesAfter[messagesAfter.length - 1] || null;
+  return {
+    addedProjectionEventCount: projectionEventsToAdd.length,
+    afterLatestTurnState: cleanText(latestTurnAfter?.state),
+    afterMessageCount: messagesAfter.length,
+    afterProjectionEventCount: projectionEventsAfter.length,
+    beforeLatestTurnState: cleanText(latestTurnBefore?.state),
+    beforeMessageCount: messagesBefore.length,
+    beforeProjectionEventCount: projectionEventsBefore.length,
+    lastRoleBefore: cleanText(lastBefore?.role),
+    lastRoleAfter: cleanText(lastAfter?.role),
+    lastTextLengthBefore: cleanMessageText(lastBefore?.text).length,
+    lastTextLengthAfter: cleanMessageText(lastAfter?.text).length,
+    wouldChange: projectionEventsToAdd.length > 0
+      || messagesAfter.length !== messagesBefore.length
+      || cleanText(latestTurnAfter?.state) !== cleanText(latestTurnBefore?.state),
+  };
+}
+
+export function diagnoseWorkspaceThreadSessionTranscriptHydration(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const threadId = cleanText(event.threadId);
+  const agentId = cleanAgentId(event.agentId || event.currentAgent || "codex", "");
+  const sessionId = cleanText(event.sessionId || event.providerSessionId || event.nativeSessionId);
+  const requestedProviderSessionId = cleanText(event.requestedProviderSessionId || event.requestedNativeSessionId);
+  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = workspaceId ? currentState[workspaceId] : null;
+  const existing = entry?.threads?.[threadId] || null;
+  const transcriptMessages = summarizeTranscriptMessagesForDiagnostics(event.messages);
+  const base = {
+    agentId,
+    hasEntry: Boolean(entry),
+    hasExistingThread: Boolean(existing),
+    incomingTranscript: transcriptMessages,
+    matchedBy,
+    requestedProviderSessionIdPresent: Boolean(requestedProviderSessionId),
+    sessionIdPresent: Boolean(sessionId),
+    threadId,
+    validAgentId: isThreadAgentId(agentId),
+    workspaceId,
+  };
+
+  if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
+    return {
+      ...base,
+      blockedReason: "invalid_request",
+      wouldApply: false,
+    };
+  }
+  if (!entry) {
+    return {
+      ...base,
+      blockedReason: "missing_workspace_entry",
+      wouldApply: false,
+    };
+  }
+  if (!existing) {
+    return {
+      ...base,
+      blockedReason: "missing_thread",
+      wouldApply: false,
+    };
+  }
+
+  const targetSummary = summarizeWorkspaceThreadSessionClaimForDiagnostics(
+    existing,
+    agentId,
+    sessionId,
+    null,
+  );
+  const archivedThread = workspaceEntryHasArchivedThreadId(entry, threadId);
+  const duplicateClaims = diagnoseWorkspaceThreadSessionDuplicateClaims(
+    entry,
+    agentId,
+    sessionId,
+    threadId,
+  );
+  const blockingDuplicate = duplicateClaims.find((claim) => !claim.canYieldToTarget);
+  const archivedSession = sessionId
+    ? workspaceEntryHasArchivedSession(entry, agentId, sessionId)
+    : false;
+  const blockedReason = archivedThread
+    ? "archived_thread_id"
+    : existing.archivedAt
+      ? "thread_archived_at"
+      : existing.transcriptHydrationMode === "session-only"
+        && !requestedProviderSessionId
+        && matchedBy !== "sessionid"
+        ? "session_only_without_requested_session"
+        : archivedSession
+          ? "archived_session"
+          : blockingDuplicate
+            ? "blocking_duplicate_provider_session"
+            : "";
+  const projectionPreview = blockedReason
+    ? null
+    : createTranscriptHydrationProjectionPreview(existing, event, agentId);
+
+  return {
+    ...base,
+    archivedSession,
+    archivedThread,
+    blockedReason,
+    blockingDuplicateThreadId: cleanText(blockingDuplicate?.threadId),
+    duplicateClaimCount: duplicateClaims.length,
+    duplicateClaims,
+    existingArchivedAtPresent: Boolean(cleanText(existing.archivedAt)),
+    projectionPreview,
+    releasableDuplicateCount: duplicateClaims.filter((claim) => claim.canYieldToTarget).length,
+    targetThread: targetSummary,
+    wouldApply: !blockedReason && Boolean(projectionPreview?.wouldChange || sessionId),
+  };
+}
+
 function collectWorkspaceThreadSessionIds(thread, agentId = "") {
   if (!thread) {
     return [];
@@ -3494,8 +4009,8 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
   }
 
   const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
+  let entry = currentState[workspaceId];
+  let existing = entry?.threads?.[threadId];
   if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId)) {
     return state || {};
   }
@@ -3509,7 +4024,21 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
     threadId,
   );
   if (duplicateThreadId) {
-    return state || {};
+    const released = releaseYieldingProviderSessionDuplicates(
+      entry,
+      agentId,
+      nativeSessionId,
+      threadId,
+      nowIso(),
+    );
+    if (released.blockingThreadId) {
+      return state || {};
+    }
+    entry = released.entry;
+    existing = entry?.threads?.[threadId];
+    if (!existing) {
+      return state || {};
+    }
   }
 
   const now = nowIso();
@@ -3567,6 +4096,119 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
           sessionName: nativeSessionTitle || existing.sessionName,
           title: nativeSessionTitle || existing.title,
           transcriptSessionId: nativeSessionId || existing.transcriptSessionId,
+          updatedAt: now,
+        },
+      },
+    },
+  };
+}
+
+export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const threadId = cleanText(event.threadId);
+  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
+    return state || {};
+  }
+
+  const currentState = normalizeWorkspaceThreads(state);
+  const entry = currentState[workspaceId];
+  const existing = entry?.threads?.[threadId];
+  if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId)) {
+    return state || {};
+  }
+
+  const invalidSessionId = cleanText(
+    event.nativeSessionId
+      || event.providerSessionId
+      || event.sessionId
+      || existing.transcriptSessionId,
+  );
+  const providerBindings = normalizeProviderBindings(
+    existing.providerBindings,
+    existing.currentAgent,
+    {
+      coordination: existing.coordination,
+      lastActiveAt: existing.lastActiveAt,
+      lastMessageAt: existing.lastMessageAt,
+      messageCount: existing.messageCount,
+      status: existing.status,
+      terminalBinding: existing.terminalBinding,
+      updatedAt: existing.updatedAt,
+    },
+  );
+  const providerBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
+    coordination: existing.coordination,
+    lastActiveAt: existing.lastActiveAt,
+    lastMessageAt: existing.lastMessageAt,
+    messageCount: existing.messageCount,
+    status: existing.status,
+    terminalBinding: existing.terminalBinding,
+    updatedAt: existing.updatedAt,
+  });
+  const bindingSessionId = cleanText(providerBinding?.nativeSessionId);
+  const transcriptSessionId = cleanText(existing.transcriptSessionId);
+  const invalidSessionMatchesThread = Boolean(
+    !invalidSessionId
+      || bindingSessionId === invalidSessionId
+      || transcriptSessionId === invalidSessionId,
+  );
+  if (!invalidSessionMatchesThread) {
+    return state || {};
+  }
+  const now = nowIso();
+  const shouldClearBindingSession = Boolean(
+    bindingSessionId
+      && (!invalidSessionId || bindingSessionId === invalidSessionId),
+  );
+  const nextProviderBinding = {
+    ...providerBinding,
+    activityStatus: "idle",
+    inputReady: false,
+    inputReadyAt: "",
+    inputReadyConfidence: "",
+    status: "idle",
+    terminalBinding: null,
+    updatedAt: now,
+  };
+  if (shouldClearBindingSession) {
+    nextProviderBinding.nativeSessionId = "";
+    nextProviderBinding.nativeSessionKind = "";
+    nextProviderBinding.nativeSessionSource = "";
+    nextProviderBinding.nativeSessionUpdatedAt = now;
+  }
+  providerBindings[agentId] = nextProviderBinding;
+
+  const shouldClearTranscriptSession = Boolean(
+    existing.transcriptSessionId
+      && (!invalidSessionId || existing.transcriptSessionId === invalidSessionId),
+  );
+  const latestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const nextLatestTurn = latestTurn?.state === "running"
+    ? normalizeThreadLatestTurn({
+      ...latestTurn,
+      completedAt: now,
+      error: cleanText(event.error || "Provider session was not available locally."),
+      state: "interrupted",
+      updatedAt: now,
+    })
+    : existing.latestTurn;
+
+  return {
+    ...currentState,
+    [workspaceId]: {
+      ...entry,
+      threads: {
+        ...entry.threads,
+        [threadId]: {
+          ...existing,
+          activityStatus: "idle",
+          latestTurn: nextLatestTurn,
+          providerBindings,
+          status: existing.status === "active" ? "idle" : existing.status,
+          terminalBinding: null,
+          transcriptSessionId: shouldClearTranscriptSession ? "" : existing.transcriptSessionId,
+          transcriptStatus: shouldClearTranscriptSession ? "idle" : existing.transcriptStatus,
           updatedAt: now,
         },
       },
@@ -3701,8 +4343,8 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   }
 
   const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
+  let entry = currentState[workspaceId];
+  let existing = entry?.threads?.[threadId];
   if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId) || existing.archivedAt) {
     return state || {};
   }
@@ -3724,7 +4366,21 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     }
     const duplicateThreadId = findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, threadId);
     if (duplicateThreadId) {
-      return state || {};
+      const released = releaseYieldingProviderSessionDuplicates(
+        entry,
+        agentId,
+        sessionId,
+        threadId,
+        now,
+      );
+      if (released.blockingThreadId) {
+        return state || {};
+      }
+      entry = released.entry;
+      existing = entry?.threads?.[threadId];
+      if (!existing) {
+        return state || {};
+      }
     }
   }
   const sessionTitle = cleanRealThreadTitleCandidate(event.sessionTitle, existing);
