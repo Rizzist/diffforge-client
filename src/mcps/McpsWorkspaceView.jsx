@@ -888,8 +888,15 @@ export default function McpsWorkspaceView({
     const data = unwrapData(response);
     setRegistry(data);
     setStatus("ready");
+    window.dispatchEvent(new CustomEvent("diffforge:workspace-mcp-registry-updated", {
+      detail: {
+        repoPath,
+        workspaceId,
+        workspaceName,
+      },
+    }));
     return data;
-  }, []);
+  }, [repoPath, workspaceId, workspaceName]);
 
   const installCatalogItem = useCallback(
     async (item) => {

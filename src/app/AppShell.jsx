@@ -1214,6 +1214,7 @@ const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
 const TERMINAL_PRESENCE_SYNC_INTERVAL_MS = 20000;
+const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
 const TERMINAL_AGENT_COLOR_HEX_BY_SLOT = [
   "#62a0ff",
   "#ff9d48",
@@ -1232,6 +1233,138 @@ const TERMINAL_AGENT_COLOR_HEX_BY_SLOT = [
   "#9fb6d9",
   "#f0f4ff",
 ];
+
+function unwrapCloudCommandData(response, fallback = {}) {
+  if (!response || typeof response !== "object") {
+    return fallback;
+  }
+  return response.data || response;
+}
+
+function safeCloudMcpText(value, fallback = "") {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, 500) : fallback;
+}
+
+function safeCloudMcpArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function safeCloudMcpBool(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function sanitizeWorkspaceMcpServerForCloud(server) {
+  if (!server || typeof server !== "object") {
+    return null;
+  }
+
+  const serverKey = safeCloudMcpText(
+    server.server_key || server.serverKey || server.id || server.name,
+    "",
+  );
+  if (!serverKey) {
+    return null;
+  }
+
+  const configValues =
+    server.config_values_json && typeof server.config_values_json === "object"
+      ? server.config_values_json
+      : {};
+  const agentConfigAccessEnabled = safeCloudMcpBool(
+    server.agent_config_access_enabled,
+    true,
+  );
+  const agentSecretConfigAccessEnabled = safeCloudMcpBool(
+    server.agent_secret_config_access_enabled,
+    false,
+  );
+  const agentEnvFileWriteEnabled = safeCloudMcpBool(
+    server.agent_env_file_write_enabled,
+    true,
+  );
+  const configSchema = safeCloudMcpArray(server.env_schema_json)
+    .slice(0, 64)
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const key = safeCloudMcpText(item.key || item.name, "");
+      if (!key) {
+        return null;
+      }
+      const configured = Object.prototype.hasOwnProperty.call(configValues, key)
+        && String(configValues[key] ?? "").trim().length > 0;
+      const secret = safeCloudMcpBool(item.secret, false);
+      return {
+        key,
+        label: safeCloudMcpText(item.label, key),
+        required: safeCloudMcpBool(item.required, false),
+        secret,
+        configured,
+        agent_readable: secret ? agentSecretConfigAccessEnabled : agentConfigAccessEnabled,
+      };
+    })
+    .filter(Boolean);
+  const tools = safeCloudMcpArray(server.tools_json)
+    .slice(0, 64)
+    .map((tool) => safeCloudMcpText(
+      typeof tool === "string" ? tool : tool?.name || tool?.id,
+      "",
+    ))
+    .filter(Boolean);
+
+  return {
+    id: safeCloudMcpText(server.id, serverKey),
+    server_key: serverKey,
+    name: safeCloudMcpText(server.name, serverKey),
+    source_kind: safeCloudMcpText(server.source_kind || server.sourceKind, ""),
+    source_label: safeCloudMcpText(server.source_label || server.sourceLabel, ""),
+    package_ref: safeCloudMcpText(server.package_ref || server.packageRef, ""),
+    version: safeCloudMcpText(server.version, ""),
+    transport: safeCloudMcpText(server.transport, "stdio"),
+    built_in: safeCloudMcpBool(server.built_in ?? server.builtIn, false),
+    install_state: safeCloudMcpText(server.install_state || server.installState, "installed"),
+    workspace_enabled: safeCloudMcpBool(server.workspace_enabled ?? server.workspaceEnabled, true),
+    approval_policy: safeCloudMcpText(server.approval_policy || server.approvalPolicy, "always_allow"),
+    agent_config_access_enabled: agentConfigAccessEnabled,
+    agent_secret_config_access_enabled: agentSecretConfigAccessEnabled,
+    agent_env_file_write_enabled: agentEnvFileWriteEnabled,
+    last_probe_status: safeCloudMcpText(server.last_probe_status || server.lastProbeStatus, ""),
+    last_probe_message: safeCloudMcpText(server.last_probe_message || server.lastProbeMessage, ""),
+    config_schema: configSchema,
+    config_summary: {
+      config_count: configSchema.length,
+      configured_count: configSchema.filter((item) => item.configured).length,
+      secret_config_count: configSchema.filter((item) => item.secret).length,
+      secret_configured_count: configSchema.filter((item) => item.secret && item.configured).length,
+    },
+    tools,
+    tool_count: tools.length,
+  };
+}
+
+function sanitizeWorkspaceMcpRegistryForCloud(registry, target) {
+  const data = unwrapCloudCommandData(registry, {});
+  return {
+    repoPath: target.repoPath,
+    workspaceId: target.workspaceId,
+    workspaceName: target.workspaceName,
+    servers: safeCloudMcpArray(data.servers)
+      .map(sanitizeWorkspaceMcpServerForCloud)
+      .filter(Boolean),
+  };
+}
 const WORKSPACE_SHUTDOWN_STEPS = [
   {
     detail: "Detaching embedded workspace browser views.",
@@ -3339,6 +3472,7 @@ export default function App() {
   const workspaceDeactivationInFlightRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
   const terminalPresenceSyncKeyRef = useRef("");
+  const workspaceMcpSyncKeyRef = useRef("");
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -7777,6 +7911,26 @@ export default function App() {
     () => JSON.stringify(terminalPresenceWorkspaces),
     [terminalPresenceWorkspaces],
   );
+  const workspaceMcpSyncTargets = useMemo(() => (
+    enabledWorkspaceRuntimeDescriptors
+      .map((descriptor) => {
+        const repoPath = String(descriptor.workingDirectory || "").trim();
+        const workspaceId = String(descriptor.workspace?.id || "").trim();
+        if (!repoPath || !workspaceId) {
+          return null;
+        }
+        return {
+          repoPath,
+          workspaceId,
+          workspaceName: descriptor.workspace?.name || workspaceId,
+        };
+      })
+      .filter(Boolean)
+  ), [enabledWorkspaceRuntimeDescriptors]);
+  const workspaceMcpSyncTargetKey = useMemo(
+    () => JSON.stringify(workspaceMcpSyncTargets),
+    [workspaceMcpSyncTargets],
+  );
 
   useEffect(() => {
     if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
@@ -7823,6 +7977,75 @@ export default function App() {
     shouldShowWorkspaceSetup,
     terminalPresenceSyncKey,
     terminalPresenceWorkspaces,
+    workspaceSyncState,
+  ]);
+
+  useEffect(() => {
+    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+      return undefined;
+    }
+
+    let disposed = false;
+    const syncWorkspaceMcps = async (reason) => {
+      const syncKey = `${workspaceMcpSyncTargetKey}:${reason}`;
+      if (reason === "workspace_mcp_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
+        return;
+      }
+
+      try {
+        const workspacesForCloud = await Promise.all(
+          workspaceMcpSyncTargets.map(async (target) => {
+            const response = await invoke("coordination_workspace_mcp_registry", {
+              repoPath: target.repoPath,
+              workspaceId: target.workspaceId,
+              workspaceName: target.workspaceName,
+            });
+            return sanitizeWorkspaceMcpRegistryForCloud(response, target);
+          }),
+        );
+        await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
+          workspaces: workspacesForCloud,
+          reason,
+        });
+        if (!disposed) {
+          workspaceMcpSyncKeyRef.current = syncKey;
+        }
+      } catch (error) {
+        if (!disposed) {
+          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_mcp_sync.failed", {
+            message: getErrorMessage(error, "Unable to sync workspace MCP settings."),
+            reason,
+            workspaceCount: workspaceMcpSyncTargets.length,
+          });
+        }
+      }
+    };
+
+    syncWorkspaceMcps("workspace_mcp_snapshot");
+    const handleWorkspaceMcpRegistryUpdated = () => {
+      syncWorkspaceMcps("workspace_mcp_registry_updated");
+    };
+    window.addEventListener(
+      "diffforge:workspace-mcp-registry-updated",
+      handleWorkspaceMcpRegistryUpdated,
+    );
+    const intervalId = window.setInterval(
+      () => syncWorkspaceMcps("workspace_mcp_heartbeat"),
+      WORKSPACE_MCP_SYNC_INTERVAL_MS,
+    );
+
+    return () => {
+      disposed = true;
+      window.removeEventListener(
+        "diffforge:workspace-mcp-registry-updated",
+        handleWorkspaceMcpRegistryUpdated,
+      );
+      window.clearInterval(intervalId);
+    };
+  }, [
+    shouldShowWorkspaceSetup,
+    workspaceMcpSyncTargetKey,
+    workspaceMcpSyncTargets,
     workspaceSyncState,
   ]);
 

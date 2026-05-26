@@ -2692,6 +2692,7 @@ pub fn run() {
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_terminal_presence,
+            cloud_mcp_sync_workspace_mcp_snapshot,
             cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_record_spec_edit_intent,
             cloud_mcp_record_voice_plan_task_status,
