@@ -7865,31 +7865,59 @@ export default function App() {
           return null;
         }
 
-        const terminals = descriptor.agentTerminalEntries
-          .map(({ role, terminalIndex }) => {
+        const terminals = descriptor.logicalTerminalIndexes
+          .map((terminalIndex) => {
             const normalizedRole = normalizeWorkspaceTerminalRole(
-              role,
+              descriptor.terminalRolesByIndex?.[terminalIndex],
               workspaceTerminalFallbackRole,
               workspaceTerminalRoleOptions,
             );
-            const agent = descriptor.terminalAgentsByIndex?.[terminalIndex] || null;
-            if (!agent || normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC) {
-              return null;
-            }
             const thread = descriptor.threadsByIndex?.[terminalIndex] || null;
             const providerBinding = getWorkspaceThreadProviderBinding(thread, normalizedRole);
             const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || null;
             const colorSlot = getTerminalAgentColorSlot(terminalIndex);
             const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
+            const hasSession = Boolean(
+              thread?.transcriptSessionId
+                || providerBinding?.nativeSessionId
+                || providerBinding?.nativeSessionTitle,
+            );
+            const rawActivity = String(
+              thread?.activityStatus
+                || thread?.latestTurn?.status
+                || thread?.status
+                || "",
+            ).trim().toLowerCase();
+            const status = (() => {
+              if (["thinking", "reasoning"].includes(rawActivity)) return "thinking";
+              if ([
+                "busy",
+                "running",
+                "working",
+                "dispatched",
+                "implementing",
+                "resume_requested",
+                "resumed",
+              ].includes(rawActivity)) return "working";
+              if (["paused", "parked", "waiting", "resume_ready"].includes(rawActivity)) return "paused";
+              if (["error", "failed", "blocked"].includes(rawActivity)) return "error";
+              if (["closed", "closing", "stopped"].includes(rawActivity)) return "closed";
+              if (!hasSession) return "no_session";
+              return "idle";
+            })();
+            const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
+              ? "Terminal"
+              : getManagedAgentLabel(normalizedRole);
             return {
               agentId: normalizedRole,
               agentKind: normalizedRole,
-              agentLabel: agent.label || getManagedAgentLabel(normalizedRole),
+              agentLabel,
               color,
               colorSlot,
               paneId: terminalBinding?.paneId
                 || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole),
-              status: "active",
+              sessionState: hasSession ? "session_attached" : "no_session",
+              status,
               terminalIndex,
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
             };
