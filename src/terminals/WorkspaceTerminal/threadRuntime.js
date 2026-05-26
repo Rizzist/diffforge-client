@@ -984,7 +984,7 @@ export function createThreadProjectionToken(prefix = "projection") {
 
 export function buildProviderTurnStartProjectionEvents({
   agentId,
-  includeUserMessage = true,
+  includeUserMessage = false,
   source = "provider-api",
   startedAt,
   text,
@@ -1031,6 +1031,7 @@ export function buildProviderTurnProjectionEvents({
   agentId,
   assistantMessageId,
   completedAt,
+  includeConversationMessages = false,
   output,
   source = "provider-api",
   startedAt,
@@ -1046,43 +1047,52 @@ export function buildProviderTurnProjectionEvents({
   const safeUserMessageId = userMessageId || createThreadProjectionToken("message-user");
   const safeAssistantMessageId = assistantMessageId || createThreadProjectionToken("message-assistant");
 
-  return [
+  const events = [
     ...buildProviderTurnStartProjectionEvents({
       agentId,
+      includeUserMessage: includeConversationMessages,
       source,
       startedAt: safeStartedAt,
       text: safeText,
       turnId: safeTurnId,
       userMessageId: safeUserMessageId,
     }),
+  ];
+
+  if (includeConversationMessages) {
+    events.push(
+      {
+        agentId,
+        createdAt: safeCompletedAt,
+        delta: safeOutput,
+        id: `projection-provider-assistant-delta-${safeAssistantMessageId}`,
+        messageId: safeAssistantMessageId,
+        source,
+        status: "streaming",
+        text: safeOutput,
+        turnId: safeTurnId,
+        type: "thread.message.assistant.delta",
+      },
+      {
+        agentId,
+        createdAt: safeCompletedAt,
+        id: `projection-provider-assistant-complete-${safeAssistantMessageId}`,
+        messageId: safeAssistantMessageId,
+        source,
+        status: "complete",
+        text: safeOutput,
+        turnId: safeTurnId,
+        type: "thread.message.assistant.complete",
+      },
+    );
+  }
+
+  events.push(
     {
       agentId,
       createdAt: safeCompletedAt,
-      delta: safeOutput,
-      id: `projection-provider-assistant-delta-${safeAssistantMessageId}`,
-      messageId: safeAssistantMessageId,
-      source,
-      status: "streaming",
-      text: safeOutput,
-      turnId: safeTurnId,
-      type: "thread.message.assistant.delta",
-    },
-    {
-      agentId,
-      createdAt: safeCompletedAt,
-      id: `projection-provider-assistant-complete-${safeAssistantMessageId}`,
-      messageId: safeAssistantMessageId,
-      source,
-      status: "complete",
-      text: safeOutput,
-      turnId: safeTurnId,
-      type: "thread.message.assistant.complete",
-    },
-    {
-      agentId,
       assistantMessageId: safeAssistantMessageId,
       completedAt: safeCompletedAt,
-      createdAt: safeCompletedAt,
       id: `projection-provider-turn-completed-${safeTurnId}`,
       messageId: safeUserMessageId,
       source,
@@ -1090,7 +1100,9 @@ export function buildProviderTurnProjectionEvents({
       turnId: safeTurnId,
       type: "thread.turn.completed",
     },
-  ];
+  );
+
+  return events;
 }
 
 export function buildProviderTurnErrorProjectionEvents({

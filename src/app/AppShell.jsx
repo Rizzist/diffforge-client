@@ -975,7 +975,9 @@ function buildTerminalReadyProjectionEvents(thread, event = {}, groundTruth = nu
   }
 
   const eventType = String(event.type || "").trim().toLowerCase();
-  const shouldCompleteFromReadiness = eventType === "terminal-prompt-ready"
+  const readinessCanCompleteTurn = eventType === "terminal-prompt-ready"
+    || eventType === "terminal-input-ready";
+  const shouldCompleteFromReadiness = readinessCanCompleteTurn
     && (
       threadLatestRunningTurnMatchesPrompt(thread, event)
       || groundTruth?.runningTurnLooksIdle === true
@@ -9708,6 +9710,7 @@ export default function App() {
       lifecycleEvent.type === "pending-prompt-sent"
       || lifecycleEvent.type === "provider-turn-completed"
       || lifecycleEvent.type === "terminal-prompt-ready"
+      || lifecycleEvent.type === "terminal-input-ready"
     ) {
       settleWorkspacePromptDelivery(lifecycleEvent.pendingPromptId || lifecycleEvent.promptId);
     } else if (lifecycleEvent.type === "pending-prompt-error") {

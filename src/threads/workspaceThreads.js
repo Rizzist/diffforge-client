@@ -46,6 +46,7 @@ const THREAD_PROJECTION_EVENT_TYPES = new Set([
   "thread.turn.started",
 ]);
 const THREAD_TURN_STATES = new Set(["completed", "error", "interrupted", "running"]);
+const CLOSED_THREAD_TURN_STATES = new Set(["completed", "error", "interrupted"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -391,69 +392,62 @@ function chooseProjectedMessageText(existingText, incomingText) {
   return cleanMessageText(incomingText);
 }
 
-function isLocalUserProjectionSource(source) {
-  const safeSource = cleanText(source).toLowerCase();
-  return Boolean(
-    safeSource === "local-submit"
-      || safeSource === "bigview-submit"
-      || safeSource === "tui-manual-input"
-      || safeSource === "terminal-confirmed"
-      || safeSource === "terminal-prompt-submitted"
-      || safeSource === "pending-prompt"
-      || safeSource.includes("terminal-prompt")
-      || safeSource.includes("manual-input")
-      || safeSource.includes("bigview-submit"),
-  );
-}
-
-function isProviderTranscriptProjectionSource(source) {
+function isTranscriptHistoryProjectionSource(source) {
   const safeSource = cleanText(source).toLowerCase();
   return Boolean(
     safeSource.endsWith("-session")
       || safeSource === "codex-rollout"
       || safeSource === "agent_thread_transcript"
-      || safeSource === "provider-api"
-      || safeSource === "provider-turn"
+      || THREAD_AGENT_IDS.includes(safeSource)
       || safeSource.includes("transcript")
-      || safeSource.includes("provider"),
+      || safeSource.includes("session-history"),
   );
 }
 
-function areLocalAndProviderUserProjectionSources(leftSource, rightSource) {
-  return Boolean(
-    (
-      isLocalUserProjectionSource(leftSource)
-      && isProviderTranscriptProjectionSource(rightSource)
-    )
-      || (
-        isProviderTranscriptProjectionSource(leftSource)
-        && isLocalUserProjectionSource(rightSource)
-      ),
-  );
+function isTranscriptHistoryProjectionEvent(event) {
+  return Boolean(isTranscriptHistoryProjectionSource(event?.source));
 }
 
-function areUserProjectionPromptDuplicates(left, right) {
-  const leftRole = cleanText(left?.role).toLowerCase();
-  const rightRole = cleanText(right?.role).toLowerCase();
-  if (leftRole !== "user" || rightRole !== "user") {
+function transcriptHistoryProjectionSource(agentId, source = "") {
+  const safeSource = cleanText(source);
+  if (isTranscriptHistoryProjectionSource(safeSource)) {
+    return safeSource;
+  }
+
+  return `${cleanAgentId(agentId, DEFAULT_AGENT_ID)}-session`;
+}
+
+function isConversationProjectionEventType(type) {
+  return type === "thread.message.user"
+    || type === "thread.message.system"
+    || type === "thread.message.assistant.delta"
+    || type === "thread.message.assistant.complete";
+}
+
+function isTurnCompleteProjectionEvent(event) {
+  const kind = cleanText(event?.kind).toLowerCase();
+  const status = cleanText(event?.status).toLowerCase();
+  const title = cleanText(event?.title).toLowerCase();
+  const messageId = cleanText(event?.messageId || event?.message_id || event?.id).toLowerCase();
+  return kind === "task_complete"
+    || kind === "final_answer"
+    || status === "task_complete"
+    || title === "task complete"
+    || messageId.includes("task-complete");
+}
+
+function projectedMessagesHaveAssistantText(messagesById, messageOrder, text) {
+  const safeText = cleanMessageText(text);
+  if (!safeText) {
     return false;
   }
 
-  if (cleanText(left?.kind, "message") !== cleanText(right?.kind, "message")) {
-    return false;
-  }
-
-  if (!areThreadMessageTextsEquivalent(left?.text, right?.text)) {
-    return false;
-  }
-
-  const leftTurnId = cleanText(left?.turnId);
-  const rightTurnId = cleanText(right?.turnId);
-  if (leftTurnId && rightTurnId && leftTurnId === rightTurnId) {
-    return true;
-  }
-
-  return areLocalAndProviderUserProjectionSources(left?.source, right?.source);
+  return messageOrder.some((messageId) => {
+    const candidate = messagesById.get(messageId);
+    return candidate?.role === "assistant"
+      && cleanText(candidate.kind, "message") !== "task_complete"
+      && cleanMessageText(candidate.text) === safeText;
+  });
 }
 
 function cleanTerminalUiText(value, fallback = "") {
@@ -807,6 +801,9 @@ function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
   if (normalizedTurn?.state === "running") {
     return "thinking";
   }
+  if (CLOSED_THREAD_TURN_STATES.has(normalizedTurn?.state)) {
+    return "idle";
+  }
 
   return normalizeThreadActivityStatus(fallback);
 }
@@ -1095,23 +1092,18 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
 
   const matchingMessageId = messagesById.has(normalizedMessage.id)
     ? normalizedMessage.id
-    : messageOrder.find((messageId, index) => {
+    : messageOrder.find((messageId) => {
       const candidate = messagesById.get(messageId);
-      const isLatestProjectedMessage = index === messageOrder.length - 1;
       return candidate
         && normalizedMessage.role === "user"
         && candidate.role === normalizedMessage.role
         && cleanText(candidate.kind, "message") === cleanText(normalizedMessage.kind, "message")
-        && (
-          areThreadMessagesEquivalent(
-            candidate,
-            normalizedMessage,
-            normalizedMessage.role === "user" ? 12000 : 5000,
-          )
-          || (
-            isLatestProjectedMessage
-            && areUserProjectionPromptDuplicates(candidate, normalizedMessage)
-          )
+        && !isTranscriptHistoryProjectionSource(candidate.source)
+        && !isTranscriptHistoryProjectionSource(normalizedMessage.source)
+        && areThreadMessagesEquivalent(
+          candidate,
+          normalizedMessage,
+          normalizedMessage.role === "user" ? 12000 : 5000,
         );
     });
 
@@ -1136,9 +1128,21 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
     return normalizeThreadMessages(fallbackMessages);
   }
 
+  const hasTranscriptHistoryMessages = projectionEvents.some((event) => (
+    isConversationProjectionEventType(event.type)
+      && isTranscriptHistoryProjectionEvent(event)
+  ));
   const messagesById = new Map();
   const messageOrder = [];
   projectionEvents.forEach((event) => {
+    if (
+      hasTranscriptHistoryMessages
+      && isConversationProjectionEventType(event.type)
+      && !isTranscriptHistoryProjectionEvent(event)
+    ) {
+      return;
+    }
+
     if (event.type === "thread.message.user" || event.type === "thread.message.system") {
       upsertProjectedMessage(messagesById, messageOrder, {
         agentId: event.agentId,
@@ -1159,6 +1163,12 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
       const eventText = event.replaceText
         ? event.text || event.delta
         : `${existing?.text || ""}${event.delta || event.text}`;
+      if (
+        isTurnCompleteProjectionEvent(event)
+        && projectedMessagesHaveAssistantText(messagesById, messageOrder, eventText)
+      ) {
+        return;
+      }
       upsertProjectedMessage(messagesById, messageOrder, {
         agentId: event.agentId,
         createdAt: event.createdAt,
@@ -1179,6 +1189,16 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
         return;
       }
 
+      const eventText = event.replaceText || !existing?.text
+        ? event.text || event.delta || existing?.text || ""
+        : existing.text;
+      if (
+        isTurnCompleteProjectionEvent(event)
+        && projectedMessagesHaveAssistantText(messagesById, messageOrder, eventText)
+      ) {
+        return;
+      }
+
       upsertProjectedMessage(messagesById, messageOrder, {
         ...(existing || {}),
         agentId: event.agentId || existing?.agentId || "",
@@ -1188,9 +1208,7 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
         role: "assistant",
         source: event.source || existing?.source || "projection",
         status: "complete",
-        text: event.replaceText || !existing?.text
-          ? event.text || event.delta || existing?.text || ""
-          : existing.text,
+        text: eventText,
         turnId: event.turnId || existing?.turnId || "",
       });
       return;
@@ -1349,6 +1367,7 @@ function isTranscriptTurnErrorMessage(message) {
 
 function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
   let latestTurn = normalizeThreadLatestTurn(fallbackLatestTurn);
+  const closedTurnIds = new Set();
 
   normalizeThreadProjectionEvents(events).forEach((event) => {
     const turnId = cleanText(event.turnId);
@@ -1358,8 +1377,13 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
 
     if (
       event.type === "thread.turn.started"
-      && latestTurn?.turnId === turnId
-      && ["completed", "error", "interrupted"].includes(latestTurn?.state)
+      && (
+        closedTurnIds.has(turnId)
+        || (
+          latestTurn?.turnId === turnId
+          && CLOSED_THREAD_TURN_STATES.has(latestTurn?.state)
+        )
+      )
     ) {
       return;
     }
@@ -1378,6 +1402,13 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
     }
 
     if (!latestTurn || latestTurn.turnId !== turnId) {
+      if (
+        event.type === "thread.turn.completed"
+        || event.type === "thread.turn.error"
+        || event.type === "thread.turn.interrupted"
+      ) {
+        closedTurnIds.add(turnId);
+      }
       return;
     }
 
@@ -1399,6 +1430,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
     }
 
     if (event.type === "thread.turn.completed") {
+      closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
         assistantMessageId: event.assistantMessageId || latestTurn.assistantMessageId,
@@ -1410,6 +1442,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
     }
 
     if (event.type === "thread.turn.error") {
+      closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
         completedAt: event.completedAt || event.createdAt,
@@ -1421,6 +1454,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
     }
 
     if (event.type === "thread.turn.interrupted") {
+      closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
         completedAt: event.completedAt || event.createdAt,
@@ -1437,7 +1471,6 @@ function findMatchingProjectedMessage(projectedMessages, message) {
   const messageId = cleanText(message?.id);
   const role = cleanText(message?.role);
   const kind = cleanText(message?.kind, "message");
-  const text = cleanMessageText(message?.text);
   const callId = cleanText(message?.callId);
 
   if (messageId) {
@@ -1457,28 +1490,15 @@ function findMatchingProjectedMessage(projectedMessages, message) {
     }
   }
 
-  const latestConversationIndex = role === "user" && text
-    ? projectedMessages.reduce((latestIndex, candidate, index) => (
-      ["assistant", "system", "user"].includes(candidate?.role) ? index : latestIndex
-    ), -1)
-    : -1;
-  const latestConversationMessage = latestConversationIndex >= 0
-    ? projectedMessages[latestConversationIndex]
-    : null;
+  if (messageId && isTranscriptHistoryProjectionSource(message?.source)) {
+    return null;
+  }
 
   return projectedMessages.find((candidate) => (
     candidate.role === role
     && cleanText(candidate.kind, "message") === kind
     && areThreadMessagesEquivalent(candidate, message, role === "user" ? 12000 : 5000)
-  )) || (
-    latestConversationMessage
-      && latestConversationMessage.role === "user"
-      && cleanText(latestConversationMessage.kind, "message") === kind
-      && cleanMessageText(latestConversationMessage.text) === text
-      && areUserProjectionPromptDuplicates(latestConversationMessage, message)
-      ? latestConversationMessage
-      : null
-  ) || null;
+  )) || null;
 }
 
 function createSubmittedUserProjectionEvents(thread, event = {}) {
@@ -1487,8 +1507,6 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
     return [];
   }
 
-  const projectionEvents = ensureThreadProjectionEvents(thread);
-  const messages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
   const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
   const createdAt = cleanText(
     event.messageCreatedAt
@@ -1496,20 +1514,6 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
       || event.submittedAt,
     nowIso(),
   );
-  const createdMs = Date.parse(createdAt);
-  const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-  if (
-    Number.isFinite(createdMs)
-    && areThreadMessagesEquivalent(
-      lastUserMessage,
-      { createdAt, kind: "message", role: "user", text },
-      2500,
-    )
-    && !shouldPreferIncomingPastedBody(lastUserMessage?.text, text)
-  ) {
-    return [];
-  }
-
   const messageId = cleanText(
     event.messageId || promptEventId,
     createRandomId(`message-${safeKey(thread?.id, "thread")}`),
@@ -1519,16 +1523,6 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   const source = cleanText(event.source || event.messageSource, "local-submit");
   return [{
     agentId,
-    createdAt,
-    id: `projection-user-${stableProjectionKey(messageId, "message")}`,
-    messageId,
-    source,
-    status: "submitted",
-    text,
-    turnId,
-    type: "thread.message.user",
-  }, {
-    agentId: cleanAgentId(event.agentId || event.currentAgent, ""),
     createdAt,
     id: `projection-turn-started-${stableProjectionKey(turnId, "turn")}`,
     messageId,
@@ -1541,21 +1535,26 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
 
 function createProjectionEventsFromTranscript(thread, incomingMessages, event = {}) {
   const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
-  const source = cleanText(event.source, `${agentId || "agent"}-session`);
+  const source = transcriptHistoryProjectionSource(agentId, event.source);
   const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
   const expectedUserMessage = cleanSubmittedUserMessage(
     event.expectedUserMessage
       || event.userMessage
       || event.message,
   );
-  const expectedMessageCreatedAt = cleanText(
-    event.expectedMessageCreatedAt
-      || event.messageCreatedAt
-      || event.promptEventSubmittedAt
-      || event.submittedAt,
-  );
+  const normalizedIncomingMessages = normalizeThreadMessages(incomingMessages);
+  const expectedPromptTranscriptMessageId = expectedUserMessage
+    ? cleanText([...normalizedIncomingMessages].reverse().find((message) => (
+      message?.role === "user"
+        && !isSlashCommandPrompt(message.text)
+        && cleanSubmittedUserMessage(message.text) === expectedUserMessage
+    ))?.id)
+    : "";
   let projectionEvents = ensureThreadProjectionEvents(thread);
-  let projectedMessages = projectThreadProjectionMessages(projectionEvents, thread?.messages);
+  let projectedMessages = projectThreadProjectionMessages(
+    projectionEvents.filter(isTranscriptHistoryProjectionEvent),
+    [],
+  );
   const events = [];
   const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
   const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
@@ -1564,43 +1563,33 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   const allowTranscriptTurnCompletion = event.allowTranscriptTurnCompletion === true;
   const assistantResponseCompletesTurn = allowTranscriptTurnCompletion
     && event.assistantResponseCompletesTurn === true;
-  let currentTurnId = cleanText(latestTurn?.turnId);
+  let currentTurnId = "";
   let transcriptAdvancedTurn = false;
 
-  normalizeThreadMessages(incomingMessages).forEach((message) => {
+  normalizedIncomingMessages.forEach((message) => {
     const eventStartCount = events.length;
-    const canonicalPromptUserMessage = Boolean(
-      promptEventId
-        && message.role === "user"
-        && expectedUserMessage
-        && cleanSubmittedUserMessage(message.text) === expectedUserMessage,
-    );
-    const matchCandidate = canonicalPromptUserMessage
-      ? {
-        ...message,
-        createdAt: expectedMessageCreatedAt || message.createdAt,
-        id: promptEventId,
-        source: message.source || source,
-      }
-      : {
-        ...message,
-        source: message.source || source,
-      };
+    const matchCandidate = {
+      ...message,
+      source,
+    };
     const projectedMessage = findMatchingProjectedMessage(projectedMessages, matchCandidate);
-    const messageId = cleanText(
-      canonicalPromptUserMessage ? promptEventId : message.id,
-      createRandomId("message"),
+    const messageId = cleanText(message.id, createRandomId("message"));
+    const createdAt = cleanText(message.createdAt, nowIso());
+    const isExpectedPromptUserMessage = Boolean(
+      expectedPromptTranscriptMessageId
+        && message.role === "user"
+        && messageId === expectedPromptTranscriptMessageId,
     );
-    const createdAt = cleanText(
-      canonicalPromptUserMessage
-        ? expectedMessageCreatedAt || message.createdAt
-        : message.createdAt,
-      nowIso(),
-    );
+    const expectedPromptTurnForMessage = isExpectedPromptUserMessage
+      ? runningLatestTurnId || expectedPromptTurnId
+      : "";
+    const incomingMessageTurnId = cleanText(message.turnId || message.turn_id);
+    const shouldContinueCurrentTranscriptTurn = Boolean(message.role !== "user" && currentTurnId);
     const messageTurnId = cleanText(
-      message.turnId
-        || message.turn_id
+      (shouldContinueCurrentTranscriptTurn ? currentTurnId : "")
+        || expectedPromptTurnForMessage
         || projectedMessage?.turnId
+        || incomingMessageTurnId
         || currentTurnId
         || createTurnIdForMessage(thread, messageId),
     );
@@ -1610,7 +1599,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       createdAt,
       kind: message.kind,
       messageId,
-      source: message.source || source,
+      source,
       title: message.title,
       turnId: messageTurnId,
     };
@@ -1620,9 +1609,9 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         return;
       }
       currentTurnId = cleanText(
-        message.turnId
-          || message.turn_id
+        expectedPromptTurnForMessage
           || projectedMessage?.turnId
+          || incomingMessageTurnId
           || createTurnIdForMessage(thread, messageId),
       );
       transcriptAdvancedTurn = true;
