@@ -1358,8 +1358,10 @@ function sanitizeWorkspaceMcpRegistryForCloud(registry, target) {
   const data = unwrapCloudCommandData(registry, {});
   return {
     repoPath: target.repoPath,
+    workspaceActive: Boolean(target.workspaceActive),
     workspaceId: target.workspaceId,
     workspaceName: target.workspaceName,
+    workspaceStatus: target.workspaceStatus || (target.workspaceActive ? "active" : "deactivated"),
     servers: safeCloudMcpArray(data.servers)
       .map(sanitizeWorkspaceMcpServerForCloud)
       .filter(Boolean),
@@ -7896,8 +7898,10 @@ export default function App() {
 
         return {
           repoPath,
+          workspaceActive: true,
           workspaceId,
           workspaceName: descriptor.workspace?.name || workspaceId,
+          workspaceStatus: "active",
           terminals,
         };
       })
@@ -7911,22 +7915,61 @@ export default function App() {
     () => JSON.stringify(terminalPresenceWorkspaces),
     [terminalPresenceWorkspaces],
   );
-  const workspaceMcpSyncTargets = useMemo(() => (
-    enabledWorkspaceRuntimeDescriptors
-      .map((descriptor) => {
-        const repoPath = String(descriptor.workingDirectory || "").trim();
-        const workspaceId = String(descriptor.workspace?.id || "").trim();
-        if (!repoPath || !workspaceId) {
-          return null;
-        }
-        return {
-          repoPath,
-          workspaceId,
-          workspaceName: descriptor.workspace?.name || workspaceId,
-        };
-      })
-      .filter(Boolean)
-  ), [enabledWorkspaceRuntimeDescriptors]);
+  const workspaceMcpSyncTargets = useMemo(() => {
+    if (shouldShowWorkspaceSetup) {
+      return [];
+    }
+
+    const targets = [];
+    const seen = new Set();
+    const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
+    const addTarget = (workspace, repoPath, activeOverride = null) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      const workingDirectory = String(repoPath || "").trim();
+      if (!workspaceId || !workingDirectory) {
+        return;
+      }
+      const key = `${workspaceId}:${workingDirectory}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      const workspaceActive = activeOverride === null
+        ? activeWorkspaceIds.has(workspaceId)
+        : Boolean(activeOverride);
+      targets.push({
+        repoPath: workingDirectory,
+        workspaceActive,
+        workspaceId,
+        workspaceName: workspace?.name || workspaceId,
+        workspaceStatus: workspaceActive ? "active" : "deactivated",
+      });
+    };
+
+    addTarget(
+      selectedWorkspace,
+      selectedWorkspaceRootDirectory || defaultWorkingDirectory,
+      activeWorkspaceIds.has(String(selectedWorkspace?.id || "").trim()),
+    );
+
+    workspaces.forEach((workspace) => {
+      addTarget(
+        workspace,
+        getWorkspaceRootDirectory(workspaceSettings, workspace?.id),
+        activeWorkspaceIds.has(String(workspace?.id || "").trim()),
+      );
+    });
+
+    return targets;
+  }, [
+    defaultWorkingDirectory,
+    enabledRuntimeWorkspaceIds,
+    selectedWorkspace,
+    selectedWorkspaceRootDirectory,
+    shouldShowWorkspaceSetup,
+    workspaceSettings,
+    workspaces,
+  ]);
   const workspaceMcpSyncTargetKey = useMemo(
     () => JSON.stringify(workspaceMcpSyncTargets),
     [workspaceMcpSyncTargets],

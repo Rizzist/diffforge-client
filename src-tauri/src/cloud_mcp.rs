@@ -2166,10 +2166,30 @@ async fn cloud_mcp_post_event_endpoint(
     event_kind: &str,
     payload: &Value,
 ) -> Result<Value, String> {
+    let mut workspace_ids = Vec::new();
+    let mut repo_ids = Vec::new();
+    if let Some(workspaces) = payload.get("workspaces").and_then(Value::as_array) {
+        for workspace in workspaces.iter().take(64) {
+            if let Some(workspace_id) =
+                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+            {
+                if !workspace_ids.iter().any(|value: &String| value == &workspace_id) {
+                    workspace_ids.push(workspace_id);
+                }
+            }
+            if let Some(repo_id) = cloud_mcp_payload_text(workspace, &["repo_id", "repoId"]) {
+                if !repo_ids.iter().any(|value: &String| value == &repo_id) {
+                    repo_ids.push(repo_id);
+                }
+            }
+        }
+    }
     let envelope = json!({
         "event_kind": event_kind,
         "payload": payload,
+        "repo_ids": repo_ids,
         "ts_ms": cloud_mcp_now_ms(),
+        "workspace_ids": workspace_ids,
     });
     cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
 }
@@ -4818,6 +4838,23 @@ async fn cloud_mcp_sync_terminal_presence(
         let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
+        let workspace_active = workspace
+            .get("workspace_active")
+            .or_else(|| workspace.get("workspaceActive"))
+            .or_else(|| workspace.get("active"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let workspace_status = cloud_mcp_payload_text(
+            workspace,
+            &["workspace_status", "workspaceStatus", "status"],
+        )
+        .unwrap_or_else(|| {
+            if workspace_active {
+                "active".to_string()
+            } else {
+                "deactivated".to_string()
+            }
+        });
         let req = cloud_mcp_spec_graph_sync_request(
             repo_path,
             workspace_id.clone(),
@@ -4831,8 +4868,10 @@ async fn cloud_mcp_sync_terminal_presence(
 
         normalized_workspaces.push(json!({
             "repo_id": req.repo_id,
+            "workspace_active": workspace_active,
             "workspace_id": req.workspace_id,
             "workspace_name": req.workspace_name,
+            "workspace_status": workspace_status,
             "terminals": terminals,
         }));
     }
@@ -4882,6 +4921,23 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
+        let workspace_active = workspace
+            .get("workspace_active")
+            .or_else(|| workspace.get("workspaceActive"))
+            .or_else(|| workspace.get("active"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let workspace_status = cloud_mcp_payload_text(
+            workspace,
+            &["workspace_status", "workspaceStatus", "status"],
+        )
+        .unwrap_or_else(|| {
+            if workspace_active {
+                "active".to_string()
+            } else {
+                "deactivated".to_string()
+            }
+        });
         let req = cloud_mcp_spec_graph_sync_request(
             repo_path,
             workspace_id.clone(),
@@ -4896,7 +4952,9 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         normalized_workspaces.push(json!({
             "repo_id": req.repo_id,
             "workspace_id": req.workspace_id,
+            "workspace_active": workspace_active,
             "workspace_name": req.workspace_name,
+            "workspace_status": workspace_status,
             "servers": servers,
         }));
     }
