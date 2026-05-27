@@ -536,6 +536,33 @@ fn terminal_idle_shell_command() -> CommandBuilder {
     CommandBuilder::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()))
 }
 
+#[cfg(windows)]
+fn terminal_interactive_shell_command() -> CommandBuilder {
+    terminal_idle_shell_command()
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_interactive_shell_command() -> CommandBuilder {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut command = CommandBuilder::new(shell);
+
+    if matches!(shell_name.as_str(), "zsh" | "bash") {
+        command.arg("-l");
+    }
+
+    command
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn terminal_interactive_shell_command() -> CommandBuilder {
+    terminal_idle_shell_command()
+}
+
 fn is_terminal_prewarm_kind(kind: &str) -> bool {
     matches!(
         kind.trim().to_ascii_lowercase().as_str(),
@@ -1152,6 +1179,7 @@ fn terminal_env_vars_with_opencode_tui_config(
 }
 
 fn apply_terminal_emulation_env(command: &mut CommandBuilder) {
+    command.env("PATH", desktop_command_path());
     command.env("TERM", TERMINAL_EMULATION_TERM);
     command.env("COLORTERM", TERMINAL_EMULATION_COLORTERM);
     command.env("FORCE_COLOR", TERMINAL_EMULATION_FORCE_COLOR);
@@ -1297,7 +1325,7 @@ fn create_warm_shell_pty_in_directory(
     size: PtySize,
     working_directory: &Path,
 ) -> Result<WarmPty, String> {
-    let mut command = terminal_idle_shell_command();
+    let mut command = terminal_interactive_shell_command();
 
     command.cwd(working_directory);
 
@@ -2112,7 +2140,10 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
     let escaped = shell_command.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
 
-    Command::new("osascript")
+    let mut command = Command::new("osascript");
+    apply_desktop_command_environment(&mut command);
+
+    command
         .args(["-e", &script])
         .spawn()
         .map(|_| ())
@@ -2140,6 +2171,7 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
 
     for (terminal, prefix_args) in terminal_attempts {
         let mut command = Command::new(terminal);
+        apply_desktop_command_environment(&mut command);
 
         if matches!(terminal, "xfce4-terminal" | "mate-terminal") {
             command.args(prefix_args);

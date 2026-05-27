@@ -26,6 +26,88 @@ fn claude_credentials_detected() -> bool {
         .unwrap_or(false)
 }
 
+fn push_existing_command_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidate.is_dir() || paths.iter().any(|path| path == &candidate) {
+        return;
+    }
+
+    paths.push(candidate);
+}
+
+fn nvm_node_version_key(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn append_nvm_node_bins(paths: &mut Vec<PathBuf>) {
+    let nvm_dir = env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| user_home_dir().map(|home| home.join(".nvm")));
+    let Some(nvm_dir) = nvm_dir else {
+        return;
+    };
+
+    push_existing_command_path(paths, nvm_dir.join("current").join("bin"));
+
+    let versions_dir = nvm_dir.join("versions").join("node");
+    let Ok(entries) = fs::read_dir(versions_dir) else {
+        return;
+    };
+    let mut version_dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+
+    version_dirs.sort_by(|left, right| {
+        nvm_node_version_key(right)
+            .cmp(&nvm_node_version_key(left))
+            .then_with(|| right.cmp(left))
+    });
+
+    for version_dir in version_dirs {
+        push_existing_command_path(paths, version_dir.join("bin"));
+    }
+}
+
+fn desktop_command_path() -> std::ffi::OsString {
+    let mut paths = Vec::new();
+
+    if let Some(home) = user_home_dir() {
+        push_existing_command_path(&mut paths, home.join(".local").join("bin"));
+        push_existing_command_path(&mut paths, home.join(".cargo").join("bin"));
+    }
+    append_nvm_node_bins(&mut paths);
+
+    #[cfg(target_os = "macos")]
+    {
+        push_existing_command_path(&mut paths, PathBuf::from("/opt/homebrew/bin"));
+        push_existing_command_path(&mut paths, PathBuf::from("/opt/homebrew/sbin"));
+        push_existing_command_path(&mut paths, PathBuf::from("/usr/local/bin"));
+        push_existing_command_path(&mut paths, PathBuf::from("/usr/local/sbin"));
+    }
+
+    if let Some(existing_path) = env::var_os("PATH") {
+        for path in env::split_paths(&existing_path) {
+            push_existing_command_path(&mut paths, path);
+        }
+    }
+
+    env::join_paths(paths)
+        .ok()
+        .or_else(|| env::var_os("PATH"))
+        .unwrap_or_default()
+}
+
+fn apply_desktop_command_environment(command: &mut Command) {
+    command.env("PATH", desktop_command_path());
+}
+
 fn run_command_capture(
     binary: &str,
     args: &[&str],
@@ -65,6 +147,7 @@ where
     }
 
     let mut command = Command::new(binary);
+    apply_desktop_command_environment(&mut command);
     command.args(args);
 
     if let Some(directory) = working_directory {
