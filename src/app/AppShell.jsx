@@ -8103,6 +8103,9 @@ export default function App() {
 	            : responseData;
 	          const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
 	          const closedCount = Number(stored?.closed_count ?? responseData?.closed_count ?? 0);
+	          const inputTerminalCount = Number(stored?.input_terminal_count ?? responseData?.input_terminal_count ?? 0);
+	          const fallbackTerminalCount = Number(stored?.fallback_terminal_count ?? responseData?.fallback_terminal_count ?? 0);
+	          const responseWorkspaceCount = Number(stored?.workspace_count ?? responseData?.workspace_count ?? 0);
 	          void recordCloudConnectionDiagnostic(diagnosticToken, {
 	            channel: "rust-client-sync",
 	            step: "rust.sync.terminal_presence",
@@ -8112,7 +8115,10 @@ export default function App() {
 	              : "Rust client terminal presence sync completed.",
 	            details: {
 	              closedCount,
+	              fallbackTerminalCount,
+	              inputTerminalCount,
 	              reason,
+	              responseWorkspaceCount,
 	              storedCount,
 	              terminalCount,
 	              workspaceCount: terminalPresenceWorkspaces.length,
@@ -8202,6 +8208,8 @@ export default function App() {
 	          : responseData;
 	        const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
 	        const enabledCount = Number(stored?.enabled_count ?? responseData?.enabled_count ?? 0);
+	        const declaredServerCount = Number(stored?.declared_server_count ?? responseData?.declared_server_count ?? 0);
+	        const responseWorkspaceCount = Number(stored?.workspace_count ?? responseData?.workspace_count ?? 0);
 	        const serverCount = workspacesForCloud.reduce(
 	          (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
 	          0,
@@ -8214,8 +8222,10 @@ export default function App() {
 	            ? "Rust client workspace MCP sync stored fewer servers than expected."
 	            : "Rust client workspace MCP sync completed.",
 	          details: {
+	            declaredServerCount,
 	            enabledCount,
 	            reason,
+	            responseWorkspaceCount,
 	            serverCount,
 	            storedCount,
 	            workspaceCount: workspacesForCloud.length,

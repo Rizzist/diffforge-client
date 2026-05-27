@@ -2621,6 +2621,27 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn cloud_mcp_payload_bool(payload: &Value, path: &[&str], fallback: bool) -> bool {
+    let mut current = payload;
+    for key in path {
+        current = match current.get(*key) {
+            Some(value) => value,
+            None => return fallback,
+        };
+    }
+    if let Some(value) = current.as_bool() {
+        return value;
+    }
+    if let Some(text) = current.as_str() {
+        return match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => fallback,
+        };
+    }
+    fallback
+}
+
 async fn cloud_mcp_register_prepared_workspace(
     state: &CloudMcpState,
     prepared: CloudMcpPreparedWorkspace,
@@ -5364,11 +5385,82 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             workspace_id.clone(),
             workspace_name.clone(),
         );
-        let servers = workspace
+        let server_items = workspace
             .get("servers")
             .and_then(Value::as_array)
             .map(|items| items.iter().take(128).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let servers = server_items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, server)| {
+                if !server.is_object() {
+                    return None;
+                }
+                let server_key = cloud_mcp_payload_text(
+                    server,
+                    &[
+                        "server_key",
+                        "serverKey",
+                        "key",
+                        "id",
+                        "name",
+                        "label",
+                        "slug",
+                        "package_ref",
+                        "packageRef",
+                    ],
+                )
+                .unwrap_or_else(|| format!("server-{}", index + 1));
+                let name = cloud_mcp_payload_text(
+                    server,
+                    &["name", "label", "display_name", "displayName"],
+                )
+                .unwrap_or_else(|| server_key.clone());
+                Some(json!({
+                    "id": cloud_mcp_payload_text(server, &["id"]).unwrap_or_else(|| server_key.clone()),
+                    "server_key": server_key,
+                    "name": name,
+                    "source_kind": cloud_mcp_payload_text(server, &["source_kind", "sourceKind"]),
+                    "source_label": cloud_mcp_payload_text(server, &["source_label", "sourceLabel"]),
+                    "package_ref": cloud_mcp_payload_text(server, &["package_ref", "packageRef"]),
+                    "version": cloud_mcp_payload_text(server, &["version"]),
+                    "transport": cloud_mcp_payload_text(server, &["transport"]).unwrap_or_else(|| "stdio".to_string()),
+                    "built_in": cloud_mcp_payload_bool(server, &["built_in"], false)
+                        || cloud_mcp_payload_bool(server, &["builtIn"], false),
+                    "install_state": cloud_mcp_payload_text(server, &["install_state", "installState"]).unwrap_or_else(|| "installed".to_string()),
+                    "workspace_enabled": cloud_mcp_payload_bool(server, &["workspace_enabled"], true)
+                        && cloud_mcp_payload_bool(server, &["workspaceEnabled"], true),
+                    "approval_policy": cloud_mcp_payload_text(server, &["approval_policy", "approvalPolicy"]).unwrap_or_else(|| "always_allow".to_string()),
+                    "agent_config_access_enabled": cloud_mcp_payload_bool(server, &["agent_config_access_enabled"], true)
+                        && cloud_mcp_payload_bool(server, &["agentConfigAccessEnabled"], true),
+                    "agent_secret_config_access_enabled": cloud_mcp_payload_bool(server, &["agent_secret_config_access_enabled"], false)
+                        || cloud_mcp_payload_bool(server, &["agentSecretConfigAccessEnabled"], false),
+                    "agent_env_file_write_enabled": cloud_mcp_payload_bool(server, &["agent_env_file_write_enabled"], true)
+                        && cloud_mcp_payload_bool(server, &["agentEnvFileWriteEnabled"], true),
+                    "last_probe_status": cloud_mcp_payload_text(server, &["last_probe_status", "lastProbeStatus"]),
+                    "last_probe_message": cloud_mcp_payload_text(server, &["last_probe_message", "lastProbeMessage"]),
+                    "config_schema": server
+                        .get("config_schema")
+                        .or_else(|| server.get("configSchema"))
+                        .or_else(|| server.get("env_schema_json"))
+                        .or_else(|| server.get("envSchema"))
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                    "tools": server
+                        .get("tools")
+                        .or_else(|| server.get("tools_json"))
+                        .or_else(|| server.get("toolsJson"))
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                    "config_summary": server
+                        .get("config_summary")
+                        .or_else(|| server.get("configSummary"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                }))
+            })
+            .collect::<Vec<_>>();
 
         let server_count = servers.len();
         normalized_workspaces.push(json!({
