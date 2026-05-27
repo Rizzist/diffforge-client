@@ -1231,6 +1231,14 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .get("event")
             .cloned()
             .unwrap_or_else(|| message.clone());
+        let event_kind = event
+            .get("event_kind")
+            .or_else(|| event.get("eventKind"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(event_kind, "client_liveness_ping" | "dashboard_liveness_ping") {
+            let _ = cloud_mcp_send_liveness_pong_event(state, &event).await;
+        }
         let _ = state.global_ws_events.send(event);
         let mut runtime = state.inner.lock().await;
         runtime.connected = true;
@@ -1239,6 +1247,75 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         runtime.global_ws_status = "connected".to_string();
         runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
     }
+}
+
+async fn cloud_mcp_send_liveness_pong_event(
+    state: &CloudMcpState,
+    event: &Value,
+) -> Result<(), String> {
+    let received_ms = cloud_mcp_now_ms();
+    let ping_id = cloud_mcp_payload_text(event, &["ping_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["pingId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "ping_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "pingId"]))
+        .unwrap_or_else(|| format!("rust-liveness-{received_ms}"));
+    let snapshot = cloud_mcp_status_snapshot(state).await;
+    let sent_ms = cloud_mcp_now_ms();
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let payload = json!({
+        "source": "rust-diffforge-liveness",
+        "event_kind": "desktop_liveness_pong",
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "ping_id": ping_id,
+        "repo_id": cloud_mcp_payload_text(event, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["repoId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "repo_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "repoId"])),
+        "workspace_id": cloud_mcp_payload_text(event, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"])),
+        "origin_connection_id": cloud_mcp_payload_text(event, &["origin_connection_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["originConnectionId"])),
+        "browser_sent_ms": cloud_mcp_payload_u64(event, &["browser_sent_ms"])
+            .or_else(|| cloud_mcp_payload_u64(event, &["browserSentMs"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "browser_sent_ms"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "browserSentMs"])),
+        "cloud_received_ms": cloud_mcp_payload_u64(event, &["cloud_received_ms"])
+            .or_else(|| cloud_mcp_payload_u64(event, &["cloudReceivedMs"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "cloud_received_ms"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "cloudReceivedMs"])),
+        "cloud_sent_ms": cloud_mcp_payload_u64(event, &["cloud_sent_ms"])
+            .or_else(|| cloud_mcp_payload_u64(event, &["cloudSentMs"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "cloud_sent_ms"]))
+            .or_else(|| cloud_mcp_payload_u64(event, &["payload", "cloudSentMs"])),
+        "rust_received_ms": received_ms,
+        "rust_sent_ms": sent_ms,
+        "rust_elapsed_ms": sent_ms.saturating_sub(received_ms),
+        "registered_workspace_count": snapshot.registered_workspaces.len(),
+        "global_ws_connected": snapshot.global_ws_connected,
+        "status": "connected",
+        "ts_ms": sent_ms,
+    });
+    let request = cloud_mcp_event_envelope("desktop_liveness_pong", &payload);
+    let envelope = json!({
+        "kind": "event",
+        "id": format!("liveness-pong-{}-{}", sent_ms, uuid::Uuid::new_v4()),
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
+        "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
+        "request": request,
+    });
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return Err("Cloud MCP app websocket is not connected.".to_string());
+    };
+    tx.send(envelope)
+        .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())
 }
 
 async fn cloud_mcp_registered_workspace_subscriptions(state: &CloudMcpState) -> Vec<Value> {
@@ -2517,6 +2594,40 @@ async fn cloud_mcp_post_event_endpoint(
 fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
     let mut workspace_ids = Vec::new();
     let mut repo_ids = Vec::new();
+    if let Some(workspace_id) = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]) {
+        if !workspace_ids.iter().any(|value: &String| value == &workspace_id) {
+            workspace_ids.push(workspace_id);
+        }
+    }
+    if let Some(repo_id) = cloud_mcp_payload_text(payload, &["repo_id", "repoId"]) {
+        if !repo_ids.iter().any(|value: &String| value == &repo_id) {
+            repo_ids.push(repo_id);
+        }
+    }
+    if let Some(items) = payload
+        .get("workspace_ids")
+        .or_else(|| payload.get("workspaceIds"))
+        .and_then(Value::as_array)
+    {
+        for item in items.iter().filter_map(Value::as_str) {
+            let item = item.trim().to_string();
+            if !item.is_empty() && !workspace_ids.iter().any(|value| value == &item) {
+                workspace_ids.push(item);
+            }
+        }
+    }
+    if let Some(items) = payload
+        .get("repo_ids")
+        .or_else(|| payload.get("repoIds"))
+        .and_then(Value::as_array)
+    {
+        for item in items.iter().filter_map(Value::as_str) {
+            let item = item.trim().to_string();
+            if !item.is_empty() && !repo_ids.iter().any(|value| value == &item) {
+                repo_ids.push(item);
+            }
+        }
+    }
     if let Some(workspaces) = payload.get("workspaces").and_then(Value::as_array) {
         for workspace in workspaces.iter().take(64) {
             if let Some(workspace_id) =
@@ -2630,6 +2741,20 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_payload_u64(payload: &Value, path: &[&str]) -> Option<u64> {
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_u64().or_else(|| {
+        current
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<u64>().ok())
+    })
 }
 
 fn cloud_mcp_payload_bool(payload: &Value, path: &[&str], fallback: bool) -> bool {
@@ -5212,6 +5337,79 @@ async fn require_cloud_mcp_terminal_gate_for_path(
 #[tauri::command]
 async fn cloud_mcp_connect(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
     cloud_mcp_connect_state(state.inner()).await
+}
+
+async fn cloud_mcp_signal_desktop_closing(
+    app: &AppHandle,
+    reason: &str,
+) -> Result<Value, String> {
+    let state = app.state::<CloudMcpState>().inner().clone();
+    let snapshot = cloud_mcp_status_snapshot(&state).await;
+    if !snapshot.global_ws_connected {
+        return Ok(json!({
+            "ok": true,
+            "sent": false,
+            "reason": "websocket_not_connected",
+        }));
+    }
+
+    let closing_workspaces = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        let mut seen = HashSet::<String>::new();
+        let mut workspaces = Vec::<Value>::new();
+        for snapshot in [
+            snapshots.terminal_presence.as_ref(),
+            snapshots.workspace_mcps.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(items) = snapshot.get("workspaces").and_then(Value::as_array) else {
+                continue;
+            };
+            for workspace in items.iter().take(64) {
+                let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                    .unwrap_or_default();
+                let repo_id = cloud_mcp_payload_text(workspace, &["repo_id", "repoId"])
+                    .unwrap_or_default();
+                let key = format!("{workspace_id}::{repo_id}");
+                if workspace_id.is_empty() || repo_id.is_empty() || !seen.insert(key) {
+                    continue;
+                }
+                workspaces.push(json!({
+                    "workspace_id": workspace_id,
+                    "repo_id": repo_id,
+                    "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
+                    "workspace_active": workspace.get("workspace_active")
+                        .or_else(|| workspace.get("workspaceActive"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(false)),
+                }));
+            }
+        }
+        workspaces
+    };
+
+    let reason = reason.trim();
+    let payload = json!({
+        "source": "rust-diffforge-lifecycle",
+        "event_kind": "desktop_client_closing",
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": if reason.is_empty() { "app_shutdown" } else { reason },
+        "status": "closing",
+        "registered_workspace_count": snapshot.registered_workspace_count,
+        "global_ws_connected": snapshot.global_ws_connected,
+        "workspaces": closing_workspaces,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    timeout(
+        Duration::from_millis(900),
+        cloud_mcp_post_event_endpoint(&state, "desktop_client_closing", &payload),
+    )
+    .await
+    .map_err(|_| "Timed out sending desktop close signal to Cloud MCP.".to_string())?
 }
 
 #[tauri::command]

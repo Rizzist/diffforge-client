@@ -2172,6 +2172,8 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
 }
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
+    let _ = cloud_mcp_signal_desktop_closing(&app_for_shutdown, "app_shutdown").await;
+
     emit_app_shutdown_progress(
         &app_for_shutdown,
         "closing_webviews",
