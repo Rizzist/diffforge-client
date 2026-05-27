@@ -48,6 +48,7 @@ const AUTH_EXCHANGE_TIMEOUT_SECS: u64 = 10;
 const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
 const DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED: bool = false;
+const DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED: bool = true;
 const DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;
 const DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT: usize = 600;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
@@ -2626,6 +2627,7 @@ pub fn run() {
             validate_desktop_session,
             logout_desktop_session,
             record_desktop_signin_diagnostic,
+            record_desktop_connection_diagnostic,
             list_workspaces,
             create_workspace,
             update_workspace,

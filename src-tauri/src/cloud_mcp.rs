@@ -519,6 +519,60 @@ async fn cloud_mcp_record_signin_diagnostic(
     }
 }
 
+async fn cloud_mcp_record_connection_diagnostic_with_token(
+    desktop_session_token: String,
+    step: &str,
+    status: &str,
+    message: &str,
+    details: Value,
+) {
+    if !DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED
+        || validate_auth_value("Desktop session", &desktop_session_token).is_err()
+    {
+        return;
+    }
+
+    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS)) else {
+        return;
+    };
+    let payload = json!({
+        "flowId": "cloud-mcp-runtime",
+        "source": "rust-diffforge-cloud-mcp",
+        "channel": "rust-cloud-mcp",
+        "step": step,
+        "status": status,
+        "message": if message.trim().is_empty() { Value::Null } else { json!(message) },
+        "details": details,
+    });
+
+    let _ = client
+        .post(format!("{API_BASE_URL}/desktop/connection-diagnostics"))
+        .bearer_auth(desktop_session_token)
+        .json(&payload)
+        .send()
+        .await;
+}
+
+async fn cloud_mcp_record_connection_diagnostic(
+    state: &CloudMcpState,
+    step: &str,
+    status: &str,
+    message: &str,
+    details: Value,
+) {
+    let token = {
+        let auth = state.auth.lock().await;
+        auth.desktop_session_token.clone()
+    };
+
+    if let Some(token) = token {
+        cloud_mcp_record_connection_diagnostic_with_token(
+            token, step, status, message, details,
+        )
+        .await;
+    }
+}
+
 fn cloud_mcp_read_blocking_api_response(
     response: reqwest::blocking::Response,
     fallback_message: &str,
@@ -913,6 +967,19 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         json!({"ws_url": target.ws_url, "transport": target.transport}),
     )
     .await;
+    cloud_mcp_record_connection_diagnostic(
+        state,
+        "rust.cloud_mcp.websocket.open",
+        "start",
+        "opening Cloud MCP app websocket",
+        json!({
+            "ws_url": target.ws_url,
+            "transport": target.transport,
+            "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+            "hasDirectRouteHeader": target.route_token.is_some(),
+        }),
+    )
+    .await;
     let mut request = target
         .ws_url
         .as_str()
@@ -952,6 +1019,19 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
                 json!({"ws_url": target.ws_url, "transport": target.transport}),
             )
             .await;
+            cloud_mcp_record_connection_diagnostic(
+                state,
+                "rust.cloud_mcp.websocket.open",
+                "error",
+                &message,
+                json!({
+                    "ws_url": target.ws_url,
+                    "transport": target.transport,
+                    "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                    "hasDirectRouteHeader": target.route_token.is_some(),
+                }),
+            )
+            .await;
             return Err(message);
         }
     };
@@ -964,6 +1044,20 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
             "ws_url": target.ws_url,
             "transport": target.transport,
             "http_status": response.status().as_u16()
+        }),
+    )
+    .await;
+    cloud_mcp_record_connection_diagnostic(
+        state,
+        "rust.cloud_mcp.websocket.open",
+        "ok",
+        "Cloud MCP app websocket opened",
+        json!({
+            "ws_url": target.ws_url,
+            "transport": target.transport,
+            "http_status": response.status().as_u16(),
+            "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+            "hasDirectRouteHeader": target.route_token.is_some(),
         }),
     )
     .await;
@@ -1049,6 +1143,16 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 json!({}),
             )
             .await;
+            cloud_mcp_record_connection_diagnostic(
+                state,
+                "rust.cloud_mcp.websocket.ready",
+                "error",
+                "Cloud MCP app websocket ready message omitted message auth.",
+                json!({
+                    "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                }),
+            )
+            .await;
             return;
         };
         {
@@ -1070,6 +1174,18 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "ok",
             "Cloud MCP app websocket ready frame received",
             json!({"connection_id": connection_id.clone()}),
+        )
+        .await;
+        cloud_mcp_record_connection_diagnostic(
+            state,
+            "rust.cloud_mcp.websocket.ready",
+            "ok",
+            "Cloud MCP app websocket ready frame received",
+            json!({
+                "connection_id": connection_id.clone(),
+                "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                "helloClientId": CLOUD_MCP_RUST_CLIENT_ID,
+            }),
         )
         .await;
         let hello = json!({

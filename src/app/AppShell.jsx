@@ -472,6 +472,7 @@ const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
 const CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED = false;
+const CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED = true;
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
@@ -609,10 +610,44 @@ async function recordCloudSigninDiagnostic(token, event) {
   }
 }
 
+async function recordCloudConnectionDiagnostic(token, event) {
+  if (!CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED || !isSafeAuthValue(token)) {
+    return;
+  }
+
+  try {
+    await invoke("record_desktop_connection_diagnostic", {
+      token,
+      channel: event.channel || "rust-client",
+      details: safeDiagnosticDetails(event.details),
+      flowId: event.flowId || "desktop-cloud-runtime",
+      message: event.message || "",
+      repoId: event.repoId || event.repo_id || "",
+      source: event.source || "rust-diffforge-ui",
+      status: event.status || "ok",
+      step: event.step,
+      workspaceId: event.workspaceId || event.workspace_id || "",
+    });
+  } catch {
+    // Connection diagnostics must never block app runtime behavior.
+  }
+}
+
 async function syncCloudMcpDesktopSessionToken(token, options = {}) {
   try {
     const safeToken = isSafeAuthValue(token) ? token : null;
     const flowId = options.flowId || "desktop-cloud-connect";
+    await recordCloudConnectionDiagnostic(safeToken, {
+      channel: "rust-client-auth",
+      flowId,
+      step: "rust.cloud_mcp.desktop_token.set",
+      status: "start",
+      message: "Rust client is sending desktop session token to Cloud MCP runtime.",
+      details: {
+        hasToken: Boolean(safeToken),
+        requireConnected: Boolean(options.requireConnected),
+      },
+    });
     await recordCloudSigninDiagnostic(safeToken, {
       flowId,
       step: "cloud_mcp.desktop_token.set",
@@ -625,6 +660,14 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
     });
     const status = await invoke("cloud_mcp_set_desktop_session_token", {
       token: safeToken,
+    });
+    await recordCloudConnectionDiagnostic(safeToken, {
+      channel: "rust-client-auth",
+      flowId,
+      step: "rust.cloud_mcp.desktop_token.set",
+      status: "ok",
+      message: "Cloud MCP runtime accepted desktop session token.",
+      details: status,
     });
     await recordCloudSigninDiagnostic(safeToken, {
       flowId,
@@ -650,6 +693,14 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
       CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
       CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
     );
+    await recordCloudConnectionDiagnostic(safeToken, {
+      channel: "rust-client-auth",
+      flowId,
+      step: "rust.cloud_mcp.connect",
+      status: connectedStatus?.connected && connectedStatus?.globalWsConnected ? "ok" : "warn",
+      message: "Rust client Cloud MCP websocket connect command returned.",
+      details: connectedStatus,
+    });
     await recordCloudSigninDiagnostic(safeToken, {
       flowId,
       step: "cloud_mcp.connect.invoke",
@@ -665,6 +716,14 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
     return connectedStatus;
   } catch (error) {
     if (options.requireConnected) {
+      await recordCloudConnectionDiagnostic(token, {
+        channel: "rust-client-auth",
+        flowId: options.flowId || "desktop-cloud-connect",
+        step: "rust.cloud_mcp.connect",
+        status: "error",
+        message: getErrorMessage(error, "Cloud MCP connection failed."),
+        details: { requireConnected: true },
+      });
       await recordCloudSigninDiagnostic(token, {
         flowId: options.flowId || "desktop-cloud-connect",
         step: "cloud_mcp.connect.invoke",
@@ -8009,30 +8068,68 @@ export default function App() {
     }
 
     let disposed = false;
-    const syncPresence = (reason) => {
-      const syncKey = `${terminalPresenceSyncKey}:${reason}`;
-      if (reason === "terminal_presence_snapshot" && terminalPresenceSyncKeyRef.current === syncKey) {
-        return;
-      }
-      invoke("cloud_mcp_sync_terminal_presence", {
-        workspaces: terminalPresenceWorkspaces,
-        reason,
-      })
-        .then(() => {
-          if (!disposed) {
-            terminalPresenceSyncKeyRef.current = syncKey;
-          }
-        })
-        .catch((error) => {
-          if (!disposed) {
-            logBigViewSyncDiagnosticEvent("cloud_mcp.terminal_presence_sync.failed", {
+	    const syncPresence = (reason) => {
+	      const syncKey = `${terminalPresenceSyncKey}:${reason}`;
+	      if (reason === "terminal_presence_snapshot" && terminalPresenceSyncKeyRef.current === syncKey) {
+	        return;
+	      }
+	      const diagnosticToken = authStore.getToken();
+	      const terminalCount = terminalPresenceWorkspaces.reduce(
+	        (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
+	        0,
+	      );
+	      void recordCloudConnectionDiagnostic(diagnosticToken, {
+	        channel: "rust-client-sync",
+	        step: "rust.sync.terminal_presence",
+	        status: "start",
+	        message: "Rust client is syncing terminal presence to cloud.",
+	        details: {
+	          reason,
+	          terminalCount,
+	          workspaceCount: terminalPresenceWorkspaces.length,
+	        },
+	      });
+	      invoke("cloud_mcp_sync_terminal_presence", {
+	        workspaces: terminalPresenceWorkspaces,
+	        reason,
+	      })
+	        .then(() => {
+	          if (!disposed) {
+	            terminalPresenceSyncKeyRef.current = syncKey;
+	          }
+	          void recordCloudConnectionDiagnostic(diagnosticToken, {
+	            channel: "rust-client-sync",
+	            step: "rust.sync.terminal_presence",
+	            status: "ok",
+	            message: "Rust client terminal presence sync completed.",
+	            details: {
+	              reason,
+	              terminalCount,
+	              workspaceCount: terminalPresenceWorkspaces.length,
+	            },
+	          });
+	        })
+	        .catch((error) => {
+	          if (!disposed) {
+	            logBigViewSyncDiagnosticEvent("cloud_mcp.terminal_presence_sync.failed", {
               message: getErrorMessage(error, "Unable to sync terminal presence."),
               reason,
-              workspaceCount: terminalPresenceWorkspaces.length,
-            });
-          }
-        });
-    };
+	              workspaceCount: terminalPresenceWorkspaces.length,
+	            });
+	          }
+	          void recordCloudConnectionDiagnostic(diagnosticToken, {
+	            channel: "rust-client-sync",
+	            step: "rust.sync.terminal_presence",
+	            status: "error",
+	            message: getErrorMessage(error, "Unable to sync terminal presence."),
+	            details: {
+	              reason,
+	              terminalCount,
+	              workspaceCount: terminalPresenceWorkspaces.length,
+	            },
+	          });
+	        });
+	    };
 
     syncPresence("terminal_presence_snapshot");
     const intervalId = window.setInterval(
@@ -8059,13 +8156,24 @@ export default function App() {
     let disposed = false;
     const syncWorkspaceMcps = async (reason) => {
       const syncKey = `${workspaceMcpSyncTargetKey}:${reason}`;
-      if (reason === "workspace_mcp_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
-        return;
-      }
+	      if (reason === "workspace_mcp_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
+	        return;
+	      }
 
-      try {
-        const workspacesForCloud = await Promise.all(
-          workspaceMcpSyncTargets.map(async (target) => {
+	      const diagnosticToken = authStore.getToken();
+	      try {
+	        await recordCloudConnectionDiagnostic(diagnosticToken, {
+	          channel: "rust-client-sync",
+	          step: "rust.sync.workspace_mcps",
+	          status: "start",
+	          message: "Rust client is collecting workspace MCP settings for cloud sync.",
+	          details: {
+	            reason,
+	            workspaceCount: workspaceMcpSyncTargets.length,
+	          },
+	        });
+	        const workspacesForCloud = await Promise.all(
+	          workspaceMcpSyncTargets.map(async (target) => {
             const response = await invoke("coordination_workspace_mcp_registry", {
               repoPath: target.repoPath,
               workspaceId: target.workspaceId,
@@ -8074,23 +8182,47 @@ export default function App() {
             return sanitizeWorkspaceMcpRegistryForCloud(response, target);
           }),
         );
-        await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
-          workspaces: workspacesForCloud,
-          reason,
-        });
-        if (!disposed) {
-          workspaceMcpSyncKeyRef.current = syncKey;
-        }
+	        await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
+	          workspaces: workspacesForCloud,
+	          reason,
+	        });
+	        await recordCloudConnectionDiagnostic(diagnosticToken, {
+	          channel: "rust-client-sync",
+	          step: "rust.sync.workspace_mcps",
+	          status: "ok",
+	          message: "Rust client workspace MCP sync completed.",
+	          details: {
+	            reason,
+	            serverCount: workspacesForCloud.reduce(
+	              (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
+	              0,
+	            ),
+	            workspaceCount: workspacesForCloud.length,
+	          },
+	        });
+	        if (!disposed) {
+	          workspaceMcpSyncKeyRef.current = syncKey;
+	        }
       } catch (error) {
         if (!disposed) {
           logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_mcp_sync.failed", {
             message: getErrorMessage(error, "Unable to sync workspace MCP settings."),
             reason,
-            workspaceCount: workspaceMcpSyncTargets.length,
-          });
-        }
-      }
-    };
+	            workspaceCount: workspaceMcpSyncTargets.length,
+	          });
+	        }
+	        await recordCloudConnectionDiagnostic(diagnosticToken, {
+	          channel: "rust-client-sync",
+	          step: "rust.sync.workspace_mcps",
+	          status: "error",
+	          message: getErrorMessage(error, "Unable to sync workspace MCP settings."),
+	          details: {
+	            reason,
+	            workspaceCount: workspaceMcpSyncTargets.length,
+	          },
+	        });
+	      }
+	    };
 
     syncWorkspaceMcps("workspace_mcp_snapshot");
     const handleWorkspaceMcpRegistryUpdated = () => {
