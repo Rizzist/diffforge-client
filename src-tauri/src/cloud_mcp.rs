@@ -2611,6 +2611,17 @@ fn cloud_mcp_post_log_context(
 }
 
 fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
+    for key in path {
+        if let Some(value) = payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(value);
+        }
+    }
+
     let mut current = payload;
     for key in path {
         current = current.get(*key)?;
