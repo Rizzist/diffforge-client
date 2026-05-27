@@ -12182,50 +12182,68 @@ fn cloud_mcp_proxy_post_json_endpoint(
             cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "workspace_id"])
         });
     let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
-    let mut request = target
-        .ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
-    request.headers_mut().insert(
-        "x-diffforge-actor",
-        HeaderValue::from_str(client_id.trim())
-            .map_err(|error| format!("Invalid Cloud MCP actor header: {error}"))?,
-    );
-    request.headers_mut().insert(
-        "user-agent",
-        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
-    );
-    if let Some(workspace_id) = workspace_id.as_deref() {
+    let build_request = |target: &CloudMcpWsTarget| -> Result<
+        tokio_tungstenite::tungstenite::http::Request<()>,
+        String,
+    > {
+        let mut request = target
+            .ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
         request.headers_mut().insert(
-            "x-diffforge-workspace-id",
-            HeaderValue::from_str(workspace_id.trim())
-                .map_err(|error| format!("Invalid Cloud MCP workspace id header: {error}"))?,
+            "x-diffforge-actor",
+            HeaderValue::from_str(client_id.trim())
+                .map_err(|error| format!("Invalid Cloud MCP actor header: {error}"))?,
         );
-    }
-    if let Some(repo_id) = repo_id.as_deref() {
         request.headers_mut().insert(
-            "x-diffforge-repo-id",
-            HeaderValue::from_str(repo_id.trim())
-                .map_err(|error| format!("Invalid Cloud MCP repo id header: {error}"))?,
+            "user-agent",
+            HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
         );
-    }
-    if let Some(token) = cloud_mcp_process_authorization_bearer() {
-        request.headers_mut().insert(
-            "authorization",
-            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
-        );
-    }
-    if let Some(route_token) = target.route_token.as_deref() {
-        request.headers_mut().insert(
-            "x-diffforge-direct-route-token",
-            HeaderValue::from_str(route_token)
-                .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
-        );
-    }
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            request.headers_mut().insert(
+                "x-diffforge-workspace-id",
+                HeaderValue::from_str(workspace_id.trim())
+                    .map_err(|error| format!("Invalid Cloud MCP workspace id header: {error}"))?,
+            );
+        }
+        if let Some(repo_id) = repo_id.as_deref() {
+            request.headers_mut().insert(
+                "x-diffforge-repo-id",
+                HeaderValue::from_str(repo_id.trim())
+                    .map_err(|error| format!("Invalid Cloud MCP repo id header: {error}"))?,
+            );
+        }
+        if let Some(token) = cloud_mcp_process_authorization_bearer() {
+            request.headers_mut().insert(
+                "authorization",
+                cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+            );
+        }
+        if let Some(route_token) = target.route_token.as_deref() {
+            request.headers_mut().insert(
+                "x-diffforge-direct-route-token",
+                HeaderValue::from_str(route_token)
+                    .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
+            );
+        }
+        Ok(request)
+    };
 
-    let (mut websocket, _) = tokio_tungstenite::tungstenite::connect(request)
-        .map_err(|error| format!("Unable to open Cloud MCP websocket: {error}"))?;
+    let request = build_request(&target)?;
+    let (mut websocket, _) = match tokio_tungstenite::tungstenite::connect(request) {
+        Ok(result) => result,
+        Err(error) if target.route_token.is_some() => {
+            let fallback = cloud_mcp_fallback_ws_target(base_url, "/v1/app/ws");
+            let fallback_request = build_request(&fallback)?;
+            tokio_tungstenite::tungstenite::connect(fallback_request).map_err(|fallback_error| {
+                format!(
+                    "Unable to open Cloud MCP websocket via direct route ({error}); fallback via balancer also failed: {fallback_error}"
+                )
+            })?
+        }
+        Err(error) => return Err(format!("Unable to open Cloud MCP websocket: {error}")),
+    };
     let ready_text = cloud_mcp_proxy_read_blocking_ws_text(&mut websocket)?;
     let ready = serde_json::from_str::<Value>(&ready_text)
         .map_err(|error| format!("Cloud MCP websocket ready frame was invalid JSON: {error}"))?;
