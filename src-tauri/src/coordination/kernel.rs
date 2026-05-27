@@ -20862,14 +20862,75 @@ fn prepare_managed_codex_home_for_terminal(
     Ok(Some(process_path_text(&target_home)))
 }
 
-fn codex_source_home_for_managed_home(target_home: &Path) -> Option<PathBuf> {
-    let candidate = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    if same_path(&candidate, target_home) {
-        return env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"));
+fn push_codex_home_candidate(
+    candidates: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    candidate: Option<PathBuf>,
+) {
+    let Some(candidate) = candidate.filter(|path| !path.as_os_str().is_empty()) else {
+        return;
+    };
+    let key = candidate
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if !key.is_empty() && seen.insert(key) {
+        candidates.push(candidate);
     }
-    Some(candidate)
+}
+
+fn codex_home_candidates_from_values(
+    codex_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_codex_home_candidate(&mut candidates, &mut seen, codex_home);
+    push_codex_home_candidate(&mut candidates, &mut seen, home.map(|home| home.join(".codex")));
+    push_codex_home_candidate(
+        &mut candidates,
+        &mut seen,
+        user_profile.map(|home| home.join(".codex")),
+    );
+
+    candidates
+}
+
+fn codex_source_home_candidates() -> Vec<PathBuf> {
+    codex_home_candidates_from_values(
+        env::var_os("CODEX_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+    )
+}
+
+fn codex_source_home_from_candidates(
+    target_home: &Path,
+    candidates: Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let mut fallback = None;
+
+    for candidate in candidates {
+        if same_path(&candidate, target_home) {
+            continue;
+        }
+        if candidate.is_dir()
+            || candidate.join("auth.json").is_file()
+            || candidate.join("config.toml").is_file()
+        {
+            return Some(candidate);
+        }
+        fallback.get_or_insert(candidate);
+    }
+
+    fallback
+}
+
+fn codex_source_home_for_managed_home(target_home: &Path) -> Option<PathBuf> {
+    codex_source_home_from_candidates(target_home, codex_source_home_candidates())
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -23132,6 +23193,36 @@ enabled = true
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",
             toml_escape(&process_path_text(&worktree))
         )));
+    }
+
+    #[test]
+    fn codex_home_candidates_include_windows_user_profile() {
+        let user_profile = PathBuf::from("C:/Users/DiffForge");
+        let candidates = codex_home_candidates_from_values(None, None, Some(user_profile.clone()));
+
+        assert_eq!(candidates, vec![user_profile.join(".codex")]);
+    }
+
+    #[test]
+    fn managed_codex_home_source_skips_missing_candidate_for_real_user_home() {
+        let repo = temp_repo("managed_codex_home_source_fallback");
+        let target = repo
+            .join(".agents")
+            .join("codex-home")
+            .join("coordinated")
+            .join("1");
+        let missing_codex_home = repo.join("missing-codex-home");
+        let user_codex_home = repo.join("user").join(".codex");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&user_codex_home).unwrap();
+        fs::write(user_codex_home.join("auth.json"), "{}\n").unwrap();
+
+        let selected = codex_source_home_from_candidates(
+            &target,
+            vec![missing_codex_home, user_codex_home.clone()],
+        );
+
+        assert_eq!(selected, Some(user_codex_home));
     }
 
     #[test]
