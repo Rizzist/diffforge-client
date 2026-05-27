@@ -2642,6 +2642,159 @@ fn cloud_mcp_payload_bool(payload: &Value, path: &[&str], fallback: bool) -> boo
     fallback
 }
 
+fn cloud_mcp_payload_usize(payload: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter().find_map(|key| {
+        payload.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<usize>().ok())
+                })
+        })
+    })
+}
+
+fn cloud_mcp_payload_items(payload: &Value, keys: &[&str], limit: usize) -> Vec<Value> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(items) = value.as_array() {
+            return items.iter().take(limit).cloned().collect();
+        }
+        if let Some(object) = value.as_object() {
+            let items = object.values().take(limit).cloned().collect::<Vec<_>>();
+            if !items.is_empty() {
+                return items;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
+    let items = cloud_mcp_payload_items(
+        workspace,
+        &[
+            "terminals",
+            "terminal_statuses",
+            "terminalStatuses",
+            "terminal_agents",
+            "terminalAgents",
+            "terminal_presence",
+            "terminalPresence",
+            "terminal_panes",
+            "terminalPanes",
+            "panes",
+            "agents",
+        ],
+        64,
+    );
+    if !items.is_empty() {
+        return items;
+    }
+
+    let indexes = workspace
+        .get("logicalTerminalIndexes")
+        .or_else(|| workspace.get("logical_terminal_indexes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_i64)
+                .take(64)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| {
+            let count = cloud_mcp_payload_usize(
+                workspace,
+                &[
+                    "logicalTerminalCount",
+                    "logical_terminal_count",
+                    "terminalCount",
+                    "terminal_count",
+                    "activeTerminalCount",
+                    "active_terminal_count",
+                ],
+            )
+            .unwrap_or(0)
+            .min(64);
+            (0..count).map(|index| index as i64).collect::<Vec<_>>()
+        });
+    if indexes.is_empty() {
+        return Vec::new();
+    }
+
+    let roles = workspace
+        .get("terminalRolesByIndex")
+        .or_else(|| workspace.get("terminal_roles_by_index"))
+        .and_then(Value::as_object);
+    let agents = workspace
+        .get("terminalAgentsByIndex")
+        .or_else(|| workspace.get("terminal_agents_by_index"))
+        .and_then(Value::as_object);
+
+    indexes
+        .into_iter()
+        .map(|index| {
+            let key = index.to_string();
+            let role = roles
+                .and_then(|roles| roles.get(&key))
+                .and_then(Value::as_str)
+                .unwrap_or("terminal");
+            let agent = agents.and_then(|agents| agents.get(&key));
+            json!({
+                "agent_kind": agent
+                    .and_then(|agent| cloud_mcp_payload_text(agent, &["agent_kind", "agentKind", "id", "agent_id", "agentId"]))
+                    .unwrap_or_else(|| role.to_string()),
+                "agent_label": agent
+                    .and_then(|agent| cloud_mcp_payload_text(agent, &["agent_label", "agentLabel", "label", "name"]))
+                    .unwrap_or_else(|| role.to_string()),
+                "status": "no_session",
+                "session_state": "no_session",
+                "terminal_index": index,
+            })
+        })
+        .collect()
+}
+
+fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
+    let direct = cloud_mcp_payload_items(
+        workspace,
+        &[
+            "servers",
+            "mcp_servers",
+            "mcpServers",
+            "workspace_servers",
+            "workspaceServers",
+            "installed_servers",
+            "installedServers",
+            "registry_servers",
+            "registryServers",
+            "items",
+            "entries",
+            "mcps",
+        ],
+        128,
+    );
+    if !direct.is_empty() {
+        return direct;
+    }
+    for key in ["registry", "data", "payload"] {
+        if let Some(nested) = workspace.get(key) {
+            let nested_items = cloud_mcp_workspace_server_items(nested);
+            if !nested_items.is_empty() {
+                return nested_items;
+            }
+        }
+    }
+    Vec::new()
+}
+
 async fn cloud_mcp_register_prepared_workspace(
     state: &CloudMcpState,
     prepared: CloudMcpPreparedWorkspace,
@@ -5201,7 +5354,17 @@ async fn cloud_mcp_sync_terminal_presence(
     for workspace in workspace_items.iter().take(64) {
         let repo_path = cloud_mcp_payload_text(
             workspace,
-            &["repo_path", "repoPath", "workspace_root", "workspaceRoot"],
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "workspace_root_directory",
+                "workspaceRootDirectory",
+                "workingDirectory",
+                "rootDirectory",
+                "terminalWorkspaceWorkingDirectory",
+            ],
         )
         .unwrap_or_default();
         if repo_path.trim().is_empty() {
@@ -5233,11 +5396,7 @@ async fn cloud_mcp_sync_terminal_presence(
             workspace_id.clone(),
             workspace_name.clone(),
         );
-        let terminal_items = workspace
-            .get("terminals")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().take(64).cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let terminal_items = cloud_mcp_workspace_terminal_items(workspace);
         let terminals = terminal_items
             .iter()
             .enumerate()
@@ -5284,7 +5443,7 @@ async fn cloud_mcp_sync_terminal_presence(
                     "terminal_id": cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId", "pane_id", "paneId"]),
                     "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
                     "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
-                    "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "slot"]),
+                    "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
                 })
             })
             .collect::<Vec<_>>();
@@ -5353,7 +5512,17 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
     for workspace in workspace_items.iter().take(64) {
         let repo_path = cloud_mcp_payload_text(
             workspace,
-            &["repo_path", "repoPath", "workspace_root", "workspaceRoot"],
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "workspace_root_directory",
+                "workspaceRootDirectory",
+                "workingDirectory",
+                "rootDirectory",
+                "terminalWorkspaceWorkingDirectory",
+            ],
         )
         .unwrap_or_default();
         if repo_path.trim().is_empty() {
@@ -5385,11 +5554,7 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             workspace_id.clone(),
             workspace_name.clone(),
         );
-        let server_items = workspace
-            .get("servers")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().take(128).cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let server_items = cloud_mcp_workspace_server_items(workspace);
         let servers = server_items
             .iter()
             .enumerate()
