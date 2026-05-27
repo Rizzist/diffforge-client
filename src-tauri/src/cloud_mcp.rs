@@ -87,6 +87,13 @@ struct CloudMcpRuntime {
 }
 
 #[derive(Clone)]
+struct CloudMcpWsTarget {
+    ws_url: String,
+    route_token: Option<String>,
+    transport: String,
+}
+
+#[derive(Clone)]
 struct CloudMcpTerminalContextState {
     last_prompt: String,
     repo_id: String,
@@ -862,7 +869,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             let runtime = state.inner.lock().await;
             runtime.base_url.clone()
         };
-        let ws_url = cloud_mcp_app_ws_url(&base_url);
+        let target = cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await;
         {
             let mut runtime = state.inner.lock().await;
             runtime.global_ws_connected = false;
@@ -874,7 +881,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             };
         }
 
-        match cloud_mcp_open_global_ws(&state, &ws_url).await {
+        match cloud_mcp_open_global_ws(&state, &target).await {
             Ok(()) => {}
             Err(error) => {
                 {
@@ -897,16 +904,18 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
     }
 }
 
-async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result<(), String> {
+async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarget) -> Result<(), String> {
     cloud_mcp_record_signin_diagnostic(
         state,
         "websocket.open",
         "start",
         "opening Cloud MCP app websocket",
-        json!({"ws_url": ws_url}),
+        json!({"ws_url": target.ws_url, "transport": target.transport}),
     )
     .await;
-    let mut request = ws_url
+    let mut request = target
+        .ws_url
+        .as_str()
         .into_client_request()
         .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
     request.headers_mut().insert(
@@ -923,6 +932,13 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
             cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
         );
     }
+    if let Some(route_token) = target.route_token.as_deref() {
+        request.headers_mut().insert(
+            "x-diffforge-direct-route-token",
+            HeaderValue::from_str(route_token)
+                .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
+        );
+    }
 
     let (stream, response) = match connect_async(request).await {
         Ok(result) => result,
@@ -933,7 +949,7 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
                 "websocket.open",
                 "error",
                 &message,
-                json!({"ws_url": ws_url}),
+                json!({"ws_url": target.ws_url, "transport": target.transport}),
             )
             .await;
             return Err(message);
@@ -944,7 +960,11 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, ws_url: &str) -> Result
         "websocket.open",
         "ok",
         "Cloud MCP app websocket opened",
-        json!({"ws_url": ws_url, "http_status": response.status().as_u16()}),
+        json!({
+            "ws_url": target.ws_url,
+            "transport": target.transport,
+            "http_status": response.status().as_u16()
+        }),
     )
     .await;
     let (mut write, mut read) = stream.split();
@@ -1119,6 +1139,145 @@ fn cloud_mcp_app_ws_url(base_url: &str) -> String {
         format!("ws://{base}")
     };
     format!("{ws_base}/v1/app/ws")
+}
+
+async fn cloud_mcp_resolve_ws_target(
+    state: &CloudMcpState,
+    base_url: &str,
+    endpoint_path: &str,
+) -> CloudMcpWsTarget {
+    let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
+    let bearer = match cloud_mcp_authorization_bearer(state).await {
+        Ok(token) => token,
+        Err(error) => {
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "route.resolve",
+                "error",
+                &format!("Unable to prepare Cloud MCP route auth: {error}"),
+                json!({"transport": "balancer_fallback"}),
+            )
+            .await;
+            return fallback;
+        }
+    };
+    let Some(bearer) = bearer else {
+        return fallback;
+    };
+
+    match cloud_mcp_fetch_direct_route_async(base_url, endpoint_path, &bearer).await {
+        Ok(Some(target)) => {
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "route.resolve",
+                "ok",
+                "Cloud MCP direct route resolved",
+                json!({"transport": target.transport, "ws_url": target.ws_url}),
+            )
+            .await;
+            target
+        }
+        Ok(None) => fallback,
+        Err(error) => {
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "route.resolve",
+                "error",
+                &format!("Cloud MCP direct route unavailable: {error}"),
+                json!({"transport": "balancer_fallback"}),
+            )
+            .await;
+            fallback
+        }
+    }
+}
+
+async fn cloud_mcp_fetch_direct_route_async(
+    base_url: &str,
+    endpoint_path: &str,
+    bearer: &str,
+) -> Result<Option<CloudMcpWsTarget>, String> {
+    let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let body = json!({"requestedPath": endpoint_path});
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
+        .post(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;
+    let status = response.status();
+    let parsed = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Cloud MCP route response was invalid JSON: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Cloud MCP route request returned {}: {}",
+            status.as_u16(),
+            parsed
+                .get("message")
+                .or_else(|| parsed.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("route rejected")
+        ));
+    }
+    Ok(cloud_mcp_direct_target_from_route(&parsed, endpoint_path))
+}
+
+fn cloud_mcp_direct_target_from_route(
+    route: &Value,
+    endpoint_path: &str,
+) -> Option<CloudMcpWsTarget> {
+    let direct = route.get("direct")?;
+    if direct.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let route_token = direct
+        .get("route_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let field = if endpoint_path == "/v1/voice-agent/ws" {
+        "voice_websocket_url"
+    } else {
+        "app_websocket_url"
+    };
+    let ws_url = direct
+        .get(field)
+        .and_then(Value::as_str)
+        .or_else(|| direct.get("app_websocket_url").and_then(Value::as_str))?
+        .trim()
+        .to_string();
+    if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
+        return None;
+    }
+    Some(CloudMcpWsTarget {
+        ws_url,
+        route_token: Some(route_token),
+        transport: direct
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("direct_cloud_container")
+            .to_string(),
+    })
+}
+
+fn cloud_mcp_fallback_ws_target(base_url: &str, endpoint_path: &str) -> CloudMcpWsTarget {
+    let ws_url = if endpoint_path == "/v1/app/ws" {
+        cloud_mcp_app_ws_url(base_url)
+    } else {
+        cloud_mcp_proxy_websocket_url(base_url, endpoint_path)
+            .unwrap_or_else(|_| cloud_mcp_app_ws_url(base_url))
+    };
+    CloudMcpWsTarget {
+        ws_url,
+        route_token: None,
+        transport: "balancer_proxy".to_string(),
+    }
 }
 
 async fn cloud_mcp_fail_pending_ws_requests(state: &CloudMcpState, error: &str) {
@@ -11213,8 +11372,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .or_else(|| {
             cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "workspace_id"])
         });
-    let ws_url = cloud_mcp_proxy_websocket_url(base_url, "/v1/app/ws")?;
-    let mut request = ws_url
+    let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
+    let mut request = target
+        .ws_url
+        .as_str()
         .into_client_request()
         .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
     request.headers_mut().insert(
@@ -11244,6 +11405,13 @@ fn cloud_mcp_proxy_post_json_endpoint(
         request.headers_mut().insert(
             "authorization",
             cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+        );
+    }
+    if let Some(route_token) = target.route_token.as_deref() {
+        request.headers_mut().insert(
+            "x-diffforge-direct-route-token",
+            HeaderValue::from_str(route_token)
+                .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
         );
     }
 
@@ -11323,6 +11491,44 @@ fn cloud_mcp_proxy_websocket_url(base_url: &str, endpoint_path: &str) -> Result<
         websocket_base.trim_end_matches('/'),
         endpoint_path.trim_start_matches('/')
     ))
+}
+
+fn cloud_mcp_proxy_resolve_blocking_target(base_url: &str, endpoint_path: &str) -> CloudMcpWsTarget {
+    let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
+    let Some(bearer) = cloud_mcp_process_authorization_bearer() else {
+        return fallback;
+    };
+    match cloud_mcp_fetch_direct_route_blocking(base_url, endpoint_path, &bearer) {
+        Ok(Some(target)) => target,
+        _ => fallback,
+    }
+}
+
+fn cloud_mcp_fetch_direct_route_blocking(
+    base_url: &str,
+    endpoint_path: &str,
+    bearer: &str,
+) -> Result<Option<CloudMcpWsTarget>, String> {
+    let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let body = json!({"requestedPath": endpoint_path});
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
+        .post(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;
+    let status = response.status();
+    let parsed = response
+        .json::<Value>()
+        .map_err(|error| format!("Cloud MCP route response was invalid JSON: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Cloud MCP route request returned {}", status.as_u16()));
+    }
+    Ok(cloud_mcp_direct_target_from_route(&parsed, endpoint_path))
 }
 
 fn cloud_mcp_proxy_read_blocking_ws_text<S>(
