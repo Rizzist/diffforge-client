@@ -3395,6 +3395,63 @@ fn cloud_voice_agent_event_kind(payload: &Value) -> &str {
         .unwrap_or_default()
 }
 
+fn cloud_voice_agent_payload_from_ws_message(message: &Message) -> Option<Value> {
+    match message {
+        Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).ok(),
+        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+        _ => None,
+    }
+}
+
+fn cloud_voice_agent_error_message(payload: &Value) -> Option<String> {
+    if cloud_voice_agent_event_kind(payload) != "voice_agent_error" {
+        return None;
+    }
+    payload
+        .pointer("/error/message")
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn cloud_voice_agent_pending_error_message<R>(read: &mut R) -> Option<String>
+where
+    R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match timeout(Duration::from_millis(75), read.next()).await {
+        Ok(Some(Ok(message))) => {
+            if let Some(payload) = cloud_voice_agent_payload_from_ws_message(&message) {
+                if let Some(error) = cloud_voice_agent_error_message(&payload) {
+                    return Some(format!("Cloud voice agent returned an error: {error}"));
+                }
+                if cloud_voice_agent_event_kind(&payload) == "voice_agent_finished" {
+                    return Some(
+                        "Cloud voice agent finished before accepting more audio.".to_string(),
+                    );
+                }
+            }
+            match message {
+                Message::Close(frame) => {
+                    let reason = frame
+                        .as_ref()
+                        .map(|frame| frame.reason.trim().to_string())
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or_else(|| "connection closed".to_string());
+                    Some(format!("Cloud voice agent closed the websocket: {reason}"))
+                }
+                _ => None,
+            }
+        }
+        Ok(Some(Err(error))) => Some(format!("Cloud voice agent stream failed: {error}")),
+        Ok(None) => Some("Cloud voice agent closed before accepting more audio.".to_string()),
+        Err(_) => None,
+    }
+}
+
 fn cloud_voice_agent_event_completes_request(payload: &Value) -> bool {
     matches!(
         cloud_voice_agent_event_kind(payload),
@@ -3450,6 +3507,7 @@ async fn run_cloud_voice_agent_stream(
     ready_tx: oneshot::Sender<Result<(), String>>,
     finished_tx: oneshot::Sender<Result<(), String>>,
 ) {
+    let mut ready_tx = Some(ready_tx);
     let mut opened_target = ws_target.clone();
     let request = match cloud_voice_agent_ws_request(
         &opened_target,
@@ -3459,7 +3517,9 @@ async fn run_cloud_voice_agent_stream(
     ) {
         Ok(request) => request,
         Err(error) => {
-            let _ = ready_tx.send(Err(error.clone()));
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(error.clone()));
+            }
             let _ = finished_tx.send(Err(error));
             return;
         }
@@ -3480,7 +3540,9 @@ async fn run_cloud_voice_agent_stream(
                 Err(error) => {
                     let message =
                         format!("Unable to prepare cloud voice agent balancer fallback: {error}");
-                    let _ = ready_tx.send(Err(message.clone()));
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(message.clone()));
+                    }
                     let _ = finished_tx.send(Err(message));
                     return;
                 }
@@ -3494,7 +3556,9 @@ async fn run_cloud_voice_agent_stream(
                     let message = format!(
                         "Unable to open cloud voice agent WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
                     );
-                    let _ = ready_tx.send(Err(message.clone()));
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(message.clone()));
+                    }
                     let _ = finished_tx.send(Err(message));
                     return;
                 }
@@ -3502,7 +3566,9 @@ async fn run_cloud_voice_agent_stream(
         }
         Err(error) => {
             let message = format!("Unable to open cloud voice agent WebSocket: {error}");
-            let _ = ready_tx.send(Err(message.clone()));
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(message.clone()));
+            }
             let _ = finished_tx.send(Err(message));
             return;
         }
@@ -3513,11 +3579,94 @@ async fn run_cloud_voice_agent_stream(
         .await
     {
         let message = format!("Unable to start cloud voice agent stream: {error}");
-        let _ = ready_tx.send(Err(message.clone()));
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(message.clone()));
+        }
         let _ = finished_tx.send(Err(message));
         return;
     }
-    let _ = ready_tx.send(Ok(()));
+
+    let start_deadline = sleep(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS));
+    tokio::pin!(start_deadline);
+    loop {
+        tokio::select! {
+            maybe_message = read.next() => {
+                match maybe_message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Err(error) = write.send(Message::Pong(payload)).await {
+                            let message = format!("Unable to answer cloud voice agent ping before stream start: {error}");
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(message.clone()));
+                            }
+                            let _ = finished_tx.send(Err(message));
+                            return;
+                        }
+                    }
+                    Some(Ok(message)) => {
+                        if let Some(payload) = cloud_voice_agent_payload_from_ws_message(&message) {
+                            let kind = cloud_voice_agent_event_kind(&payload).to_string();
+                            emit_cloud_voice_agent_event(&app, payload.clone());
+                            if let Some(error) = cloud_voice_agent_error_message(&payload) {
+                                let message = format!("Cloud voice agent could not start audio stream: {error}");
+                                if let Some(ready_tx) = ready_tx.take() {
+                                    let _ = ready_tx.send(Err(message.clone()));
+                                }
+                                let _ = finished_tx.send(Err(message));
+                                return;
+                            }
+                            if kind == "voice_agent_stream_started" {
+                                if let Some(ready_tx) = ready_tx.take() {
+                                    let _ = ready_tx.send(Ok(()));
+                                }
+                                break;
+                            }
+                        } else if matches!(message, Message::Close(_)) {
+                            let message = "Cloud voice agent closed before the audio stream started.".to_string();
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(message.clone()));
+                            }
+                            let _ = finished_tx.send(Err(message));
+                            return;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let message = format!("Cloud voice agent stream failed before it started: {error}");
+                        if let Some(ready_tx) = ready_tx.take() {
+                            let _ = ready_tx.send(Err(message.clone()));
+                        }
+                        let _ = finished_tx.send(Err(message));
+                        return;
+                    }
+                    None => {
+                        let message = "Cloud voice agent websocket closed before the audio stream started.".to_string();
+                        if let Some(ready_tx) = ready_tx.take() {
+                            let _ = ready_tx.send(Err(message.clone()));
+                        }
+                        let _ = finished_tx.send(Err(message));
+                        return;
+                    }
+                }
+            }
+            maybe_control = control_rx.recv() => {
+                if matches!(maybe_control, Some(CloudVoiceAgentControl::Stop) | None) {
+                    let message = "Cloud voice agent stream was stopped before it started.".to_string();
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(message.clone()));
+                    }
+                    let _ = finished_tx.send(Ok(()));
+                    return;
+                }
+            }
+            _ = &mut start_deadline => {
+                let message = "Cloud voice agent timed out while starting the audio stream.".to_string();
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(message.clone()));
+                }
+                let _ = finished_tx.send(Err(message));
+                return;
+            }
+        }
+    }
 
     log_audio_diagnostic_event(
         "audio.cloud_voice.start.done",
@@ -3631,7 +3780,15 @@ async fn run_cloud_voice_agent_stream(
                     }
                     tts_suppression_until = None;
                     if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
-                        stream_error = Some(format!("Unable to stream audio to cloud voice agent: {error}"));
+                        stream_error = Some(
+                            cloud_voice_agent_pending_error_message(&mut read)
+                                .await
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "Unable to stream audio to cloud voice agent: {error}"
+                                    )
+                                }),
+                        );
                         break;
                     }
                 }
