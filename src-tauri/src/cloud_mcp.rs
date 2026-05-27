@@ -2459,11 +2459,15 @@ async fn cloud_mcp_post_event_endpoint(
             }
         }
     }
+    let primary_workspace_id = (workspace_ids.len() == 1).then(|| workspace_ids[0].clone());
+    let primary_repo_id = (repo_ids.len() == 1).then(|| repo_ids[0].clone());
     let envelope = json!({
         "event_kind": event_kind,
         "payload": payload,
+        "repo_id": primary_repo_id,
         "repo_ids": repo_ids,
         "ts_ms": cloud_mcp_now_ms(),
+        "workspace_id": primary_workspace_id,
         "workspace_ids": workspace_ids,
     });
     cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
