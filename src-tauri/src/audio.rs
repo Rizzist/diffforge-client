@@ -3425,10 +3425,6 @@ async fn run_cloud_voice_agent_stream(
         }
     };
     request.headers_mut().insert(
-        "x-diffforge-client-id",
-        HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
-    );
-    request.headers_mut().insert(
         "x-diffforge-actor",
         HeaderValue::from_static("orchestrator-voice"),
     );
@@ -3888,10 +3884,6 @@ async fn run_cloud_voice_agent_text_message(
             return;
         }
     };
-    request.headers_mut().insert(
-        "x-diffforge-client-id",
-        HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
-    );
     request.headers_mut().insert(
         "x-diffforge-actor",
         HeaderValue::from_static("orchestrator-voice"),

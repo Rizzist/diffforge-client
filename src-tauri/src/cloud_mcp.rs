@@ -11599,9 +11599,9 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .into_client_request()
         .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
     request.headers_mut().insert(
-        "x-diffforge-client-id",
+        "x-diffforge-actor",
         HeaderValue::from_str(client_id.trim())
-            .map_err(|error| format!("Invalid Cloud MCP client id header: {error}"))?,
+            .map_err(|error| format!("Invalid Cloud MCP actor header: {error}"))?,
     );
     request.headers_mut().insert(
         "user-agent",
