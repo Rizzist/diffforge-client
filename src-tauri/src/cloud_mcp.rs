@@ -33,6 +33,7 @@ const CLOUD_MCP_KNOWLEDGE_MAX_NOTE_BYTES: u64 = 384 * 1024;
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
     auth: Arc<Mutex<CloudMcpAuthRuntime>>,
+    runtime_snapshots: Arc<Mutex<CloudMcpRuntimeSnapshots>>,
     spec_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpSpecGraphSyncRuntime>>>,
     spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
     knowledge_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpKnowledgeGraphSyncRuntime>>>,
@@ -54,6 +55,12 @@ struct CloudMcpProcessAuthCache {
     desktop_session_token: Option<String>,
     appwrite_jwt: Option<String>,
     appwrite_jwt_expires_ms: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+struct CloudMcpRuntimeSnapshots {
+    terminal_presence: Option<Value>,
+    workspace_mcps: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -259,6 +266,7 @@ impl CloudMcpState {
                 terminal_contexts: HashMap::new(),
             })),
             auth: Arc::new(Mutex::new(CloudMcpAuthRuntime::default())),
+            runtime_snapshots: Arc::new(Mutex::new(CloudMcpRuntimeSnapshots::default())),
             spec_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
             spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
             knowledge_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
@@ -975,7 +983,8 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         json!({
             "ws_url": target.ws_url,
             "transport": target.transport,
-            "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+            "clientIdentity": "appwrite_account",
+            "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
             "hasDirectRouteHeader": target.route_token.is_some(),
         }),
     )
@@ -986,7 +995,7 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         .into_client_request()
         .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
     request.headers_mut().insert(
-        "x-diffforge-client-id",
+        "x-diffforge-actor",
         HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
     );
     request.headers_mut().insert(
@@ -1027,7 +1036,8 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
                 json!({
                     "ws_url": target.ws_url,
                     "transport": target.transport,
-                    "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                    "clientIdentity": "appwrite_account",
+                    "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
                     "hasDirectRouteHeader": target.route_token.is_some(),
                 }),
             )
@@ -1056,7 +1066,8 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
             "ws_url": target.ws_url,
             "transport": target.transport,
             "http_status": response.status().as_u16(),
-            "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+            "clientIdentity": "appwrite_account",
+            "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
             "hasDirectRouteHeader": target.route_token.is_some(),
         }),
     )
@@ -1149,7 +1160,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 "error",
                 "Cloud MCP app websocket ready message omitted message auth.",
                 json!({
-                    "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                    "clientIdentity": "appwrite_account",
+                    "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
                 }),
             )
             .await;
@@ -1183,7 +1195,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "Cloud MCP app websocket ready frame received",
             json!({
                 "connection_id": connection_id.clone(),
-                "clientIdHeader": CLOUD_MCP_RUST_CLIENT_ID,
+                "clientIdentity": "appwrite_account",
                 "helloClientId": CLOUD_MCP_RUST_CLIENT_ID,
             }),
         )
@@ -1195,14 +1207,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "source": "rust-diffforge",
             "contract": "diffforge.app_ws.v1",
             "auth": {
-                "connection_id": connection_id,
-                "message_token": message_token,
+                "connection_id": connection_id.clone(),
+                "message_token": message_token.clone(),
             },
             "workspaces": cloud_mcp_registered_workspace_subscriptions(state).await,
         });
         if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
             let _ = tx.send(hello);
         }
+        cloud_mcp_replay_runtime_snapshots(state, &connection_id, &message_token).await;
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -1321,7 +1334,7 @@ async fn cloud_mcp_fetch_direct_route_async(
         .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
-        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
+        .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .json(&body)
         .send()
         .await
@@ -1394,6 +1407,62 @@ fn cloud_mcp_fallback_ws_target(base_url: &str, endpoint_path: &str) -> CloudMcp
         route_token: None,
         transport: "balancer_proxy".to_string(),
     }
+}
+
+async fn cloud_mcp_replay_runtime_snapshots(
+    state: &CloudMcpState,
+    connection_id: &str,
+    message_token: &str,
+) {
+    let snapshots = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots.clone()
+    };
+    let mut replay_items = Vec::new();
+    if let Some(payload) = snapshots.terminal_presence {
+        replay_items.push(("terminal_presence_snapshot", payload));
+    }
+    if let Some(payload) = snapshots.workspace_mcps {
+        replay_items.push(("workspace_mcp_snapshot", payload));
+    }
+    if replay_items.is_empty() {
+        return;
+    }
+
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return;
+    };
+    let replay_count = replay_items.len();
+    for (event_kind, payload) in replay_items {
+        let request = cloud_mcp_event_envelope(event_kind, &payload);
+        let envelope = json!({
+            "kind": "event",
+            "id": format!("runtime-replay-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+            "contract": "diffforge.app_ws.v1",
+            "auth": {
+                "connection_id": connection_id,
+                "message_token": message_token,
+            },
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
+                .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
+            "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
+                .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
+            "request": request,
+        });
+        let _ = tx.send(envelope);
+    }
+
+    cloud_mcp_record_connection_diagnostic(
+        state,
+        "rust.cloud_mcp.runtime_snapshot.replay",
+        "ok",
+        "Rust client replayed cached runtime snapshots after websocket reconnect.",
+        json!({
+            "snapshotCount": replay_count,
+        }),
+    )
+    .await;
 }
 
 async fn cloud_mcp_fail_pending_ws_requests(state: &CloudMcpState, error: &str) {
@@ -2441,6 +2510,11 @@ async fn cloud_mcp_post_event_endpoint(
     event_kind: &str,
     payload: &Value,
 ) -> Result<Value, String> {
+    let envelope = cloud_mcp_event_envelope(event_kind, payload);
+    cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
+}
+
+fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
     let mut workspace_ids = Vec::new();
     let mut repo_ids = Vec::new();
     if let Some(workspaces) = payload.get("workspaces").and_then(Value::as_array) {
@@ -2461,7 +2535,7 @@ async fn cloud_mcp_post_event_endpoint(
     }
     let primary_workspace_id = (workspace_ids.len() == 1).then(|| workspace_ids[0].clone());
     let primary_repo_id = (repo_ids.len() == 1).then(|| repo_ids[0].clone());
-    let envelope = json!({
+    json!({
         "event_kind": event_kind,
         "payload": payload,
         "repo_id": primary_repo_id,
@@ -2469,8 +2543,7 @@ async fn cloud_mcp_post_event_endpoint(
         "ts_ms": cloud_mcp_now_ms(),
         "workspace_id": primary_workspace_id,
         "workspace_ids": workspace_ids,
-    });
-    cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
+    })
 }
 
 fn cloud_mcp_post_log_context(
@@ -5181,6 +5254,11 @@ async fn cloud_mcp_sync_terminal_presence(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
+    {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        snapshots.terminal_presence = Some(payload.clone());
+    }
+
     cloud_mcp_post_event_endpoint(state.inner(), "terminal_presence_snapshot", &payload).await
 }
 
@@ -5284,6 +5362,11 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         "summary": "Desktop workspace MCP settings synced without secret values.",
         "ts_ms": cloud_mcp_now_ms(),
     });
+
+    {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        snapshots.workspace_mcps = Some(payload.clone());
+    }
 
     cloud_mcp_post_event_endpoint(state.inner(), "workspace_mcp_snapshot", &payload).await
 }
@@ -11654,7 +11737,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
-        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
+        .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .json(&body)
         .send()
         .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;
