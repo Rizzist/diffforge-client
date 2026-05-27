@@ -20889,7 +20889,11 @@ fn codex_home_candidates_from_values(
     let mut seen = HashSet::new();
 
     push_codex_home_candidate(&mut candidates, &mut seen, codex_home);
-    push_codex_home_candidate(&mut candidates, &mut seen, home.map(|home| home.join(".codex")));
+    push_codex_home_candidate(
+        &mut candidates,
+        &mut seen,
+        home.map(|home| home.join(".codex")),
+    );
     push_codex_home_candidate(
         &mut candidates,
         &mut seen,
@@ -20912,21 +20916,22 @@ fn codex_source_home_from_candidates(
     candidates: Vec<PathBuf>,
 ) -> Option<PathBuf> {
     let mut fallback = None;
+    let mut existing = None;
 
     for candidate in candidates {
         if same_path(&candidate, target_home) {
             continue;
         }
-        if candidate.is_dir()
-            || candidate.join("auth.json").is_file()
-            || candidate.join("config.toml").is_file()
-        {
+        if candidate.join("auth.json").is_file() {
             return Some(candidate);
+        }
+        if existing.is_none() && (candidate.is_dir() || candidate.join("config.toml").is_file()) {
+            existing = Some(candidate.clone());
         }
         fallback.get_or_insert(candidate);
     }
 
-    fallback
+    existing.or(fallback)
 }
 
 fn codex_source_home_for_managed_home(target_home: &Path) -> Option<PathBuf> {
@@ -23220,6 +23225,29 @@ enabled = true
         let selected = codex_source_home_from_candidates(
             &target,
             vec![missing_codex_home, user_codex_home.clone()],
+        );
+
+        assert_eq!(selected, Some(user_codex_home));
+    }
+
+    #[test]
+    fn managed_codex_home_source_prefers_authenticated_user_home() {
+        let repo = temp_repo("managed_codex_home_source_auth");
+        let empty_codex_home = repo.join("empty-codex-home");
+        let user_codex_home = repo.join("user").join(".codex");
+        let target = repo
+            .join(".agents")
+            .join("codex-home")
+            .join("coordinated")
+            .join("1");
+        fs::create_dir_all(&empty_codex_home).unwrap();
+        fs::create_dir_all(&user_codex_home).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(user_codex_home.join("auth.json"), "{}\n").unwrap();
+
+        let selected = codex_source_home_from_candidates(
+            &target,
+            vec![empty_codex_home, user_codex_home.clone()],
         );
 
         assert_eq!(selected, Some(user_codex_home));
