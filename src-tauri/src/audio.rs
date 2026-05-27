@@ -3588,7 +3588,13 @@ async fn run_cloud_voice_agent_app_ws_stream(
         return;
     }
 
-    let start_deadline = sleep(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS));
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Ok(()));
+    }
+
+    let start_deadline = sleep(Duration::from_secs(
+        CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS,
+    ));
     tokio::pin!(start_deadline);
     loop {
         tokio::select! {
@@ -3647,10 +3653,20 @@ async fn run_cloud_voice_agent_app_ws_stream(
                 }
             }
             _ = &mut start_deadline => {
-                let message = "Cloud voice agent timed out while starting the audio stream.".to_string();
-                if let Some(ready_tx) = ready_tx.take() {
-                    let _ = ready_tx.send(Err(message.clone()));
-                }
+                let message = format!(
+                    "Cloud voice agent did not report audio stream readiness within {CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS} seconds."
+                );
+                emit_cloud_voice_agent_event(
+                    &app,
+                    json!({
+                        "kind": "voice_agent_error",
+                        "contract": "diffforge.voice_agent.v1",
+                        "error": {
+                            "code": "desktop_cloud_voice_stream_start_timeout",
+                            "message": message.clone(),
+                        },
+                    }),
+                );
                 let _ = finished_tx.send(Err(message));
                 return;
             }
@@ -4748,6 +4764,15 @@ async fn start_cloud_voice_agent_stream(
     log_audio_diagnostic_event("audio.cloud_voice.start.command", json!({}));
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
+    if let Some(session) = session_guard.as_mut() {
+        match session.finished_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                *session_guard = None;
+                let _ = audio_state.input_worker.detach_realtime_stream();
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
     if session_guard.is_some() {
         return Err("Cloud voice agent stream is already active.".to_string());
     }
@@ -4853,7 +4878,12 @@ async fn start_cloud_voice_agent_stream(
         finished_tx,
     ));
 
-    match timeout(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS), ready_rx).await {
+    match timeout(
+        Duration::from_secs(CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS),
+        ready_rx,
+    )
+    .await
+    {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
             let _ = audio_state.input_worker.detach_realtime_stream();
@@ -4865,7 +4895,10 @@ async fn start_cloud_voice_agent_stream(
         }
         Err(_elapsed) => {
             let _ = audio_state.input_worker.detach_realtime_stream();
-            return Err("Cloud voice agent stream timed out while connecting.".to_string());
+            return Err(
+                "Cloud voice agent did not acknowledge the app websocket start request."
+                    .to_string(),
+            );
         }
     }
 
