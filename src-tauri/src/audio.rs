@@ -3176,18 +3176,6 @@ async fn cancel_whisper_transcription(audio_state: State<'_, AudioState>) -> Res
     Ok(())
 }
 
-fn cloud_voice_agent_ws_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        format!("ws://{base}")
-    };
-    format!("{ws_base}/v1/voice-agent/ws")
-}
-
 fn clean_cloud_voice_agent_text(value: Option<String>, max_chars: usize) -> String {
     value
         .unwrap_or_default()
@@ -3404,7 +3392,7 @@ fn update_cloud_voice_agent_tts_suppression(
 
 async fn run_cloud_voice_agent_stream(
     app: AppHandle,
-    ws_url: String,
+    ws_target: CloudMcpWsTarget,
     auth_bearer: Option<String>,
     start_request: Value,
     workspace_id: String,
@@ -3415,7 +3403,7 @@ async fn run_cloud_voice_agent_stream(
     ready_tx: oneshot::Sender<Result<(), String>>,
     finished_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut request = match ws_url.into_client_request() {
+    let mut request = match ws_target.ws_url.as_str().into_client_request() {
         Ok(request) => request,
         Err(error) => {
             let message = format!("Unable to prepare cloud voice agent stream: {error}");
@@ -3427,6 +3415,10 @@ async fn run_cloud_voice_agent_stream(
     request.headers_mut().insert(
         "x-diffforge-actor",
         HeaderValue::from_static("orchestrator-voice"),
+    );
+    request.headers_mut().insert(
+        "user-agent",
+        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
     );
     if !workspace_id.is_empty() {
         match cloud_voice_agent_header(&workspace_id, "workspace id") {
@@ -3467,6 +3459,21 @@ async fn run_cloud_voice_agent_stream(
             }
         }
     }
+    if let Some(route_token) = ws_target.route_token.as_deref() {
+        match HeaderValue::from_str(route_token) {
+            Ok(header) => {
+                request
+                    .headers_mut()
+                    .insert("x-diffforge-direct-route-token", header);
+            }
+            Err(error) => {
+                let message = format!("Invalid Cloud voice agent route token header: {error}");
+                let _ = ready_tx.send(Err(message.clone()));
+                let _ = finished_tx.send(Err(message));
+                return;
+            }
+        }
+    }
 
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
@@ -3495,6 +3502,8 @@ async fn run_cloud_voice_agent_stream(
             "repo_id": repo_id,
             "sample_rate": sample_rate,
             "workspace_id": workspace_id,
+            "transport": ws_target.transport,
+            "direct": ws_target.route_token.is_some(),
         }),
     );
 
@@ -3869,14 +3878,14 @@ async fn run_cloud_voice_agent_stream(
 
 async fn run_cloud_voice_agent_text_message(
     app: AppHandle,
-    ws_url: String,
+    ws_target: CloudMcpWsTarget,
     auth_bearer: Option<String>,
     text_request: Value,
     workspace_id: String,
     repo_id: String,
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut request = match ws_url.into_client_request() {
+    let mut request = match ws_target.ws_url.as_str().into_client_request() {
         Ok(request) => request,
         Err(error) => {
             let message = format!("Unable to prepare cloud voice agent chat: {error}");
@@ -3887,6 +3896,10 @@ async fn run_cloud_voice_agent_text_message(
     request.headers_mut().insert(
         "x-diffforge-actor",
         HeaderValue::from_static("orchestrator-voice"),
+    );
+    request.headers_mut().insert(
+        "user-agent",
+        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
     );
     if !workspace_id.is_empty() {
         match cloud_voice_agent_header(&workspace_id, "workspace id") {
@@ -3924,6 +3937,20 @@ async fn run_cloud_voice_agent_text_message(
             }
         }
     }
+    if let Some(route_token) = ws_target.route_token.as_deref() {
+        match HeaderValue::from_str(route_token) {
+            Ok(header) => {
+                request
+                    .headers_mut()
+                    .insert("x-diffforge-direct-route-token", header);
+            }
+            Err(error) => {
+                let message = format!("Invalid Cloud voice agent route token header: {error}");
+                let _ = ready_tx.send(Err(message));
+                return;
+            }
+        }
+    }
 
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
@@ -3949,6 +3976,8 @@ async fn run_cloud_voice_agent_text_message(
         json!({
             "repo_id": repo_id,
             "workspace_id": workspace_id,
+            "transport": ws_target.transport,
+            "direct": ws_target.route_token.is_some(),
         }),
     );
 
@@ -4152,9 +4181,15 @@ async fn start_cloud_voice_agent_stream(
     let (finished_tx, finished_rx) = oneshot::channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel::<CloudVoiceAgentControl>();
     let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state.inner(),
+        &cloud_mcp_base_url(),
+        "/v1/voice-agent/ws",
+    )
+    .await;
     tauri::async_runtime::spawn(run_cloud_voice_agent_stream(
         app,
-        cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
+        ws_target,
         auth_bearer,
         start_request,
         workspace_id.clone(),
@@ -4254,9 +4289,15 @@ async fn send_cloud_voice_agent_text_message(
     });
     let (ready_tx, ready_rx) = oneshot::channel();
     let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state.inner(),
+        &cloud_mcp_base_url(),
+        "/v1/voice-agent/ws",
+    )
+    .await;
     tauri::async_runtime::spawn(run_cloud_voice_agent_text_message(
         app,
-        cloud_voice_agent_ws_url(&cloud_mcp_base_url()),
+        ws_target,
         auth_bearer,
         text_request,
         workspace_id,
