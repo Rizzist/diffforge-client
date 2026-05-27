@@ -5212,11 +5212,61 @@ async fn cloud_mcp_sync_terminal_presence(
             workspace_id.clone(),
             workspace_name.clone(),
         );
-        let terminals = workspace
+        let terminal_items = workspace
             .get("terminals")
             .and_then(Value::as_array)
             .map(|items| items.iter().take(64).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let terminals = terminal_items
+            .iter()
+            .enumerate()
+            .map(|(index, terminal)| {
+                let terminal_index = terminal
+                    .get("terminal_index")
+                    .or_else(|| terminal.get("terminalIndex"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(index as i64)
+                    .clamp(0, 255);
+                let agent_kind = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "agent_kind",
+                        "agentKind",
+                        "agent_id",
+                        "agentId",
+                        "role",
+                        "provider",
+                        "binary",
+                        "kind",
+                    ],
+                )
+                .unwrap_or_else(|| "terminal".to_string());
+                let agent_label =
+                    cloud_mcp_payload_text(terminal, &["agent_label", "agentLabel", "label"])
+                        .unwrap_or_else(|| agent_kind.clone());
+                let status = cloud_mcp_payload_text(terminal, &["status", "state"])
+                    .unwrap_or_else(|| "active".to_string());
+                let session_state =
+                    cloud_mcp_payload_text(terminal, &["session_state", "sessionState"])
+                        .unwrap_or_else(|| "unknown".to_string());
+                json!({
+                    "presence_agent_id": cloud_mcp_payload_text(
+                        terminal,
+                        &["presence_agent_id", "presenceAgentId", "id"],
+                    ),
+                    "agent_kind": agent_kind,
+                    "agent_label": agent_label,
+                    "status": status,
+                    "session_state": session_state,
+                    "terminal_index": terminal_index,
+                    "pane_id": cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]),
+                    "terminal_id": cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId", "pane_id", "paneId"]),
+                    "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
+                    "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
+                    "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "slot"]),
+                })
+            })
+            .collect::<Vec<_>>();
 
         let terminal_count = terminals.len();
         normalized_workspaces.push(json!({
