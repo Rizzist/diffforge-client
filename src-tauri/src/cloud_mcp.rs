@@ -5145,15 +5145,28 @@ async fn cloud_mcp_sync_terminal_presence(
             .map(|items| items.iter().take(64).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
+        let terminal_count = terminals.len();
         normalized_workspaces.push(json!({
             "repo_id": req.repo_id,
+            "workspace_root": req.root_display,
             "workspace_active": workspace_active,
             "workspace_id": req.workspace_id,
             "workspace_name": req.workspace_name,
             "workspace_status": workspace_status,
+            "terminal_count": terminal_count,
             "terminals": terminals,
         }));
     }
+    let terminal_count = normalized_workspaces
+        .iter()
+        .map(|workspace| {
+            workspace
+                .get("terminals")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+        })
+        .sum::<usize>();
 
     let payload = json!({
         "source": "rust-diffforge-terminal-presence-sync",
@@ -5162,6 +5175,7 @@ async fn cloud_mcp_sync_terminal_presence(
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
         "workspace_count": normalized_workspaces.len(),
+        "terminal_count": terminal_count,
         "workspaces": normalized_workspaces,
         "summary": "Desktop terminal presence synced.",
         "ts_ms": cloud_mcp_now_ms(),
@@ -5228,12 +5242,15 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             .map(|items| items.iter().take(128).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
+        let server_count = servers.len();
         normalized_workspaces.push(json!({
             "repo_id": req.repo_id,
+            "workspace_root": req.root_display,
             "workspace_id": req.workspace_id,
             "workspace_active": workspace_active,
             "workspace_name": req.workspace_name,
             "workspace_status": workspace_status,
+            "server_count": server_count,
             "servers": servers,
         }));
     }

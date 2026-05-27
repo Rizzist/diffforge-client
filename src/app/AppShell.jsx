@@ -8093,17 +8093,27 @@ export default function App() {
 	        workspaces: terminalPresenceWorkspaces,
 	        reason,
 	      })
-	        .then(() => {
+	        .then((response) => {
 	          if (!disposed) {
 	            terminalPresenceSyncKeyRef.current = syncKey;
 	          }
+	          const responseData = unwrapCloudCommandData(response, {});
+	          const stored = responseData?.stored && typeof responseData.stored === "object"
+	            ? responseData.stored
+	            : responseData;
+	          const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
+	          const closedCount = Number(stored?.closed_count ?? responseData?.closed_count ?? 0);
 	          void recordCloudConnectionDiagnostic(diagnosticToken, {
 	            channel: "rust-client-sync",
 	            step: "rust.sync.terminal_presence",
-	            status: "ok",
-	            message: "Rust client terminal presence sync completed.",
+	            status: storedCount < terminalCount ? "warn" : "ok",
+	            message: storedCount < terminalCount
+	              ? "Rust client terminal presence sync stored fewer terminals than expected."
+	              : "Rust client terminal presence sync completed.",
 	            details: {
+	              closedCount,
 	              reason,
+	              storedCount,
 	              terminalCount,
 	              workspaceCount: terminalPresenceWorkspaces.length,
 	            },
@@ -8182,21 +8192,32 @@ export default function App() {
             return sanitizeWorkspaceMcpRegistryForCloud(response, target);
           }),
         );
-	        await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
+	        const syncResponse = await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
 	          workspaces: workspacesForCloud,
 	          reason,
 	        });
+	        const responseData = unwrapCloudCommandData(syncResponse, {});
+	        const stored = responseData?.stored && typeof responseData.stored === "object"
+	          ? responseData.stored
+	          : responseData;
+	        const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
+	        const enabledCount = Number(stored?.enabled_count ?? responseData?.enabled_count ?? 0);
+	        const serverCount = workspacesForCloud.reduce(
+	          (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
+	          0,
+	        );
 	        await recordCloudConnectionDiagnostic(diagnosticToken, {
 	          channel: "rust-client-sync",
 	          step: "rust.sync.workspace_mcps",
-	          status: "ok",
-	          message: "Rust client workspace MCP sync completed.",
+	          status: storedCount < serverCount ? "warn" : "ok",
+	          message: storedCount < serverCount
+	            ? "Rust client workspace MCP sync stored fewer servers than expected."
+	            : "Rust client workspace MCP sync completed.",
 	          details: {
+	            enabledCount,
 	            reason,
-	            serverCount: workspacesForCloud.reduce(
-	              (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
-	              0,
-	            ),
+	            serverCount,
+	            storedCount,
 	            workspaceCount: workspacesForCloud.length,
 	          },
 	        });
