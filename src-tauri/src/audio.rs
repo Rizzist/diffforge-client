@@ -3199,6 +3199,53 @@ fn cloud_voice_agent_header(value: &str, label: &str) -> Result<HeaderValue, Str
     HeaderValue::from_str(value).map_err(|error| format!("Invalid {label} header: {error}"))
 }
 
+fn cloud_voice_agent_ws_request(
+    ws_target: &CloudMcpWsTarget,
+    auth_bearer: Option<&str>,
+    workspace_id: &str,
+    repo_id: &str,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
+    let mut request = ws_target
+        .ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|error| format!("Unable to prepare cloud voice agent websocket: {error}"))?;
+    request.headers_mut().insert(
+        "x-diffforge-actor",
+        HeaderValue::from_static("orchestrator-voice"),
+    );
+    request.headers_mut().insert(
+        "user-agent",
+        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
+    );
+    if !workspace_id.is_empty() {
+        request.headers_mut().insert(
+            "x-diffforge-workspace-id",
+            cloud_voice_agent_header(workspace_id, "workspace id")?,
+        );
+    }
+    if !repo_id.is_empty() {
+        request.headers_mut().insert(
+            "x-diffforge-repo-id",
+            cloud_voice_agent_header(repo_id, "repo id")?,
+        );
+    }
+    if let Some(token) = auth_bearer {
+        request.headers_mut().insert(
+            "authorization",
+            cloud_mcp_bearer_header(token, "Cloud voice agent auth token")?,
+        );
+    }
+    if let Some(route_token) = ws_target.route_token.as_deref() {
+        request.headers_mut().insert(
+            "x-diffforge-direct-route-token",
+            HeaderValue::from_str(route_token)
+                .map_err(|error| format!("Invalid Cloud voice agent route token header: {error}"))?,
+        );
+    }
+    Ok(request)
+}
+
 fn emit_cloud_voice_agent_event(app: &AppHandle, payload: Value) {
     let _ = app.emit(CLOUD_VOICE_AGENT_EVENT, payload);
 }
@@ -3403,80 +3450,56 @@ async fn run_cloud_voice_agent_stream(
     ready_tx: oneshot::Sender<Result<(), String>>,
     finished_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut request = match ws_target.ws_url.as_str().into_client_request() {
+    let mut opened_target = ws_target.clone();
+    let request = match cloud_voice_agent_ws_request(
+        &opened_target,
+        auth_bearer.as_deref(),
+        &workspace_id,
+        &repo_id,
+    ) {
         Ok(request) => request,
         Err(error) => {
-            let message = format!("Unable to prepare cloud voice agent stream: {error}");
-            let _ = ready_tx.send(Err(message.clone()));
-            let _ = finished_tx.send(Err(message));
+            let _ = ready_tx.send(Err(error.clone()));
+            let _ = finished_tx.send(Err(error));
             return;
         }
     };
-    request.headers_mut().insert(
-        "x-diffforge-actor",
-        HeaderValue::from_static("orchestrator-voice"),
-    );
-    request.headers_mut().insert(
-        "user-agent",
-        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
-    );
-    if !workspace_id.is_empty() {
-        match cloud_voice_agent_header(&workspace_id, "workspace id") {
-            Ok(header) => {
-                request
-                    .headers_mut()
-                    .insert("x-diffforge-workspace-id", header);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.clone()));
-                let _ = finished_tx.send(Err(error));
-                return;
-            }
-        }
-    }
-    if !repo_id.is_empty() {
-        match cloud_voice_agent_header(&repo_id, "repo id") {
-            Ok(header) => {
-                request.headers_mut().insert("x-diffforge-repo-id", header);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.clone()));
-                let _ = finished_tx.send(Err(error));
-                return;
-            }
-        }
-    }
-    if let Some(token) = auth_bearer.as_deref() {
-        match cloud_mcp_bearer_header(token, "Cloud voice agent auth token") {
-            Ok(header) => {
-                request.headers_mut().insert("authorization", header);
-            }
-            Err(error) => {
-                let message = error;
-                let _ = ready_tx.send(Err(message.clone()));
-                let _ = finished_tx.send(Err(message));
-                return;
-            }
-        }
-    }
-    if let Some(route_token) = ws_target.route_token.as_deref() {
-        match HeaderValue::from_str(route_token) {
-            Ok(header) => {
-                request
-                    .headers_mut()
-                    .insert("x-diffforge-direct-route-token", header);
-            }
-            Err(error) => {
-                let message = format!("Invalid Cloud voice agent route token header: {error}");
-                let _ = ready_tx.send(Err(message.clone()));
-                let _ = finished_tx.send(Err(message));
-                return;
-            }
-        }
-    }
 
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
+        Err(error) if opened_target.route_token.is_some() => {
+            let direct_error = error.to_string();
+            let fallback = cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), "/v1/voice-agent/ws");
+            let fallback_request = match cloud_voice_agent_ws_request(
+                &fallback,
+                auth_bearer.as_deref(),
+                &workspace_id,
+                &repo_id,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    let message =
+                        format!("Unable to prepare cloud voice agent balancer fallback: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    let _ = finished_tx.send(Err(message));
+                    return;
+                }
+            };
+            match connect_async(fallback_request).await {
+                Ok(stream) => {
+                    opened_target = fallback;
+                    stream
+                }
+                Err(fallback_error) => {
+                    let message = format!(
+                        "Unable to open cloud voice agent WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
+                    );
+                    let _ = ready_tx.send(Err(message.clone()));
+                    let _ = finished_tx.send(Err(message));
+                    return;
+                }
+            }
+        }
         Err(error) => {
             let message = format!("Unable to open cloud voice agent WebSocket: {error}");
             let _ = ready_tx.send(Err(message.clone()));
@@ -3502,8 +3525,8 @@ async fn run_cloud_voice_agent_stream(
             "repo_id": repo_id,
             "sample_rate": sample_rate,
             "workspace_id": workspace_id,
-            "transport": ws_target.transport,
-            "direct": ws_target.route_token.is_some(),
+            "transport": opened_target.transport,
+            "direct": opened_target.route_token.is_some(),
         }),
     );
 
@@ -3885,75 +3908,53 @@ async fn run_cloud_voice_agent_text_message(
     repo_id: String,
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut request = match ws_target.ws_url.as_str().into_client_request() {
+    let mut opened_target = ws_target.clone();
+    let request = match cloud_voice_agent_ws_request(
+        &opened_target,
+        auth_bearer.as_deref(),
+        &workspace_id,
+        &repo_id,
+    ) {
         Ok(request) => request,
         Err(error) => {
-            let message = format!("Unable to prepare cloud voice agent chat: {error}");
-            let _ = ready_tx.send(Err(message));
+            let _ = ready_tx.send(Err(error));
             return;
         }
     };
-    request.headers_mut().insert(
-        "x-diffforge-actor",
-        HeaderValue::from_static("orchestrator-voice"),
-    );
-    request.headers_mut().insert(
-        "user-agent",
-        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
-    );
-    if !workspace_id.is_empty() {
-        match cloud_voice_agent_header(&workspace_id, "workspace id") {
-            Ok(header) => {
-                request
-                    .headers_mut()
-                    .insert("x-diffforge-workspace-id", header);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-                return;
-            }
-        }
-    }
-    if !repo_id.is_empty() {
-        match cloud_voice_agent_header(&repo_id, "repo id") {
-            Ok(header) => {
-                request.headers_mut().insert("x-diffforge-repo-id", header);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-                return;
-            }
-        }
-    }
-    if let Some(token) = auth_bearer.as_deref() {
-        match cloud_mcp_bearer_header(token, "Cloud voice agent auth token") {
-            Ok(header) => {
-                request.headers_mut().insert("authorization", header);
-            }
-            Err(error) => {
-                let message = error;
-                let _ = ready_tx.send(Err(message));
-                return;
-            }
-        }
-    }
-    if let Some(route_token) = ws_target.route_token.as_deref() {
-        match HeaderValue::from_str(route_token) {
-            Ok(header) => {
-                request
-                    .headers_mut()
-                    .insert("x-diffforge-direct-route-token", header);
-            }
-            Err(error) => {
-                let message = format!("Invalid Cloud voice agent route token header: {error}");
-                let _ = ready_tx.send(Err(message));
-                return;
-            }
-        }
-    }
 
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
+        Err(error) if opened_target.route_token.is_some() => {
+            let direct_error = error.to_string();
+            let fallback = cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), "/v1/voice-agent/ws");
+            let fallback_request = match cloud_voice_agent_ws_request(
+                &fallback,
+                auth_bearer.as_deref(),
+                &workspace_id,
+                &repo_id,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    let message =
+                        format!("Unable to prepare cloud voice agent chat balancer fallback: {error}");
+                    let _ = ready_tx.send(Err(message));
+                    return;
+                }
+            };
+            match connect_async(fallback_request).await {
+                Ok(stream) => {
+                    opened_target = fallback;
+                    stream
+                }
+                Err(fallback_error) => {
+                    let message = format!(
+                        "Unable to open cloud voice agent chat WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
+                    );
+                    let _ = ready_tx.send(Err(message));
+                    return;
+                }
+            }
+        }
         Err(error) => {
             let message = format!("Unable to open cloud voice agent chat WebSocket: {error}");
             let _ = ready_tx.send(Err(message));
@@ -3976,8 +3977,8 @@ async fn run_cloud_voice_agent_text_message(
         json!({
             "repo_id": repo_id,
             "workspace_id": workspace_id,
-            "transport": ws_target.transport,
-            "direct": ws_target.route_token.is_some(),
+            "transport": opened_target.transport,
+            "direct": opened_target.route_token.is_some(),
         }),
     );
 

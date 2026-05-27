@@ -943,7 +943,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             };
         }
 
-        match cloud_mcp_open_global_ws(&state, &target).await {
+        match cloud_mcp_open_global_ws(&state, &base_url, &target).await {
             Ok(()) => {}
             Err(error) => {
                 {
@@ -966,7 +966,11 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
     }
 }
 
-async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarget) -> Result<(), String> {
+async fn cloud_mcp_open_global_ws(
+    state: &CloudMcpState,
+    base_url: &str,
+    target: &CloudMcpWsTarget,
+) -> Result<(), String> {
     cloud_mcp_record_signin_diagnostic(
         state,
         "websocket.open",
@@ -989,35 +993,99 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         }),
     )
     .await;
-    let mut request = target
-        .ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
-    request.headers_mut().insert(
-        "x-diffforge-actor",
-        HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
-    );
-    request.headers_mut().insert(
-        "user-agent",
-        HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
-    );
-    if let Some(token) = cloud_mcp_authorization_bearer(state).await? {
+    let auth_bearer = cloud_mcp_authorization_bearer(state).await?;
+    let build_request = |target: &CloudMcpWsTarget| -> Result<
+        tokio_tungstenite::tungstenite::http::Request<()>,
+        String,
+    > {
+        let mut request = target
+            .ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
         request.headers_mut().insert(
-            "authorization",
-            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+            "x-diffforge-actor",
+            HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
         );
-    }
-    if let Some(route_token) = target.route_token.as_deref() {
         request.headers_mut().insert(
-            "x-diffforge-direct-route-token",
-            HeaderValue::from_str(route_token)
-                .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
+            "user-agent",
+            HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
         );
-    }
+        if let Some(token) = auth_bearer.as_deref() {
+            request.headers_mut().insert(
+                "authorization",
+                cloud_mcp_bearer_header(token, "Cloud MCP auth token")?,
+            );
+        }
+        if let Some(route_token) = target.route_token.as_deref() {
+            request.headers_mut().insert(
+                "x-diffforge-direct-route-token",
+                HeaderValue::from_str(route_token)
+                    .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
+            );
+        }
+        Ok(request)
+    };
 
+    let mut opened_target = target.clone();
+    let request = build_request(&opened_target)?;
     let (stream, response) = match connect_async(request).await {
         Ok(result) => result,
+        Err(error) if opened_target.route_token.is_some() => {
+            let direct_message = format!("Unable to open Cloud MCP app websocket: {error}");
+            cloud_mcp_record_connection_diagnostic(
+                state,
+                "rust.cloud_mcp.websocket.open",
+                "warn",
+                "Direct Cloud MCP app websocket failed; retrying through balancer.",
+                json!({
+                    "ws_url": opened_target.ws_url,
+                    "transport": opened_target.transport,
+                    "clientIdentity": "appwrite_account",
+                    "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
+                    "hasDirectRouteHeader": true,
+                    "directError": clean_terminal_telemetry_text(&direct_message),
+                }),
+            )
+            .await;
+            let fallback = cloud_mcp_fallback_ws_target(base_url, "/v1/app/ws");
+            let fallback_request = build_request(&fallback)?;
+            match connect_async(fallback_request).await {
+                Ok(result) => {
+                    opened_target = fallback;
+                    result
+                }
+                Err(fallback_error) => {
+                    let message = format!(
+                        "{direct_message}; fallback via balancer also failed: {fallback_error}"
+                    );
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "websocket.open",
+                        "error",
+                        &message,
+                        json!({"ws_url": opened_target.ws_url, "transport": opened_target.transport}),
+                    )
+                    .await;
+                    cloud_mcp_record_connection_diagnostic(
+                        state,
+                        "rust.cloud_mcp.websocket.open",
+                        "error",
+                        &message,
+                        json!({
+                            "ws_url": opened_target.ws_url,
+                            "transport": opened_target.transport,
+                            "clientIdentity": "appwrite_account",
+                            "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
+                            "hasDirectRouteHeader": true,
+                            "fallbackTransport": "balancer_proxy",
+                        }),
+                    )
+                    .await;
+                    return Err(message);
+                }
+            }
+        }
         Err(error) => {
             let message = format!("Unable to open Cloud MCP app websocket: {error}");
             cloud_mcp_record_signin_diagnostic(
@@ -1051,8 +1119,8 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         "ok",
         "Cloud MCP app websocket opened",
         json!({
-            "ws_url": target.ws_url,
-            "transport": target.transport,
+            "ws_url": opened_target.ws_url,
+            "transport": opened_target.transport,
             "http_status": response.status().as_u16()
         }),
     )
@@ -1063,12 +1131,12 @@ async fn cloud_mcp_open_global_ws(state: &CloudMcpState, target: &CloudMcpWsTarg
         "ok",
         "Cloud MCP app websocket opened",
         json!({
-            "ws_url": target.ws_url,
-            "transport": target.transport,
+            "ws_url": opened_target.ws_url,
+            "transport": opened_target.transport,
             "http_status": response.status().as_u16(),
             "clientIdentity": "appwrite_account",
             "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
-            "hasDirectRouteHeader": target.route_token.is_some(),
+            "hasDirectRouteHeader": opened_target.route_token.is_some(),
         }),
     )
     .await;
