@@ -1075,6 +1075,7 @@ function WorkspaceThreadsOverlay({
   todoDropTarget = false,
   todoDropUnsupportedMessage = "",
   viewState,
+  workspaceRoot = "",
   workspaceThreads,
   workspaces,
 }) {
@@ -1603,6 +1604,7 @@ function WorkspaceThreadsOverlay({
           todoDropTarget={todoDropTarget}
           todoDropUnsupportedMessage={todoDropUnsupportedMessage}
           workspace={newChatActive ? newChatWorkspace : activeWorkspace}
+          workspaceRoot={(newChatActive ? newChatWorkspace?.rootDirectory : activeWorkspace?.rootDirectory) || workspaceRoot || ""}
           workspaceThreadEntry={workspaceThreads?.[newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId]}
         />
       </OverlayPanel>

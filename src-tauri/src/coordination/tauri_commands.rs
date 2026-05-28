@@ -18,8 +18,41 @@ fn kernel(
     CoordinationKernel::open(repo_path, db_path.map(PathBuf::from))
 }
 
+fn kernel_for_worktree_input(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: &Value,
+) -> Result<CoordinationKernel, String> {
+    let repo_path = repo_path
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| repo_path_from_worktree_input(input));
+    kernel(repo_path, db_path)
+}
+
 fn default_repo_path() -> PathBuf {
     crate::default_working_directory().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn repo_path_from_worktree_input(input: &Value) -> Option<String> {
+    let worktree_path = input["worktree_path"]
+        .as_str()
+        .or_else(|| input["worktreePath"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = PathBuf::from(worktree_path);
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|value| value.to_str()) != Some("worktrees") {
+            continue;
+        }
+        let agents_dir = ancestor.parent()?;
+        if agents_dir.file_name().and_then(|value| value.to_str()) != Some(".agents") {
+            continue;
+        }
+        return agents_dir
+            .parent()
+            .map(|repo_path| repo_path.display().to_string());
+    }
+    None
 }
 
 fn result(value: Result<Value, String>) -> Result<Value, String> {
@@ -541,6 +574,26 @@ pub fn coordination_submit_patch_status(
         input["task_id"].as_str(),
         input["session_id"].as_str(),
     ))
+}
+
+#[tauri::command]
+pub fn coordination_worktree_diff_summary(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(kernel_for_worktree_input(repo_path, db_path, &input)?.worktree_diff_summary(&input))
+}
+
+#[tauri::command]
+pub fn coordination_undo_worktree_diff_summary(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    result(
+        kernel_for_worktree_input(repo_path, db_path, &input)?.undo_worktree_diff_summary(&input),
+    )
 }
 
 #[tauri::command]

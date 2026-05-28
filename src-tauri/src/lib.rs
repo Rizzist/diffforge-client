@@ -2851,6 +2851,8 @@ pub fn run() {
             coordination::tauri_commands::coordination_validate_patch,
             coordination::tauri_commands::coordination_submit_patch,
             coordination::tauri_commands::coordination_submit_patch_status,
+            coordination::tauri_commands::coordination_worktree_diff_summary,
+            coordination::tauri_commands::coordination_undo_worktree_diff_summary,
             coordination::tauri_commands::coordination_request_merge,
             coordination::tauri_commands::coordination_initialize_merge_resolution,
             coordination::tauri_commands::coordination_apply_merge,

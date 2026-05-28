@@ -70,6 +70,7 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
 ];
 const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
 const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
+const WORKTREE_DIFF_UNTRACKED_MAX_BYTES: u64 = 1_000_000;
 
 #[derive(Clone)]
 struct SessionSlotOptions {
@@ -12937,6 +12938,326 @@ impl CoordinationKernel {
         Ok(files)
     }
 
+    pub fn worktree_diff_summary(&self, input: &Value) -> Result<Value, String> {
+        self.worktree_diff_summary_data(input).map(api_ok)
+    }
+
+    pub fn undo_worktree_diff_summary(&self, input: &Value) -> Result<Value, String> {
+        let before = self.worktree_diff_summary_data(input)?;
+        let expected_summary_key =
+            json_text_any(input, &["expected_summary_key", "expectedSummaryKey"]);
+        let summary_key = before["summaryKey"].as_str().unwrap_or_default();
+        if let Some(expected_summary_key) = expected_summary_key {
+            if expected_summary_key != summary_key {
+                return Ok(api_error(
+                    "diff_summary_stale",
+                    "The edited files changed since this summary was captured.",
+                    json!({
+                        "expectedSummaryKey": expected_summary_key,
+                        "actualSummaryKey": summary_key,
+                    }),
+                ));
+            }
+        }
+
+        let files = before["files"].as_array().cloned().unwrap_or_default();
+        let untracked_files = files
+            .iter()
+            .filter(|file| file["untracked"].as_bool().unwrap_or(false))
+            .map(|file| file["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        if !untracked_files.is_empty() {
+            return Ok(api_error(
+                "undo_untracked_files_unsupported",
+                "Undo is blocked because this summary includes untracked files.",
+                json!({"untrackedFiles": untracked_files}),
+            ));
+        }
+
+        let worktree_path = before["worktreePath"]
+            .as_str()
+            .ok_or_else(|| "Diff summary is missing worktreePath.".to_string())
+            .map(PathBuf::from)?;
+        let base_sha = before["baseSha"]
+            .as_str()
+            .ok_or_else(|| "Diff summary is missing baseSha.".to_string())?;
+        let diff = run_git_bytes(&worktree_path, &["diff", "--binary", base_sha, "--"])?;
+        if diff.is_empty() {
+            return Ok(api_ok(json!({
+                "status": "noop",
+                "before": before,
+                "after": before,
+            })));
+        }
+
+        run_git_bytes_with_stdin(
+            &worktree_path,
+            &["apply", "--reverse", "--whitespace=nowarn"],
+            &diff,
+        )?;
+        let after = self.worktree_diff_summary_data(input)?;
+        Ok(api_ok(json!({
+            "status": "undone",
+            "before": before,
+            "after": after,
+        })))
+    }
+
+    fn worktree_diff_summary_data(&self, input: &Value) -> Result<Value, String> {
+        let context = self.resolve_worktree_diff_context(input)?;
+        let changed = self.changed_files(&context.worktree_path)?;
+        let count_map = self.diff_numstat_counts(&context.worktree_path, &context.base_sha)?;
+        let mut files = Vec::new();
+        let mut additions_total = 0i64;
+        let mut deletions_total = 0i64;
+        let mut partial = false;
+
+        for changed_file in changed {
+            reject_path_escape(&changed_file.path)?;
+            let full_path = context.worktree_path.join(&changed_file.path);
+            if full_path.exists() {
+                let canonical_target = full_path.canonicalize().map_err(|error| {
+                    format!(
+                        "Unable to canonicalize changed path {}: {error}",
+                        changed_file.path
+                    )
+                })?;
+                if !canonical_target.starts_with(&context.worktree_path) {
+                    return Err(format!(
+                        "Changed path escapes worktree: {}",
+                        changed_file.path
+                    ));
+                }
+            }
+
+            let counts = count_map
+                .get(&changed_file.path)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if changed_file.untracked {
+                        count_untracked_file_lines(&full_path)
+                    } else {
+                        DiffLineCount::unknown("unknown")
+                    }
+                });
+            let additions = counts.additions;
+            let deletions = counts.deletions;
+            if let Some(additions) = additions {
+                additions_total = additions_total.saturating_add(additions);
+            } else {
+                partial = true;
+            }
+            if let Some(deletions) = deletions {
+                deletions_total = deletions_total.saturating_add(deletions);
+            } else {
+                partial = true;
+            }
+            if counts.binary {
+                partial = true;
+            }
+
+            files.push(json!({
+                "path": changed_file.path.clone(),
+                "name": display_file_name(&changed_file.path),
+                "changeKind": changed_file.change_kind.clone(),
+                "change_kind": changed_file.change_kind.clone(),
+                "additions": additions,
+                "deletions": deletions,
+                "linesAdded": additions,
+                "linesRemoved": deletions,
+                "binary": counts.binary,
+                "untracked": changed_file.untracked,
+                "countStatus": counts.status,
+                "count_status": counts.status,
+                "modifiedMs": file_modified_ms(&full_path),
+            }));
+        }
+
+        files.sort_by(|left, right| {
+            let left_modified = left["modifiedMs"].as_i64().unwrap_or(0);
+            let right_modified = right["modifiedMs"].as_i64().unwrap_or(0);
+            right_modified
+                .cmp(&left_modified)
+                .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
+        });
+        let latest_file = files.first().cloned().unwrap_or(Value::Null);
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+
+        let summary_payload = json!({
+            "baseSha": context.base_sha.clone(),
+            "worktreePath": process_path_text(&context.worktree_path),
+            "files": files.iter().map(|file| json!({
+                "path": file["path"].clone(),
+                "changeKind": file["changeKind"].clone(),
+                "additions": file["additions"].clone(),
+                "deletions": file["deletions"].clone(),
+                "binary": file["binary"].clone(),
+                "untracked": file["untracked"].clone(),
+                "countStatus": file["countStatus"].clone(),
+            })).collect::<Vec<_>>(),
+        });
+        let summary_key = sha256_hex(
+            &serde_json::to_vec(&summary_payload)
+                .map_err(|error| format!("Unable to serialize diff summary key: {error}"))?,
+        );
+
+        Ok(json!({
+            "worktreePath": process_path_text(&context.worktree_path),
+            "worktree_path": process_path_text(&context.worktree_path),
+            "worktreeId": context.worktree_id.clone(),
+            "worktree_id": context.worktree_id.clone(),
+            "baseSha": context.base_sha.clone(),
+            "base_sha": context.base_sha.clone(),
+            "summaryKey": summary_key,
+            "summary_key": summary_key,
+            "fileCount": files.len(),
+            "file_count": files.len(),
+            "additions": additions_total,
+            "deletions": deletions_total,
+            "partial": partial,
+            "latestFile": latest_file,
+            "latest_file": latest_file,
+            "files": files,
+        }))
+    }
+
+    fn resolve_worktree_diff_context(&self, input: &Value) -> Result<WorktreeDiffContext, String> {
+        let worktree_path_text = json_text_any(input, &["worktree_path", "worktreePath"])
+            .ok_or_else(|| "worktree_path is required.".to_string())?;
+        let worktree_path = PathBuf::from(&worktree_path_text);
+        if !worktree_path.exists() {
+            return Err(format!(
+                "Worktree path is missing: {}",
+                worktree_path.display()
+            ));
+        }
+        let canonical_worktree = worktree_path.canonicalize().map_err(|error| {
+            format!(
+                "Unable to canonicalize worktree path {}: {error}",
+                worktree_path.display()
+            )
+        })?;
+        let canonical_worktrees_root = self
+            .paths
+            .worktrees_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.paths.worktrees_root.clone());
+        if !canonical_worktree.starts_with(&canonical_worktrees_root) {
+            return Err(format!(
+                "Worktree path escapes .agents/worktrees: {}",
+                canonical_worktree.display()
+            ));
+        }
+        let inside = run_git(&canonical_worktree, &["rev-parse", "--is-inside-work-tree"])?;
+        if inside.trim() != "true" {
+            return Err(format!(
+                "Worktree path is not inside a git worktree: {}",
+                canonical_worktree.display()
+            ));
+        }
+        let top_level = run_git(&canonical_worktree, &["rev-parse", "--show-toplevel"])?;
+        if !same_path_text(top_level.trim(), &process_path_text(&canonical_worktree)) {
+            return Err(format!(
+                "Git top-level {} does not match worktree path {}.",
+                top_level.trim(),
+                canonical_worktree.display()
+            ));
+        }
+
+        let worktree_row = self.find_worktree_row_for_path(&canonical_worktree)?;
+        let worktree_id = worktree_row
+            .as_ref()
+            .and_then(|row| row["id"].as_str().map(str::to_string));
+        let base_sha = json_text_any(input, &["base_sha", "baseSha"])
+            .or_else(|| {
+                worktree_row
+                    .as_ref()
+                    .and_then(|row| row["base_sha"].as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                run_git(&canonical_worktree, &["rev-parse", "HEAD"])
+                    .unwrap_or_else(|_| "HEAD".to_string())
+                    .trim()
+                    .to_string()
+            });
+
+        Ok(WorktreeDiffContext {
+            base_sha,
+            worktree_id,
+            worktree_path: canonical_worktree,
+        })
+    }
+
+    fn find_worktree_row_for_path(&self, worktree_path: &Path) -> Result<Option<Value>, String> {
+        let rows = self.query_json(
+            "SELECT id, path, base_sha
+             FROM worktrees
+             WHERE status IS NULL OR status != 'deleted'
+             ORDER BY updated_at DESC",
+            &[],
+        )?;
+        let worktree_path_text = process_path_text(worktree_path);
+        for row in rows {
+            let Some(row_path) = row["path"].as_str() else {
+                continue;
+            };
+            if same_path_text(row_path, &worktree_path_text) {
+                return Ok(Some(row));
+            }
+            if let Ok(canonical_row_path) = PathBuf::from(row_path).canonicalize() {
+                if same_path_text(&process_path_text(&canonical_row_path), &worktree_path_text) {
+                    return Ok(Some(row));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn diff_numstat_counts(
+        &self,
+        worktree_path: &Path,
+        base_sha: &str,
+    ) -> Result<HashMap<String, DiffLineCount>, String> {
+        let output = run_git(
+            worktree_path,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--numstat",
+                "--find-renames",
+                "--find-copies",
+                base_sha,
+                "--",
+            ],
+        )?;
+        let mut counts = HashMap::new();
+        for line in output.lines() {
+            let mut parts = line.splitn(3, '\t');
+            let additions_text = parts.next().unwrap_or_default();
+            let deletions_text = parts.next().unwrap_or_default();
+            let path_text = parts.next().unwrap_or_default();
+            let path = normalize_numstat_path(path_text);
+            if path.is_empty() {
+                continue;
+            }
+            let binary = additions_text == "-" || deletions_text == "-";
+            counts.insert(
+                path,
+                DiffLineCount {
+                    additions: additions_text.parse::<i64>().ok(),
+                    deletions: deletions_text.parse::<i64>().ok(),
+                    binary,
+                    status: if binary { "binary" } else { "counted" }.to_string(),
+                },
+            );
+        }
+        Ok(counts)
+    }
+
     fn mark_untracked_intent_to_add(
         &self,
         worktree_path: &Path,
@@ -20361,6 +20682,122 @@ struct ChangedFile {
     untracked: bool,
 }
 
+struct WorktreeDiffContext {
+    worktree_path: PathBuf,
+    worktree_id: Option<String>,
+    base_sha: String,
+}
+
+#[derive(Clone)]
+struct DiffLineCount {
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    binary: bool,
+    status: String,
+}
+
+impl DiffLineCount {
+    fn unknown(status: &str) -> Self {
+        Self {
+            additions: None,
+            deletions: None,
+            binary: false,
+            status: status.to_string(),
+        }
+    }
+}
+
+fn json_text_any(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| input[*key].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn display_file_name(path: &str) -> String {
+    path.replace('\\', "/")
+        .rsplit('/')
+        .find(|value| !value.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn file_modified_ms(path: &Path) -> i64 {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn count_untracked_file_lines(path: &Path) -> DiffLineCount {
+    let Ok(metadata) = path.metadata() else {
+        return DiffLineCount::unknown("missing");
+    };
+    if !metadata.is_file() {
+        return DiffLineCount::unknown("not_file");
+    }
+    if metadata.len() > WORKTREE_DIFF_UNTRACKED_MAX_BYTES {
+        return DiffLineCount::unknown("large_untracked");
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return DiffLineCount::unknown("unreadable");
+    };
+    if bytes.iter().any(|byte| *byte == 0) {
+        return DiffLineCount {
+            additions: None,
+            deletions: None,
+            binary: true,
+            status: "binary".to_string(),
+        };
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return DiffLineCount {
+            additions: None,
+            deletions: None,
+            binary: true,
+            status: "binary".to_string(),
+        };
+    }
+    let line_count = if bytes.is_empty() {
+        0
+    } else {
+        let newline_count = bytes.iter().filter(|byte| **byte == b'\n').count() as i64;
+        if bytes.ends_with(b"\n") {
+            newline_count
+        } else {
+            newline_count.saturating_add(1)
+        }
+    };
+    DiffLineCount {
+        additions: Some(line_count),
+        deletions: Some(0),
+        binary: false,
+        status: "counted".to_string(),
+    }
+}
+
+fn normalize_numstat_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    if let Some(brace_start) = normalized.find('{') {
+        if let Some(brace_end) = normalized[brace_start + 1..].find('}') {
+            let brace_end = brace_start + 1 + brace_end;
+            let prefix = &normalized[..brace_start];
+            let suffix = &normalized[brace_end + 1..];
+            let inner = &normalized[brace_start + 1..brace_end];
+            if let Some((_, right)) = inner.split_once("=>") {
+                return format!("{prefix}{}{suffix}", right.trim());
+            }
+        }
+    }
+    if let Some((_, right)) = normalized.rsplit_once("=>") {
+        return right.trim().to_string();
+    }
+    normalized
+}
+
 fn is_coordination_owned_root_status_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     normalized == ".gitignore"
@@ -20667,6 +21104,18 @@ fn repo_has_git(repo_path: &Path) -> bool {
 }
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git_bytes_with_optional_stdin(cwd, args, None)
+}
+
+fn run_git_bytes_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>, String> {
+    run_git_bytes_with_optional_stdin(cwd, args, Some(stdin))
+}
+
+fn run_git_bytes_with_optional_stdin(
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     if crate::app_shutdown_requested() {
         return Err(crate::app_shutdown_blocked_message("git"));
     }
@@ -20681,7 +21130,11 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     command
         .current_dir(PathBuf::from(process_path_text(cwd)))
         .args(&git_args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -20712,11 +21165,24 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         let mut buffer = Vec::new();
         stderr.read_to_end(&mut buffer).map(|_| buffer)
     });
+    let stdin_handle = if let Some(stdin) = stdin {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Unable to open git {} stdin", args.join(" ")))?;
+        let input = stdin.to_vec();
+        Some(thread::spawn(move || child_stdin.write_all(&input)))
+    } else {
+        None
+    };
     let started = Instant::now();
     let status = loop {
         if crate::app_shutdown_requested() {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(handle) = stdin_handle {
+                let _ = handle.join();
+            }
             let _ = stdout_handle.join();
             let _ = stderr_handle.join();
             return Err(crate::app_shutdown_blocked_message("git"));
@@ -20724,6 +21190,9 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         if started.elapsed() >= GIT_COMMAND_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(handle) = stdin_handle {
+                let _ = handle.join();
+            }
             let _ = stdout_handle.join();
             let stderr = stderr_handle
                 .join()
@@ -20748,6 +21217,9 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(error) => {
                 let _ = child.kill();
+                if let Some(handle) = stdin_handle {
+                    let _ = handle.join();
+                }
                 return Err(format!(
                     "Unable to wait for git {}: {error}",
                     args.join(" ")
@@ -20763,8 +21235,22 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .join()
         .map_err(|_| format!("Unable to join git {} stderr reader", args.join(" ")))?
         .map_err(|error| format!("Unable to read git {} stderr: {error}", args.join(" ")))?;
+    let stdin_result = if let Some(handle) = stdin_handle {
+        Some(
+            handle
+                .join()
+                .map_err(|_| format!("Unable to join git {} stdin writer", args.join(" ")))?,
+        )
+    } else {
+        None
+    };
 
     if status.success() {
+        if let Some(result) = stdin_result {
+            result.map_err(|error| {
+                format!("Unable to write git {} stdin: {error}", args.join(" "))
+            })?;
+        }
         return Ok(stdout);
     }
 

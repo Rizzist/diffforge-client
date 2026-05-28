@@ -5,8 +5,11 @@ import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
+import { Undo } from "@styled-icons/material-rounded/Undo";
 import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import Prism from "prismjs";
 import "prismjs/components/prism-markup";
@@ -1044,8 +1047,16 @@ const ActivityCell = styled.article`
 `;
 
 const ActivityBullet = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--thread-blue);
   user-select: none;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
 `;
 
 const ActivityText = styled.div`
@@ -1064,6 +1075,221 @@ const ActivityText = styled.div`
     animation: ${thinkingPulse} 1.1s ease-in-out infinite;
     content: "...";
   }
+`;
+
+const DiffInline = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+`;
+
+const DiffFileName = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: #4eb4ff;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const DiffCount = styled.span`
+  color: var(--thread-muted);
+  font-variant-numeric: tabular-nums;
+  font-weight: 720;
+
+  &[data-tone="add"] {
+    color: #74d28a;
+  }
+
+  &[data-tone="delete"] {
+    color: #ff6d61;
+  }
+`;
+
+const ThreadDiffLiveBanner = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--thread-border-strong);
+  border-radius: 8px;
+  color: var(--thread-fg);
+  background: var(--thread-card-raised);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  animation: ${thinkingPulse} 1.5s ease-in-out;
+`;
+
+const ThreadDiffBannerTitle = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+  overflow: hidden;
+  font-size: var(--thread-detail-font-size);
+  font-weight: 760;
+  white-space: nowrap;
+
+  span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+`;
+
+const ThreadDiffCard = styled.section`
+  display: grid;
+  width: min(100%, 690px);
+  min-width: 0;
+  justify-self: stretch;
+  overflow: hidden;
+  margin: 12px 0 4px 3px;
+  border: 1px solid var(--thread-border-strong);
+  border-radius: 8px;
+  color: var(--thread-fg);
+  background: var(--thread-card-raised);
+`;
+
+const ThreadDiffCardHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--thread-border);
+`;
+
+const ThreadDiffCardTitle = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+  font-size: var(--thread-detail-font-size);
+  font-weight: 760;
+  white-space: nowrap;
+
+  > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+`;
+
+const ThreadDiffActionButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--thread-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--thread-detail-small-font-size);
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+
+  svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+  }
+
+  &:hover:not(:disabled) {
+    color: var(--thread-fg);
+    background: var(--thread-accent);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  @media (max-width: 520px) {
+    width: 28px;
+    padding: 0;
+
+    span {
+      display: none;
+    }
+  }
+`;
+
+const ThreadDiffExpandButton = styled(ThreadDiffActionButton)`
+  width: 28px;
+  padding: 0;
+
+  svg {
+    transition: transform 130ms ease;
+  }
+
+  &[data-expanded="true"] svg {
+    transform: rotate(180deg);
+  }
+`;
+
+const ThreadDiffFileList = styled.div`
+  display: grid;
+  max-height: 220px;
+  overflow-y: auto;
+`;
+
+const ThreadDiffFileRow = styled.button`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.035);
+  color: var(--thread-fg);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  &:hover {
+    background: var(--thread-accent);
+  }
+`;
+
+const ThreadDiffFilePath = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: #d4d4d4;
+  font-size: var(--thread-detail-font-size);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ThreadDiffFileCounts = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--thread-detail-font-size);
 `;
 
 const ComposerShell = styled.form`
@@ -1738,6 +1964,10 @@ const IMAGE_EXTENSION_MIME_TYPES = new Map([
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
 const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za-z0-9_.@ -]+\.[A-Za-z0-9]+(?::\d+)?|[A-Za-z0-9_.@-]+\.(?:cjs|css|html|js|jsx|json|lock|md|mdx|mjs|ps1|py|rs|scss|sh|toml|ts|tsx|txt|yaml|yml)(?::\d+)?)/g;
+const THREAD_DIFF_SUMMARY_STORAGE_PREFIX = "diffforge.threadDiffSummary.v1";
+const THREAD_DIFF_POLL_INTERVAL_MS = 1100;
+const THREAD_DIFF_TERMINAL_STATES = new Set(["completed", "error", "interrupted", "cancelled", "canceled"]);
+const THREAD_DIFF_LIVE_STATES = new Set(["running", "thinking", "starting", "queued"]);
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
 const PRISM_LANGUAGE_ALIASES = new Map([
   ["cjs", "javascript"],
@@ -3072,7 +3302,7 @@ function cleanFileReference(value) {
     .replace(/:\d+$/, "");
 }
 
-function openWorkspaceFile(workspace, filePath) {
+function openWorkspaceFile(workspace, filePath, options = {}) {
   const relativePath = cleanFileReference(filePath);
   if (!relativePath || typeof window === "undefined") {
     return;
@@ -3080,6 +3310,7 @@ function openWorkspaceFile(workspace, filePath) {
 
   window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
     detail: {
+      ...options,
       relativePath,
       workspaceId: workspace?.id || "",
     },
@@ -3333,6 +3564,183 @@ function MessageTextContent({ message, workspace }) {
 
 function threadLatestTurnState(thread) {
   return String(thread?.latestTurn?.state || "").trim().toLowerCase();
+}
+
+function getThreadDiffTurnState(thread, groundTruth) {
+  return String(
+    groundTruth?.effectiveLatestTurnState
+      || groundTruth?.latestTurnState
+      || thread?.latestTurn?.state
+      || "",
+  ).trim().toLowerCase();
+}
+
+function threadDiffTurnIsLive(thread, groundTruth) {
+  const state = getThreadDiffTurnState(thread, groundTruth);
+  return THREAD_DIFF_LIVE_STATES.has(state)
+    || thread?.activityStatus === "thinking"
+    || thread?.activityStatus === "working";
+}
+
+function threadDiffTurnIsTerminal(thread, groundTruth, hasAssistantBlock) {
+  const state = getThreadDiffTurnState(thread, groundTruth);
+  return THREAD_DIFF_TERMINAL_STATES.has(state)
+    || (Boolean(hasAssistantBlock) && !threadDiffTurnIsLive(thread, groundTruth));
+}
+
+function safeThreadDiffStoragePart(value) {
+  return encodeURIComponent(String(value || "").trim() || "unknown");
+}
+
+function getThreadDiffStorageKey(workspaceId, threadId, turnId) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeThreadId = String(threadId || "").trim();
+  const safeTurnId = String(turnId || "").trim();
+  if (!safeWorkspaceId || !safeThreadId || !safeTurnId) {
+    return "";
+  }
+  return [
+    THREAD_DIFF_SUMMARY_STORAGE_PREFIX,
+    safeThreadDiffStoragePart(safeWorkspaceId),
+    safeThreadDiffStoragePart(safeThreadId),
+    safeThreadDiffStoragePart(safeTurnId),
+  ].join(":");
+}
+
+function readStoredThreadDiffSummary(key) {
+  if (!key || typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return normalizeThreadDiffSummary(JSON.parse(window.localStorage.getItem(key) || "null"));
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredThreadDiffSummary(key, summary) {
+  if (!key || typeof window === "undefined") {
+    return;
+  }
+  try {
+    if (summary) {
+      window.localStorage.setItem(key, JSON.stringify(summary));
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Storage is best-effort; the live thread state remains authoritative.
+  }
+}
+
+function getThreadDiffWorktreePath(thread, providerBinding, liveTerminal) {
+  return String(
+    thread?.coordination?.worktreePath
+      || providerBinding?.coordination?.worktreePath
+      || liveTerminal?.worktreePath
+      || "",
+  ).trim();
+}
+
+function isThreadDiffWorktreePath(path) {
+  const normalized = String(path || "").replace(/\\/g, "/");
+  return normalized.includes("/.agents/worktrees/");
+}
+
+function getThreadDiffTurnId(thread, latestMessage, latestAssistantBlockId) {
+  return String(
+    thread?.latestTurn?.turnId
+      || latestMessage?.turnId
+      || latestAssistantBlockId
+      || "",
+  ).trim();
+}
+
+function unwrapThreadDiffApiResult(value) {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if (value.ok === false) {
+    const error = value.error || {};
+    throw new Error(error.message || error.code || "Diff summary request failed.");
+  }
+  return value.data || value;
+}
+
+function getNumberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeThreadDiffFile(file) {
+  if (!file || typeof file !== "object" || Array.isArray(file)) {
+    return null;
+  }
+  const path = String(file.path || "").replace(/\\/g, "/").trim();
+  if (!path) {
+    return null;
+  }
+  return {
+    additions: getNumberOrNull(file.additions ?? file.linesAdded ?? file.lines_added),
+    binary: file.binary === true,
+    changeKind: String(file.changeKind || file.change_kind || "modified").trim() || "modified",
+    countStatus: String(file.countStatus || file.count_status || "").trim(),
+    deletions: getNumberOrNull(file.deletions ?? file.linesRemoved ?? file.lines_removed),
+    modifiedMs: Number(file.modifiedMs || file.modified_ms || 0) || 0,
+    name: String(file.name || path.split("/").filter(Boolean).pop() || path).trim(),
+    path,
+    untracked: file.untracked === true,
+  };
+}
+
+function normalizeThreadDiffSummary(value) {
+  const data = unwrapThreadDiffApiResult(value);
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  const files = (Array.isArray(data.files) ? data.files : [])
+    .map(normalizeThreadDiffFile)
+    .filter(Boolean)
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const latestFile = normalizeThreadDiffFile(data.latestFile || data.latest_file)
+    || [...files].sort((left, right) => (
+      (right.modifiedMs || 0) - (left.modifiedMs || 0)
+      || left.path.localeCompare(right.path)
+    ))[0]
+    || null;
+  const fileCount = Number(data.fileCount ?? data.file_count ?? files.length) || files.length;
+
+  return {
+    additions: Number(data.additions || 0) || 0,
+    baseSha: String(data.baseSha || data.base_sha || "").trim(),
+    capturedAt: String(data.capturedAt || data.captured_at || "").trim(),
+    deletions: Number(data.deletions || 0) || 0,
+    fileCount,
+    files,
+    latestFile,
+    partial: data.partial === true,
+    summaryKey: String(data.summaryKey || data.summary_key || "").trim(),
+    undoStatus: String(data.undoStatus || data.undo_status || "").trim(),
+    worktreeId: String(data.worktreeId || data.worktree_id || "").trim(),
+    worktreePath: String(data.worktreePath || data.worktree_path || "").trim(),
+  };
+}
+
+function formatThreadDiffFileCount(count) {
+  const safeCount = Math.max(0, Number(count) || 0);
+  return `${safeCount} ${safeCount === 1 ? "file" : "files"} changed`;
+}
+
+function formatThreadDiffCount(value, prefix) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return `${prefix}?`;
+  }
+  return `${prefix}${number}`;
+}
+
+function getThreadDiffReviewPath(summary, file) {
+  return file?.path || summary?.latestFile?.path || summary?.files?.[0]?.path || "";
 }
 
 function messagesContainTurnWork(messages, turnId) {
@@ -4070,11 +4478,140 @@ function ThreadMessage({
   );
 }
 
+function ThreadDiffCounts({ additions, deletions }) {
+  return (
+    <ThreadDiffFileCounts>
+      <DiffCount data-tone="add">{formatThreadDiffCount(additions, "+")}</DiffCount>
+      <DiffCount data-tone="delete">{formatThreadDiffCount(deletions, "-")}</DiffCount>
+    </ThreadDiffFileCounts>
+  );
+}
+
+function LiveDiffActivity({ summary }) {
+  const latestFile = summary?.latestFile || summary?.files?.[0] || null;
+  if (!summary?.fileCount || !latestFile) {
+    return null;
+  }
+
+  return (
+    <ActivityCell>
+      <ActivityBullet aria-hidden="true">
+        <Edit aria-hidden="true" />
+      </ActivityBullet>
+      <ActivityText data-live="true" title={latestFile.path}>
+        <DiffInline>
+          <span>Editing</span>
+          <DiffFileName>{latestFile.name || latestFile.path}</DiffFileName>
+          <DiffCount data-tone="add">{formatThreadDiffCount(latestFile.additions, "+")}</DiffCount>
+          <DiffCount data-tone="delete">{formatThreadDiffCount(latestFile.deletions, "-")}</DiffCount>
+        </DiffInline>
+      </ActivityText>
+    </ActivityCell>
+  );
+}
+
+function ThreadDiffBanner({ onReview, summary }) {
+  if (!summary?.fileCount) {
+    return null;
+  }
+
+  return (
+    <ThreadDiffLiveBanner aria-label="Current file changes">
+      <ThreadDiffBannerTitle title={summary.partial ? "Some binary or large files could not be line-counted." : undefined}>
+        <span>{formatThreadDiffFileCount(summary.fileCount)}</span>
+        <DiffCount data-tone="add">{formatThreadDiffCount(summary.additions, "+")}</DiffCount>
+        <DiffCount data-tone="delete">{formatThreadDiffCount(summary.deletions, "-")}</DiffCount>
+      </ThreadDiffBannerTitle>
+      <ThreadDiffActionButton
+        onClick={() => onReview?.(summary)}
+        title="Review changed files"
+        type="button"
+      >
+        <span>Review</span>
+        <OpenInNew aria-hidden="true" />
+      </ThreadDiffActionButton>
+    </ThreadDiffLiveBanner>
+  );
+}
+
+function ThreadDiffSummaryCard({
+  expanded,
+  onReview,
+  onToggleExpanded,
+  onUndo,
+  summary,
+  undoing = false,
+}) {
+  if (!summary?.fileCount) {
+    return null;
+  }
+  const undone = summary.undoStatus === "undone";
+
+  return (
+    <ThreadDiffCard aria-label="Changed files summary">
+      <ThreadDiffCardHeader>
+        <ThreadDiffCardTitle title={summary.partial ? "Some binary or large files could not be line-counted." : undefined}>
+          <span>{formatThreadDiffFileCount(summary.fileCount)}</span>
+          <DiffCount data-tone="add">{formatThreadDiffCount(summary.additions, "+")}</DiffCount>
+          <DiffCount data-tone="delete">{formatThreadDiffCount(summary.deletions, "-")}</DiffCount>
+        </ThreadDiffCardTitle>
+        <ThreadDiffActionButton
+          disabled={undoing || undone}
+          onClick={() => onUndo?.(summary)}
+          title={undone ? "Changes undone" : "Undo these changes"}
+          type="button"
+        >
+          <span>{undone ? "Undone" : undoing ? "Undoing" : "Undo"}</span>
+          <Undo aria-hidden="true" />
+        </ThreadDiffActionButton>
+        <ThreadDiffActionButton
+          onClick={() => onReview?.(summary)}
+          title="Review changed files"
+          type="button"
+        >
+          <span>Review</span>
+          <OpenInNew aria-hidden="true" />
+        </ThreadDiffActionButton>
+        <ThreadDiffExpandButton
+          aria-label={expanded ? "Collapse changed files" : "Expand changed files"}
+          data-expanded={expanded ? "true" : "false"}
+          onClick={() => onToggleExpanded?.()}
+          title={expanded ? "Collapse changed files" : "Expand changed files"}
+          type="button"
+        >
+          <ExpandMore aria-hidden="true" />
+        </ThreadDiffExpandButton>
+      </ThreadDiffCardHeader>
+      {expanded ? (
+        <ThreadDiffFileList>
+          {summary.files.map((file) => (
+            <ThreadDiffFileRow
+              key={file.path}
+              onClick={() => onReview?.(summary, file)}
+              title={file.path}
+              type="button"
+            >
+              <ThreadDiffFilePath>{file.path}</ThreadDiffFilePath>
+              <ThreadDiffCounts additions={file.additions} deletions={file.deletions} />
+            </ThreadDiffFileRow>
+          ))}
+        </ThreadDiffFileList>
+      ) : null}
+    </ThreadDiffCard>
+  );
+}
+
 function AssistantResponseBlock({
   copyAlwaysVisible = false,
+  diffSummary = null,
+  diffSummaryExpanded = true,
   isCopied = false,
   item,
   onCopyMessage,
+  onReviewDiffSummary,
+  onToggleDiffSummary,
+  onUndoDiffSummary,
+  undoingDiff = false,
   workspace,
 }) {
   const copyText = getAssistantBlockCopyText(item?.items);
@@ -4082,7 +4619,10 @@ function AssistantResponseBlock({
   const copyTitle = isCopied ? "Copied" : "Copy";
 
   return (
-    <AssistantBlock data-message-role="assistant">
+    <AssistantBlock
+      data-has-diff-summary={diffSummary?.fileCount ? "true" : "false"}
+      data-message-role="assistant"
+    >
       {item?.items?.map((blockItem) => (
         blockItem.type === "activity-group" ? (
           <ActivityMessage
@@ -4099,6 +4639,14 @@ function AssistantResponseBlock({
           />
         )
       ))}
+      <ThreadDiffSummaryCard
+        expanded={diffSummaryExpanded}
+        onReview={onReviewDiffSummary}
+        onToggleExpanded={onToggleDiffSummary}
+        onUndo={onUndoDiffSummary}
+        summary={diffSummary}
+        undoing={undoingDiff}
+      />
       {canCopy ? (
         <MessageCopyButton
           aria-label={copyTitle}
@@ -4134,6 +4682,7 @@ function WorkspaceThreadDetail({
   todoDropTarget = false,
   todoDropUnsupportedMessage = "",
   workspace,
+  workspaceRoot = "",
   workspaceThreadEntry,
 }) {
   const [draft, setDraft] = useState("");
@@ -4142,6 +4691,11 @@ function WorkspaceThreadDetail({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [copiedMessageId, setCopiedMessageId] = useState("");
+  const [liveDiffSummary, setLiveDiffSummary] = useState(null);
+  const [finalDiffSummary, setFinalDiffSummary] = useState(null);
+  const [diffSummaryExpanded, setDiffSummaryExpanded] = useState(true);
+  const [diffRefreshToken, setDiffRefreshToken] = useState(0);
+  const [undoingDiffKey, setUndoingDiffKey] = useState("");
   const detailRootRef = useRef(null);
   const composerBoxRef = useRef(null);
   const composerInputRef = useRef(null);
@@ -4246,6 +4800,25 @@ function WorkspaceThreadDetail({
     [messages, thread, threadGroundTruth],
   );
   const latestActivity = activityItems[activityItems.length - 1] || null;
+  const diffWorktreePath = getThreadDiffWorktreePath(thread, activeProviderBinding, effectiveLiveTerminal);
+  const diffRepoPath = String(
+    workspaceRoot
+      || workspace?.rootDirectory
+      || workspace?.workingDirectory
+      || "",
+  ).trim();
+  const diffTurnId = getThreadDiffTurnId(thread, latestMessage, latestAssistantBlockId);
+  const diffStorageKey = getThreadDiffStorageKey(
+    workspace?.id || thread?.workspaceId || "",
+    thread?.id || "",
+    diffTurnId,
+  );
+  const diffTurnLive = threadDiffTurnIsLive(thread, threadGroundTruth);
+  const diffTurnTerminal = threadDiffTurnIsTerminal(thread, threadGroundTruth, Boolean(latestAssistantBlockId));
+  const visibleFinalDiffSummary = diffTurnTerminal ? finalDiffSummary : null;
+  const visibleLiveDiffSummary = liveDiffSummary?.fileCount && !visibleFinalDiffSummary?.fileCount
+    ? liveDiffSummary
+    : null;
   useEffect(() => {
     const snapshot = getThreadDetailRenderDiagnosticSnapshot({
       activeAgentId,
@@ -4289,6 +4862,101 @@ function WorkspaceThreadDetail({
     workspace,
     workspaceThreadEntry,
   ]);
+
+  useEffect(() => {
+    setFinalDiffSummary(readStoredThreadDiffSummary(diffStorageKey));
+    setDiffSummaryExpanded(true);
+  }, [diffStorageKey]);
+
+  useEffect(() => {
+    if (!thread?.id || !diffWorktreePath || !isThreadDiffWorktreePath(diffWorktreePath)) {
+      setLiveDiffSummary(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timeoutId = 0;
+
+    const fetchSummary = async () => {
+      try {
+        const result = await invoke("coordination_worktree_diff_summary", {
+          dbPath: null,
+          input: {
+            threadId: thread?.id || "",
+            turnId: diffTurnId,
+            worktreePath: diffWorktreePath,
+            workspaceId: workspace?.id || thread?.workspaceId || "",
+          },
+          repoPath: diffRepoPath || null,
+        });
+        const summary = normalizeThreadDiffSummary(result);
+        if (!cancelled) {
+          setLiveDiffSummary(summary?.fileCount ? summary : null);
+        }
+      } catch (summaryError) {
+        if (!cancelled) {
+          setLiveDiffSummary(null);
+        }
+        console.warn("Unable to read thread diff summary", summaryError);
+      }
+    };
+
+    fetchSummary();
+
+    const poll = async () => {
+      await fetchSummary();
+      if (!cancelled && diffTurnLive) {
+        timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
+      }
+    };
+
+    if (diffTurnLive) {
+      timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
+    }
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [
+    diffRefreshToken,
+    diffRepoPath,
+    diffTurnId,
+    diffTurnLive,
+    diffWorktreePath,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
+
+  useEffect(() => {
+    if (!diffStorageKey || !diffTurnTerminal || !liveDiffSummary?.fileCount) {
+      return;
+    }
+    const nextSummary = {
+      ...liveDiffSummary,
+      capturedAt: liveDiffSummary.capturedAt || new Date().toISOString(),
+      turnId: diffTurnId,
+    };
+    setFinalDiffSummary((currentSummary) => {
+      if (
+        currentSummary?.summaryKey === nextSummary.summaryKey
+        && currentSummary?.undoStatus === nextSummary.undoStatus
+      ) {
+        return currentSummary;
+      }
+      writeStoredThreadDiffSummary(diffStorageKey, nextSummary);
+      return nextSummary;
+    });
+  }, [
+    diffStorageKey,
+    diffTurnId,
+    diffTurnTerminal,
+    liveDiffSummary,
+  ]);
+
   const activeProviderModelId = String(
     activeProviderBinding?.modelId
       || activeProviderBinding?.model
@@ -4375,6 +5043,61 @@ function WorkspaceThreadDetail({
       }, 1400);
     } catch (copyError) {
       console.warn("Unable to copy thread message", copyError);
+    }
+  };
+
+  const reviewDiffSummary = (summary, file = null) => {
+    const targetPath = getThreadDiffReviewPath(summary, file);
+    if (!targetPath) {
+      return;
+    }
+    openWorkspaceFile(workspace, targetPath, {
+      reviewMode: "worktree_diff",
+      worktreePath: summary?.worktreePath || diffWorktreePath || "",
+    });
+  };
+
+  const undoDiffSummary = async (summary) => {
+    if (!summary?.summaryKey || !summary?.worktreePath) {
+      return;
+    }
+    if (
+      typeof window !== "undefined"
+      && !window.confirm(`Undo ${formatThreadDiffFileCount(summary.fileCount)} from this thread?`)
+    ) {
+      return;
+    }
+
+    setUndoingDiffKey(summary.summaryKey);
+    setError("");
+    try {
+      const result = await invoke("coordination_undo_worktree_diff_summary", {
+        dbPath: null,
+        input: {
+          baseSha: summary.baseSha,
+          expectedSummaryKey: summary.summaryKey,
+          threadId: thread?.id || "",
+          turnId: diffTurnId,
+          worktreePath: summary.worktreePath,
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        },
+        repoPath: diffRepoPath || null,
+      });
+      unwrapThreadDiffApiResult(result);
+      const undoneSummary = {
+        ...summary,
+        undoStatus: "undone",
+        undoneAt: new Date().toISOString(),
+      };
+      setFinalDiffSummary(undoneSummary);
+      writeStoredThreadDiffSummary(diffStorageKey, undoneSummary);
+      setDiffRefreshToken((token) => token + 1);
+    } catch (undoError) {
+      const message = undoError?.message || "Unable to undo these changes.";
+      setError(message);
+      console.warn("Unable to undo thread diff summary", undoError);
+    } finally {
+      setUndoingDiffKey("");
     }
   };
 
@@ -5469,10 +6192,16 @@ function WorkspaceThreadDetail({
             item.type === "assistant-block" ? (
               <AssistantResponseBlock
                 copyAlwaysVisible={item.id === latestAssistantBlockId}
+                diffSummary={item.id === latestAssistantBlockId ? visibleFinalDiffSummary : null}
+                diffSummaryExpanded={diffSummaryExpanded}
                 isCopied={copiedMessageId === item.id}
                 item={item}
                 key={item.id}
                 onCopyMessage={handleCopyMessage}
+                onReviewDiffSummary={reviewDiffSummary}
+                onToggleDiffSummary={() => setDiffSummaryExpanded((expanded) => !expanded)}
+                onUndoDiffSummary={undoDiffSummary}
+                undoingDiff={Boolean(undoingDiffKey && undoingDiffKey === visibleFinalDiffSummary?.summaryKey)}
                 workspace={workspace}
               />
             ) : item.type === "activity-group" ? (
@@ -5492,6 +6221,7 @@ function WorkspaceThreadDetail({
             )
           ))}
 
+          <LiveDiffActivity summary={visibleLiveDiffSummary} />
           {activityItems.map((item) => (
             <ActivityCell key={item.id}>
               <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
@@ -5507,6 +6237,10 @@ function WorkspaceThreadDetail({
           submitDraft();
         }}
       >
+        <ThreadDiffBanner
+          onReview={reviewDiffSummary}
+          summary={visibleLiveDiffSummary}
+        />
         <HiddenFileInput
           accept={IMAGE_ATTACHMENT_ACCEPT}
           multiple

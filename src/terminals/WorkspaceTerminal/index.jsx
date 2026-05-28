@@ -11792,6 +11792,7 @@ function WorkspaceTerminal({
                   todoDropTarget={todoDropTarget}
                   todoDropUnsupportedMessage={todoDropUnsupportedMessage}
                   workspace={workspace}
+                  workspaceRoot={workingDirectory}
                   workspaceThreadEntry={workspaceThreadEntry}
                 />
               </TerminalInlineUiView>
@@ -11963,6 +11964,7 @@ function WorkspaceTerminal({
               todoDropTarget={todoDropTarget}
               todoDropUnsupportedMessage={todoDropUnsupportedMessage}
               viewState={workspaceThreads?.[workspace?.id || ""]?.threadsView}
+              workspaceRoot={workingDirectory}
               workspaceThreads={workspaceThreads}
               workspaces={workspaces}
             />
