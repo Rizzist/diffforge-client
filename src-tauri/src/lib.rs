@@ -2279,15 +2279,11 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
         &app_for_shutdown,
         "stopping_syncs",
         "Stopping syncs",
-        "Stopping knowledge graph sync tasks.",
+        "Stopping graph sync tasks.",
         3,
         None,
         None,
     );
-    {
-        let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
-        let _ = cloud_mcp_stop_all_knowledge_graph_syncs(cloud_mcp_state.inner()).await;
-    }
 
     emit_app_shutdown_progress(
         &app_for_shutdown,
@@ -2794,10 +2790,6 @@ pub fn run() {
             cloud_mcp_start_spec_graph_sync,
             cloud_mcp_stop_spec_graph_sync,
             cloud_mcp_get_spec_graph,
-            cloud_mcp_get_cached_knowledge_graph,
-            cloud_mcp_start_knowledge_graph_sync,
-            cloud_mcp_stop_knowledge_graph_sync,
-            cloud_mcp_get_knowledge_graph,
             agent_thread_session_discover,
             agent_thread_transcript,
             terminal_open,

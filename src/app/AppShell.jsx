@@ -747,7 +747,6 @@ function readMainWindowFocusedFallback() {
 }
 
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
-const KNOWLEDGE_GRAPH_CACHE_EVENT = "cloud-mcp-knowledge-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const APP_SHUTDOWN_PROGRESS_EVENT = "forge-app-shutdown-progress";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
@@ -1438,7 +1437,7 @@ const WORKSPACE_SHUTDOWN_STEPS = [
     label: "Stopping watchers",
   },
   {
-    detail: "Stopping knowledge graph sync tasks.",
+    detail: "Stopping graph sync tasks.",
     id: "stopping_syncs",
     label: "Stopping syncs",
   },
@@ -3067,7 +3066,7 @@ function normalizeGraphWorkspacePath(value) {
 }
 
 function graphSnapshotBody(snapshot) {
-  return snapshot?.specGraph || snapshot?.knowledgeGraph || snapshot?.raw || {};
+  return snapshot?.specGraph || snapshot?.raw || {};
 }
 
 function graphSnapshotWorkspaceId(snapshot) {
@@ -3247,7 +3246,11 @@ function normalizeWorkspaceTerminalSlotIndexes(indexes) {
 
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
   if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
-    return normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId]);
+    const normalizedIndexes = normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId]);
+    const safeTerminalCount = Number.parseInt(terminalCount, 10);
+    return Number.isInteger(safeTerminalCount) && safeTerminalCount > 0
+      ? normalizedIndexes.slice(0, safeTerminalCount)
+      : normalizedIndexes;
   }
 
   return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
@@ -3605,7 +3608,7 @@ export default function App() {
     }));
   }, []);
 
-  const applyWorkspaceGraphSnapshot = useCallback((kind, repoPath, workspaceId, snapshot) => {
+  const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
     const snapshotRepoPath = graphSnapshotRepoPath(snapshot);
     const snapshotWorkspaceId = graphSnapshotWorkspaceId(snapshot);
@@ -3614,12 +3617,6 @@ export default function App() {
       workspaceId || snapshotWorkspaceId,
     ) || workspaceGraphSnapshotKey(snapshot);
     if (!key) return;
-
-    const snapshotKey = kind === "knowledge" ? "knowledgeSnapshot" : "specSnapshot";
-    const stateKey = kind === "knowledge" ? "knowledgeState" : "specState";
-    const errorKey = kind === "knowledge" ? "knowledgeError" : "specError";
-    const updatedAtKey = kind === "knowledge" ? "knowledgeUpdatedAt" : "specUpdatedAt";
-    const fallbackState = kind === "knowledge" ? "local" : "empty";
 
     setWorkspaceGraphState((current) => {
       const keysToUpdate = new Set([key]);
@@ -3639,10 +3636,10 @@ export default function App() {
           ...previous,
           repoPath: repoPath || previous.repoPath || snapshotRepoPath,
           workspaceId: workspaceId || previous.workspaceId || snapshotWorkspaceId,
-          [snapshotKey]: snapshot,
-          [stateKey]: graphSnapshotSyncState(snapshot, fallbackState),
-          [errorKey]: graphSnapshotSyncError(snapshot),
-          [updatedAtKey]: Date.now(),
+          specSnapshot: snapshot,
+          specState: graphSnapshotSyncState(snapshot, "empty"),
+          specError: graphSnapshotSyncError(snapshot),
+          specUpdatedAt: Date.now(),
         };
       });
       return next;
@@ -3657,10 +3654,10 @@ export default function App() {
     let disposed = false;
     const unlisteners = [];
 
-    const attach = (eventName, kind) => {
+    const attach = (eventName) => {
       listen(eventName, (event) => {
         if (disposed) return;
-        applyWorkspaceGraphSnapshot(kind, "", "", event?.payload);
+        applyWorkspaceGraphSnapshot("", "", event?.payload);
       }).then((unlisten) => {
         if (disposed) {
           unlisten();
@@ -3670,8 +3667,7 @@ export default function App() {
       });
     };
 
-    attach(SPEC_GRAPH_CACHE_EVENT, "spec");
-    attach(KNOWLEDGE_GRAPH_CACHE_EVENT, "knowledge");
+    attach(SPEC_GRAPH_CACHE_EVENT);
 
     return () => {
       disposed = true;
@@ -7924,7 +7920,13 @@ export default function App() {
           return null;
         }
 
-        const terminals = descriptor.logicalTerminalIndexes
+        const displayedTerminalIndexes = normalizeWorkspaceTerminalSlotIndexes(
+          flattenWorkspaceDisplayRows(descriptor.displayRows),
+        ).filter((terminalIndex) => descriptor.logicalTerminalIndexes.includes(terminalIndex));
+        const presenceTerminalIndexes = displayedTerminalIndexes.length
+          ? displayedTerminalIndexes
+          : descriptor.logicalTerminalIndexes;
+        const terminals = presenceTerminalIndexes
           .map((terminalIndex) => {
             const normalizedRole = normalizeWorkspaceTerminalRole(
               descriptor.terminalRolesByIndex?.[terminalIndex],
@@ -7948,6 +7950,7 @@ export default function App() {
                 || "",
             ).trim().toLowerCase();
             const status = (() => {
+              if (!hasSession) return "ready";
               if (["thinking", "reasoning"].includes(rawActivity)) return "thinking";
               if ([
                 "busy",
@@ -7960,8 +7963,7 @@ export default function App() {
               ].includes(rawActivity)) return "working";
               if (["paused", "parked", "waiting", "resume_ready"].includes(rawActivity)) return "paused";
               if (["error", "failed", "blocked"].includes(rawActivity)) return "error";
-              if (["closed", "closing", "stopped"].includes(rawActivity)) return "closed";
-              if (!hasSession) return "no_session";
+              if (["closed", "closing", "stopped"].includes(rawActivity)) return "idle";
               return "idle";
             })();
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
@@ -8513,7 +8515,6 @@ export default function App() {
 
     let cancelled = false;
     let specSyncGeneration = null;
-    let knowledgeSyncGeneration = null;
     const workspaceId = activatedWorkspaceIdForGraphSync;
     const workspaceName = activatedWorkspaceNameForGraphSync || null;
     const stopSyncs = () => {
@@ -8523,19 +8524,11 @@ export default function App() {
           syncGeneration: specSyncGeneration,
         }).catch(() => {});
       }
-      if (knowledgeSyncGeneration) {
-        invoke("cloud_mcp_stop_knowledge_graph_sync", {
-          repoPath,
-          syncGeneration: knowledgeSyncGeneration,
-        }).catch(() => {});
-      }
     };
 
     setWorkspaceGraphStatus(repoPath, workspaceId, {
       specState: "loading",
       specError: "",
-      knowledgeState: "loading",
-      knowledgeError: "",
     });
 
     invoke("cloud_mcp_get_cached_spec_graph", {
@@ -8544,30 +8537,13 @@ export default function App() {
       workspaceName,
     })
       .then((result) => {
-        if (!cancelled) applyWorkspaceGraphSnapshot("spec", repoPath, workspaceId, result);
+        if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
       })
       .catch((error) => {
         if (!cancelled) {
           setWorkspaceGraphStatus(repoPath, workspaceId, {
             specState: "error",
             specError: getErrorMessage(error, "Unable to load cached Spec Graph."),
-          });
-        }
-      });
-
-    invoke("cloud_mcp_get_cached_knowledge_graph", {
-      repoPath,
-      workspaceId,
-      workspaceName,
-    })
-      .then((result) => {
-        if (!cancelled) applyWorkspaceGraphSnapshot("knowledge", repoPath, workspaceId, result);
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setWorkspaceGraphStatus(repoPath, workspaceId, {
-            knowledgeState: "error",
-            knowledgeError: getErrorMessage(error, "Unable to load cached Knowledge Graph."),
           });
         }
       });
@@ -8579,7 +8555,7 @@ export default function App() {
     })
       .then((result) => {
         specSyncGeneration = Number(result?.syncGeneration) || null;
-        if (!cancelled) applyWorkspaceGraphSnapshot("spec", repoPath, workspaceId, result);
+        if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
         if (cancelled) {
           stopSyncs();
         }
@@ -8589,27 +8565,6 @@ export default function App() {
           setWorkspaceGraphStatus(repoPath, workspaceId, {
             specState: "error",
             specError: getErrorMessage(error, "Unable to start Spec Graph sync."),
-          });
-        }
-      });
-
-    invoke("cloud_mcp_start_knowledge_graph_sync", {
-      repoPath,
-      workspaceId,
-      workspaceName,
-    })
-      .then((result) => {
-        knowledgeSyncGeneration = Number(result?.syncGeneration) || null;
-        if (!cancelled) applyWorkspaceGraphSnapshot("knowledge", repoPath, workspaceId, result);
-        if (cancelled) {
-          stopSyncs();
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setWorkspaceGraphStatus(repoPath, workspaceId, {
-            knowledgeState: "error",
-            knowledgeError: getErrorMessage(error, "Unable to start Knowledge Graph sync."),
           });
         }
       });
@@ -12454,9 +12409,6 @@ export default function App() {
                   {selectedWorkspace ? (
                     <SpecGraphWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
-                      knowledgeGraphError={selectedWorkspaceGraphState.knowledgeError || ""}
-                      knowledgeGraphSnapshot={selectedWorkspaceGraphState.knowledgeSnapshot || null}
-                      knowledgeGraphState={selectedWorkspaceGraphState.knowledgeState || "idle"}
                       isWorkspaceActive={Boolean(
                         isSelectedWorkspaceActivated
                         && !workspaceDeactivationState.isActive,

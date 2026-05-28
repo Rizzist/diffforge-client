@@ -11,6 +11,8 @@ import styled, { keyframes } from "styled-components";
 import {
   ButtonForgeIcon,
   ButtonFolderIcon,
+  ButtonFullscreenExitIcon,
+  ButtonFullscreenIcon,
   DashboardTitle,
   ForgeWorkspace,
   FormMessage,
@@ -26,6 +28,9 @@ import {
   SetupField,
   SetupHeader,
   SetupInput,
+  TitleMaximizeIcon,
+  TitleMinimizeIcon,
+  TitleRestoreIcon,
   WorkspaceRootActions,
   WorkspaceRootChooser,
   WorkspaceSetupPanel,
@@ -595,15 +600,50 @@ function drawOrchestratorVoiceCanvasRing(context, waveform, options = {}) {
 }
 
 const TerminalWorkspaceMain = styled.div`
+  position: relative;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
   display: flex;
   overflow: hidden;
+  background: #020304;
 
   html[data-forge-theme="light"] & {
     background: #f5f5f7;
+  }
+
+  &[data-workspace-tool-fullscreen="true"] [data-workspace-tool-main-grid="true"] {
+    opacity: 0.36;
+    filter: brightness(0.6) saturate(0.78);
+    pointer-events: none;
+  }
+
+  &[data-workspace-tool-fullscreen="true"] [data-workspace-tool-resize-handle="true"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
+    position: absolute !important;
+    inset: 0;
+    z-index: 320;
+    flex: none !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    overflow: visible;
+    box-shadow:
+      0 34px 90px rgba(0, 0, 0, 0.54),
+      0 0 0 1px rgba(226, 232, 240, 0.08);
+  }
+
+  html[data-forge-theme="light"] & [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
+    box-shadow:
+      0 30px 70px rgba(15, 23, 42, 0.16),
+      0 0 0 1px rgba(0, 0, 0, 0.08);
   }
 `;
 
@@ -691,7 +731,7 @@ const TerminalSurfaceSlot = styled.div`
 `;
 
 const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
-const TODO_QUEUE_VISIBLE_MIN_WIDTH = 1120;
+const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 4000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
@@ -733,6 +773,10 @@ const WORKSPACE_TOOL_TABS = [
   { id: "files", label: "Files" },
   { id: "web", label: "Web" },
 ];
+const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
+const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
+const TODO_QUEUE_PANE_MODE_MAXIMIZED = "maximized";
+const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
 
 const TodoQueueSurface = styled.aside`
   display: grid;
@@ -740,7 +784,7 @@ const TodoQueueSurface = styled.aside`
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   padding: 0;
   border-left: 1px solid rgba(230, 236, 245, 0.08);
   color: #e8eef8;
@@ -754,6 +798,157 @@ const TodoQueueSurface = styled.aside`
     color: #1d1d1f;
     background: #f5f5f7;
   }
+
+  &[data-pane-mode="fullscreen"] {
+    border-left: 0;
+  }
+`;
+
+const WorkspaceToolTopBar = styled.div`
+  display: grid;
+  min-height: 34px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 7px 4px 10px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.045)),
+    rgba(12, 16, 23, 0.66);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 10px 30px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(18px) saturate(150%);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.74)),
+      rgba(245, 245, 247, 0.78);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.95),
+      0 10px 24px rgba(15, 23, 42, 0.07);
+  }
+`;
+
+const WorkspaceToolTitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(232, 238, 248, 0.92);
+  font-size: 11px;
+  font-weight: 860;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #2a2c31;
+  }
+`;
+
+const WorkspaceToolControls = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+`;
+
+const WorkspaceToolControlButton = styled.button`
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(232, 238, 248, 0.74);
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  &:active {
+    transform: translateY(1px);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #5d626c;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #1d1d1f;
+    background: rgba(0, 0, 0, 0.07);
+  }
+`;
+
+const WorkspaceToolMinimizedRail = styled.aside`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  justify-items: center;
+  gap: 8px;
+  padding: 7px 4px;
+  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  color: rgba(232, 238, 248, 0.86);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.035)),
+    rgba(8, 12, 18, 0.82);
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+  backdrop-filter: blur(18px) saturate(150%);
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(0, 0, 0, 0.08);
+    color: #2a2c31;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.68)),
+      rgba(245, 245, 247, 0.78);
+    box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.8);
+  }
+`;
+
+const WorkspaceToolRailLabel = styled.div`
+  align-self: center;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  overflow: hidden;
+  color: rgba(232, 238, 248, 0.72);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #5d626c;
+  }
+`;
+
+const WorkspaceToolRailControls = styled.div`
+  display: grid;
+  gap: 4px;
 `;
 
 const OrchestratorTopNav = styled.div`
@@ -4333,14 +4528,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onBeginTodoDrag,
   onCancelQueuedItem,
   onDraftChange,
+  onMaximizePane,
+  onMinimizePane,
   onOpenWorkspaceSettings,
   onQueueItem,
   onRemoveItem,
   onReorderItem,
+  onRestorePane,
   onSubmitDraft,
+  onToggleFullscreenPane,
   onUpdateItem,
   onVoiceAgentToolCall,
   onVoicePlanServerResult,
+  paneMode = TODO_QUEUE_PANE_MODE_NORMAL,
   pendingItems = {},
   rootDirectory = "",
   workspace,
@@ -5775,6 +5975,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [items, onReorderItem, reorderingItemId]);
 
   const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
+  const activeWorkspaceToolLabel = WORKSPACE_TOOL_TABS.find((tool) => (
+    tool.id === activeWorkspaceTool
+  ))?.label || "Orchestrator";
+  const paneFullscreen = paneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const paneMaximized = paneMode === TODO_QUEUE_PANE_MODE_MAXIMIZED;
   const orchestratorVoiceInputActive = orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening";
   const orchestratorVoiceHasSignal = orchestratorVoiceInputActive && orchestratorVoiceLevel >= 6;
@@ -5803,7 +6008,50 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorChatCanSend = Boolean(orchestratorChatDraft.trim()) && !orchestratorChatBusy;
 
   return (
-    <TodoQueueSurface aria-label="Orchestrator">
+    <TodoQueueSurface
+      aria-label="Workspace tools"
+      data-pane-mode={paneMode}
+      data-tool-fullscreen={paneFullscreen ? "true" : undefined}
+    >
+      <WorkspaceToolTopBar>
+        <WorkspaceToolTitle title={activeWorkspaceToolLabel}>
+          {activeWorkspaceToolLabel}
+        </WorkspaceToolTitle>
+        <WorkspaceToolControls aria-label="Workspace tool pane controls">
+          <WorkspaceToolControlButton
+            aria-label="Minimize workspace tools"
+            onClick={onMinimizePane}
+            title="Minimize"
+            type="button"
+          >
+            <TitleMinimizeIcon aria-hidden="true" />
+          </WorkspaceToolControlButton>
+          <WorkspaceToolControlButton
+            aria-label={paneMaximized || paneFullscreen ? "Restore workspace tools" : "Maximize workspace tools"}
+            onClick={paneFullscreen ? onRestorePane : onMaximizePane}
+            title={paneMaximized || paneFullscreen ? "Restore" : "Maximize"}
+            type="button"
+          >
+            {paneMaximized || paneFullscreen ? (
+              <TitleRestoreIcon aria-hidden="true" />
+            ) : (
+              <TitleMaximizeIcon aria-hidden="true" />
+            )}
+          </WorkspaceToolControlButton>
+          <WorkspaceToolControlButton
+            aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
+            onClick={onToggleFullscreenPane}
+            title={paneFullscreen ? "Exit big view" : "Big view"}
+            type="button"
+          >
+            {paneFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </WorkspaceToolControlButton>
+        </WorkspaceToolControls>
+      </WorkspaceToolTopBar>
       <OrchestratorTopNav aria-label="Workspace tool">
         {WORKSPACE_TOOL_TABS.map((tool) => (
           <OrchestratorTopButton
@@ -6311,14 +6559,33 @@ function TerminalView({
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
+  const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
+  const todoQueueVisible = Boolean(
+    hasVisibleWorkspaceTerminalPanes
+    && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
+  );
+  const todoQueuePaneMinimized = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
+  const todoQueuePaneMaximized = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_MAXIMIZED;
+  const todoQueuePaneFullscreen = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const todoQueuePanelSize = todoQueuePaneMinimized
+    ? 5
+    : todoQueuePaneMaximized || todoQueuePaneFullscreen
+      ? 62
+      : 30;
+  const terminalGridPanelSize = 100 - todoQueuePanelSize;
+  const todoQueuePanelMinSize = todoQueuePaneMinimized ? 5 : 20;
+  const todoQueuePanelMaxSize = todoQueuePaneMinimized ? 5 : 70;
+  const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
   const fullscreenTransitionTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
   const terminalDragStateRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
   const terminalPanelRectRef = useRef(null);
+  const terminalGridPanelRef = useRef(null);
   const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
+  const todoQueuePanelRef = useRef(null);
   const todoDragStateRef = useRef(null);
   const todoQueueDispatchingRef = useRef(false);
   const todoQueueItemsRef = useRef([]);
@@ -7384,6 +7651,32 @@ function TerminalView({
 
     return () => observer.disconnect();
   }, [shouldShowWorkspaceSetup]);
+
+  useEffect(() => {
+    if (!todoQueueVisible && todoQueuePaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
+      setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+    }
+  }, [todoQueuePaneMode, todoQueueVisible]);
+
+  useEffect(() => {
+    if (!todoQueueVisible || !hasVisibleWorkspaceTerminalPanes) {
+      return undefined;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      terminalGridPanelRef.current?.resize?.(terminalGridPanelSize);
+      todoQueuePanelRef.current?.resize?.(todoQueuePanelSize);
+      scheduleMeasureTerminalLayout();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    hasVisibleWorkspaceTerminalPanes,
+    scheduleMeasureTerminalLayout,
+    terminalGridPanelSize,
+    todoQueuePanelSize,
+    todoQueueVisible,
+  ]);
 
   useLayoutEffect(() => {
     measureTerminalLayout();
@@ -10723,6 +11016,30 @@ function TerminalView({
     terminalWorkspace?.id,
   ]);
 
+  const minimizeTodoQueuePane = useCallback(() => {
+    setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
+  }, []);
+
+  const restoreTodoQueuePane = useCallback(() => {
+    setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+  }, []);
+
+  const toggleMaximizeTodoQueuePane = useCallback(() => {
+    setTodoQueuePaneMode((currentMode) => (
+      currentMode === TODO_QUEUE_PANE_MODE_MAXIMIZED
+        ? TODO_QUEUE_PANE_MODE_NORMAL
+        : TODO_QUEUE_PANE_MODE_MAXIMIZED
+    ));
+  }, []);
+
+  const toggleFullscreenTodoQueuePane = useCallback(() => {
+    setTodoQueuePaneMode((currentMode) => (
+      currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
+        ? TODO_QUEUE_PANE_MODE_NORMAL
+        : TODO_QUEUE_PANE_MODE_FULLSCREEN
+    ));
+  }, []);
+
   const getTerminalSlotStyle = useCallback((terminalIndex) => {
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
     const fullscreenThisTerminal = fullscreenActive && fullscreenTerminalIndex === terminalIndex;
@@ -10769,10 +11086,6 @@ function TerminalView({
     terminalPanelRect,
   ]);
 
-  const todoQueueVisible = Boolean(
-    hasVisibleWorkspaceTerminalPanes
-    && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
-  );
   const todoDragOverDropTarget = Boolean(
     todoDragActive && Number.isInteger(todoDragState?.targetTerminalIndex),
   );
@@ -11009,53 +11322,101 @@ function TerminalView({
           </PrimaryButton>
         </WorkspaceSetupPanel>
       ) : (
-          <TerminalWorkspaceMain ref={terminalWorkspaceMainRef}>
+          <TerminalWorkspaceMain
+            data-workspace-tool-fullscreen={todoQueuePaneFullscreen ? "true" : "false"}
+            data-workspace-tool-pane-mode={todoQueuePaneMode}
+            ref={terminalWorkspaceMainRef}
+          >
             {hasVisibleWorkspaceTerminalPanes ? (
               <ResizePanelGroup
                 id={`workspace-terminal-main-${terminalWorkspace.id}`}
                 orientation="horizontal"
               >
                 <ResizePanel
-                  defaultSize={todoQueueVisible ? "76%" : "100%"}
+                  data-workspace-tool-main-grid="true"
+                  defaultSize={todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
                   id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
-                  minSize={todoQueueVisible ? "54%" : "100%"}
+                  minSize={todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
+                  ref={terminalGridPanelRef}
                 >
                   {terminalWorkspaceContent}
                 </ResizePanel>
                 {todoQueueVisible && (
                   <>
-                    <ResizeHandle data-direction="horizontal" />
+                    <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
                     <ResizePanel
-                      defaultSize="24%"
+                      data-pane-mode={todoQueuePaneMode}
+                      data-workspace-tool-panel="true"
+                      defaultSize={`${todoQueuePanelSize}%`}
                       id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
-                      maxSize="36%"
-                      minSize="18%"
+                      maxSize={`${todoQueuePanelMaxSize}%`}
+                      minSize={`${todoQueuePanelMinSize}%`}
+                      ref={todoQueuePanelRef}
                     >
-                      <TodoQueuePanel
-                        activeDragItemId={todoDragState?.itemId || ""}
-                        agentStatuses={agentStatuses}
-                        defaultWorkingDirectory={defaultWorkingDirectory}
-                        draft={todoQueueDraft}
-                        dropError={todoDropError}
-                        items={todoQueueItems}
-                        onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
-                        onBeginTodoDrag={handleBeginTodoDrag}
-                        onCancelQueuedItem={cancelQueuedTodoQueueItem}
-                        onDraftChange={setTodoQueueDraft}
-                        onOpenWorkspaceSettings={onOpenWorkspaceSettings}
-                        onQueueItem={queueTodoQueueItem}
-                        onRemoveItem={removeTodoQueueItem}
-                        onReorderItem={reorderTodoQueueItem}
-                        onSubmitDraft={submitTodoQueueDraft}
-                        onUpdateItem={updateTodoQueueItemText}
-                        onVoiceAgentToolCall={handleVoiceAgentToolCall}
-                        onVoicePlanServerResult={handleVoicePlanServerResult}
-                        pendingItems={todoQueuePendingItems}
-                        rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
-                        workspace={terminalWorkspace}
-                        workspaceError={workspaceError}
-                        workspaceId={terminalWorkspace.id}
-                      />
+                      {todoQueuePaneMinimized ? (
+                        <WorkspaceToolMinimizedRail aria-label="Workspace tools minimized">
+                          <WorkspaceToolRailControls>
+                            <WorkspaceToolControlButton
+                              aria-label="Restore workspace tools"
+                              onClick={restoreTodoQueuePane}
+                              title="Restore"
+                              type="button"
+                            >
+                              <TitleRestoreIcon aria-hidden="true" />
+                            </WorkspaceToolControlButton>
+                            <WorkspaceToolControlButton
+                              aria-label="Maximize workspace tools"
+                              onClick={toggleMaximizeTodoQueuePane}
+                              title="Maximize"
+                              type="button"
+                            >
+                              <TitleMaximizeIcon aria-hidden="true" />
+                            </WorkspaceToolControlButton>
+                          </WorkspaceToolRailControls>
+                          <WorkspaceToolRailLabel>Tools</WorkspaceToolRailLabel>
+                          <WorkspaceToolRailControls>
+                            <WorkspaceToolControlButton
+                              aria-label="Open workspace tools big view"
+                              onClick={toggleFullscreenTodoQueuePane}
+                              title="Big view"
+                              type="button"
+                            >
+                              <ButtonFullscreenIcon aria-hidden="true" />
+                            </WorkspaceToolControlButton>
+                          </WorkspaceToolRailControls>
+                        </WorkspaceToolMinimizedRail>
+                      ) : (
+                        <TodoQueuePanel
+                          activeDragItemId={todoDragState?.itemId || ""}
+                          agentStatuses={agentStatuses}
+                          defaultWorkingDirectory={defaultWorkingDirectory}
+                          draft={todoQueueDraft}
+                          dropError={todoDropError}
+                          items={todoQueueItems}
+                          onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
+                          onBeginTodoDrag={handleBeginTodoDrag}
+                          onCancelQueuedItem={cancelQueuedTodoQueueItem}
+                          onDraftChange={setTodoQueueDraft}
+                          onMaximizePane={toggleMaximizeTodoQueuePane}
+                          onMinimizePane={minimizeTodoQueuePane}
+                          onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+                          onQueueItem={queueTodoQueueItem}
+                          onRemoveItem={removeTodoQueueItem}
+                          onReorderItem={reorderTodoQueueItem}
+                          onRestorePane={restoreTodoQueuePane}
+                          onSubmitDraft={submitTodoQueueDraft}
+                          onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
+                          onUpdateItem={updateTodoQueueItemText}
+                          onVoiceAgentToolCall={handleVoiceAgentToolCall}
+                          onVoicePlanServerResult={handleVoicePlanServerResult}
+                          paneMode={todoQueuePaneMode}
+                          pendingItems={todoQueuePendingItems}
+                          rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+                          workspace={terminalWorkspace}
+                          workspaceError={workspaceError}
+                          workspaceId={terminalWorkspace.id}
+                        />
+                      )}
                     </ResizePanel>
                   </>
                 )}
