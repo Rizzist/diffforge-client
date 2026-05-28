@@ -5,6 +5,11 @@ use notify::{
 
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
+const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = true;
+const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_APP_WS_URL";
+const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str =
+    "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
+const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL: &str = "ws://127.0.0.1:8080/v1/app/ws";
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
@@ -38,6 +43,8 @@ struct CloudMcpState {
     spec_graph_filetree_sync_requests: Arc<Mutex<HashMap<String, u64>>>,
     knowledge_graph_syncs: Arc<Mutex<HashMap<String, CloudMcpKnowledgeGraphSyncRuntime>>>,
     global_ws_started: Arc<AtomicBool>,
+    global_ws_epoch: Arc<AtomicU64>,
+    global_ws_reconnect: Arc<tokio::sync::Notify>,
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
@@ -248,7 +255,7 @@ struct CloudMcpWorkspaceRegistrationResult {
 
 impl CloudMcpState {
     fn new() -> Self {
-        let (global_ws_events, _) = tokio::sync::broadcast::channel(512);
+        let (global_ws_events, _) = tokio::sync::broadcast::channel(8192);
         Self {
             inner: Arc::new(Mutex::new(CloudMcpRuntime {
                 base_url: cloud_mcp_base_url(),
@@ -271,6 +278,8 @@ impl CloudMcpState {
             spec_graph_filetree_sync_requests: Arc::new(Mutex::new(HashMap::new())),
             knowledge_graph_syncs: Arc::new(Mutex::new(HashMap::new())),
             global_ws_started: Arc::new(AtomicBool::new(false)),
+            global_ws_epoch: Arc::new(AtomicU64::new(0)),
+            global_ws_reconnect: Arc::new(tokio::sync::Notify::new()),
             global_ws_tx: Arc::new(Mutex::new(None)),
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
@@ -921,11 +930,30 @@ async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
     }
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        cloud_mcp_global_ws_loop(state).await;
+        let loop_state = state.clone();
+        let result =
+            std::panic::AssertUnwindSafe(cloud_mcp_global_ws_loop(loop_state))
+                .catch_unwind()
+                .await;
+        if result.is_err() {
+            state.global_ws_started.store(false, Ordering::SeqCst);
+            cloud_mcp_mark_global_ws_disconnected(
+                &state,
+                "Cloud MCP app websocket loop crashed and will be restarted.",
+            )
+            .await;
+        }
     });
 }
 
 async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
+    cloud_mcp_log_voice_shared_ws(
+        "voice_agent.shared_ws.manager_started",
+        "manager",
+        "start",
+        "Rust started the single shared app websocket manager.",
+        json!({}),
+    );
     loop {
         let base_url = {
             let runtime = state.inner.lock().await;
@@ -957,13 +985,34 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                     runtime.global_ws_connection_id = None;
                     runtime.global_ws_message_token = None;
                 }
-                let _ = state.global_ws_tx.lock().await.take();
-                cloud_mcp_fail_pending_ws_requests(&state, &error).await;
+                cloud_mcp_mark_global_ws_disconnected(&state, &error).await;
             }
         }
 
-        sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(2)) => {}
+            _ = state.global_ws_reconnect.notified() => {}
+        }
     }
+}
+
+fn cloud_mcp_voice_ws_kind(kind: &str) -> bool {
+    kind.starts_with("voice_agent_")
+}
+
+fn cloud_mcp_log_voice_shared_ws(phase: &str, kind: &str, status: &str, reason: &str, details: Value) {
+    log_voice_orchestrator_diagnostic_event(
+        phase,
+        json!({
+            "source": "rust-diffforge",
+            "surface": "voice_agent",
+            "transport": "app_websocket",
+            "kind": kind,
+            "status": status,
+            "reason": reason,
+            "details": details,
+        }),
+    );
 }
 
 async fn cloud_mcp_open_global_ws(
@@ -1142,10 +1191,23 @@ async fn cloud_mcp_open_global_ws(
     .await;
     let (mut write, mut read) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let ws_epoch = state.global_ws_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    cloud_mcp_log_voice_shared_ws(
+        "voice_agent.shared_ws.epoch_opened",
+        "manager",
+        "start",
+        "Rust opened a new active shared app websocket epoch.",
+        json!({
+            "epoch": ws_epoch,
+            "transport": opened_target.transport,
+            "ws_url": opened_target.ws_url,
+        }),
+    );
     {
         let mut tx_slot = state.global_ws_tx.lock().await;
         *tx_slot = Some(tx.clone());
     }
+    drop(tx);
     {
         let mut runtime = state.inner.lock().await;
         runtime.connected = false;
@@ -1156,20 +1218,12 @@ async fn cloud_mcp_open_global_ws(
         runtime.global_ws_message_token = None;
     }
 
-    loop {
+    let result: Result<(), String> = loop {
         tokio::select! {
-            outgoing = rx.recv() => {
-                let Some(outgoing) = outgoing else {
-                    return Ok(());
-                };
-                write
-                    .send(Message::Text(outgoing.to_string().into()))
-                    .await
-                    .map_err(|error| format!("Cloud MCP app websocket write failed: {error}"))?;
-            }
+            biased;
             incoming = read.next() => {
                 let Some(incoming) = incoming else {
-                    return Err("Cloud MCP app websocket closed by server.".to_string());
+                    break Err("Cloud MCP app websocket closed by server.".to_string());
                 };
                 match incoming {
                     Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
@@ -1179,18 +1233,135 @@ async fn cloud_mcp_open_global_ws(
                         }
                     }
                     Ok(Message::Ping(payload)) => {
-                        write
+                        if let Err(error) = write
                             .send(Message::Pong(payload))
                             .await
-                            .map_err(|error| format!("Cloud MCP app websocket pong failed: {error}"))?;
+                        {
+                            break Err(format!("Cloud MCP app websocket pong failed: {error}"));
+                        }
                     }
-                    Ok(Message::Close(_)) => return Err("Cloud MCP app websocket closed.".to_string()),
-                    Err(error) => return Err(format!("Cloud MCP app websocket read failed: {error}")),
+                    Ok(Message::Close(_)) => break Err("Cloud MCP app websocket closed.".to_string()),
+                    Err(error) => break Err(format!("Cloud MCP app websocket read failed: {error}")),
                     _ => {}
                 }
             }
+            outgoing = rx.recv() => {
+                let Some(outgoing) = outgoing else {
+                    break Err("Cloud MCP app websocket outgoing sender closed.".to_string());
+                };
+                let outgoing_kind = outgoing
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let outgoing_id = outgoing
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if cloud_mcp_voice_ws_kind(&outgoing_kind) {
+                    cloud_mcp_log_voice_shared_ws(
+                        "voice_agent.shared_ws.write_started",
+                        &outgoing_kind,
+                        "start",
+                        "Rust websocket writer is sending a voice frame to cloud.",
+                        json!({
+                            "epoch": ws_epoch,
+                            "id": outgoing_id,
+                            "repo_id": outgoing.get("repo_id").cloned().unwrap_or(Value::Null),
+                            "workspace_id": outgoing.get("workspace_id").cloned().unwrap_or(Value::Null),
+                            "request_kind": outgoing.get("request").and_then(|request| request.get("kind")).cloned().unwrap_or(Value::Null),
+                            "voice_session_id": outgoing.get("request").and_then(|request| request.get("voice_session_id").or_else(|| request.get("voiceSessionId"))).cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                if let Err(error) = write
+                    .send(Message::Text(outgoing.to_string().into()))
+                    .await
+                {
+                    break Err(format!("Cloud MCP app websocket write failed: {error}"));
+                }
+                if cloud_mcp_voice_ws_kind(&outgoing_kind) {
+                    cloud_mcp_log_voice_shared_ws(
+                        "voice_agent.shared_ws.write_finished",
+                        &outgoing_kind,
+                        "ok",
+                        "Rust websocket writer sent a voice frame to cloud.",
+                        json!({
+                            "epoch": ws_epoch,
+                            "id": outgoing_id,
+                        }),
+                    );
+                }
+            }
         }
+    };
+
+    cloud_mcp_clear_global_ws_sender_if_current(state, ws_epoch, result.as_ref().err()).await;
+    result
+}
+
+async fn cloud_mcp_clear_global_ws_sender_if_current(
+    state: &CloudMcpState,
+    ws_epoch: u64,
+    error: Option<&String>,
+) {
+    let cleared = if state.global_ws_epoch.load(Ordering::SeqCst) == ws_epoch {
+        let mut tx_slot = state.global_ws_tx.lock().await;
+        *tx_slot = None;
+        true
+    } else {
+        false
+    };
+
+    if !cleared {
+        return;
     }
+
+    let message = error
+        .map(|value| clean_terminal_telemetry_text(value))
+        .unwrap_or_else(|| "Cloud MCP app websocket disconnected.".to_string());
+    cloud_mcp_log_voice_shared_ws(
+        "voice_agent.shared_ws.epoch_closed",
+        "manager",
+        "warn",
+        "Rust shared app websocket epoch ended.",
+        json!({
+            "epoch": ws_epoch,
+            "error": message.clone(),
+        }),
+    );
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "websocket_retrying".to_string();
+        runtime.last_error = format!("Cloud MCP websocket unavailable: {message}");
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "retrying".to_string();
+        runtime.global_ws_last_error = message.clone();
+        runtime.global_ws_connection_id = None;
+        runtime.global_ws_message_token = None;
+    }
+    cloud_mcp_fail_pending_ws_requests(state, &message).await;
+}
+
+async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &str) {
+    let message = clean_terminal_telemetry_text(error);
+    state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "websocket_retrying".to_string();
+        runtime.last_error = format!("Cloud MCP websocket unavailable: {message}");
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "retrying".to_string();
+        runtime.global_ws_last_error = message.clone();
+        runtime.global_ws_connection_id = None;
+        runtime.global_ws_message_token = None;
+    }
+    let _ = state.global_ws_tx.lock().await.take();
+    cloud_mcp_fail_pending_ws_requests(state, &message).await;
+    state.global_ws_reconnect.notify_waiters();
 }
 
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
@@ -1309,8 +1480,22 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         let event_kind = event
             .get("event_kind")
             .or_else(|| event.get("eventKind"))
+            .or_else(|| event.get("kind"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if event_kind.starts_with("voice_agent_") {
+            cloud_mcp_log_voice_shared_ws(
+                "voice_agent.shared_ws.event_received",
+                event_kind,
+                "received",
+                "Rust websocket reader received a voice event from cloud.",
+                json!({
+                    "repo_id": event.get("repo_id").or_else(|| event.get("repoId")).cloned().unwrap_or(Value::Null),
+                    "workspace_id": event.get("workspace_id").or_else(|| event.get("workspaceId")).cloned().unwrap_or(Value::Null),
+                    "voice_session_id": event.get("voice_session_id").or_else(|| event.get("voiceSessionId")).cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
         if matches!(event_kind, "client_liveness_ping" | "dashboard_liveness_ping") {
             let _ = cloud_mcp_send_liveness_pong_event(state, &event).await;
         }
@@ -1533,6 +1718,18 @@ async fn cloud_mcp_resolve_ws_target(
     base_url: &str,
     endpoint_path: &str,
 ) -> CloudMcpWsTarget {
+    if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
+        cloud_mcp_record_signin_diagnostic(
+            state,
+            "route.resolve",
+            "ok",
+            "Cloud MCP local Docker websocket override is active",
+            json!({"transport": target.transport, "ws_url": target.ws_url}),
+        )
+        .await;
+        return target;
+    }
+
     let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
     let bearer = match cloud_mcp_authorization_bearer(state).await {
         Ok(token) => token,
@@ -1577,6 +1774,69 @@ async fn cloud_mcp_resolve_ws_target(
             fallback
         }
     }
+}
+
+fn cloud_mcp_rewrite_ws_endpoint(ws_url: &str, endpoint_path: &str) -> String {
+    let ws_url = ws_url.trim();
+    let endpoint_path = if endpoint_path.starts_with('/') {
+        endpoint_path.to_string()
+    } else {
+        format!("/{endpoint_path}")
+    };
+
+    for suffix in ["/v1/app/ws", "/v1/voice/ws"] {
+        if let Some(base) = ws_url.strip_suffix(suffix) {
+            return format!("{base}{endpoint_path}");
+        }
+    }
+
+    if let Some(index) = ws_url.find("/v1/") {
+        return format!("{}{}", &ws_url[..index], endpoint_path);
+    }
+
+    format!("{}{}", ws_url.trim_end_matches('/'), endpoint_path)
+}
+
+fn cloud_mcp_local_docker_ws_target(endpoint_path: &str) -> Option<CloudMcpWsTarget> {
+    let enabled = env::var("RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED);
+    if !enabled {
+        return None;
+    }
+
+    let explicit_voice_url = if endpoint_path == "/v1/voice/ws" {
+        env::var(CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    let configured_url = explicit_voice_url.or_else(|| {
+        env::var(CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let ws_url = configured_url
+        .map(|value| cloud_mcp_rewrite_ws_endpoint(&value, endpoint_path))
+        .unwrap_or_else(|| cloud_mcp_rewrite_ws_endpoint(CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL, endpoint_path));
+    if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
+        return None;
+    }
+
+    Some(CloudMcpWsTarget {
+        ws_url,
+        route_token: None,
+        transport: "local_docker_cloud".to_string(),
+    })
 }
 
 async fn cloud_mcp_fetch_direct_route_async(
@@ -1628,20 +1888,27 @@ fn cloud_mcp_direct_target_from_route(
         .get("route_token")
         .and_then(Value::as_str)
         .map(str::to_string)?;
-    let field = if endpoint_path == "/v1/voice-agent/ws" {
-        "voice_websocket_url"
+    let preferred = if endpoint_path == "/v1/voice/ws" {
+        direct
+            .get("voice_websocket_url")
+            .or_else(|| direct.get("voiceWebsocketUrl"))
     } else {
-        "app_websocket_url"
+        None
     };
-    let ws_url = direct
-        .get(field)
-        .and_then(Value::as_str)
-        .or_else(|| direct.get("app_websocket_url").and_then(Value::as_str))?
+    let ws_url = preferred
+        .or_else(|| direct.get("websocket_url"))
+        .or_else(|| direct.get("websocketUrl"))
+        .or_else(|| direct.get("browser_websocket_url"))
+        .or_else(|| direct.get("browserWebsocketUrl"))
+        .or_else(|| direct.get("app_websocket_url"))
+        .or_else(|| direct.get("appWebsocketUrl"))
+        .and_then(Value::as_str)?
         .trim()
         .to_string();
     if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
         return None;
     }
+    let ws_url = cloud_mcp_rewrite_ws_endpoint(&ws_url, endpoint_path);
     Some(CloudMcpWsTarget {
         ws_url,
         route_token: Some(route_token),
@@ -1744,10 +2011,67 @@ async fn cloud_mcp_ws_request(
     request_kind: &str,
     payload: &Value,
 ) -> Result<Value, String> {
+    cloud_mcp_ws_request_with_timeout(
+        state,
+        request_kind,
+        payload,
+        Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn cloud_mcp_ws_request_with_timeout(
+    state: &CloudMcpState,
+    request_kind: &str,
+    payload: &Value,
+    response_timeout: Duration,
+) -> Result<Value, String> {
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        match cloud_mcp_ws_request_once_with_timeout(state, request_kind, payload, response_timeout)
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                if !cloud_mcp_ws_request_error_is_transient(&error) || attempt > 0 {
+                    return Err(error);
+                }
+                last_error = error.clone();
+                cloud_mcp_mark_global_ws_disconnected(state, &error).await;
+                state.global_ws_reconnect.notify_waiters();
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+async fn cloud_mcp_ws_request_once_with_timeout(
+    state: &CloudMcpState,
+    request_kind: &str,
+    payload: &Value,
+    response_timeout: Duration,
+) -> Result<Value, String> {
     cloud_mcp_start_global_ws(state).await;
     let tx = cloud_mcp_wait_for_ws_sender(state).await?;
     let request_id = format!("ws-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
     let auth = cloud_mcp_ws_auth_object(state).await?;
+    if cloud_mcp_voice_ws_kind(request_kind) {
+        cloud_mcp_log_voice_shared_ws(
+            "voice_agent.shared_ws.request_prepared",
+            request_kind,
+            "start",
+            "Rust prepared an authenticated voice request for the shared app websocket.",
+            json!({
+                "id": request_id,
+                "repo_id": cloud_mcp_payload_text(payload, &["repo_id"]),
+                "workspace_id": cloud_mcp_payload_text(payload, &["workspace_id"]),
+                "voice_session_id": cloud_mcp_payload_text(payload, &["voice_session_id", "voiceSessionId"]),
+                "request_kind": cloud_mcp_payload_text(payload, &["kind"]),
+                "timeout_ms": response_timeout.as_millis(),
+            }),
+        );
+    }
     let (response_tx, response_rx) = oneshot::channel::<Value>();
     state
         .global_ws_pending
@@ -1768,24 +2092,79 @@ async fn cloud_mcp_ws_request(
     });
     if tx.send(envelope).is_err() {
         state.global_ws_pending.lock().await.remove(&request_id);
+        if cloud_mcp_voice_ws_kind(request_kind) {
+            cloud_mcp_log_voice_shared_ws(
+                "voice_agent.shared_ws.request_queue_failed",
+                request_kind,
+                "error",
+                "Rust could not queue a voice request on the shared app websocket.",
+                json!({
+                    "id": request_id,
+                }),
+            );
+        }
         return Err("Cloud MCP app websocket is not accepting messages.".to_string());
     }
-    let response = match timeout(
-        Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS),
-        response_rx,
-    )
-    .await
+    if cloud_mcp_voice_ws_kind(request_kind) {
+        cloud_mcp_log_voice_shared_ws(
+            "voice_agent.shared_ws.request_queued",
+            request_kind,
+            "ok",
+            "Rust queued a voice request on the shared app websocket and is waiting for the cloud ack.",
+            json!({
+                "id": request_id,
+            }),
+        );
+    }
+    let response = match timeout(response_timeout, response_rx).await
     {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
             state.global_ws_pending.lock().await.remove(&request_id);
+            if cloud_mcp_voice_ws_kind(request_kind) {
+                cloud_mcp_log_voice_shared_ws(
+                    "voice_agent.shared_ws.response_cancelled",
+                    request_kind,
+                    "error",
+                    "Rust voice request response channel was cancelled before cloud ack.",
+                    json!({
+                        "id": request_id,
+                    }),
+                );
+            }
             return Err("Cloud MCP app websocket response was cancelled.".to_string());
         }
         Err(_) => {
             state.global_ws_pending.lock().await.remove(&request_id);
+            if cloud_mcp_voice_ws_kind(request_kind) {
+                cloud_mcp_log_voice_shared_ws(
+                    "voice_agent.shared_ws.response_timeout",
+                    request_kind,
+                    "error",
+                    "Rust timed out waiting for the cloud ack for a voice request.",
+                    json!({
+                        "id": request_id,
+                        "timeout_ms": response_timeout.as_millis(),
+                    }),
+                );
+            }
             return Err("Cloud MCP app websocket request timed out.".to_string());
         }
     };
+    if cloud_mcp_voice_ws_kind(request_kind) {
+        cloud_mcp_log_voice_shared_ws(
+            "voice_agent.shared_ws.response_received",
+            request_kind,
+            "ok",
+            "Rust received the cloud ack for a voice request.",
+            json!({
+                "id": request_id,
+                "response_kind": response.get("kind").and_then(Value::as_str),
+                "ok": response.get("ok").and_then(Value::as_bool),
+                "request_kind": response.get("request_kind").or_else(|| response.get("requestKind")).cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
     if response.get("ok").and_then(Value::as_bool) == Some(false)
         || response.get("kind").and_then(Value::as_str) == Some("error")
     {
@@ -1803,6 +2182,26 @@ async fn cloud_mcp_ws_request(
         "data": data,
         "warnings": [],
     }))
+}
+
+fn cloud_mcp_ws_request_error_is_transient(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if !error.contains("cloud mcp app websocket") && !error.contains("cloud mcp websocket") {
+        return false;
+    }
+    [
+        "not accepting",
+        "not connected",
+        "sender",
+        "timed out",
+        "cancelled",
+        "closed",
+        "disconnected",
+        "write failed",
+        "read failed",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 async fn cloud_mcp_ws_auth_object(state: &CloudMcpState) -> Result<Value, String> {
@@ -1823,6 +2222,12 @@ async fn cloud_mcp_ws_auth_object(state: &CloudMcpState) -> Result<Value, String
     }))
 }
 
+async fn cloud_mcp_wait_for_app_ws_auth(state: &CloudMcpState) -> Result<Value, String> {
+    cloud_mcp_start_global_ws(state).await;
+    let _ = cloud_mcp_wait_for_ws_sender(state).await?;
+    cloud_mcp_ws_auth_object(state).await
+}
+
 async fn cloud_mcp_wait_for_ws_sender(
     state: &CloudMcpState,
 ) -> Result<mpsc::UnboundedSender<Value>, String> {
@@ -1835,8 +2240,17 @@ async fn cloud_mcp_wait_for_ws_sender(
                 && runtime.global_ws_message_token.is_some()
         };
         if ready {
-            if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
-                return Ok(tx);
+            let tx = state.global_ws_tx.lock().await.as_ref().cloned();
+            if let Some(tx) = tx {
+                if !tx.is_closed() {
+                    return Ok(tx);
+                }
+                cloud_mcp_mark_global_ws_disconnected(
+                    state,
+                    "Cloud MCP app websocket sender closed.",
+                )
+                .await;
+                state.global_ws_reconnect.notify_waiters();
             }
         }
         if started.elapsed() >= Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS) {

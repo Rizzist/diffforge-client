@@ -37,6 +37,7 @@ import {
   startLowPowerAudioBuffer,
 } from "../audio/audioCapture";
 import {
+  cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
   sendCloudVoiceAgentTextMessage,
@@ -2789,7 +2790,7 @@ function getVoiceAgentToolCallSignature(toolCall) {
 }
 
 function getVoiceAgentEventKind(event) {
-  return String(event?.kind || event?.type || "").trim();
+  return cloudVoiceAgentEventKind(event);
 }
 
 function getVoiceAgentEventMarker(event) {
@@ -5479,7 +5480,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
-      const kind = String(event?.kind || event?.type || "").trim();
+      const kind = cloudVoiceAgentEventKind(event);
       if (kind === "voice_agent_error") {
         if (!orchestratorVoiceEventsActiveRef.current) {
           return;

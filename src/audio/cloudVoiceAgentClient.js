@@ -2,26 +2,119 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export const CLOUD_VOICE_AGENT_EVENT = "forge-cloud-voice-agent-event";
+export const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED = false;
+
+export function cloudVoiceAgentEventKind(event) {
+  return String(event?.kind || event?.event_kind || event?.eventKind || event?.type || "").trim();
+}
+
+function cleanVoiceOrchestratorDiagnosticText(value) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim()
+    .slice(0, 512);
+}
+
+export function logVoiceOrchestratorDiagnosticEvent(phase, fields = {}) {
+  if (!VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED) {
+    return;
+  }
+
+  invoke("voice_orchestrator_diagnostic_log", {
+    phase: cleanVoiceOrchestratorDiagnosticText(phase),
+    fields: {
+      source: "frontend",
+      surface: "voice_agent",
+      ...fields,
+    },
+  }).catch(() => {});
+}
 
 export function startCloudVoiceAgentStream(request = {}) {
-  return invoke("start_cloud_voice_agent_stream", { request });
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.invoke", {
+    hasAgentStatuses: Array.isArray(request?.agentStatuses || request?.agent_statuses),
+    repoId: request?.repoId || request?.repo_id || "",
+    workspaceId: request?.workspaceId || request?.workspace_id || "",
+  });
+  return invoke("start_cloud_voice_agent_stream", { request })
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.ok", {
+        active: Boolean(result?.active),
+        repoId: result?.repoId || result?.repo_id || "",
+        sampleRate: result?.sampleRate || result?.sample_rate || null,
+        workspaceId: result?.workspaceId || result?.workspace_id || "",
+      });
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
 }
 
 export function stopCloudVoiceAgentStream() {
-  return invoke("stop_cloud_voice_agent_stream");
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.invoke");
+  return invoke("stop_cloud_voice_agent_stream")
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.ok");
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
 }
 
 export function finishCloudVoiceAgentInput() {
-  return invoke("finish_cloud_voice_agent_input");
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.finish_input.invoke");
+  return invoke("finish_cloud_voice_agent_input")
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.finish_input.ok");
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.finish_input.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
 }
 
 export function sendCloudVoiceAgentTextMessage(request = {}) {
-  return invoke("send_cloud_voice_agent_text_message", { request });
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.text_message.invoke", {
+    repoId: request?.repoId || request?.repo_id || "",
+    textLength: String(request?.text || "").length,
+    turnIndex: request?.turnIndex || request?.turn_index || 0,
+    workspaceId: request?.workspaceId || request?.workspace_id || "",
+  });
+  return invoke("send_cloud_voice_agent_text_message", { request })
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.text_message.ok");
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.text_message.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
 }
 
 export function subscribeCloudVoiceAgentEvents(handler) {
   return listen(CLOUD_VOICE_AGENT_EVENT, (event) => {
-    handler(event.payload || {});
+    const payload = event.payload || {};
+    logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.event.received", {
+      hasError: Boolean(payload?.error),
+      kind: cleanVoiceOrchestratorDiagnosticText(cloudVoiceAgentEventKind(payload)),
+      repoId: payload?.repo_id || payload?.repoId || "",
+      voiceSessionId: payload?.voice_session_id || payload?.voiceSessionId || "",
+      workspaceId: payload?.workspace_id || payload?.workspaceId || "",
+    });
+    handler(payload);
   }).then((unlisten) => {
     let active = true;
     return () => {
@@ -145,14 +238,39 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
       if (closed) {
         return;
       }
-      const kind = String(event?.kind || event?.type || "").trim();
+      const kind = cloudVoiceAgentEventKind(event);
       try {
         if (kind === "voice_agent_tts_start") {
           await ensureAudioContext();
+          logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.start", {
+            phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
+            sampleRate: event?.audio?.sample_rate || event?.audio?.sampleRate || null,
+            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+          });
           return;
         }
         if (kind === "voice_agent_tts_audio") {
+          logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.audio", {
+            base64Chars: String(event?.audio?.base64 || "").length,
+            phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
+            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+          });
           await playLinear16Chunk(event);
+          return;
+        }
+        if (kind === "voice_agent_tts_end") {
+          logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.end", {
+            phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
+            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+          });
+          return;
+        }
+        if (kind === "voice_agent_tts_error") {
+          logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.error", {
+            code: cleanVoiceOrchestratorDiagnosticText(event?.error?.code || ""),
+            message: cleanVoiceOrchestratorDiagnosticText(event?.error?.message || event?.message || ""),
+            phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
+          });
         }
       } catch (error) {
         onError?.(error);

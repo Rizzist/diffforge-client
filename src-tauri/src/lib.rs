@@ -111,6 +111,8 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
+const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
 const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
@@ -155,6 +157,7 @@ static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -200,7 +203,7 @@ const DEEPGRAM_DEFAULT_LANGUAGE: &str = "en";
 const DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS: u64 = 90;
 const DEEPGRAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
-const CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS: u64 = 30;
+const CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS: u64 = 45;
 const CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS: u64 = 55;
 const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
 const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
@@ -1667,6 +1670,10 @@ fn bigview_sync_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE)
 }
 
+fn voice_orchestrator_diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path(VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE)
+}
+
 fn terminal_status_log_path() -> PathBuf {
     diagnostic_log_path(TERMINAL_STATUS_LOG_FILE)
 }
@@ -1779,6 +1786,52 @@ fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
     };
 
     let _ = writeln!(file, "{entry}");
+}
+
+fn write_voice_orchestrator_diagnostic_log_entry(entry: Value) {
+    if !voice_orchestrator_diagnostics_enabled() {
+        return;
+    }
+
+    let log_path = voice_orchestrator_diagnostic_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+    let _ = file.flush();
+}
+
+fn voice_orchestrator_diagnostics_enabled() -> bool {
+    if !VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED {
+        return false;
+    }
+
+    env::var("RUST_DIFFFORGE_VOICE_ORCHESTRATOR_LOGS")
+        .or_else(|_| env::var("DIFFFORGE_VOICE_ORCHESTRATOR_LOGS"))
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
 }
 
 fn write_terminal_status_log_entry(entry: Value) {
@@ -2007,6 +2060,31 @@ fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), Strin
     }));
 
     Ok(())
+}
+
+#[tauri::command]
+fn voice_orchestrator_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
+    write_voice_orchestrator_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+fn log_voice_orchestrator_diagnostic_event(phase: &str, fields: Value) {
+    write_voice_orchestrator_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
 }
 
 #[tauri::command]
@@ -2551,6 +2629,14 @@ pub fn run() {
             "log_file": whisper_local_audio_log_path().display().to_string(),
         }),
     );
+    log_voice_orchestrator_diagnostic_event(
+        "voice_agent.process_start",
+        json!({
+            "app_pid": std::process::id(),
+            "log_file": voice_orchestrator_diagnostic_log_path().display().to_string(),
+            "enabled": VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED,
+        }),
+    );
 
     #[cfg(desktop)]
     {
@@ -2674,6 +2760,7 @@ pub fn run() {
             finish_cloud_voice_agent_input,
             stop_cloud_voice_agent_stream,
             send_cloud_voice_agent_text_message,
+            voice_orchestrator_diagnostic_log,
             read_orchestrator_voice_history,
             write_orchestrator_voice_history,
             audio_shortcuts_status,
