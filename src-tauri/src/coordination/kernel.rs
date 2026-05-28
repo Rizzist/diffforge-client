@@ -8193,7 +8193,14 @@ impl CoordinationKernel {
                 .map_err(|error| format!("Unable to create git exclude directory: {error}"))?;
         }
         let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
-        let additions = [".mcp.json", ".codex/", ".claude/", "opencode.json"];
+        let additions = [
+            ".agents/",
+            "logs/",
+            ".mcp.json",
+            ".codex/",
+            ".claude/",
+            "opencode.json",
+        ];
         let mut next = existing.clone();
         for addition in additions {
             if !existing.lines().any(|line| line.trim() == addition) {
@@ -12912,7 +12919,9 @@ impl CoordinationKernel {
                 } else {
                     "modified"
                 };
-                if is_ignored_system_status_path(&path) {
+                if is_coordination_owned_root_status_path(&path)
+                    || is_ignored_system_status_path(&path)
+                {
                     continue;
                 }
                 files.push(ChangedFile {

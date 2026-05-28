@@ -5,7 +5,7 @@ use notify::{
 
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
-const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = true;
+const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = false;
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_APP_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str =
     "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
@@ -2264,6 +2264,24 @@ fn cloud_mcp_workspace_control_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("cloud-mcp")
 }
 
+fn cloud_mcp_visible_workspace_log_root(root: &Path) -> PathBuf {
+    for ancestor in root.ancestors() {
+        if ancestor.file_name().and_then(|value| value.to_str()) != Some("worktrees") {
+            continue;
+        }
+        let Some(agents_dir) = ancestor.parent() else {
+            continue;
+        };
+        if agents_dir.file_name().and_then(|value| value.to_str()) != Some(".agents") {
+            continue;
+        }
+        if let Some(workspace_root) = agents_dir.parent() {
+            return workspace_root.to_path_buf();
+        }
+    }
+    root.to_path_buf()
+}
+
 fn cloud_mcp_workspace_log_path(root: &Path) -> PathBuf {
     cloud_mcp_workspace_control_dir(root).join("cloud-mcp.jsonl")
 }
@@ -2275,6 +2293,8 @@ fn cloud_mcp_workspace_log(
     workspace_name: &str,
     fields: Value,
 ) -> Result<PathBuf, String> {
+    let root = cloud_mcp_visible_workspace_log_root(root);
+    let root = root.as_path();
     let dir = cloud_mcp_workspace_control_dir(root);
     fs::create_dir_all(&dir).map_err(|error| {
         format!(
