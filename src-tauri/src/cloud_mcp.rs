@@ -1402,11 +1402,19 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             }),
         )
         .await;
+        let device_profile = cloud_mcp_desktop_device_profile();
         let hello = json!({
             "kind": "hello",
             "id": format!("hello-{}", cloud_mcp_now_ms()),
             "client_id": CLOUD_MCP_RUST_CLIENT_ID,
             "source": "rust-diffforge",
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
             "contract": "diffforge.app_ws.v1",
             "auth": {
                 "connection_id": connection_id.clone(),
@@ -1550,11 +1558,19 @@ async fn cloud_mcp_send_lifecycle_event(
     let now = cloud_mcp_now_ms();
     let snapshot = cloud_mcp_status_snapshot(state).await;
     let auth = cloud_mcp_ws_auth_object(state).await?;
+    let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
         "source": "rust-diffforge-lifecycle",
         "event_kind": event_kind,
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
         "reason": reason.unwrap_or(status),
         "status": status,
         "registered_workspace_count": snapshot.registered_workspace_count,
@@ -1588,6 +1604,93 @@ async fn cloud_mcp_send_lifecycle_event(
         "status": status,
         "ts_ms": now,
     }))
+}
+
+fn cloud_mcp_desktop_device_profile() -> Value {
+    static DEVICE_PROFILE: OnceLock<Value> = OnceLock::new();
+    DEVICE_PROFILE
+        .get_or_init(|| {
+            let platform = cloud_mcp_desktop_platform();
+            let device_name = cloud_mcp_desktop_device_name();
+            let device_id = cloud_mcp_desktop_device_id(&device_name, platform);
+            json!({
+                "device_id": device_id,
+                "device_name": device_name,
+                "machine_name": device_name,
+                "hostname": device_name,
+                "platform": platform,
+                "os": platform,
+                "form_factor": "desktop",
+                "device_type": "pc",
+                "client_kind": "client",
+                "client_type": "rust_desktop",
+                "connection_source": "rust-diffforge",
+            })
+        })
+        .clone()
+}
+
+fn cloud_mcp_desktop_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        "unknown"
+    }
+}
+
+fn cloud_mcp_desktop_device_name() -> String {
+    cloud_mcp_platform_device_name()
+        .or_else(sysinfo::System::host_name)
+        .or_else(|| env::var("COMPUTERNAME").ok())
+        .or_else(|| env::var("HOSTNAME").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Diff Forge Desktop".to_string())
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect()
+}
+
+fn cloud_mcp_platform_device_name() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        cloud_mcp_device_name_from_command("scutil", &["--get", "ComputerName"])
+    } else {
+        None
+    }
+}
+
+fn cloud_mcp_device_name_from_command(command: &str, args: &[&str]) -> Option<String> {
+    Command::new(command)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_mcp_desktop_device_id(device_name: &str, platform: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(platform.as_bytes());
+    hasher.update(b":");
+    hasher.update(device_name.as_bytes());
+    let digest = hasher.finalize();
+    let fingerprint = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{}-{}", platform, fingerprint)
 }
 
 async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
