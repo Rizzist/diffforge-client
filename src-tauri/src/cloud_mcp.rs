@@ -30,6 +30,7 @@ const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
 const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE: &str = "local-ignored-whitelist.json";
+const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -1612,7 +1613,7 @@ fn cloud_mcp_desktop_device_profile() -> Value {
         .get_or_init(|| {
             let platform = cloud_mcp_desktop_platform();
             let device_name = cloud_mcp_desktop_device_name();
-            let device_id = cloud_mcp_desktop_device_id(&device_name, platform);
+            let device_id = cloud_mcp_stable_desktop_device_id(&device_name, platform);
             json!({
                 "device_id": device_id,
                 "device_name": device_name,
@@ -1628,6 +1629,43 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             })
         })
         .clone()
+}
+
+fn cloud_mcp_stable_desktop_device_id(device_name: &str, platform: &str) -> String {
+    if let Some(path) = cloud_mcp_desktop_device_id_path() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if cloud_mcp_valid_device_id(trimmed) {
+                return trimmed.to_string();
+            }
+        }
+
+        let generated = format!("{}-{}", platform, uuid::Uuid::new_v4());
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::write(&path, generated.as_bytes()).is_ok() {
+            return generated;
+        }
+    }
+
+    cloud_mcp_desktop_device_id(device_name, platform)
+}
+
+fn cloud_mcp_desktop_device_id_path() -> Option<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    Some(home.join(".diffforge").join(CLOUD_MCP_DEVICE_ID_FILE))
+}
+
+fn cloud_mcp_valid_device_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 120
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 fn cloud_mcp_desktop_platform() -> &'static str {

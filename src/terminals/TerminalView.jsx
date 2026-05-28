@@ -28,7 +28,6 @@ import {
   SetupField,
   SetupHeader,
   SetupInput,
-  TitleMaximizeIcon,
   TitleMinimizeIcon,
   TitleRestoreIcon,
   WorkspaceRootActions,
@@ -627,6 +626,10 @@ const TerminalWorkspaceMain = styled.div`
     pointer-events: none;
   }
 
+  [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
+    min-width: 300px;
+  }
+
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
     position: absolute !important;
     inset: 0;
@@ -735,6 +738,8 @@ const TerminalSurfaceSlot = styled.div`
 
 const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
+const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
+const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 4000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
@@ -778,7 +783,6 @@ const WORKSPACE_TOOL_TABS = [
 ];
 const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
 const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
-const TODO_QUEUE_PANE_MODE_MAXIMIZED = "maximized";
 const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
 
 const TodoQueueSurface = styled.aside`
@@ -805,56 +809,10 @@ const TodoQueueSurface = styled.aside`
   &[data-pane-mode="fullscreen"] {
     border-left: 0;
   }
-`;
 
-const WorkspaceToolTopBar = styled.div`
-  display: grid;
-  min-height: 34px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 7px 4px 10px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.045)),
-    rgba(12, 16, 23, 0.66);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    0 10px 30px rgba(0, 0, 0, 0.18);
-  backdrop-filter: blur(18px) saturate(150%);
-
-  html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.74)),
-      rgba(245, 245, 247, 0.78);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.95),
-      0 10px 24px rgba(15, 23, 42, 0.07);
+  &[data-active-tool="orchestrator"] {
+    grid-template-rows: auto minmax(0, 1fr);
   }
-`;
-
-const WorkspaceToolTitle = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: rgba(232, 238, 248, 0.92);
-  font-size: 11px;
-  font-weight: 860;
-  letter-spacing: 0.02em;
-  line-height: 1;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-
-  html[data-forge-theme="light"] & {
-    color: #2a2c31;
-  }
-`;
-
-const WorkspaceToolControls = styled.div`
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
 `;
 
 const WorkspaceToolControlButton = styled.button`
@@ -903,55 +861,75 @@ const WorkspaceToolControlButton = styled.button`
 
 const WorkspaceToolMinimizedRail = styled.aside`
   display: grid;
+  position: relative;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  justify-items: center;
-  gap: 8px;
-  padding: 7px 4px;
+  grid-template-rows: 1fr;
+  place-items: center;
+  padding: 7px 2px;
   border-left: 1px solid rgba(230, 236, 245, 0.08);
   color: rgba(232, 238, 248, 0.86);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.035)),
-    rgba(8, 12, 18, 0.82);
-  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.04);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
+    rgba(0, 0, 0, 0.72);
+  box-shadow:
+    inset 1px 0 0 rgba(255, 255, 255, 0.045),
+    0 8px 22px rgba(0, 0, 0, 0.2);
   overflow: hidden;
-  backdrop-filter: blur(18px) saturate(150%);
+  backdrop-filter: blur(18px) saturate(135%);
 
   html[data-forge-theme="light"] & {
     border-left-color: rgba(0, 0, 0, 0.08);
     color: #2a2c31;
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.68)),
-      rgba(245, 245, 247, 0.78);
+      linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5)),
+      rgba(18, 20, 24, 0.2);
     box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.8);
   }
 `;
 
+const WorkspaceToolRailControls = styled.div`
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  transform: translateX(-50%);
+
+  ${WorkspaceToolControlButton} {
+    display: grid;
+    width: 20px;
+    height: 20px;
+    color: rgba(232, 238, 248, 0.68);
+    line-height: 0;
+    padding: 0;
+    place-items: center;
+
+    svg {
+      display: block;
+      width: 11px;
+      height: 11px;
+    }
+  }
+`;
+
 const WorkspaceToolRailLabel = styled.div`
-  align-self: center;
   writing-mode: vertical-rl;
   transform: rotate(180deg);
-  overflow: hidden;
-  color: rgba(232, 238, 248, 0.72);
+  color: rgba(232, 238, 248, 0.7);
   font-size: 10px;
   font-weight: 900;
   letter-spacing: 0.08em;
   line-height: 1;
-  text-overflow: ellipsis;
   text-transform: uppercase;
-  white-space: nowrap;
+  user-select: none;
 
   html[data-forge-theme="light"] & {
-    color: #5d626c;
+    color: #2a2c31;
   }
-`;
-
-const WorkspaceToolRailControls = styled.div`
-  display: grid;
-  gap: 4px;
 `;
 
 const OrchestratorTopNav = styled.div`
@@ -1027,10 +1005,11 @@ const OrchestratorView = styled.div`
 
 const OrchestratorVoiceArea = styled.div`
   display: grid;
-  min-height: 128px;
+  position: relative;
+  min-height: 134px;
   place-items: center;
   gap: 10px;
-  padding: 14px 12px;
+  padding: 18px 12px 16px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background:
     radial-gradient(circle at center, rgba(98, 160, 255, 0.14), transparent 62%),
@@ -1042,45 +1021,55 @@ const OrchestratorVoiceArea = styled.div`
   }
 `;
 
+const OrchestratorVoicePaneControls = styled.div`
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 1px 2px;
+  border: 1px solid rgba(226, 232, 240, 0.08);
+  border-radius: 999px;
+  transform: translateX(-50%);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
+    rgba(0, 0, 0, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 8px 22px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(18px) saturate(135%);
+
+  ${WorkspaceToolControlButton} {
+    width: 19px;
+    height: 19px;
+    color: rgba(232, 238, 248, 0.68);
+
+    svg {
+      width: 10px;
+      height: 10px;
+    }
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5)),
+      rgba(18, 20, 24, 0.2);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.72),
+      0 8px 20px rgba(15, 23, 42, 0.1);
+  }
+`;
+
 const OrchestratorVoiceControls = styled.div`
   display: inline-flex;
   min-width: 0;
   align-items: center;
   justify-content: center;
   gap: 10px;
-`;
-
-const OrchestratorVoiceModePill = styled.span`
-  display: inline-flex;
-  min-width: 64px;
-  min-height: 24px;
-  align-items: center;
-  justify-content: center;
-  padding: 0 10px;
-  border: 1px solid rgba(125, 176, 255, 0.2);
-  border-radius: 999px;
-  color: #9fbcf0;
-  background: rgba(15, 22, 34, 0.7);
-  font-size: 10px;
-  font-weight: 820;
-  line-height: 1;
-  text-transform: uppercase;
-
-  &[data-mode="manual"] {
-    border-color: rgba(255, 168, 76, 0.28);
-    color: #ffb66b;
-    background: rgba(50, 30, 14, 0.58);
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
-  }
-
-  html[data-forge-theme="light"] &[data-mode="manual"] {
-    color: #a45300;
-    background: rgba(255, 168, 76, 0.16);
-  }
 `;
 
 const OrchestratorVoiceButton = styled.button`
@@ -1183,6 +1172,10 @@ const OrchestratorVoiceButton = styled.button`
 
 const OrchestratorVoiceCancelButton = styled.button`
   display: inline-grid;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 8;
   width: 32px;
   height: 32px;
   place-items: center;
@@ -4645,13 +4638,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onBeginTodoDrag,
   onCancelQueuedItem,
   onDraftChange,
-  onMaximizePane,
   onMinimizePane,
   onOpenWorkspaceSettings,
   onQueueItem,
   onRemoveItem,
   onReorderItem,
-  onRestorePane,
   onSubmitDraft,
   onToggleFullscreenPane,
   onUpdateItem,
@@ -6158,11 +6149,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [items, onReorderItem, reorderingItemId]);
 
   const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
-  const activeWorkspaceToolLabel = WORKSPACE_TOOL_TABS.find((tool) => (
-    tool.id === activeWorkspaceTool
-  ))?.label || "Orchestrator";
   const paneFullscreen = paneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
-  const paneMaximized = paneMode === TODO_QUEUE_PANE_MODE_MAXIMIZED;
   const orchestratorVoiceInputActive = orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening";
   const orchestratorVoiceManualMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
@@ -6178,7 +6165,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         : orchestratorVoiceError
           ? "Restart voice agent monitor"
           : "Start voice agent monitor";
-  const orchestratorVoiceModeLabel = orchestratorVoiceManualMode ? "Manual" : "Auto";
   const orchestratorVoiceButtonTitle = orchestratorVoiceError
     || orchestratorVoiceFeedback
     || (orchestratorVoiceState === "starting"
@@ -6200,48 +6186,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   return (
     <TodoQueueSurface
       aria-label="Workspace tools"
+      data-active-tool={activeWorkspaceTool}
       data-pane-mode={paneMode}
       data-tool-fullscreen={paneFullscreen ? "true" : undefined}
     >
-      <WorkspaceToolTopBar>
-        <WorkspaceToolTitle title={activeWorkspaceToolLabel}>
-          {activeWorkspaceToolLabel}
-        </WorkspaceToolTitle>
-        <WorkspaceToolControls aria-label="Workspace tool pane controls">
-          <WorkspaceToolControlButton
-            aria-label="Minimize workspace tools"
-            onClick={onMinimizePane}
-            title="Minimize"
-            type="button"
-          >
-            <TitleMinimizeIcon aria-hidden="true" />
-          </WorkspaceToolControlButton>
-          <WorkspaceToolControlButton
-            aria-label={paneMaximized || paneFullscreen ? "Restore workspace tools" : "Maximize workspace tools"}
-            onClick={paneFullscreen ? onRestorePane : onMaximizePane}
-            title={paneMaximized || paneFullscreen ? "Restore" : "Maximize"}
-            type="button"
-          >
-            {paneMaximized || paneFullscreen ? (
-              <TitleRestoreIcon aria-hidden="true" />
-            ) : (
-              <TitleMaximizeIcon aria-hidden="true" />
-            )}
-          </WorkspaceToolControlButton>
-          <WorkspaceToolControlButton
-            aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
-            onClick={onToggleFullscreenPane}
-            title={paneFullscreen ? "Exit big view" : "Big view"}
-            type="button"
-          >
-            {paneFullscreen ? (
-              <ButtonFullscreenExitIcon aria-hidden="true" />
-            ) : (
-              <ButtonFullscreenIcon aria-hidden="true" />
-            )}
-          </WorkspaceToolControlButton>
-        </WorkspaceToolControls>
-      </WorkspaceToolTopBar>
       <OrchestratorTopNav aria-label="Workspace tool">
         {WORKSPACE_TOOL_TABS.map((tool) => (
           <OrchestratorTopButton
@@ -6276,10 +6224,39 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       ) : (
         <OrchestratorView>
           <OrchestratorVoiceArea>
+            <OrchestratorVoicePaneControls aria-label="Orchestrator pane controls">
+              <WorkspaceToolControlButton
+                aria-label="Minimize workspace tools"
+                onClick={onMinimizePane}
+                title="Minimize"
+                type="button"
+              >
+                <TitleMinimizeIcon aria-hidden="true" />
+              </WorkspaceToolControlButton>
+              <WorkspaceToolControlButton
+                aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
+                onClick={onToggleFullscreenPane}
+                title={paneFullscreen ? "Exit big view" : "Big view"}
+                type="button"
+              >
+                {paneFullscreen ? (
+                  <ButtonFullscreenExitIcon aria-hidden="true" />
+                ) : (
+                  <ButtonFullscreenIcon aria-hidden="true" />
+                )}
+              </WorkspaceToolControlButton>
+            </OrchestratorVoicePaneControls>
+            {orchestratorVoiceCanCancel && (
+              <OrchestratorVoiceCancelButton
+                aria-label="Cancel voice submission"
+                onClick={cancelOrchestratorVoiceSubmission}
+                title="Cancel submission"
+                type="button"
+              >
+                <Close aria-hidden="true" />
+              </OrchestratorVoiceCancelButton>
+            )}
             <OrchestratorVoiceControls>
-              <OrchestratorVoiceModePill data-mode={orchestratorSubmissionMode}>
-                {orchestratorVoiceModeLabel}
-              </OrchestratorVoiceModePill>
               <OrchestratorVoiceButton
                 aria-label={orchestratorVoiceButtonLabel}
                 data-error={orchestratorVoiceError ? "true" : undefined}
@@ -6297,16 +6274,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 />
                 <OrchestratorVoiceLogo />
               </OrchestratorVoiceButton>
-              {orchestratorVoiceCanCancel && (
-                <OrchestratorVoiceCancelButton
-                  aria-label="Cancel voice submission"
-                  onClick={cancelOrchestratorVoiceSubmission}
-                  title="Cancel submission"
-                  type="button"
-                >
-                  <Close aria-hidden="true" />
-                </OrchestratorVoiceCancelButton>
-              )}
             </OrchestratorVoiceControls>
           </OrchestratorVoiceArea>
           <OrchestratorSectionTabs aria-label="Orchestrator section">
@@ -6784,16 +6751,21 @@ function TerminalView({
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
   );
   const todoQueuePaneMinimized = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
-  const todoQueuePaneMaximized = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_MAXIMIZED;
   const todoQueuePaneFullscreen = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const todoQueueMinimizedSize = terminalWorkspaceMainWidth > 0
+    ? Math.min(4, Math.max(2.8, (TODO_QUEUE_MINIMIZED_WIDTH_PX / terminalWorkspaceMainWidth) * 100))
+    : 3.2;
+  const todoQueueRestoredMinSize = terminalWorkspaceMainWidth > 0
+    ? Math.min(70, Math.max(20, (TODO_QUEUE_RESTORED_MIN_WIDTH_PX / terminalWorkspaceMainWidth) * 100))
+    : 20;
   const todoQueuePanelSize = todoQueuePaneMinimized
-    ? 5
-    : todoQueuePaneMaximized || todoQueuePaneFullscreen
+    ? todoQueueMinimizedSize
+    : todoQueuePaneFullscreen
       ? 62
-      : 30;
+      : Math.max(30, todoQueueRestoredMinSize);
   const terminalGridPanelSize = 100 - todoQueuePanelSize;
-  const todoQueuePanelMinSize = todoQueuePaneMinimized ? 5 : 20;
-  const todoQueuePanelMaxSize = todoQueuePaneMinimized ? 5 : 70;
+  const todoQueuePanelMinSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : todoQueueRestoredMinSize;
+  const todoQueuePanelMaxSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : 70;
   const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
   const fullscreenTransitionTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
@@ -11242,14 +11214,6 @@ function TerminalView({
     setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
   }, []);
 
-  const toggleMaximizeTodoQueuePane = useCallback(() => {
-    setTodoQueuePaneMode((currentMode) => (
-      currentMode === TODO_QUEUE_PANE_MODE_MAXIMIZED
-        ? TODO_QUEUE_PANE_MODE_NORMAL
-        : TODO_QUEUE_PANE_MODE_MAXIMIZED
-    ));
-  }, []);
-
   const toggleFullscreenTodoQueuePane = useCallback(() => {
     setTodoQueuePaneMode((currentMode) => (
       currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
@@ -11575,33 +11539,15 @@ function TerminalView({
                         <WorkspaceToolMinimizedRail aria-label="Workspace tools minimized">
                           <WorkspaceToolRailControls>
                             <WorkspaceToolControlButton
-                              aria-label="Restore workspace tools"
+                              aria-label="Unminimize workspace tools"
                               onClick={restoreTodoQueuePane}
-                              title="Restore"
+                              title="Unminimize"
                               type="button"
                             >
                               <TitleRestoreIcon aria-hidden="true" />
                             </WorkspaceToolControlButton>
-                            <WorkspaceToolControlButton
-                              aria-label="Maximize workspace tools"
-                              onClick={toggleMaximizeTodoQueuePane}
-                              title="Maximize"
-                              type="button"
-                            >
-                              <TitleMaximizeIcon aria-hidden="true" />
-                            </WorkspaceToolControlButton>
                           </WorkspaceToolRailControls>
                           <WorkspaceToolRailLabel>Tools</WorkspaceToolRailLabel>
-                          <WorkspaceToolRailControls>
-                            <WorkspaceToolControlButton
-                              aria-label="Open workspace tools big view"
-                              onClick={toggleFullscreenTodoQueuePane}
-                              title="Big view"
-                              type="button"
-                            >
-                              <ButtonFullscreenIcon aria-hidden="true" />
-                            </WorkspaceToolControlButton>
-                          </WorkspaceToolRailControls>
                         </WorkspaceToolMinimizedRail>
                       ) : (
                         <TodoQueuePanel
@@ -11615,13 +11561,11 @@ function TerminalView({
                           onBeginTodoDrag={handleBeginTodoDrag}
                           onCancelQueuedItem={cancelQueuedTodoQueueItem}
                           onDraftChange={setTodoQueueDraft}
-                          onMaximizePane={toggleMaximizeTodoQueuePane}
                           onMinimizePane={minimizeTodoQueuePane}
                           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
                           onQueueItem={queueTodoQueueItem}
                           onRemoveItem={removeTodoQueueItem}
                           onReorderItem={reorderTodoQueueItem}
-                          onRestorePane={restoreTodoQueuePane}
                           onSubmitDraft={submitTodoQueueDraft}
                           onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
                           onUpdateItem={updateTodoQueueItemText}
