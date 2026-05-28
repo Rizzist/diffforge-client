@@ -3,6 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 
 const AUDIO_INPUT_DEVICE_STORAGE_KEY = "diffforge.audio.inputDeviceId";
 const AUDIO_INPUT_SETUP_STORAGE_KEY = "diffforge.audio.inputSetupReady";
+const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_STORAGE_KEY = "diffforge.audio.orchestratorSubmissionMode";
 const AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY = "diffforge.audio.autoOpenRecorder";
 const AUDIO_RECORDER_MODE_STORAGE_KEY = "diffforge.audio.recorderMode";
 export const AUDIO_WIDGET_THEME_STORAGE_KEY = "diffforge.audio.widgetTheme";
@@ -15,6 +16,9 @@ export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
 export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
 export const AUDIO_RECORDER_MODE_PUSH_TO_TALK = "push-to-talk";
 export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
+export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO = "auto";
+export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL = "manual";
+export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT = "diffforge:audio-orchestrator-submission-mode";
 export const AUDIO_WIDGET_THEME_DARK = "dark";
 export const AUDIO_WIDGET_THEME_LIGHT = "light";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
@@ -43,6 +47,12 @@ function normalizeAudioRecorderMode(value) {
   return value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
     ? AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
     : AUDIO_RECORDER_MODE_PUSH_TO_TALK;
+}
+
+export function normalizeOrchestratorVoiceSubmissionMode(value) {
+  return value === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL
+    ? AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL
+    : AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO;
 }
 
 export function normalizeAudioWidgetTheme(value) {
@@ -144,6 +154,28 @@ export function readAudioRecorderMode() {
 export function writeAudioRecorderMode(mode) {
   if (canUseStorage()) {
     window.localStorage.setItem(AUDIO_RECORDER_MODE_STORAGE_KEY, normalizeAudioRecorderMode(mode));
+  }
+}
+
+export function readOrchestratorVoiceSubmissionMode() {
+  if (!canUseStorage()) {
+    return AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO;
+  }
+
+  return normalizeOrchestratorVoiceSubmissionMode(
+    window.localStorage.getItem(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_STORAGE_KEY),
+  );
+}
+
+export function writeOrchestratorVoiceSubmissionMode(mode) {
+  const normalizedMode = normalizeOrchestratorVoiceSubmissionMode(mode);
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_STORAGE_KEY, normalizedMode);
+  }
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+    window.dispatchEvent(new CustomEvent(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, {
+      detail: { mode: normalizedMode },
+    }));
   }
 }
 

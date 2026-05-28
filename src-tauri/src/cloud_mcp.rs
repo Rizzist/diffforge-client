@@ -3284,6 +3284,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/spec/task-history" => Some("spec_task_history"),
         "/v1/spec/nodes" => Some("spec_node"),
         "/v1/workspace/reset-graph-state" => Some("reset_workspace_graph_state"),
+        "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
 }
@@ -6188,9 +6189,18 @@ async fn cloud_mcp_sync_agent_installations(
         cloud_mcp_now_ms(),
         uuid::Uuid::new_v4()
     );
+    let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
         "source": "rust-diffforge-agent-installation-sync",
         "event_kind": "agent_installation_snapshot",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
         "repo_id": req.repo_id,
         "repo_path": req.root_display,
         "workspace_root": req.root_display,
@@ -6225,6 +6235,7 @@ async fn cloud_mcp_sync_terminal_presence(
         .as_array()
         .ok_or_else(|| "Terminal presence sync requires a workspaces array.".to_string())?;
     let mut normalized_workspaces = Vec::new();
+    let device_profile = cloud_mcp_desktop_device_profile();
 
     for workspace in workspace_items.iter().take(64) {
         let repo_path = cloud_mcp_payload_text(
@@ -6305,6 +6316,9 @@ async fn cloud_mcp_sync_terminal_presence(
                     cloud_mcp_payload_text(terminal, &["session_state", "sessionState"])
                         .unwrap_or_else(|| "unknown".to_string());
                 json!({
+                    "device": device_profile.clone(),
+                    "device_id": device_profile["device_id"].clone(),
+                    "machine_id": device_profile["device_id"].clone(),
                     "presence_agent_id": cloud_mcp_payload_text(
                         terminal,
                         &["presence_agent_id", "presenceAgentId", "id"],
@@ -6325,6 +6339,14 @@ async fn cloud_mcp_sync_terminal_presence(
 
         let terminal_count = terminals.len();
         normalized_workspaces.push(json!({
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
             "repo_id": req.repo_id,
             "workspace_root": req.root_display,
             "workspace_active": workspace_active,
@@ -6349,6 +6371,14 @@ async fn cloud_mcp_sync_terminal_presence(
     let payload = json!({
         "source": "rust-diffforge-terminal-presence-sync",
         "event_kind": "terminal_presence_snapshot",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
@@ -6383,6 +6413,7 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         .as_array()
         .ok_or_else(|| "Workspace MCP sync requires a workspaces array.".to_string())?;
     let mut normalized_workspaces = Vec::new();
+    let device_profile = cloud_mcp_desktop_device_profile();
 
     for workspace in workspace_items.iter().take(64) {
         let repo_path = cloud_mcp_payload_text(
@@ -6504,6 +6535,14 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
 
         let server_count = servers.len();
         normalized_workspaces.push(json!({
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
             "repo_id": req.repo_id,
             "workspace_root": req.root_display,
             "workspace_id": req.workspace_id,
@@ -6534,6 +6573,14 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         "source": "rust-diffforge-workspace-mcp-sync",
         "event_kind": "workspace_mcp_snapshot",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
@@ -6592,6 +6639,51 @@ async fn cloud_mcp_reset_workspace_graph_state(
     )
     .await?;
     cloud_mcp_clear_graph_reset_caches(&req.root, &req.repo_id, normalized_scope)?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_hard_reset_cloud_sqlite(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-cloud-sqlite-hard-reset",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id,
+        "repo_path": req.root_display,
+        "workspace_root": req.root_display,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "scope": "client_preserve_filetree",
+        "confirm": "hard_reset_cloud_sqlite_preserve_filetree",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/cloud/sqlite/hard-reset",
+        &payload,
+    )
+    .await?;
     Ok(cloud_mcp_response_data(&response))
 }
 

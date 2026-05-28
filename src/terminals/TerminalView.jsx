@@ -37,7 +37,10 @@ import {
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
 import {
+  AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT,
+  AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL,
   getAudioInputErrorMessage,
+  readOrchestratorVoiceSubmissionMode,
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
 } from "../audio/audioCapture";
@@ -1026,6 +1029,8 @@ const OrchestratorVoiceArea = styled.div`
   display: grid;
   min-height: 128px;
   place-items: center;
+  gap: 10px;
+  padding: 14px 12px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background:
     radial-gradient(circle at center, rgba(98, 160, 255, 0.14), transparent 62%),
@@ -1034,6 +1039,47 @@ const OrchestratorVoiceArea = styled.div`
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(0, 0, 0, 0.08);
     background: #ffffff;
+  }
+`;
+
+const OrchestratorVoiceControls = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+`;
+
+const OrchestratorVoiceModePill = styled.span`
+  display: inline-flex;
+  min-width: 64px;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  border: 1px solid rgba(125, 176, 255, 0.2);
+  border-radius: 999px;
+  color: #9fbcf0;
+  background: rgba(15, 22, 34, 0.7);
+  font-size: 10px;
+  font-weight: 820;
+  line-height: 1;
+  text-transform: uppercase;
+
+  &[data-mode="manual"] {
+    border-color: rgba(255, 168, 76, 0.28);
+    color: #ffb66b;
+    background: rgba(50, 30, 14, 0.58);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-mode="manual"] {
+    color: #a45300;
+    background: rgba(255, 168, 76, 0.16);
   }
 `;
 
@@ -1132,6 +1178,45 @@ const OrchestratorVoiceButton = styled.button`
     box-shadow:
       0 0 0 4px rgba(0, 102, 204, 0.11),
       0 0 0 1px rgba(0, 102, 204, 0.12) inset;
+  }
+`;
+
+const OrchestratorVoiceCancelButton = styled.button`
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 117, 117, 0.22);
+  border-radius: 999px;
+  color: #ff8d8d;
+  background: rgba(61, 15, 18, 0.64);
+  cursor: pointer;
+  outline: none;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+
+  &:hover {
+    border-color: rgba(255, 117, 117, 0.42);
+    color: #ffd0d0;
+    background: rgba(96, 20, 26, 0.82);
+  }
+
+  &:active {
+    transform: scale(0.97);
+  }
+
+  > svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #b42318;
+    background: rgba(244, 63, 94, 0.1);
   }
 `;
 
@@ -1330,6 +1415,10 @@ const OrchestratorHistoryTurn = styled.article`
     background: transparent;
   }
 
+  &[data-cancelled="true"] {
+    opacity: 0.72;
+  }
+
   html[data-forge-theme="light"] & {
     background: transparent;
   }
@@ -1472,6 +1561,14 @@ const OrchestratorHistoryTurnStatus = styled.div`
   html[data-forge-theme="light"] & {
     color: #0066cc;
   }
+
+  &[data-status="cancelled"] {
+    color: #ff9b73;
+  }
+
+  html[data-forge-theme="light"] &[data-status="cancelled"] {
+    color: #b45309;
+  }
 `;
 
 const OrchestratorHistoryTranscript = styled.div`
@@ -1493,6 +1590,17 @@ const OrchestratorHistoryTranscript = styled.div`
     background: #242424;
   }
 
+  &[data-cancelled="true"] {
+    border-color: rgba(255, 149, 103, 0.18);
+    color: rgba(255, 220, 202, 0.8);
+    background:
+      linear-gradient(135deg, rgba(255, 149, 103, 0.08), rgba(67, 42, 30, 0.2)),
+      #242424;
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+    text-decoration-color: rgba(255, 149, 103, 0.56);
+  }
+
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.05);
     color: #242424;
@@ -1503,6 +1611,12 @@ const OrchestratorHistoryTranscript = styled.div`
   html[data-forge-theme="light"] &[data-pending="true"] {
     color: #343434;
     background: #eeeeee;
+  }
+
+  html[data-forge-theme="light"] &[data-cancelled="true"] {
+    border-color: rgba(180, 83, 9, 0.16);
+    color: rgba(91, 50, 15, 0.74);
+    background: rgba(255, 247, 237, 0.92);
   }
 `;
 
@@ -3149,6 +3263,9 @@ function getVoiceHistoryTurnKey(event, sessionId) {
 
 function getVoiceHistoryTurnStatus(item) {
   const llmStatus = String(item?.llmStatus || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (llmStatus === "cancelled" || llmStatus === "canceled") {
+    return "Cancelled";
+  }
   if (llmStatus === "failed" || llmStatus === "error") {
     return "Failed";
   }
@@ -4559,6 +4676,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
   const [orchestratorVoiceFeedback, setOrchestratorVoiceFeedback] = useState("");
   const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
+  const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
   const [orchestratorChatDraft, setOrchestratorChatDraft] = useState("");
@@ -4636,6 +4754,24 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   useEffect(() => {
     orchestratorVoiceHistoryItemsRef.current = orchestratorVoiceHistoryItems;
   }, [orchestratorVoiceHistoryItems]);
+
+  useEffect(() => {
+    const refreshMode = (event) => {
+      setOrchestratorSubmissionMode(event?.detail?.mode || readOrchestratorVoiceSubmissionMode());
+    };
+    const handleStorage = (event) => {
+      if (!event.key || event.key.startsWith("diffforge.audio.")) {
+        refreshMode();
+      }
+    };
+
+    window.addEventListener(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, refreshMode);
+    window.addEventListener("storage", handleStorage);
+    return () => {
+      window.removeEventListener(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, refreshMode);
+      window.removeEventListener("storage", handleStorage);
+    };
+  }, []);
 
   useLayoutEffect(() => {
     if (activeOrchestratorSection !== "history") {
@@ -4724,6 +4860,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     }
     clearVoiceHistoryTurnTimeout(safeTurnKey);
     updateVoiceHistoryTurn(safeTurnKey, (currentItem) => {
+      const isCancelled = normalizedStatus === "cancelled" || normalizedStatus === "canceled";
       if (currentItem.llmFinal || currentItem.queued || currentItem.plan) {
         if (normalizedStatus === "failed" || normalizedStatus === "error") {
           return {
@@ -4733,24 +4870,33 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             llmStatus: normalizedStatus,
           };
         }
+        if (isCancelled && !currentItem.queued && !currentItem.plan) {
+          return {
+            llmError: normalizedMessage,
+            llmFeedback: currentItem.llmFeedback || "",
+            llmFinal: true,
+            llmStatus: normalizedStatus,
+          };
+        }
         return currentItem;
       }
       return {
         llmError: normalizedMessage,
-        llmFeedback: currentItem.llmFeedback || normalizedMessage,
+        llmFeedback: isCancelled ? (currentItem.llmFeedback || "") : (currentItem.llmFeedback || normalizedMessage),
         llmFinal: true,
         llmStatus: normalizedStatus,
-        transcriptFinal: currentItem.transcriptFinal,
+        transcriptFinal: isCancelled ? Boolean(currentItem.transcript) : currentItem.transcriptFinal,
       };
     });
   }, [clearVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
-  const markPendingVoiceHistoryTurnsTerminal = useCallback((status, message) => {
+  const markPendingVoiceHistoryTurnsTerminal = useCallback((status, message, options = {}) => {
+    const includeInterim = Boolean(options?.includeInterim);
     const sessionPrefix = `${Number(orchestratorVoiceSessionRef.current || 0)}:`;
     const pendingTurnKeys = orchestratorVoiceHistoryItemsRef.current
       .filter((item) => (
         String(item.id || "").startsWith(sessionPrefix)
-        && item.transcriptFinal
+        && (item.transcriptFinal || (includeInterim && item.transcript))
         && !item.llmFinal
         && !item.queued
         && !item.plan
@@ -5175,6 +5321,35 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     await monitor?.close?.().catch(() => {});
   }, [orchestratorPanelWorkspaceId]);
 
+  const cancelOrchestratorVoiceSubmission = useCallback(async () => {
+    const hadActiveEvents = orchestratorVoiceEventsActiveRef.current;
+    orchestratorVoiceRunRef.current += 1;
+    cancelOrchestratorFastResponseGate("cancelled");
+    clearAllVoiceHistoryTurnTimeouts();
+    orchestratorVoiceInputFinishRequestedRef.current = false;
+    if (hadActiveEvents) {
+      markPendingVoiceHistoryTurnsTerminal(
+        "cancelled",
+        "Voice submission cancelled.",
+        { includeInterim: true },
+      );
+    }
+    const monitor = orchestratorVoiceMonitorRef.current;
+    orchestratorVoiceMonitorRef.current = null;
+    const ttsPlayer = orchestratorVoiceTtsPlayerRef.current;
+    orchestratorVoiceTtsPlayerRef.current = null;
+    orchestratorVoiceEventsActiveRef.current = false;
+    setOrchestratorVoiceState("idle");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    setOrchestratorVoiceFeedback("");
+    setOrchestratorChatSubmitting(false);
+    await ttsPlayer?.close?.().catch(() => {});
+    await stopCloudVoiceAgentStream().catch(() => {});
+    await monitor?.finishCapture?.().catch(() => null);
+    await monitor?.close?.().catch(() => {});
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, markPendingVoiceHistoryTurnsTerminal]);
+
   const completeOrchestratorVoiceSession = useCallback(async () => {
     orchestratorVoiceRunRef.current += 1;
     cancelOrchestratorFastResponseGate("finished");
@@ -5195,6 +5370,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   const startOrchestratorVoiceMonitor = useCallback(async () => {
     const runId = orchestratorVoiceRunRef.current + 1;
+    const submissionMode = readOrchestratorVoiceSubmissionMode();
     orchestratorVoiceRunRef.current = runId;
     clearAllVoiceHistoryTurnTimeouts();
     resetOrchestratorFastResponseGate();
@@ -5214,6 +5390,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     void orchestratorVoiceTtsPlayerRef.current?.prime?.();
     await previousTtsPlayer?.close?.().catch(() => {});
     setOrchestratorVoiceState("starting");
+    setOrchestratorSubmissionMode(submissionMode);
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
@@ -5260,7 +5437,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
-      await startCloudVoiceAgentStream(getCloudVoiceAgentRequestContext());
+      await startCloudVoiceAgentStream({
+        ...getCloudVoiceAgentRequestContext(),
+        submissionMode,
+      });
       cloudStarted = true;
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
@@ -5787,6 +5967,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
 
       if (kind === "voice_agent_plan_snapshot") {
+        if (!orchestratorVoiceEventsActiveRef.current) {
+          return;
+        }
         cancelOrchestratorFastResponseGate("plan_snapshot");
         logTerminalStatus("frontend.voice_agent.plan_snapshot_event", {
           active: Boolean(orchestratorVoiceEventsActiveRef.current),
@@ -5982,25 +6165,32 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const paneMaximized = paneMode === TODO_QUEUE_PANE_MODE_MAXIMIZED;
   const orchestratorVoiceInputActive = orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening";
+  const orchestratorVoiceManualMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
   const orchestratorVoiceHasSignal = orchestratorVoiceInputActive && orchestratorVoiceLevel >= 6;
   const orchestratorVoiceButtonLabel = orchestratorVoiceState === "starting"
     ? "Starting voice agent monitor"
     : orchestratorVoiceState === "listening"
-      ? "Finish voice agent input"
+      ? orchestratorVoiceManualMode
+        ? "Submit voice agent input"
+        : "Finish voice agent input"
       : orchestratorVoiceState === "processing"
         ? "Voice agent response in progress"
         : orchestratorVoiceError
           ? "Restart voice agent monitor"
           : "Start voice agent monitor";
+  const orchestratorVoiceModeLabel = orchestratorVoiceManualMode ? "Manual" : "Auto";
   const orchestratorVoiceButtonTitle = orchestratorVoiceError
     || orchestratorVoiceFeedback
     || (orchestratorVoiceState === "starting"
       ? "Starting input"
       : orchestratorVoiceState === "listening"
-        ? "Stop sending audio"
+        ? orchestratorVoiceManualMode ? "Submit input" : "Stop sending audio"
         : orchestratorVoiceState === "processing"
           ? "Waiting for the voice response"
           : "Start listening");
+  const orchestratorVoiceCanCancel = orchestratorVoiceInputActive
+    || orchestratorVoiceState === "processing"
+    || orchestratorChatSubmitting;
   const orchestratorChatBusy = orchestratorChatSubmitting
     || orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening"
@@ -6086,23 +6276,38 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       ) : (
         <OrchestratorView>
           <OrchestratorVoiceArea>
-            <OrchestratorVoiceButton
-              aria-label={orchestratorVoiceButtonLabel}
-              data-error={orchestratorVoiceError ? "true" : undefined}
-              data-monitoring={orchestratorVoiceInputActive ? "true" : undefined}
-              data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
-              onClick={toggleOrchestratorVoiceMonitor}
-              title={orchestratorVoiceButtonTitle}
-              type="button"
-            >
-              <OrchestratorVoiceCanvasRing
-                active={orchestratorVoiceInputActive}
-                hasSignal={orchestratorVoiceHasSignal}
-                level={orchestratorVoiceLevel}
-                stats={orchestratorVoiceStats}
-              />
-              <OrchestratorVoiceLogo />
-            </OrchestratorVoiceButton>
+            <OrchestratorVoiceControls>
+              <OrchestratorVoiceModePill data-mode={orchestratorSubmissionMode}>
+                {orchestratorVoiceModeLabel}
+              </OrchestratorVoiceModePill>
+              <OrchestratorVoiceButton
+                aria-label={orchestratorVoiceButtonLabel}
+                data-error={orchestratorVoiceError ? "true" : undefined}
+                data-monitoring={orchestratorVoiceInputActive ? "true" : undefined}
+                data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
+                onClick={toggleOrchestratorVoiceMonitor}
+                title={orchestratorVoiceButtonTitle}
+                type="button"
+              >
+                <OrchestratorVoiceCanvasRing
+                  active={orchestratorVoiceInputActive}
+                  hasSignal={orchestratorVoiceHasSignal}
+                  level={orchestratorVoiceLevel}
+                  stats={orchestratorVoiceStats}
+                />
+                <OrchestratorVoiceLogo />
+              </OrchestratorVoiceButton>
+              {orchestratorVoiceCanCancel && (
+                <OrchestratorVoiceCancelButton
+                  aria-label="Cancel voice submission"
+                  onClick={cancelOrchestratorVoiceSubmission}
+                  title="Cancel submission"
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </OrchestratorVoiceCancelButton>
+              )}
+            </OrchestratorVoiceControls>
           </OrchestratorVoiceArea>
           <OrchestratorSectionTabs aria-label="Orchestrator section">
             <OrchestratorSectionButton
@@ -6293,6 +6498,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                     <OrchestratorHistoryList>
                       {orchestratorVoiceHistoryItems.map((item) => {
                         const status = getVoiceHistoryTurnStatus(item);
+                        const cancelled = status === "Cancelled";
                         const pending = status === "Pending" || status === "Thinking";
                         const llmPending = Boolean(
                           item.transcriptFinal
@@ -6309,13 +6515,25 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         const assistantTime = formatVoiceHistoryMessageTime(item.updatedAtMs);
 
                         return (
-                          <OrchestratorHistoryTurn data-pending={pending ? "true" : undefined} key={item.id}>
+                          <OrchestratorHistoryTurn
+                            data-cancelled={cancelled ? "true" : undefined}
+                            data-pending={pending ? "true" : undefined}
+                            key={item.id}
+                          >
                             {item.transcript && (
                               <OrchestratorHistoryUserMessage>
-                                <OrchestratorHistoryTranscript data-pending={pending ? "true" : undefined}>
+                                <OrchestratorHistoryTranscript
+                                  data-cancelled={cancelled ? "true" : undefined}
+                                  data-pending={pending ? "true" : undefined}
+                                >
                                   {item.transcript}
                                 </OrchestratorHistoryTranscript>
                                 <OrchestratorHistoryMessageActions data-align="right">
+                                  {cancelled && (
+                                    <OrchestratorHistoryTurnStatus data-status="cancelled">
+                                      Cancelled
+                                    </OrchestratorHistoryTurnStatus>
+                                  )}
                                   {userTime && (
                                     <OrchestratorHistoryMessageTime>{userTime}</OrchestratorHistoryMessageTime>
                                   )}

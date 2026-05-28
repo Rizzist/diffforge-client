@@ -1555,6 +1555,7 @@ struct DeepgramRealtimeStartStatus {
 struct CloudVoiceAgentStartRequest {
     repo_id: Option<String>,
     agent_statuses: Option<Value>,
+    submission_mode: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     workspace_root: Option<String>,
@@ -2782,6 +2783,7 @@ pub fn run() {
             cloud_mcp_sync_terminal_presence,
             cloud_mcp_sync_workspace_mcp_snapshot,
             cloud_mcp_reset_workspace_graph_state,
+            cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_record_spec_edit_intent,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_get_activity,

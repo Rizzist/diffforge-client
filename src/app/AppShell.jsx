@@ -3490,6 +3490,9 @@ export default function App() {
   const [billingStatus, setBillingStatus] = useState(null);
   const [billingStatusState, setBillingStatusState] = useState("idle");
   const [billingStatusError, setBillingStatusError] = useState("");
+  const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
+  const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
+  const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
   );
@@ -8487,6 +8490,16 @@ export default function App() {
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
+  const cloudSqliteResetTarget = activatedWorkspace || selectedWorkspace || defaultWorkspace || workspaces[0] || null;
+  const cloudSqliteResetTargetId = String(cloudSqliteResetTarget?.id || "").trim();
+  const cloudSqliteResetTargetName = String(cloudSqliteResetTarget?.name || "").trim();
+  const cloudSqliteResetRepoPath = cloudSqliteResetTargetId
+    ? getWorkspaceRootDirectory(workspaceSettings, cloudSqliteResetTargetId) || defaultWorkingDirectory
+    : "";
+  const isCloudSqliteResetting = cloudSqliteResetState === "resetting";
+  const cloudSqliteResetDisabled = isCloudSqliteResetting
+    || !cloudSqliteResetTargetId
+    || !cloudSqliteResetRepoPath;
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const isWorkspaceSettingsDeactivating = Boolean(
@@ -8497,6 +8510,53 @@ export default function App() {
   const isWorkspaceSettingsBusy = workspaceSettingsState === "saving" || isWorkspaceSettingsDeactivating;
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
+
+  const hardResetCloudSqlite = useCallback(async () => {
+    setCloudSqliteResetMessage("");
+    setCloudSqliteResetError("");
+
+    if (!cloudSqliteResetTargetId || !cloudSqliteResetRepoPath) {
+      setCloudSqliteResetError("Choose or activate a workspace before resetting cloud SQLite.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Hard reset cloud SQLite for this desktop account? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state. Workspace filetree sync snapshots are kept and the reset database is uploaded to Backblaze B2.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setCloudSqliteResetState("resetting");
+    try {
+      const response = await invoke("cloud_mcp_hard_reset_cloud_sqlite", {
+        repoPath: cloudSqliteResetRepoPath,
+        workspaceId: cloudSqliteResetTargetId,
+        workspaceName: cloudSqliteResetTargetName || null,
+      });
+      const data = unwrapCloudCommandData(response, {});
+      const preservedFiletrees = Number(data?.preserved?.repo_filetree_state || 0);
+      const backups = Array.isArray(data?.backups) ? data.backups : [];
+      const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
+      const skippedBackup = backups.find((backup) => backup?.skipped);
+      const filetreeLabel = preservedFiletrees === 1 ? "filetree snapshot" : "filetree snapshots";
+      const backupLabel = updatedBackupCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
+      const backupMessage = updatedBackupCount > 0
+        ? `updated ${updatedBackupCount} ${backupLabel}`
+        : `skipped B2 backup${skippedBackup?.reason ? ` (${skippedBackup.reason})` : ""}`;
+      setCloudSqliteResetMessage(
+        `Cloud SQLite reset complete. Preserved ${preservedFiletrees} ${filetreeLabel} and ${backupMessage}.`,
+      );
+    } catch (error) {
+      setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
+    } finally {
+      setCloudSqliteResetState("idle");
+    }
+  }, [
+    cloudSqliteResetRepoPath,
+    cloudSqliteResetTargetId,
+    cloudSqliteResetTargetName,
+  ]);
 
   useEffect(() => {
     if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
@@ -12227,6 +12287,71 @@ export default function App() {
                             <span>Activate selected</span>
                           </PrimaryButton>
                         )}
+                      </AccountCardFooter>
+                    </AccountCard>
+                  </AccountSettingsPanel>
+
+                  <AccountSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Cloud maintenance</PanelKicker>
+                        <PanelHeading>Cloud SQLite reset</PanelHeading>
+                      </div>
+                    </PanelHeaderRow>
+
+                    <AccountCard data-tone="orange">
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Hard reset</SettingsLabel>
+                          <SettingsValue>Reset cloud SQLite</SettingsValue>
+                          <SettingsHint>
+                            Deletes cloud task history, voice orchestrator history, synced devices, logs, MCP state, terminal presence, and Spec Graph working state. Workspace filetree sync snapshots are preserved.
+                          </SettingsHint>
+                        </div>
+                        <AgentReadyPill data-tone="orange">
+                          {isCloudSqliteResetting ? (
+                            <PendingIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          )}
+                          <span>{isCloudSqliteResetting ? "Resetting" : "B2 checkpoint"}</span>
+                        </AgentReadyPill>
+                      </AccountCardHeader>
+
+                      <SettingsIdentityGrid>
+                        <SettingsIdentityItem>
+                          <span>Target</span>
+                          <strong>{cloudSqliteResetTargetName || "No workspace"}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Preserved</span>
+                          <strong>Filetree sync</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Remote</span>
+                          <strong>Backblaze B2</strong>
+                        </SettingsIdentityItem>
+                      </SettingsIdentityGrid>
+
+                      {cloudSqliteResetError && <FormMessage $state="error">{cloudSqliteResetError}</FormMessage>}
+                      {cloudSqliteResetMessage && (
+                        <AgentInstallMessage data-tone="success">
+                          {cloudSqliteResetMessage}
+                        </AgentInstallMessage>
+                      )}
+
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          Use this when cloud history or device sync state needs a complete rebuild without losing workspace filetree snapshots.
+                        </SettingsHint>
+                        <PrimaryDangerButton
+                          disabled={cloudSqliteResetDisabled}
+                          onClick={hardResetCloudSqlite}
+                          type="button"
+                        >
+                          {isCloudSqliteResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isCloudSqliteResetting ? "Resetting..." : "Hard reset cloud SQLite"}</span>
+                        </PrimaryDangerButton>
                       </AccountCardFooter>
                     </AccountCard>
                   </AccountSettingsPanel>

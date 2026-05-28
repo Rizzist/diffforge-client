@@ -5,6 +5,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   AUDIO_TRANSCRIPTION_RESULT_EVENT,
+  AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO,
+  AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT,
+  AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL,
   AUDIO_RECORDER_MODE_PUSH_TO_TALK,
   AUDIO_RECORDER_MODE_TOGGLE_TO_TALK,
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
@@ -22,6 +25,7 @@ import {
   prepareWhisperModel,
   publishAudioTranscriptionResult,
   readAudioRecorderMode,
+  readOrchestratorVoiceSubmissionMode,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
@@ -31,6 +35,7 @@ import {
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
   writeAudioRecorderMode,
+  writeOrchestratorVoiceSubmissionMode,
   writeAudioTranscriptionProvider,
   writeAutoOpenAudioRecorder,
   writeAudioWidgetTheme,
@@ -949,6 +954,7 @@ export default function AudioWorkspaceView({
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
+  const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [historyScrollTop, setHistoryScrollTop] = useState(0);
@@ -987,6 +993,7 @@ export default function AudioWorkspaceView({
     : isBusy || (isCloudMode ? !deepgramReady : !installed);
   const recorderAction = recorderOpen ? onCloseWidget : onOpenWidget;
   const isToggleRecorderMode = recorderMode === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK;
+  const isManualOrchestratorMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
   const recorderHint = recorderOpen
     ? "Floating recorder is open."
     : isToggleRecorderMode
@@ -1210,6 +1217,12 @@ export default function AudioWorkspaceView({
     setRecorderMode(nextMode);
     writeAudioRecorderMode(nextMode);
     notifyAudioSettingsChanged("recorder-mode");
+  }, []);
+
+  const updateOrchestratorSubmissionMode = useCallback((nextMode) => {
+    setOrchestratorSubmissionMode(nextMode);
+    writeOrchestratorVoiceSubmissionMode(nextMode);
+    notifyAudioSettingsChanged("orchestrator-submission-mode");
   }, []);
 
   const updateAudioWidgetTheme = useCallback((nextTheme) => {
@@ -1458,18 +1471,25 @@ export default function AudioWorkspaceView({
         setAudioHistory(readAudioTranscriptionHistory());
         setRecorderMode(readAudioRecorderMode());
         setAudioWidgetTheme(readAudioWidgetTheme());
+        setOrchestratorSubmissionMode(readOrchestratorVoiceSubmissionMode());
         setAudioMode(readAudioTranscriptionProvider());
         setDeepgramApiKey(readDeepgramApiKey());
         setDeepgramLanguage(readDeepgramLanguage());
       }
     };
 
+    const handleOrchestratorModeChanged = (event) => {
+      setOrchestratorSubmissionMode(event?.detail?.mode || readOrchestratorVoiceSubmissionMode());
+    };
+
     window.addEventListener("storage", handleStorage);
+    window.addEventListener(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, handleOrchestratorModeChanged);
 
     return () => {
       disposed = true;
       unlisten();
       window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, handleOrchestratorModeChanged);
     };
   }, []);
 
@@ -1620,6 +1640,42 @@ export default function AudioWorkspaceView({
                 ))}
               </AudioModeGrid>
             </AudioCloudField>
+          </AudioRecorderPanel>
+
+          <AudioRecorderPanel aria-label="Orchestrator voice controls">
+            <AudioDeviceHeader>
+              <div>
+                <SettingsLabel>Orchestrator</SettingsLabel>
+                <SettingsHint>{isManualOrchestratorMode ? "Manual submit" : "Auto submit"}</SettingsHint>
+              </div>
+              <AudioStatePill data-installed="true">
+                {isManualOrchestratorMode ? "Manual" : "Auto"}
+              </AudioStatePill>
+            </AudioDeviceHeader>
+            <AudioModeGrid role="group" aria-label="Orchestrator voice submission mode">
+              <AudioModeButton
+                aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO}
+                onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO)}
+                type="button"
+              >
+                <ButtonMicIcon aria-hidden="true" />
+                <span>
+                  <strong>Auto</strong>
+                  <span>Submit on pause</span>
+                </span>
+              </AudioModeButton>
+              <AudioModeButton
+                aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL}
+                onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL)}
+                type="button"
+              >
+                <ButtonKeyIcon aria-hidden="true" />
+                <span>
+                  <strong>Manual</strong>
+                  <span>Press to submit</span>
+                </span>
+              </AudioModeButton>
+            </AudioModeGrid>
           </AudioRecorderPanel>
         </AudioGeneralToolbar>
 

@@ -3220,6 +3220,17 @@ fn clean_cloud_voice_agent_message_text(value: String, max_chars: usize) -> Stri
         .collect()
 }
 
+fn normalize_cloud_voice_agent_submission_mode(value: Option<String>) -> String {
+    match clean_cloud_voice_agent_text(value, 32)
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "manual" | "manual_submit" | "push_to_submit" => "manual".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
 fn cloud_voice_agent_header(value: &str, label: &str) -> Result<HeaderValue, String> {
     HeaderValue::from_str(value).map_err(|error| format!("Invalid {label} header: {error}"))
 }
@@ -5969,10 +5980,12 @@ async fn start_cloud_voice_agent_stream(
     let CloudVoiceAgentStartRequest {
         repo_id,
         agent_statuses,
+        submission_mode,
         workspace_id,
         workspace_name,
         workspace_root,
     } = request;
+    let submission_mode = normalize_cloud_voice_agent_submission_mode(submission_mode);
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
     let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
@@ -6001,6 +6014,7 @@ async fn start_cloud_voice_agent_stream(
         &repo_id,
         json!({
             "agent_status_count": agent_statuses.as_array().map(|items| items.len()).unwrap_or(0),
+            "submission_mode": submission_mode.clone(),
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
         }),
@@ -6130,7 +6144,12 @@ async fn start_cloud_voice_agent_stream(
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
             "repo_id": repo_id.clone(),
+            "submission_mode": submission_mode.clone(),
+            "input_mode": submission_mode.clone(),
             "agent_statuses": agent_statuses.clone(),
+            "turn_policy": {
+                "input_submission": submission_mode.clone(),
+            },
             "tts": {
                 "enabled": true,
                 "provider": "deepgram_aura",

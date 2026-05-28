@@ -34,6 +34,7 @@ export function startCloudVoiceAgentStream(request = {}) {
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.invoke", {
     hasAgentStatuses: Array.isArray(request?.agentStatuses || request?.agent_statuses),
     repoId: request?.repoId || request?.repo_id || "",
+    submissionMode: request?.submissionMode || request?.submission_mode || "",
     workspaceId: request?.workspaceId || request?.workspace_id || "",
   });
   return invoke("start_cloud_voice_agent_stream", { request })
