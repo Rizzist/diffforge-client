@@ -25,6 +25,7 @@ const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
+const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
@@ -1746,6 +1747,10 @@ async fn cloud_mcp_start_remote_command_listener(
                 .or_else(|| cloud_mcp_payload_text(&event, &["eventKind"]))
                 .or_else(|| cloud_mcp_payload_text(&event, &["kind"]))
                 .unwrap_or_default();
+            if event_kind.starts_with("credit_wallet_") {
+                let _ = app.emit(CLOUD_MCP_CREDIT_WALLET_EVENT, event.clone());
+                continue;
+            }
             if event_kind != "remote_command_requested" {
                 continue;
             }

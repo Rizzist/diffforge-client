@@ -553,6 +553,48 @@ function creditUsagePercent(credits) {
   return Math.min(100, Math.max(0, Math.round((remaining / total) * 100)));
 }
 
+function liveCreditNumber(value, fallback = null) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function liveCreditText(value, fallback = "") {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+}
+
+function normalizeLiveCreditWallet(wallet, previous = {}) {
+  const credits = wallet?.credits || wallet?.wallet || wallet || {};
+  const total = credits.total || credits.totalCredits || {};
+  const term = credits.term || {};
+  const termEnd = liveCreditText(term.term_end || term.termEnd, previous.resetAt || "");
+  return {
+    ...(previous || {}),
+    known: credits.known ?? previous?.known ?? true,
+    live: credits.live ?? previous?.live ?? true,
+    source: liveCreditText(credits.source, previous?.source || "diff_forge_hot_credit_wallet"),
+    walletVersion: liveCreditNumber(credits.wallet_version ?? credits.walletVersion, previous?.walletVersion || 0),
+    pendingEventCount: liveCreditNumber(credits.pending_event_count ?? credits.pendingEventCount, previous?.pendingEventCount || 0),
+    planName: liveCreditText(term.plan_name || term.planName, previous?.planName || ""),
+    resetAt: termEnd || null,
+    termEnd: termEnd || null,
+    termId: liveCreditText(term.id, previous?.termId || ""),
+    termRemainingCredits: liveCreditNumber(total.remaining_credits ?? total.remainingCredits, previous?.termRemainingCredits || 0),
+    termReservedCredits: liveCreditNumber(total.reserved_credits ?? total.reservedCredits, previous?.termReservedCredits || 0),
+    termTotalCredits: liveCreditNumber(total.total_credits ?? total.totalCredits, previous?.termTotalCredits || 0),
+    termUsedCredits: liveCreditNumber(total.used_credits ?? total.usedCredits, previous?.termUsedCredits || 0),
+    providerCostMicrousd: liveCreditNumber(total.provider_cost_microusd ?? total.providerCostMicrousd, previous?.providerCostMicrousd || 0),
+    inputTokens: liveCreditNumber(total.input_tokens ?? total.inputTokens, previous?.inputTokens || 0),
+    cachedInputTokens: liveCreditNumber(total.cached_input_tokens ?? total.cachedInputTokens, previous?.cachedInputTokens || 0),
+    outputTokens: liveCreditNumber(total.output_tokens ?? total.outputTokens, previous?.outputTokens || 0),
+    audioSeconds: liveCreditNumber(total.audio_seconds ?? total.audioSeconds, previous?.audioSeconds || 0),
+    ttsCharacters: liveCreditNumber(total.tts_characters ?? total.ttsCharacters, previous?.ttsCharacters || 0),
+    webSearchCalls: liveCreditNumber(total.web_search_calls ?? total.webSearchCalls, previous?.webSearchCalls || 0),
+    eventCount: liveCreditNumber(total.event_count ?? total.eventCount, previous?.eventCount || 0),
+    updatedAt: liveCreditText(credits.updated_at || credits.updatedAt, new Date().toISOString()),
+  };
+}
+
 function lowCreditWarningKey(credits) {
   if (!credits) {
     return "";
@@ -797,6 +839,7 @@ const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-disp
 const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
+const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 
 function getThreadDiagnosticTextLength(value) {
@@ -8797,6 +8840,7 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlistenRemoteCommand = null;
+    let unlistenCreditWallet = null;
 
     const remoteCommandText = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
@@ -8833,6 +8877,18 @@ export default function App() {
     const startRemoteCommandListener = async () => {
       try {
         await invoke("cloud_mcp_start_remote_command_listener");
+        unlistenCreditWallet = await listen(CLOUD_MCP_CREDIT_WALLET_EVENT, (creditEvent) => {
+          if (disposed) return;
+          const event = creditEvent?.payload || {};
+          const payload = event.payload && typeof event.payload === "object" ? event.payload : event;
+          const wallet = payload.credits || payload.wallet || payload;
+          setBillingStatus((current) => ({
+            ...(current || {}),
+            credits: normalizeLiveCreditWallet(wallet, current?.credits),
+          }));
+          setBillingStatusState("ready");
+          setBillingStatusError("");
+        });
         unlistenRemoteCommand = await listen(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
           if (disposed) return;
           const event = remoteEvent?.payload || {};
@@ -8901,6 +8957,9 @@ export default function App() {
       disposed = true;
       if (typeof unlistenRemoteCommand === "function") {
         unlistenRemoteCommand();
+      }
+      if (typeof unlistenCreditWallet === "function") {
+        unlistenCreditWallet();
       }
     };
   }, [workspaces]);
