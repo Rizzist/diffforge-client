@@ -24,6 +24,7 @@ const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
+const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
@@ -45,6 +46,7 @@ struct CloudMcpState {
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
+    remote_command_listener_started: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -247,6 +249,7 @@ impl CloudMcpState {
             global_ws_tx: Arc::new(Mutex::new(None)),
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
+            remote_command_listener_started: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1605,6 +1608,173 @@ async fn cloud_mcp_send_lifecycle_event(
         "status": status,
         "ts_ms": now,
     }))
+}
+
+fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
+    let Some(target_device_id) = cloud_mcp_payload_text(event, &["target_device_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["targetDeviceId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_device_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetDeviceId"]))
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let device = cloud_mcp_desktop_device_profile();
+    [
+        cloud_mcp_payload_text(&device, &["device_id"]),
+        cloud_mcp_payload_text(&device, &["deviceId"]),
+        cloud_mcp_payload_text(&device, &["machine_name"]),
+        cloud_mcp_payload_text(&device, &["machineName"]),
+        cloud_mcp_payload_text(&device, &["device_name"]),
+        cloud_mcp_payload_text(&device, &["deviceName"]),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value.trim().to_lowercase())
+    .any(|value| value == target_device_id)
+}
+
+async fn cloud_mcp_send_remote_command_status_event(
+    state: &CloudMcpState,
+    event: &Value,
+    status: &str,
+    message: &str,
+) -> Result<Value, String> {
+    let now = cloud_mcp_now_ms();
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let status_kind = if matches!(status, "completed" | "failed") {
+        "remote_command_result"
+    } else {
+        "remote_command_ack"
+    };
+    let payload = json!({
+        "source": "rust-diffforge-remote-control",
+        "event_kind": status_kind,
+        "command_id": cloud_mcp_payload_text(event, &["command_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["commandId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandId"])),
+        "command_kind": cloud_mcp_payload_text(event, &["command_kind"])
+            .or_else(|| cloud_mcp_payload_text(event, &["commandKind"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_kind"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandKind"])),
+        "target_agent_id": cloud_mcp_payload_text(event, &["target_agent_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetAgentId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_agent_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetAgentId"])),
+        "target_device_id": cloud_mcp_payload_text(event, &["target_device_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetDeviceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_device_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetDeviceId"])),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "origin_connection_id": cloud_mcp_payload_text(event, &["origin_connection_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["originConnectionId"])),
+        "repo_id": cloud_mcp_payload_text(event, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["repoId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "repo_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "repoId"])),
+        "workspace_id": cloud_mcp_payload_text(event, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"])),
+        "status": status,
+        "message": message,
+        "rust_received_ms": now,
+        "ts_ms": now,
+    });
+    let request = cloud_mcp_event_envelope(status_kind, &payload);
+    let envelope = json!({
+        "kind": "event",
+        "id": format!("remote-command-status-{}-{}", now, uuid::Uuid::new_v4()),
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
+        "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
+        "request": request,
+    });
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return Err("Cloud MCP app websocket is not connected.".to_string());
+    };
+    tx.send(envelope)
+        .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())?;
+    Ok(json!({"ok": true, "sent": true, "status": status}))
+}
+
+#[tauri::command]
+async fn cloud_mcp_start_remote_command_listener(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    if state
+        .remote_command_listener_started
+        .swap(true, Ordering::SeqCst)
+    {
+        return Ok(json!({"ok": true, "already_running": true}));
+    }
+
+    let state_clone = state.inner().clone();
+    cloud_mcp_start_global_ws(&state_clone).await;
+    let mut ws_events = state.global_ws_events.subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if crate::app_shutdown_requested() {
+                break;
+            }
+            let event = match ws_events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let event_kind = cloud_mcp_payload_text(&event, &["event_kind"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["eventKind"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["kind"]))
+                .unwrap_or_default();
+            if event_kind != "remote_command_requested" {
+                continue;
+            }
+            if !cloud_mcp_remote_command_matches_device(&event) {
+                continue;
+            }
+            let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
+            let (status, message) = if emit_result.is_ok() {
+                ("received", "Remote command received by desktop.")
+            } else {
+                ("failed", "Desktop UI was not available for the remote command.")
+            };
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state_clone,
+                &event,
+                status,
+                message,
+            )
+            .await;
+        }
+    });
+    Ok(json!({"ok": true, "started": true}))
+}
+
+#[tauri::command]
+async fn cloud_mcp_record_remote_command_status(
+    state: State<'_, CloudMcpState>,
+    event: Value,
+    status: String,
+    message: Option<String>,
+) -> Result<Value, String> {
+    cloud_mcp_send_remote_command_status_event(
+        state.inner(),
+        &event,
+        status.trim(),
+        message.as_deref().unwrap_or(""),
+    )
+    .await
 }
 
 fn cloud_mcp_desktop_device_profile() -> Value {
@@ -6686,6 +6856,7 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
     repo_path: String,
     workspace_id: String,
     workspace_name: Option<String>,
+    reset_scope: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(
         repo_path.clone(),
@@ -6693,6 +6864,11 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         workspace_name.clone(),
     );
     let device_profile = cloud_mcp_desktop_device_profile();
+    let reset_scope = reset_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("client_preserve_filetree");
     let payload = json!({
         "source": "rust-diffforge-cloud-sqlite-hard-reset",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
@@ -6701,7 +6877,7 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         "workspace_root": req.root_display,
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
-        "scope": "client_preserve_filetree",
+        "scope": reset_scope,
         "confirm": "hard_reset_cloud_sqlite_preserve_filetree",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),

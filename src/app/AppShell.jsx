@@ -794,6 +794,8 @@ const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-promp
 const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
 const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
 const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
+const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 
 function getThreadDiagnosticTextLength(value) {
@@ -8496,7 +8498,11 @@ export default function App() {
   const cloudSqliteResetRepoPath = cloudSqliteResetTargetId
     ? getWorkspaceRootDirectory(workspaceSettings, cloudSqliteResetTargetId) || defaultWorkingDirectory
     : "";
-  const isCloudSqliteResetting = cloudSqliteResetState === "resetting";
+  const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
+    || cloudSqliteResetState === "resetting";
+  const isCloudSqliteClientResetting = cloudSqliteResetState === "client_resetting"
+    || cloudSqliteResetState === "resetting";
+  const isCloudSqliteAccountResetting = cloudSqliteResetState === "account_resetting";
   const cloudSqliteResetDisabled = isCloudSqliteResetting
     || !cloudSqliteResetTargetId
     || !cloudSqliteResetRepoPath;
@@ -8511,7 +8517,7 @@ export default function App() {
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
 
-  const hardResetCloudSqlite = useCallback(async () => {
+  const hardResetCloudSqlite = useCallback(async (resetScope = "client") => {
     setCloudSqliteResetMessage("");
     setCloudSqliteResetError("");
 
@@ -8520,32 +8526,37 @@ export default function App() {
       return;
     }
 
+    const isAccountReset = resetScope === "account";
     const confirmed = window.confirm(
-      "Hard reset cloud SQLite for this desktop account? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state. Workspace filetree sync snapshots are kept and the reset database is uploaded to Backblaze B2.",
+      isAccountReset
+        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including old duplicate device/client activations from before device standardization. Workspace filetree sync snapshots are kept and reset databases are uploaded to Backblaze B2."
+        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state for this client. Workspace filetree sync snapshots are kept and the reset database is uploaded to Backblaze B2.",
     );
     if (!confirmed) {
       return;
     }
 
-    setCloudSqliteResetState("resetting");
+    setCloudSqliteResetState(isAccountReset ? "account_resetting" : "client_resetting");
     try {
       const response = await invoke("cloud_mcp_hard_reset_cloud_sqlite", {
         repoPath: cloudSqliteResetRepoPath,
         workspaceId: cloudSqliteResetTargetId,
         workspaceName: cloudSqliteResetTargetName || null,
+        resetScope: isAccountReset ? "account_preserve_filetree" : "client_preserve_filetree",
       });
       const data = unwrapCloudCommandData(response, {});
       const preservedFiletrees = Number(data?.preserved?.repo_filetree_state || 0);
       const backups = Array.isArray(data?.backups) ? data.backups : [];
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
       const skippedBackup = backups.find((backup) => backup?.skipped);
+      const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
       const filetreeLabel = preservedFiletrees === 1 ? "filetree snapshot" : "filetree snapshots";
       const backupLabel = updatedBackupCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
       const backupMessage = updatedBackupCount > 0
         ? `updated ${updatedBackupCount} ${backupLabel}`
         : `skipped B2 backup${skippedBackup?.reason ? ` (${skippedBackup.reason})` : ""}`;
       setCloudSqliteResetMessage(
-        `Cloud SQLite reset complete. Preserved ${preservedFiletrees} ${filetreeLabel} and ${backupMessage}.`,
+        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}. Preserved ${preservedFiletrees} ${filetreeLabel} and ${backupMessage}.`,
       );
     } catch (error) {
       setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
@@ -8711,6 +8722,118 @@ export default function App() {
       window.removeEventListener(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, handleSpecEditCancelled);
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenRemoteCommand = null;
+
+    const remoteCommandText = (event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      return String(
+        event?.body
+          || event?.message
+          || event?.prompt
+          || event?.text
+          || payload.body
+          || payload.message
+          || payload.prompt
+          || payload.text
+          || "",
+      ).trim();
+    };
+    const remoteCommandWorkspaceId = (event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const requestedWorkspaceId = String(
+        event?.workspace_id
+          || event?.workspaceId
+          || payload.workspace_id
+          || payload.workspaceId
+          || "",
+      ).trim();
+      if (requestedWorkspaceId && findWorkspaceById(workspaces, requestedWorkspaceId)) {
+        return requestedWorkspaceId;
+      }
+      return activatedWorkspaceIdRef.current
+        || selectedWorkspaceIdRef.current
+        || workspaces[0]?.id
+        || "";
+    };
+
+    const startRemoteCommandListener = async () => {
+      try {
+        await invoke("cloud_mcp_start_remote_command_listener");
+        unlistenRemoteCommand = await listen(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
+          if (disposed) return;
+          const event = remoteEvent?.payload || {};
+          const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
+            || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          const text = remoteCommandText(event);
+          const workspaceId = remoteCommandWorkspaceId(event);
+          const agentId = normalizeManagedAgentProviderId(
+            event.target_agent_id
+              || event.targetAgentId
+              || event.payload?.target_agent_id
+              || event.payload?.targetAgentId
+              || "",
+          );
+          if (!text || !workspaceId) {
+            await invoke("cloud_mcp_record_remote_command_status", {
+              event,
+              status: "failed",
+              message: !workspaceId
+                ? "No local workspace is available for the remote command."
+                : "Remote command did not include a task message.",
+            }).catch(() => {});
+            return;
+          }
+          const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
+          window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
+            detail: {
+              item: {
+                createdAt: event.created_at || event.createdAt || new Date().toISOString(),
+                id: commandId,
+                kind: "todo",
+                remoteCommand: {
+                  commandId,
+                  source: event.source || "next-diffforge",
+                },
+                source: "next-remote-control",
+                targetAgentId: agentId || "",
+                targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+                text,
+                workspaceId,
+              },
+              commandId,
+              source: "next-diffforge",
+              workspaceId,
+              workspaceName: targetWorkspace?.name || "",
+            },
+          }));
+          await invoke("cloud_mcp_record_remote_command_status", {
+            event,
+            status: "queued",
+            message: agentId
+              ? `Queued for ${getManagedAgentLabel(agentId)}.`
+              : "Queued for the next available coding agent.",
+          }).catch(() => {});
+        });
+      } catch (error) {
+        logBigViewSyncDiagnosticEvent("remote_control.listener_error", {
+          message: getErrorMessage(error, "Remote command listener failed."),
+          surface: "app_shell",
+        });
+      }
+    };
+
+    startRemoteCommandListener();
+    return () => {
+      disposed = true;
+      if (typeof unlistenRemoteCommand === "function") {
+        unlistenRemoteCommand();
+      }
+    };
+  }, [workspaces]);
+
   const submitSpecEditIntent = useCallback(async (payload) => {
     if (!selectedWorkspace || !activatedWorkspace || selectedWorkspace.id !== activatedWorkspace.id) {
       throw new Error("Activate this workspace to edit specs.");
@@ -12342,15 +12465,23 @@ export default function App() {
 
                       <AccountCardFooter>
                         <SettingsHint>
-                          Use this when cloud history or device sync state needs a complete rebuild without losing workspace filetree snapshots.
+                          Use client reset for this desktop client. Use account reset when old duplicate devices or pre-standardization client stores are still visible.
                         </SettingsHint>
                         <PrimaryDangerButton
                           disabled={cloudSqliteResetDisabled}
-                          onClick={hardResetCloudSqlite}
+                          onClick={() => hardResetCloudSqlite("client")}
                           type="button"
                         >
-                          {isCloudSqliteResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteResetting ? "Resetting..." : "Hard reset cloud SQLite"}</span>
+                          {isCloudSqliteClientResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isCloudSqliteClientResetting ? "Resetting..." : "Reset current client"}</span>
+                        </PrimaryDangerButton>
+                        <PrimaryDangerButton
+                          disabled={cloudSqliteResetDisabled}
+                          onClick={() => hardResetCloudSqlite("account")}
+                          type="button"
+                        >
+                          {isCloudSqliteAccountResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isCloudSqliteAccountResetting ? "Resetting..." : "Reset account state"}</span>
                         </PrimaryDangerButton>
                       </AccountCardFooter>
                     </AccountCard>

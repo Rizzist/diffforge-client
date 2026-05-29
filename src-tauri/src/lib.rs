@@ -2784,6 +2784,8 @@ pub fn run() {
             cloud_mcp_sync_workspace_mcp_snapshot,
             cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_hard_reset_cloud_sqlite,
+            cloud_mcp_start_remote_command_listener,
+            cloud_mcp_record_remote_command_status,
             cloud_mcp_record_spec_edit_intent,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_get_activity,

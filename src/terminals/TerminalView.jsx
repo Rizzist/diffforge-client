@@ -133,6 +133,7 @@ const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
 const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
 const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
+const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
@@ -140,6 +141,7 @@ const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-
 const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
 const TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO = "tui-spec-edit-auto-queue";
 const TODO_QUEUE_SOURCE_VOICE_PLAN = "tui-voice-plan-queue";
+const TODO_QUEUE_SOURCE_REMOTE_CONTROL = "next-remote-control";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
 const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
@@ -2131,6 +2133,16 @@ const TodoQueueItemCard = styled.article`
     line-height: 1.45;
   }
 
+  &[data-todo-targeted="true"]::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    margin-top: 7px;
+    border-radius: 999px;
+    background: var(--todo-agent-color, #8bb8ff);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--todo-agent-color, #8bb8ff) 20%, transparent);
+  }
+
   &:hover {
     background: rgba(47, 128, 255, 0.1);
   }
@@ -4017,6 +4029,24 @@ function normalizeTodoTerminalAgentId(value) {
   return String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
 }
 
+function getTodoQueueTargetAgentId(item) {
+  return normalizeTodoTerminalAgentId(
+    item?.targetAgentId
+      || item?.target_agent_id
+      || item?.remoteCommand?.targetAgentId
+      || item?.remote_command?.target_agent_id
+      || "",
+  );
+}
+
+function getTodoQueueAgentAccentColor(agentId) {
+  const normalized = normalizeTodoTerminalAgentId(agentId);
+  if (normalized === "claude") return "#ff9f43";
+  if (normalized === "opencode") return "#41d38a";
+  if (normalized === "codex") return "#62a0ff";
+  return "#8bb8ff";
+}
+
 function findTodoAgentStatus(agentStatuses, agentId) {
   const normalizedAgentId = normalizeTodoTerminalAgentId(agentId);
   return (Array.isArray(agentStatuses) ? agentStatuses : []).find((status) => (
@@ -4313,6 +4343,11 @@ function createTodoQueueItem(text, options = {}) {
   const specEdit = normalizeTodoQueueSpecEdit(options.specEdit);
   const planTask = normalizeTodoQueuePlanTask(options.planTask);
   const workspaceId = String(options.workspaceId || specEdit?.workspaceId || "").trim();
+  const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
+  const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
+  const remoteCommand = options.remoteCommand && typeof options.remoteCommand === "object"
+    ? { ...options.remoteCommand }
+    : null;
 
   return {
     createdAt,
@@ -4323,6 +4358,9 @@ function createTodoQueueItem(text, options = {}) {
     ...(planTask ? { planTask } : {}),
     ...(source ? { source } : {}),
     ...(specEdit ? { specEdit } : {}),
+    ...(remoteCommand ? { remoteCommand } : {}),
+    ...(targetAgentId ? { targetAgentId } : {}),
+    ...(targetAgentLabel ? { targetAgentLabel } : {}),
     text: normalizeTodoQueueText(text),
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -4341,6 +4379,13 @@ function normalizeTodoQueueItem(item) {
   const specEdit = getTodoQueueItemSpecEdit(item);
   const planTask = getTodoQueueItemPlanTask(item);
   const workspaceId = String(item.workspaceId || item.workspace_id || specEdit?.workspaceId || "").trim();
+  const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
+  const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
+  const remoteCommand = item.remoteCommand && typeof item.remoteCommand === "object"
+    ? { ...item.remoteCommand }
+    : item.remote_command && typeof item.remote_command === "object"
+      ? { ...item.remote_command }
+      : null;
   if (!text && !image && !note && !specEdit?.promptText) {
     return null;
   }
@@ -4356,6 +4401,9 @@ function normalizeTodoQueueItem(item) {
     ...(planTask ? { planTask } : {}),
     ...(source ? { source } : {}),
     ...(specEdit ? { specEdit } : {}),
+    ...(remoteCommand ? { remoteCommand } : {}),
+    ...(targetAgentId ? { targetAgentId } : {}),
+    ...(targetAgentLabel ? { targetAgentLabel } : {}),
     text,
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -6327,6 +6375,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         const image = getTodoQueueItemImage(item);
                         const note = getTodoQueueItemNote(item);
                         const hasPreview = Boolean(image || note);
+                        const targetAgentId = getTodoQueueTargetAgentId(item);
 
                         return (
                           <TodoQueueItemCard
@@ -6336,6 +6385,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             data-todo-pending={isPending ? "true" : undefined}
                             data-todo-queued={isQueued ? "true" : undefined}
                             data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
+                            data-todo-targeted={targetAgentId ? "true" : undefined}
                             data-todo-cancellable={isQueued ? "true" : undefined}
                             data-todo-sending={isSending ? "true" : undefined}
                             key={item.id}
@@ -6350,9 +6400,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             onPointerDown={(event) => handlePointerDown(event, item)}
                             ref={(element) => setTodoItemElement(item.id, element)}
                             role="listitem"
+                            style={targetAgentId ? { "--todo-agent-color": getTodoQueueAgentAccentColor(targetAgentId) } : undefined}
                             title={
                               isQueued
-                                ? "Queued for the next available agent."
+                                ? targetAgentId
+                                  ? `Queued for ${item.targetAgentLabel || targetAgentId}.`
+                                  : "Queued for the next available agent."
                                 : isSending
                                   ? "Sending to terminal."
                                   : "Drag into an agent terminal. Double-click to edit."
@@ -10076,6 +10129,58 @@ function TerminalView({
     updateTodoQueueItems,
   ]);
 
+  useEffect(() => {
+    const handleRemoteTodoQueueEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || detail.item?.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+
+      const item = normalizeTodoQueueItem({
+        ...(detail.item || {}),
+        kind: "todo",
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        workspaceId: eventWorkspaceId,
+      });
+      if (!item) {
+        return;
+      }
+
+      updateTodoQueueItems((currentItems) => (
+        currentItems
+          .filter((candidate) => candidate.id !== item.id)
+          .concat([item])
+      ));
+      setTodoDropError("");
+      setTodoQueueItemPending(item.id, {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        phase: "queued",
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        targetRole: getTodoQueueTargetAgentId(item),
+        workspaceId: terminalWorkspace.id,
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+      logBigViewSyncDiagnosticEvent("remote_control.queue_added", {
+        commandId: detail.commandId || item.remoteCommand?.commandId || item.id,
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        targetAgentId: getTodoQueueTargetAgentId(item),
+        surface: "tui_todo_queue",
+        workspaceId: terminalWorkspace.id,
+      });
+    };
+
+    window.addEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
+    return () => {
+      window.removeEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
+    };
+  }, [
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
   const cancelQueuedTodoQueueItem = useCallback((itemId) => {
     const safeItemId = String(itemId || "").trim();
     const pendingItem = safeItemId ? todoQueuePendingItemsRef.current[safeItemId] || null : null;
@@ -10242,6 +10347,7 @@ function TerminalView({
       }
     }
 
+    const requestedTargetAgentId = getTodoQueueTargetAgentId(queuedItem);
     let target = null;
     for (const terminalIndex of logicalTerminalIndexes) {
       const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
@@ -10249,7 +10355,8 @@ function TerminalView({
         requireAvailable: true,
         reservationItemId: queuedItem.id,
       });
-      if (candidate.available) {
+      const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);
+      if (candidate.available && (!requestedTargetAgentId || candidateRole === requestedTargetAgentId)) {
         target = candidate;
         break;
       }
@@ -10258,6 +10365,7 @@ function TerminalView({
       logTerminalStatus("frontend.todo_queue.dispatch_wait", {
         item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
         reason: "no_available_terminal",
+        requestedTargetAgentId,
         terminalCount: logicalTerminalIndexes.length,
         workspaceId: terminalWorkspace?.id || "",
       });
