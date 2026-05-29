@@ -67,6 +67,7 @@ struct CloudMcpProcessAuthCache {
 struct CloudMcpRuntimeSnapshots {
     terminal_presence: Option<Value>,
     workspace_mcps: Option<Value>,
+    tokenomics: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -1010,6 +1011,9 @@ async fn cloud_mcp_open_global_ws(
     )
     .await;
     let auth_bearer = cloud_mcp_authorization_bearer(state).await?;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
         String,
@@ -1026,6 +1030,11 @@ async fn cloud_mcp_open_global_ws(
         request.headers_mut().insert(
             "user-agent",
             HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
+        );
+        request.headers_mut().insert(
+            "x-diffforge-device-id",
+            HeaderValue::from_str(&device_id)
+                .map_err(|error| format!("Invalid Cloud MCP device id header: {error}"))?,
         );
         if let Some(token) = auth_bearer.as_deref() {
             request.headers_mut().insert(
@@ -2251,6 +2260,9 @@ async fn cloud_mcp_replay_runtime_snapshots(
     }
     if let Some(payload) = snapshots.workspace_mcps {
         replay_items.push(("workspace_mcp_snapshot", payload));
+    }
+    if let Some(payload) = snapshots.tokenomics {
+        replay_items.push(("tokenomics_rollup_snapshot", payload));
     }
     if replay_items.is_empty() {
         return;
@@ -6809,6 +6821,54 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
 }
 
 #[tauri::command]
+async fn cloud_mcp_sync_tokenomics_state(
+    state: State<'_, CloudMcpState>,
+    summary: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let clean_reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "tokenomics_rollup_snapshot".to_string());
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let rollups = summary
+        .get("rollups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let payload = json!({
+        "source": "rust-diffforge-tokenomics-sync",
+        "event_kind": "tokenomics_rollup_snapshot",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": clean_reason,
+        "summary": summary,
+        "rollups": rollups,
+        "rollup_count": summary
+            .get("rollups")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        snapshots.tokenomics = Some(payload.clone());
+    }
+
+    cloud_mcp_post_event_endpoint(state.inner(), "tokenomics_rollup_snapshot", &payload).await
+}
+
+#[tauri::command]
 async fn cloud_mcp_reset_workspace_graph_state(
     state: State<'_, CloudMcpState>,
     repo_path: String,
@@ -11096,6 +11156,9 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .or_else(|| {
             cloud_mcp_proxy_payload_text(&body_value, &["params", "arguments", "workspace_id"])
         });
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
     let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
@@ -11114,6 +11177,11 @@ fn cloud_mcp_proxy_post_json_endpoint(
         request.headers_mut().insert(
             "user-agent",
             HeaderValue::from_static(CLOUD_MCP_DESKTOP_USER_AGENT),
+        );
+        request.headers_mut().insert(
+            "x-diffforge-device-id",
+            HeaderValue::from_str(&device_id)
+                .map_err(|error| format!("Invalid Cloud MCP device id header: {error}"))?,
         );
         if let Some(workspace_id) = workspace_id.as_deref() {
             request.headers_mut().insert(

@@ -6134,12 +6134,16 @@ async fn start_cloud_voice_agent_stream(
                 "sample_rate": status.sample_rate,
             }),
         );
+        let device_profile = cloud_mcp_desktop_device_profile();
         let start_request = json!({
             "kind": "start",
             "contract": CLOUD_VOICE_AGENT_CONTRACT,
             "voice_protocol": "diffforge.voice.realtime.v2",
             "lane": "control",
             "voice_session_id": voice_session_id.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "device": device_profile,
             "workspace_id": workspace_id.clone(),
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
@@ -6408,12 +6412,16 @@ async fn send_cloud_voice_agent_text_message(
             "transport": ws_target.transport.clone(),
         }),
     );
+    let device_profile = cloud_mcp_desktop_device_profile();
     let text_request = json!({
         "kind": "text_message",
         "contract": CLOUD_VOICE_AGENT_CONTRACT,
         "voice_protocol": "diffforge.voice.realtime.v2",
         "lane": "control",
         "voice_session_id": voice_session_id,
+        "device_id": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "device": device_profile,
         "text": text,
         "turn_index": turn_index.unwrap_or(0),
         "workspace_id": workspace_id.clone(),

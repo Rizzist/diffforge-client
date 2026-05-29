@@ -1642,6 +1642,7 @@ include!("workspace_threads_store.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("terminal_cli.rs");
+include!("tokenomics.rs");
 include!("cloud_mcp.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
@@ -2782,6 +2783,11 @@ pub fn run() {
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_terminal_presence,
             cloud_mcp_sync_workspace_mcp_snapshot,
+            cloud_mcp_sync_tokenomics_state,
+            tokenomics_scan_usage,
+            tokenomics_get_summary,
+            tokenomics_get_sync_payload,
+            tokenomics_record_usage,
             cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_start_remote_command_listener,

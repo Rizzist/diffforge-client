@@ -456,7 +456,8 @@ import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceVie
 import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
-import WebWorkspaceView, { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
+import { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
+import TokenomicsWorkspaceView from "../tokenomics/TokenomicsWorkspaceView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -1751,6 +1752,35 @@ function createAuthState() {
 
 function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
+}
+
+function billingPlanLabelFromStatus(billingStatus, sessionUser) {
+  const paid = isPaidUser(sessionUser) || billingStatus?.planStatus === "paid";
+
+  if (!paid) {
+    return "Free";
+  }
+
+  const rawPlan = String(
+    billingStatus?.planName
+    || billingStatus?.credits?.planName
+    || sessionUser?.planName
+    || "",
+  ).trim().toLowerCase();
+
+  if (rawPlan === "ultra") {
+    return "Ultra";
+  }
+
+  if (rawPlan === "pro") {
+    return "Pro";
+  }
+
+  if (rawPlan === "plus") {
+    return "Plus";
+  }
+
+  return "Paid";
 }
 
 function parseAuthCallback(urlValue) {
@@ -7607,7 +7637,7 @@ export default function App() {
   }[authState] || "ready";
   const displayName = user?.name || user?.email || "there";
   const userIsPaid = isPaidUser(user);
-  const planLabel = userIsPaid ? "Pro" : "Free";
+  const planLabel = billingPlanLabelFromStatus(billingStatus, user);
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
   const billingTotalCredits = Number(billingCredits?.termTotalCredits || 0);
@@ -8289,6 +8319,47 @@ export default function App() {
     workspaceMcpSyncTargets,
     workspaceSyncState,
   ]);
+
+  useEffect(() => {
+    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+      return undefined;
+    }
+
+    let disposed = false;
+    const syncTokenomics = async (reason) => {
+      try {
+        if (reason === "tokenomics_scan") {
+          await invoke("tokenomics_scan_usage");
+        }
+        const summary = await invoke("tokenomics_get_sync_payload");
+        if (disposed) {
+          return;
+        }
+        await invoke("cloud_mcp_sync_tokenomics_state", {
+          summary,
+          reason,
+        });
+      } catch (error) {
+        if (!disposed) {
+          logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_sync.failed", {
+            message: getErrorMessage(error, "Unable to sync Tokenomics."),
+            reason,
+          });
+        }
+      }
+    };
+
+    syncTokenomics("tokenomics_scan");
+    const intervalId = window.setInterval(
+      () => syncTokenomics("tokenomics_heartbeat"),
+      5 * 60 * 1000,
+    );
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [shouldShowWorkspaceSetup, workspaceSyncState]);
 
   useEffect(() => {
     if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
@@ -11673,15 +11744,41 @@ export default function App() {
                 </PricingPlanCard>
 
                 <PricingPlanCard data-featured="true">
-                  <PlanEyebrow>Pro</PlanEyebrow>
+                  <PlanEyebrow>Plus</PlanEyebrow>
                   <PlanPrice>
-                    $25<span>/mo</span>
+                    $40<span>/mo</span>
                   </PlanPrice>
-                  <PlanDescription>Paid status unlocks the native dashboard shell.</PlanDescription>
+                  <PlanDescription>Paid status unlocks the native dashboard shell with 5,000 monthly credits.</PlanDescription>
                   <PlanFeatureList>
                     <li>Desktop workspace dashboard</li>
-                    <li>Blank desktop workspace shell</li>
+                    <li>Cloud workspace sync</li>
+                    <li>5,000 included credits</li>
+                  </PlanFeatureList>
+                </PricingPlanCard>
+
+                <PricingPlanCard data-featured="true">
+                  <PlanEyebrow>Pro</PlanEyebrow>
+                  <PlanPrice>
+                    $100<span>/mo</span>
+                  </PlanPrice>
+                  <PlanDescription>Higher allowance for heavier cloud AI, voice, and orchestration work.</PlanDescription>
+                  <PlanFeatureList>
+                    <li>Everything in Plus</li>
+                    <li>20,000 included credits</li>
                     <li>Priority native app access</li>
+                  </PlanFeatureList>
+                </PricingPlanCard>
+
+                <PricingPlanCard data-featured="true">
+                  <PlanEyebrow>Ultra</PlanEyebrow>
+                  <PlanPrice>
+                    $200<span>/mo</span>
+                  </PlanPrice>
+                  <PlanDescription>Largest monthly allowance for intensive cloud AI and orchestration work.</PlanDescription>
+                  <PlanFeatureList>
+                    <li>Everything in Pro</li>
+                    <li>50,000 included credits</li>
+                    <li>Maximum monthly AI allowance</li>
                   </PlanFeatureList>
                 </PricingPlanCard>
               </PricingPlans>
@@ -11840,14 +11937,14 @@ export default function App() {
                         <span>Spec Graph</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="Web"
-                        data-active={activeView === "web"}
-                        onClick={() => showView("web")}
-                        title="Web"
+                        aria-label="Tokenomics"
+                        data-active={activeView === "tokenomics"}
+                        onClick={() => showView("tokenomics")}
+                        title="Tokenomics"
                         type="button"
                       >
                         <ButtonBrowserIcon aria-hidden="true" />
-                        <span>Web</span>
+                        <span>Tokenomics</span>
                       </RailActionButton>
                       <RailActionButton
                         aria-label="MCPs"
@@ -11922,6 +12019,7 @@ export default function App() {
                         data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
                       >
                         <TerminalView
+                          billingStatus={billingStatus}
                           defaultWorkingDirectory={defaultWorkingDirectory}
                           terminalWorkspace={activatedWorkspace}
                           terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
@@ -11999,6 +12097,7 @@ export default function App() {
                           key={runtimeWorkspace.id}
                         >
                           <TerminalView
+                            billingStatus={billingStatus}
                             defaultWorkingDirectory={defaultWorkingDirectory}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
@@ -12681,16 +12780,17 @@ export default function App() {
                     <WorkspaceIdleState detail="Select a workspace to view the spec graph." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "web" ? (
-                <ForgeWorkspace aria-label="Workspace web" data-motion={viewMotion}>
+              ) : visibleView === "tokenomics" ? (
+                <ForgeWorkspace aria-label="Workspace Tokenomics" data-motion={viewMotion}>
                   {selectedWorkspace ? (
-                    <WebWorkspaceView
+                    <TokenomicsWorkspaceView
+                      billingStatus={billingStatus}
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       rootDirectory={selectedWorkspaceFileRoot}
                       workspace={selectedWorkspace}
                     />
                   ) : (
-                    <WorkspaceIdleState detail="Select a workspace to open a web view." viewMotion={viewMotion} />
+                    <WorkspaceIdleState detail="Select a workspace to inspect Tokenomics." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "processes" ? (
