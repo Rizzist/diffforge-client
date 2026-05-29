@@ -491,9 +491,7 @@ async fn forge_working_directory() -> Result<ForgeWorkingDirectory, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let working_directory = default_working_directory()?;
 
-        Ok(ForgeWorkingDirectory {
-            working_directory: workspace_path_display(&working_directory),
-        })
+        Ok(workspace_root_response(&working_directory))
     })
     .await
     .map_err(|error| format!("Unable to read Forge working directory: {error}"))?
@@ -508,7 +506,7 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 return Err(error);
             }
         };
-        match ensure_workspace_git_ready_for_coordination(&working_directory) {
+        match workspace_git_bootstrap_for_selected_root(&working_directory) {
             Ok(_) => {}
             Err(error) => {
                 return Err(format!(
@@ -516,10 +514,7 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 ));
             }
         }
-        let resolved_directory = workspace_path_display(&working_directory);
-        Ok(ForgeWorkingDirectory {
-            working_directory: resolved_directory,
-        })
+        Ok(workspace_root_response(&working_directory))
     })
     .await
     .map_err(|error| format!("Unable to validate workspace root directory: {error}"))?

@@ -2301,6 +2301,7 @@ async fn terminal_open(
                 return Err(error);
             }
         };
+    let mut terminal_project_root = working_directory.clone();
     let mut process_working_directory = workspace_path_for_process(&working_directory);
     let mut launch_worktree: Option<Value> = None;
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
@@ -2321,7 +2322,9 @@ async fn terminal_open(
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if plain_shell {
     } else if !is_prewarm_pty {
-        ensure_workspace_git_bootstrap_for_terminal(&working_directory).await?;
+        let coordination_working_directory = workspace_coordination_root_for_terminal(&working_directory)?;
+        terminal_project_root = coordination_working_directory.clone();
+        ensure_workspace_git_bootstrap_for_terminal(&coordination_working_directory).await?;
 
         let coordination_pty_id = if fresh_session {
             format!("{pane_id}-fresh-{instance_id}")
@@ -2331,7 +2334,7 @@ async fn terminal_open(
         let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
             coordination_pty_id,
             terminal_launch_epoch,
-            working_directory.clone(),
+            coordination_working_directory,
             kind.clone(),
             provider_for_coordination.clone(),
             label.clone(),
@@ -2545,7 +2548,7 @@ async fn terminal_open(
         instance_id,
         command,
         working_directory: workspace_path_display(&process_working_directory),
-        project_root: workspace_path_display(&working_directory),
+        project_root: workspace_path_display(&terminal_project_root),
         agent_id: coordination_context
             .as_ref()
             .map(|context| context.agent_id.clone())
@@ -2624,41 +2627,56 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
                 continue;
             }
         };
-        let root_key = workspace_path_display(&working_directory);
+        let mounts = workspace_project_mounts(&working_directory);
+        let exact_repo = mounts
+            .iter()
+            .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(&working_directory));
+        let recovery_roots = if !exact_repo && !mounts.is_empty() {
+            mounts
+                .iter()
+                .map(|mount| mount.root_path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![working_directory]
+        };
 
-        if !seen_roots.insert(root_key.clone()) {
-            continue;
-        }
+        for recovery_root in recovery_roots {
+            let root_key = workspace_path_display(&recovery_root);
 
-        match crate::coordination::CoordinationKernel::init(&working_directory, None)
-            .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
-        {
-            Ok(mut report) => {
-                scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
-                idle_sessions_interrupted +=
-                    report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
-                finished_sessions_interrupted +=
-                    report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
-
-                if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
-                    for task in tasks.iter_mut() {
-                        if let Some(object) = task.as_object_mut() {
-                            object.insert("repoPath".to_string(), json!(root_key.clone()));
-                        }
-                        interrupted_tasks.push(task.clone());
-                    }
-                }
-
-                if let Some(object) = report.as_object_mut() {
-                    object.insert("repoPath".to_string(), json!(root_key));
-                }
-                workspace_reports.push(report);
+            if !seen_roots.insert(root_key.clone()) {
+                continue;
             }
-            Err(error) => {
-                errors.push(json!({
-                    "root": root_key,
-                    "error": clean_terminal_telemetry_text(&error),
-                }));
+
+            match crate::coordination::CoordinationKernel::init(&recovery_root, None)
+                .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
+            {
+                Ok(mut report) => {
+                    scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
+                    idle_sessions_interrupted +=
+                        report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
+                    finished_sessions_interrupted +=
+                        report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
+
+                    if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
+                        for task in tasks.iter_mut() {
+                            if let Some(object) = task.as_object_mut() {
+                                object.insert("repoPath".to_string(), json!(root_key.clone()));
+                            }
+                            interrupted_tasks.push(task.clone());
+                        }
+                    }
+
+                    if let Some(object) = report.as_object_mut() {
+                        object.insert("repoPath".to_string(), json!(root_key));
+                    }
+                    workspace_reports.push(report);
+                }
+                Err(error) => {
+                    errors.push(json!({
+                        "root": root_key,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }));
+                }
             }
         }
     }

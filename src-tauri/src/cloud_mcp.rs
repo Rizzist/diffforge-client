@@ -7184,6 +7184,485 @@ fn cloud_mcp_spec_graph_sync_request(
     }
 }
 
+fn cloud_mcp_container_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount> {
+    let mounts = workspace_project_mounts(root);
+    let exact_repo = mounts
+        .iter()
+        .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(root));
+    if exact_repo {
+        Vec::new()
+    } else {
+        mounts
+    }
+}
+
+fn cloud_mcp_existing_spec_graph_cache(req: &CloudMcpSpecGraphSyncRequest) -> Option<Value> {
+    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
+    if !cache_path.exists() || cloud_mcp_path_contains_symlink_under(&req.root, &cache_path) {
+        return None;
+    }
+    let snapshot = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())?;
+    Some(cloud_mcp_stamp_spec_graph_snapshot(
+        snapshot,
+        req,
+        &cache_path,
+        "local_mount_cache",
+        "",
+    ))
+}
+
+fn cloud_mcp_mount_node_id(mount: &WorkspaceProjectMount) -> String {
+    format!(
+        "container-mount-{}",
+        cloud_mcp_short_hash(&mount.project_root)
+    )
+}
+
+fn cloud_mcp_prefix_mount_graph_id(mount: &WorkspaceProjectMount, id: &str) -> String {
+    format!(
+        "mount-{}-{id}",
+        cloud_mcp_short_hash(&mount.project_root)
+    )
+}
+
+fn cloud_mcp_mount_project_relative_path(mount: &WorkspaceProjectMount, raw_path: &str) -> String {
+    let normalized = raw_path
+        .replace('\\', "/")
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string();
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let project_root = mount.project_root.replace('\\', "/").trim_end_matches('/').to_string();
+    if normalized == project_root {
+        return String::new();
+    }
+    if let Some(stripped) = normalized.strip_prefix(&(project_root + "/")) {
+        return stripped.trim_matches('/').to_string();
+    }
+
+    let mount_path = mount
+        .workspace_relative_path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string();
+    if !mount_path.is_empty() {
+        if normalized == mount_path {
+            return String::new();
+        }
+        if let Some(stripped) = normalized.strip_prefix(&(mount_path + "/")) {
+            return stripped.trim_matches('/').to_string();
+        }
+    }
+
+    normalized
+}
+
+fn cloud_mcp_mount_visible_path(mount: &WorkspaceProjectMount, project_relative_path: &str) -> String {
+    let mount_path = mount
+        .workspace_relative_path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string();
+    let project_relative_path = project_relative_path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string();
+
+    match (mount_path.is_empty(), project_relative_path.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => project_relative_path,
+        (false, true) => mount_path,
+        (false, false) => format!("{mount_path}/{project_relative_path}"),
+    }
+}
+
+fn cloud_mcp_value_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    value.as_object_mut()
+}
+
+fn cloud_mcp_attach_mount_metadata(
+    object: &mut serde_json::Map<String, Value>,
+    workspace_root: &Path,
+    mount: &WorkspaceProjectMount,
+    project_relative_path: &str,
+    visible_path: &str,
+) {
+    object.insert("mount_id".to_string(), json!(mount.mount_id.clone()));
+    object.insert("mountId".to_string(), json!(mount.mount_id.clone()));
+    object.insert("workspace_root".to_string(), json!(workspace_path_display(workspace_root)));
+    object.insert("workspaceRoot".to_string(), json!(workspace_path_display(workspace_root)));
+    object.insert("project_root".to_string(), json!(mount.project_root.clone()));
+    object.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
+    object.insert(
+        "project_relative_path".to_string(),
+        json!(project_relative_path),
+    );
+    object.insert(
+        "projectRelativePath".to_string(),
+        json!(project_relative_path),
+    );
+    object.insert("visible_path".to_string(), json!(visible_path));
+    object.insert("visiblePath".to_string(), json!(visible_path));
+
+    let metadata = object
+        .entry("metadata".to_string())
+        .or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert("mount_id".to_string(), json!(mount.mount_id.clone()));
+        metadata.insert("mountId".to_string(), json!(mount.mount_id.clone()));
+        metadata.insert("workspace_root".to_string(), json!(workspace_path_display(workspace_root)));
+        metadata.insert("workspaceRoot".to_string(), json!(workspace_path_display(workspace_root)));
+        metadata.insert("project_root".to_string(), json!(mount.project_root.clone()));
+        metadata.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
+        metadata.insert(
+            "project_relative_path".to_string(),
+            json!(project_relative_path),
+        );
+        metadata.insert(
+            "projectRelativePath".to_string(),
+            json!(project_relative_path),
+        );
+        metadata.insert("visible_path".to_string(), json!(visible_path));
+        metadata.insert("visiblePath".to_string(), json!(visible_path));
+    }
+}
+
+fn cloud_mcp_container_mount_node(
+    workspace_root: &Path,
+    container_repo_id: &str,
+    mount: &WorkspaceProjectMount,
+) -> Value {
+    let id = cloud_mcp_mount_node_id(mount);
+    let summary = if mount.has_agents {
+        "Mounted Git project with local Diff Forge state.".to_string()
+    } else {
+        "Mounted Git project.".to_string()
+    };
+    json!({
+        "id": id,
+        "repo_id": container_repo_id,
+        "node_type": "folder",
+        "title": mount.project_name.clone(),
+        "summary": summary.clone(),
+        "purpose": summary,
+        "path": mount.workspace_relative_path.clone(),
+        "freshness_state": "no_spec",
+        "spec_state": "no_spec",
+        "file_source": "local_mount",
+        "file_origin": "local",
+        "local_only": true,
+        "active_agent_count": 0,
+        "active_agents": [],
+        "active_specs": [],
+        "superseded_specs": [],
+        "specs": [],
+        "mount_id": mount.mount_id.clone(),
+        "workspace_root": workspace_path_display(workspace_root),
+        "project_root": mount.project_root.clone(),
+        "project_relative_path": "",
+        "visible_path": mount.workspace_relative_path.clone(),
+        "metadata": {
+            "mount_id": mount.mount_id.clone(),
+            "workspace_root": workspace_path_display(workspace_root),
+            "project_root": mount.project_root.clone(),
+            "project_relative_path": "",
+            "visible_path": mount.workspace_relative_path.clone(),
+            "has_agents": mount.has_agents,
+            "has_spec_graph_cache": mount.has_spec_graph_cache,
+            "source": "local_mount",
+            "origin": "local"
+        }
+    })
+}
+
+fn cloud_mcp_prefix_container_node(
+    workspace_root: &Path,
+    mount: &WorkspaceProjectMount,
+    mut node: Value,
+    index: usize,
+) -> Option<(Value, String, bool)> {
+    let original_id = cloud_mcp_spec_graph_item_id(&node)
+        .unwrap_or_else(|| format!("node-{index}"));
+    let prefixed_id = cloud_mcp_prefix_mount_graph_id(mount, &original_id);
+    let node_type = cloud_mcp_payload_text(&node, &["node_type", "nodeType", "type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw_path = cloud_mcp_payload_text(&node, &["path", "display_path", "displayPath"])
+        .unwrap_or_default();
+    let project_relative_path = cloud_mcp_mount_project_relative_path(mount, &raw_path);
+    let visible_path = cloud_mcp_mount_visible_path(mount, &project_relative_path);
+    let is_root_like = matches!(
+        node_type.as_str(),
+        "workspace" | "repository" | "repo_root" | "root"
+    );
+
+    let object = cloud_mcp_value_object_mut(&mut node)?;
+    object.insert("id".to_string(), json!(prefixed_id.clone()));
+    if object.contains_key("node_id") {
+        object.insert("node_id".to_string(), json!(prefixed_id.clone()));
+    }
+    if object.contains_key("nodeId") {
+        object.insert("nodeId".to_string(), json!(prefixed_id.clone()));
+    }
+    if !visible_path.is_empty() || is_root_like || matches!(node_type.as_str(), "file" | "folder" | "implementation_unit") {
+        object.insert("path".to_string(), json!(visible_path.clone()));
+    }
+    cloud_mcp_attach_mount_metadata(
+        object,
+        workspace_root,
+        mount,
+        &project_relative_path,
+        &visible_path,
+    );
+
+    Some((node, prefixed_id, is_root_like))
+}
+
+fn cloud_mcp_prefix_container_edge(
+    workspace_root: &Path,
+    mount: &WorkspaceProjectMount,
+    mut edge: Value,
+    index: usize,
+) -> Option<Value> {
+    let from = cloud_mcp_payload_text(&edge, &["from_node_id", "fromNodeId", "from", "source"])?;
+    let to = cloud_mcp_payload_text(&edge, &["to_node_id", "toNodeId", "to", "target"])?;
+    let id = cloud_mcp_spec_graph_item_id(&edge).unwrap_or_else(|| format!("edge-{index}"));
+    let prefixed_id = cloud_mcp_prefix_mount_graph_id(mount, &id);
+    let prefixed_from = cloud_mcp_prefix_mount_graph_id(mount, &from);
+    let prefixed_to = cloud_mcp_prefix_mount_graph_id(mount, &to);
+    let object = cloud_mcp_value_object_mut(&mut edge)?;
+    object.insert("id".to_string(), json!(prefixed_id));
+    object.insert("from".to_string(), json!(prefixed_from.clone()));
+    object.insert("to".to_string(), json!(prefixed_to.clone()));
+    if object.contains_key("from_node_id") {
+        object.insert("from_node_id".to_string(), json!(prefixed_from.clone()));
+    }
+    if object.contains_key("fromNodeId") {
+        object.insert("fromNodeId".to_string(), json!(prefixed_from));
+    }
+    if object.contains_key("to_node_id") {
+        object.insert("to_node_id".to_string(), json!(prefixed_to.clone()));
+    }
+    if object.contains_key("toNodeId") {
+        object.insert("toNodeId".to_string(), json!(prefixed_to));
+    }
+    cloud_mcp_attach_mount_metadata(object, workspace_root, mount, "", &mount.workspace_relative_path);
+    Some(edge)
+}
+
+fn cloud_mcp_container_spec_graph_snapshot(
+    req: &CloudMcpSpecGraphSyncRequest,
+    mounts: &[WorkspaceProjectMount],
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let container_node_id = format!("container-root-{}", cloud_mcp_short_hash(&req.root_display));
+    let mount_values = mounts
+        .iter()
+        .map(|mount| {
+            json!({
+                "mountId": mount.mount_id.clone(),
+                "workspaceRelativePath": mount.workspace_relative_path.clone(),
+                "projectRoot": mount.project_root.clone(),
+                "projectName": mount.project_name.clone(),
+                "hasAgents": mount.has_agents,
+                "hasSpecGraphCache": mount.has_spec_graph_cache,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![json!({
+        "id": container_node_id,
+        "repo_id": req.repo_id.clone(),
+        "node_type": "workspace",
+        "title": cloud_mcp_repo_display_name(&req.root),
+        "summary": format!("Container workspace with {} mounted Git project{}.", mounts.len(), if mounts.len() == 1 { "" } else { "s" }),
+        "purpose": "Local container view composed from nested Git project roots.",
+        "path": req.root_display.clone(),
+        "freshness_state": "no_spec",
+        "spec_state": "no_spec",
+        "file_source": "container_mounts",
+        "file_origin": "local",
+        "local_only": true,
+        "active_agent_count": 0,
+        "active_agents": [],
+        "active_specs": [],
+        "superseded_specs": [],
+        "specs": [],
+        "metadata": {
+            "workspace_root": req.root_display.clone(),
+            "container_workspace": true,
+            "project_mount_count": mounts.len(),
+            "source": "container_mounts",
+            "origin": "local"
+        }
+    })];
+    let mut edges = Vec::new();
+    let mut task_history_tasks = Vec::new();
+    let mut cursor_parts = vec![req.repo_id.clone()];
+
+    for mount in mounts {
+        let project_req = CloudMcpSpecGraphSyncRequest {
+            root: mount.root_path.clone(),
+            root_display: mount.project_root.clone(),
+            repo_id: cloud_mcp_repo_id_for_root(&mount.root_path),
+            workspace_id: req.workspace_id.clone(),
+            workspace_name: Some(mount.project_name.clone()),
+        };
+        let mount_node_id = cloud_mcp_mount_node_id(mount);
+        nodes.push(cloud_mcp_container_mount_node(&req.root, &req.repo_id, mount));
+        edges.push(json!({
+            "id": format!("container-edge-{mount_node_id}"),
+            "from": nodes[0]["id"].clone(),
+            "to": mount_node_id.clone(),
+            "kind": "contains",
+            "metadata": {
+                "containment": true,
+                "source": "container_mounts",
+                "mount_id": mount.mount_id.clone(),
+                "project_root": mount.project_root.clone(),
+            }
+        }));
+
+        let Some(snapshot) = cloud_mcp_existing_spec_graph_cache(&project_req) else {
+            continue;
+        };
+        cursor_parts.push(
+            snapshot
+                .get("cursor")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let child_nodes = cloud_mcp_spec_graph_array(&snapshot, "specNodes", "nodes");
+        let child_edges = cloud_mcp_spec_graph_array(&snapshot, "specEdges", "edges");
+        let mut first_child_node_id: Option<String> = None;
+        let mut root_like_child_node_id: Option<String> = None;
+
+        for (index, node) in child_nodes.into_iter().enumerate() {
+            if let Some((node, prefixed_id, is_root_like)) =
+                cloud_mcp_prefix_container_node(&req.root, mount, node, index)
+            {
+                if first_child_node_id.is_none() {
+                    first_child_node_id = Some(prefixed_id.clone());
+                }
+                if root_like_child_node_id.is_none() && is_root_like {
+                    root_like_child_node_id = Some(prefixed_id.clone());
+                }
+                nodes.push(node);
+            }
+        }
+
+        if let Some(child_root_id) = root_like_child_node_id.or(first_child_node_id) {
+            edges.push(json!({
+                "id": format!("container-mount-root-edge-{child_root_id}"),
+                "from": mount_node_id.clone(),
+                "to": child_root_id,
+                "kind": "contains",
+                "metadata": {
+                    "containment": true,
+                    "source": "container_mounts",
+                    "mount_id": mount.mount_id.clone(),
+                    "project_root": mount.project_root.clone(),
+                }
+            }));
+        }
+
+        for (index, edge) in child_edges.into_iter().enumerate() {
+            if let Some(edge) = cloud_mcp_prefix_container_edge(&req.root, mount, edge, index) {
+                edges.push(edge);
+            }
+        }
+
+        if let Some(tasks) = snapshot
+            .get("taskHistory")
+            .or_else(|| snapshot.get("raw").and_then(|raw| raw.get("task_history")))
+            .and_then(|history| history.get("tasks"))
+            .and_then(Value::as_array)
+        {
+            for task in tasks {
+                let mut task = task.clone();
+                if let Some(object) = task.as_object_mut() {
+                    object.insert("mount_id".to_string(), json!(mount.mount_id.clone()));
+                    object.insert("mountId".to_string(), json!(mount.mount_id.clone()));
+                    object.insert("project_root".to_string(), json!(mount.project_root.clone()));
+                    object.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
+                }
+                task_history_tasks.push(task);
+            }
+        }
+    }
+
+    let cursor = format!("container-local-{}", cloud_mcp_short_hash(&cursor_parts.join("|")));
+    let raw = json!({
+        "kind": "container_project_spec_graph",
+        "version": 1,
+        "repo_id": req.repo_id.clone(),
+        "workspace_id": req.workspace_id.clone(),
+        "nodes": nodes,
+        "edges": edges,
+        "hidden_edges": [],
+        "agent_work": {},
+        "graph_stats": {
+            "container_workspace": true,
+            "project_mount_count": mounts.len(),
+            "project_mounts": mount_values.clone(),
+        },
+        "task_history": {
+            "kind": "spec_task_history",
+            "version": 1,
+            "tasks": task_history_tasks,
+        },
+        "cursor": cursor,
+        "node_hashes": {},
+        "edge_hashes": {},
+    });
+    let mut snapshot = cloud_mcp_spec_graph_snapshot_from_data(
+        req,
+        raw,
+        Path::new(""),
+        sync_state,
+        sync_error,
+    );
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("cachePath".to_string(), json!(""));
+        object.insert("projectMounts".to_string(), json!(mount_values));
+        object.insert("containerWorkspace".to_string(), json!(true));
+        object.insert(
+            "sourceOfTruth".to_string(),
+            json!({
+                "kind": "container_spec_graph",
+                "repo_id": req.repo_id.clone(),
+                "local_mounts": true,
+                "cached_under_agents": false,
+            }),
+        );
+    }
+    snapshot
+}
+
+fn cloud_mcp_container_spec_graph_snapshot_for_repo_path(
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    sync_state: &str,
+    sync_error: &str,
+) -> Option<Value> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let mounts = cloud_mcp_container_project_mounts(&req.root);
+    (!mounts.is_empty()).then(|| {
+        cloud_mcp_container_spec_graph_snapshot(&req, &mounts, sync_state, sync_error)
+    })
+}
+
 fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &Value) -> bool {
     let kind = cloud_mcp_payload_text(event, &["kind"])
         .or_else(|| cloud_mcp_payload_text(event, &["type"]))
@@ -7558,6 +8037,57 @@ fn cloud_mcp_build_local_ignored_spec_graph_overlay(root: &Path) -> Result<Value
         )
     })?;
     Ok(overlay)
+}
+
+fn cloud_mcp_build_container_local_ignored_spec_graph_overlay(
+    root: &Path,
+    mounts: &[WorkspaceProjectMount],
+) -> Value {
+    let repo_id = cloud_mcp_repo_id_for_root(root);
+    let root_display = workspace_path_display(root);
+    let repo_name = cloud_mcp_repo_display_name(root);
+    let display_root = cloud_mcp_repo_display_root(root);
+    let mut nodes = Vec::new();
+
+    for mount in mounts {
+        for (project_relative_path, path) in cloud_mcp_local_ignored_whitelist_candidates(&mount.root_path) {
+            let visible_path = cloud_mcp_mount_visible_path(mount, &project_relative_path);
+            let Some(mut node) =
+                cloud_mcp_local_ignored_overlay_node(&repo_id, &visible_path, &path)
+            else {
+                continue;
+            };
+            if let Some(object) = node.as_object_mut() {
+                cloud_mcp_attach_mount_metadata(
+                    object,
+                    root,
+                    mount,
+                    &project_relative_path,
+                    &visible_path,
+                );
+            }
+            nodes.push(node);
+        }
+    }
+
+    json!({
+        "ok": true,
+        "source": "rust-diffforge-container-local-ignored-overlay",
+        "local_only": true,
+        "cache_hit": false,
+        "cache_key": format!("container-local-ignored-{}", cloud_mcp_short_hash(&root_display)),
+        "cache_path": "",
+        "repo_id": repo_id,
+        "repo_path": root_display,
+        "repo_name": repo_name,
+        "display_root": display_root,
+        "container_workspace": true,
+        "project_mount_count": mounts.len(),
+        "allowed_paths": ["AGENTS.md", "CLAUDE.md", ".mcp.json", ".gitignore", ".agents", ".codex"],
+        "nodes": nodes,
+        "edges": [],
+        "updated_at_ms": cloud_mcp_now_ms(),
+    })
 }
 
 fn cloud_mcp_path_contains_symlink(path: &Path) -> bool {
@@ -8517,6 +9047,16 @@ async fn cloud_mcp_get_cached_spec_graph(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
+    if let Some(snapshot) = cloud_mcp_container_spec_graph_snapshot_for_repo_path(
+        repo_path.clone(),
+        workspace_id.clone(),
+        workspace_name.clone(),
+        "local_mounts",
+        "",
+    ) {
+        return Ok(snapshot);
+    }
+
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
     Ok(cloud_mcp_read_spec_graph_cache_preserving_state(
         &req, "empty", "",
@@ -8530,6 +9070,13 @@ async fn cloud_mcp_get_local_ignored_spec_graph_overlay(
     let root = resolve_workspace_root_directory(Some(&repo_path))
         .unwrap_or_else(|_| PathBuf::from(&repo_path));
     let root = workspace_path_for_process(&root);
+    let mounts = cloud_mcp_container_project_mounts(&root);
+    if !mounts.is_empty() {
+        return Ok(cloud_mcp_build_container_local_ignored_spec_graph_overlay(
+            &root,
+            &mounts,
+        ));
+    }
     tauri::async_runtime::spawn_blocking(move || {
         cloud_mcp_build_local_ignored_spec_graph_overlay(&root)
     })
@@ -8545,6 +9092,20 @@ async fn cloud_mcp_start_spec_graph_sync(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
+    if let Some(mut snapshot) = cloud_mcp_container_spec_graph_snapshot_for_repo_path(
+        repo_path.clone(),
+        workspace_id.clone(),
+        workspace_name.clone(),
+        "local_mounts",
+        "",
+    ) {
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("syncGeneration".to_string(), json!(0));
+        }
+        let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot.clone());
+        return Ok(snapshot);
+    }
+
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
     let requested_generation = cloud_mcp_now_ms();
     let requested_stop = Arc::new(AtomicBool::new(false));

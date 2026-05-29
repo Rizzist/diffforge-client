@@ -1037,8 +1037,11 @@ function FileTreeNode({
       absolutePath,
       payload: {
         kind: "file",
+        mountId: entry.mountId || "",
         name: getExplorerFileName(relativePath),
         path: absolutePath,
+        projectRelativePath: entry.projectRelativePath || "",
+        projectRoot: entry.projectRoot || "",
         relativePath,
         workspaceId: workspaceId || "",
         workspaceRoot: workspaceRoot || "",
@@ -1146,8 +1149,11 @@ function FileTreeNode({
           const absolutePath = joinWorkspaceFilePath(workspaceRoot, relativePath);
           const payload = {
             kind: "file",
+            mountId: entry.mountId || "",
             name: getExplorerFileName(relativePath),
             path: absolutePath,
+            projectRelativePath: entry.projectRelativePath || "",
+            projectRoot: entry.projectRoot || "",
             relativePath,
             workspaceId: workspaceId || "",
             workspaceRoot: workspaceRoot || "",
@@ -1211,7 +1217,7 @@ function FileTreeNode({
 
           onOpenFile(entry);
         }}
-        title={entry.relativePath || entry.name}
+        title={entry.isProjectMount && entry.projectRoot ? entry.projectRoot : entry.relativePath || entry.name}
         type="button"
       >
         <FileDisclosure aria-hidden="true">
@@ -1402,8 +1408,11 @@ export default function FilesWorkspaceView({
       setSelectedFile({
         ...entry,
         gitStatus: nextGitStatus,
+        mountId: result?.mountId || entry.mountId || "",
         size: result?.size ?? entry.size,
         modifiedMs: result?.modifiedMs ?? entry.modifiedMs,
+        projectRelativePath: result?.projectRelativePath || entry.projectRelativePath || "",
+        projectRoot: result?.projectRoot || entry.projectRoot || "",
       });
       setFileContent(result?.content || "");
       setFileState("ready");

@@ -80,6 +80,8 @@ const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
+const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 128;
+const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 2;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
 const GIT_STATUS_TIMEOUT_SECS: u64 = 2;
@@ -1175,6 +1177,9 @@ struct SavedTodoTextAttachment {
 #[serde(rename_all = "camelCase")]
 struct ForgeWorkingDirectory {
     working_directory: String,
+    workspace_kind: String,
+    active_project_root: Option<String>,
+    project_mounts: Vec<WorkspaceProjectMount>,
 }
 
 #[derive(Serialize)]
@@ -1186,6 +1191,12 @@ struct WorkspaceDirectoryEntry {
     size: Option<u64>,
     modified_ms: Option<u64>,
     git_status: Option<String>,
+    project_root: Option<String>,
+    project_relative_path: Option<String>,
+    mount_id: Option<String>,
+    is_project_mount: bool,
+    has_agents: bool,
+    has_spec_graph_cache: bool,
 }
 
 #[derive(Serialize)]
@@ -1195,6 +1206,9 @@ struct WorkspaceDirectoryListing {
     relative_path: String,
     entries: Vec<WorkspaceDirectoryEntry>,
     truncated: bool,
+    workspace_kind: String,
+    active_project_root: Option<String>,
+    project_mounts: Vec<WorkspaceProjectMount>,
 }
 
 #[derive(Serialize)]
@@ -1207,6 +1221,9 @@ struct WorkspaceFileText {
     size: u64,
     modified_ms: Option<u64>,
     git_status: Option<String>,
+    project_root: Option<String>,
+    project_relative_path: Option<String>,
+    mount_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1216,6 +1233,9 @@ struct WorkspaceFileDiff {
     relative_path: String,
     diff: String,
     truncated: bool,
+    project_root: Option<String>,
+    project_relative_path: Option<String>,
+    mount_id: Option<String>,
 }
 
 #[derive(Deserialize)]

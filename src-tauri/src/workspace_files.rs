@@ -170,6 +170,26 @@ struct WorkspaceGitBootstrap {
     gitignore_update: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceProjectMount {
+    mount_id: String,
+    workspace_relative_path: String,
+    project_root: String,
+    project_name: String,
+    has_agents: bool,
+    has_spec_graph_cache: bool,
+    #[serde(skip_serializing)]
+    root_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct WorkspaceProjectFileContext {
+    mount: WorkspaceProjectMount,
+    project_relative_path: String,
+    is_project_root: bool,
+}
+
 fn trim_gitignore_ascii(value: &[u8]) -> &[u8] {
     let mut start = 0usize;
     let mut end = value.len();
@@ -242,6 +262,260 @@ fn workspace_git_marker_description(root: &Path) -> String {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
         Err(error) => format!("unreadable ({error})"),
     }
+}
+
+fn workspace_project_mount_skip_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".agents"
+            | ".cache"
+            | ".git"
+            | ".gradle"
+            | ".next"
+            | ".nuxt"
+            | ".parcel-cache"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".venv"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "out"
+            | "target"
+            | "vendor"
+            | "venv"
+    )
+}
+
+fn workspace_has_git_marker(root: &Path) -> bool {
+    root.join(".git").exists()
+}
+
+fn workspace_git_top_level(root: &Path) -> Option<PathBuf> {
+    if app_shutdown_requested() {
+        return None;
+    }
+
+    let top_level = run_git_text(
+        root,
+        &["rev-parse", "--show-toplevel"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        "git rev-parse --show-toplevel",
+    )
+    .ok()?;
+    let path = PathBuf::from(top_level.trim());
+    path.canonicalize().ok().or(Some(path))
+}
+
+fn workspace_is_exact_git_root(root: &Path) -> bool {
+    if !workspace_has_git_marker(root) {
+        return false;
+    }
+
+    let root_key = root
+        .canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(root));
+    workspace_git_top_level(root)
+        .map(|top_level| normalized_path_key(&top_level) == root_key)
+        .unwrap_or(false)
+}
+
+fn workspace_project_mount_id(relative_path: &str) -> String {
+    let normalized = normalize_git_status_path(relative_path);
+    if normalized.is_empty() {
+        "root".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn workspace_project_mount_from_root(
+    workspace_root: &Path,
+    project_root: PathBuf,
+) -> Option<WorkspaceProjectMount> {
+    let workspace_relative_path = child_relative_path(workspace_root, &project_root)?;
+    let project_name = project_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| workspace_path_display(&project_root));
+    let has_agents = project_root.join(".agents").is_dir();
+    let has_spec_graph_cache = project_root.join(".agents").join("spec-graph").is_dir();
+
+    Some(WorkspaceProjectMount {
+        mount_id: workspace_project_mount_id(&workspace_relative_path),
+        workspace_relative_path,
+        project_root: workspace_path_display(&project_root),
+        project_name,
+        has_agents,
+        has_spec_graph_cache,
+        root_path: project_root,
+    })
+}
+
+fn workspace_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount> {
+    let workspace_root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+
+    if workspace_is_exact_git_root(&workspace_root) {
+        return workspace_project_mount_from_root(&workspace_root, workspace_root.clone())
+            .into_iter()
+            .collect();
+    }
+
+    let mut mounts = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((workspace_root.clone(), 0usize));
+
+    while let Some((directory, depth)) = queue.pop_front() {
+        if mounts.len() >= MAX_WORKSPACE_PROJECT_MOUNTS {
+            break;
+        }
+
+        let read_dir = match fs::read_dir(&directory) {
+            Ok(read_dir) => read_dir,
+            Err(_) => continue,
+        };
+
+        for entry in read_dir {
+            if mounts.len() >= MAX_WORKSPACE_PROJECT_MOUNTS {
+                break;
+            }
+
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+
+            if workspace_project_mount_skip_name(name) {
+                continue;
+            }
+
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&workspace_root) {
+                continue;
+            }
+
+            if workspace_is_exact_git_root(&canonical) {
+                let key = normalized_path_key(&canonical);
+                if seen.insert(key) {
+                    if let Some(mount) =
+                        workspace_project_mount_from_root(&workspace_root, canonical.clone())
+                    {
+                        mounts.push(mount);
+                    }
+                }
+                continue;
+            }
+
+            if depth + 1 < WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH {
+                queue.push_back((canonical, depth + 1));
+            }
+        }
+    }
+
+    mounts.sort_by(|left, right| {
+        left.workspace_relative_path
+            .cmp(&right.workspace_relative_path)
+    });
+    mounts
+}
+
+fn workspace_kind_for_mounts(root: &Path, mounts: &[WorkspaceProjectMount]) -> String {
+    if mounts
+        .iter()
+        .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(root))
+    {
+        "git_repo".to_string()
+    } else if !mounts.is_empty() {
+        "container".to_string()
+    } else {
+        "plain".to_string()
+    }
+}
+
+fn workspace_active_project_root_for_mounts(
+    mounts: &[WorkspaceProjectMount],
+) -> Option<String> {
+    if mounts.len() == 1 {
+        mounts.first().map(|mount| mount.project_root.clone())
+    } else {
+        None
+    }
+}
+
+fn workspace_root_response(root: &Path) -> ForgeWorkingDirectory {
+    let mounts = workspace_project_mounts(root);
+    ForgeWorkingDirectory {
+        working_directory: workspace_path_display(root),
+        workspace_kind: workspace_kind_for_mounts(root, &mounts),
+        active_project_root: workspace_active_project_root_for_mounts(&mounts),
+        project_mounts: mounts,
+    }
+}
+
+fn workspace_git_bootstrap_for_selected_root(root: &Path) -> Result<WorkspaceGitBootstrap, String> {
+    let mounts = workspace_project_mounts(root);
+    let is_exact_repo = mounts
+        .iter()
+        .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(root));
+
+    if !is_exact_repo && !mounts.is_empty() {
+        return Ok(WorkspaceGitBootstrap {
+            repo_path: workspace_path_display(root),
+            branch: String::new(),
+            head_sha: String::new(),
+            initialized_repo: false,
+            created_initial_commit: false,
+            gitignore_update: "container_project_mounts".to_string(),
+        });
+    }
+
+    ensure_workspace_git_ready_for_coordination(root)
+}
+
+fn workspace_coordination_root_for_terminal(root: &Path) -> Result<PathBuf, String> {
+    let mounts = workspace_project_mounts(root);
+    let is_exact_repo = mounts
+        .iter()
+        .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(root));
+
+    if is_exact_repo || mounts.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+
+    if mounts.len() == 1 {
+        return Ok(mounts[0].root_path.clone());
+    }
+
+    let labels = mounts
+        .iter()
+        .take(5)
+        .map(|mount| mount.workspace_relative_path.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Workspace root is a container with multiple Git projects ({labels}). Open or select a specific project before launching an isolated agent terminal."
+    ))
 }
 
 fn ensure_workspace_agents_gitignore(root: &Path) -> Result<WorkspaceAgentsGitignoreUpdate, String> {
@@ -657,6 +931,35 @@ fn child_relative_path(root: &Path, child: &Path) -> Option<String> {
         .map(workspace_relative_display)
 }
 
+fn workspace_project_context_for_path(
+    path: &Path,
+    mounts: &[WorkspaceProjectMount],
+) -> Option<WorkspaceProjectFileContext> {
+    let mut best: Option<&WorkspaceProjectMount> = None;
+
+    for mount in mounts {
+        if !path.starts_with(&mount.root_path) {
+            continue;
+        }
+
+        let should_replace = best
+            .map(|current| mount.root_path.components().count() > current.root_path.components().count())
+            .unwrap_or(true);
+        if should_replace {
+            best = Some(mount);
+        }
+    }
+
+    let mount = best?.clone();
+    let project_relative_path = child_relative_path(&mount.root_path, path).unwrap_or_default();
+    let is_project_root = project_relative_path.is_empty();
+    Some(WorkspaceProjectFileContext {
+        mount,
+        project_relative_path,
+        is_project_root,
+    })
+}
+
 fn normalize_git_status_path(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_string()
 }
@@ -817,11 +1120,67 @@ fn git_status_for_relative_path(
     best_status.cloned()
 }
 
+fn git_status_for_project_context(
+    statuses: &HashMap<String, String>,
+    context: &WorkspaceProjectFileContext,
+    kind: &str,
+) -> Option<String> {
+    if context.is_project_root && kind == "directory" {
+        return statuses
+            .values()
+            .max_by_key(|status| git_status_priority(status))
+            .cloned();
+    }
+
+    git_status_for_relative_path(statuses, &context.project_relative_path, kind)
+}
+
+fn git_status_for_container_directory(
+    workspace_relative_path: &str,
+    mounts: &[WorkspaceProjectMount],
+    git_status_cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Option<String> {
+    let normalized = normalize_git_status_path(workspace_relative_path);
+    let prefix = if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("{normalized}/")
+    };
+    let mut best_status: Option<String> = None;
+
+    for mount in mounts {
+        if normalize_git_status_path(&mount.workspace_relative_path) == normalized
+            || (!prefix.is_empty() && mount.workspace_relative_path.starts_with(&prefix))
+        {
+            let key = mount.project_root.clone();
+            let statuses = git_status_cache
+                .entry(key)
+                .or_insert_with(|| workspace_git_statuses(&mount.root_path));
+            if let Some(status) = statuses
+                .values()
+                .max_by_key(|status| git_status_priority(status))
+                .cloned()
+            {
+                let should_replace = best_status
+                    .as_ref()
+                    .map(|current| git_status_priority(&status) > git_status_priority(current))
+                    .unwrap_or(true);
+                if should_replace {
+                    best_status = Some(status);
+                }
+            }
+        }
+    }
+
+    best_status
+}
+
 fn directory_entry_from_path(
     root: &Path,
     path: PathBuf,
     metadata: fs::Metadata,
-    git_statuses: &HashMap<String, String>,
+    mounts: &[WorkspaceProjectMount],
+    git_status_cache: &mut HashMap<String, HashMap<String, String>>,
 ) -> Option<WorkspaceDirectoryEntry> {
     let name = path.file_name()?.to_string_lossy().to_string();
     let kind = if metadata.is_dir() {
@@ -832,10 +1191,42 @@ fn directory_entry_from_path(
         return None;
     };
     let relative_path = child_relative_path(root, &path)?;
+    let project_context = workspace_project_context_for_path(&path, mounts);
+    let git_status = if let Some(context) = project_context.as_ref() {
+        let statuses = git_status_cache
+            .entry(context.mount.project_root.clone())
+            .or_insert_with(|| workspace_git_statuses(&context.mount.root_path));
+        git_status_for_project_context(statuses, context, kind)
+    } else if kind == "directory" {
+        git_status_for_container_directory(&relative_path, mounts, git_status_cache)
+    } else {
+        None
+    };
 
     Some(WorkspaceDirectoryEntry {
         name,
-        git_status: git_status_for_relative_path(git_statuses, &relative_path, kind),
+        git_status,
+        project_root: project_context
+            .as_ref()
+            .map(|context| context.mount.project_root.clone()),
+        project_relative_path: project_context
+            .as_ref()
+            .map(|context| context.project_relative_path.clone()),
+        mount_id: project_context
+            .as_ref()
+            .map(|context| context.mount.mount_id.clone()),
+        is_project_mount: project_context
+            .as_ref()
+            .map(|context| context.is_project_root)
+            .unwrap_or(false),
+        has_agents: project_context
+            .as_ref()
+            .map(|context| context.mount.has_agents)
+            .unwrap_or(false),
+        has_spec_graph_cache: project_context
+            .as_ref()
+            .map(|context| context.mount.has_spec_graph_cache)
+            .unwrap_or(false),
         relative_path,
         kind: kind.to_string(),
         size: metadata.is_file().then_some(metadata.len()),
@@ -859,7 +1250,10 @@ fn list_workspace_directory_for(
 
     let mut entries = Vec::new();
     let mut truncated = false;
-    let git_statuses = workspace_git_statuses(&workspace_root);
+    let project_mounts = workspace_project_mounts(&workspace_root);
+    let workspace_kind = workspace_kind_for_mounts(&workspace_root, &project_mounts);
+    let active_project_root = workspace_active_project_root_for_mounts(&project_mounts);
+    let mut git_status_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
     let read_dir = fs::read_dir(&directory)
         .map_err(|error| format!("Unable to list workspace folder: {error}"))?;
 
@@ -885,7 +1279,13 @@ fn list_workspace_directory_for(
         };
 
         if let Some(entry) =
-            directory_entry_from_path(&workspace_root, path, metadata, &git_statuses)
+            directory_entry_from_path(
+                &workspace_root,
+                path,
+                metadata,
+                &project_mounts,
+                &mut git_status_cache,
+            )
         {
             entries.push(entry);
         }
@@ -905,6 +1305,9 @@ fn list_workspace_directory_for(
         relative_path: normalized_relative_path,
         entries,
         truncated,
+        workspace_kind,
+        active_project_root,
+        project_mounts,
     })
 }
 
@@ -930,14 +1333,25 @@ fn read_workspace_file_for(
         fs::read(&file_path).map_err(|error| format!("Unable to read workspace file: {error}"))?;
     let content = String::from_utf8(bytes)
         .map_err(|_| "Workspace file is not valid UTF-8 text.".to_string())?;
+    let project_mounts = workspace_project_mounts(&workspace_root);
+    let project_context = workspace_project_context_for_path(&file_path, &project_mounts);
+    let git_status = project_context.as_ref().and_then(|context| {
+        let statuses = workspace_git_statuses(&context.mount.root_path);
+        git_status_for_project_context(&statuses, context, "file")
+    });
 
     Ok(WorkspaceFileText {
         root: workspace_path_display(&workspace_root),
-        git_status: git_status_for_relative_path(
-            &workspace_git_statuses(&workspace_root),
-            &normalized_relative_path,
-            "file",
-        ),
+        git_status,
+        project_root: project_context
+            .as_ref()
+            .map(|context| context.mount.project_root.clone()),
+        project_relative_path: project_context
+            .as_ref()
+            .map(|context| context.project_relative_path.clone()),
+        mount_id: project_context
+            .as_ref()
+            .map(|context| context.mount.mount_id.clone()),
         relative_path: normalized_relative_path,
         name: file_path
             .file_name()
@@ -1019,8 +1433,12 @@ fn read_workspace_file_diff_for(
         return Err("Workspace path is not a file.".to_string());
     }
 
-    let git_statuses = workspace_git_statuses(&workspace_root);
-    let git_status = git_status_for_relative_path(&git_statuses, &normalized_relative_path, "file");
+    let project_mounts = workspace_project_mounts(&workspace_root);
+    let project_context = workspace_project_context_for_path(&file_path, &project_mounts);
+    let git_status = project_context.as_ref().and_then(|context| {
+        let statuses = workspace_git_statuses(&context.mount.root_path);
+        git_status_for_project_context(&statuses, context, "file")
+    });
 
     if git_status.as_deref() != Some("modified") {
         return Ok(WorkspaceFileDiff {
@@ -1028,11 +1446,40 @@ fn read_workspace_file_diff_for(
             relative_path: normalized_relative_path,
             diff: String::new(),
             truncated: false,
+            project_root: project_context
+                .as_ref()
+                .map(|context| context.mount.project_root.clone()),
+            project_relative_path: project_context
+                .as_ref()
+                .map(|context| context.project_relative_path.clone()),
+            mount_id: project_context
+                .as_ref()
+                .map(|context| context.mount.mount_id.clone()),
         });
     }
 
-    let working_diff = workspace_file_git_diff(&workspace_root, &normalized_relative_path, false);
-    let staged_diff = workspace_file_git_diff(&workspace_root, &normalized_relative_path, true);
+    let Some(context) = project_context.as_ref() else {
+        return Ok(WorkspaceFileDiff {
+            root: workspace_path_display(&workspace_root),
+            relative_path: normalized_relative_path,
+            diff: String::new(),
+            truncated: false,
+            project_root: None,
+            project_relative_path: None,
+            mount_id: None,
+        });
+    };
+
+    let working_diff = workspace_file_git_diff(
+        &context.mount.root_path,
+        &context.project_relative_path,
+        false,
+    );
+    let staged_diff = workspace_file_git_diff(
+        &context.mount.root_path,
+        &context.project_relative_path,
+        true,
+    );
     let diff = [working_diff, staged_diff]
         .into_iter()
         .filter(|value| !value.trim().is_empty())
@@ -1045,6 +1492,9 @@ fn read_workspace_file_diff_for(
         relative_path: normalized_relative_path,
         diff,
         truncated,
+        project_root: Some(context.mount.project_root.clone()),
+        project_relative_path: Some(context.project_relative_path.clone()),
+        mount_id: Some(context.mount.mount_id.clone()),
     })
 }
 
@@ -1052,13 +1502,37 @@ fn read_workspace_file_diff_for(
 mod workspace_files_tests {
     use super::*;
 
-    #[test]
-    fn git_preflight_initializes_selected_workspace_root_with_head() {
+    fn test_workspace_root(prefix: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-git-preflight-{suffix}"));
+        env::temp_dir().join(format!("{prefix}-{suffix}"))
+    }
+
+    fn run_test_git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn init_test_git_repo(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        run_test_git(root, &["init"]);
+        run_test_git(root, &["config", "user.name", "Diff Forge Test"]);
+        run_test_git(root, &["config", "user.email", "test@diffforge.local"]);
+        fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        run_test_git(root, &["add", "tracked.txt"]);
+        run_test_git(root, &["commit", "-m", "initial"]);
+    }
+
+    #[test]
+    fn git_preflight_initializes_selected_workspace_root_with_head() {
+        let root = test_workspace_root("diffforge-git-preflight");
         fs::create_dir_all(&root).unwrap();
 
         let result = ensure_workspace_git_ready_for_coordination(&root).unwrap();
@@ -1081,11 +1555,7 @@ mod workspace_files_tests {
 
     #[test]
     fn git_preflight_reports_existing_invalid_git_marker() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-invalid-git-marker-{suffix}"));
+        let root = test_workspace_root("diffforge-invalid-git-marker");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(".git"), "gitdir: missing\n").unwrap();
 
@@ -1103,11 +1573,7 @@ mod workspace_files_tests {
 
     #[test]
     fn workspace_gitignore_adds_logs_when_agents_already_ignored() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-gitignore-logs-{suffix}"));
+        let root = test_workspace_root("diffforge-gitignore-logs");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(".gitignore"), ".agents/\n").unwrap();
 
@@ -1122,11 +1588,7 @@ mod workspace_files_tests {
 
     #[test]
     fn workspace_root_directory_collapses_agent_worktree_to_project_root() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-visible-root-{suffix}"));
+        let root = test_workspace_root("diffforge-visible-root");
         let worktree = root.join(".agents").join("worktrees").join("codex-01");
         fs::create_dir_all(&worktree).unwrap();
 
@@ -1137,6 +1599,60 @@ mod workspace_files_tests {
             normalized_path_key(&resolved),
             normalized_path_key(&root.canonicalize().unwrap())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_preflight_does_not_initialize_container_with_project_mounts() {
+        let root = test_workspace_root("diffforge-container-mounts");
+        let project = root.join("rust-diffforge");
+        init_test_git_repo(&project);
+        fs::create_dir_all(project.join(".agents").join("spec-graph")).unwrap();
+
+        let bootstrap = workspace_git_bootstrap_for_selected_root(&root).unwrap();
+        let response = workspace_root_response(&root);
+
+        assert!(!root.join(".git").exists());
+        assert!(!root.join(".agents").exists());
+        assert!(!bootstrap.initialized_repo);
+        assert_eq!(bootstrap.gitignore_update, "container_project_mounts");
+        assert_eq!(response.workspace_kind, "container");
+        assert_eq!(response.project_mounts.len(), 1);
+        assert_eq!(
+            response.project_mounts[0].workspace_relative_path,
+            "rust-diffforge"
+        );
+        assert!(response.project_mounts[0].has_agents);
+        assert!(response.project_mounts[0].has_spec_graph_cache);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_file_git_state_uses_nested_project_mount() {
+        let root = test_workspace_root("diffforge-container-file-state");
+        let project = root.join("app");
+        init_test_git_repo(&project);
+        fs::write(project.join("tracked.txt"), "two\n").unwrap();
+
+        let file = read_workspace_file_for(
+            workspace_path_display(&root),
+            "app/tracked.txt".to_string(),
+        )
+        .unwrap();
+        assert_eq!(file.git_status.as_deref(), Some("modified"));
+        assert_eq!(file.project_relative_path.as_deref(), Some("tracked.txt"));
+        assert_eq!(file.mount_id.as_deref(), Some("app"));
+
+        let diff = read_workspace_file_diff_for(
+            workspace_path_display(&root),
+            "app/tracked.txt".to_string(),
+        )
+        .unwrap();
+        assert!(diff.diff.contains("-one"));
+        assert!(diff.diff.contains("+two"));
+        assert!(!root.join(".git").exists());
 
         let _ = fs::remove_dir_all(root);
     }
