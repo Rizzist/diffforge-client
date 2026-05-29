@@ -4677,6 +4677,7 @@ function OrchestratorVoiceCanvasRing({
 
 const TodoQueuePanel = memo(function TodoQueuePanel({
   activeDragItemId = "",
+  billingStatus = null,
   defaultWorkingDirectory = "",
   draft,
   dropError = "",
@@ -11663,6 +11664,7 @@ function TerminalView({
                         <TodoQueuePanel
                           activeDragItemId={todoDragState?.itemId || ""}
                           agentStatuses={agentStatuses}
+                          billingStatus={billingStatus}
                           defaultWorkingDirectory={defaultWorkingDirectory}
                           draft={todoQueueDraft}
                           dropError={todoDropError}

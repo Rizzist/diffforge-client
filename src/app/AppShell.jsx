@@ -1793,6 +1793,25 @@ function createAuthState() {
     .replace(/=+$/g, "");
 }
 
+async function desktopLoginUrlWithDevice(state) {
+  const url = new URL(WEB_LOGIN_URL);
+  url.searchParams.set("state", state);
+  try {
+    const profile = await invoke("cloud_mcp_get_desktop_device_profile");
+    const deviceId = safeCloudMcpText(profile?.device_id || profile?.deviceId, "");
+    if (deviceId) url.searchParams.set("desktopDeviceId", deviceId);
+    const deviceName = safeCloudMcpText(profile?.device_name || profile?.deviceName || profile?.machine_name || profile?.machineName, "");
+    if (deviceName) url.searchParams.set("desktopDeviceName", deviceName);
+    const platform = safeCloudMcpText(profile?.platform || profile?.os, "");
+    if (platform) url.searchParams.set("desktopPlatform", platform);
+    const formFactor = safeCloudMcpText(profile?.form_factor || profile?.formFactor || profile?.device_type || profile?.deviceType, "");
+    if (formFactor) url.searchParams.set("desktopFormFactor", formFactor);
+  } catch {
+    // Desktop login can continue without the optional web-presence handoff.
+  }
+  return url.toString();
+}
+
 function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
 }
@@ -4995,7 +5014,7 @@ export default function App() {
     authStore.setWaiting(state);
 
     try {
-      const loginUrl = `${WEB_LOGIN_URL}?state=${encodeURIComponent(state)}`;
+      const loginUrl = await desktopLoginUrlWithDevice(state);
       await withTimeout(
         openUrl(loginUrl),
         OPEN_BROWSER_TIMEOUT_MS,

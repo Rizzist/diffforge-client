@@ -1815,6 +1815,11 @@ fn cloud_mcp_desktop_device_profile() -> Value {
         .clone()
 }
 
+#[tauri::command]
+async fn cloud_mcp_get_desktop_device_profile() -> Result<Value, String> {
+    Ok(cloud_mcp_desktop_device_profile())
+}
+
 fn cloud_mcp_stable_desktop_device_id(device_name: &str, platform: &str) -> String {
     if let Some(path) = cloud_mcp_desktop_device_id_path() {
         if let Ok(existing) = fs::read_to_string(&path) {
