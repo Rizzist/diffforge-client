@@ -111,15 +111,15 @@ const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
-const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
-const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
-const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
+const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = true;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
 const TERMINAL_DIAGNOSTIC_SLOW_MS: f64 = 8.0;
@@ -759,17 +759,6 @@ impl TerminalSessionMode {
             TerminalSessionMode::ManagedPatch => "git_worktree_patch",
             TerminalSessionMode::DirectEdit => "bounded_direct_edit",
             TerminalSessionMode::Activity => "none",
-            TerminalSessionMode::Free => "external_unmanaged",
-            TerminalSessionMode::RemoteOps => "remote_unmanaged",
-        }
-    }
-
-    fn coordination_enforcement_mode(self) -> &'static str {
-        match self {
-            TerminalSessionMode::General => "general_worker",
-            TerminalSessionMode::ManagedPatch => "worktree_required",
-            TerminalSessionMode::DirectEdit => "bounded_direct_edit",
-            TerminalSessionMode::Activity => "activity_only",
             TerminalSessionMode::Free => "external_unmanaged",
             TerminalSessionMode::RemoteOps => "remote_unmanaged",
         }
@@ -3243,6 +3232,7 @@ pub fn run() {
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             tokenomics_scan_usage,
+            tokenomics_scan_usage_silent,
             tokenomics_get_summary,
             tokenomics_get_live_limits,
             tokenomics_get_sync_payload,

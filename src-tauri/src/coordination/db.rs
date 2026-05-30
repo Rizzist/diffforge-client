@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime},
@@ -121,12 +121,13 @@ pub struct StoragePaths {
 
 impl StoragePaths {
     pub fn new(repo_path: PathBuf, db_path: Option<PathBuf>) -> Self {
-        let agents_root = repo_path.join(".agents");
+        let agents_root = coordination_repo_state_root(&repo_path);
+        let worktrees_root = repo_path.join(".agents").join("worktrees");
         Self {
             db_path: db_path.unwrap_or_else(|| agents_root.join("kernel.sqlite")),
             artifacts_root: agents_root.join("artifacts"),
             memory_root: agents_root.join("memory"),
-            worktrees_root: agents_root.join("worktrees"),
+            worktrees_root,
             mcp_root: agents_root.join("mcp"),
             cloud_root: agents_root.join("cloud"),
             agents_root,
@@ -180,6 +181,78 @@ impl StoragePaths {
 
         Ok(diagnostics)
     }
+}
+
+pub fn coordination_repo_state_root(repo_path: &Path) -> PathBuf {
+    coordination_private_state_root()
+        .join("repos")
+        .join(coordination_repo_state_id(repo_path))
+}
+
+pub fn coordination_daemon_info_path(repo_path: &Path) -> PathBuf {
+    coordination_repo_state_root(repo_path)
+        .join("mcp")
+        .join("coordination.daemon.json")
+}
+
+fn coordination_private_state_root() -> PathBuf {
+    if let Some(path) = env::var_os("DIFFFORGE_COORDINATION_STATE_ROOT").map(PathBuf::from) {
+        return path;
+    }
+    if cfg!(test) {
+        return env::temp_dir().join("diffforge-test-coordination");
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+            return home
+                .join("Library")
+                .join("Application Support")
+                .join("Diff Forge AI")
+                .join("coordination");
+        }
+    }
+    if cfg!(windows) {
+        if let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from) {
+            return app_data.join("Diff Forge AI").join("coordination");
+        }
+    }
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        return data_home.join("diffforge").join("coordination");
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        return home
+            .join(".local")
+            .join("share")
+            .join("diffforge")
+            .join("coordination");
+    }
+    env::temp_dir().join("diffforge").join("coordination")
+}
+
+fn coordination_repo_state_id(repo_path: &Path) -> String {
+    let path_text = process_path_text(repo_path);
+    let name = repo_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("workspace")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path_text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let slug = if name.is_empty() { "workspace" } else { &name };
+    format!("{slug}-{hash:016x}")
 }
 
 pub fn canonical_repo_path(repo_path: impl AsRef<Path>) -> Result<PathBuf, String> {

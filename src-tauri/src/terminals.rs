@@ -493,10 +493,9 @@ fn terminal_metadata_forensics_json(metadata: &TerminalInstanceMetadata) -> Valu
 
 fn terminal_input_forensics_kind(data: &str) -> &'static str {
     match data {
-        "\r" | "\n" | "\r\n" => "enter",
-        TERMINAL_ENTER_SEQUENCE | TERMINAL_ENTER_SEQUENCE_MOD1 | TERMINAL_SHIFT_ENTER_SEQUENCE => {
-            "enter_escape_sequence"
-        }
+        "\r" | "\n" | "\r\n" => "plain_enter",
+        TERMINAL_ENTER_SEQUENCE | TERMINAL_ENTER_SEQUENCE_MOD1 => "enhanced_enter_sequence",
+        TERMINAL_SHIFT_ENTER_SEQUENCE => "shift_enter_sequence",
         _ if data.chars().any(|character| character.is_control()) => "control_or_escape",
         _ => "text",
     }
@@ -1186,6 +1185,211 @@ async fn ensure_workspace_git_bootstrap_for_terminal(
     }
 }
 
+#[derive(Debug)]
+struct TerminalCoordinationLaunchTarget {
+    root: PathBuf,
+    enforcement_mode: &'static str,
+    requires_git_bootstrap: bool,
+}
+
+fn terminal_git_root_for_coordination_target(root: &Path) -> Option<PathBuf> {
+    let top_level = workspace_git_top_level(root)?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if root.starts_with(&top_level) {
+        Some(top_level)
+    } else {
+        None
+    }
+}
+
+fn terminal_requested_or_current_root(
+    workspace_root: &Path,
+    requested_project_root: Option<&str>,
+    requested_mount_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(requested_mount_id) = requested_mount_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let mounts = workspace_project_mounts(workspace_root);
+        if let Some(mount) = mounts.iter().find(|mount| mount.mount_id == requested_mount_id) {
+            return Ok(mount.root_path.clone());
+        }
+        return Err(format!(
+            "Requested project mount {requested_mount_id} is not available in this workspace."
+        ));
+    }
+
+    if let Some(requested_project_root) = requested_project_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(requested_project_root)
+            .canonicalize()
+            .map_err(|error| format!("Unable to resolve requested project root: {error}"));
+    }
+
+    Ok(workspace_root.to_path_buf())
+}
+
+fn terminal_coordination_launch_target(
+    workspace_root: &Path,
+    requested_project_root: Option<&str>,
+    requested_mount_id: Option<&str>,
+    session_mode: TerminalSessionMode,
+) -> Result<TerminalCoordinationLaunchTarget, String> {
+    let mut target_root = match session_mode {
+        TerminalSessionMode::ManagedPatch
+        | TerminalSessionMode::General
+        | TerminalSessionMode::DirectEdit => terminal_requested_or_current_root(
+            workspace_root,
+            requested_project_root,
+            requested_mount_id,
+        )?,
+        TerminalSessionMode::Activity | TerminalSessionMode::RemoteOps | TerminalSessionMode::Free => {
+            workspace_root.to_path_buf()
+        }
+    };
+
+    if matches!(
+        session_mode,
+        TerminalSessionMode::ManagedPatch | TerminalSessionMode::General
+    ) {
+        if let Some(git_root) = terminal_git_root_for_coordination_target(&target_root) {
+            target_root = git_root;
+        }
+    }
+
+    let has_git = terminal_git_root_for_coordination_target(&target_root).is_some();
+    let enforcement_mode = match session_mode {
+        TerminalSessionMode::ManagedPatch => "worktree_required",
+        TerminalSessionMode::General if has_git => "worktree_required",
+        TerminalSessionMode::General => "bounded_direct_edit",
+        TerminalSessionMode::DirectEdit if has_git => "worktree_required",
+        TerminalSessionMode::DirectEdit => "bounded_direct_edit",
+        TerminalSessionMode::Activity => "activity_only",
+        TerminalSessionMode::RemoteOps => "remote_unmanaged",
+        TerminalSessionMode::Free => "external_unmanaged",
+    };
+
+    Ok(TerminalCoordinationLaunchTarget {
+        root: target_root,
+        enforcement_mode,
+        requires_git_bootstrap: enforcement_mode == "worktree_required",
+    })
+}
+
+fn terminal_context_requires_isolated_worktree(
+    context: &crate::coordination::models::TerminalCoordinationContext,
+) -> bool {
+    context.enforcement_mode == "worktree_required"
+}
+
+fn terminal_path_key_after_canonicalize(path: &Path) -> String {
+    path.canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(path))
+}
+
+fn terminal_is_slot_worktree_path(path: &Path, worktrees_root: &Path, slot_key: &str) -> bool {
+    let slot_key = slot_key.trim();
+    if slot_key.is_empty() {
+        return false;
+    }
+    let relative = path.strip_prefix(worktrees_root).ok();
+    let Some(slot_segment) = relative
+        .and_then(|path| path.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+
+    slot_segment == slot_key || slot_segment.starts_with(&format!("{slot_key}-"))
+}
+
+fn validate_terminal_isolated_worktree_context(
+    context: &crate::coordination::models::TerminalCoordinationContext,
+    label: &str,
+) -> Result<(), String> {
+    if !terminal_context_requires_isolated_worktree(context) {
+        return Ok(());
+    }
+
+    let has_worktree_id = context
+        .worktree_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_worktree_path = context
+        .worktree_path
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let write_root = PathBuf::from(&context.write_root);
+    let worktree_path = context
+        .worktree_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let repo_root = PathBuf::from(&context.repo_path);
+    let worktrees_root = repo_root.join(".agents").join("worktrees");
+    let write_root_key = terminal_path_key_after_canonicalize(&write_root);
+    let repo_root_key = terminal_path_key_after_canonicalize(&repo_root);
+    let worktrees_root_canonical = worktrees_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktrees_root.clone());
+    let write_root_canonical = write_root
+        .canonicalize()
+        .unwrap_or_else(|_| write_root.clone());
+    let write_root_matches_repo_root = write_root_key == repo_root_key;
+    let write_root_under_worktrees = write_root
+        .canonicalize()
+        .ok()
+        .zip(worktrees_root.canonicalize().ok())
+        .map(|(write_root, worktrees_root)| write_root.starts_with(worktrees_root))
+        .unwrap_or_else(|| write_root.starts_with(&worktrees_root));
+    let write_root_matches_worktree_path = worktree_path
+        .as_ref()
+        .is_some_and(|worktree_path| write_root_key == terminal_path_key_after_canonicalize(worktree_path));
+    let slot_key = context
+        .slot_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let write_root_matches_slot = slot_key.is_some_and(|slot_key| {
+        terminal_is_slot_worktree_path(&write_root_canonical, &worktrees_root_canonical, slot_key)
+    });
+
+    if has_worktree_id
+        && has_worktree_path
+        && !write_root_matches_repo_root
+        && write_root_under_worktrees
+        && write_root_matches_worktree_path
+        && write_root_matches_slot
+    {
+        return Ok(());
+    }
+
+    let reason = if !has_worktree_id {
+        "coordination did not return a worktree id"
+    } else if write_root_matches_repo_root {
+        "coordination write root points at the repository root"
+    } else if !write_root_under_worktrees {
+        "coordination write root is outside .agents/worktrees"
+    } else if !has_worktree_path {
+        "coordination did not return a worktree path"
+    } else if !write_root_matches_worktree_path {
+        "coordination write root does not match the assigned worktree path"
+    } else if slot_key.is_none() {
+        "coordination did not return a slot key"
+    } else if !write_root_matches_slot {
+        "coordination write root points at another slot's worktree"
+    } else {
+        "coordination returned an invalid isolated worktree context"
+    };
+    Err(format!("Terminal isolation failed for {label}: {reason}."))
+}
+
 async fn prepare_terminal_coordination_launch(
     pty_id: String,
     terminal_launch_epoch: String,
@@ -1196,7 +1400,7 @@ async fn prepare_terminal_coordination_launch(
     terminal_slot_key: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
-    session_mode: TerminalSessionMode,
+    enforcement_mode: &'static str,
 ) -> Result<
     (
         crate::coordination::models::TerminalCoordinationContext,
@@ -1250,47 +1454,16 @@ async fn prepare_terminal_coordination_launch(
             None,
             None,
             Some(&terminal_launch_epoch),
-            Some(session_mode.coordination_enforcement_mode()),
+            Some(enforcement_mode),
         ) {
             Ok(context) => {
-                let worktree_required = context.enforcement_mode == "worktree_required";
-                let has_worktree_id = context
-                    .worktree_id
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty());
-                let has_worktree_path = context
-                    .worktree_path
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty());
-                let write_root_display =
-                    workspace_path_display(&PathBuf::from(&context.write_root));
-                let repo_root_display = workspace_path_display(&working_directory);
-                #[cfg(windows)]
-                let write_root_matches_repo_root =
-                    write_root_display.eq_ignore_ascii_case(&repo_root_display);
-                #[cfg(not(windows))]
-                let write_root_matches_repo_root = write_root_display == repo_root_display;
-                if session_mode.requires_managed_patch_worktree()
-                    && (!worktree_required
-                    || !has_worktree_id
-                    || !has_worktree_path
-                    || write_root_matches_repo_root)
-                {
+                if let Err(error) = validate_terminal_isolated_worktree_context(&context, &label) {
                     let coordination = terminal_coordination_session_from_context(&context);
                     interrupt_terminal_coordination_session(
                         &coordination,
                         "coding_agent_requires_isolated_worktree",
                     );
-                    let reason = if context.enforcement_mode == "coordination_only" {
-                        "coordination returned coordination_only instead of an isolated worktree"
-                    } else if !has_worktree_id {
-                        "coordination did not return a worktree id"
-                    } else if write_root_matches_repo_root {
-                        "coordination write root points at the repository root"
-                    } else {
-                        "coordination did not return a worktree path"
-                    };
-                    return Err(format!("Terminal isolation failed for {label}: {reason}."));
+                    return Err(error);
                 }
 
                 let process_working_directory =
@@ -2354,29 +2527,16 @@ async fn terminal_open(
     });
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
-    if session_mode == TerminalSessionMode::DirectEdit {
-        let direct_edit_root = workspace_direct_edit_root_for_terminal(
+    if (!is_prewarm_pty || !plain_shell) && session_mode.should_prepare_coordination() {
+        let coordination_target = terminal_coordination_launch_target(
             &working_directory,
             requested_project_root.as_deref(),
             requested_mount_id.as_deref(),
+            session_mode,
         )?;
-        terminal_project_root = direct_edit_root.clone();
-        process_working_directory = workspace_path_for_process(&direct_edit_root);
-    }
-    if !is_prewarm_pty && session_mode.should_prepare_coordination() {
-        let coordination_working_directory = match session_mode {
-            TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal(
-                &working_directory,
-                requested_project_root.as_deref(),
-                requested_mount_id.as_deref(),
-            )?,
-            TerminalSessionMode::General => working_directory.clone(),
-            TerminalSessionMode::DirectEdit => terminal_project_root.clone(),
-            TerminalSessionMode::Activity | TerminalSessionMode::RemoteOps => working_directory.clone(),
-            TerminalSessionMode::Free => working_directory.clone(),
-        };
+        let coordination_working_directory = coordination_target.root;
         terminal_project_root = coordination_working_directory.clone();
-        if session_mode.requires_managed_patch_worktree() {
+        if coordination_target.requires_git_bootstrap {
             ensure_workspace_git_bootstrap_for_terminal(&coordination_working_directory).await?;
         }
 
@@ -2395,7 +2555,7 @@ async fn terminal_open(
             terminal_slot_key.clone(),
             workspace_id.clone(),
             workspace_name.clone(),
-            session_mode,
+            coordination_target.enforcement_mode,
         )
         .await?;
         process_working_directory = prepared_working_directory;
@@ -2668,8 +2828,14 @@ async fn terminal_open(
                     .as_ref()
                     .map(|_| "worktree_only".to_string())
             }),
-        session_mode: session_mode.as_str().to_string(),
-        file_authority: session_mode.file_authority().to_string(),
+        session_mode: coordination_context
+            .as_ref()
+            .map(|context| context.session_mode().to_string())
+            .unwrap_or_else(|| session_mode.as_str().to_string()),
+        file_authority: coordination_context
+            .as_ref()
+            .map(|context| context.file_authority().to_string())
+            .unwrap_or_else(|| session_mode.file_authority().to_string()),
     })
 }
 
@@ -3602,8 +3768,18 @@ fn terminal_input_gate_diagnostic_snapshot(gate: &TerminalInputGate) -> Value {
     })
 }
 
+fn terminal_write_data_hex_prefix(data: &str) -> String {
+    data.as_bytes()
+        .iter()
+        .take(64)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn terminal_write_data_diagnostic(data: &str) -> Value {
     json!({
+        "byte_hex_prefix": terminal_write_data_hex_prefix(data),
         "contains_enter_sequence": data.contains(TERMINAL_ENTER_SEQUENCE),
         "contains_enter_sequence_mod1": data.contains(TERMINAL_ENTER_SEQUENCE_MOD1),
         "contains_shift_enter_sequence": data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE),
@@ -3613,6 +3789,10 @@ fn terminal_write_data_diagnostic(data: &str) -> Value {
         "has_escape": data.contains('\u{1b}'),
         "has_line_feed": data.contains('\n'),
         "is_only_submit": matches!(data, "\r" | "\n"),
+        "is_only_carriage_return": data == "\r",
+        "is_only_enter_sequence": data == TERMINAL_ENTER_SEQUENCE || data == TERMINAL_ENTER_SEQUENCE_MOD1,
+        "is_only_line_feed": data == "\n",
+        "is_only_shift_enter_sequence": data == TERMINAL_SHIFT_ENTER_SEQUENCE,
         "preview": clean_terminal_diagnostic_log_text(data),
         "starts_with_escape": data.starts_with('\u{1b}'),
     })
@@ -7112,6 +7292,43 @@ mod terminal_tests {
         repo
     }
 
+    fn terminal_test_repo_with_commit(name: &str) -> PathBuf {
+        let repo = terminal_test_repo(name);
+        fs::write(repo.join("README.md"), "initial\n").unwrap();
+        for args in [
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Diff Forge Test"],
+            vec!["add", "README.md"],
+            vec!["commit", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        repo
+    }
+
+    fn terminal_test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "diffforge_terminal_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn terminal_test_plain_project(name: &str) -> PathBuf {
+        let repo = terminal_test_directory(name);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("package.json"), "{}\n").unwrap();
+        repo
+    }
+
     fn terminal_test_coordination(name: &str) -> TerminalCoordinationSession {
         let repo = terminal_test_repo(name);
         let kernel = crate::coordination::CoordinationKernel::init(&repo, None).unwrap();
@@ -7140,6 +7357,40 @@ mod terminal_tests {
             session_id,
             terminal_launch_epoch: None,
             env_vars: Vec::new(),
+        }
+    }
+
+    fn terminal_test_isolated_context(
+        repo: &Path,
+        slot_key: &str,
+        worktree_path: &Path,
+        write_root: &Path,
+    ) -> crate::coordination::models::TerminalCoordinationContext {
+        crate::coordination::models::TerminalCoordinationContext {
+            agent_id: "agent-1".to_string(),
+            agent_kind: "codex".to_string(),
+            agent_slot_id: Some(format!("slot-{slot_key}")),
+            slot_key: Some(slot_key.to_string()),
+            session_id: "session-1".to_string(),
+            terminal_launch_epoch: None,
+            task_id: None,
+            worktree_id: Some(format!("worktree-{slot_key}")),
+            worktree_path: Some(worktree_path.display().to_string()),
+            write_root: write_root.display().to_string(),
+            enforcement_mode: "worktree_required".to_string(),
+            db_path: repo.join(".agents").join("coordination.sqlite").display().to_string(),
+            repo_path: repo.display().to_string(),
+            mcp_config_path: String::new(),
+            codex_mcp_config_path: String::new(),
+            codex_home_path: None,
+            claude_mcp_config_path: String::new(),
+            mcp_command: String::new(),
+            workspace_id: Some("workspace-1".to_string()),
+            workspace_mcp_allowed_tools: Vec::new(),
+            objective_key: "workspace-1".to_string(),
+            context_run_id: None,
+            context_role: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -7247,6 +7498,175 @@ mod terminal_tests {
                 "{mode:?} completion mode changed"
             );
         }
+    }
+
+    #[test]
+    fn general_terminal_launch_target_uses_worktree_policy_for_git_root() {
+        let repo = terminal_test_repo("general_git_launch_target");
+
+        let target = terminal_coordination_launch_target(
+            &repo,
+            None,
+            None,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert!(target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_keeps_non_git_project_direct() {
+        let project = terminal_test_plain_project("general_non_git_launch_target");
+
+        let target = terminal_coordination_launch_target(
+            &project,
+            None,
+            None,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
+        assert!(!target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&project.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_promotes_git_subdirectory_to_top_level() {
+        let repo = terminal_test_repo("general_git_subdir_launch_target");
+        let subdir = repo.join("src").join("client");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let target = terminal_coordination_launch_target(
+            &subdir,
+            None,
+            None,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_keeps_container_direct_until_git_path_selected() {
+        let container = terminal_test_directory("general_multi_repo_container");
+        let frontend = container.join("frontend");
+        let backend = container.join("backend");
+        fs::create_dir_all(&frontend).unwrap();
+        fs::create_dir_all(&backend).unwrap();
+        let status = Command::new("git").arg("init").arg(&frontend).status().unwrap();
+        assert!(status.success());
+        let status = Command::new("git").arg("init").arg(&backend).status().unwrap();
+        assert!(status.success());
+
+        let container_target = terminal_coordination_launch_target(
+            &container,
+            None,
+            None,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+        assert_eq!(container_target.enforcement_mode, "bounded_direct_edit");
+        assert!(!container_target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&container_target.root.canonicalize().unwrap()),
+            normalized_path_key(&container.canonicalize().unwrap())
+        );
+
+        let selected = terminal_coordination_launch_target(
+            &container,
+            None,
+            Some("frontend"),
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+        assert_eq!(selected.enforcement_mode, "worktree_required");
+        assert_eq!(
+            normalized_path_key(&selected.root.canonicalize().unwrap()),
+            normalized_path_key(&frontend.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn direct_edit_launch_target_uses_worktree_policy_for_git_root() {
+        let repo = terminal_test_repo("direct_edit_git_launch_target");
+
+        let target = terminal_coordination_launch_target(
+            &repo,
+            None,
+            None,
+            TerminalSessionMode::DirectEdit,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert!(target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn isolated_worktree_context_validation_rejects_repo_root_write_root() {
+        let repo = terminal_test_directory("isolated_context_repo_root");
+        fs::create_dir_all(repo.join(".agents").join("worktrees")).unwrap();
+        let context = terminal_test_isolated_context(&repo, "1", &repo, &repo);
+
+        let error = validate_terminal_isolated_worktree_context(&context, "Codex").unwrap_err();
+
+        assert!(error.contains("repository root"));
+    }
+
+    #[test]
+    fn isolated_worktree_context_validation_accepts_slot_worktree() {
+        let repo = terminal_test_directory("isolated_context_worktree");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let context = terminal_test_isolated_context(&repo, "1", &worktree, &worktree);
+
+        validate_terminal_isolated_worktree_context(&context, "Codex").unwrap();
+    }
+
+    #[test]
+    fn isolated_worktree_context_validation_rejects_cross_slot_worktree() {
+        let repo = terminal_test_directory("isolated_context_cross_slot");
+        let other_slot_worktree = repo.join(".agents").join("worktrees").join("2");
+        fs::create_dir_all(&other_slot_worktree).unwrap();
+        let context =
+            terminal_test_isolated_context(&repo, "1", &other_slot_worktree, &other_slot_worktree);
+
+        let error = validate_terminal_isolated_worktree_context(&context, "Codex").unwrap_err();
+
+        assert!(error.contains("another slot"));
+    }
+
+    #[test]
+    fn isolated_worktree_context_validation_rejects_mismatched_assigned_worktree() {
+        let repo = terminal_test_directory("isolated_context_mismatched_worktree");
+        let assigned = repo.join(".agents").join("worktrees").join("1");
+        let write_root = repo.join(".agents").join("worktrees").join("1-shadow");
+        fs::create_dir_all(&assigned).unwrap();
+        fs::create_dir_all(&write_root).unwrap();
+        let context = terminal_test_isolated_context(&repo, "1", &assigned, &write_root);
+
+        let error = validate_terminal_isolated_worktree_context(&context, "Codex").unwrap_err();
+
+        assert!(error.contains("assigned worktree path"));
     }
 
     #[test]
@@ -7457,7 +7877,11 @@ mod terminal_tests {
             .any(|pair| pair == ["--disable", "apps"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+            .any(|pair| pair == ["--enable", "hooks"]));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/diffforge-agent-worktree"]));
@@ -7495,9 +7919,34 @@ mod terminal_tests {
             .join("1.claude.json")
             .display()
             .to_string();
+        let worktree_path = PathBuf::from(&coordination.repo_path)
+            .join(".agents")
+            .join("worktrees")
+            .join("1")
+            .display()
+            .to_string();
         coordination
             .env_vars
             .push(("CLAUDE_MCP_CONFIG".to_string(), claude_config_path.clone()));
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            worktree_path.clone(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_WORKTREE_PATH".to_string(),
+            worktree_path.clone(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_ENFORCEMENT_MODE".to_string(),
+            "worktree_required".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "git_worktree_patch".to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("COORDINATION_SLOT_KEY".to_string(), "1".to_string()));
         coordination.env_vars.push((
             "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS".to_string(),
             "appwrite-api__appwrite_search_tools".to_string(),
@@ -7505,7 +7954,22 @@ mod terminal_tests {
 
         let args = terminal_args_with_codex_mcp_identity(
             "claude",
-            &["--model".to_string(), "sonnet".to_string()],
+            &[
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/repo-root-override".to_string(),
+                "--allowedTools".to_string(),
+                "Bash,Write".to_string(),
+                "--mcp-config".to_string(),
+                "/tmp/unsafe-claude-mcp.json".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "--settings".to_string(),
+                "{\"disableAllHooks\":true}".to_string(),
+                "--allow-dangerously-skip-permissions".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
             Some(&coordination),
             "pane-auto",
             42,
@@ -7513,7 +7977,10 @@ mod terminal_tests {
 
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
+            .any(|pair| pair == ["--add-dir", worktree_path.as_str()]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", "/tmp/repo-root-override"]));
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -7535,18 +8002,262 @@ mod terminal_tests {
         ] {
             assert!(allowed_tools.split(',').any(|allowed| allowed == tool));
         }
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+        assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
+        assert!(!allowed_tools.split(',').any(|allowed| allowed == "Write"));
         let mcp_config = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
             .unwrap();
         assert_eq!(mcp_config, claude_config_path);
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--mcp-config", "/tmp/unsafe-claude-mcp.json"]));
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(!mcp_config.contains("\"coordination-kernel\""));
         assert!(!mcp_config.contains("terminal_launch_args"));
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--allow-dangerously-skip-permissions"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        let settings_arg = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
+            .unwrap();
+        let settings: Value = serde_json::from_str(settings_arg).unwrap();
+        assert_eq!(settings["disableBypassPermissionsMode"].as_str(), Some("disable"));
+        assert_eq!(
+            settings["permissions"]["defaultMode"].as_str(),
+            Some("acceptEdits")
+        );
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().iter().any(
+            |hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")
+        ));
+        assert_eq!(settings["sandbox"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            settings["sandbox"]["allowUnsandboxedCommands"].as_bool(),
+            Some(false)
+        );
         assert!(!args.iter().any(|arg| arg == "--no-alt-screen"));
+    }
+
+    #[test]
+    fn coordinated_claude_direct_edit_adds_git_route_guard_for_bounded_root() {
+        let direct_root = terminal_test_directory("claude_direct_edit_args");
+        let direct_root_text = direct_root.display().to_string();
+        let mut coordination = terminal_test_coordination("claude_direct_edit_kernel");
+        coordination.repo_path = direct_root_text.clone();
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            direct_root_text.clone(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_ENFORCEMENT_MODE".to_string(),
+            "bounded_direct_edit".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "bounded_direct_edit".to_string(),
+        ));
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "claude",
+            &["--permission-mode".to_string(), "bypassPermissions".to_string()],
+            Some(&coordination),
+            "pane-direct",
+            43,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", direct_root_text.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        let settings_arg = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
+            .unwrap();
+        let settings: Value = serde_json::from_str(settings_arg).unwrap();
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().iter().any(
+            |hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")
+        ));
+        assert!(settings_arg.contains("--diff-forge-write-guard"));
+        let allowed_tools = args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--allowedTools" || pair[0] == "--allowed-tools")
+                    .then(|| pair[1].as_str())
+            })
+            .unwrap();
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)")));
+        assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_denies_root_file_edit() {
+        let repo = terminal_test_directory("claude_guard_root_edit");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": repo.join("pricing.html").display().to_string()
+            }
+        });
+
+        let reason =
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1").unwrap();
+
+        assert!(reason.contains("outside terminal slot"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_allows_assigned_worktree_edit() {
+        let repo = terminal_test_directory("claude_guard_worktree_edit");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": worktree.join("pricing.html").display().to_string()
+            }
+        });
+
+        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1");
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn claude_worktree_guard_denies_other_slot_worktree_edit() {
+        let repo = terminal_test_directory("claude_guard_cross_slot_edit");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        let other = repo.join(".agents").join("worktrees").join("2");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": other.join("pricing.html").display().to_string()
+            }
+        });
+
+        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1")
+            .unwrap();
+
+        assert!(reason.contains("outside terminal slot"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_denies_unsandboxed_shell_escape() {
+        let repo = terminal_test_directory("claude_guard_unsandboxed_shell");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "command": "python -c 'print(1)'",
+                "dangerouslyDisableSandbox": true
+            }
+        });
+
+        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1")
+            .unwrap();
+
+        assert!(reason.contains("unsandboxed"));
+    }
+
+    #[test]
+    fn diff_forge_apply_patch_guard_rewrites_git_paths_to_slot_worktree() {
+        let repo = terminal_test_repo_with_commit("codex_apply_patch_route");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-fn main() {{}}\n+fn main() {{ println!(\"hi\"); }}\n*** End Patch\n",
+            repo.join("src/main.rs").display()
+        );
+
+        let rewrite = diff_forge_rewrite_apply_patch(
+            &patch,
+            &repo,
+            "slot1",
+            "codex",
+        )
+        .unwrap();
+
+        assert!(rewrite.changed);
+        assert!(rewrite.command.contains(".agents/worktrees/slot1"));
+        assert!(!rewrite
+            .command
+            .contains(&format!("*** Update File: {}", repo.join("src/main.rs").display())));
+    }
+
+    #[test]
+    fn diff_forge_write_guard_allows_non_git_direct_edit() {
+        let root = terminal_test_directory("write_guard_non_git");
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": root.display().to_string(),
+            "tool_input": {
+                "file_path": root.join("notes.txt").display().to_string()
+            }
+        });
+
+        let decision =
+            diff_forge_write_guard_decision("claude", &hook_input, &root, "slot1", "claude")
+                .unwrap();
+
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_real_git_root_edit_with_worktree_path() {
+        let repo = terminal_test_repo_with_commit("write_guard_git_root");
+        fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "file_path": repo.join("pricing.html").display().to_string()
+            }
+        });
+
+        let error =
+            diff_forge_write_guard_decision("claude", &hook_input, &repo, "slot1", "claude")
+                .unwrap_err();
+
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains(".agents/worktrees/slot1"));
     }
 
     #[cfg(windows)]
@@ -7651,11 +8362,19 @@ mod terminal_tests {
     }
 
     #[test]
-    fn coordinated_codex_launch_respects_explicit_approval_flags() {
+    fn coordinated_codex_launch_uses_managed_permissions_and_worktree_cwd() {
         let mut coordination = terminal_test_coordination("codex_existing_approval_args");
         coordination.env_vars.push((
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
             "/tmp/diffforge-agent-worktree".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_ENFORCEMENT_MODE".to_string(),
+            "worktree_required".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "git_worktree_patch".to_string(),
         ));
         let base = vec![
             "--ask-for-approval".to_string(),
@@ -7664,6 +8383,7 @@ mod terminal_tests {
             "read-only".to_string(),
             "--cd".to_string(),
             "/tmp/custom-cwd".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
         ];
 
         let args = terminal_args_with_codex_mcp_identity(
@@ -7684,17 +8404,59 @@ mod terminal_tests {
             args.iter()
                 .filter(|arg| arg.as_str() == "--sandbox")
                 .count(),
-            1
+            0
         );
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 1);
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--ask-for-approval", "on-request"]));
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--sandbox", "read-only"]));
+            .any(|pair| pair == ["--enable", "hooks"]));
         assert!(args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--cd", "/tmp/diffforge-agent-worktree"]));
+        assert!(!args
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
+    }
+
+    #[test]
+    fn coordinated_codex_activity_launch_is_read_only() {
+        let mut coordination = terminal_test_coordination("codex_activity_args");
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            "/tmp/diffforge-activity-root".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_ENFORCEMENT_MODE".to_string(),
+            "activity_only".to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("COORDINATION_FILE_AUTHORITY".to_string(), "none".to_string()));
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &["--model".to_string(), "gpt-5.4".to_string()],
+            Some(&coordination),
+            "pane-activity",
+            7,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--enable", "hooks"]));
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
     }
 }

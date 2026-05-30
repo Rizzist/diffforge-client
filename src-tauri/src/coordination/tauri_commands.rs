@@ -1364,8 +1364,9 @@ mod tests {
         create_package_project(&frontend);
         create_package_project(&backend);
 
-        coordination_init(Some(frontend.display().to_string()), None).unwrap();
-        assert!(frontend.join(".agents").join("kernel.sqlite").exists());
+        let init = coordination_init(Some(frontend.display().to_string()), None).unwrap();
+        let init_db_path = PathBuf::from(data(&init)["db_path"].as_str().unwrap_or_default());
+        assert!(init_db_path.exists());
 
         let snapshot = coordination_get_snapshot(Some(root.display().to_string()), None).unwrap();
         let snapshot_data = data(&snapshot);
@@ -1411,7 +1412,12 @@ mod tests {
             crate::normalized_path_key(&frontend_path)
         );
         assert!(!root.join(".agents").exists());
-        assert!(frontend.join(".agents").join("kernel.sqlite").exists());
+        let registry_db_path = PathBuf::from(
+            registry_data["coordination_kernel"]["db_path"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+        assert!(registry_db_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -697,6 +697,8 @@ fn terminal_args_with_codex_mcp_identity(
     };
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
+    let enforcement_mode = env_value("COORDINATION_ENFORCEMENT_MODE").unwrap_or_default();
+    let file_authority = env_value("COORDINATION_FILE_AUTHORITY").unwrap_or_default();
 
     let mut coordination_args =
         crate::coordination::mcp::proxy_args_for_repo(&coordination.repo_path);
@@ -730,6 +732,7 @@ fn terminal_args_with_codex_mcp_identity(
     }
 
     if is_codex {
+        let _ = (enforcement_mode.as_str(), file_authority.as_str());
         apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
 
         next.push("-c".to_string());
@@ -786,23 +789,57 @@ fn apply_codex_managed_runtime_isolation_args(args: &mut Vec<String>) {
     }
 }
 
-fn apply_codex_coordinated_auto_approval_args(args: &mut Vec<String>, write_root: Option<&str>) {
-    if !terminal_args_have_option(args, "--ask-for-approval", "-a") {
-        args.push("--ask-for-approval".to_string());
-        args.push("never".to_string());
-    }
-    if !terminal_args_have_option(args, "--sandbox", "-s")
-        && !terminal_args_have_option(args, "--dangerously-bypass-approvals-and-sandbox", "")
-    {
-        args.push("--sandbox".to_string());
-        args.push("workspace-write".to_string());
-    }
+fn apply_codex_coordinated_auto_approval_args(
+    args: &mut Vec<String>,
+    write_root: Option<&str>,
+) {
+    strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
+    args.push("--ask-for-approval".to_string());
+    args.push("never".to_string());
+
+    // Diff Forge coordinated Codex sessions use the app-generated CODEX_HOME
+    // permission profile. Keep older sandbox flags out of the launch args so
+    // profile read/write carveouts for container roots actually take effect.
+    strip_terminal_arg_option(args, "--sandbox", "-s", true);
+    strip_terminal_arg_option(args, "--dangerously-bypass-approvals-and-sandbox", "", false);
+    strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);
+
     if let Some(write_root) = write_root.filter(|value| !value.trim().is_empty()) {
-        if !terminal_args_have_option(args, "--cd", "-C") {
-            args.push("--cd".to_string());
-            args.push(write_root.to_string());
-        }
+        strip_terminal_arg_option(args, "--cd", "-C", true);
+        args.push("--cd".to_string());
+        args.push(write_root.to_string());
     }
+
+    if !terminal_args_have_option_value(args, "--enable", "", "hooks") {
+        args.push("--enable".to_string());
+        args.push("hooks".to_string());
+    }
+    args.push("--dangerously-bypass-hook-trust".to_string());
+}
+
+fn strip_terminal_arg_option(args: &mut Vec<String>, long: &str, short: &str, takes_value: bool) {
+    let mut next = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let exact = arg == long || (!short.is_empty() && arg == short);
+        let inline = (!long.is_empty() && arg.starts_with(&format!("{long}=")))
+            || (!short.is_empty() && arg.starts_with(&format!("{short}=")));
+        if exact {
+            index += 1;
+            if takes_value && index < args.len() {
+                index += 1;
+            }
+            continue;
+        }
+        if inline {
+            index += 1;
+            continue;
+        }
+        next.push(arg.clone());
+        index += 1;
+    }
+    *args = next;
 }
 
 fn apply_claude_coordinated_auto_approval_args(
@@ -810,20 +847,63 @@ fn apply_claude_coordinated_auto_approval_args(
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
 ) {
-    if !terminal_args_have_any_option(args, &["--add-dir"])
-        && !coordination.repo_path.trim().is_empty()
-    {
+    let write_root = terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
+        .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| coordination.repo_path.clone());
+    let enforcement_mode =
+        terminal_coordination_env_value(coordination, "COORDINATION_ENFORCEMENT_MODE")
+            .unwrap_or_default();
+    let file_authority = terminal_coordination_env_value(coordination, "COORDINATION_FILE_AUTHORITY")
+        .unwrap_or_default();
+    let worktree_required = enforcement_mode.trim() == "worktree_required"
+        || file_authority.trim() == "git_worktree_patch";
+    let direct_edit_allowed = enforcement_mode.trim() == "bounded_direct_edit"
+        || file_authority.trim() == "bounded_direct_edit";
+    let local_edit_allowed = worktree_required || direct_edit_allowed;
+
+    strip_terminal_arg_option(args, "--dangerously-skip-permissions", "", false);
+    strip_terminal_arg_option(args, "--allow-dangerously-skip-permissions", "", false);
+
+    strip_terminal_arg_option(args, "--add-dir", "", true);
+    if !write_root.trim().is_empty() {
         args.push("--add-dir".to_string());
-        args.push(coordination.repo_path.clone());
+        args.push(write_root.clone());
     }
-    if !terminal_args_have_any_option(args, &["--allowedTools", "--allowed-tools"]) {
-        args.push("--allowedTools".to_string());
-        args.push(claude_auto_approved_tools_arg(coordination));
+
+    strip_terminal_arg_option(args, "--allowedTools", "", true);
+    strip_terminal_arg_option(args, "--allowed-tools", "", true);
+    args.push("--allowedTools".to_string());
+    args.push(claude_auto_approved_tools_arg(
+        coordination,
+        local_edit_allowed.then_some(write_root.as_str()),
+    ));
+
+    strip_terminal_arg_option(args, "--mcp-config", "", true);
+    args.push("--mcp-config".to_string());
+    args.push(claude_coordination_mcp_config_arg(
+        coordination,
+        coordination_args,
+    ));
+
+    if local_edit_allowed {
+        strip_terminal_arg_option(args, "--permission-mode", "", true);
+        args.push("--permission-mode".to_string());
+        args.push("acceptEdits".to_string());
     }
-    if !terminal_args_have_any_option(args, &["--mcp-config"]) {
-        args.push("--mcp-config".to_string());
-        args.push(claude_coordination_mcp_config_arg(coordination, coordination_args));
+
+    if worktree_required || direct_edit_allowed {
+        strip_terminal_arg_option(args, "--settings", "", true);
+        args.push("--settings".to_string());
+        args.push(claude_write_authority_guard_settings(
+            coordination,
+            &write_root,
+            worktree_required,
+        ));
+
+        strip_terminal_arg_option(args, "--setting-sources", "", true);
     }
+
     apply_claude_managed_mcp_isolation_args(args);
 }
 
@@ -835,11 +915,23 @@ fn apply_claude_managed_mcp_isolation_args(args: &mut Vec<String>) {
     }
 }
 
-fn claude_auto_approved_tools_arg(coordination: &TerminalCoordinationSession) -> String {
+fn claude_auto_approved_tools_arg(
+    coordination: &TerminalCoordinationSession,
+    allowed_edit_root: Option<&str>,
+) -> String {
     let mut tools = ["Read", "Glob", "Grep", "LS"]
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    if let Some(root) = allowed_edit_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(claude_absolute_permission_glob)
+    {
+        tools.push(format!("Edit({root})"));
+        tools.push(format!("Write({root})"));
+        tools.push(format!("NotebookEdit({root})"));
+    }
     tools.extend(
         crate::coordination::mcp::TOOL_NAMES
             .iter()
@@ -868,6 +960,805 @@ fn claude_auto_approved_tools_arg(coordination: &TerminalCoordinationSession) ->
         );
     }
     tools.join(",")
+}
+
+fn claude_write_authority_guard_settings(
+    coordination: &TerminalCoordinationSession,
+    write_root: &str,
+    worktree_required: bool,
+) -> String {
+    let write_root = write_root.trim();
+    let edit_root = claude_absolute_permission_glob(write_root);
+    let guard_command = if worktree_required {
+        claude_worktree_guard_hook_command(coordination, write_root)
+    } else {
+        diff_forge_write_guard_hook_command(coordination, write_root, "claude")
+    };
+    let mut deny_rules = vec![
+        format!(
+            "Edit({})",
+            claude_absolute_permission_glob(
+                PathBuf::from(&coordination.repo_path)
+                    .join(".git")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        ),
+        format!(
+            "Write({})",
+            claude_absolute_permission_glob(
+                PathBuf::from(&coordination.repo_path)
+                    .join(".git")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        ),
+    ];
+
+    if cfg!(windows) {
+        deny_rules.extend(
+            ["Bash", "PowerShell", "Monitor"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+
+    let mut settings = json!({
+        "disableBypassPermissionsMode": "disable",
+        "permissions": {
+            "defaultMode": "acceptEdits",
+            "allow": [
+                format!("Edit({edit_root})")
+            ],
+            "deny": deny_rules
+        },
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Edit|Write|NotebookEdit",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": guard_command
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Bash|PowerShell|Monitor",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": guard_command
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    if !cfg!(windows) {
+        settings["sandbox"] = json!({
+            "enabled": true,
+            "failIfUnavailable": true,
+            "allowUnsandboxedCommands": false,
+            "filesystem": {
+                "allowWrite": [write_root]
+            }
+        });
+    }
+
+    settings.to_string()
+}
+
+fn claude_absolute_permission_glob(path: &str) -> String {
+    let mut path = claude_permission_absolute_path(path);
+    while path.ends_with('/') && path.len() > 2 {
+        path.pop();
+    }
+    format!("{path}/**")
+}
+
+fn claude_permission_absolute_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return "//".to_string();
+    }
+
+    #[cfg(windows)]
+    {
+        let bytes = normalized.as_bytes();
+        if bytes.len() >= 3
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+            && bytes[0].is_ascii_alphabetic()
+        {
+            let drive = (bytes[0] as char).to_ascii_lowercase();
+            let rest = normalized[3..].trim_start_matches('/');
+            return if rest.is_empty() {
+                format!("//{drive}")
+            } else {
+                format!("//{drive}/{rest}")
+            };
+        }
+    }
+
+    if normalized.starts_with("//") {
+        normalized
+    } else if normalized.starts_with('/') {
+        format!("/{normalized}")
+    } else {
+        format!("//{normalized}")
+    }
+}
+
+fn claude_worktree_guard_hook_command(
+    coordination: &TerminalCoordinationSession,
+    write_root: &str,
+) -> String {
+    let slot_key = terminal_coordination_env_value(coordination, "COORDINATION_SLOT_KEY")
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_path = coordination.mcp_command.as_str();
+
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --claude-worktree-guard --repo-path {} --worktree-path {} --slot-key {}\"",
+            quote_powershell_literal(command_path),
+            quote_powershell_literal(&coordination.repo_path),
+            quote_powershell_literal(write_root),
+            quote_powershell_literal(&slot_key),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{} --claude-worktree-guard --repo-path {} --worktree-path {} --slot-key {}",
+            quote_shell_literal(command_path),
+            quote_shell_literal(&coordination.repo_path),
+            quote_shell_literal(write_root),
+            quote_shell_literal(&slot_key),
+        )
+    }
+}
+
+fn diff_forge_write_guard_hook_command(
+    coordination: &TerminalCoordinationSession,
+    write_root: &str,
+    provider: &str,
+) -> String {
+    let slot_key = terminal_coordination_env_value(coordination, "COORDINATION_SLOT_KEY")
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_path = coordination.mcp_command.as_str();
+    let agent_kind = coordination.agent_kind.as_str();
+
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-write-guard --provider {} --repo-path {} --slot-key {} --agent-kind {}\"",
+            quote_powershell_literal(command_path),
+            quote_powershell_literal(provider),
+            quote_powershell_literal(write_root),
+            quote_powershell_literal(&slot_key),
+            quote_powershell_literal(agent_kind),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{} --diff-forge-write-guard --provider {} --repo-path {} --slot-key {} --agent-kind {}",
+            quote_shell_literal(command_path),
+            quote_shell_literal(provider),
+            quote_shell_literal(write_root),
+            quote_shell_literal(&slot_key),
+            quote_shell_literal(agent_kind),
+        )
+    }
+}
+
+pub fn run_claude_worktree_guard(args: &[String]) -> i32 {
+    let repo_path = terminal_cli_arg_value(args, "--repo-path");
+    let worktree_path = terminal_cli_arg_value(args, "--worktree-path");
+    let slot_key = terminal_cli_arg_value(args, "--slot-key").unwrap_or("unknown");
+
+    let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) else {
+        print_claude_worktree_guard_deny("Diff Forge Claude guard is missing the repo path.");
+        return 0;
+    };
+    let Some(worktree_path) = worktree_path.filter(|value| !value.trim().is_empty()) else {
+        print_claude_worktree_guard_deny("Diff Forge Claude guard is missing the worktree path.");
+        return 0;
+    };
+
+    let mut input = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+        print_claude_worktree_guard_deny(&format!(
+            "Diff Forge Claude guard could not read hook input: {error}."
+        ));
+        return 0;
+    }
+    let hook_input = match serde_json::from_str::<Value>(&input) {
+        Ok(value) => value,
+        Err(error) => {
+            print_claude_worktree_guard_deny(&format!(
+                "Diff Forge Claude guard received invalid hook input: {error}."
+            ));
+            return 0;
+        }
+    };
+
+    if let Some(reason) = claude_worktree_guard_denial_reason(
+        &hook_input,
+        Path::new(repo_path),
+        Path::new(worktree_path),
+        slot_key,
+    ) {
+        print_claude_worktree_guard_deny(&reason);
+    }
+
+    0
+}
+
+pub fn run_diff_forge_write_guard(args: &[String]) -> i32 {
+    let provider = terminal_cli_arg_value(args, "--provider").unwrap_or("codex");
+    let repo_path = terminal_cli_arg_value(args, "--repo-path");
+    let slot_key = terminal_cli_arg_value(args, "--slot-key").unwrap_or("unknown");
+    let agent_kind = terminal_cli_arg_value(args, "--agent-kind").unwrap_or(provider);
+
+    let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) else {
+        print_diff_forge_pre_tool_deny(
+            provider,
+            "Diff Forge write guard is missing the coordination root.",
+        );
+        return 0;
+    };
+
+    let mut input = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+        print_diff_forge_pre_tool_deny(
+            provider,
+            &format!("Diff Forge write guard could not read hook input: {error}."),
+        );
+        return 0;
+    }
+    let hook_input = match serde_json::from_str::<Value>(&input) {
+        Ok(value) => value,
+        Err(error) => {
+            print_diff_forge_pre_tool_deny(
+                provider,
+                &format!("Diff Forge write guard received invalid hook input: {error}."),
+            );
+            return 0;
+        }
+    };
+
+    match diff_forge_write_guard_decision(
+        provider,
+        &hook_input,
+        Path::new(repo_path),
+        slot_key,
+        agent_kind,
+    ) {
+        Ok(Some(output)) => println!("{output}"),
+        Ok(None) => {}
+        Err(error) => print_diff_forge_pre_tool_deny(provider, &error),
+    }
+
+    0
+}
+
+fn diff_forge_write_guard_decision(
+    provider: &str,
+    hook_input: &Value,
+    coordination_root: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<Option<Value>, String> {
+    let tool_name = hook_input["tool_name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim();
+    let tool_key = tool_name.to_ascii_lowercase();
+    let tool_input = &hook_input["tool_input"];
+
+    if matches!(tool_key.as_str(), "bash" | "powershell" | "monitor") {
+        if tool_input["dangerouslyDisableSandbox"].as_bool() == Some(true)
+            || tool_input["dangerously_disable_sandbox"].as_bool() == Some(true)
+        {
+            return Err(
+                "Diff Forge denied this shell command because it requested unsandboxed execution."
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if provider.eq_ignore_ascii_case("codex") && tool_key == "apply_patch" {
+        let command = tool_input["command"]
+            .as_str()
+            .ok_or_else(|| "Diff Forge denied apply_patch because the patch command was missing.".to_string())?;
+        let cwd = hook_input["cwd"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| coordination_root.to_path_buf());
+        let rewrite =
+            diff_forge_rewrite_apply_patch(command, &cwd, slot_key, agent_kind)?;
+        if rewrite.changed {
+            return Ok(Some(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "Diff Forge routed Git repository edits to the assigned worktree.",
+                    "updatedInput": {
+                        "command": rewrite.command
+                    },
+                    "additionalContext": rewrite.summary
+                }
+            })));
+        }
+        return Ok(None);
+    }
+
+    if matches!(
+        tool_key.as_str(),
+        "edit" | "write" | "multiedit" | "notebookedit"
+    ) {
+        let cwd = hook_input["cwd"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| coordination_root.to_path_buf());
+        let mut candidate_paths = Vec::new();
+        claude_guard_collect_tool_paths(tool_input, &mut candidate_paths);
+        if candidate_paths.is_empty() {
+            return Err(format!(
+                "Diff Forge denied this {tool_name} call because the tool did not provide a target file path."
+            ));
+        }
+        for candidate in candidate_paths {
+            let candidate_path = claude_guard_resolved_path(&PathBuf::from(candidate), &cwd);
+            if let Some(reason) =
+                diff_forge_git_write_denial_reason(&candidate_path, slot_key, agent_kind)?
+            {
+                return Err(reason);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug, Clone)]
+struct DiffForgeApplyPatchRewrite {
+    command: String,
+    changed: bool,
+    summary: String,
+}
+
+fn diff_forge_rewrite_apply_patch(
+    command: &str,
+    cwd: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<DiffForgeApplyPatchRewrite, String> {
+    let mut changed = false;
+    let mut routes = Vec::new();
+    let mut lines = Vec::new();
+    for line in command.lines() {
+        let mut rewritten = line.to_string();
+        for prefix in [
+            "*** Update File: ",
+            "*** Add File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ] {
+            if let Some(path) = line.strip_prefix(prefix) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    let absolute = claude_guard_resolved_path(&PathBuf::from(path), cwd);
+                    if let Some(mapped) =
+                        diff_forge_git_write_worktree_path(&absolute, slot_key, agent_kind)?
+                    {
+                        rewritten = format!("{prefix}{}", mapped.display());
+                        changed = true;
+                        routes.push(format!("{} -> {}", absolute.display(), mapped.display()));
+                    }
+                }
+                break;
+            }
+        }
+        lines.push(rewritten);
+    }
+    let mut next = lines.join("\n");
+    if command.ends_with('\n') {
+        next.push('\n');
+    }
+    let summary = if routes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Diff Forge routed Git repository patch paths through worktrees: {}",
+            routes.join("; ")
+        )
+    };
+    Ok(DiffForgeApplyPatchRewrite {
+        command: next,
+        changed,
+        summary,
+    })
+}
+
+fn diff_forge_git_write_denial_reason(
+    candidate_path: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<Option<String>, String> {
+    let Some(mapped) = diff_forge_git_write_worktree_path(candidate_path, slot_key, agent_kind)?
+    else {
+        return Ok(None);
+    };
+    if terminal_paths_equal(candidate_path, &mapped) {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "Diff Forge denied this direct Git repository edit. Edit the assigned worktree path instead: {}",
+        mapped.display()
+    )))
+}
+
+fn diff_forge_git_write_worktree_path(
+    candidate_path: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<Option<PathBuf>, String> {
+    if diff_forge_path_is_in_slot_worktree(candidate_path, slot_key) {
+        return Ok(None);
+    }
+    if diff_forge_path_is_in_other_slot_worktree(candidate_path, slot_key) {
+        return Err(format!(
+            "Diff Forge denied this edit because {} is inside another terminal slot's worktree.",
+            candidate_path.display()
+        ));
+    }
+
+    let Some(repo_root) = diff_forge_nearest_git_root(candidate_path) else {
+        return Ok(None);
+    };
+    if diff_forge_path_is_in_slot_worktree(&repo_root, slot_key) {
+        return Ok(None);
+    }
+    if diff_forge_path_is_in_other_slot_worktree(&repo_root, slot_key) {
+        return Err(format!(
+            "Diff Forge denied this edit because {} is inside another terminal slot's worktree.",
+            candidate_path.display()
+        ));
+    }
+
+    let worktree = diff_forge_create_or_reuse_slot_worktree(&repo_root, slot_key, agent_kind)?;
+    let relative = candidate_path
+        .strip_prefix(&repo_root)
+        .map_err(|_| {
+            format!(
+                "Unable to map {} relative to Git root {}.",
+                candidate_path.display(),
+                repo_root.display()
+            )
+        })?;
+    Ok(Some(worktree.join(relative)))
+}
+
+fn diff_forge_create_or_reuse_slot_worktree(
+    repo_root: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<PathBuf, String> {
+    let (kernel, _) =
+        crate::coordination::CoordinationKernel::open_for_terminal_launch(repo_root, None)
+            .map_err(|error| {
+                format!(
+                    "Unable to open Diff Forge coordination for {}: {error}",
+                    repo_root.display()
+                )
+            })?;
+    let agent_kind = if agent_kind.trim().is_empty() {
+        "agent"
+    } else {
+        agent_kind.trim()
+    };
+    let agent_name = format!("{} {}", agent_kind, slot_key.trim());
+    let slot = kernel
+        .get_or_create_agent_slot(slot_key, &agent_name, agent_kind, None)
+        .map_err(|error| {
+            format!(
+                "Unable to create Diff Forge agent slot for {}: {error}",
+                repo_root.display()
+            )
+        })?;
+    let slot_id = slot["id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Diff Forge agent slot did not return an id.".to_string())?;
+    let worktree = kernel
+        .create_or_reuse_worktree_for_slot(slot_id)
+        .map_err(|error| {
+            format!(
+                "Unable to create Diff Forge worktree for {}: {error}",
+                repo_root.display()
+            )
+        })?;
+    let path = worktree["path"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Diff Forge worktree did not return a path.".to_string())?;
+    Ok(claude_guard_resolved_path(&PathBuf::from(path), repo_root))
+}
+
+fn diff_forge_nearest_git_root(path: &Path) -> Option<PathBuf> {
+    let resolved = claude_guard_existing_or_parent_canonical_path(path);
+    let mut cursor = if resolved.is_dir() {
+        resolved.as_path()
+    } else {
+        resolved.parent().unwrap_or(resolved.as_path())
+    };
+    loop {
+        let dot_git = cursor.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(claude_guard_clean_path(cursor));
+        }
+        let Some(parent) = cursor.parent() else {
+            return None;
+        };
+        cursor = parent;
+    }
+}
+
+fn diff_forge_path_is_in_slot_worktree(path: &Path, slot_key: &str) -> bool {
+    diff_forge_worktree_slot_segment(path).is_some_and(|segment| {
+        segment == slot_key || segment.starts_with(&format!("{slot_key}-"))
+    })
+}
+
+fn diff_forge_path_is_in_other_slot_worktree(path: &Path, slot_key: &str) -> bool {
+    diff_forge_worktree_slot_segment(path).is_some_and(|segment| {
+        !(segment == slot_key || segment.starts_with(&format!("{slot_key}-")))
+    })
+}
+
+fn diff_forge_worktree_slot_segment(path: &Path) -> Option<String> {
+    let path = claude_guard_clean_path(path);
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    components.windows(3).find_map(|window| {
+        (window[0] == ".agents" && window[1] == "worktrees").then(|| window[2].clone())
+    })
+}
+
+fn terminal_paths_equal(left: &Path, right: &Path) -> bool {
+    claude_guard_path_key(left) == claude_guard_path_key(right)
+}
+
+fn print_diff_forge_pre_tool_deny(provider: &str, reason: &str) {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider.contains("claude") {
+        print_claude_worktree_guard_deny(reason);
+        return;
+    }
+    println!(
+        "{}",
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        })
+    );
+}
+
+fn terminal_cli_arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    let inline_prefix = format!("{key}=");
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == key {
+            return args.get(index + 1).map(String::as_str);
+        }
+        if let Some(value) = arg.strip_prefix(&inline_prefix) {
+            return Some(value);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn print_claude_worktree_guard_deny(reason: &str) {
+    println!(
+        "{}",
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        })
+    );
+}
+
+fn claude_worktree_guard_denial_reason(
+    hook_input: &Value,
+    repo_path: &Path,
+    worktree_path: &Path,
+    slot_key: &str,
+) -> Option<String> {
+    let tool_name = hook_input["tool_name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim();
+    let tool_key = tool_name.to_ascii_lowercase();
+    let tool_input = &hook_input["tool_input"];
+
+    if matches!(tool_key.as_str(), "bash" | "powershell" | "monitor") {
+        if tool_input["dangerouslyDisableSandbox"].as_bool() == Some(true)
+            || tool_input["dangerously_disable_sandbox"].as_bool() == Some(true)
+        {
+            return Some(
+                "Diff Forge denied this shell command because it requested unsandboxed execution."
+                    .to_string(),
+            );
+        }
+        return None;
+    }
+
+    if !matches!(
+        tool_key.as_str(),
+        "edit" | "write" | "multiedit" | "notebookedit"
+    ) {
+        return None;
+    }
+
+    let worktree = claude_guard_resolved_path(worktree_path, worktree_path);
+    if !claude_guard_path_is_under_worktree(&worktree, repo_path, slot_key) {
+        return Some(
+            "Diff Forge denied this edit because the assigned worktree is not a valid terminal slot worktree."
+                .to_string(),
+        );
+    }
+
+    let cwd = hook_input["cwd"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| worktree.clone());
+    let mut candidate_paths = Vec::new();
+    claude_guard_collect_tool_paths(tool_input, &mut candidate_paths);
+    if candidate_paths.is_empty() {
+        return Some(format!(
+            "Diff Forge denied this {tool_name} call because Claude did not provide a target file path."
+        ));
+    }
+
+    for candidate in candidate_paths {
+        let candidate_path = claude_guard_resolved_path(&PathBuf::from(candidate), &cwd);
+        if !claude_guard_path_is_inside(&candidate_path, &worktree) {
+            return Some(format!(
+                "Diff Forge denied this edit because {} is outside terminal slot {slot_key}'s assigned worktree {}.",
+                candidate_path.display(),
+                worktree.display()
+            ));
+        }
+    }
+
+    None
+}
+
+fn claude_guard_collect_tool_paths(value: &Value, paths: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "file_path" | "filePath" | "path" | "notebook_path" | "notebookPath"
+                ) {
+                    if let Some(path) = value.as_str().filter(|path| !path.trim().is_empty()) {
+                        paths.push(path.to_string());
+                    }
+                }
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    claude_guard_collect_tool_paths(value, paths);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                claude_guard_collect_tool_paths(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn claude_guard_resolved_path(path: &Path, cwd: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    claude_guard_existing_or_parent_canonical_path(&absolute)
+}
+
+fn claude_guard_existing_or_parent_canonical_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return claude_guard_clean_path(&canonical);
+    }
+
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        let Some(parent) = cursor.parent() else {
+            return claude_guard_clean_path(path);
+        };
+        cursor = parent;
+    }
+
+    let mut resolved = cursor
+        .canonicalize()
+        .unwrap_or_else(|_| claude_guard_clean_path(cursor));
+    for segment in missing.iter().rev() {
+        resolved.push(segment);
+    }
+    claude_guard_clean_path(&resolved)
+}
+
+fn claude_guard_clean_path(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                cleaned.push(component.as_os_str());
+            }
+        }
+    }
+    cleaned
+}
+
+fn claude_guard_path_is_inside(path: &Path, root: &Path) -> bool {
+    let path_key = claude_guard_path_key(path);
+    let root_key = claude_guard_path_key(root);
+    path_key == root_key || path_key.starts_with(&format!("{root_key}/"))
+}
+
+fn claude_guard_path_is_under_worktree(path: &Path, repo_path: &Path, slot_key: &str) -> bool {
+    let worktrees_root = claude_guard_resolved_path(&repo_path.join(".agents").join("worktrees"), repo_path);
+    if !claude_guard_path_is_inside(path, &worktrees_root) {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(&worktrees_root) else {
+        return false;
+    };
+    let Some(Component::Normal(segment)) = relative.components().next() else {
+        return false;
+    };
+    let segment = segment.to_string_lossy();
+    segment == slot_key || segment.starts_with(&format!("{slot_key}-"))
+}
+
+fn claude_guard_path_key(path: &Path) -> String {
+    claude_guard_clean_path(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn claude_coordination_mcp_config_arg(

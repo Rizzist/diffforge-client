@@ -786,6 +786,7 @@ fn workspace_git_bootstrap_for_selected_root(root: &Path) -> Result<WorkspaceGit
     ensure_workspace_git_ready_for_coordination(root)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn workspace_coordination_root_for_terminal(
     root: &Path,
     requested_project_root: Option<&str>,
@@ -873,6 +874,7 @@ fn workspace_coordination_root_for_terminal(
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn workspace_direct_edit_root_for_terminal(
     root: &Path,
     requested_project_root: Option<&str>,

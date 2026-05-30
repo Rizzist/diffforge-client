@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -5120,6 +5120,8 @@ impl CoordinationKernel {
             slot_key.as_deref(),
             &session_id,
             &write_root,
+            &enforcement_mode,
+            &mcp_command,
         )?;
 
         Ok(TerminalCoordinationContext {
@@ -5257,6 +5259,8 @@ impl CoordinationKernel {
             slot_key.as_deref(),
             &session_id,
             &write_root,
+            &enforcement_mode,
+            &mcp_command,
         )?;
 
         Ok(TerminalCoordinationContext {
@@ -6074,13 +6078,7 @@ impl CoordinationKernel {
             &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
         )?;
         write_json_file_atomic(&claude_path, &generic_config)?;
-        self.write_agent_contract_files(&self.paths.repo_path)?;
-        let (repo_mcp_path, repo_codex_path) = self.write_repo_root_mcp_activation_files(
-            &generic_config,
-            &command,
-            &args,
-            &gateway_approved_tools,
-        )?;
+        let shared_repo_cleanup = self.cleanup_repo_root_coordination_activation_files()?;
 
         let response = json!({
             "server_name": "coordination-kernel",
@@ -6099,8 +6097,10 @@ impl CoordinationKernel {
             "config_path": process_path_text(&generic_path),
             "codex_config_path": process_path_text(&codex_path),
             "claude_config_path": process_path_text(&claude_path),
-            "repo_mcp_path": process_path_text(&repo_mcp_path),
-            "repo_codex_config_path": process_path_text(&repo_codex_path),
+            "repo_activation_files_enabled": false,
+            "repo_mcp_path": Value::Null,
+            "repo_codex_config_path": Value::Null,
+            "shared_repo_cleanup": shared_repo_cleanup,
         });
         remember_workspace_mcp_activation(cache_key, &response);
         if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
@@ -6171,8 +6171,6 @@ impl CoordinationKernel {
         let generic_path = self.paths.mcp_root.join("coordination.json");
         let codex_path = self.paths.mcp_root.join("coordination.codex.toml");
         let claude_path = self.paths.mcp_root.join("coordination.claude.json");
-        let repo_mcp_path = self.paths.repo_path.join(".mcp.json");
-        let repo_codex_path = self.paths.repo_path.join(".codex").join("config.toml");
 
         Ok(json!({
             "server_name": "coordination-kernel",
@@ -6191,8 +6189,9 @@ impl CoordinationKernel {
             "config_path": process_path_text(&generic_path),
             "codex_config_path": process_path_text(&codex_path),
             "claude_config_path": process_path_text(&claude_path),
-            "repo_mcp_path": process_path_text(&repo_mcp_path),
-            "repo_codex_config_path": process_path_text(&repo_codex_path),
+            "repo_activation_files_enabled": false,
+            "repo_mcp_path": Value::Null,
+            "repo_codex_config_path": Value::Null,
         }))
     }
 
@@ -7917,13 +7916,11 @@ impl CoordinationKernel {
             &gateway_approved_tools,
             worktree_path,
         );
-        let repo_activation_ready = self.repo_root_mcp_activation_files_exist();
         let files_reused = existing_config
             .as_ref()
             .and_then(|(_, hash)| hash.as_deref())
             == Some(config_hash.as_str())
-            && slot_files_ready
-            && repo_activation_ready;
+            && slot_files_ready;
 
         if files_reused {
         } else {
@@ -7933,7 +7930,7 @@ impl CoordinationKernel {
                 &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
             )?;
             write_json_file_atomic(&claude_path, &claude_config)?;
-            self.write_repo_root_dynamic_mcp_activation_files()?;
+            self.cleanup_repo_root_coordination_activation_files()?;
             if let (Some(_worktree_id), Some(worktree_path)) = (worktree_id, worktree_path) {
                 if !path_text_under_path(worktree_path, &self.paths.worktrees_root) {
                     return Err(format!(
@@ -8056,21 +8053,6 @@ impl CoordinationKernel {
         (command, args)
     }
 
-    fn repo_root_mcp_activation_files_exist(&self) -> bool {
-        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
-        self.paths.repo_path.join(".mcp.json").exists()
-            && self
-                .paths
-                .repo_path
-                .join(".codex")
-                .join("config.toml")
-                .exists()
-            && claude_settings_file_has_required_policy_with_gateway_tools(
-                &claude_settings_path(&self.paths.repo_path),
-                &gateway_approved_tools,
-            )
-    }
-
     fn slot_mcp_activation_files_match(
         &self,
         generic_path: &Path,
@@ -8153,93 +8135,6 @@ impl CoordinationKernel {
         Ok(())
     }
 
-    fn write_repo_root_dynamic_mcp_activation_files(&self) -> Result<(PathBuf, PathBuf), String> {
-        let (command, mut args) = self.coordination_mcp_command_spec();
-        args.extend([
-            "--repo-path".to_string(),
-            process_path_text(&self.paths.repo_path),
-            "--db-path".to_string(),
-            process_path_text(&self.paths.db_path),
-        ]);
-        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
-        let gateway_args = workspace_gateway_args_from_coordination_args(&args);
-
-        let generic_config = json!({
-            "mcpServers": {
-                "coordination-kernel": {
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
-                        "COORDINATION_MCP_ALWAYS_ON": "1"
-                    },
-                    "diffforge": {
-                        "scope": "repo-root-dynamic-agent",
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "identitySource": "terminal_environment",
-                        "authority": "local_coordination_kernel"
-                    }
-                },
-                "workspace-mcp-gateway": {
-                    "command": command.clone(),
-                    "args": gateway_args,
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
-                        "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
-                    },
-                    "diffforge": {
-                        "scope": "repo-root-dynamic-agent",
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "identitySource": "terminal_environment",
-                        "authority": "workspace_mcp_gateway"
-                    }
-                }
-            }
-        });
-
-        self.write_repo_root_mcp_activation_files(
-            &generic_config,
-            &command,
-            &args,
-            &gateway_approved_tools,
-        )
-    }
-
-    fn write_repo_root_mcp_activation_files(
-        &self,
-        generic_config: &Value,
-        command: &str,
-        args: &[String],
-        gateway_approved_tools: &[String],
-    ) -> Result<(PathBuf, PathBuf), String> {
-        self.ensure_repo_root_mcp_files_ignored()?;
-
-        let mcp_path = self.paths.repo_path.join(".mcp.json");
-        write_json_file_atomic(&mcp_path, generic_config)?;
-
-        let codex_dir = self.paths.repo_path.join(".codex");
-        fs::create_dir_all(&codex_dir)
-            .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
-        let codex_path = codex_dir.join("config.toml");
-        write_text_file_atomic(
-            &codex_path,
-            &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
-        )?;
-        write_claude_settings_file_with_gateway_tools(
-            &self.paths.repo_path,
-            gateway_approved_tools,
-        )?;
-        self.write_agent_contract_files(&self.paths.repo_path)?;
-
-        Ok((mcp_path, codex_path))
-    }
-
     fn write_agent_contract_files(&self, root: &Path) -> Result<(), String> {
         if !root.exists() {
             return Ok(());
@@ -8258,67 +8153,47 @@ impl CoordinationKernel {
         Ok(())
     }
 
-    fn ensure_repo_root_mcp_files_ignored(&self) -> Result<(), String> {
-        let exclude_path_text = match run_git(
-            &self.paths.repo_path,
-            &["rev-parse", "--git-path", "info/exclude"],
-        ) {
-            Ok(value) => value,
-            Err(_) => return Ok(()),
-        };
-        let exclude_path = {
-            let trimmed = exclude_path_text.trim();
-            let path = PathBuf::from(trimmed);
-            if path.is_absolute() {
-                path
-            } else {
-                self.paths.repo_path.join(path)
+    fn cleanup_repo_root_coordination_activation_files(&self) -> Result<Value, String> {
+        let mut removed = Vec::new();
+        let mut updated = Vec::new();
+
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = self.paths.repo_path.join(name);
+            match remove_generated_agent_contract(&path)? {
+                GeneratedFileCleanup::Removed => removed.push(name.to_string()),
+                GeneratedFileCleanup::Updated => updated.push(name.to_string()),
+                GeneratedFileCleanup::Unchanged => {}
             }
-        };
-        if let Some(parent) = exclude_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "Unable to create git exclude directory {}: {error}",
-                    parent.display()
-                )
-            })?;
         }
-        let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
-        let mut additions = Vec::new();
-        if !existing.lines().any(|line| line.trim() == ".mcp.json") {
-            additions.push(".mcp.json");
+
+        match cleanup_repo_mcp_json(&self.paths.repo_path.join(".mcp.json"))? {
+            GeneratedFileCleanup::Removed => removed.push(".mcp.json".to_string()),
+            GeneratedFileCleanup::Updated => updated.push(".mcp.json".to_string()),
+            GeneratedFileCleanup::Unchanged => {}
         }
-        if !existing
-            .lines()
-            .any(|line| line.trim() == ".codex/config.toml")
-        {
-            additions.push(".codex/config.toml");
+
+        match cleanup_repo_codex_config(&self.paths.repo_path.join(".codex").join("config.toml"))? {
+            GeneratedFileCleanup::Removed => removed.push(".codex/config.toml".to_string()),
+            GeneratedFileCleanup::Updated => updated.push(".codex/config.toml".to_string()),
+            GeneratedFileCleanup::Unchanged => {}
         }
-        if !existing
-            .lines()
-            .any(|line| line.trim() == ".claude/settings.local.json")
-        {
-            additions.push(".claude/settings.local.json");
+
+        match cleanup_repo_claude_settings(&claude_settings_path(&self.paths.repo_path))? {
+            GeneratedFileCleanup::Removed => {
+                removed.push(".claude/settings.local.json".to_string())
+            }
+            GeneratedFileCleanup::Updated => {
+                updated.push(".claude/settings.local.json".to_string())
+            }
+            GeneratedFileCleanup::Unchanged => {}
         }
-        if additions.is_empty() {
-            return Ok(());
-        }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&exclude_path)
-            .map_err(|error| format!("Unable to open {}: {error}", exclude_path.display()))?;
-        if !existing.ends_with('\n') && !existing.is_empty() {
-            writeln!(file)
-                .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
-        }
-        writeln!(file, "# Diff Forge local MCP activation files")
-            .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
-        for addition in additions {
-            writeln!(file, "{addition}")
-                .map_err(|error| format!("Unable to update {}: {error}", exclude_path.display()))?;
-        }
-        Ok(())
+
+        Ok(json!({
+            "removed": removed,
+            "updated": updated,
+            "removed_count": removed.len(),
+            "updated_count": updated.len(),
+        }))
     }
 
     fn ensure_worktree_mcp_files_ignored(&self, worktree: &Path) -> Result<(), String> {
@@ -21523,6 +21398,8 @@ fn prepare_managed_codex_home_for_terminal(
     slot_key: Option<&str>,
     session_id: &str,
     write_root: &str,
+    enforcement_mode: &str,
+    mcp_command: &str,
 ) -> Result<Option<String>, String> {
     if !agent_kind.to_ascii_lowercase().contains("codex") {
         return Ok(None);
@@ -21560,7 +21437,15 @@ fn prepare_managed_codex_home_for_terminal(
         .transpose()
         .map_err(|error| format!("Unable to read user Codex config: {error}"))?
         .unwrap_or_default();
-    let config = codex_managed_home_config(&source_body, &paths.repo_path, Path::new(write_root));
+    let config = codex_managed_home_config(
+        &source_body,
+        &paths.repo_path,
+        Path::new(write_root),
+        enforcement_mode,
+        slot_key,
+        agent_kind,
+        mcp_command,
+    )?;
     write_text_file_atomic(&target_home.join("config.toml"), &config)?;
 
     if let Some(source_home) = source_home {
@@ -21665,24 +21550,41 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn codex_managed_home_config(source_body: &str, repo_path: &Path, write_root: &Path) -> String {
-    let without_native_mcps = strip_codex_native_mcp_server_sections(source_body);
-    let mut config = ensure_codex_project_trust_entry(&without_native_mcps, repo_path);
+fn codex_managed_home_config(
+    source_body: &str,
+    repo_path: &Path,
+    write_root: &Path,
+    enforcement_mode: &str,
+    slot_key: Option<&str>,
+    agent_kind: &str,
+    mcp_command: &str,
+) -> Result<String, String> {
+    let without_managed_conflicts = strip_codex_managed_runtime_conflicts(source_body);
+    let mut config = ensure_codex_project_trust_entry(&without_managed_conflicts, repo_path);
     config = ensure_codex_project_trust_entry(&config, write_root);
+    config = append_codex_managed_permission_profile(
+        config,
+        repo_path,
+        write_root,
+        enforcement_mode,
+        slot_key,
+        agent_kind,
+        mcp_command,
+    )?;
     if !config.ends_with('\n') {
         config.push('\n');
     }
-    config
+    Ok(config)
 }
 
-fn strip_codex_native_mcp_server_sections(body: &str) -> String {
+fn strip_codex_managed_runtime_conflicts(body: &str) -> String {
     let mut skip = false;
     let mut kept = Vec::new();
     for line in body.lines() {
         if let Some(section) = toml_section_name(line) {
-            skip = codex_toml_section_is_mcp_servers(&section);
+            skip = codex_toml_section_is_managed_runtime_conflict(&section);
         }
-        if !skip && codex_toml_line_is_mcp_servers_assignment(line) {
+        if !skip && codex_toml_line_is_managed_runtime_conflict(line) {
             continue;
         }
         if !skip {
@@ -21696,16 +21598,280 @@ fn strip_codex_native_mcp_server_sections(body: &str) -> String {
     next
 }
 
-fn codex_toml_section_is_mcp_servers(section: &str) -> bool {
+fn codex_toml_section_is_managed_runtime_conflict(section: &str) -> bool {
     let section = section.trim().trim_matches('"').trim_matches('\'');
-    section == "mcp_servers" || section.starts_with("mcp_servers.")
+    section == "mcp_servers"
+        || section.starts_with("mcp_servers.")
+        || section == "permissions"
+        || section.starts_with("permissions.")
+        || section == "sandbox_workspace_write"
+        || section.starts_with("sandbox_workspace_write.")
+        || section == "hooks"
+        || section.starts_with("hooks.")
 }
 
-fn codex_toml_line_is_mcp_servers_assignment(line: &str) -> bool {
+fn codex_toml_line_is_managed_runtime_conflict(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed
-        .strip_prefix("mcp_servers")
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
+    [
+        "mcp_servers",
+        "default_permissions",
+        "sandbox_mode",
+        "sandbox_workspace_write",
+        "sandbox_permissions",
+    ]
+    .iter()
+    .any(|key| {
+        trimmed
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CodexManagedGitRoute {
+    repo_root: PathBuf,
+    worktree_root: PathBuf,
+}
+
+fn append_codex_managed_permission_profile(
+    mut config: String,
+    repo_path: &Path,
+    write_root: &Path,
+    enforcement_mode: &str,
+    slot_key: Option<&str>,
+    agent_kind: &str,
+    mcp_command: &str,
+) -> Result<String, String> {
+    let slot_key = slot_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let write_root = write_root
+        .canonicalize()
+        .unwrap_or_else(|_| write_root.to_path_buf());
+    let routes = if enforcement_mode == "bounded_direct_edit" {
+        codex_managed_git_routes_for_direct_root(&write_root, slot_key, agent_kind)?
+    } else {
+        Vec::new()
+    };
+    let write_enabled = matches!(
+        enforcement_mode,
+        "worktree_required" | "bounded_direct_edit" | "general_worker"
+    );
+    let parent_profile = if write_enabled {
+        ":workspace"
+    } else {
+        ":read-only"
+    };
+    let profile = "diffforge-coordinated";
+    config.push_str(&format!(
+        "\ndefault_permissions = \"{profile}\"\n\n\
+[permissions.{profile}]\n\
+description = \"Diff Forge coordinated agent filesystem policy.\"\n\
+extends = \"{parent_profile}\"\n\n\
+[permissions.{profile}.workspace_roots]\n\
+\"{}\" = true\n\n\
+[permissions.{profile}.filesystem]\n\
+\":root\" = \"read\"\n",
+        toml_escape(&process_path_text(&write_root))
+    ));
+
+    if write_enabled {
+        config.push_str(&format!(
+            "\n[permissions.{profile}.filesystem.\":workspace_roots\"]\n\
+\".\" = \"write\"\n"
+        ));
+
+        for route in &routes {
+            let repo_relative = codex_permission_relative_path(&write_root, &route.repo_root)?;
+            let worktree_relative =
+                codex_permission_relative_path(&write_root, &route.worktree_root)?;
+            config.push_str(&format!(
+                "\"{}\" = \"read\"\n\"{}\" = \"write\"\n",
+                toml_escape(&repo_relative),
+                toml_escape(&worktree_relative)
+            ));
+        }
+    }
+
+    config.push_str(&format!(
+        "\n[[hooks.PreToolUse]]\n\
+matcher = \"apply_patch|Edit|Write|Bash\"\n\n\
+[[hooks.PreToolUse.hooks]]\n\
+type = \"command\"\n\
+command = \"{}\"\n\
+timeout = 30\n\
+statusMessage = \"Routing Diff Forge writes\"\n",
+        toml_escape(&codex_write_guard_hook_command(
+            mcp_command,
+            &process_path_text(repo_path),
+            slot_key,
+            agent_kind,
+        ))
+    ));
+
+    Ok(config)
+}
+
+fn codex_managed_git_routes_for_direct_root(
+    write_root: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<Vec<CodexManagedGitRoute>, String> {
+    let mut routes = Vec::new();
+    for repo_root in discover_nested_git_roots(write_root, 8, 256) {
+        let worktree_root = create_or_reuse_codex_route_worktree(&repo_root, slot_key, agent_kind)?;
+        routes.push(CodexManagedGitRoute {
+            repo_root,
+            worktree_root,
+        });
+    }
+    Ok(routes)
+}
+
+fn discover_nested_git_roots(root: &Path, max_depth: usize, max_roots: usize) -> Vec<PathBuf> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut roots = Vec::new();
+    let mut queue = VecDeque::from([(root.clone(), 0usize)]);
+    let mut seen = HashSet::new();
+    while let Some((directory, depth)) = queue.pop_front() {
+        if roots.len() >= max_roots {
+            break;
+        }
+        let key = process_path_text(&directory).to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        if directory != root
+            && (directory.join(".git").is_dir() || directory.join(".git").is_file())
+        {
+            roots.push(directory);
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(
+                name.as_str(),
+                ".git"
+                    | ".agents"
+                    | ".codex"
+                    | ".claude"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | ".next"
+                    | ".cache"
+            ) {
+                continue;
+            }
+            queue.push_back((path, depth + 1));
+        }
+    }
+    roots
+}
+
+fn create_or_reuse_codex_route_worktree(
+    repo_root: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<PathBuf, String> {
+    let (kernel, _) =
+        CoordinationKernel::open_for_terminal_launch(repo_root, None).map_err(|error| {
+            format!(
+                "Unable to open Diff Forge coordination for nested repo {}: {error}",
+                repo_root.display()
+            )
+        })?;
+    let agent_kind = if agent_kind.trim().is_empty() {
+        "codex"
+    } else {
+        agent_kind.trim()
+    };
+    let agent_name = format!("{} {}", agent_kind, slot_key.trim());
+    let slot = kernel
+        .get_or_create_agent_slot(slot_key, &agent_name, agent_kind, None)
+        .map_err(|error| {
+            format!(
+                "Unable to create Diff Forge route slot for {}: {error}",
+                repo_root.display()
+            )
+        })?;
+    let slot_id = slot["id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Diff Forge route slot did not return an id.".to_string())?;
+    let worktree = kernel
+        .create_or_reuse_worktree_for_slot(slot_id)
+        .map_err(|error| {
+            format!(
+                "Unable to create Diff Forge route worktree for {}: {error}",
+                repo_root.display()
+            )
+        })?;
+    let path = worktree["path"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Diff Forge route worktree did not return a path.".to_string())?;
+    Ok(PathBuf::from(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path)))
+}
+
+fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, String> {
+    let relative = child.strip_prefix(root).map_err(|_| {
+        format!(
+            "Unable to express {} relative to {} for Codex permissions.",
+            child.display(),
+            root.display()
+        )
+    })?;
+    let text = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+    if text.is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+fn codex_write_guard_hook_command(
+    command: &str,
+    repo_path: &str,
+    slot_key: &str,
+    agent_kind: &str,
+) -> String {
+    format!(
+        "{} --diff-forge-write-guard --provider {} --repo-path {} --slot-key {} --agent-kind {}",
+        quote_shell_literal_for_config(command),
+        quote_shell_literal_for_config("codex"),
+        quote_shell_literal_for_config(repo_path),
+        quote_shell_literal_for_config(slot_key),
+        quote_shell_literal_for_config(agent_kind),
+    )
+}
+
+fn quote_shell_literal_for_config(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn toml_section_name(line: &str) -> Option<String> {
@@ -22148,6 +22314,13 @@ fn opencode_config_json(command: &str, args: &[String]) -> Value {
 const DIFFFORGE_AGENT_CONTRACT_BEGIN: &str = "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->";
 const DIFFFORGE_AGENT_CONTRACT_END: &str = "<!-- DIFFFORGE_AGENT_CONTRACT_END -->";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedFileCleanup {
+    Removed,
+    Updated,
+    Unchanged,
+}
+
 fn diffforge_agent_contract_markdown() -> String {
     format!(
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
@@ -22205,6 +22378,216 @@ fn write_or_update_generated_agent_contract(path: &Path, contract: &str) -> Resu
 
     write_text_file_atomic(path, contract)?;
     Ok(true)
+}
+
+fn remove_generated_agent_contract(path: &Path) -> Result<GeneratedFileCleanup, String> {
+    if !path.exists() {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    let existing = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    let Some(start) = existing.find(DIFFFORGE_AGENT_CONTRACT_BEGIN) else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    let Some(end) = existing.find(DIFFFORGE_AGENT_CONTRACT_END) else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    if end < start {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    let end_index = end + DIFFFORGE_AGENT_CONTRACT_END.len();
+    let mut next = format!("{}{}", &existing[..start], &existing[end_index..]);
+    next = next.trim_matches('\n').to_string();
+    if next.trim().is_empty() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(GeneratedFileCleanup::Removed);
+    }
+    next.push('\n');
+    if next == existing {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    write_text_file_atomic(path, &next)?;
+    Ok(GeneratedFileCleanup::Updated)
+}
+
+fn cleanup_repo_mcp_json(path: &Path) -> Result<GeneratedFileCleanup, String> {
+    if !path.exists() {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    let Ok(mut config) = serde_json::from_str::<Value>(&body) else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    let Some(config_object) = config.as_object_mut() else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    let Some(servers_value) = config_object.get_mut("mcpServers") else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    let Some(servers) = servers_value.as_object_mut() else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+
+    let mut changed = false;
+    for key in ["coordination-kernel", "workspace-mcp-gateway"] {
+        let should_remove = servers
+            .get(key)
+            .is_some_and(value_is_diffforge_coordination_mcp_server);
+        if should_remove {
+            servers.remove(key);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    if servers.is_empty() {
+        config_object.remove("mcpServers");
+    }
+    if config_object.is_empty() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(GeneratedFileCleanup::Removed);
+    }
+    write_json_file_atomic(path, &Value::Object(config_object.clone()))?;
+    Ok(GeneratedFileCleanup::Updated)
+}
+
+fn value_is_diffforge_coordination_mcp_server(value: &Value) -> bool {
+    let authority = value["diffforge"]["authority"].as_str().unwrap_or_default();
+    if matches!(
+        authority,
+        "local_coordination_kernel" | "workspace_mcp_gateway"
+    ) {
+        return true;
+    }
+    value["env"]["COORDINATION_ENABLED"].as_str() == Some("1")
+        || value["env"]["DIFFFORGE_WORKSPACE_MCP_GATEWAY"].as_str() == Some("1")
+}
+
+fn cleanup_repo_codex_config(path: &Path) -> Result<GeneratedFileCleanup, String> {
+    if !path.exists() {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    let next = strip_codex_diffforge_mcp_server_sections(&body);
+    if next == body {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    if next.trim().is_empty() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(GeneratedFileCleanup::Removed);
+    }
+    write_text_file_atomic(path, &next)?;
+    Ok(GeneratedFileCleanup::Updated)
+}
+
+fn strip_codex_diffforge_mcp_server_sections(body: &str) -> String {
+    let mut skip = false;
+    let mut kept = Vec::new();
+    for line in body.lines() {
+        if let Some(section) = toml_section_name(line) {
+            skip = codex_toml_section_is_diffforge_mcp_server(&section);
+        }
+        if !skip {
+            kept.push(line);
+        }
+    }
+    let mut next = kept.join("\n").trim_matches('\n').to_string();
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next
+}
+
+fn codex_toml_section_is_diffforge_mcp_server(section: &str) -> bool {
+    let section = section.trim().trim_matches('"').trim_matches('\'');
+    section == "mcp_servers.coordination-kernel"
+        || section.starts_with("mcp_servers.coordination-kernel.")
+        || section == "mcp_servers.workspace-mcp-gateway"
+        || section.starts_with("mcp_servers.workspace-mcp-gateway.")
+}
+
+fn cleanup_repo_claude_settings(path: &Path) -> Result<GeneratedFileCleanup, String> {
+    if !path.exists() {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    let Ok(settings_value) = serde_json::from_str::<Value>(&body) else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+    let Some(mut settings) = settings_value.as_object().cloned() else {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    };
+
+    let mut changed = false;
+    if let Some(enabled_servers) = settings
+        .get_mut("enabledMcpjsonServers")
+        .and_then(Value::as_array_mut)
+    {
+        let before_len = enabled_servers.len();
+        enabled_servers.retain(|server| {
+            !matches!(
+                server.as_str(),
+                Some("coordination-kernel" | "workspace-mcp-gateway")
+            )
+        });
+        changed |= enabled_servers.len() != before_len;
+        if enabled_servers.is_empty() {
+            settings.remove("enabledMcpjsonServers");
+        }
+    }
+
+    if changed
+        && settings
+            .get("enableAllProjectMcpServers")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        settings.remove("enableAllProjectMcpServers");
+    }
+
+    let mut remove_permissions = false;
+    if let Some(permissions) = settings
+        .get_mut("permissions")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(allow) = permissions.get_mut("allow").and_then(Value::as_array_mut) {
+            let before_len = allow.len();
+            allow.retain(|rule| {
+                rule.as_str().is_none_or(|rule| {
+                    !rule.starts_with("mcp__coordination-kernel__")
+                        && !rule.starts_with("mcp__workspace-mcp-gateway__")
+                })
+            });
+            changed |= allow.len() != before_len;
+            if allow.is_empty() {
+                permissions.remove("allow");
+            }
+        }
+        if permissions.is_empty() {
+            remove_permissions = true;
+        }
+    }
+    if remove_permissions {
+        settings.remove("permissions");
+    }
+
+    if !changed {
+        return Ok(GeneratedFileCleanup::Unchanged);
+    }
+    if settings.is_empty() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(GeneratedFileCleanup::Removed);
+    }
+    write_json_file_atomic(path, &Value::Object(settings))?;
+    Ok(GeneratedFileCleanup::Updated)
 }
 
 fn ensure_git_info_exclude_entries(root: &Path, additions: &[&str]) -> Result<(), String> {
@@ -23597,19 +23980,23 @@ mod tests {
         let mcp_config_path = session["mcpConfigPath"].as_str().unwrap();
         let worktree_path = session["writeRoot"].as_str().unwrap();
 
-        assert!(normalize_path_for_compare(mcp_config_path)
-            .ends_with(".agents/mcp/agents/codex-01.json"));
+        assert_eq!(
+            normalize_path_for_compare(mcp_config_path),
+            normalize_path_for_compare(&process_path_text(
+                &kernel.paths.mcp_root.join("agents").join("codex-01.json")
+            ))
+        );
         assert!(!mcp_config_path.contains(session_id));
         assert!(PathBuf::from(mcp_config_path).exists());
-        assert!(repo
-            .join(".agents")
-            .join("mcp")
+        assert!(kernel
+            .paths
+            .mcp_root
             .join("agents")
             .join("codex-01.codex.toml")
             .exists());
-        assert!(repo
-            .join(".agents")
-            .join("mcp")
+        assert!(kernel
+            .paths
+            .mcp_root
             .join("agents")
             .join("codex-01.claude.json")
             .exists());
@@ -23644,15 +24031,13 @@ mod tests {
         let agent_config = fs::read_to_string(mcp_config_path).unwrap();
         assert!(!agent_config.contains(session_id));
         assert!(!agent_config.contains("COORDINATION_SESSION_ID"));
-        assert!(repo.join(".mcp.json").exists());
-        assert!(repo.join(".codex").join("config.toml").exists());
-        assert!(claude_settings_file_has_required_policy(
-            &repo.join(".claude").join("settings.local.json")
-        ));
-        let repo_codex = fs::read_to_string(repo.join(".codex").join("config.toml")).unwrap();
+        assert!(!repo.join(".mcp.json").exists());
+        assert!(!repo.join(".codex").join("config.toml").exists());
+        assert!(!repo.join(".claude").join("settings.local.json").exists());
+        let worktree_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap();
+        assert!(worktree_agents.contains("coordination-kernel.start_task"));
         let worktree_codex =
             fs::read_to_string(worktree.join(".codex").join("config.toml")).unwrap();
-        assert!(!repo_codex.contains("[mcp_servers.cloud-diffforge]"));
         assert!(!worktree_codex.contains("[mcp_servers.cloud-diffforge]"));
 
         let second = kernel
@@ -23733,6 +24118,11 @@ mod tests {
         );
         assert_eq!(status["always_on"].as_bool(), Some(true));
         assert_eq!(status["toggleable"].as_bool(), Some(false));
+        assert_eq!(
+            status["repo_activation_files_enabled"].as_bool(),
+            Some(false)
+        );
+        assert!(status["repo_mcp_path"].is_null());
         assert!(PathBuf::from(status["config_path"].as_str().unwrap()).exists());
     }
 
@@ -23743,9 +24133,9 @@ mod tests {
         let status = kernel
             .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
             .unwrap();
-        let repo_mcp_path = PathBuf::from(status["repo_mcp_path"].as_str().unwrap());
-        assert!(repo_mcp_path.exists());
-        fs::remove_file(&repo_mcp_path).unwrap();
+        let repo_mcp_path = repo.join(".mcp.json");
+        assert!(status["repo_mcp_path"].is_null());
+        assert!(!repo_mcp_path.exists());
 
         let cached = kernel
             .ensure_workspace_mcp_config_with_telemetry(
@@ -23754,16 +24144,13 @@ mod tests {
                 Some("workspace-terminal-cache-test"),
             )
             .unwrap();
-        assert_eq!(
-            cached["repo_mcp_path"].as_str(),
-            status["repo_mcp_path"].as_str()
-        );
+        assert!(cached["repo_mcp_path"].is_null());
         assert!(!repo_mcp_path.exists());
 
         kernel
             .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
             .unwrap();
-        assert!(repo_mcp_path.exists());
+        assert!(!repo_mcp_path.exists());
     }
 
     #[test]
@@ -23774,7 +24161,6 @@ mod tests {
             .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
             .unwrap();
         let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
-        let claude_settings_path = repo.join(".claude").join("settings.local.json");
 
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
         assert!(config.contains("[mcp_servers.workspace-mcp-gateway]\ncommand = "));
@@ -23795,34 +24181,7 @@ mod tests {
                 "[mcp_servers.workspace-mcp-gateway.tools.{tool}]\napproval_mode = \"approve\""
             )));
         }
-        assert!(claude_settings_file_has_required_policy(
-            &claude_settings_path
-        ));
-        let claude_settings: Value =
-            serde_json::from_str(&fs::read_to_string(claude_settings_path).unwrap()).unwrap();
-        let claude_allow = claude_settings["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<HashSet<_>>();
-        for tool in [
-            "Read",
-            "Glob",
-            "Grep",
-            "LS",
-            "mcp__coordination-kernel__start_task",
-            "mcp__coordination-kernel__acquire_lease",
-            "mcp__coordination-kernel__checkpoint",
-            "mcp__coordination-kernel__complete_task",
-            "mcp__coordination-kernel__submit_patch",
-            "mcp__coordination-kernel__submit_patch_status",
-            "mcp__workspace-mcp-gateway__workspace_mcp__sync_manifest",
-            "mcp__workspace-mcp-gateway__workspace_mcp__list_servers",
-            "mcp__workspace-mcp-gateway__workspace_mcp__get_server_status",
-        ] {
-            assert!(claude_allow.contains(tool));
-        }
+        assert!(!repo.join(".claude").join("settings.local.json").exists());
         assert!(!config.contains("[mcp_servers.cloud-diffforge]"));
         for prompt_gated_tool in [
             "get_brief",
@@ -23905,7 +24264,16 @@ APPWRITE_PROJECT_ID = "project"
 enabled = true
 "#;
 
-        let config = codex_managed_home_config(source, &repo, &worktree);
+        let config = codex_managed_home_config(
+            source,
+            &repo,
+            &worktree,
+            "worktree_required",
+            Some("1"),
+            "codex",
+            "diffforge",
+        )
+        .unwrap();
 
         assert!(!config.contains("mcp_servers ="));
         assert!(!config.contains("[mcp_servers]"));
@@ -23920,6 +24288,68 @@ enabled = true
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",
             toml_escape(&process_path_text(&worktree))
         )));
+    }
+
+    #[test]
+    fn managed_codex_home_config_protects_nested_git_roots_in_direct_container() {
+        let container = temp_repo("managed_codex_container");
+        let child = container.join("nested").join("repo");
+        fs::create_dir_all(&child).unwrap();
+        run(&child, "git", &["init"]);
+        fs::write(child.join("src.txt"), "initial\n").unwrap();
+        run(&child, "git", &["add", "src.txt"]);
+        run(
+            &child,
+            "git",
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let config = codex_managed_home_config(
+            "model = \"gpt-5.5\"\nsandbox_mode = \"danger-full-access\"\n",
+            &container,
+            &container,
+            "bounded_direct_edit",
+            Some("slot1"),
+            "codex",
+            "diffforge",
+        )
+        .unwrap();
+
+        assert!(config.contains("default_permissions = \"diffforge-coordinated\""));
+        assert!(!config.contains("sandbox_mode ="));
+        assert!(config.contains("\"nested/repo\" = \"read\""));
+        assert!(config.contains("\"nested/repo/.agents/worktrees/slot1"));
+        assert!(config.contains("\" = \"write\""));
+        assert!(config.contains("--diff-forge-write-guard"));
+    }
+
+    #[test]
+    fn managed_codex_home_config_keeps_activity_sessions_read_only() {
+        let root = temp_repo("managed_codex_activity");
+        let config = codex_managed_home_config(
+            "model = \"gpt-5.5\"\n",
+            &root,
+            &root,
+            "activity_only",
+            Some("slot1"),
+            "codex",
+            "diffforge",
+        )
+        .unwrap();
+
+        assert!(config.contains("extends = \":read-only\""));
+        assert!(
+            !config.contains("[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]")
+        );
+        assert!(!config.contains("\".\" = \"write\""));
     }
 
     #[test]
@@ -24022,16 +24452,7 @@ enabled = true
         let tool_section =
             "[mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools]";
         assert!(config.contains(tool_section));
-
-        let claude_settings_path = repo.join(".claude").join("settings.local.json");
-        let claude_settings: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_settings_path).unwrap()).unwrap();
-        assert!(claude_settings["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str()
-                == Some("mcp__workspace-mcp-gateway__appwrite-api__appwrite_search_tools")));
+        assert!(!repo.join(".claude").join("settings.local.json").exists());
 
         kernel
             .conn
@@ -24047,14 +24468,6 @@ enabled = true
             .unwrap();
         let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
         assert!(!config.contains(tool_section));
-        let claude_settings: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_settings_path).unwrap()).unwrap();
-        assert!(!claude_settings["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str()
-                == Some("mcp__workspace-mcp-gateway__appwrite-api__appwrite_search_tools")));
     }
 
     #[test]

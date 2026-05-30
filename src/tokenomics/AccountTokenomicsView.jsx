@@ -228,6 +228,8 @@ function mergeLimits(limits, windowKind) {
   const confidences = [...new Set(rows.map((row) => row?.confidence).filter(Boolean))];
   const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points || row?.ratePoints) ? (row.rate_points || row.ratePoints) : []);
   const limitSource = rows.find((row) => row?.limit_source || row?.limitSource)?.limit_source || rows.find((row) => row?.limitSource)?.limitSource || "";
+  const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
+  const claudeUnavailable = isClaudeLimitUnavailable(rows);
   return {
     windowKind,
     label: rows[0]?.label || (windowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
@@ -235,11 +237,12 @@ function mergeLimits(limits, windowKind) {
     planName: plans.length ? plans.join(" + ") : "No plan detected",
     confidence: confidences.includes("estimated") ? "estimated" : (confidences[0] || "unknown"),
     limitSource,
+    providerKeys,
     remainingPercent,
     usedPercent,
     paceDelta,
-    statusLabel: limitStatusLabel(remainingPercent, paceDelta, rows),
-    resetLabel: rows[0]?.reset_label || rows[0]?.resetLabel || (windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule"),
+    statusLabel: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable),
+    resetLabel: limitResetLabel(rows, windowKind, claudeUnavailable),
     ratePoints,
     limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),
     resetAfterSeconds: numeric(rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds),
@@ -247,8 +250,39 @@ function mergeLimits(limits, windowKind) {
   };
 }
 
-function limitStatusLabel(remainingPercent, paceDelta, rows) {
-  if (remainingPercent == null) return rows.find((row) => row?.status_label || row?.statusLabel)?.status_label || "Plan limit not exposed";
+function isClaudeLimitUnavailable(rows) {
+  return rows.some((row) => {
+    if (providerKey(row) !== "claude") return false;
+    const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+    const confidence = String(row?.confidence || "").toLowerCase();
+    const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
+    return source === "claude_statusline_unavailable"
+      || source === "not_exposed"
+      || confidence === "unknown"
+      || status.includes("not exposed")
+      || status.includes("unavailable");
+  });
+}
+
+function limitResetLabel(rows, windowKind, claudeUnavailable) {
+  const current = rows[0]?.reset_label || rows[0]?.resetLabel || "";
+  if (!claudeUnavailable) {
+    return current || (windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule");
+  }
+  if (!current || current.includes("Provider limit unavailable")) {
+    return "Open Claude Code to publish live limits";
+  }
+  if (current.includes("Provider schedule unavailable")) {
+    return "Claude Code has not reported its weekly window";
+  }
+  return current;
+}
+
+function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable = false) {
+  if (remainingPercent == null) {
+    if (claudeUnavailable) return "Live limits unavailable";
+    return rows.find((row) => row?.status_label || row?.statusLabel)?.status_label || "Plan limit not exposed";
+  }
   if (remainingPercent <= 0) return "Limit exhausted";
   if (remainingPercent < 18 || paceDelta > 25) return "Pace is running hot";
   if (remainingPercent < 38 || paceDelta > 8) return "Watch current pace";
@@ -358,13 +392,27 @@ function windowDurationLabel(limit) {
 
 function limitSourceText(limit) {
   const source = limit?.limitSource || limit?.limit_source || "";
+  const isClaude = Array.isArray(limit?.providerKeys) && limit.providerKeys.includes("claude");
+  if (source === "claude_statusline_unavailable") return "Live Claude Code limits unavailable";
   if (source === "claude_statusline") return "Live Claude Code usage";
   if (source === "codex_usage_api") return "Live Codex usage";
   if (limit?.confidence === "live") return "Live provider usage";
+  if (isClaude && (source === "not_exposed" || limit?.confidence === "unknown")) return "Live Claude Code limits unavailable";
   if (source === "not_exposed") return "Provider limit not exposed";
   if (source === "local_inferred") return "Limits estimated from local CLI usage";
   if (limit?.confidence === "estimated") return "Limits estimated from local CLI usage";
   return "Provider limit not exposed";
+}
+
+function planStatusTitle(limit, selectedProvider) {
+  if (!limit?.planDetected) {
+    return selectedProvider === "claude" ? "No Claude account detected" : "No provider plan detected";
+  }
+  const name = String(limit?.planName || "").trim();
+  if (selectedProvider === "claude" && name === "Claude subscription") {
+    return "Claude account signed in";
+  }
+  return name || (selectedProvider === "claude" ? "Claude account signed in" : "Provider plan detected");
 }
 
 function codexCreditBalance(limits) {
@@ -880,7 +928,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
         ) : null}
 
         <PlanStatusLine>
-          <strong>{fiveHour.planDetected ? fiveHour.planName : "No provider plan detected"}</strong>
+          <strong>{planStatusTitle(fiveHour, selectedProvider)}</strong>
           <span>{limitSourceText(fiveHour)}</span>
         </PlanStatusLine>
         {openAiCredits ? (

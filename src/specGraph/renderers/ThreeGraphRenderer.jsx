@@ -225,8 +225,9 @@ function nodeRect(layout, node, padding = 0) {
 }
 
 function graphBounds(nodes, layout) {
-  if (!nodes.length) return null;
-  return nodes.reduce((bounds, node) => {
+  const laidOutNodes = nodes.filter((node) => layout.has(node.id));
+  if (!laidOutNodes.length) return null;
+  return laidOutNodes.reduce((bounds, node) => {
     const rect = nodeRect(layout, node);
     return {
       left: Math.min(bounds.left, rect.left),
@@ -321,6 +322,7 @@ function boundaryPoint(layout, fromNode, toNode) {
 }
 
 function edgeColor(edge, sourceNode, targetNode) {
+  if ([sourceNode, targetNode].some((node) => node && isNoSpecNode(node))) return "#64748b";
   if (isContainmentEdge(edge)) return "#64748b";
   const abstractNode = [sourceNode, targetNode].find((node) => nodeKind(node) === "abstract");
   return abstractNode ? nodeTone(abstractNode) : nodeSourceTone(targetNode || sourceNode);
@@ -335,16 +337,25 @@ function nodeFillColor(node, active, hovered, theme) {
     if (hovered) return mixHex(lightReadableTone(nodeSourceTone(node)), "#ffffff", 0.88);
     return mixHex(lightReadableTone(nodeTone(node)), "#ffffff", 0.94);
   }
-  const base = noSpec ? "#0f172a" : mixHex(nodeTone(node), "#0b1220", 0.78);
-  if (active) return mixHex(nodeTone(node), "#132238", noSpec ? 0.82 : 0.56);
+  if (noSpec) {
+    if (active) return mixHex("#64748b", "#111827", 0.7);
+    if (hovered) return mixHex("#64748b", "#0f172a", 0.74);
+    return "#0f172a";
+  }
+  const base = mixHex(nodeTone(node), "#0b1220", 0.78);
+  if (active) return mixHex(nodeTone(node), "#132238", 0.56);
   if (hovered) return mixHex(nodeSourceTone(node), "#111827", sourceState === "unknown" ? 0.82 : 0.64);
   if (sourceState === "local") return mixHex(base, "#020617", 0.3);
   return base;
 }
 
 function nodeBorderColor(node, active, hovered, theme) {
+  if (isNoSpecNode(node)) {
+    const noSpecColor = active || hovered ? "#94a3b8" : "#64748b";
+    return theme === "light" ? lightReadableTone(noSpecColor) : noSpecColor;
+  }
   const color = active
-    ? (isNoSpecNode(node) ? "#94a3b8" : nodeTone(node))
+    ? nodeTone(node)
     : hovered
       ? nodeSourceTone(node)
       : nodeSourceState(node) !== "unknown"
@@ -521,6 +532,15 @@ function screenToGraph(event, rect, cameraState) {
   };
 }
 
+function releasePointerCaptureSafely(element, pointerId) {
+  if (!element || pointerId == null || typeof element.releasePointerCapture !== "function") return;
+  try {
+    element.releasePointerCapture(pointerId);
+  } catch {
+    // The browser may already have released capture after a cancel/lost-capture path.
+  }
+}
+
 function rectsIntersect(left, right) {
   return left.left < right.right
     && left.right > right.left
@@ -606,6 +626,7 @@ export default function ThreeGraphRenderer({
   const graphGroupRef = useRef(null);
   const orbitRef = useRef({ mesh: null, records: [] });
   const rafRef = useRef(0);
+  const fitRetryRef = useRef({ frame: 0, timeout: 0, token: 0 });
   const dragRef = useRef(null);
   const interactedRef = useRef(false);
   const cameraStateRef = useRef({ x: 0, y: 0, zoom: 0.65 });
@@ -708,7 +729,7 @@ export default function ThreeGraphRenderer({
   const fitGraph = useCallback(() => {
     const frame = containerRef.current?.getBoundingClientRect();
     const bounds = graphBounds(nodesRef.current, layoutRef.current);
-    if (!frame?.width || !frame?.height || !bounds) return;
+    if (!frame?.width || !frame?.height || !bounds) return false;
     const width = Math.max(1, bounds.right - bounds.left + FIT_PADDING * 2);
     const height = Math.max(1, bounds.bottom - bounds.top + FIT_PADDING * 2);
     const zoom = clamp(Math.min(frame.width / width, frame.height / height), MIN_ZOOM, 1.08);
@@ -717,7 +738,45 @@ export default function ThreeGraphRenderer({
       y: (bounds.top + bounds.bottom) / 2,
       zoom,
     });
+    return true;
   }, [setCamera]);
+
+  const cancelScheduledFit = useCallback(() => {
+    const pending = fitRetryRef.current;
+    pending.token += 1;
+    if (pending.frame) {
+      window.cancelAnimationFrame(pending.frame);
+      pending.frame = 0;
+    }
+    if (pending.timeout) {
+      window.clearTimeout(pending.timeout);
+      pending.timeout = 0;
+    }
+  }, []);
+
+  const scheduleFitGraph = useCallback(({ attempts = 10, force = false } = {}) => {
+    if (!force && interactedRef.current) return;
+    cancelScheduledFit();
+    const token = fitRetryRef.current.token;
+    const runAttempt = (remaining) => {
+      fitRetryRef.current.frame = window.requestAnimationFrame(() => {
+        fitRetryRef.current.frame = 0;
+        if (fitRetryRef.current.token !== token) return;
+        if (!force && interactedRef.current) return;
+        if (fitGraph() || remaining <= 0) return;
+        fitRetryRef.current.timeout = window.setTimeout(() => {
+          fitRetryRef.current.timeout = 0;
+          if (fitRetryRef.current.token === token) runAttempt(remaining - 1);
+        }, 48);
+      });
+    };
+    runAttempt(Math.max(0, attempts));
+  }, [cancelScheduledFit, fitGraph]);
+
+  const handleFitGraph = useCallback(() => {
+    interactedRef.current = false;
+    scheduleFitGraph({ attempts: 6, force: true });
+  }, [scheduleFitGraph]);
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -741,6 +800,7 @@ export default function ThreeGraphRenderer({
     cameraRef.current = camera;
 
     return () => {
+      cancelScheduledFit();
       if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
       rafRef.current = 0;
       scene.children.forEach(disposeObject);
@@ -751,7 +811,42 @@ export default function ThreeGraphRenderer({
       cameraRef.current = null;
       graphGroupRef.current = null;
     };
-  }, []);
+  }, [cancelScheduledFit]);
+
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    const canvas = renderer?.domElement;
+    if (!canvas) return undefined;
+    const handleContextLost = (event) => {
+      event.preventDefault();
+    };
+    const handleContextRestored = () => {
+      scheduleFitGraph({ attempts: 6 });
+      scheduleRender();
+    };
+    canvas.addEventListener("webglcontextlost", handleContextLost);
+    canvas.addEventListener("webglcontextrestored", handleContextRestored);
+    return () => {
+      canvas.removeEventListener("webglcontextlost", handleContextLost);
+      canvas.removeEventListener("webglcontextrestored", handleContextRestored);
+    };
+  }, [scheduleFitGraph, scheduleRender]);
+
+  useEffect(() => {
+    const handleResume = () => {
+      scheduleRender();
+      scheduleFitGraph({ attempts: 6 });
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") handleResume();
+    };
+    window.addEventListener("focus", handleResume);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", handleResume);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [scheduleFitGraph, scheduleRender]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -766,16 +861,20 @@ export default function ThreeGraphRenderer({
       viewportSizeRef.current = nextSize;
       setViewportSize(nextSize);
       updateVisibleLabels(cameraStateRef.current, nextSize);
-      if (!interactedRef.current) window.requestAnimationFrame(fitGraph);
+      scheduleFitGraph({ attempts: 8 });
       scheduleRender();
     };
     updateSize();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateSize);
+      return () => window.removeEventListener("resize", updateSize);
+    }
     const observer = new ResizeObserver(updateSize);
     observer.observe(container);
     return () => observer.disconnect();
-  }, [fitGraph, scheduleRender, updateVisibleLabels]);
+  }, [scheduleFitGraph, scheduleRender, updateVisibleLabels]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     nodesRef.current = nodes;
     layoutRef.current = activeLayout;
   }, [activeLayout, nodes]);
@@ -963,8 +1062,8 @@ export default function ThreeGraphRenderer({
 
   useEffect(() => {
     interactedRef.current = false;
-    window.requestAnimationFrame(fitGraph);
-  }, [graphKey]);
+    scheduleFitGraph({ attempts: 12, force: true });
+  }, [graphKey, scheduleFitGraph]);
 
   useEffect(() => {
     if (!liveOrbitCount) return undefined;
@@ -1021,6 +1120,14 @@ export default function ThreeGraphRenderer({
     };
   }, []);
 
+  const clearDrag = useCallback((pointerId = null) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (pointerId != null && drag.pointerId !== pointerId) return;
+    releasePointerCaptureSafely(containerRef.current, drag.pointerId);
+    dragRef.current = null;
+  }, []);
+
   const handlePointerMove = useCallback((event) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -1047,11 +1154,28 @@ export default function ThreeGraphRenderer({
     const rect = containerRef.current?.getBoundingClientRect();
     const drag = dragRef.current;
     dragRef.current = null;
-    containerRef.current?.releasePointerCapture?.(event.pointerId);
+    releasePointerCaptureSafely(containerRef.current, event.pointerId);
     if (!rect || drag?.moved) return;
     const hit = hitTestNode(nodesRef.current, layoutRef.current, screenToGraph(event, rect, cameraStateRef.current));
     if (hit) onSelect(hit.id);
   }, [onSelect]);
+
+  const handlePointerCancel = useCallback((event) => {
+    clearDrag(event.pointerId);
+  }, [clearDrag]);
+
+  useEffect(() => {
+    const handleWindowPointerEnd = (event) => clearDrag(event.pointerId);
+    const handleWindowBlur = () => clearDrag();
+    window.addEventListener("pointerup", handleWindowPointerEnd);
+    window.addEventListener("pointercancel", handleWindowPointerEnd);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("pointerup", handleWindowPointerEnd);
+      window.removeEventListener("pointercancel", handleWindowPointerEnd);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [clearDrag]);
 
   const visibleNodes = useMemo(
     () => nodes.filter((node) => visibleLabelIds.has(node.id) && activeLayout.has(node.id)),
@@ -1074,6 +1198,8 @@ export default function ThreeGraphRenderer({
       onPointerMove={handlePointerMove}
       onPointerLeave={() => setHoveredNodeId("")}
       onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
+      onLostPointerCapture={handlePointerCancel}
       onWheel={handleWheel}
     >
       <GraphGrid aria-hidden="true" />
@@ -1118,7 +1244,7 @@ export default function ThreeGraphRenderer({
         })}
       </LabelLayer>
       <ThreeControls onPointerDown={(event) => event.stopPropagation()}>
-        <ControlButton type="button" title="Fit graph" onClick={fitGraph}>
+        <ControlButton type="button" title="Fit graph" onClick={handleFitGraph}>
           Fit
         </ControlButton>
       </ThreeControls>
@@ -1130,6 +1256,7 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
   const kind = nodeKind(node);
   const sourceState = nodeSourceState(node);
   const source = sourceLabel(sourceState);
+  const nodeKindTone = kindTone(kind);
   const liveCount = liveAgentsFor(node).length;
   const outOfSpecCount = Number(node.out_of_spec_count || node.notification_count) || 0;
   const title = text(node.display_title || node.displayTitle || node.title);
@@ -1143,6 +1270,8 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
       style={style}
       $compact={compact}
       $kind={kind}
+      $kindTone={nodeKindTone}
+      $live={liveCount > 0}
       $noSpec={noSpec}
       $selected={selected}
       $sourceState={sourceState}
@@ -1154,6 +1283,13 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
       }}
       onPointerDown={(event) => event.stopPropagation()}
     >
+      <SourceAccent
+        aria-hidden="true"
+        $kind={kind}
+        $noSpec={noSpec}
+        $sourceState={sourceState}
+        $sourceTone={nodeSourceTone(node)}
+      />
       {liveCount > 0 && <LabelBadge>{liveCount}</LabelBadge>}
       {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
       <LabelMeta $kind={kind} $noSpec={noSpec} $statusTone={nodeTone(node)}>
@@ -1276,20 +1412,29 @@ const ProjectGroupCount = styled.div`
 
 const LabelCard = styled.button`
   align-items: center;
-  background: ${({ $kind, $noSpec, $statusTone }) => {
-    if ($noSpec) return "rgba(15, 23, 42, 0.32)";
+  background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+    if ($noSpec) return "rgba(15, 23, 42, 0.64)";
     if ($kind === "abstract") {
-      return `linear-gradient(135deg, ${colorWithAlpha($statusTone || "#c084fc", "16")}, rgba(13, 17, 23, 0.18) 58%)`;
+      return `
+        linear-gradient(135deg, ${colorWithAlpha($kindTone || "#c084fc", "24")}, rgba(13, 17, 23, 0.94) 56%),
+        radial-gradient(circle at 52% 46%, ${colorWithAlpha($statusTone || "#fbbf24", "24")}, transparent 68%),
+        rgba(13, 17, 23, 0.96)
+      `;
     }
-    return `radial-gradient(circle at 48% 36%, ${colorWithAlpha($statusTone || "#38bdf8", "16")}, rgba(13, 17, 23, 0.18) 66%)`;
+    return `
+      radial-gradient(circle at 48% 36%, ${colorWithAlpha($statusTone || "#38bdf8", "24")}, rgba(13, 17, 23, 0.88) 62%),
+      rgba(13, 17, 23, 0.94)
+    `;
   }};
-  border: ${({ $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+  border: ${({ $kind, $kindTone, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
     if ($selected && $noSpec) return "1px solid rgba(148, 163, 184, 0.58)";
     if ($selected) return `1.5px solid ${$statusTone || "#38bdf8"}`;
+    if ($noSpec) return "1px solid rgba(100, 116, 139, 0.32)";
     if ($sourceState === "lease") return `1.5px dashed ${$sourceTone || "#f59e0b"}`;
     if ($sourceState === "local") return `1.2px dotted ${$sourceTone || "#94a3b8"}`;
     if ($sourceState === "worktree") return `1.2px solid ${colorWithAlpha($sourceTone || "#38bdf8", "cc")}`;
     if ($sourceState === "main") return `1px solid ${colorWithAlpha($sourceTone || "#22c55e", "8f")}`;
+    if ($kind === "abstract") return `1px dashed ${colorWithAlpha($kindTone || "#c084fc", "99")}`;
     return "1px solid rgba(230, 236, 245, 0.14)";
   }};
   border-radius: ${({ $kind }) => {
@@ -1298,12 +1443,14 @@ const LabelCard = styled.button`
     if ($kind === "abstract") return "22px 9px 22px 9px";
     return "999px";
   }};
-  box-shadow: ${({ $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+  box-shadow: ${({ $live, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
     if ($selected && $noSpec) return "0 0 0 2px rgba(100, 116, 139, 0.14), 0 10px 24px rgba(0, 0, 0, 0.18)";
-    if ($selected) return `0 0 0 2px ${colorWithAlpha($statusTone || "#38bdf8", "55")}, 0 0 0 5px ${colorWithAlpha($sourceTone || "#38bdf8", "22")}, 0 18px 44px rgba(0, 0, 0, 0.28)`;
-    if ($sourceState === "lease") return `0 0 0 1px ${colorWithAlpha($sourceTone || "#f59e0b", "44")}, 0 0 24px ${colorWithAlpha($sourceTone || "#f59e0b", "22")}`;
-    if ($sourceState === "worktree") return `0 0 0 1px ${colorWithAlpha($sourceTone || "#38bdf8", "33")}, 0 0 24px ${colorWithAlpha($sourceTone || "#38bdf8", "1f")}`;
-    return "none";
+    if ($selected) return `0 0 0 2px ${colorWithAlpha($statusTone || "#38bdf8", "55")}, 0 0 0 5px ${colorWithAlpha($sourceTone || "#38bdf8", "22")}, 0 18px 44px rgba(0, 0, 0, 0.34)`;
+    if ($sourceState === "lease") return `0 0 0 1px ${colorWithAlpha($sourceTone || "#f59e0b", "44")}, 0 0 24px ${colorWithAlpha($sourceTone || "#f59e0b", "22")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    if ($sourceState === "worktree") return `0 0 0 1px ${colorWithAlpha($sourceTone || "#38bdf8", "33")}, 0 0 24px ${colorWithAlpha($sourceTone || "#38bdf8", "1f")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    if ($live) return `0 0 0 1px ${colorWithAlpha($sourceTone || "#34d399", "33")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
+    if ($noSpec) return "0 8px 18px rgba(0, 0, 0, 0.14)";
+    return "0 12px 30px rgba(0, 0, 0, 0.2)";
   }};
   color: inherit;
   cursor: pointer;
@@ -1313,8 +1460,12 @@ const LabelCard = styled.button`
   justify-content: center;
   left: 0;
   min-width: 0;
-  opacity: ${({ $noSpec, $selected }) => ($noSpec && !$selected ? 0.78 : 1)};
+  opacity: ${({ $noSpec, $selected, $sourceState }) => {
+    if ($noSpec) return $selected ? 0.86 : 0.7;
+    return $sourceState === "local" ? 0.76 : 1;
+  }};
   outline: none;
+  overflow: visible;
   padding: ${({ $kind, $compact }) => {
     if ($compact) return $kind === "workspace" ? "22px" : "8px";
     if ($kind === "workspace") return "24px";
@@ -1330,10 +1481,10 @@ const LabelCard = styled.button`
   user-select: none;
 
   html[data-forge-theme="light"] & {
-    background: ${({ $kind, $noSpec, $statusTone }) => {
-      if ($noSpec) return "rgba(248, 250, 252, 0.78)";
-      if ($kind === "abstract") return `linear-gradient(135deg, ${colorWithAlpha(lightReadableTone($statusTone || "#7e22ce"), "10")}, rgba(255, 255, 255, 0.74) 58%)`;
-      return `linear-gradient(180deg, rgba(255, 255, 255, 0.82), ${colorWithAlpha(lightReadableTone($statusTone || "#0066cc"), "08")})`;
+    background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+      if ($noSpec) return "#f8fafc";
+      if ($kind === "abstract") return `linear-gradient(135deg, ${colorWithAlpha(lightReadableTone($kindTone, "#7e22ce"), "12")}, #ffffff 58%)`;
+      return `linear-gradient(180deg, #ffffff, ${colorWithAlpha(lightReadableTone($statusTone || "#0066cc"), "08")})`;
     }};
     border-color: ${({ $selected, $noSpec, $sourceTone, $statusTone }) => (
       $selected
@@ -1343,15 +1494,25 @@ const LabelCard = styled.button`
     box-shadow: ${({ $selected, $noSpec, $sourceTone, $statusTone }) => (
       $selected
         ? `0 0 0 2px ${colorWithAlpha(lightReadableTone($noSpec ? "#64748b" : ($statusTone || $sourceTone)), "24")}, 0 1px 2px rgba(0, 0, 0, 0.06)`
-        : "0 1px 2px rgba(0, 0, 0, 0.04)"
+        : "0 1px 2px rgba(0, 0, 0, 0.05)"
     )};
+    opacity: ${({ $noSpec, $selected, $sourceState }) => {
+      if ($noSpec) return $selected ? 0.94 : 0.82;
+      return $sourceState === "local" ? 0.84 : 1;
+    }};
   }
 
   &::before {
-    background: ${({ $kind, $noSpec, $sourceTone }) => {
+    background: ${({ $kind, $kindTone, $noSpec }) => {
       if ($kind !== "folder") return "transparent";
-      return $noSpec ? "rgba(100, 116, 139, 0.5)" : colorWithAlpha($sourceTone || "#22c55e", "88");
+      return $noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($kindTone || "#a78bfa", "88");
     }};
+    border: ${({ $kind, $noSpec, $sourceTone }) => (
+      $kind === "folder"
+        ? `1px solid ${$noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($sourceTone || "#22c55e", "aa")}`
+        : "0"
+    )};
+    border-bottom: 0;
     border-radius: 8px 8px 3px 3px;
     content: "";
     display: ${({ $kind }) => ($kind === "folder" ? "block" : "none")};
@@ -1360,21 +1521,125 @@ const LabelCard = styled.button`
     position: absolute;
     top: -6px;
     width: 30px;
+    z-index: 1;
   }
 
   &::after {
-    background: ${({ $kind, $noSpec, $sourceTone }) => {
-      if ($kind !== "file") return "transparent";
-      return $noSpec ? "rgba(100, 116, 139, 0.56)" : colorWithAlpha($sourceTone || "#22c55e", "cc");
-    }};
-    clip-path: ${({ $kind }) => ($kind === "file" ? "polygon(100% 0, 0 0, 100% 100%)" : "none")};
     content: "";
-    display: ${({ $kind }) => ($kind === "file" ? "block" : "none")};
-    height: 14px;
+    pointer-events: none;
     position: absolute;
-    right: 0;
-    top: 0;
-    width: 14px;
+    z-index: 1;
+    ${({ $kind, $kindTone, $noSpec, $sourceTone }) => {
+      if ($kind === "file") {
+        return `
+          background: ${$noSpec ? "rgba(100, 116, 139, 0.48)" : colorWithAlpha($sourceTone || "#22c55e", "cc")};
+          clip-path: polygon(100% 0, 0 0, 100% 100%);
+          height: 14px;
+          right: 0;
+          top: 0;
+          width: 14px;
+        `;
+      }
+      if ($kind === "abstract") {
+        return `
+          background: rgba(13, 17, 23, 0.96);
+          border: 1px solid ${colorWithAlpha($kindTone || "#c084fc", "bb")};
+          height: 14px;
+          right: 16px;
+          top: -6px;
+          transform: rotate(45deg);
+          width: 14px;
+        `;
+      }
+      return "display: none;";
+    }}
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background: ${({ $kind, $kindTone, $noSpec }) => {
+      if ($kind !== "folder") return "transparent";
+      return $noSpec ? "#94a3b8" : colorWithAlpha(lightReadableTone($kindTone || "#7e22ce"), "66");
+    }};
+    border-color: ${({ $noSpec, $sourceTone }) => (
+      $noSpec ? "#94a3b8" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "99")
+    )};
+  }
+
+  html[data-forge-theme="light"] &::after {
+    ${({ $kind, $kindTone, $noSpec, $sourceTone }) => {
+      if ($kind === "file") {
+        return `background: ${$noSpec ? "#94a3b8" : lightReadableTone($sourceTone || "#0a7f45")};`;
+      }
+      if ($kind === "abstract") {
+        return `
+          background: #ffffff;
+          border-color: ${colorWithAlpha(lightReadableTone($kindTone || "#7e22ce"), "aa")};
+        `;
+      }
+      return "";
+    }}
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: ${({ $noSpec, $sourceTone, $statusTone }) => (
+      lightReadableTone($noSpec ? "#64748b" : ($sourceTone || $statusTone), "#0066cc")
+    )};
+  }
+`;
+
+const SourceAccent = styled.span`
+  pointer-events: none;
+  position: absolute;
+  z-index: 1;
+  ${({ $kind, $noSpec, $sourceState, $sourceTone }) => {
+    if ($sourceState === "unknown") return "display: none;";
+    if ($kind === "workspace") {
+      return `
+        background: transparent;
+        border: 1px solid ${$noSpec ? "rgba(100, 116, 139, 0.36)" : colorWithAlpha($sourceTone || "#22c55e", "88")};
+        border-radius: 999px;
+        inset: 8px;
+      `;
+    }
+    if ($kind === "folder") {
+      return `
+        background: ${$noSpec ? "rgba(100, 116, 139, 0.44)" : colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        border-radius: 999px;
+        bottom: 6px;
+        height: 3px;
+        left: 10px;
+        right: 10px;
+      `;
+    }
+    if ($kind === "file") {
+      return `
+        background: ${$noSpec ? "rgba(100, 116, 139, 0.44)" : colorWithAlpha($sourceTone || "#22c55e", "d9")};
+        border-radius: 0 999px 999px 0;
+        bottom: 13px;
+        left: 0;
+        top: 13px;
+        width: 5px;
+      `;
+    }
+    return `
+      background: ${$noSpec ? "rgba(100, 116, 139, 0.42)" : colorWithAlpha($sourceTone || "#94a3b8", "b8")};
+      border-radius: 999px;
+      bottom: 10px;
+      height: 2px;
+      right: 10px;
+      transform: rotate(-28deg);
+      width: 24px;
+    `;
+  }}
+
+  html[data-forge-theme="light"] & {
+    ${({ $kind, $noSpec, $sourceState, $sourceTone }) => {
+      if ($sourceState === "unknown") return "";
+      if ($kind === "workspace") {
+        return `border-color: ${$noSpec ? "rgba(100, 116, 139, 0.42)" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "88")};`;
+      }
+      return `background: ${$noSpec ? "rgba(100, 116, 139, 0.58)" : colorWithAlpha(lightReadableTone($sourceTone || "#0a7f45"), "d9")};`;
+    }}
   }
 `;
 
@@ -1394,8 +1659,10 @@ const LabelMeta = styled.div`
   line-height: 1;
   max-width: 100%;
   overflow: hidden;
+  position: relative;
   text-transform: uppercase;
   white-space: nowrap;
+  z-index: 2;
 
   html[data-forge-theme="light"] & {
     color: ${({ $noSpec, $statusTone }) => ($noSpec ? "#64748b" : ($statusTone || "#0066cc"))};
@@ -1429,7 +1696,9 @@ const LabelTitle = styled.div`
   line-height: ${({ $kind }) => ($kind === "folder" ? 1.12 : 1.18)};
   max-width: 100%;
   overflow: hidden;
+  position: relative;
   text-overflow: ellipsis;
+  z-index: 2;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: ${({ $kind }) => {
     if ($kind === "workspace") return 5;
@@ -1450,8 +1719,10 @@ const LabelPath = styled.div`
   line-height: 1.15;
   max-width: 100%;
   overflow: hidden;
+  position: relative;
   text-overflow: ellipsis;
   white-space: nowrap;
+  z-index: 2;
 
   html[data-forge-theme="light"] & {
     color: #6e6e73;
@@ -1474,6 +1745,7 @@ const LabelBadge = styled.span`
   position: absolute;
   right: -7px;
   top: -7px;
+  z-index: 3;
 `;
 
 const OutOfSpecBadge = styled.span`
@@ -1492,6 +1764,7 @@ const OutOfSpecBadge = styled.span`
   padding: 0 6px;
   position: absolute;
   top: -7px;
+  z-index: 3;
 
   html[data-forge-theme="light"] & {
     background: rgba(139, 90, 0, 0.08);

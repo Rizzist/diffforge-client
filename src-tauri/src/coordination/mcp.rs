@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::{
-    db::REPO_ID,
+    db::{coordination_daemon_info_path, REPO_ID},
     kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
 };
 
@@ -37,7 +37,6 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
 ];
-const SHARED_DAEMON_INFO_RELATIVE_PATH: &[&str] = &[".agents", "mcp", "coordination.daemon.json"];
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -240,11 +239,7 @@ fn mcp_now_ms() -> u64 {
 }
 
 pub fn daemon_info_path_for_repo(repo_path: impl AsRef<Path>) -> PathBuf {
-    let mut path = repo_path.as_ref().to_path_buf();
-    for part in SHARED_DAEMON_INFO_RELATIVE_PATH {
-        path.push(part);
-    }
-    path
+    coordination_daemon_info_path(repo_path.as_ref())
 }
 
 pub fn proxy_args_for_repo(repo_path: impl AsRef<Path>) -> Vec<String> {
@@ -4197,7 +4192,8 @@ mod tests {
         let status = ensure_shared_daemon_for_workspace(&root, None).unwrap();
         assert_eq!(status["status"].as_str(), Some("ready"));
 
-        let info_text = fs::read_to_string(daemon_info_path_for_repo(&root)).unwrap();
+        let info_path = PathBuf::from(status["info_path"].as_str().unwrap_or_default());
+        let info_text = fs::read_to_string(&info_path).unwrap();
         let info: Value = serde_json::from_str(&info_text).unwrap();
         let mut stream = TcpStream::connect(info["endpoint"].as_str().unwrap()).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -4251,7 +4247,7 @@ mod tests {
 
         let stopped = stop_shared_daemon_for_repo(&root, "test_cleanup").unwrap();
         assert_eq!(stopped["status"].as_str(), Some("stopped"));
-        assert!(!daemon_info_path_for_repo(&root).exists());
+        assert!(!info_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }

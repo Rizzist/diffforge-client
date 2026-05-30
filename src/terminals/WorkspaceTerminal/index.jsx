@@ -402,6 +402,7 @@ import {
   TERMINAL_DEFAULT_SCROLLBACK_ROWS,
   TERMINAL_DELETE_INPUT_BATCH_MS,
   TERMINAL_ENABLE_WEBGL_RENDERER,
+  TERMINAL_ENTER_SEQUENCE,
   TERMINAL_INPUT_BATCH_MAX_CHARS,
   TERMINAL_INPUT_BATCH_MS,
   TERMINAL_INPUT_ERROR_EVENT,
@@ -737,6 +738,28 @@ const TERMINAL_BARE_FILE_EXTENSIONS = new Set([
   "yml",
 ]);
 
+function getTerminalInputSequenceDiagnosticFields(data) {
+  const value = String(data || "");
+  return {
+    ...getTerminalInputDebugFields(value),
+    containsCarriageReturn: value.includes("\r"),
+    containsCtrlU: value.includes("\x15"),
+    containsEnterSequence: value.includes(TERMINAL_ENTER_SEQUENCE),
+    containsLineFeed: value.includes("\n"),
+    containsShiftEnterSequence: value.includes(TERMINAL_SHIFT_ENTER_SEQUENCE),
+    isOnlyCarriageReturn: value === "\r",
+    isOnlyEnterSequence: value === TERMINAL_ENTER_SEQUENCE,
+    isOnlyLineFeed: value === "\n",
+    isOnlyShiftEnterSequence: value === TERMINAL_SHIFT_ENTER_SEQUENCE,
+    sequenceHex: Array.from(value)
+      .slice(0, 48)
+      .map((character) => character.charCodeAt(0).toString(16).padStart(2, "0"))
+      .join(" "),
+    startsWithEscape: value.startsWith("\x1b"),
+    textLength: value.length,
+  };
+}
+
 function decodeTerminalOutputChunkForReady(data) {
   if (typeof data === "string") {
     return data;
@@ -915,9 +938,9 @@ function normalizeTerminalSessionMode(value, fallback = TERMINAL_SESSION_MODE_FR
   return fallback;
 }
 
-function defaultTerminalSessionModeForRole(roleId, isPrewarm = false) {
+function defaultTerminalSessionModeForRole(roleId, _isPrewarm = false) {
   const role = String(roleId || "").trim().toLowerCase();
-  if (isPrewarm || role === "prewarm-pty") {
+  if (role === "prewarm-pty") {
     return TERMINAL_SESSION_MODE_FREE;
   }
   return TERMINAL_SESSION_MODE_GENERAL;
@@ -10241,7 +10264,7 @@ function WorkspaceTerminal({
 
         focusTerminalKeyboardInput();
 
-        const shouldWriteStartupModelRestore = false;
+        const shouldWriteStartupModelRestore = terminalAgentKind === "codex";
         if (
           startupThreadProviderModel
           && startupThreadProviderSessionId
@@ -10287,10 +10310,22 @@ function WorkspaceTerminal({
               terminalIndex,
               workspaceId: workspace?.id || "",
             });
+            dispatchTerminalControlUiSuppression({
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              model: startupThreadProviderModel,
+              paneId,
+              reason: "startup-model-restore",
+              terminalIndex,
+              threadId: startupThreadId || "",
+              workspaceId: workspace?.id || "",
+            });
             invoke("terminal_write", {
               data: buildTerminalSubmittedInput(restoreModelCommand, terminalAgentKind, isGenericTerminal),
               instanceId: terminalInstanceId,
               paneId,
+              promptEventSource: "startup-model-restore",
+              threadId: startupThreadId || "",
             }).then(() => {
               logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_done", {
                 agentId: terminalAgentKind,
@@ -10481,11 +10516,16 @@ function WorkspaceTerminal({
     const threadId = terminalThreadIdRef.current || thread?.id || "";
     const instanceId = terminalInstanceIdRef.current || 0;
     const hasSessionRestoreModel = Boolean(threadProviderSessionId && threadProviderModel);
+    const pendingPromptTextDiagnostic = getBigViewTextDiagnosticFields(promptText, {
+      previewLength: 180,
+    });
     const pendingPromptLogFields = {
       agentId: terminalAgentKind,
       deliveryMode: effectiveDeliveryMode,
       hasPromptId: Boolean(promptId),
       hasPromptText: Boolean(promptText),
+      promptText: pendingPromptTextDiagnostic,
+      requestedDeliveryMode: deliveryMode,
       instanceId,
       isGenericTerminal,
       paneId,
@@ -10693,10 +10733,12 @@ function WorkspaceTerminal({
             },
           );
           const syncData = buildTerminalComposerDraftInput("", promptText, true);
+          const syncSequenceTrace = getTerminalInputSequenceDiagnosticFields(syncData);
           setThreadComposerDraftValue(pendingSyncKey, promptText, "pending_prompt_sync_prompt");
           logTerminalStatus("frontend.pending_prompt.sync_write_start", {
             ...pendingPromptLogFields,
             instanceId: currentInstanceId,
+            syncSequence: syncSequenceTrace,
             syncDataLength: syncData.length,
             threadId: currentThreadId,
           });
@@ -10706,6 +10748,9 @@ function WorkspaceTerminal({
             instanceId: currentInstanceId,
             paneId,
             promptId,
+            promptText: pendingPromptTextDiagnostic,
+            sendPolicy: "pending-prompt-terminal-sync-then-submit",
+            syncSequence: syncSequenceTrace,
             terminalIndex,
             threadId: currentThreadId,
             workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -10719,6 +10764,7 @@ function WorkspaceTerminal({
           logTerminalStatus("frontend.pending_prompt.sync_write_done", {
             ...pendingPromptLogFields,
             instanceId: currentInstanceId,
+            syncSequence: syncSequenceTrace,
             syncDataLength: syncData.length,
             threadId: currentThreadId,
           });
@@ -10728,6 +10774,9 @@ function WorkspaceTerminal({
             instanceId: currentInstanceId,
             paneId,
             promptId,
+            promptText: pendingPromptTextDiagnostic,
+            sendPolicy: "pending-prompt-terminal-sync-then-submit",
+            syncSequence: syncSequenceTrace,
             terminalIndex,
             threadId: currentThreadId,
             workspaceId: workspace?.id || thread?.workspaceId || "",
@@ -10751,12 +10800,28 @@ function WorkspaceTerminal({
           try {
             const pendingPromptSubmittedAt = new Date().toISOString();
             const submitSequence = getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal);
+            const submitSequenceTrace = getTerminalInputSequenceDiagnosticFields(submitSequence);
             logTerminalStatus("frontend.pending_prompt.submit_write_start", {
               ...pendingPromptLogFields,
               instanceId: currentInstanceId,
               promptEventSubmittedAt: pendingPromptSubmittedAt,
+              submitSequence: submitSequenceTrace,
               submitSequenceLength: submitSequence.length,
               threadId: currentThreadId,
+            });
+            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_sequence_resolved", {
+              agentId: terminalAgentKind,
+              deliveryMode: effectiveDeliveryMode,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptText: pendingPromptTextDiagnostic,
+              sendPolicy: "pending-prompt-terminal-confirmed-submit",
+              submitSequence: submitSequenceTrace,
+              terminalIndex,
+              threadId: currentThreadId,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
             });
             await invoke("terminal_write", {
               data: submitSequence,
@@ -10772,8 +10837,23 @@ function WorkspaceTerminal({
               ...pendingPromptLogFields,
               instanceId: currentInstanceId,
               promptEventSubmittedAt: pendingPromptSubmittedAt,
+              submitSequence: submitSequenceTrace,
               submitSequenceLength: submitSequence.length,
               threadId: currentThreadId,
+            });
+            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_write_done", {
+              agentId: terminalAgentKind,
+              deliveryMode: effectiveDeliveryMode,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptText: pendingPromptTextDiagnostic,
+              sendPolicy: "pending-prompt-terminal-confirmed-submit",
+              submitSequence: submitSequenceTrace,
+              terminalIndex,
+              threadId: currentThreadId,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
             });
             await waiter.promise;
             armTerminalPromptReadyDetection();

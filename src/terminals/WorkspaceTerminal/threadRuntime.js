@@ -15,6 +15,7 @@ import {
   TERMINAL_MIN_COLS,
   TERMINAL_MIN_ROWS,
   TERMINAL_ENTER_SEQUENCE,
+  TERMINAL_SHIFT_ENTER_SEQUENCE,
   TERMINAL_PROMPT_SUBMITTED_EVENT,
   TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT,
   TODO_DRAG_MIME,
@@ -26,6 +27,25 @@ import {
   getTerminalAgentKind,
   logThreadBridgeDiagnostic,
 } from "./terminalCore.js";
+
+function getSubmitSequenceDiagnosticFields(sequence) {
+  const value = String(sequence || "");
+  return {
+    containsCarriageReturn: value.includes("\r"),
+    containsEnterSequence: value.includes(TERMINAL_ENTER_SEQUENCE),
+    containsLineFeed: value.includes("\n"),
+    containsShiftEnterSequence: value.includes(TERMINAL_SHIFT_ENTER_SEQUENCE),
+    isOnlyCarriageReturn: value === "\r",
+    isOnlyEnterSequence: value === TERMINAL_ENTER_SEQUENCE,
+    isOnlyLineFeed: value === "\n",
+    isOnlyShiftEnterSequence: value === TERMINAL_SHIFT_ENTER_SEQUENCE,
+    length: value.length,
+    sequenceHex: Array.from(value)
+      .slice(0, 32)
+      .map((character) => character.charCodeAt(0).toString(16).padStart(2, "0"))
+      .join(" "),
+  };
+}
 
 export function normalizeWorkspaceTerminalCount(value) {
   const count = Number.parseInt(value, 10);
@@ -1516,6 +1536,7 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       retryDelayMs,
       retryIndex: retryIndex + 1,
       sendPolicy: "terminal-confirmed-and-session-accepted",
+      submitSequence: getSubmitSequenceDiagnosticFields(safeSubmitSequence),
       threadId: safeThreadId,
       workspaceId,
     });
@@ -1555,6 +1576,7 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       retryDelayMs,
       retryIndex: retryIndex + 1,
       sendPolicy: "terminal-confirmed-and-session-accepted",
+      submitSequence: getSubmitSequenceDiagnosticFields(safeSubmitSequence),
       threadId: safeThreadId,
       workspaceId,
     });

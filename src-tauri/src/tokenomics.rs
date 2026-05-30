@@ -14,7 +14,14 @@ use std::io::BufRead as _;
 
 #[tauri::command]
 async fn tokenomics_scan_usage(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app))
+    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app, true))
+        .await
+        .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))?
+}
+
+#[tauri::command]
+async fn tokenomics_scan_usage_silent(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app, false))
         .await
         .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))?
 }
@@ -55,6 +62,7 @@ async fn tokenomics_get_sync_delta(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = tokenomics_open_db(&app)?;
+        tokenomics_reconcile_current_provider_accounts(&conn)?;
         tokenomics_sync_delta_from_conn(&conn, since_updated_at.as_deref())
     })
     .await
@@ -229,7 +237,7 @@ fn tokenomics_ensure_column(
     Ok(())
 }
 
-fn tokenomics_scan_usage_for(app: &AppHandle) -> Result<Value, String> {
+fn tokenomics_scan_usage_for(app: &AppHandle, emit_progress: bool) -> Result<Value, String> {
     let scan_lock = TOKENOMICS_SCAN_LOCK.get_or_init(|| StdMutex::new(()));
     let _scan_guard = match scan_lock.try_lock() {
         Ok(guard) => guard,
@@ -251,8 +259,9 @@ fn tokenomics_scan_usage_for(app: &AppHandle) -> Result<Value, String> {
     let mut inserted_events = 0usize;
     let mut sources = Vec::new();
 
+    tokenomics_reconcile_current_provider_accounts(&conn)?;
     tokenomics_reconcile_codex_provider_before_scan(&conn)?;
-    let codex_result = tokenomics_scan_codex_state_db(app, &conn)?;
+    let codex_result = tokenomics_scan_codex_state_db(app, &conn, emit_progress)?;
     scanned_files += codex_result.files_scanned;
     inserted_events += codex_result.inserted_events;
     sources.push(json!({
@@ -379,9 +388,7 @@ fn tokenomics_provider_account(provider: &str, agent_kind: &str) -> TokenomicsPr
         "codex" => tokenomics_home_dir()
             .map(|home| home.join(".codex").join("auth.json"))
             .and_then(tokenomics_read_json_file),
-        "claude" => tokenomics_home_dir()
-            .map(|home| home.join(".claude").join(".credentials.json"))
-            .and_then(tokenomics_read_json_file),
+        "claude" => tokenomics_claude_auth_value(),
         _ => None,
     };
     tokenomics_provider_account_from_auth(
@@ -403,27 +410,7 @@ fn tokenomics_provider_account_from_auth(
             label: base_label,
         };
     };
-    let mut identifiers = Vec::new();
-    tokenomics_collect_json_values_for_keys(
-        auth_value,
-        &[
-            "account_id",
-            "accountId",
-            "user_id",
-            "userId",
-            "userid",
-            "sub",
-            "email",
-            "login",
-            "username",
-            "organization_id",
-            "organizationId",
-        ],
-        &mut identifiers,
-    );
-    if identifiers.is_empty() {
-        tokenomics_collect_jwt_account_identifiers(auth_value, &mut identifiers);
-    }
+    let mut identifiers = tokenomics_provider_account_key_identifiers(provider, agent_kind, auth_value);
     if identifiers.is_empty() {
         tokenomics_collect_json_values_for_keys(
             auth_value,
@@ -455,9 +442,11 @@ fn tokenomics_provider_account_from_auth(
     }
     let hash = tokenomics_hash(&format!("{provider}:{agent_kind}:{fingerprint}"));
     let suffix = hash.get(0..8).unwrap_or(hash.as_str());
+    let label = tokenomics_provider_account_display_label(provider, agent_kind, auth_value, suffix)
+        .unwrap_or_else(|| format!("{base_label} {suffix}"));
     TokenomicsProviderAccount {
         key: format!("{provider}:{agent_kind}:{suffix}"),
-        label: format!("{base_label} {suffix}"),
+        label,
     }
 }
 
@@ -468,6 +457,222 @@ fn tokenomics_provider_account_base_label(provider: &str, agent_kind: &str) -> S
         "opencode" => "OpenCode account".to_string(),
         _ => format!("{} account", tokenomics_title_case(provider)),
     }
+}
+
+fn tokenomics_provider_account_display_label(
+    provider: &str,
+    agent_kind: &str,
+    auth_value: &Value,
+    account_suffix: &str,
+) -> Option<String> {
+    match (provider, agent_kind) {
+        ("openai", "codex") => tokenomics_codex_account_display_label(auth_value, account_suffix),
+        ("anthropic", "claude") => {
+            tokenomics_claude_account_display_label(auth_value, account_suffix)
+        }
+        _ => None,
+    }
+}
+
+fn tokenomics_codex_account_display_label(auth_value: &Value, account_suffix: &str) -> Option<String> {
+    let mut jwt_payloads = Vec::new();
+    tokenomics_collect_jwt_payloads(auth_value, &mut jwt_payloads);
+
+    for payload in &jwt_payloads {
+        if let Some(label) = tokenomics_text_field(payload, &["name", "display_name", "displayName"])
+        {
+            return Some(label);
+        }
+    }
+
+    for payload in &jwt_payloads {
+        if let Some(profile) = payload.get("https://api.openai.com/profile") {
+            if let Some(label) = tokenomics_text_field(profile, &["name", "display_name", "displayName"]) {
+                return Some(label);
+            }
+            if tokenomics_text_field(profile, &["email"]).is_some() {
+                return Some(tokenomics_account_letter_label(account_suffix));
+            }
+        }
+        if tokenomics_text_field(payload, &["email", "preferred_username"]).is_some() {
+            return Some(tokenomics_account_letter_label(account_suffix));
+        }
+    }
+
+    if let Some(label) = tokenomics_text_field(auth_value, &["name", "display_name", "displayName"])
+    {
+        return Some(label);
+    }
+    if tokenomics_text_field(auth_value, &["email", "login", "username"]).is_some() {
+        return Some(tokenomics_account_letter_label(account_suffix));
+    }
+    None
+}
+
+fn tokenomics_claude_account_display_label(auth_value: &Value, account_suffix: &str) -> Option<String> {
+    let account = tokenomics_claude_oauth_account(auth_value).unwrap_or(auth_value);
+    if let Some(label) = tokenomics_text_field(account, &["displayName", "display_name", "name"]) {
+        return Some(label);
+    }
+    if tokenomics_text_field(account, &["emailAddress", "email"]).is_some() {
+        return Some(tokenomics_account_letter_label(account_suffix));
+    }
+    tokenomics_text_field(account, &["organizationName", "organization_name"])
+}
+
+fn tokenomics_text_field(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    for key in keys {
+        if let Some(text) = object
+            .get(*key)
+            .and_then(tokenomics_json_scalar_text)
+            .and_then(tokenomics_account_label_text)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn tokenomics_account_label_text(value: String) -> Option<String> {
+    let clean = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if clean.is_empty() || clean.chars().any(char::is_control) {
+        return None;
+    }
+    Some(clean.chars().take(96).collect())
+}
+
+fn tokenomics_account_letter_label(seed: &str) -> String {
+    let hash = tokenomics_hash(seed);
+    let index = hash
+        .get(0..2)
+        .and_then(|value| u8::from_str_radix(value, 16).ok())
+        .unwrap_or(0);
+    char::from(b'A' + (index % 26)).to_string()
+}
+
+fn tokenomics_provider_account_key_identifiers(
+    provider: &str,
+    agent_kind: &str,
+    auth_value: &Value,
+) -> Vec<String> {
+    match (provider, agent_kind) {
+        ("openai", "codex") => tokenomics_codex_account_key_identifiers(auth_value),
+        ("anthropic", "claude") => tokenomics_claude_account_key_identifiers(auth_value),
+        _ => tokenomics_generic_account_key_identifiers(auth_value),
+    }
+}
+
+fn tokenomics_generic_account_key_identifiers(auth_value: &Value) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    tokenomics_collect_json_values_for_keys(
+        auth_value,
+        &[
+            "account_id",
+            "accountId",
+            "user_id",
+            "userId",
+            "userid",
+            "sub",
+            "email",
+            "login",
+            "username",
+            "organization_id",
+            "organizationId",
+        ],
+        &mut identifiers,
+    );
+    if identifiers.is_empty() {
+        tokenomics_collect_jwt_account_identifiers(auth_value, &mut identifiers);
+    }
+    identifiers
+}
+
+fn tokenomics_codex_account_key_identifiers(auth_value: &Value) -> Vec<String> {
+    for keys in [
+        &["account_id", "accountId"][..],
+        &["chatgpt_account_id", "chatgptAccountId"][..],
+        &[
+            "chatgpt_account_user_id",
+            "chatgptAccountUserId",
+            "chatgpt_user_id",
+            "chatgptUserId",
+            "user_id",
+            "userId",
+            "userid",
+        ][..],
+        &["sub"][..],
+        &["email", "login", "username"][..],
+    ] {
+        let mut identifiers = Vec::new();
+        tokenomics_collect_json_values_for_keys(auth_value, keys, &mut identifiers);
+        if identifiers.is_empty() {
+            tokenomics_collect_jwt_values_for_keys(auth_value, keys, &mut identifiers);
+        }
+        identifiers.sort();
+        identifiers.dedup();
+        if !identifiers.is_empty() {
+            return identifiers;
+        }
+    }
+    Vec::new()
+}
+
+fn tokenomics_claude_account_key_identifiers(auth_value: &Value) -> Vec<String> {
+    let Some(account) = tokenomics_claude_oauth_account(auth_value) else {
+        return tokenomics_text_field(
+            auth_value,
+            &["accountUuid", "account_uuid", "userID", "userId", "user_id", "emailAddress", "email"],
+        )
+        .into_iter()
+        .collect();
+    };
+    for keys in [
+        &["accountUuid", "account_uuid"][..],
+        &["userID", "userId", "user_id", "userid"][..],
+        &["emailAddress", "email"][..],
+        &["organizationUuid", "organization_uuid", "organizationId", "organization_id"][..],
+    ] {
+        let mut identifiers = Vec::new();
+        tokenomics_collect_json_values_for_keys(account, keys, &mut identifiers);
+        if identifiers.is_empty()
+            && !keys.iter().any(|key| key.to_ascii_lowercase().contains("organization"))
+        {
+            tokenomics_collect_json_values_for_keys(auth_value, keys, &mut identifiers);
+        }
+        identifiers.sort();
+        identifiers.dedup();
+        if !identifiers.is_empty() {
+            return identifiers;
+        }
+    }
+    Vec::new()
+}
+
+fn tokenomics_claude_oauth_account(value: &Value) -> Option<&Value> {
+    value
+        .get("oauthAccount")
+        .or_else(|| value.get("oauth_account"))
+        .or_else(|| value.get("claude_config").and_then(|config| config.get("oauthAccount")))
+        .or_else(|| value.get("claudeConfig").and_then(|config| config.get("oauthAccount")))
+}
+
+fn tokenomics_claude_auth_value() -> Option<Value> {
+    let home = tokenomics_home_dir()?;
+    let credentials = tokenomics_read_json_file(home.join(".claude").join(".credentials.json"));
+    let claude_config = tokenomics_read_json_file(home.join(".claude.json"));
+    if credentials.is_none() && claude_config.is_none() {
+        return None;
+    }
+    Some(json!({
+        "credentials": credentials,
+        "claude_config": claude_config,
+    }))
 }
 
 fn tokenomics_read_json_file(path: PathBuf) -> Option<Value> {
@@ -505,30 +710,50 @@ fn tokenomics_json_scalar_text(value: &Value) -> Option<String> {
 }
 
 fn tokenomics_collect_jwt_account_identifiers(value: &Value, output: &mut Vec<String>) {
+    tokenomics_collect_jwt_values_for_keys(
+        value,
+        &[
+            "account_id",
+            "accountId",
+            "user_id",
+            "userId",
+            "sub",
+            "email",
+            "organization_id",
+            "organizationId",
+        ],
+        output,
+    );
+}
+
+fn tokenomics_collect_jwt_values_for_keys(value: &Value, keys: &[&str], output: &mut Vec<String>) {
     if let Some(text) = value.as_str() {
         if let Some(payload) = tokenomics_decode_jwt_payload(text) {
-            tokenomics_collect_json_values_for_keys(
-                &payload,
-                &[
-                    "account_id",
-                    "accountId",
-                    "user_id",
-                    "userId",
-                    "sub",
-                    "email",
-                    "organization_id",
-                    "organizationId",
-                ],
-                output,
-            );
+            tokenomics_collect_json_values_for_keys(&payload, keys, output);
         }
     } else if let Some(object) = value.as_object() {
         for item in object.values() {
-            tokenomics_collect_jwt_account_identifiers(item, output);
+            tokenomics_collect_jwt_values_for_keys(item, keys, output);
         }
     } else if let Some(array) = value.as_array() {
         for item in array {
-            tokenomics_collect_jwt_account_identifiers(item, output);
+            tokenomics_collect_jwt_values_for_keys(item, keys, output);
+        }
+    }
+}
+
+fn tokenomics_collect_jwt_payloads(value: &Value, output: &mut Vec<Value>) {
+    if let Some(text) = value.as_str() {
+        if let Some(payload) = tokenomics_decode_jwt_payload(text) {
+            output.push(payload);
+        }
+    } else if let Some(object) = value.as_object() {
+        for item in object.values() {
+            tokenomics_collect_jwt_payloads(item, output);
+        }
+    } else if let Some(array) = value.as_array() {
+        for item in array {
+            tokenomics_collect_jwt_payloads(item, output);
         }
     }
 }
@@ -643,6 +868,216 @@ fn tokenomics_reconcile_provider_scanner_version(
     Ok(())
 }
 
+fn tokenomics_reconcile_provider_account_label(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    provider_account: &TokenomicsProviderAccount,
+) -> Result<(), String> {
+    if provider_account.key.ends_with(":unknown") || provider_account.label.trim().is_empty() {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE tokenomics_usage_events
+         SET provider_account_label=?1
+         WHERE provider=?2 AND agent_kind=?3 AND provider_account_key=?4
+           AND COALESCE(provider_account_label, '') != ?1",
+        rusqlite::params![
+            provider_account.label.as_str(),
+            provider,
+            agent_kind,
+            provider_account.key.as_str()
+        ],
+    )
+    .map_err(|error| format!("Unable to reconcile Tokenomics account event labels: {error}"))?;
+
+    let now = tokenomics_now_iso_like();
+    conn.execute(
+        "UPDATE tokenomics_rollups
+         SET provider_account_label=?1, updated_at=?5
+         WHERE provider=?2 AND agent_kind=?3 AND provider_account_key=?4
+           AND COALESCE(provider_account_label, '') != ?1",
+        rusqlite::params![
+            provider_account.label.as_str(),
+            provider,
+            agent_kind,
+            provider_account.key.as_str(),
+            now
+        ],
+    )
+    .map_err(|error| format!("Unable to reconcile Tokenomics account rollup labels: {error}"))?;
+
+    Ok(())
+}
+
+fn tokenomics_migrate_provider_account_key(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    old_key: &str,
+    provider_account: &TokenomicsProviderAccount,
+) -> Result<(), String> {
+    if old_key.trim().is_empty()
+        || old_key == provider_account.key
+        || provider_account.key.ends_with(":unknown")
+    {
+        return Ok(());
+    }
+
+    let old_rollups: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tokenomics_rollups
+             WHERE provider=?1 AND agent_kind=?2
+               AND (provider_account_key=?3 OR subscription_key=?3)",
+            rusqlite::params![provider, agent_kind, old_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let changed_events = conn
+        .execute(
+            "UPDATE tokenomics_usage_events
+             SET subscription_key=?1, provider_account_key=?1, provider_account_label=?2
+             WHERE provider=?3 AND agent_kind=?4
+               AND (provider_account_key=?5 OR subscription_key=?5)",
+            rusqlite::params![
+                provider_account.key.as_str(),
+                provider_account.label.as_str(),
+                provider,
+                agent_kind,
+                old_key
+            ],
+        )
+        .map_err(|error| format!("Unable to migrate Tokenomics account events: {error}"))?;
+
+    if changed_events > 0 || old_rollups > 0 {
+        tokenomics_rebuild_provider_rollups_from_events(conn, provider, agent_kind)?;
+    }
+
+    Ok(())
+}
+
+fn tokenomics_reconcile_current_codex_account_label(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    let codex_account = tokenomics_provider_account("openai", "codex");
+    tokenomics_reconcile_provider_account_label(conn, "openai", "codex", &codex_account)
+}
+
+fn tokenomics_reconcile_current_claude_account_identity(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    let claude_auth = tokenomics_claude_auth_value();
+    let claude_account =
+        tokenomics_provider_account_from_auth("anthropic", "claude", claude_auth.as_ref());
+    let has_user_identity = claude_auth
+        .as_ref()
+        .and_then(tokenomics_claude_oauth_account)
+        .and_then(|account| {
+            tokenomics_text_field(
+                account,
+                &[
+                    "accountUuid",
+                    "account_uuid",
+                    "userID",
+                    "userId",
+                    "user_id",
+                    "emailAddress",
+                    "email",
+                ],
+            )
+        })
+        .is_some();
+    if has_user_identity {
+        for legacy_key in tokenomics_claude_legacy_account_keys() {
+            tokenomics_migrate_provider_account_key(
+                conn,
+                "anthropic",
+                "claude",
+                &legacy_key,
+                &claude_account,
+            )?;
+        }
+    }
+    tokenomics_reconcile_provider_account_label(conn, "anthropic", "claude", &claude_account)
+}
+
+fn tokenomics_reconcile_current_provider_accounts(conn: &rusqlite::Connection) -> Result<(), String> {
+    tokenomics_reconcile_current_codex_account_label(conn)?;
+    tokenomics_reconcile_current_claude_account_identity(conn)?;
+    Ok(())
+}
+
+fn tokenomics_claude_legacy_account_keys() -> Vec<String> {
+    let Some(home) = tokenomics_home_dir() else {
+        return Vec::new();
+    };
+    let Some(credentials) = tokenomics_read_json_file(home.join(".claude").join(".credentials.json")) else {
+        return Vec::new();
+    };
+    tokenomics_legacy_provider_account_key_from_auth("anthropic", "claude", &credentials)
+        .into_iter()
+        .collect()
+}
+
+fn tokenomics_legacy_provider_account_key_from_auth(
+    provider: &str,
+    agent_kind: &str,
+    auth_value: &Value,
+) -> Option<String> {
+    let mut identifiers = Vec::new();
+    tokenomics_collect_json_values_for_keys(
+        auth_value,
+        &[
+            "account_id",
+            "accountId",
+            "user_id",
+            "userId",
+            "userid",
+            "sub",
+            "email",
+            "login",
+            "username",
+            "organization_id",
+            "organizationId",
+        ],
+        &mut identifiers,
+    );
+    if identifiers.is_empty() {
+        tokenomics_collect_jwt_account_identifiers(auth_value, &mut identifiers);
+    }
+    if identifiers.is_empty() {
+        tokenomics_collect_json_values_for_keys(
+            auth_value,
+            &[
+                "refresh_token",
+                "refreshToken",
+                "access_token",
+                "accessToken",
+                "id_token",
+                "idToken",
+                "session_token",
+                "sessionToken",
+            ],
+            &mut identifiers,
+        );
+    }
+    identifiers.sort();
+    identifiers.dedup();
+    let fingerprint = if identifiers.is_empty() {
+        serde_json::to_string(auth_value).unwrap_or_default()
+    } else {
+        identifiers.join("|")
+    };
+    if fingerprint.trim().is_empty() {
+        return None;
+    }
+    let hash = tokenomics_hash(&format!("{provider}:{agent_kind}:{fingerprint}"));
+    let suffix = hash.get(0..8).unwrap_or(hash.as_str());
+    Some(format!("{provider}:{agent_kind}:{suffix}"))
+}
+
 fn tokenomics_unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -650,7 +1085,10 @@ fn tokenomics_unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn tokenomics_emit_scan_progress(app: &AppHandle, payload: Value) {
+fn tokenomics_emit_scan_progress(app: &AppHandle, emit_progress: bool, payload: Value) {
+    if !emit_progress {
+        return;
+    }
     let _ = app.emit(TOKENOMICS_SCAN_PROGRESS_EVENT, payload);
 }
 
@@ -903,6 +1341,7 @@ fn tokenomics_source_is_unchanged(
 fn tokenomics_scan_codex_state_db(
     app: &AppHandle,
     conn: &rusqlite::Connection,
+    emit_progress: bool,
 ) -> Result<TokenomicsScanResult, String> {
     let Some(home) = tokenomics_home_dir() else {
         return Ok(TokenomicsScanResult {
@@ -921,6 +1360,7 @@ fn tokenomics_scan_codex_state_db(
     }
     let source_id = db_path.display().to_string();
     let provider_account = tokenomics_provider_account("openai", "codex");
+    tokenomics_reconcile_provider_account_label(conn, "openai", "codex", &provider_account)?;
     let mut scan_state = tokenomics_get_scan_state(conn, "openai", "codex", &source_id)?;
     let needs_scanner_reset = scan_state
         .as_ref()
@@ -957,6 +1397,7 @@ fn tokenomics_scan_codex_state_db(
 
     tokenomics_emit_scan_progress(
         app,
+        emit_progress,
         json!({
             "provider": "openai",
             "agent_kind": "codex",
@@ -1061,7 +1502,7 @@ fn tokenomics_scan_codex_state_db(
                     progress["summary"] = summary;
                 }
             }
-            tokenomics_emit_scan_progress(app, progress);
+            tokenomics_emit_scan_progress(app, emit_progress, progress);
         }
 
         let (mtime, size) = tokenomics_file_mtime_size(&candidate.rollout_path);
@@ -1138,7 +1579,7 @@ fn tokenomics_scan_codex_state_db(
     if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
         complete_progress["summary"] = summary;
     }
-    tokenomics_emit_scan_progress(app, complete_progress);
+    tokenomics_emit_scan_progress(app, emit_progress, complete_progress);
 
     tokenomics_upsert_scan_state(
         conn,
@@ -1856,6 +2297,145 @@ fn tokenomics_increment_rollup(
     Ok(())
 }
 
+fn tokenomics_rebuild_provider_rollups_from_events(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tokenomics_rollups WHERE provider=?1 AND agent_kind=?2",
+        rusqlite::params![provider, agent_kind],
+    )
+    .map_err(|error| format!("Unable to clear Tokenomics provider rollups: {error}"))?;
+    tokenomics_rebuild_provider_rollups_for_width(conn, provider, agent_kind, "day", "bucket_day")?;
+    tokenomics_rebuild_provider_rollups_for_width(
+        conn,
+        provider,
+        agent_kind,
+        "hour",
+        "bucket_hour",
+    )?;
+    Ok(())
+}
+
+fn tokenomics_rebuild_provider_rollups_for_width(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    bucket_width: &str,
+    bucket_column: &str,
+) -> Result<(), String> {
+    let query = format!(
+        "SELECT
+           provider, agent_kind, model, subscription_key, provider_account_key,
+           MAX(provider_account_label) AS provider_account_label,
+           workspace_id, MAX(repo_path) AS repo_path, {bucket_column} AS bucket_start,
+           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+           COALESCE(SUM(output_tokens), 0) AS output_tokens,
+           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+           COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+           COALESCE(SUM(total_tokens), 0) AS total_tokens,
+           COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
+           COUNT(*) AS event_count
+         FROM tokenomics_usage_events
+         WHERE provider=?1 AND agent_kind=?2
+         GROUP BY provider, agent_kind, model, subscription_key, provider_account_key,
+                  workspace_id, {bucket_column}"
+    );
+    let mut statement = conn
+        .prepare(&query)
+        .map_err(|error| format!("Unable to prepare Tokenomics rollup rebuild: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![provider, agent_kind], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query Tokenomics rollup rebuild: {error}"))?;
+    let mut rebuilt = Vec::new();
+    for row in rows {
+        rebuilt.push(row.map_err(|error| format!("Unable to read Tokenomics rollup rebuild: {error}"))?);
+    }
+    let now = tokenomics_now_iso_like();
+    for (
+        row_provider,
+        row_agent_kind,
+        model,
+        subscription_key,
+        provider_account_key,
+        provider_account_label,
+        workspace_id,
+        repo_path,
+        bucket_start,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+        estimated_cost_microusd,
+        event_count,
+    ) in rebuilt
+    {
+        let rollup_id = tokenomics_hash(&format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            row_provider,
+            row_agent_kind,
+            model.as_deref().unwrap_or_default(),
+            subscription_key.as_deref().unwrap_or_default(),
+            provider_account_key.as_deref().unwrap_or_default(),
+            workspace_id.as_deref().unwrap_or_default(),
+            bucket_width,
+            bucket_start,
+        ));
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key,
+               provider_account_key, provider_account_label, workspace_id, repo_path,
+               bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            rusqlite::params![
+                rollup_id,
+                row_provider,
+                row_agent_kind,
+                model,
+                subscription_key,
+                provider_account_key,
+                provider_account_label,
+                workspace_id,
+                repo_path,
+                bucket_width,
+                bucket_start,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                total_tokens,
+                estimated_cost_microusd,
+                event_count,
+                now.as_str(),
+            ],
+        )
+        .map_err(|error| format!("Unable to insert rebuilt Tokenomics rollup: {error}"))?;
+    }
+    Ok(())
+}
+
 fn tokenomics_record_usage_value(
     conn: &rusqlite::Connection,
     usage: &Value,
@@ -1938,6 +2518,7 @@ fn tokenomics_record_usage_value(
 
 fn tokenomics_summary_for(app: &AppHandle, include_rollups: bool) -> Result<Value, String> {
     let conn = tokenomics_open_db(app)?;
+    tokenomics_reconcile_current_provider_accounts(&conn)?;
     tokenomics_summary_from_conn(&conn, include_rollups, None)
 }
 
@@ -2497,7 +3078,7 @@ fn tokenomics_claude_statusline_limits(
     let plan_name = plan
         .get("plan_name")
         .and_then(Value::as_str)
-        .unwrap_or("Claude subscription");
+        .unwrap_or("Claude account signed in");
     let mut limits = Vec::new();
     if let Some(five_hour) = rate_limits
         .get("five_hour")
@@ -2611,6 +3192,26 @@ fn tokenomics_unknown_limit_snapshot(
     window_kind: &str,
     label: &str,
 ) -> Value {
+    let is_claude = provider == "anthropic" && agent_kind == "claude";
+    let (limit_source, status_label) = if is_claude {
+        (
+            "claude_statusline_unavailable",
+            "Live Claude Code limits unavailable",
+        )
+    } else {
+        ("not_exposed", "Plan limit not exposed")
+    };
+    let reset_label = if is_claude {
+        if window_kind == "5_hour" {
+            "Open Claude Code to publish live limits"
+        } else {
+            "Claude Code has not reported its weekly window"
+        }
+    } else if window_kind == "5_hour" {
+        "Provider limit unavailable"
+    } else {
+        "Provider schedule unavailable"
+    };
     json!({
         "provider": provider,
         "agent_kind": agent_kind,
@@ -2622,7 +3223,7 @@ fn tokenomics_unknown_limit_snapshot(
         "plan_detected": plan.get("plan_detected").cloned().unwrap_or(Value::Bool(false)),
         "plan_name": plan.get("plan_name").cloned().unwrap_or(Value::String("Unknown".to_string())),
         "plan_source": plan.get("plan_source").cloned().unwrap_or(Value::String("local".to_string())),
-        "limit_source": "not_exposed",
+        "limit_source": limit_source,
         "confidence": "unknown",
         "allowance_unit": "unknown",
         "used": Value::Null,
@@ -2631,8 +3232,8 @@ fn tokenomics_unknown_limit_snapshot(
         "used_percent": Value::Null,
         "remaining_percent": Value::Null,
         "pace_delta_percent": 0,
-        "status_label": "Plan limit not exposed",
-        "reset_label": if window_kind == "5_hour" { "Provider limit unavailable" } else { "Provider schedule unavailable" },
+        "status_label": status_label,
+        "reset_label": reset_label,
         "rate_points": [],
     })
 }
@@ -2749,16 +3350,56 @@ fn tokenomics_claude_plan_state() -> Value {
         .as_ref()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    tokenomics_claude_plan_state_from_credentials(credentials.as_ref())
+}
+
+fn tokenomics_claude_plan_state_from_credentials(credentials: Option<&Value>) -> Value {
     let has_oauth = credentials
-        .as_ref()
         .and_then(|value| value.get("claudeAiOauth"))
         .map(|value| !value.is_null())
         .unwrap_or(false);
+    let subscription_type = credentials
+        .and_then(|value| value.get("claudeAiOauth"))
+        .and_then(|oauth| tokenomics_value_string(oauth, &["subscriptionType", "subscription_type"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let rate_limit_tier = credentials
+        .and_then(|value| value.get("claudeAiOauth"))
+        .and_then(|oauth| tokenomics_value_string(oauth, &["rateLimitTier", "rate_limit_tier"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let plan_name = if let Some(subscription_type) = subscription_type.as_deref() {
+        tokenomics_claude_subscription_label(subscription_type)
+    } else if has_oauth {
+        "Claude account signed in".to_string()
+    } else {
+        "No Claude auth detected".to_string()
+    };
     json!({
         "plan_detected": has_oauth,
-        "plan_name": if has_oauth { "Claude subscription" } else { "No Claude auth detected" },
+        "account_detected": has_oauth,
+        "plan_name": plan_name,
         "plan_source": if credentials.is_some() { "claude_credentials_file" } else { "not_found" },
+        "subscription_type": subscription_type,
+        "rate_limit_tier": rate_limit_tier,
     })
+}
+
+fn tokenomics_claude_subscription_label(subscription_type: &str) -> String {
+    let normalized = subscription_type.trim();
+    if normalized.is_empty() {
+        return "Claude account signed in".to_string();
+    }
+    let lower = normalized.to_ascii_lowercase();
+    match lower.as_str() {
+        "free" => "Claude Free".to_string(),
+        "pro" => "Claude Pro".to_string(),
+        "max" => "Claude Max".to_string(),
+        "team" => "Claude Team".to_string(),
+        "enterprise" => "Claude Enterprise".to_string(),
+        "api" => "Claude API".to_string(),
+        _ => format!("Claude {}", tokenomics_title_case(normalized)),
+    }
 }
 
 fn tokenomics_query_one(conn: &rusqlite::Connection, sql: &str) -> Result<Value, String> {
@@ -3018,5 +3659,339 @@ mod tokenomics_tests {
         assert_eq!(account_a.key, account_b.key);
         assert!(account_a.key.starts_with("openai:codex:"));
         assert!(account_a.label.starts_with("Codex account "));
+    }
+
+    #[test]
+    fn tokenomics_provider_account_uses_codex_jwt_name_as_label() {
+        let payload_a = general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"sub":"user-123","name":"Syed Rizvi","email":"syed@example.test"}"#,
+        );
+        let payload_b = general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"sub":"user-123","name":"Syed Renamed","email":"renamed@example.test"}"#,
+        );
+        let auth_a = json!({
+            "tokens": {
+                "account_id": "stable-account-id",
+                "id_token": format!("header.{payload_a}.signature-a")
+            }
+        });
+        let auth_b = json!({
+            "tokens": {
+                "account_id": "stable-account-id",
+                "id_token": format!("header.{payload_b}.signature-b")
+            }
+        });
+
+        let account_a = tokenomics_provider_account_from_auth("openai", "codex", Some(&auth_a));
+        let account_b = tokenomics_provider_account_from_auth("openai", "codex", Some(&auth_b));
+
+        assert_eq!(account_a.key, account_b.key);
+        assert_eq!(account_a.label, "Syed Rizvi");
+        assert_eq!(account_b.label, "Syed Renamed");
+    }
+
+    #[test]
+    fn tokenomics_provider_account_uses_letter_for_codex_email_fallback() {
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"user-123","email":"syed@example.test"}"#);
+        let auth = json!({
+            "tokens": {
+                "account_id": "stable-account-id",
+                "id_token": format!("header.{payload}.signature")
+            }
+        });
+
+        let account = tokenomics_provider_account_from_auth("openai", "codex", Some(&auth));
+
+        assert_eq!(account.label.len(), 1);
+        assert!(account.label.chars().all(|character| character.is_ascii_uppercase()));
+        assert!(!account.label.contains('@'));
+    }
+
+    #[test]
+    fn tokenomics_reconcile_provider_account_label_updates_existing_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let account = TokenomicsProviderAccount {
+            key: "openai:codex:stable".to_string(),
+            label: "Syed Rizvi".to_string(),
+        };
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, source_kind, source_path,
+               bucket_day, bucket_hour, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'event-a', 'openai', 'codex', NULL, ?1, ?1,
+               'Codex account stable', NULL, NULL, 'codex_token_count_jsonl', NULL,
+               '2026-05-30', '2026-05-30T04', 1, 1, 0,
+               0, 2, 0, '2026-05-30T04:00:00Z', '2026-05-30T04:00:00Z'
+             )",
+            rusqlite::params![account.key.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, bucket_width, bucket_start,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+               estimated_cost_microusd, event_count, updated_at
+             ) VALUES(
+               'rollup-a', 'openai', 'codex', NULL, ?1, ?1,
+               'Codex account stable', NULL, NULL, 'hour', '2026-05-30T04',
+               1, 1, 0, 0, 2, 0, 1, '2026-05-30T04:00:00Z'
+             )",
+            rusqlite::params![account.key.as_str()],
+        )
+        .unwrap();
+
+        tokenomics_reconcile_provider_account_label(&conn, "openai", "codex", &account).unwrap();
+
+        let event_label: String = conn
+            .query_row(
+                "SELECT provider_account_label FROM tokenomics_usage_events WHERE id='event-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_label: String = conn
+            .query_row(
+                "SELECT provider_account_label FROM tokenomics_rollups WHERE id='rollup-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(event_label, "Syed Rizvi");
+        assert_eq!(rollup_label, "Syed Rizvi");
+    }
+
+    #[test]
+    fn tokenomics_provider_account_uses_claude_oauth_account_identity() {
+        let auth_a = json!({
+            "credentials": {
+                "claudeAiOauth": {
+                    "accessToken": "access-a",
+                    "refreshToken": "refresh-a"
+                }
+            },
+            "claude_config": {
+                "oauthAccount": {
+                    "accountUuid": "stable-claude-account",
+                    "displayName": "Claude Syed",
+                    "emailAddress": "syed@example.test",
+                    "organizationUuid": "org-a"
+                }
+            }
+        });
+        let auth_b = json!({
+            "credentials": {
+                "claudeAiOauth": {
+                    "accessToken": "access-b",
+                    "refreshToken": "refresh-b"
+                }
+            },
+            "claude_config": {
+                "oauthAccount": {
+                    "accountUuid": "stable-claude-account",
+                    "displayName": "Claude Renamed",
+                    "emailAddress": "renamed@example.test",
+                    "organizationUuid": "org-b"
+                }
+            }
+        });
+
+        let account_a =
+            tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth_a));
+        let account_b =
+            tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth_b));
+
+        assert_eq!(account_a.key, account_b.key);
+        assert_eq!(account_a.label, "Claude Syed");
+        assert_eq!(account_b.label, "Claude Renamed");
+    }
+
+    #[test]
+    fn tokenomics_provider_account_uses_letter_for_claude_email_fallback() {
+        let auth = json!({
+            "claude_config": {
+                "oauthAccount": {
+                    "accountUuid": "stable-claude-account",
+                    "emailAddress": "syed@example.test",
+                    "organizationName": "Fallback Org"
+                }
+            }
+        });
+
+        let account = tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth));
+
+        assert_eq!(account.label.len(), 1);
+        assert!(account.label.chars().all(|character| character.is_ascii_uppercase()));
+        assert!(!account.label.contains('@'));
+    }
+
+    #[test]
+    fn tokenomics_provider_account_keeps_claude_credential_only_token_key() {
+        let auth = json!({
+            "credentials": {
+                "organizationUuid": "shared-org",
+                "claudeAiOauth": {
+                    "accessToken": "access-a",
+                    "refreshToken": "refresh-a"
+                }
+            }
+        });
+
+        let account = tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth));
+        let legacy_key =
+            tokenomics_legacy_provider_account_key_from_auth("anthropic", "claude", &auth).unwrap();
+
+        assert_eq!(account.key, legacy_key);
+        assert!(account.label.starts_with("Claude account "));
+    }
+
+    #[test]
+    fn tokenomics_migrate_provider_account_key_rebuilds_claude_rollups() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let old_credentials = json!({
+            "claudeAiOauth": {
+                "accessToken": "legacy-access",
+                "refreshToken": "legacy-refresh"
+            }
+        });
+        let old_key =
+            tokenomics_legacy_provider_account_key_from_auth("anthropic", "claude", &old_credentials)
+                .unwrap();
+        let account = TokenomicsProviderAccount {
+            key: "anthropic:claude:stable".to_string(),
+            label: "Claude Syed".to_string(),
+        };
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, source_kind, source_path,
+               bucket_day, bucket_hour, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'claude-event-a', 'anthropic', 'claude', 'sonnet', ?1, ?1,
+               'Claude account legacy', NULL, '/tmp/repo', 'jsonl', '/tmp/session.jsonl',
+               '2026-05-30', '2026-05-30T04', 3, 4, 1,
+               2, 10, 0, '2026-05-30T04:00:00Z', '2026-05-30T04:00:00Z'
+             )",
+            rusqlite::params![old_key.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, bucket_width, bucket_start,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+               estimated_cost_microusd, event_count, updated_at
+             ) VALUES(
+               'legacy-rollup-a', 'anthropic', 'claude', 'sonnet', ?1, ?1,
+               'Claude account legacy', NULL, '/tmp/repo', 'day', '2026-05-30',
+               3, 4, 1, 2, 10, 0, 1, '2026-05-30T04:00:00Z'
+             )",
+            rusqlite::params![old_key.as_str()],
+        )
+        .unwrap();
+
+        tokenomics_migrate_provider_account_key(
+            &conn,
+            "anthropic",
+            "claude",
+            &old_key,
+            &account,
+        )
+        .unwrap();
+
+        let migrated = tokenomics_query_one(
+            &conn,
+            "SELECT provider_account_key, provider_account_label, subscription_key
+             FROM tokenomics_usage_events WHERE id='claude-event-a'",
+        )
+        .unwrap();
+        assert_eq!(migrated["provider_account_key"], json!("anthropic:claude:stable"));
+        assert_eq!(migrated["provider_account_label"], json!("Claude Syed"));
+        assert_eq!(migrated["subscription_key"], json!("anthropic:claude:stable"));
+
+        let old_rollup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_rollups WHERE provider_account_key=?1",
+                rusqlite::params![old_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let new_rollups = tokenomics_query_rows(
+            &conn,
+            "SELECT bucket_width, provider_account_key, provider_account_label, total_tokens, event_count
+             FROM tokenomics_rollups ORDER BY bucket_width",
+        )
+        .unwrap();
+
+        assert_eq!(old_rollup_count, 0);
+        assert_eq!(new_rollups.len(), 2);
+        assert!(new_rollups.iter().all(|row| {
+            row["provider_account_key"] == json!("anthropic:claude:stable")
+                && row["provider_account_label"] == json!("Claude Syed")
+                && row["total_tokens"] == json!(10)
+                && row["event_count"] == json!(1)
+        }));
+    }
+
+    #[test]
+    fn tokenomics_claude_plan_state_distinguishes_auth_from_subscription() {
+        let signed_in = tokenomics_claude_plan_state_from_credentials(Some(&json!({
+            "claudeAiOauth": {
+                "accessToken": "token"
+            }
+        })));
+
+        assert_eq!(signed_in["plan_detected"], json!(true));
+        assert_eq!(signed_in["account_detected"], json!(true));
+        assert_eq!(signed_in["plan_name"], json!("Claude account signed in"));
+        assert!(signed_in["subscription_type"].is_null());
+
+        let pro = tokenomics_claude_plan_state_from_credentials(Some(&json!({
+            "claudeAiOauth": {
+                "accessToken": "token",
+                "subscriptionType": "pro",
+                "rateLimitTier": "standard"
+            }
+        })));
+
+        assert_eq!(pro["plan_name"], json!("Claude Pro"));
+        assert_eq!(pro["subscription_type"], json!("pro"));
+        assert_eq!(pro["rate_limit_tier"], json!("standard"));
+    }
+
+    #[test]
+    fn tokenomics_claude_unknown_limit_uses_statusline_unavailable_copy() {
+        let account = TokenomicsProviderAccount {
+            key: "anthropic:claude:test".to_string(),
+            label: "Claude account test".to_string(),
+        };
+        let snapshot = tokenomics_unknown_limit_snapshot(
+            "anthropic",
+            "claude",
+            &account,
+            &json!({
+                "plan_detected": true,
+                "plan_name": "Claude account signed in",
+                "plan_source": "claude_credentials_file",
+            }),
+            "5_hour",
+            "5-Hour Session",
+        );
+
+        assert_eq!(snapshot["limit_source"], json!("claude_statusline_unavailable"));
+        assert_eq!(snapshot["status_label"], json!("Live Claude Code limits unavailable"));
+        assert_eq!(
+            snapshot["reset_label"],
+            json!("Open Claude Code to publish live limits")
+        );
+        assert_eq!(snapshot["plan_name"], json!("Claude account signed in"));
     }
 }

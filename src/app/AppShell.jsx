@@ -8385,6 +8385,11 @@ export default function App() {
           runtimeWorkspace.id,
           logicalTerminalIndexes,
         );
+        const terminalsByIndex = Object.fromEntries(
+          Object.values(workspaceThreads?.[runtimeWorkspace.id]?.terminals || {})
+            .map((terminal) => [Number(terminal?.terminalIndex), terminal])
+            .filter(([terminalIndex]) => Number.isInteger(terminalIndex)),
+        );
         const agentTerminalEntries = terminalRoleEntries.filter(({ role, terminalIndex }) => (
           normalizeWorkspaceTerminalRole(
             role,
@@ -8410,6 +8415,7 @@ export default function App() {
             terminalRoles[0] || workspaceTerminalFallbackRole,
           ),
           terminalAgentsByIndex,
+          terminalsByIndex,
           terminalRolesByIndex,
           threadsByIndex,
           workingDirectory,
@@ -8454,6 +8460,25 @@ export default function App() {
             const thread = descriptor.threadsByIndex?.[terminalIndex] || null;
             const providerBinding = getWorkspaceThreadProviderBinding(thread, normalizedRole);
             const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || null;
+            const liveTerminalCandidate = descriptor.terminalsByIndex?.[terminalIndex] || null;
+            const liveTerminalAgent = normalizeWorkspaceTerminalRole(
+              liveTerminalCandidate?.agentId || normalizedRole,
+              workspaceTerminalFallbackRole,
+              workspaceTerminalRoleOptions,
+            );
+            const liveTerminal = (
+              liveTerminalCandidate
+              && liveTerminalAgent === normalizedRole
+              && (!thread?.id || !liveTerminalCandidate.threadId || liveTerminalCandidate.threadId === thread.id)
+            )
+              ? liveTerminalCandidate
+              : null;
+            const terminalGroundTruth = getThreadTerminalGroundTruth({
+              liveTerminal,
+              providerBinding,
+              targetRole: normalizedRole,
+              thread,
+            });
             const colorSlot = getTerminalAgentColorSlot(terminalIndex);
             const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
             const hasSession = Boolean(
@@ -8461,15 +8486,21 @@ export default function App() {
                 || providerBinding?.nativeSessionId
                 || providerBinding?.nativeSessionTitle,
             );
+            const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
             const rawActivity = String(
-              thread?.activityStatus
+              terminalGroundTruth.effectiveActivityStatus
+                || thread?.activityStatus
                 || thread?.latestTurn?.status
                 || thread?.status
                 || "",
             ).trim().toLowerCase();
             const status = (() => {
-              if (!hasSession) return "ready";
+              if (liveStatus === "error" || rawActivity === "error" || rawActivity === "failed") return "error";
+              if (terminalGroundTruth.terminalIsParked || ["paused", "parked", "waiting", "resume_ready"].includes(rawActivity)) return "paused";
+              if (liveStatus === "starting" || rawActivity === "starting") return "working";
+              if (terminalGroundTruth.terminalIsPromptingUser) return "paused";
               if (["thinking", "reasoning"].includes(rawActivity)) return "thinking";
+              if (terminalGroundTruth.effectiveLatestTurnState === "running") return "thinking";
               if ([
                 "busy",
                 "running",
@@ -8479,9 +8510,13 @@ export default function App() {
                 "resume_requested",
                 "resumed",
               ].includes(rawActivity)) return "working";
-              if (["paused", "parked", "waiting", "resume_ready"].includes(rawActivity)) return "paused";
-              if (["error", "failed", "blocked"].includes(rawActivity)) return "error";
               if (["closed", "closing", "stopped"].includes(rawActivity)) return "idle";
+              if (liveTerminal && ["active", "running"].includes(liveStatus)) {
+                return terminalGroundTruth.agentInputReady || terminalGroundTruth.terminalIsComplete
+                  ? "ready"
+                  : "working";
+              }
+              if (!liveTerminal && !hasSession) return "idle";
               return "idle";
             })();
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
@@ -8846,7 +8881,7 @@ export default function App() {
           return;
         }
 
-        await startAccountTokenomicsStartupScan(accountKey);
+        await invoke("tokenomics_scan_usage_silent");
         const summary = await invoke("tokenomics_get_sync_delta", {
           sinceUpdatedAt: tokenomicsSyncCursorRef.current || null,
         });
@@ -10378,9 +10413,15 @@ export default function App() {
               && voicePlanPromptEventId.startsWith("voice-plan-")
               && promptAccepted,
           );
+          const expectedUserMessageIsControlPrompt = Boolean(
+            expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
+          );
           const requiresExactPromptEvidence = (
             pollUntilTurnComplete
             && Boolean(expectedUserMessage)
+            && !expectedUserMessageIsControlPrompt
+            && activeRunningTurnAtTranscriptResult
+            && !terminalReadinessCanSettleTurn
             && !matchedBy.includes("timestamp")
             && !matchedBy.includes("recovery")
           );
@@ -10396,6 +10437,7 @@ export default function App() {
               elapsedMs,
               matchedBy,
               messageCount: messages.length,
+              expectedUserMessageIsControlPrompt,
               pollUntilTurnComplete,
               promptEventIdPresent: Boolean(promptEventId),
               reason: staleVoicePlanCompletionWithoutPrompt

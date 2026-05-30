@@ -3475,12 +3475,33 @@ export function updateWorkspaceThreadAgent(state, event = {}) {
     };
   }
   const terminalIndex = normalizeTerminalIndex(event.terminalIndex ?? existing.terminalIndex);
+  const terminalKey = terminalSessionKey(terminalIndex);
+  const existingTerminal = terminalKey ? entry.terminals[terminalKey] : null;
+  if (
+    terminalKey
+    && existingTerminal
+    && cleanAgentId(existingTerminal.agentId, "") !== agentId
+  ) {
+    delete entry.terminals[terminalKey];
+    entry.terminalOrder = entry.terminalOrder.filter((key) => key !== terminalKey);
+  }
+  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const nextLatestTurn = existingLatestTurn?.state === "running"
+    ? normalizeThreadLatestTurn({
+      ...existingLatestTurn,
+      completedAt: now,
+      error: cleanText(event.reason || "Terminal agent changed."),
+      state: "interrupted",
+      updatedAt: now,
+    })
+    : existing.latestTurn;
   rememberTerminalThread(entry, terminalIndex, threadId);
   entry.activeThreadId = threadId;
   entry.threads[threadId] = {
     ...existing,
     activityStatus: "idle",
     currentAgent: agentId,
+    latestTurn: nextLatestTurn,
     preferredAgent: agentId,
     providerBindings,
     status: event.status || existing.status,
