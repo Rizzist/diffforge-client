@@ -8414,7 +8414,7 @@ export default function App() {
     syncTokenomics("tokenomics_scan");
     const intervalId = window.setInterval(
       () => syncTokenomics("tokenomics_heartbeat"),
-      5 * 60 * 1000,
+      10 * 1000,
     );
 
     return () => {

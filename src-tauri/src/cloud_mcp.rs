@@ -6848,7 +6848,7 @@ async fn cloud_mcp_sync_tokenomics_state(
         .unwrap_or_default();
     let payload = json!({
         "source": "rust-diffforge-tokenomics-sync",
-        "event_kind": "tokenomics_rollup_snapshot",
+        "event_kind": "tokenomics_hourly_usage_snapshot",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
@@ -6875,7 +6875,7 @@ async fn cloud_mcp_sync_tokenomics_state(
         snapshots.tokenomics = Some(payload.clone());
     }
 
-    cloud_mcp_post_event_endpoint(state.inner(), "tokenomics_rollup_snapshot", &payload).await
+    cloud_mcp_post_event_endpoint(state.inner(), "tokenomics_hourly_usage_snapshot", &payload).await
 }
 
 #[tauri::command]

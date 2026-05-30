@@ -14,6 +14,7 @@ import {
   TERMINAL_MAX_ROWS,
   TERMINAL_MIN_COLS,
   TERMINAL_MIN_ROWS,
+  TERMINAL_ENTER_SEQUENCE,
   TERMINAL_PROMPT_SUBMITTED_EVENT,
   TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT,
   TODO_DRAG_MIME,
@@ -1764,6 +1765,10 @@ let nextWorkspaceTerminalInstanceId = 1;
 export function getTerminalSubmitSequence(_agentKind, isGenericTerminal = false) {
   if (isGenericTerminal) {
     return "";
+  }
+
+  if (getTerminalAgentKind(_agentKind) === "codex") {
+    return TERMINAL_ENTER_SEQUENCE;
   }
 
   return "\r";

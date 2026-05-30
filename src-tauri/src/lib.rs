@@ -2807,6 +2807,7 @@ pub fn run() {
             cloud_mcp_sync_tokenomics_state,
             tokenomics_scan_usage,
             tokenomics_get_summary,
+            tokenomics_get_live_limits,
             tokenomics_get_sync_payload,
             tokenomics_record_usage,
             cloud_mcp_reset_workspace_graph_state,

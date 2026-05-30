@@ -79,6 +79,7 @@ export const TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS = 16;
 export const TERMINAL_INPUT_BATCH_MS = 8;
 export const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 export const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
+export const TERMINAL_ENTER_SEQUENCE = "\x1b[13u";
 export const TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 export const TODO_DRAG_MIME = "application/x-diffforge-todo";
 export const TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES = 0;

@@ -9465,7 +9465,7 @@ function TerminalView({
                     ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
                     : terminalText
                 ),
-                allowEnterRetry: false,
+                allowEnterRetry: true,
                 isGenericTerminal: false,
                 logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
                 promptId,
