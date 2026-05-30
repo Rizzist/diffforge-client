@@ -1300,6 +1300,41 @@ mod tests {
     }
 
     #[test]
+    fn coordination_targets_expand_nested_container_leaf_projects_only() {
+        let root = test_root("expand-nested-container");
+        create_package_project(&root.join("product-a").join("frontend"));
+        create_package_project(&root.join("product-a").join("backend"));
+        create_package_project(&root.join("product-b").join("api"));
+
+        let targets =
+            coordination_workspace_targets(Some(root.display().to_string()), None).unwrap();
+        let target_data = data(&targets);
+        let target_paths = target_data["targets"].as_array().unwrap();
+
+        assert_eq!(target_data["container"].as_bool(), Some(true));
+        assert_eq!(target_paths.len(), 3);
+        assert!(target_paths.iter().any(|target| {
+            target["mountId"].as_str() == Some("product-a/frontend")
+                && target["repoPath"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("product-a/frontend"))
+        }));
+        assert!(target_paths.iter().any(|target| {
+            target["mountId"].as_str() == Some("product-a/backend")
+                && target["repoPath"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("product-a/backend"))
+        }));
+        assert!(target_paths
+            .iter()
+            .all(|target| target["projectKind"].as_str() != Some("container")));
+        assert!(!root.join(".agents").exists());
+        assert!(!root.join(".git").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ambiguous_container_single_repo_commands_refuse_parent_kernel() {
         let root = test_root("refuse-parent");
         create_package_project(&root.join("frontend"));

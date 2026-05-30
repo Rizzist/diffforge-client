@@ -30,6 +30,33 @@ test("normalizeSnapshot preserves container project mounts", () => {
   assert.equal(graph.projectMounts[0].project_root, "/workspace/frontend");
 });
 
+test("normalizeSnapshot preserves nested container mount metadata", () => {
+  const graph = normalizeSnapshot({
+    containerWorkspace: true,
+    projectMounts: [{
+      mountId: "product-a",
+      mountKind: "container",
+      projectKind: "container",
+      workspaceRelativePath: "product-a",
+    }, {
+      mountId: "product-a/frontend",
+      mountKind: "project",
+      parentMountId: "product-a",
+      projectKind: "project",
+      workspaceRelativePath: "product-a/frontend",
+    }],
+    specGraph: {
+      nodes: [],
+      edges: [],
+      graph_stats: {},
+    },
+  });
+
+  assert.equal(graph.projectMounts.length, 2);
+  assert.equal(graph.projectMounts[0].mount_kind, "container");
+  assert.equal(graph.projectMounts[1].parent_mount_id, "product-a");
+});
+
 test("normalizeSnapshot promotes child routing metadata on mounted nodes", () => {
   const graph = normalizeSnapshot({
     repoPath: "/workspace",

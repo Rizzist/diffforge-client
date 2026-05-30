@@ -83,7 +83,7 @@ const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 128;
-const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 2;
+const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 3;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
 const GIT_STATUS_TIMEOUT_SECS: u64 = 2;
@@ -1182,6 +1182,7 @@ struct ForgeWorkingDirectory {
     workspace_kind: String,
     active_project_root: Option<String>,
     project_mounts: Vec<WorkspaceProjectMount>,
+    workspace_mounts: Vec<WorkspaceProjectMount>,
 }
 
 #[derive(Serialize)]
@@ -1211,6 +1212,7 @@ struct WorkspaceDirectoryListing {
     workspace_kind: String,
     active_project_root: Option<String>,
     project_mounts: Vec<WorkspaceProjectMount>,
+    workspace_mounts: Vec<WorkspaceProjectMount>,
 }
 
 #[derive(Serialize)]

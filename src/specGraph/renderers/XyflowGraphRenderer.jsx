@@ -162,45 +162,69 @@ function projectGroupLabel(context, fallback) {
   );
 }
 
-function projectGroupKeyForNode(node) {
+function projectGroupInfosForNode(node) {
   const context = nodeProjectContext(node);
-  const key = text(context.mountId || context.projectRoot || context.sourceRepoId);
-  if (!key) return null;
-  return {
+  const mountId = text(context.mountId);
+  if (mountId) {
+    const parts = mountId
+      .replace(/\\/g, "/")
+      .split("/")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (parts.length > 1) {
+      return parts.map((_, index) => {
+        const key = parts.slice(0, index + 1).join("/");
+        return {
+          key,
+          label: key,
+          projectRoot: index === parts.length - 1 ? context.projectRoot : "",
+          visiblePath: key,
+          workspaceRoot: context.workspaceRoot,
+          depth: index + 1,
+        };
+      });
+    }
+  }
+  const key = text(mountId || context.projectRoot || context.sourceRepoId);
+  if (!key) return [];
+  return [{
     key,
     label: projectGroupLabel(context, key),
     projectRoot: context.projectRoot,
     visiblePath: context.visiblePath,
     workspaceRoot: context.workspaceRoot,
-  };
+    depth: 1,
+  }];
 }
 
 function projectGroupFlowNodes(nodes, layout, selectedNodeId) {
   const groups = new Map();
   nodes.forEach((node) => {
-    const groupInfo = projectGroupKeyForNode(node);
-    if (!groupInfo) return;
+    const groupInfos = projectGroupInfosForNode(node);
+    if (!groupInfos.length) return;
     const position = layout.get(node.id);
     if (!position) return;
     const dimensions = dimensionsForFlowNode(node);
-    const existing = groups.get(groupInfo.key) || {
-      ...groupInfo,
-      left: Number.POSITIVE_INFINITY,
-      top: Number.POSITIVE_INFINITY,
-      right: Number.NEGATIVE_INFINITY,
-      bottom: Number.NEGATIVE_INFINITY,
-      memberIds: [],
-    };
-    existing.left = Math.min(existing.left, position.x);
-    existing.top = Math.min(existing.top, position.y);
-    existing.right = Math.max(existing.right, position.x + dimensions.width);
-    existing.bottom = Math.max(existing.bottom, position.y + dimensions.height);
-    existing.memberIds.push(node.id);
-    groups.set(groupInfo.key, existing);
+    groupInfos.forEach((groupInfo) => {
+      const existing = groups.get(groupInfo.key) || {
+        ...groupInfo,
+        left: Number.POSITIVE_INFINITY,
+        top: Number.POSITIVE_INFINITY,
+        right: Number.NEGATIVE_INFINITY,
+        bottom: Number.NEGATIVE_INFINITY,
+        memberIds: [],
+      };
+      existing.left = Math.min(existing.left, position.x);
+      existing.top = Math.min(existing.top, position.y);
+      existing.right = Math.max(existing.right, position.x + dimensions.width);
+      existing.bottom = Math.max(existing.bottom, position.y + dimensions.height);
+      existing.memberIds.push(node.id);
+      groups.set(groupInfo.key, existing);
+    });
   });
 
   return [...groups.values()]
-    .sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key))
+    .sort((left, right) => (left.depth || 0) - (right.depth || 0) || left.label.localeCompare(right.label) || left.key.localeCompare(right.key))
     .map((group) => {
       const width = Math.max(
         PROJECT_GROUP_MIN_SIZE.width,
@@ -218,7 +242,7 @@ function projectGroupFlowNodes(nodes, layout, selectedNodeId) {
           x: group.left - PROJECT_GROUP_PADDING.left,
           y: group.top - PROJECT_GROUP_PADDING.top,
         },
-        zIndex: 0,
+        zIndex: Math.max(0, Math.min(4, Number(group.depth || 1) - 1)),
         draggable: false,
         selectable: false,
         connectable: false,

@@ -239,6 +239,9 @@ struct WorkspaceProjectMount {
     project_root: String,
     project_name: String,
     project_kind: String,
+    mount_kind: String,
+    parent_mount_id: Option<String>,
+    mount_depth: usize,
     has_git: bool,
     has_agents: bool,
     has_spec_graph_cache: bool,
@@ -389,6 +392,7 @@ fn workspace_is_exact_git_root(root: &Path) -> bool {
 enum WorkspaceProjectKind {
     Git,
     Marker,
+    Container,
 }
 
 impl WorkspaceProjectKind {
@@ -396,6 +400,7 @@ impl WorkspaceProjectKind {
         match self {
             WorkspaceProjectKind::Git => "git",
             WorkspaceProjectKind::Marker => "project",
+            WorkspaceProjectKind::Container => "container",
         }
     }
 }
@@ -489,6 +494,26 @@ fn workspace_project_mount_id(relative_path: &str) -> String {
     }
 }
 
+fn workspace_mount_depth(relative_path: &str) -> usize {
+    normalize_git_status_path(relative_path)
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .count()
+}
+
+fn workspace_mount_parent_id(relative_path: &str) -> Option<String> {
+    let normalized = normalize_git_status_path(relative_path);
+    let mut parts = normalized
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        return None;
+    }
+    parts.pop();
+    Some(workspace_project_mount_id(&parts.join("/")))
+}
+
 fn workspace_project_mount_from_root(
     workspace_root: &Path,
     project_root: PathBuf,
@@ -504,6 +529,8 @@ fn workspace_project_mount_from_root(
         .unwrap_or_else(|| workspace_path_display(&project_root));
     let has_agents = project_root.join(".agents").is_dir();
     let has_spec_graph_cache = project_root.join(".agents").join("spec-graph").is_dir();
+    let parent_mount_id = workspace_mount_parent_id(&workspace_relative_path);
+    let mount_depth = workspace_mount_depth(&workspace_relative_path);
 
     Some(WorkspaceProjectMount {
         mount_id: workspace_project_mount_id(&workspace_relative_path),
@@ -511,11 +538,74 @@ fn workspace_project_mount_from_root(
         project_root: workspace_path_display(&project_root),
         project_name,
         project_kind: project_kind.as_str().to_string(),
+        mount_kind: if matches!(project_kind, WorkspaceProjectKind::Container) {
+            "container".to_string()
+        } else {
+            "project".to_string()
+        },
+        parent_mount_id,
+        mount_depth,
         has_git: matches!(project_kind, WorkspaceProjectKind::Git),
         has_agents,
         has_spec_graph_cache,
         root_path: project_root,
     })
+}
+
+fn workspace_mount_is_project(mount: &WorkspaceProjectMount) -> bool {
+    mount.mount_kind == "project" && mount.project_kind != "container"
+}
+
+fn workspace_mount_manifest_from_projects(
+    workspace_root: &Path,
+    project_mounts: &[WorkspaceProjectMount],
+) -> Vec<WorkspaceProjectMount> {
+    let workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut manifest = Vec::new();
+    let mut seen = HashSet::new();
+
+    for project_mount in project_mounts {
+        let normalized_relative = normalize_git_status_path(&project_mount.workspace_relative_path);
+        let parts = normalized_relative
+            .split('/')
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>();
+
+        for depth in 1..parts.len() {
+            if manifest.len() + project_mounts.len() >= MAX_WORKSPACE_PROJECT_MOUNTS {
+                break;
+            }
+            let relative_path = parts[..depth].join("/");
+            let path = workspace_root.join(relative_path);
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&workspace_root) {
+                continue;
+            }
+            let key = normalized_path_key(&canonical);
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(mount) = workspace_project_mount_from_root(
+                &workspace_root,
+                canonical,
+                WorkspaceProjectKind::Container,
+            ) {
+                manifest.push(mount);
+            }
+        }
+    }
+
+    manifest.extend(project_mounts.iter().filter(|mount| workspace_mount_is_project(mount)).cloned());
+    manifest.sort_by(|left, right| {
+        left.workspace_relative_path
+            .cmp(&right.workspace_relative_path)
+            .then_with(|| left.mount_kind.cmp(&right.mount_kind))
+    });
+    manifest
 }
 
 fn workspace_mount_is_selected_root(root: &Path, mount: &WorkspaceProjectMount) -> bool {
@@ -667,11 +757,13 @@ fn workspace_active_project_root_for_mounts(
 
 fn workspace_root_response(root: &Path) -> ForgeWorkingDirectory {
     let mounts = workspace_project_mounts(root);
+    let workspace_mounts = workspace_mount_manifest_from_projects(root, &mounts);
     ForgeWorkingDirectory {
         working_directory: workspace_path_display(root),
         workspace_kind: workspace_kind_for_mounts(root, &mounts),
         active_project_root: workspace_active_project_root_for_mounts(&mounts),
         project_mounts: mounts,
+        workspace_mounts,
     }
 }
 
@@ -1581,6 +1673,7 @@ fn list_workspace_directory_for(
         truncated,
         workspace_kind,
         active_project_root,
+        workspace_mounts: workspace_mount_manifest_from_projects(&workspace_root, &project_mounts),
         project_mounts,
     })
 }
@@ -1944,6 +2037,57 @@ mod workspace_files_tests {
         assert!(mount_ids.contains(&("frontend", false, "project")));
         assert!(!root.join(".git").exists());
         assert!(!root.join(".agents").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_container_mount_manifest_preserves_parent_container_layers() {
+        let root = test_workspace_root("diffforge-nested-container-mounts");
+        create_package_project(&root.join("portfolio").join("product-a").join("frontend"), "{}\n");
+        create_package_project(&root.join("portfolio").join("product-a").join("backend"), "{}\n");
+        create_package_project(&root.join("portfolio").join("product-b").join("api"), "{}\n");
+
+        let response = workspace_root_response(&root);
+        let project_mount_ids = response
+            .project_mounts
+            .iter()
+            .map(|mount| mount.mount_id.as_str())
+            .collect::<Vec<_>>();
+        let workspace_mounts = response
+            .workspace_mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.mount_id.as_str(),
+                    mount.mount_kind.as_str(),
+                    mount.parent_mount_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.workspace_kind, "container");
+        assert_eq!(response.project_mounts.len(), 3);
+        assert!(project_mount_ids.contains(&"portfolio/product-a/frontend"));
+        assert!(project_mount_ids.contains(&"portfolio/product-a/backend"));
+        assert!(project_mount_ids.contains(&"portfolio/product-b/api"));
+        assert!(workspace_mounts.contains(&("portfolio", "container", None)));
+        assert!(workspace_mounts.contains(&(
+            "portfolio/product-a",
+            "container",
+            Some("portfolio")
+        )));
+        assert!(workspace_mounts.contains(&(
+            "portfolio/product-a/frontend",
+            "project",
+            Some("portfolio/product-a")
+        )));
+        assert!(workspace_mounts.contains(&(
+            "portfolio/product-b/api",
+            "project",
+            Some("portfolio/product-b")
+        )));
+        assert!(!root.join(".git").exists());
 
         let _ = fs::remove_dir_all(root);
     }

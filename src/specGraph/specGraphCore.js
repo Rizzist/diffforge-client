@@ -96,10 +96,16 @@ function normalizeProjectMount(rawMount) {
   const projectRoot = text(field(mount, "projectRoot", "project_root"));
   const projectName = text(field(mount, "projectName", "project_name"));
   const projectKind = text(field(mount, "projectKind", "project_kind"));
+  const mountKind = text(field(mount, "mountKind", "mount_kind"), projectKind === "container" ? "container" : "project");
+  const parentMountId = text(field(mount, "parentMountId", "parent_mount_id"));
   return {
     ...mount,
     mountId,
     mount_id: mountId,
+    mountKind,
+    mount_kind: mountKind,
+    parentMountId,
+    parent_mount_id: parentMountId,
     workspaceRelativePath,
     workspace_relative_path: workspaceRelativePath,
     projectRoot,
