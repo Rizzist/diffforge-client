@@ -85,6 +85,25 @@ export function rowCost(row) {
   return numeric(row?.cost, row?.estimated_cost_microusd, row?.estimatedCostMicrousd);
 }
 
+export function rowProviderAccountKey(row) {
+  return String(
+    row?.provider_account_key
+      || row?.providerAccountKey
+      || row?.subscription_key
+      || row?.subscriptionKey
+      || "",
+  ).trim();
+}
+
+export function rowProviderAccountLabel(row) {
+  return String(
+    row?.provider_account_label
+      || row?.providerAccountLabel
+      || rowProviderAccountKey(row)
+      || "Account",
+  ).trim();
+}
+
 export function rowActivityTokens(row) {
   const reportedTotal = rowTotal(row);
   const componentTotal = rowInput(row) + rowOutput(row) + rowCache(row);

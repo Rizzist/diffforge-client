@@ -4764,6 +4764,7 @@ function OrchestratorVoiceCanvasRing({
 }
 
 const TodoQueuePanel = memo(function TodoQueuePanel({
+  accountKey = "",
   activeDragItemId = "",
   billingStatus = null,
   defaultWorkingDirectory = "",
@@ -11794,6 +11795,7 @@ function TerminalView({
                         </WorkspaceToolMinimizedRail>
                       ) : (
                         <TodoQueuePanel
+                          accountKey={accountKey}
                           activeDragItemId={todoDragState?.itemId || ""}
                           agentStatuses={agentStatuses}
                           billingStatus={billingStatus}

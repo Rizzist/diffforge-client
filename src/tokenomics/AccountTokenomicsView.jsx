@@ -15,6 +15,8 @@ import {
   rowCost,
   rowInput,
   rowOutput,
+  rowProviderAccountKey,
+  rowProviderAccountLabel,
   rowTotal,
 } from "./tokenomicsFormat.js";
 
@@ -53,6 +55,7 @@ function createTokenomicsStoreState() {
     status: "loading",
     error: "",
     selectedProvider: "all",
+    selectedAccountKey: "all",
     scanProgress: null,
   };
 }
@@ -90,9 +93,12 @@ function providerLabel(row) {
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[String(row?.provider || "").toLowerCase()] || row?.label || "Agent";
 }
 
-function filterRows(rows, selectedProvider) {
+function filterRows(rows, selectedProvider, selectedAccountKey = "all") {
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
-  return rows.filter((row) => provider.match(row));
+  return rows.filter((row) => (
+    provider.match(row)
+      && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
+  ));
 }
 
 function aggregateRows(rows) {
@@ -141,8 +147,8 @@ function compactDayLabel(key, todayKey) {
   return dateFromDayKey(key).toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" });
 }
 
-function buildDailyRows(dailyRows, selectedProvider) {
-  const filtered = filterRows(dailyRows, selectedProvider);
+function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
+  const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey);
   const byDay = new Map();
   for (const row of filtered) {
     const key = bucketDayKey(row);
@@ -173,21 +179,26 @@ function buildDailyRows(dailyRows, selectedProvider) {
   }));
 }
 
-function monthAggregate(dailyRows, selectedProvider) {
+function monthAggregate(dailyRows, selectedProvider, selectedAccountKey) {
   const month = dayKeyUtc(new Date()).slice(0, 7);
-  const rows = filterRows(dailyRows, selectedProvider).filter((row) => bucketDayKey(row).startsWith(month));
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey)
+    .filter((row) => bucketDayKey(row).startsWith(month));
   return aggregateRows(rows);
 }
 
-function todayAggregate(dailyRows, selectedProvider) {
+function todayAggregate(dailyRows, selectedProvider, selectedAccountKey) {
   const today = dayKeyUtc(new Date());
-  const rows = filterRows(dailyRows, selectedProvider).filter((row) => bucketDayKey(row) === today);
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey)
+    .filter((row) => bucketDayKey(row) === today);
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider) {
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all") {
   if (!Array.isArray(limits)) return [];
-  return limits.filter((limit) => selectedProvider === "all" || providerKey(limit) === selectedProvider);
+  return limits.filter((limit) => (
+    (selectedProvider === "all" || providerKey(limit) === selectedProvider)
+      && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
+  ));
 }
 
 function mergeLimits(limits, windowKind) {
@@ -244,10 +255,10 @@ function limitStatusLabel(remainingPercent, paceDelta, rows) {
   return "Safe at current pace";
 }
 
-function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider) {
+function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKey) {
   const windowSeconds = sessionWindowSeconds(limit);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
-  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider);
+  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKey);
   if (rows.some((row) => row?.window_index != null || row?.windowIndex != null)) {
     const byIndex = new Map();
     for (const row of rows) {
@@ -385,8 +396,8 @@ function dailyBarHeight(value, maxValue) {
   return Math.max(11, Math.round((total / max) * 78));
 }
 
-function modelBreakdown(modelRows, providerRows, selectedProvider) {
-  const rows = filterRows(modelRows.length ? modelRows : providerRows, selectedProvider);
+function modelBreakdown(modelRows, providerRows, selectedProvider, selectedAccountKey) {
+  const rows = filterRows(modelRows.length ? modelRows : providerRows, selectedProvider, selectedAccountKey);
   const total = rows.reduce((sum, row) => sum + rowTotal(row), 0);
   if (selectedProvider === "all") {
     return rows
@@ -411,6 +422,39 @@ function modelBreakdown(modelRows, providerRows, selectedProvider) {
   return (PROVIDER_MODELS[selectedProvider] || []).map((label) => ({ label, percent: 0 })).slice(0, 3);
 }
 
+function providerAccountOptions(summary, selectedProvider) {
+  if (selectedProvider === "all") return [];
+  const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
+  const rows = [
+    ...(Array.isArray(summary?.accounts) ? summary.accounts : []),
+    ...(Array.isArray(summary?.by_account) ? summary.by_account : []),
+    ...(Array.isArray(summary?.limits) ? summary.limits : []),
+  ].filter((row) => provider.match(row));
+  const byKey = new Map();
+  for (const row of rows) {
+    const key = rowProviderAccountKey(row);
+    if (!key) continue;
+    const current = byKey.get(key) || {
+      key,
+      label: rowProviderAccountLabel(row),
+      total: 0,
+    };
+    current.total += rowTotal(row);
+    if (!current.label || current.label === key) {
+      current.label = rowProviderAccountLabel(row);
+    }
+    byKey.set(key, current);
+  }
+  const accounts = [...byKey.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+  if (!accounts.length) return [];
+  const providerLabelText = selectedProvider === "codex"
+    ? "All Codex"
+    : selectedProvider === "claude"
+      ? "All Claude"
+      : `All ${provider.label}`;
+  return [{ key: "all", label: providerLabelText }, ...accounts];
+}
+
 function lastUpdatedText(value) {
   if (!value) return "Updated just now";
   const date = new Date(value);
@@ -430,6 +474,7 @@ function mergeTokenomicsSummary(previous, next) {
     ...next,
     total: next.total || previous.total,
     by_provider: next.by_provider || previous.by_provider,
+    by_account: next.by_account || previous.by_account,
     by_model: next.by_model || previous.by_model,
     daily: next.daily || previous.daily,
     daily_by_provider: next.daily_by_provider || previous.daily_by_provider,
@@ -437,6 +482,7 @@ function mergeTokenomicsSummary(previous, next) {
     session_hourly_by_provider: next.session_hourly_by_provider || previous.session_hourly_by_provider,
     rollups: next.rollups || previous.rollups,
     sources: next.sources || previous.sources,
+    accounts: next.accounts || previous.accounts,
     limits: next.limits || previous.limits,
     credits: next.credits || previous.credits,
   };
@@ -646,6 +692,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     status,
     error,
     selectedProvider,
+    selectedAccountKey,
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
 
@@ -654,7 +701,11 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   const setSelectedProvider = useCallback((provider) => {
-    updateTokenomicsStore({ selectedProvider: provider });
+    updateTokenomicsStore({ selectedProvider: provider, selectedAccountKey: "all" });
+  }, []);
+
+  const setSelectedAccountKey = useCallback((nextAccountKey) => {
+    updateTokenomicsStore({ selectedAccountKey: nextAccountKey || "all" });
   }, []);
 
   useEffect(() => {
@@ -673,27 +724,68 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
   const providers = Array.isArray(summary?.by_provider) ? summary.by_provider : [];
   const modelRows = Array.isArray(summary?.by_model) ? summary.by_model : [];
+  const accountOptions = useMemo(
+    () => providerAccountOptions(summary, selectedProvider),
+    [summary, selectedProvider],
+  );
+  useEffect(() => {
+    if (selectedProvider === "all") {
+      if (selectedAccountKey !== "all") {
+        updateTokenomicsStore({ selectedAccountKey: "all" });
+      }
+      return;
+    }
+    if (
+      selectedAccountKey !== "all"
+      && !accountOptions.some((option) => option.key === selectedAccountKey)
+    ) {
+      updateTokenomicsStore({ selectedAccountKey: "all" });
+    }
+  }, [accountOptions, selectedAccountKey, selectedProvider]);
   const dailyRaw = selectedProvider === "all"
     ? (Array.isArray(summary?.daily) ? summary.daily : [])
     : (Array.isArray(summary?.daily_by_provider) ? summary.daily_by_provider : []);
   const hourlyRaw = Array.isArray(summary?.session_hourly_by_provider)
     ? summary.session_hourly_by_provider
     : (Array.isArray(summary?.hourly_by_provider) ? summary.hourly_by_provider : []);
-  const dailyRows = useMemo(() => buildDailyRows(dailyRaw, selectedProvider), [dailyRaw, selectedProvider]);
-  const today = useMemo(() => todayAggregate(dailyRaw, selectedProvider), [dailyRaw, selectedProvider]);
-  const month = useMemo(() => monthAggregate(dailyRaw, selectedProvider), [dailyRaw, selectedProvider]);
-  const total = useMemo(() => aggregateRows(filterRows(providers, selectedProvider)), [providers, selectedProvider]);
-  const limits = useMemo(() => filterLimits(summary?.limits, selectedProvider), [summary?.limits, selectedProvider]);
+  const dailyRows = useMemo(
+    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey),
+    [dailyRaw, selectedAccountKey, selectedProvider],
+  );
+  const today = useMemo(
+    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey),
+    [dailyRaw, selectedAccountKey, selectedProvider],
+  );
+  const month = useMemo(
+    () => monthAggregate(dailyRaw, selectedProvider, selectedAccountKey),
+    [dailyRaw, selectedAccountKey, selectedProvider],
+  );
+  const accountRows = Array.isArray(summary?.by_account) ? summary.by_account : [];
+  const totalRows = selectedProvider === "all" || selectedAccountKey === "all" ? providers : accountRows;
+  const total = useMemo(
+    () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey)),
+    [selectedAccountKey, selectedProvider, totalRows],
+  );
+  const limits = useMemo(
+    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey),
+    [selectedAccountKey, selectedProvider, summary?.limits],
+  );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
-  const sessionUsageRows = useMemo(() => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider), [fiveHour, hourlyRaw, selectedProvider]);
+  const sessionUsageRows = useMemo(
+    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey),
+    [fiveHour, hourlyRaw, selectedAccountKey, selectedProvider],
+  );
   const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
   const averageSessionUsage = activeSessionRows.reduce((sum, row) => sum + row.total, 0) / Math.max(1, activeSessionRows.length);
   const openAiCredits = useMemo(() => selectedProvider === "codex" ? codexCreditBalance(limits) : null, [limits, selectedProvider]);
   const dailyAverage = dailyRows.reduce((sum, row) => sum + dailyUsageValue(row), 0) / Math.max(1, dailyRows.filter((row) => dailyUsageValue(row) > 0).length);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
-  const breakdown = useMemo(() => modelBreakdown(modelRows, providers, selectedProvider), [modelRows, providers, selectedProvider]);
+  const breakdown = useMemo(
+    () => modelBreakdown(modelRows, providers, selectedProvider, selectedAccountKey),
+    [modelRows, providers, selectedAccountKey, selectedProvider],
+  );
   const credits = billingStatus?.credits || summary?.credits || {};
 
   return (
@@ -713,6 +805,23 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             </ProviderTab>
           ))}
         </ProviderTabs>
+        {accountOptions.length > 1 ? (
+          <AccountTabs role="tablist" aria-label="Provider account filter">
+            {accountOptions.map((account) => (
+              <AccountTab
+                key={account.key}
+                $active={selectedAccountKey === account.key}
+                $provider={selectedProvider}
+                onClick={() => setSelectedAccountKey(account.key)}
+                role="tab"
+                title={account.label}
+                type="button"
+              >
+                {account.label}
+              </AccountTab>
+            ))}
+          </AccountTabs>
+        ) : null}
 
         {error ? <TokenomicsError>{error}</TokenomicsError> : null}
 
@@ -1044,6 +1153,41 @@ const ProviderTab = styled.button`
   html[data-forge-theme="light"] & {
     color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#475569")};
     background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 12%, #ffffff)` : "transparent")};
+  }
+`;
+
+const AccountTabs = styled.div`
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 2px 1px 4px;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+const AccountTab = styled.button`
+  flex: 0 0 auto;
+  max-width: 210px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(148, 163, 184, 0.16)")};
+  border-radius: 7px;
+  color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#94a3b8")};
+  background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 14%, rgba(15, 23, 42, 0.74))` : "rgba(15, 23, 42, 0.48)")};
+  font: inherit;
+  font-size: 11px;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#475569")};
+    background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 10%, #ffffff)` : "#f8fafc")};
   }
 `;
 

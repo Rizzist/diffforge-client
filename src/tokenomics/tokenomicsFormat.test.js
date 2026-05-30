@@ -11,6 +11,8 @@ import {
   rowCache,
   rowInput,
   rowOutput,
+  rowProviderAccountKey,
+  rowProviderAccountLabel,
   rowTotal,
 } from "./tokenomicsFormat.js";
 
@@ -62,4 +64,16 @@ test("daily usage reads already-aggregated chart rows", () => {
     dailyUsageTitle(row),
     "Today: total 66.2M · input 66M · cache 64M · output 178K · cost $49",
   );
+});
+
+test("provider account helpers prefer explicit account identity", () => {
+  const row = {
+    subscription_key: "openai:codex:legacy",
+    provider_account_key: "openai:codex:abc123",
+    provider_account_label: "Codex account abc123",
+  };
+
+  assert.equal(rowProviderAccountKey(row), "openai:codex:abc123");
+  assert.equal(rowProviderAccountLabel(row), "Codex account abc123");
+  assert.equal(rowProviderAccountKey({ subscriptionKey: "anthropic:claude" }), "anthropic:claude");
 });

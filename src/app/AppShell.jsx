@@ -4577,6 +4577,14 @@ export default function App() {
     setWorkspaceError("");
   }, []);
 
+  const expireDesktopSession = useCallback((error) => {
+    setSignedOut(
+      "Your desktop session expired. Sign in again with the web app.",
+      getErrorMessage(error, "Desktop session expired."),
+      { clearPending: true },
+    );
+  }, [setSignedOut]);
+
   const setAuthenticated = useCallback((sessionUser) => {
     const isPaid = isPaidUser(sessionUser);
 
@@ -5873,14 +5881,6 @@ export default function App() {
       }));
     }
   }, []);
-
-  const expireDesktopSession = useCallback((error) => {
-    setSignedOut(
-      "Your desktop session expired. Sign in again with the web app.",
-      getErrorMessage(error, "Desktop session expired."),
-      { clearPending: true },
-    );
-  }, [setSignedOut]);
 
   const loadWorkspaces = useCallback(async () => {
     const token = authStore.getToken();
