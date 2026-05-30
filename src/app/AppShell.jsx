@@ -457,7 +457,7 @@ import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
-import TokenomicsWorkspaceView from "../tokenomics/TokenomicsWorkspaceView.jsx";
+import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -3723,6 +3723,7 @@ export default function App() {
   const terminalPresenceSyncKeyRef = useRef("");
   const workspaceMcpSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
+  const tokenomicsSyncInFlightRef = useRef(false);
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
@@ -8339,7 +8340,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (authState !== "authenticated" || !isPaidUser(user)) {
       return undefined;
     }
 
@@ -8576,6 +8577,10 @@ export default function App() {
         .pop() || "";
     };
     const syncTokenomics = async (reason) => {
+      if (tokenomicsSyncInFlightRef.current) {
+        return;
+      }
+      tokenomicsSyncInFlightRef.current = true;
       try {
         if (reason === "tokenomics_scan") {
           await invoke("tokenomics_scan_usage");
@@ -8617,20 +8622,22 @@ export default function App() {
             reason,
           });
         }
+      } finally {
+        tokenomicsSyncInFlightRef.current = false;
       }
     };
 
     syncTokenomics("tokenomics_scan");
     const intervalId = window.setInterval(
       () => syncTokenomics("tokenomics_heartbeat"),
-      10 * 1000,
+      60 * 1000,
     );
 
     return () => {
       disposed = true;
       window.clearInterval(intervalId);
     };
-  }, [shouldShowWorkspaceSetup, workspaceSyncState]);
+  }, [authState, user]);
 
   useEffect(() => {
     if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
@@ -12261,16 +12268,6 @@ export default function App() {
                         <span>Spec Graph</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="Tokenomics"
-                        data-active={activeView === "tokenomics"}
-                        onClick={() => showView("tokenomics")}
-                        title="Tokenomics"
-                        type="button"
-                      >
-                        <ButtonBrowserIcon aria-hidden="true" />
-                        <span>Tokenomics</span>
-                      </RailActionButton>
-                      <RailActionButton
                         aria-label="MCPs"
                         data-active={activeView === "mcps"}
                         onClick={() => showView("mcps")}
@@ -12304,6 +12301,17 @@ export default function App() {
                     >
                       <ButtonMicIcon aria-hidden="true" />
                       <span>Audio</span>
+                    </RailActionButton>
+                    <RailActionButton
+                      aria-label="Tokenomics"
+                      data-active={activeView === "tokenomics"}
+                      data-scope="global"
+                      onClick={() => showView("tokenomics")}
+                      title="Tokenomics"
+                      type="button"
+                    >
+                      <ButtonBrowserIcon aria-hidden="true" />
+                      <span>Tokenomics</span>
                     </RailActionButton>
                     <RailActionButton
                       aria-label="Settings"
@@ -13110,17 +13118,8 @@ export default function App() {
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (
-                <ForgeWorkspace aria-label="Workspace Tokenomics" data-motion={viewMotion}>
-                  {selectedWorkspace ? (
-                    <TokenomicsWorkspaceView
-                      billingStatus={billingStatus}
-                      defaultWorkingDirectory={defaultWorkingDirectory}
-                      rootDirectory={selectedWorkspaceFileRoot}
-                      workspace={selectedWorkspace}
-                    />
-                  ) : (
-                    <WorkspaceIdleState detail="Select a workspace to inspect Tokenomics." viewMotion={viewMotion} />
-                  )}
+                <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>
+                  <AccountTokenomicsView billingStatus={billingStatus} />
                 </ForgeWorkspace>
               ) : visibleView === "processes" ? (
                 <ForgeWorkspace aria-label="Processes" data-motion={viewMotion}>

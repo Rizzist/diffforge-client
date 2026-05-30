@@ -7703,6 +7703,8 @@ async fn cloud_mcp_sync_tokenomics_state(
     let payload = json!({
         "source": "rust-diffforge-tokenomics-sync",
         "event_kind": event_kind,
+        "scope": "account",
+        "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),

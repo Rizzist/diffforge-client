@@ -2,6 +2,21 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
+import {
+  dailyUsageTitle,
+  dailyUsageValue,
+  formatCost,
+  formatCostTitle,
+  formatTokenTitle,
+  formatTokens,
+  numeric,
+  rowActivityTokens,
+  rowCache,
+  rowCost,
+  rowInput,
+  rowOutput,
+  rowTotal,
+} from "./tokenomicsFormat.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 
@@ -35,28 +50,6 @@ function providerAccent(provider) {
   return PROVIDER_ACCENTS[provider] || "#60a5fa";
 }
 
-function numeric(...values) {
-  for (const value of values) {
-    const number = Number(value);
-    if (Number.isFinite(number)) return number;
-  }
-  return 0;
-}
-
-function formatTokens(value) {
-  const number = numeric(value);
-  if (number <= 0) return "0";
-  if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(number >= 10_000_000 ? 0 : 1)}M`;
-  if (number >= 1_000) return `${(number / 1_000).toFixed(number >= 100_000 ? 0 : 1)}K`;
-  return String(Math.round(number));
-}
-
-function formatCost(microusd) {
-  const value = numeric(microusd) / 1_000_000;
-  if (value <= 0) return "$0.00";
-  return `$${value.toFixed(value >= 10 ? 0 : 2)}`;
-}
-
 function formatCredits(value) {
   if (value == null || value === "") return "0";
   const raw = typeof value === "string" ? value.trim() : String(value);
@@ -82,30 +75,6 @@ function providerLabel(row) {
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[String(row?.provider || "").toLowerCase()] || row?.label || "Agent";
 }
 
-function rowTotal(row) {
-  return numeric(row?.total_tokens, row?.totalTokens);
-}
-
-function rowInput(row) {
-  return numeric(row?.input_tokens, row?.inputTokens);
-}
-
-function rowOutput(row) {
-  return numeric(row?.output_tokens, row?.outputTokens);
-}
-
-function rowCache(row) {
-  return numeric(
-    row?.cache_tokens,
-    row?.cacheTokens,
-    numeric(row?.cache_read_tokens, row?.cacheReadTokens) + numeric(row?.cache_write_tokens, row?.cacheWriteTokens),
-  );
-}
-
-function rowCost(row) {
-  return numeric(row?.estimated_cost_microusd, row?.estimatedCostMicrousd);
-}
-
 function filterRows(rows, selectedProvider) {
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   return rows.filter((row) => provider.match(row));
@@ -117,7 +86,7 @@ function aggregateRows(rows) {
       input: acc.input + rowInput(row),
       output: acc.output + rowOutput(row),
       cache: acc.cache + rowCache(row),
-      total: acc.total + rowTotal(row),
+      total: acc.total + rowActivityTokens(row),
       cost: acc.cost + rowCost(row),
       events: acc.events + numeric(row?.event_count, row?.eventCount),
     }),
@@ -401,14 +370,6 @@ function dailyBarHeight(value, maxValue) {
   return Math.max(11, Math.round((total / max) * 78));
 }
 
-function dailyUsageValue(row) {
-  return rowInput(row);
-}
-
-function dailyUsageTitle(row) {
-  return `${row.label}: input ${formatTokens(row.input)} · cache ${formatTokens(row.cache)} · output ${formatTokens(row.output)} · cost ${formatCost(row.cost)}`;
-}
-
 function modelBreakdown(modelRows, providerRows, selectedProvider) {
   const rows = filterRows(modelRows.length ? modelRows : providerRows, selectedProvider);
   const total = rows.reduce((sum, row) => sum + rowTotal(row), 0);
@@ -488,7 +449,15 @@ function tokenomicsLoadingDetail(progress) {
   return parts.join(" · ");
 }
 
-export default function TokenomicsWorkspaceView({ billingStatus = null } = {}) {
+function TokenCell({ value }) {
+  return <td title={formatTokenTitle(value)}>{formatTokens(value)}</td>;
+}
+
+function CostCell({ value }) {
+  return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
+}
+
+export default function AccountTokenomicsView({ billingStatus = null } = {}) {
   const [summary, setSummary] = useState(null);
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
@@ -768,17 +737,17 @@ export default function TokenomicsWorkspaceView({ billingStatus = null } = {}) {
             <tbody>
               <tr>
                 <td>Today</td>
-                <td>{formatTokens(today.input)}</td>
-                <td>{formatTokens(today.output)}</td>
-                <td>{formatTokens(today.cache)}</td>
-                <td>{formatCost(today.cost)}</td>
+                <TokenCell value={today.input} />
+                <TokenCell value={today.output} />
+                <TokenCell value={today.cache} />
+                <CostCell value={today.cost} />
               </tr>
               <tr>
                 <td>This Month</td>
-                <td>{formatTokens(month.input || total.input)}</td>
-                <td>{formatTokens(month.output || total.output)}</td>
-                <td>{formatTokens(month.cache || total.cache)}</td>
-                <td>{formatCost(month.cost || total.cost)}</td>
+                <TokenCell value={month.input || total.input} />
+                <TokenCell value={month.output || total.output} />
+                <TokenCell value={month.cache || total.cache} />
+                <CostCell value={month.cost || total.cost} />
               </tr>
             </tbody>
           </UsageTable>
@@ -1417,13 +1386,18 @@ const UsageTable = styled.table`
   th {
     color: #7f9ac1;
     font-size: clamp(8px, 2.1vw, 10px);
-    font-weight: 900;
+    font-weight: 800;
   }
 
   td {
     color: #e5eefb;
     font-size: clamp(9px, 2.5vw, 11px);
-    font-weight: 900;
+    font-weight: 750;
+    letter-spacing: 0;
+  }
+
+  td:first-child {
+    font-weight: 800;
   }
 
   html[data-forge-theme="light"] & {
@@ -1452,10 +1426,11 @@ const ModelRow = styled.div`
   gap: 8px;
   color: #dfe9f8;
   font-size: clamp(10px, 2.6vw, 12px);
-  font-weight: 900;
+  font-weight: 800;
 
   strong {
     color: #a8c3ee;
+    font-weight: 800;
   }
 
   html[data-forge-theme="light"] & {

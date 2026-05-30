@@ -63,7 +63,6 @@ import {
 } from "../threads/threadTerminalGroundTruth.js";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
-import TokenomicsWorkspaceView from "../tokenomics/TokenomicsWorkspaceView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
@@ -781,7 +780,6 @@ const VOICE_PLAN_PARKED_STATUSES = new Set([
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
   { id: "files", label: "Files" },
-  { id: "tokenomics", label: "Tokenomics" },
 ];
 const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
 const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
@@ -6348,15 +6346,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             rootDirectory={rootDirectory}
             workspace={workspace}
             workspaceError={workspaceError}
-          />
-        </WorkspaceToolSurface>
-      ) : activeWorkspaceTool === "tokenomics" ? (
-        <WorkspaceToolSurface data-tool="tokenomics">
-          <TokenomicsWorkspaceView
-            billingStatus={billingStatus}
-            defaultWorkingDirectory={defaultWorkingDirectory}
-            rootDirectory={rootDirectory}
-            workspace={workspace}
           />
         </WorkspaceToolSurface>
       ) : (
