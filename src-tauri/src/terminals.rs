@@ -2251,16 +2251,16 @@ async fn terminal_open(
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
     let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
-    let default_session_mode = if plain_shell || is_prewarm_pty {
+    let default_session_mode = if is_prewarm_pty {
         TerminalSessionMode::Free
     } else {
-        TerminalSessionMode::ManagedPatch
+        TerminalSessionMode::General
     };
     let session_mode =
         TerminalSessionMode::from_request(requested_session_mode.as_deref(), default_session_mode)?;
     if plain_shell && session_mode.requires_managed_patch_worktree() {
         return Err(
-            "Plain shell terminals cannot use managed patch mode. Use an agent terminal for managed patch mode or free/activity/remote mode for shell work."
+            "Plain shell terminals cannot be forced into managed patch mode. Use the default general worker authority for shell work."
                 .to_string(),
         );
     }
@@ -2370,6 +2370,7 @@ async fn terminal_open(
                 requested_project_root.as_deref(),
                 requested_mount_id.as_deref(),
             )?,
+            TerminalSessionMode::General => working_directory.clone(),
             TerminalSessionMode::DirectEdit => terminal_project_root.clone(),
             TerminalSessionMode::Activity | TerminalSessionMode::RemoteOps => working_directory.clone(),
             TerminalSessionMode::Free => working_directory.clone(),
@@ -7159,6 +7160,16 @@ mod terminal_tests {
             TerminalSessionMode::ManagedPatch
         );
         assert_eq!(
+            TerminalSessionMode::from_request(Some("general-worker"), TerminalSessionMode::Free)
+                .unwrap(),
+            TerminalSessionMode::General
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("task_scoped"), TerminalSessionMode::Free)
+                .unwrap(),
+            TerminalSessionMode::General
+        );
+        assert_eq!(
             TerminalSessionMode::from_request(Some("direct"), TerminalSessionMode::ManagedPatch)
                 .unwrap(),
             TerminalSessionMode::DirectEdit
@@ -7179,6 +7190,7 @@ mod terminal_tests {
                 .unwrap_err();
         assert!(invalid.contains("managed_patch"));
 
+        assert_eq!(TerminalSessionMode::General.file_authority(), "task_scoped");
         assert_eq!(
             TerminalSessionMode::ManagedPatch.file_authority(),
             "git_worktree_patch"
@@ -7201,6 +7213,7 @@ mod terminal_tests {
     #[test]
     fn non_free_modes_prepare_coordination_but_only_managed_patch_refreshes_context_pack() {
         let modes = [
+            TerminalSessionMode::General,
             TerminalSessionMode::ManagedPatch,
             TerminalSessionMode::DirectEdit,
             TerminalSessionMode::Activity,

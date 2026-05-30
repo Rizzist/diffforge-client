@@ -335,6 +335,26 @@ async fn update_workspace(
 }
 
 #[tauri::command]
+async fn delete_workspace(token: String, workspace_id: String) -> Result<Value, String> {
+    validate_auth_value("Desktop session", &token)?;
+
+    let workspace_id = clean_workspace_id(workspace_id)?;
+
+    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
+    let response = client
+        .delete(format!("{API_BASE_URL}/desktop/workspaces"))
+        .bearer_auth(token)
+        .json(&DeleteWorkspaceRequest {
+            workspace_id: &workspace_id,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Unable to delete workspace: {error}"))?;
+
+    read_api_response(response, "Unable to delete workspace.").await
+}
+
+#[tauri::command]
 async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let npm_version_handle = thread::spawn(|| {

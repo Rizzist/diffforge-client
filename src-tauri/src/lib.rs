@@ -733,6 +733,7 @@ struct TerminalCoordinationSession {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalSessionMode {
+    General,
     ManagedPatch,
     DirectEdit,
     Activity,
@@ -743,6 +744,7 @@ enum TerminalSessionMode {
 impl TerminalSessionMode {
     fn as_str(self) -> &'static str {
         match self {
+            TerminalSessionMode::General => "general",
             TerminalSessionMode::ManagedPatch => "managed_patch",
             TerminalSessionMode::DirectEdit => "direct_edit",
             TerminalSessionMode::Activity => "activity",
@@ -753,6 +755,7 @@ impl TerminalSessionMode {
 
     fn file_authority(self) -> &'static str {
         match self {
+            TerminalSessionMode::General => "task_scoped",
             TerminalSessionMode::ManagedPatch => "git_worktree_patch",
             TerminalSessionMode::DirectEdit => "bounded_direct_edit",
             TerminalSessionMode::Activity => "none",
@@ -763,6 +766,7 @@ impl TerminalSessionMode {
 
     fn coordination_enforcement_mode(self) -> &'static str {
         match self {
+            TerminalSessionMode::General => "general_worker",
             TerminalSessionMode::ManagedPatch => "worktree_required",
             TerminalSessionMode::DirectEdit => "bounded_direct_edit",
             TerminalSessionMode::Activity => "activity_only",
@@ -773,11 +777,12 @@ impl TerminalSessionMode {
 
     fn completion_mode(self) -> &'static str {
         match self {
-            TerminalSessionMode::ManagedPatch => "submit_patch",
-            TerminalSessionMode::DirectEdit
+            TerminalSessionMode::General
+            | TerminalSessionMode::DirectEdit
             | TerminalSessionMode::Activity
             | TerminalSessionMode::Free
             | TerminalSessionMode::RemoteOps => "complete_task",
+            TerminalSessionMode::ManagedPatch => "submit_patch",
         }
     }
 
@@ -802,6 +807,9 @@ impl TerminalSessionMode {
         };
 
         match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "general" | "worker" | "general_worker" | "task_scoped" => {
+                Ok(TerminalSessionMode::General)
+            }
             "managed" | "managed_patch" | "patch" | "patch_mode" | "worktree" => {
                 Ok(TerminalSessionMode::ManagedPatch)
             }
@@ -809,7 +817,7 @@ impl TerminalSessionMode {
             "activity" | "activity_mode" => Ok(TerminalSessionMode::Activity),
             "free" | "free_terminal" | "unmanaged" => Ok(TerminalSessionMode::Free),
             "remote" | "remote_ops" | "ssh" => Ok(TerminalSessionMode::RemoteOps),
-            _ => Err("Terminal session mode must be one of managed_patch, direct_edit, activity, free, or remote_ops.".to_string()),
+            _ => Err("Terminal session mode must be one of general, managed_patch, direct_edit, activity, free, or remote_ops.".to_string()),
         }
     }
 }
@@ -1085,6 +1093,12 @@ struct CreateWorkspaceRequest<'a> {
 struct UpdateWorkspaceRequest<'a> {
     workspace_id: &'a str,
     name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteWorkspaceRequest<'a> {
+    workspace_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -2598,6 +2612,233 @@ async fn deactivate_workspace_runtime(
     Ok(result)
 }
 
+fn workspace_delete_known_metadata_paths(agents_root: &Path) -> Vec<PathBuf> {
+    [
+        "spec-graph",
+        "worktrees",
+        "cloud-mcp",
+        "artifacts",
+        "memory",
+        "mcp",
+        "cloud",
+        "db",
+        "kernel.sqlite",
+        "kernel.sqlite-wal",
+        "kernel.sqlite-shm",
+        "diffforge_threads.sqlite3",
+        "diffforge_threads.sqlite3-wal",
+        "diffforge_threads.sqlite3-shm",
+    ]
+    .into_iter()
+    .map(|name| agents_root.join(name))
+    .collect()
+}
+
+fn workspace_delete_path_is_exact_child(path: &Path, parent: &Path) -> bool {
+    path.parent()
+        .map(|path_parent| normalized_path_key(path_parent) == normalized_path_key(parent))
+        .unwrap_or(false)
+}
+
+fn workspace_delete_git_dirty_summary(path: &Path) -> Result<Option<String>, String> {
+    if !path.join(".git").exists() {
+        return Ok(None);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("Unable to inspect {} with git: {error}", path.display()))?;
+
+    if !output.status.success() {
+        if path.join(".git").exists() {
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(240)
+                .collect::<String>();
+            return Err(format!(
+                "Unable to inspect worktree {} before deletion{}",
+                path.display(),
+                if stderr.is_empty() {
+                    ".".to_string()
+                } else {
+                    format!(": {stderr}")
+                }
+            ));
+        }
+        return Ok(None);
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .take(8)
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if status.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(status))
+    }
+}
+
+fn workspace_delete_dirty_worktrees(worktrees_root: &Path) -> Result<Vec<Value>, String> {
+    if !worktrees_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut dirty = Vec::new();
+    let entries = fs::read_dir(worktrees_root)
+        .map_err(|error| format!("Unable to read workspace worktrees: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Unable to read workspace worktree: {error}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("Unable to inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        if let Some(summary) = workspace_delete_git_dirty_summary(&path)? {
+            dirty.push(json!({
+                "path": path.display().to_string(),
+                "status": summary,
+            }));
+        }
+    }
+    Ok(dirty)
+}
+
+fn workspace_delete_remove_path(path: &Path, agents_root: &Path) -> Result<bool, String> {
+    if !workspace_delete_path_is_exact_child(path, agents_root) {
+        return Err(format!(
+            "Refusing to delete workspace metadata path outside .agents: {}",
+            path.display()
+        ));
+    }
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!("Unable to inspect {}: {error}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(true);
+    }
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn delete_workspace_local_metadata_for(
+    repo_path: String,
+    discard_dirty_worktrees: bool,
+) -> Result<Value, String> {
+    let root = resolve_workspace_root_directory(Some(&repo_path))?;
+    let agents_root = root.join(".agents");
+    let agents_metadata = match fs::symlink_metadata(&agents_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({
+                "ok": true,
+                "repoPath": root.display().to_string(),
+                "agentsRoot": agents_root.display().to_string(),
+                "removed": [],
+                "removedCount": 0,
+                "agentsRootRemoved": false,
+                "skipped": true,
+            }));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to inspect workspace .agents directory: {error}"
+            ));
+        }
+    };
+
+    if agents_metadata.file_type().is_symlink() || !agents_metadata.is_dir() {
+        return Err(
+            "Workspace .agents path is not a directory; refusing metadata delete.".to_string(),
+        );
+    }
+
+    let worktrees_root = agents_root.join("worktrees");
+    let dirty_worktrees = workspace_delete_dirty_worktrees(&worktrees_root)?;
+    if !discard_dirty_worktrees && !dirty_worktrees.is_empty() {
+        return Err(format!(
+            "Workspace has {} dirty Diff Forge worktree{} under .agents/worktrees. Submit, save, or discard those changes before deleting the workspace.",
+            dirty_worktrees.len(),
+            if dirty_worktrees.len() == 1 { "" } else { "s" },
+        ));
+    }
+
+    let mut removed = Vec::new();
+    for path in workspace_delete_known_metadata_paths(&agents_root) {
+        if workspace_delete_remove_path(&path, &agents_root)? {
+            removed.push(path.display().to_string());
+        }
+    }
+
+    let agents_root_removed = match fs::read_dir(&agents_root) {
+        Ok(entries) => {
+            let is_empty = entries.into_iter().next().is_none();
+            if is_empty {
+                fs::remove_dir(&agents_root).map_err(|error| {
+                    format!(
+                        "Unable to remove empty workspace .agents directory {}: {error}",
+                        agents_root.display()
+                    )
+                })?;
+            }
+            is_empty
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Unable to inspect workspace .agents directory after cleanup: {error}"
+            ));
+        }
+    };
+
+    let removed_count = removed.len();
+
+    Ok(json!({
+        "ok": true,
+        "repoPath": root.display().to_string(),
+        "agentsRoot": agents_root.display().to_string(),
+        "removed": removed,
+        "removedCount": removed_count,
+        "dirtyWorktrees": dirty_worktrees,
+        "agentsRootRemoved": agents_root_removed,
+        "skipped": false,
+    }))
+}
+
+#[tauri::command]
+async fn delete_workspace_local_metadata(
+    repo_path: String,
+    discard_dirty_worktrees: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_workspace_local_metadata_for(repo_path, discard_dirty_worktrees.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("Unable to delete workspace metadata: {error}"))?
+}
+
 #[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -2671,6 +2912,74 @@ fn note_main_window_minimize_requested() -> Result<(), String> {
     mark_main_window_minimize_requested();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_delete_local_metadata_tests {
+    use super::*;
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("diffforge-{name}-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn delete_workspace_local_metadata_removes_only_owned_agents_paths() {
+        let root = temp_workspace("workspace-delete-metadata");
+        let agents = root.join(".agents");
+        fs::create_dir_all(agents.join("spec-graph")).unwrap();
+        fs::create_dir_all(agents.join("worktrees").join("slot-1")).unwrap();
+        fs::write(agents.join("spec-graph").join("cache.json"), "{}").unwrap();
+        fs::write(
+            agents.join("worktrees").join("slot-1").join("note.txt"),
+            "draft",
+        )
+        .unwrap();
+        fs::write(agents.join("kernel.sqlite"), "").unwrap();
+        fs::write(root.join("source.txt"), "keep").unwrap();
+
+        let result =
+            delete_workspace_local_metadata_for(root.display().to_string(), false).unwrap();
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["agentsRootRemoved"], json!(true));
+        assert!(!agents.exists());
+        assert_eq!(fs::read_to_string(root.join("source.txt")).unwrap(), "keep");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_workspace_local_metadata_blocks_dirty_git_worktrees() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = temp_workspace("workspace-delete-dirty-worktree");
+        let worktree = root.join(".agents").join("worktrees").join("slot-1");
+        fs::create_dir_all(&worktree).unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        fs::write(worktree.join("dirty.txt"), "unsaved").unwrap();
+
+        let error =
+            delete_workspace_local_metadata_for(root.display().to_string(), false).unwrap_err();
+
+        assert!(error.contains("dirty Diff Forge worktree"));
+        assert!(worktree.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2835,6 +3144,7 @@ pub fn run() {
             list_workspaces,
             create_workspace,
             update_workspace,
+            delete_workspace,
             agent_statuses,
             start_agent_login,
             disconnect_agent,
@@ -2854,6 +3164,7 @@ pub fn run() {
             workspace_web_navigate,
             workspace_web_reload,
             workspace_web_close_all,
+            delete_workspace_local_metadata,
             run_forge_prompt,
             agent_thread_turn_start,
             save_todo_image_attachments,
@@ -2901,6 +3212,7 @@ pub fn run() {
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_terminal_presence,
             cloud_mcp_sync_workspace_mcp_snapshot,
+            cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             tokenomics_scan_usage,
             tokenomics_get_summary,

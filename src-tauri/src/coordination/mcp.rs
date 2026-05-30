@@ -2948,12 +2948,42 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         ));
     }
     let resource_key = req(input, "resource_key")?;
-    let file_authority = input["file_authority"].as_str().unwrap_or("none");
-    let enforcement_mode = input["enforcement_mode"].as_str().unwrap_or_default();
-    let no_local_file_authority = matches!(enforcement_mode, "activity_only" | "remote_unmanaged")
-        || matches!(file_authority, "remote_unmanaged" | "external_unmanaged")
-        || (file_authority == "none"
-            && matches!(enforcement_mode, "activity_only" | "remote_unmanaged"));
+    let mut file_authority = input["file_authority"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
+    let mut enforcement_mode = input["enforcement_mode"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut authority_resolution = Value::Null;
+    if enforcement_mode == "general_worker" && cloud_file_resource_key(resource_key) {
+        authority_resolution =
+            kernel.resolve_general_worker_file_authority(agent_id, session_id)?;
+        if let Some(value) = authority_resolution["enforcement_mode"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            enforcement_mode = value.to_string();
+        }
+        if let Some(value) = authority_resolution["file_authority"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            file_authority = value.to_string();
+        }
+    }
+    let no_local_file_authority = matches!(
+        enforcement_mode.as_str(),
+        "activity_only" | "remote_unmanaged"
+    ) || matches!(
+        file_authority.as_str(),
+        "remote_unmanaged" | "external_unmanaged"
+    ) || (file_authority == "none"
+        && matches!(
+            enforcement_mode.as_str(),
+            "activity_only" | "remote_unmanaged"
+        ));
     if no_local_file_authority && cloud_file_resource_key(resource_key) {
         return Ok(api_error(
             "no_local_file_authority",
@@ -3021,6 +3051,9 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
     let mut response = acquired;
     if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
         data.insert("cloud".to_string(), cloud);
+        if !authority_resolution.is_null() {
+            data.insert("authority".to_string(), authority_resolution);
+        }
     }
     Ok(response)
 }
@@ -3558,30 +3591,6 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
     let Some(object) = input.as_object_mut() else {
         return;
     };
-    let missing_task_id = object
-        .get("task_id")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    let missing_agent_id = object
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    let missing_session_id = object
-        .get("session_id")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    let missing_terminal_launch_epoch = object
-        .get("terminal_launch_epoch")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    if !missing_task_id
-        && !missing_agent_id
-        && !missing_session_id
-        && !missing_terminal_launch_epoch
-    {
-        return;
-    }
-
     let session = active_session_for_identity(
         kernel,
         object.get("session_id").and_then(Value::as_str),
@@ -3600,8 +3609,6 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
         ("session_id", "id"),
         ("terminal_launch_epoch", "terminal_launch_epoch"),
         ("task_id", "task_id"),
-        ("worktree_id", "worktree_id"),
-        ("enforcement_mode", "enforcement_mode"),
     ] {
         let missing = object
             .get(key)
@@ -3614,6 +3621,34 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
             {
                 object.insert(key.to_string(), Value::String(value.to_string()));
             }
+        }
+    }
+    let session_enforcement = session["enforcement_mode"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("coordination_only");
+    let current_enforcement = object
+        .get("enforcement_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let refresh_authority = current_enforcement.is_empty()
+        || matches!(
+            current_enforcement,
+            "general_worker" | "coordination_only" | "activity_only" | "read_only"
+        )
+        || session_enforcement == "worktree_required";
+    if refresh_authority {
+        object.insert(
+            "enforcement_mode".to_string(),
+            Value::String(session_enforcement.to_string()),
+        );
+        if let Some(value) = session["worktree_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            object.insert("worktree_id".to_string(), Value::String(value.to_string()));
         }
     }
     let missing_worktree_path = object
@@ -3640,13 +3675,7 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            session["enforcement_mode"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or("coordination_only");
+        .unwrap_or(session_enforcement);
     let (session_mode, file_authority, completion_mode) =
         coordination_authority_for_enforcement_mode(enforcement_mode);
     for (key, value) in [
@@ -3658,7 +3687,7 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
             .get(key)
             .and_then(Value::as_str)
             .is_none_or(|value| value.trim().is_empty());
-        if missing {
+        if missing || refresh_authority {
             object.insert(key.to_string(), Value::String(value.to_string()));
         }
     }
@@ -3668,6 +3697,7 @@ fn coordination_authority_for_enforcement_mode(
     enforcement_mode: &str,
 ) -> (&'static str, &'static str, &'static str) {
     match enforcement_mode {
+        "general_worker" => ("general", "task_scoped", "complete_task"),
         "worktree_required" => ("managed_patch", "git_worktree_patch", "submit_patch"),
         "bounded_direct_edit" => ("direct_edit", "bounded_direct_edit", "complete_task"),
         "activity_only" => ("activity", "none", "complete_task"),

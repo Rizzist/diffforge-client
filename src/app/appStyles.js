@@ -4564,6 +4564,12 @@ export const TerminalModeBadge = styled.span`
     background: rgba(98, 160, 255, 0.13);
   }
 
+  &[data-mode="worker"] {
+    border-color: rgba(98, 160, 255, 0.24);
+    color: #d6e5ff;
+    background: rgba(98, 160, 255, 0.1);
+  }
+
   &[data-mode="direct_edit"] {
     border-color: rgba(250, 204, 21, 0.3);
     color: #fde68a;
@@ -8200,9 +8206,9 @@ export const McpHeaderPanel = styled.section`
 
 export const McpTitleRow = styled.div`
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) auto;
+  grid-template-columns: 44px minmax(260px, 0.72fr) minmax(420px, 1.28fr);
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 
   > div {
@@ -8214,7 +8220,8 @@ export const McpTitleRow = styled.div`
     overflow: hidden;
     font-size: 15px;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   p {
@@ -8224,8 +8231,8 @@ export const McpTitleRow = styled.div`
   }
 
   ${VaultPlaceholderIcon} {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
     border-color: rgba(125, 160, 205, 0.24);
     color: var(--forge-blue-soft);
     background: rgba(125, 160, 205, 0.08);
@@ -8247,7 +8254,7 @@ export const McpTitleRow = styled.div`
   }
 
   @media (max-width: 760px) {
-    grid-template-columns: 36px minmax(0, 1fr);
+    grid-template-columns: 44px minmax(0, 1fr);
 
     > button {
       grid-column: 1 / -1;
@@ -8255,8 +8262,8 @@ export const McpTitleRow = styled.div`
     }
   }
 
-  @container (max-width: 760px) {
-    grid-template-columns: 36px minmax(0, 1fr);
+  @container (max-width: 1120px) {
+    grid-template-columns: 44px minmax(0, 1fr);
 
     > [aria-label="MCP summary"] {
       grid-column: 1 / -1;
@@ -8356,6 +8363,10 @@ export const McpHeaderMetrics = styled.div`
   justify-content: flex-end;
   gap: 6px;
   flex-wrap: wrap;
+
+  @container (max-width: 1120px) {
+    justify-content: flex-start;
+  }
 `;
 
 export const McpMetricPill = styled.span`
@@ -9052,22 +9063,36 @@ export const McpToolChip = styled.span`
 
 export const McpInlineActions = styled.span`
   display: inline-flex;
+  flex: 1 1 420px;
+  min-width: min(100%, 360px);
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 5px;
+
+  ${McpInput} {
+    flex: 1 1 260px;
+    width: auto;
+    min-width: min(100%, 220px);
+    max-width: 460px;
+    min-height: 34px;
+  }
 
   button {
     display: inline-flex;
-    min-height: 26px;
+    flex: 0 0 auto;
+    min-height: 34px;
     align-items: center;
     justify-content: center;
     gap: 5px;
-    padding: 0 7px;
+    padding: 0 10px;
     border: 1px solid var(--forge-border);
     border-radius: 6px;
     color: var(--forge-text-soft);
     background: rgba(21, 27, 35, 0.72);
     font-size: 10px;
     font-weight: 900;
+    white-space: nowrap;
 
     html[data-forge-theme="light"] & {
       background: var(--forge-surface);
@@ -9077,6 +9102,26 @@ export const McpInlineActions = styled.span`
   button:hover {
     border-color: rgba(125, 160, 205, 0.34);
     color: var(--forge-text);
+  }
+
+  @container (max-width: 1120px) {
+    flex: 1 1 100%;
+    justify-content: flex-start;
+  }
+
+  @container (max-width: 560px) {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+
+    ${McpInput} {
+      grid-column: 1 / -1;
+      max-width: none;
+    }
+
+    button {
+      width: 100%;
+    }
   }
 `;
 

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import styled from "styled-components";
 import {
   dailyUsageTitle,
@@ -19,6 +19,7 @@ import {
 } from "./tokenomicsFormat.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
+const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 
 const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
@@ -45,6 +46,20 @@ const PROVIDER_ACCENTS = {
   codex: "#60a5fa",
   claude: "#fb923c",
 };
+
+function createTokenomicsStoreState() {
+  return {
+    summary: null,
+    status: "loading",
+    error: "",
+    selectedProvider: "all",
+    scanProgress: null,
+  };
+}
+
+function normalizeTokenomicsAccountKey(accountKey) {
+  return String(accountKey || "local-account").trim() || "local-account";
+}
 
 function providerAccent(provider) {
   return PROVIDER_ACCENTS[provider] || "#60a5fa";
@@ -427,6 +442,174 @@ function mergeTokenomicsSummary(previous, next) {
   };
 }
 
+const tokenomicsStore = {
+  accountKey: "local-account",
+  requestEpoch: 0,
+  state: createTokenomicsStoreState(),
+  loadedOnce: false,
+  loadPromise: null,
+  pollInterval: null,
+  pollSubscriberCount: 0,
+  progressListenerPromise: null,
+  progressUnlisten: null,
+  subscribers: new Set(),
+};
+
+function notifyTokenomicsSubscribers() {
+  for (const subscriber of tokenomicsStore.subscribers) {
+    subscriber(tokenomicsStore.state);
+  }
+}
+
+function updateTokenomicsStore(patchOrUpdater) {
+  const previous = tokenomicsStore.state;
+  const patch = typeof patchOrUpdater === "function"
+    ? patchOrUpdater(previous)
+    : patchOrUpdater;
+  tokenomicsStore.state = {
+    ...previous,
+    ...(patch || {}),
+  };
+  notifyTokenomicsSubscribers();
+}
+
+function subscribeTokenomicsStore(subscriber) {
+  tokenomicsStore.subscribers.add(subscriber);
+  subscriber(tokenomicsStore.state);
+  return () => {
+    tokenomicsStore.subscribers.delete(subscriber);
+  };
+}
+
+function tokenomicsErrorMessage(caught) {
+  return caught?.message || String(caught || "Unable to load Tokenomics.");
+}
+
+function mergeSummaryIntoTokenomicsStore(next) {
+  updateTokenomicsStore((previous) => ({
+    summary: mergeTokenomicsSummary(previous.summary, next || {}),
+  }));
+}
+
+function resetTokenomicsStoreForAccount(accountKey) {
+  const normalizedAccountKey = normalizeTokenomicsAccountKey(accountKey);
+  if (tokenomicsStore.accountKey === normalizedAccountKey) {
+    return;
+  }
+
+  tokenomicsStore.accountKey = normalizedAccountKey;
+  tokenomicsStore.requestEpoch += 1;
+  tokenomicsStore.loadedOnce = false;
+  tokenomicsStore.loadPromise = null;
+  tokenomicsStore.state = createTokenomicsStoreState();
+  notifyTokenomicsSubscribers();
+}
+
+function ensureTokenomicsProgressListener() {
+  if (tokenomicsStore.progressUnlisten || tokenomicsStore.progressListenerPromise) {
+    return;
+  }
+
+  tokenomicsStore.progressListenerPromise = listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
+    const payload = event.payload || null;
+    updateTokenomicsStore({ scanProgress: payload });
+    if (payload?.summary) {
+      mergeSummaryIntoTokenomicsStore(payload.summary);
+    }
+  })
+    .then((handler) => {
+      tokenomicsStore.progressUnlisten = handler;
+    })
+    .catch(() => {})
+    .finally(() => {
+      tokenomicsStore.progressListenerPromise = null;
+    });
+}
+
+function loadTokenomicsStore({ scan = false, force = false } = {}) {
+  const hasSummary = Boolean(tokenomicsStore.state.summary);
+  const shouldScan = Boolean(scan || !tokenomicsStore.loadedOnce);
+  const requestEpoch = tokenomicsStore.requestEpoch;
+
+  if (tokenomicsStore.loadPromise) {
+    return tokenomicsStore.loadPromise;
+  }
+  if (!force && !shouldScan && tokenomicsStore.loadedOnce && hasSummary) {
+    return Promise.resolve(tokenomicsStore.state.summary);
+  }
+
+  updateTokenomicsStore((previous) => ({
+    error: "",
+    scanProgress: shouldScan ? null : previous.scanProgress,
+    status: shouldScan ? "scanning" : (previous.summary ? "ready" : "loading"),
+  }));
+
+  tokenomicsStore.loadPromise = (async () => {
+    try {
+      if (shouldScan) {
+        invoke("tokenomics_get_live_limits")
+          .then((limitsSummary) => {
+            if (tokenomicsStore.requestEpoch === requestEpoch) {
+              mergeSummaryIntoTokenomicsStore(limitsSummary || {});
+            }
+          })
+          .catch(() => {});
+      }
+
+      const next = shouldScan
+        ? await invoke("tokenomics_scan_usage")
+        : await invoke("tokenomics_get_summary");
+      if (tokenomicsStore.requestEpoch !== requestEpoch) {
+        return tokenomicsStore.state.summary;
+      }
+      tokenomicsStore.loadedOnce = true;
+      updateTokenomicsStore((previous) => ({
+        error: "",
+        status: "ready",
+        summary: mergeTokenomicsSummary(previous.summary, next || {}),
+      }));
+      return tokenomicsStore.state.summary;
+    } catch (caught) {
+      if (tokenomicsStore.requestEpoch !== requestEpoch) {
+        return tokenomicsStore.state.summary;
+      }
+      updateTokenomicsStore((previous) => ({
+        error: tokenomicsErrorMessage(caught),
+        status: previous.summary ? "ready" : "error",
+      }));
+      return tokenomicsStore.state.summary;
+    }
+  })();
+
+  tokenomicsStore.loadPromise.finally(() => {
+    if (tokenomicsStore.requestEpoch === requestEpoch) {
+      tokenomicsStore.loadPromise = null;
+    }
+  });
+
+  return tokenomicsStore.loadPromise;
+}
+
+function startTokenomicsViewPolling() {
+  ensureTokenomicsProgressListener();
+  tokenomicsStore.pollSubscriberCount += 1;
+  void loadTokenomicsStore();
+
+  if (!tokenomicsStore.pollInterval) {
+    tokenomicsStore.pollInterval = window.setInterval(() => {
+      void loadTokenomicsStore({ force: true });
+    }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
+  }
+
+  return () => {
+    tokenomicsStore.pollSubscriberCount = Math.max(0, tokenomicsStore.pollSubscriberCount - 1);
+    if (tokenomicsStore.pollSubscriberCount === 0 && tokenomicsStore.pollInterval) {
+      window.clearInterval(tokenomicsStore.pollInterval);
+      tokenomicsStore.pollInterval = null;
+    }
+  };
+}
+
 function tokenomicsLoadingLabel(status, summary, progress) {
   const phase = String(progress?.phase || "");
   if (phase === "complete") return "Finalizing usage";
@@ -457,95 +640,34 @@ function CostCell({ value }) {
   return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
 }
 
-export default function AccountTokenomicsView({ billingStatus = null } = {}) {
-  const [summary, setSummary] = useState(null);
-  const [status, setStatus] = useState("loading");
-  const [error, setError] = useState("");
-  const [selectedProvider, setSelectedProvider] = useState("all");
-  const [scanProgress, setScanProgress] = useState(null);
-  const loadedOnceRef = useRef(false);
+export default function AccountTokenomicsView({ accountKey = "", billingStatus = null } = {}) {
+  const [{
+    summary,
+    status,
+    error,
+    selectedProvider,
+    scanProgress,
+  }, setTokenomicsState] = useState(() => tokenomicsStore.state);
 
   const refresh = useCallback(async ({ scan = false } = {}) => {
-    setStatus(scan ? "scanning" : "loading");
-    setError("");
-    if (scan) setScanProgress(null);
-    try {
-      if (scan) {
-        invoke("tokenomics_get_live_limits")
-          .then((limitsSummary) => {
-            setSummary((previous) => mergeTokenomicsSummary(previous, limitsSummary || {}));
-          })
-          .catch(() => {});
-      }
-      const next = scan
-        ? await invoke("tokenomics_scan_usage")
-        : await invoke("tokenomics_get_summary");
-      setSummary((previous) => mergeTokenomicsSummary(previous, next || {}));
-      setStatus("ready");
-    } catch (caught) {
-      setError(caught?.message || String(caught || "Unable to load Tokenomics."));
-      setStatus("error");
-    }
+    await loadTokenomicsStore({ scan, force: true });
+  }, []);
+
+  const setSelectedProvider = useCallback((provider) => {
+    updateTokenomicsStore({ selectedProvider: provider });
   }, []);
 
   useEffect(() => {
-    let disposed = false;
-    const load = async () => {
-      try {
-        const command = loadedOnceRef.current ? "tokenomics_get_summary" : "tokenomics_scan_usage";
-        loadedOnceRef.current = true;
-        if (command === "tokenomics_scan_usage") {
-          invoke("tokenomics_get_live_limits")
-            .then((limitsSummary) => {
-              if (!disposed) {
-                setSummary((previous) => mergeTokenomicsSummary(previous, limitsSummary || {}));
-              }
-            })
-            .catch(() => {});
-        }
-        const next = await invoke(command);
-        if (!disposed) {
-          setSummary((previous) => mergeTokenomicsSummary(previous, next || {}));
-          setStatus("ready");
-        }
-      } catch (caught) {
-        if (!disposed) {
-          setError(caught?.message || String(caught || "Unable to load Tokenomics."));
-          setStatus("error");
-        }
-      }
-    };
-    load();
-    const interval = window.setInterval(load, 10_000);
-    return () => {
-      disposed = true;
-      window.clearInterval(interval);
-    };
-  }, []);
+    resetTokenomicsStoreForAccount(accountKey);
+    void loadTokenomicsStore();
+  }, [accountKey]);
 
   useEffect(() => {
-    let disposed = false;
-    let unlisten = null;
-    listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
-      if (!disposed) {
-        const payload = event.payload || null;
-        setScanProgress(payload);
-        if (payload?.summary) {
-          setSummary((previous) => mergeTokenomicsSummary(previous, payload.summary || {}));
-        }
-      }
-    })
-      .then((handler) => {
-        if (disposed) {
-          handler();
-        } else {
-          unlisten = handler;
-        }
-      })
-      .catch(() => {});
+    const unsubscribeStore = subscribeTokenomicsStore(setTokenomicsState);
+    const stopPolling = startTokenomicsViewPolling();
     return () => {
-      disposed = true;
-      if (unlisten) unlisten();
+      stopPolling();
+      unsubscribeStore();
     };
   }, []);
 

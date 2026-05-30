@@ -430,6 +430,7 @@ import {
   ButtonBrowserIcon,
   ButtonCloseIcon,
   ButtonDarkModeIcon,
+  ButtonDeleteIcon,
   ButtonFolderIcon,
   ButtonLightModeIcon,
   ButtonLogoutIcon,
@@ -4953,6 +4954,168 @@ export default function App() {
     }
   }, [clearPreparedWorkspaceTerminals, defaultWorkingDirectory, updateWorkspaceLifecycleSettings]);
 
+  const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
+    const targetWorkspaceId = String(workspaceId || "").trim();
+    const targetWorkspace = findWorkspaceById(workspacesRef.current, targetWorkspaceId);
+
+    if (!targetWorkspaceId || !targetWorkspace) {
+      setWorkspaceSettingsError("Choose a workspace before deleting it.");
+      return;
+    }
+
+    if (workspaceDeactivationInFlightRef.current || workspaceSettingsState === "deleting") {
+      return;
+    }
+
+    const token = authStore.getToken();
+    if (!isSafeAuthValue(token)) {
+      expireDesktopSession("Desktop session required to delete workspace.");
+      return;
+    }
+
+    const workspaceName = String(targetWorkspace.name || targetWorkspaceId).trim();
+    const repoPath = getWorkspaceRootDirectory(workspaceSettingsRef.current, targetWorkspaceId)
+      || defaultWorkingDirectoryRef.current;
+    if (!repoPath) {
+      setWorkspaceSettingsError("Workspace root is missing. Choose a root before deleting this workspace.");
+      return;
+    }
+
+    const confirmation = window.prompt(
+      `Delete "${workspaceName}" from Diff Forge? This removes Diff Forge cloud/live state and local .agents metadata, but does not delete your project files.\n\nType the workspace name to continue.`,
+      "",
+    );
+    if (confirmation !== workspaceName) {
+      return;
+    }
+
+    workspaceDeactivationInFlightRef.current = targetWorkspaceId;
+    setWorkspaceSettingsState("deleting");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    clearPreparedWorkspaceTerminals(targetWorkspaceId);
+    workspaceAgentLaunchKeyRef.current = "";
+    workspaceAgentBatchInFlightKeyRef.current = "";
+    setWorkspaceAgentBatchSentKey("");
+
+    try {
+      await withTimeout(
+        invoke("deactivate_workspace_runtime", {
+          repoPath,
+          reason: "workspace_delete",
+          workspaceId: targetWorkspaceId,
+        }),
+        WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
+        "Workspace runtime cleanup timed out.",
+      );
+
+      await invoke("delete_workspace_local_metadata", {
+        repoPath,
+        discardDirtyWorktrees: false,
+      });
+
+      await invoke("cloud_mcp_delete_workspace", {
+        repoPath,
+        workspaceId: targetWorkspaceId,
+        workspaceName,
+        includeChildProjects: false,
+      });
+
+      await invoke("delete_workspace", {
+        token,
+        workspaceId: targetWorkspaceId,
+      });
+
+      const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+        .filter((workspace) => workspace.id !== targetWorkspaceId);
+      workspacesRef.current = nextWorkspaces;
+      setWorkspaces(nextWorkspaces);
+
+      const nextSettings = { ...(workspaceSettingsRef.current || {}) };
+      delete nextSettings[targetWorkspaceId];
+      workspaceSettingsRef.current = nextSettings;
+      persistWorkspaceSettings(nextSettings);
+      setWorkspaceSettings(nextSettings);
+
+      const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+      const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+        previousLifecycleSettings.enabledWorkspaceIds,
+      ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
+      updateWorkspaceLifecycleSettings({
+        defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
+          ? ""
+          : previousLifecycleSettings.defaultWorkspaceId,
+        enabledWorkspaceIds: nextEnabledWorkspaceIds,
+      });
+
+      setWorkspaceThreads((current) => {
+        const next = { ...(current || {}) };
+        delete next[targetWorkspaceId];
+        workspaceThreadsRef.current = next;
+        return next;
+      });
+      setWorkspaceNotifications((current) => {
+        const next = { ...(current || {}) };
+        delete next[targetWorkspaceId];
+        return next;
+      });
+      setWorkspaceTerminalLogicalIndexes((current) => {
+        const next = { ...(current || {}) };
+        delete next[targetWorkspaceId];
+        workspaceTerminalLogicalIndexesRef.current = next;
+        return next;
+      });
+      setWorkspaceTerminalDisplayLayouts((current) => {
+        const next = { ...(current || {}) };
+        delete next[targetWorkspaceId];
+        workspaceTerminalDisplayLayoutsRef.current = next;
+        return next;
+      });
+      setPendingSpecEditIntents((current) => Object.fromEntries(
+        Object.entries(current || {}).filter(([, intent]) => intent?.workspaceId !== targetWorkspaceId),
+      ));
+      setWorkspaceGraphState((current) => Object.fromEntries(
+        Object.entries(current || {}).filter(([key]) => !key.startsWith(`${targetWorkspaceId}::`)),
+      ));
+      terminalPresenceSyncKeyRef.current = "";
+      workspaceMcpSyncKeyRef.current = "";
+
+      if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
+        const nextActivatedWorkspace = nextEnabledWorkspaceIds
+          .map((enabledWorkspaceId) => findWorkspaceById(nextWorkspaces, enabledWorkspaceId))
+          .find(Boolean)
+          || nextWorkspaces[0]
+          || null;
+        setActivatedWorkspaceId(nextActivatedWorkspace?.id || "");
+      }
+      if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
+        setSelectedWorkspaceId(nextWorkspaces[0]?.id || "");
+      }
+
+      setWorkspaceSettingsModalId("");
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        telemetrySource: "workspace_deleted",
+        telemetryWorkspaceId: targetWorkspaceId,
+      });
+    } catch (error) {
+      if (isDesktopSessionExpiredError(error)) {
+        expireDesktopSession(error);
+        return;
+      }
+      setWorkspaceSettingsError(getErrorMessage(error, "Unable to delete workspace from Diff Forge."));
+    } finally {
+      workspaceDeactivationInFlightRef.current = "";
+      setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
+      setWorkspaceSettingsState("idle");
+    }
+  }, [
+    clearPreparedWorkspaceTerminals,
+    expireDesktopSession,
+    showView,
+    updateWorkspaceLifecycleSettings,
+    workspaceSettingsState,
+  ]);
+
   const completeAuthStartup = useCallback(() => {
     if (authStartupFinishedRef.current) {
       return;
@@ -8155,10 +8318,6 @@ export default function App() {
           terminalAgentsByIndex,
           terminalRolesByIndex,
           threadsByIndex,
-          coordinationTargets: getWorkspaceCoordinationTargetsForRoot(
-            workspaceCoordinationTargetsByRoot,
-            workingDirectory,
-          ),
           workingDirectory,
           workspace: runtimeWorkspace,
         };
@@ -8174,7 +8333,6 @@ export default function App() {
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
     workspaceThreads,
-    workspaceCoordinationTargetsByRoot,
     workspaces,
   ]);
   const terminalPresenceWorkspaces = useMemo(() => (
@@ -8284,28 +8442,22 @@ export default function App() {
       if (!workspaceId || !rootDirectory) {
         return;
       }
+      const key = workspaceId;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
-      getWorkspaceCoordinationTargetsForRoot(
-        workspaceCoordinationTargetsByRoot,
-        rootDirectory,
-      ).forEach((coordinationTarget) => {
-        const workingDirectory = String(coordinationTarget?.repoPath || rootDirectory).trim();
-        const key = `${workspaceId}:${workingDirectory}`;
-        if (!workingDirectory || seen.has(key)) {
-          return;
-        }
-        seen.add(key);
-        targets.push({
-          mountId: coordinationTarget?.mountId || "",
-          projectName: coordinationTarget?.projectName || "",
-          repoPath: workingDirectory,
-          workspaceActive,
-          workspaceId,
-          workspaceName: workspace?.name || workspaceId,
-          workspaceStatus: workspaceActive ? "active" : "deactivated",
-        });
+      targets.push({
+        mountId: "",
+        projectName: "",
+        repoPath: rootDirectory,
+        workspaceActive,
+        workspaceId,
+        workspaceName: workspace?.name || workspaceId,
+        workspaceStatus: workspaceActive ? "active" : "deactivated",
       });
     };
 
@@ -8330,7 +8482,6 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
-    workspaceCoordinationTargetsByRoot,
     workspaceSettings,
     workspaces,
   ]);
@@ -8561,7 +8712,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (authState !== "authenticated" || !isPaidUser(user)) {
       return undefined;
     }
 
@@ -8652,22 +8803,16 @@ export default function App() {
       if (!workspaceId || !rootDirectory) {
         return;
       }
-      getWorkspaceCoordinationTargetsForRoot(
-        workspaceCoordinationTargetsByRoot,
-        rootDirectory,
-      ).forEach((coordinationTarget) => {
-        const workingDirectory = String(coordinationTarget?.repoPath || rootDirectory).trim();
-        const key = `${workspaceId}:${workingDirectory}`;
-        if (!workingDirectory || seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
-          return;
-        }
-        seen.add(key);
-        targets.push({
-          key,
-          repoPath: workingDirectory,
-          workspaceId,
-          workspaceName: workspace?.name || "",
-        });
+      const key = workspaceId;
+      if (seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
+        return;
+      }
+      seen.add(key);
+      targets.push({
+        key,
+        repoPath: rootDirectory,
+        workspaceId,
+        workspaceName: workspace?.name || "",
       });
     };
 
@@ -8692,7 +8837,6 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
-    workspaceCoordinationTargetsByRoot,
     workspaceSyncState,
   ]);
 
@@ -8701,23 +8845,17 @@ export default function App() {
 
     enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
       const workspaceId = descriptor.workspace?.id || "";
-      const coordinationTargets = descriptor.coordinationTargets?.length
-        ? descriptor.coordinationTargets
-        : [{ repoPath: descriptor.workingDirectory || "" }];
+      const repoPath = descriptor.workingDirectory || "";
+      const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
 
-      coordinationTargets.forEach((coordinationTarget) => {
-        const repoPath = coordinationTarget?.repoPath || "";
-        const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
+      if (!runtimeKey) {
+        return;
+      }
 
-        if (!runtimeKey) {
-          return;
-        }
-
-        desiredTargets.set(runtimeKey, {
-          repoPath,
-          workspaceId,
-          workspaceName: descriptor.workspace?.name || "",
-        });
+      desiredTargets.set(runtimeKey, {
+        repoPath,
+        workspaceId,
+        workspaceName: descriptor.workspace?.name || "",
       });
     });
 
@@ -8875,7 +9013,10 @@ export default function App() {
       && selectedWorkspace
       && workspaceDeactivationState.workspaceId === selectedWorkspace.id,
   );
-  const isWorkspaceSettingsBusy = workspaceSettingsState === "saving" || isWorkspaceSettingsDeactivating;
+  const isWorkspaceSettingsDeleting = workspaceSettingsState === "deleting";
+  const isWorkspaceSettingsBusy = workspaceSettingsState === "saving"
+    || isWorkspaceSettingsDeactivating
+    || isWorkspaceSettingsDeleting;
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
 
@@ -12351,15 +12492,12 @@ export default function App() {
                         data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
                       >
                         <TerminalView
+                          accountKey={user?.id || user?.email || ""}
                           billingStatus={billingStatus}
                           defaultWorkingDirectory={defaultWorkingDirectory}
                           terminalWorkspace={activatedWorkspace}
                           terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
                           terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
-                          terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
-                            workspaceCoordinationTargetsByRoot,
-                            activatedWorkspaceTerminalWorkingDirectory,
-                          )}
                           terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
                           terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
                           terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
@@ -12433,12 +12571,12 @@ export default function App() {
                           key={runtimeWorkspace.id}
                         >
                           <TerminalView
+                            accountKey={user?.id || user?.email || ""}
                             billingStatus={billingStatus}
                             defaultWorkingDirectory={defaultWorkingDirectory}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
-                            terminalWorkspaceCoordinationTargets={runtimeDescriptor.coordinationTargets}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
                             terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
@@ -13119,7 +13257,10 @@ export default function App() {
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (
                 <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>
-                  <AccountTokenomicsView billingStatus={billingStatus} />
+                  <AccountTokenomicsView
+                    accountKey={user?.id || user?.email || ""}
+                    billingStatus={billingStatus}
+                  />
                 </ForgeWorkspace>
               ) : visibleView === "processes" ? (
                 <ForgeWorkspace aria-label="Processes" data-motion={viewMotion}>
@@ -13149,10 +13290,6 @@ export default function App() {
                 <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
                   {selectedWorkspace ? (
                     <McpsWorkspaceView
-                      coordinationTargets={getWorkspaceCoordinationTargetsForRoot(
-                        workspaceCoordinationTargetsByRoot,
-                        selectedWorkspaceFileRoot,
-                      )}
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       onOpenSettings={() => showView("settings")}
                       rootDirectory={selectedWorkspaceFileRoot}
@@ -13171,7 +13308,7 @@ export default function App() {
                 <WorkspaceSettingsOverlay
                   aria-label="Workspace settings modal"
                   onMouseDown={(event) => {
-                    if (isWorkspaceSettingsDeactivating) {
+                    if (isWorkspaceSettingsBusy) {
                       return;
                     }
 
@@ -13360,6 +13497,25 @@ export default function App() {
                         />
                       </WorkspaceSettingsSection>
 
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Danger zone</PanelKicker>
+                          <SettingsHint>
+                            Remove this workspace from Diff Forge cloud/live state and delete local Diff Forge metadata. Project files stay on disk.
+                          </SettingsHint>
+                        </div>
+                        <WorkspaceSettingsActions>
+                          <PrimaryDangerButton
+                            disabled={isWorkspaceSettingsBusy}
+                            onClick={() => deleteWorkspaceFromForge(selectedWorkspace.id)}
+                            type="button"
+                          >
+                            <ButtonDeleteIcon aria-hidden="true" />
+                            <span>{isWorkspaceSettingsDeleting ? "Deleting..." : "Delete from Diff Forge"}</span>
+                          </PrimaryDangerButton>
+                        </WorkspaceSettingsActions>
+                      </WorkspaceSettingsSection>
+
                       <WorkspaceSettingsActions>
                         <PrimaryButton disabled={isWorkspaceSettingsBusy} type="submit">
                           <ButtonCheckIcon aria-hidden="true" />
@@ -13371,16 +13527,22 @@ export default function App() {
                     {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
                     {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
                   </WorkspaceSettingsDialog>
-                  {isWorkspaceSettingsDeactivating && (
+                  {(isWorkspaceSettingsDeactivating || isWorkspaceSettingsDeleting) && (
                     <WorkspaceSettingsBusyOverlay aria-live="polite" role="status">
-                      <WorkspaceSettingsBusyPanel aria-label="Deactivating workspace">
+                      <WorkspaceSettingsBusyPanel aria-label={isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}>
                         <WorkspaceCloseSpinner aria-hidden="true" />
-                        <WorkspaceCloseTitle>Deactivating workspace</WorkspaceCloseTitle>
+                        <WorkspaceCloseTitle>
+                          {isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}
+                        </WorkspaceCloseTitle>
                         <WorkspaceCloseDetail>
-                          Stopping file watchers, terminals, and workspace services before the runtime is released.
+                          {isWorkspaceSettingsDeleting
+                            ? "Stopping workspace services, removing cloud live state, and cleaning Diff Forge metadata."
+                            : "Stopping file watchers, terminals, and workspace services before the runtime is released."}
                         </WorkspaceCloseDetail>
                         <WorkspaceCloseCounter>
-                          {workspaceDeactivateTotal > 0
+                          {isWorkspaceSettingsDeleting
+                            ? "Project files stay on disk"
+                            : workspaceDeactivateTotal > 0
                             ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
                             : "Stopping workspace runtime"}
                         </WorkspaceCloseCounter>

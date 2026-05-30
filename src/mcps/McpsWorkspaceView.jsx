@@ -769,35 +769,14 @@ function parseMarketplaceCommand(provider, command) {
 }
 
 export default function McpsWorkspaceView({
-  coordinationTargets = [],
   defaultWorkingDirectory,
   rootDirectory,
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
   const workspaceName = workspace?.name || "Workspace";
-  const coordinationProjectTargets = useMemo(() => (
-    (Array.isArray(coordinationTargets) ? coordinationTargets : [])
-      .map((target) => {
-        const repoPath = String(target?.repoPath || target?.repo_path || "").trim();
-        if (!repoPath) return null;
-        return {
-          repoPath,
-          mountId: String(target?.mountId || target?.mount_id || "").trim(),
-          projectName: String(target?.projectName || target?.project_name || "").trim(),
-          workspaceRelativePath: String(
-            target?.workspaceRelativePath || target?.workspace_relative_path || "",
-          ).trim(),
-        };
-      })
-      .filter(Boolean)
-  ), [coordinationTargets]);
-  const [selectedCoordinationRepoPath, setSelectedCoordinationRepoPath] = useState("");
-  const selectedCoordinationTarget = coordinationProjectTargets.find(
-    (target) => target.repoPath === selectedCoordinationRepoPath,
-  ) || coordinationProjectTargets[0] || null;
   const repoPath = workspaceId
-    ? selectedCoordinationTarget?.repoPath || rootDirectory || defaultWorkingDirectory || ""
+    ? rootDirectory || defaultWorkingDirectory || ""
     : "";
   const commandBase = useMemo(() => ({ repoPath }), [repoPath]);
   const [status, setStatus] = useState("idle");
@@ -817,16 +796,6 @@ export default function McpsWorkspaceView({
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
-
-  useEffect(() => {
-    if (!coordinationProjectTargets.length) {
-      setSelectedCoordinationRepoPath("");
-      return;
-    }
-    if (!coordinationProjectTargets.some((target) => target.repoPath === selectedCoordinationRepoPath)) {
-      setSelectedCoordinationRepoPath(coordinationProjectTargets[0].repoPath);
-    }
-  }, [coordinationProjectTargets, selectedCoordinationRepoPath]);
 
   const beginAction = useCallback((nextState, nextContext = {}) => {
     setActionContext(nextContext);
@@ -1929,21 +1898,6 @@ export default function McpsWorkspaceView({
               <span>config</span>
             </McpMetricPill>
             <McpInlineActions>
-              {coordinationProjectTargets.length > 1 && (
-                <McpInput
-                  aria-label="Project"
-                  as="select"
-                  disabled={isBusy}
-                  onChange={(event) => setSelectedCoordinationRepoPath(event.target.value)}
-                  value={selectedCoordinationTarget?.repoPath || coordinationProjectTargets[0]?.repoPath || ""}
-                >
-                  {coordinationProjectTargets.map((target) => (
-                    <option key={target.repoPath} value={target.repoPath}>
-                      {target.projectName || target.workspaceRelativePath || target.repoPath}
-                    </option>
-                  ))}
-                </McpInput>
-              )}
               <button
                 disabled={isBusy}
                 onClick={() => {

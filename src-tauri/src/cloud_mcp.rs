@@ -7677,6 +7677,231 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
     cloud_mcp_post_event_endpoint(state.inner(), "workspace_mcp_snapshot", &payload).await
 }
 
+fn cloud_mcp_workspace_payload_matches_delete(value: &Value, workspace_id: &str) -> bool {
+    cloud_mcp_payload_text(value, &["workspace_id", "workspaceId", "id"])
+        .as_deref()
+        .map(|value| value == workspace_id)
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_filter_deleted_workspace_snapshot(
+    snapshot: &mut Option<Value>,
+    workspace_id: &str,
+    count_kind: &str,
+) -> usize {
+    let (removed, should_clear) = {
+        let Some(snapshot_value) = snapshot.as_mut() else {
+            return 0;
+        };
+        let Some(object) = snapshot_value.as_object_mut() else {
+            return 0;
+        };
+        let Some(workspaces) = object.get_mut("workspaces").and_then(Value::as_array_mut) else {
+            return 0;
+        };
+
+        let before = workspaces.len();
+        workspaces.retain(|workspace| !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id));
+        let removed = before.saturating_sub(workspaces.len());
+        if removed == 0 {
+            return 0;
+        }
+
+        let workspace_count = workspaces.len();
+        let terminal_count = (count_kind == "terminals").then(|| {
+            workspaces
+                .iter()
+                .map(|workspace| {
+                    workspace
+                        .get("terminals")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default()
+                })
+                .sum::<usize>()
+        });
+        let server_count = (count_kind == "mcps").then(|| {
+            workspaces
+                .iter()
+                .map(|workspace| {
+                    workspace
+                        .get("servers")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default()
+                })
+                .sum::<usize>()
+        });
+        object.insert("workspace_count".to_string(), json!(workspace_count));
+        object.insert("workspaceCount".to_string(), json!(workspace_count));
+        if let Some(terminal_count) = terminal_count {
+            object.insert("terminal_count".to_string(), json!(terminal_count));
+            object.insert("terminalCount".to_string(), json!(terminal_count));
+        }
+        if let Some(server_count) = server_count {
+            object.insert("server_count".to_string(), json!(server_count));
+            object.insert("serverCount".to_string(), json!(server_count));
+        }
+        (removed, workspace_count == 0)
+    };
+
+    if should_clear {
+        *snapshot = None;
+    }
+
+    removed
+}
+
+async fn cloud_mcp_stop_spec_graph_syncs_for_repo_ids(
+    state: &CloudMcpState,
+    repo_ids: &[String],
+) -> usize {
+    let repo_ids = repo_ids
+        .iter()
+        .map(|repo_id| repo_id.trim().to_string())
+        .filter(|repo_id| !repo_id.is_empty())
+        .collect::<HashSet<_>>();
+    if repo_ids.is_empty() {
+        return 0;
+    }
+
+    let mut stopped = 0usize;
+    let runtimes = {
+        let mut syncs = state.spec_graph_syncs.lock().await;
+        let mut removed = Vec::new();
+        syncs.retain(|repo_id, runtime| {
+            if repo_ids.contains(repo_id) {
+                removed.push(runtime.clone());
+                stopped += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    };
+    for runtime in runtimes {
+        runtime.stop.store(true, Ordering::SeqCst);
+        runtime.wake.notify_waiters();
+    }
+    {
+        let mut container_syncs = state.spec_graph_container_syncs.lock().await;
+        container_syncs.retain(|repo_id, _| !repo_ids.contains(repo_id));
+    }
+    {
+        let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
+        requests.retain(|repo_id, _| !repo_ids.contains(repo_id));
+    }
+    stopped
+}
+
+#[tauri::command]
+async fn cloud_mcp_delete_workspace(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    include_child_projects: Option<bool>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Workspace delete requires a workspace id.".to_string());
+    }
+
+    let root = resolve_workspace_root_directory(Some(&repo_path))?;
+    let root_display = workspace_path_display(&root);
+    let root_repo_id = cloud_mcp_repo_id_for_root(&root);
+    let workspace_name = workspace_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| workspace_id.clone());
+    let include_child_projects = include_child_projects.unwrap_or(false);
+    let mounts = cloud_mcp_container_project_mounts(&root);
+    let child_repo_ids = mounts
+        .iter()
+        .map(|mount| cloud_mcp_repo_id_for_root(&mount.root_path))
+        .collect::<Vec<_>>();
+    let mut runtime_repo_ids = vec![root_repo_id.clone()];
+    runtime_repo_ids.extend(child_repo_ids.iter().cloned());
+    runtime_repo_ids.sort();
+    runtime_repo_ids.dedup();
+    let mut cloud_delete_repo_ids = vec![root_repo_id.clone()];
+    if include_child_projects {
+        cloud_delete_repo_ids.extend(child_repo_ids.iter().cloned());
+        cloud_delete_repo_ids.sort();
+        cloud_delete_repo_ids.dedup();
+    }
+
+    let stopped_syncs = cloud_mcp_stop_spec_graph_syncs_for_repo_ids(
+        state.inner(),
+        &runtime_repo_ids,
+    )
+    .await;
+    let (removed_terminal_snapshots, removed_mcp_snapshots) = {
+        let mut snapshots = state.runtime_snapshots.lock().await;
+        let terminal_removed = cloud_mcp_filter_deleted_workspace_snapshot(
+            &mut snapshots.terminal_presence,
+            &workspace_id,
+            "terminals",
+        );
+        let mcp_removed = cloud_mcp_filter_deleted_workspace_snapshot(
+            &mut snapshots.workspace_mcps,
+            &workspace_id,
+            "mcps",
+        );
+        (terminal_removed, mcp_removed)
+    };
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime
+            .registered_workspaces
+            .retain(|_, workspace| workspace.workspace_id != workspace_id);
+        runtime
+            .terminal_contexts
+            .retain(|_, terminal| terminal.workspace_id != workspace_id);
+    }
+
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-workspace-delete",
+        "event_kind": "workspace_deleted",
+        "repo_id": root_repo_id,
+        "repo_ids": cloud_delete_repo_ids,
+        "runtime_repo_ids": runtime_repo_ids,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "workspace_root": root_display,
+        "include_child_projects": include_child_projects,
+        "child_repo_count": child_repo_ids.len(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": "workspace_delete",
+        "summary": "Desktop workspace deleted from Diff Forge.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    let response = cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
+    Ok(json!({
+        "ok": true,
+        "workspaceId": payload["workspace_id"].clone(),
+        "repoIds": payload["repo_ids"].clone(),
+        "runtimeRepoIds": payload["runtime_repo_ids"].clone(),
+        "includeChildProjects": include_child_projects,
+        "stoppedSpecGraphSyncs": stopped_syncs,
+        "removedTerminalSnapshots": removed_terminal_snapshots,
+        "removedMcpSnapshots": removed_mcp_snapshots,
+        "serverResponse": response,
+    }))
+}
+
 #[tauri::command]
 async fn cloud_mcp_sync_tokenomics_state(
     state: State<'_, CloudMcpState>,

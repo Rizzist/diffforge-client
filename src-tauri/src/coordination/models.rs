@@ -55,6 +55,7 @@ pub struct TerminalCoordinationContext {
 impl TerminalCoordinationContext {
     pub fn file_authority(&self) -> &'static str {
         match self.enforcement_mode.as_str() {
+            "general_worker" => "task_scoped",
             "worktree_required" => "git_worktree_patch",
             "bounded_direct_edit" => "bounded_direct_edit",
             "activity_only" => "none",
@@ -67,6 +68,7 @@ impl TerminalCoordinationContext {
 
     pub fn session_mode(&self) -> &'static str {
         match self.enforcement_mode.as_str() {
+            "general_worker" => "general",
             "worktree_required" => "managed_patch",
             "bounded_direct_edit" => "direct_edit",
             "activity_only" => "activity",
@@ -98,6 +100,8 @@ impl TerminalCoordinationContext {
         };
         let direct_write_policy = if self.enforcement_mode == "bounded_direct_edit" {
             "allowed_for_bounded_direct_edit"
+        } else if self.enforcement_mode == "general_worker" {
+            "resolved_by_task_authority"
         } else if self.enforcement_mode == "worktree_required" {
             "block_patch_and_merge"
         } else {
@@ -291,13 +295,14 @@ Merge integration branch: diff-forge/integration\nShell cwd is this slot's isola
         )
         } else {
             let authority_note = match self.enforcement_mode.as_str() {
+                "general_worker" => "This terminal is a general workspace worker. It starts in the workspace root; file authority is resolved when concrete task work requests it.",
                 "bounded_direct_edit" => "This terminal may edit only this bounded project root directly. It does not have git worktree isolation and must finish with complete_task instead of submit_patch.",
                 "activity_only" => "This terminal is for coordinated activity tracking. It has no local file authority; use start_task/checkpoint/complete_task for visible work logs.",
                 "remote_unmanaged" => "This terminal is for remote or external operations. It has no local file authority; use start_task/checkpoint/complete_task for visible work logs.",
                 _ => "This terminal is coordinated for task tracking only. It has no patch submission authority.",
             };
             format!(
-                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called\nMode: {}\nFile authority: {}\nCompletion: complete_task\n{}\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nWhen work begins, call coordination-kernel.start_task with a short plan, checkpoint only meaningful active progress, and call coordination-kernel.complete_task when the task is done. submit_patch is only available in managed patch worktree sessions.\n",
+                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called\nMode: {}\nFile authority: {}\nCompletion: complete_task\n{}\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nWhen work begins, call coordination-kernel.start_task with a short plan. For local file edits, acquire a lease before editing; Diff Forge will return the direct project root or isolated worktree authority for this task. Checkpoint only meaningful active progress. Finish with submit_patch when an isolated worktree is assigned, otherwise complete_task.\n",
                 self.repo_path,
                 self.write_root,
                 self.agent_id,

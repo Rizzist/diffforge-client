@@ -4826,6 +4826,7 @@ impl CoordinationKernel {
             if !matches!(
                 mode,
                 "worktree_required"
+                    | "general_worker"
                     | "bounded_direct_edit"
                     | "activity_only"
                     | "remote_unmanaged"
@@ -20178,6 +20179,87 @@ impl CoordinationKernel {
         Ok(worktree)
     }
 
+    pub fn resolve_general_worker_file_authority(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<Value, String> {
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        let enforcement_mode = session["enforcement_mode"]
+            .as_str()
+            .unwrap_or("coordination_only");
+        if enforcement_mode != "general_worker" {
+            let file_authority = match enforcement_mode {
+                "worktree_required" => "git_worktree_patch",
+                "bounded_direct_edit" => "bounded_direct_edit",
+                "remote_unmanaged" => "remote_unmanaged",
+                _ => "none",
+            };
+            return Ok(json!({
+                "changed": false,
+                "enforcement_mode": enforcement_mode,
+                "file_authority": file_authority,
+                "worktree_id": session["worktree_id"].clone(),
+                "write_root": session["write_root"].clone(),
+            }));
+        }
+
+        if repo_has_git(&self.paths.repo_path) {
+            let worktree = self.create_worktree_for_session(agent_id, session_id, None)?;
+            return Ok(json!({
+                "changed": true,
+                "enforcement_mode": "worktree_required",
+                "file_authority": "git_worktree_patch",
+                "completion_mode": "submit_patch",
+                "session_mode": "managed_patch",
+                "worktree_id": worktree["id"].clone(),
+                "worktree_path": worktree["path"].clone(),
+                "agent_branch_root": worktree["path"].clone(),
+                "branch_name": worktree["branchName"].clone(),
+            }));
+        }
+
+        let now = now_rfc3339();
+        let write_root = self.paths.repo_path.display().to_string();
+        self.conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET worktree_id=NULL,
+                     write_root=?1,
+                     base_git_sha=NULL,
+                     current_git_sha=NULL,
+                     enforcement_mode='bounded_direct_edit',
+                     updated_at=?2
+                 WHERE id=?3 AND agent_id=?4",
+                params![&write_root, &now, session_id, agent_id],
+            )
+            .map_err(|error| format!("Unable to assign direct file authority: {error}"))?;
+        self.emit_event(
+            "session_file_authority_resolved",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "enforcement_mode": "bounded_direct_edit",
+                "file_authority": "bounded_direct_edit",
+                "write_root": write_root,
+                "reason": "general_worker_no_git",
+            }),
+        )?;
+        Ok(json!({
+            "changed": true,
+            "enforcement_mode": "bounded_direct_edit",
+            "file_authority": "bounded_direct_edit",
+            "completion_mode": "complete_task",
+            "session_mode": "direct_edit",
+            "write_root": write_root,
+        }))
+    }
+
     fn branch_exists(&self, branch: &str) -> Result<bool, String> {
         if crate::app_shutdown_requested() {
             return Err(crate::app_shutdown_blocked_message("git branch inspection"));
@@ -25348,6 +25430,102 @@ enabled = true
             "COORDINATION_COMPLETION_MODE".to_string(),
             "complete_task".to_string()
         )));
+    }
+
+    #[test]
+    fn general_worker_resolves_no_git_file_authority_to_bounded_direct_edit() {
+        let repo = temp_repo("general_worker_no_git");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-general"),
+                Some("workspace-general"),
+                Some("General Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-general"),
+                Some("general_worker"),
+            )
+            .unwrap();
+
+        assert_eq!(context.enforcement_mode, "general_worker");
+        assert_eq!(context.file_authority(), "task_scoped");
+
+        let authority = kernel
+            .resolve_general_worker_file_authority(
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+            )
+            .unwrap();
+
+        assert_eq!(authority["changed"].as_bool(), Some(true));
+        assert_eq!(
+            authority["enforcement_mode"].as_str(),
+            Some("bounded_direct_edit")
+        );
+        assert_eq!(
+            authority["file_authority"].as_str(),
+            Some("bounded_direct_edit")
+        );
+        assert_eq!(authority["completion_mode"].as_str(), Some("complete_task"));
+        assert!(authority["worktree_id"].as_str().is_none());
+    }
+
+    #[test]
+    fn general_worker_resolves_git_file_authority_to_managed_worktree() {
+        let repo = init_git_repo("general_worker_git");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-general-git"),
+                Some("workspace-general-git"),
+                Some("General Git Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-general-git"),
+                Some("general_worker"),
+            )
+            .unwrap();
+
+        let authority = kernel
+            .resolve_general_worker_file_authority(
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+            )
+            .unwrap();
+
+        assert_eq!(authority["changed"].as_bool(), Some(true));
+        assert_eq!(
+            authority["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        assert_eq!(
+            authority["file_authority"].as_str(),
+            Some("git_worktree_patch")
+        );
+        assert_eq!(authority["completion_mode"].as_str(), Some("submit_patch"));
+        let worktree_path = authority["worktree_path"].as_str().unwrap();
+        assert!(PathBuf::from(worktree_path).exists());
+        let session = kernel
+            .query_one(
+                "SELECT enforcement_mode, worktree_id FROM agent_sessions WHERE id=?1",
+                &[&context.session_id],
+                "missing",
+            )
+            .unwrap();
+        assert_eq!(
+            session["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        assert!(session["worktree_id"].as_str().is_some());
     }
 
     #[test]
