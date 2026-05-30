@@ -2415,13 +2415,17 @@ async fn cloud_mcp_ws_request_with_timeout(
     response_timeout: Duration,
 ) -> Result<Value, String> {
     let mut last_error = String::new();
+    let retry_transient_errors = request_kind != "hard_reset_cloud_sqlite";
     for attempt in 0..2 {
         match cloud_mcp_ws_request_once_with_timeout(state, request_kind, payload, response_timeout)
             .await
         {
             Ok(response) => return Ok(response),
             Err(error) => {
-                if !cloud_mcp_ws_request_error_is_transient(&error) || attempt > 0 {
+                if !retry_transient_errors
+                    || !cloud_mcp_ws_request_error_is_transient(&error)
+                    || attempt > 0
+                {
                     return Err(error);
                 }
                 last_error = error.clone();
@@ -7420,6 +7424,21 @@ async fn cloud_mcp_sync_terminal_presence(
                 let session_state =
                     cloud_mcp_payload_text(terminal, &["session_state", "sessionState"])
                         .unwrap_or_else(|| "unknown".to_string());
+                let terminal_instance_id = terminal
+                    .get("terminal_instance_id")
+                    .or_else(|| terminal.get("terminalInstanceId"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let status_seq = terminal
+                    .get("status_seq")
+                    .or_else(|| terminal.get("statusSeq"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let input_ready = terminal
+                    .get("input_ready")
+                    .or_else(|| terminal.get("inputReady"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 json!({
                     "device": device_profile.clone(),
                     "device_id": device_profile["device_id"].clone(),
@@ -7433,6 +7452,14 @@ async fn cloud_mcp_sync_terminal_presence(
                     "status": status,
                     "session_state": session_state,
                     "terminal_index": terminal_index,
+                    "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch", "terminalEpoch"]),
+                    "terminal_instance_id": terminal_instance_id,
+                    "terminal_lifecycle": cloud_mcp_payload_text(terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
+                    "readiness": cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness", "terminalReadiness"]),
+                    "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
+                    "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
+                    "status_seq": status_seq,
+                    "input_ready": input_ready,
                     "pane_id": cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]),
                     "terminal_id": cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId", "pane_id", "paneId"]),
                     "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
@@ -8126,6 +8153,10 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         &payload,
     )
     .await?;
+    {
+        let mut snapshots = state.runtime_snapshots.lock().await;
+        *snapshots = CloudMcpRuntimeSnapshots::default();
+    }
     Ok(cloud_mcp_response_data(&response))
 }
 

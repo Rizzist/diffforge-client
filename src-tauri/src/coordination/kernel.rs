@@ -5114,7 +5114,7 @@ impl CoordinationKernel {
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
             self.workspace_mcp_gateway_approved_tool_names(workspace_id);
-        let codex_home_path = prepare_managed_codex_home_for_terminal(
+        let codex_profile = prepare_managed_codex_profile_for_terminal(
             &self.paths,
             agent_kind,
             slot_key.as_deref(),
@@ -5140,7 +5140,8 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
-            codex_home_path,
+            codex_home_path: None,
+            codex_profile,
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
@@ -5253,7 +5254,7 @@ impl CoordinationKernel {
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
             self.workspace_mcp_gateway_approved_tool_names(workspace_id);
-        let codex_home_path = prepare_managed_codex_home_for_terminal(
+        let codex_profile = prepare_managed_codex_profile_for_terminal(
             &self.paths,
             &agent_kind,
             slot_key.as_deref(),
@@ -5279,7 +5280,8 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
-            codex_home_path,
+            codex_home_path: None,
+            codex_profile,
             claude_mcp_config_path,
             mcp_command,
             workspace_id: workspace_id.map(str::to_string),
@@ -21392,7 +21394,7 @@ fn text_file_matches(path: &Path, value: &str) -> bool {
     bytes_file_matches(path, value.as_bytes())
 }
 
-fn prepare_managed_codex_home_for_terminal(
+fn prepare_managed_codex_profile_for_terminal(
     paths: &StoragePaths,
     agent_kind: &str,
     slot_key: Option<&str>,
@@ -21416,215 +21418,97 @@ fn prepare_managed_codex_home_for_terminal(
                 session_segment
             }
         });
-    let target_home = paths
-        .agents_root
-        .join("codex-home")
-        .join("coordinated")
-        .join(slot_segment);
-    fs::create_dir_all(&target_home).map_err(|error| {
-        format!(
-            "Unable to create managed Codex home {}: {error}",
-            target_home.display()
-        )
-    })?;
-
-    let source_home = codex_source_home_for_managed_home(&target_home);
-    let source_config = source_home.as_ref().map(|home| home.join("config.toml"));
-    let source_body = source_config
-        .as_ref()
-        .filter(|path| path.exists())
-        .map(fs::read_to_string)
-        .transpose()
-        .map_err(|error| format!("Unable to read user Codex config: {error}"))?
-        .unwrap_or_default();
-    let config = codex_managed_home_config(
-        &source_body,
+    let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
+    let profile_home = codex_profile_home_for_launch()?;
+    let hooks_path = profile_home.join(format!("{profile}.hooks.json"));
+    let config = codex_managed_profile_config(
         &paths.repo_path,
         Path::new(write_root),
         enforcement_mode,
         slot_key,
         agent_kind,
-        mcp_command,
+        Some(&hooks_path),
     )?;
-    write_text_file_atomic(&target_home.join("config.toml"), &config)?;
+    write_text_file_atomic(
+        &profile_home.join(format!("{profile}.config.toml")),
+        &config,
+    )?;
+    write_json_file_atomic(
+        &hooks_path,
+        &codex_managed_hooks_config(&paths.repo_path, slot_key, agent_kind, mcp_command),
+    )?;
 
-    if let Some(source_home) = source_home {
-        for file_name in [
-            "auth.json",
-            "models_cache.json",
-            "installation_id",
-            "version.json",
-            ".personality_migration",
-            ".codex-global-state.json",
-        ] {
-            ensure_managed_codex_home_file(
-                &source_home.join(file_name),
-                &target_home.join(file_name),
-            )?;
-        }
-    }
-
-    Ok(Some(process_path_text(&target_home)))
+    Ok(Some(profile))
 }
 
-fn push_codex_home_candidate(
-    candidates: &mut Vec<PathBuf>,
-    seen: &mut HashSet<String>,
-    candidate: Option<PathBuf>,
-) {
-    let Some(candidate) = candidate.filter(|path| !path.as_os_str().is_empty()) else {
-        return;
+fn codex_profile_home_for_launch() -> Result<PathBuf, String> {
+    let Some(home) = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+    else {
+        return Err("Unable to determine Codex home for Diff Forge launch profile.".to_string());
     };
-    let key = candidate
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    if !key.is_empty() && seen.insert(key) {
-        candidates.push(candidate);
-    }
+    fs::create_dir_all(&home).map_err(|error| {
+        format!(
+            "Unable to create Codex profile home {}: {error}",
+            home.display()
+        )
+    })?;
+    Ok(home)
 }
 
-fn codex_home_candidates_from_values(
-    codex_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-    user_profile: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-
-    push_codex_home_candidate(&mut candidates, &mut seen, codex_home);
-    push_codex_home_candidate(
-        &mut candidates,
-        &mut seen,
-        home.map(|home| home.join(".codex")),
-    );
-    push_codex_home_candidate(
-        &mut candidates,
-        &mut seen,
-        user_profile.map(|home| home.join(".codex")),
-    );
-
-    candidates
-}
-
-fn codex_source_home_candidates() -> Vec<PathBuf> {
-    codex_home_candidates_from_values(
-        env::var_os("CODEX_HOME").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
-        env::var_os("USERPROFILE").map(PathBuf::from),
+fn codex_managed_profile_name(repo_path: &Path, slot_segment: &str) -> String {
+    let repo_name = repo_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(safe_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    let slot_segment = safe_id(slot_segment);
+    let mut hasher = Sha256::new();
+    hasher.update(process_path_text(repo_path).as_bytes());
+    let hash = hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "diffforge-{}-{}-{}",
+        repo_name,
+        hash,
+        if slot_segment.is_empty() {
+            "session"
+        } else {
+            slot_segment.as_str()
+        }
     )
 }
 
-fn codex_source_home_from_candidates(
-    target_home: &Path,
-    candidates: Vec<PathBuf>,
-) -> Option<PathBuf> {
-    let mut fallback = None;
-    let mut existing = None;
-
-    for candidate in candidates {
-        if same_path(&candidate, target_home) {
-            continue;
-        }
-        if candidate.join("auth.json").is_file() {
-            return Some(candidate);
-        }
-        if existing.is_none() && (candidate.is_dir() || candidate.join("config.toml").is_file()) {
-            existing = Some(candidate.clone());
-        }
-        fallback.get_or_insert(candidate);
-    }
-
-    existing.or(fallback)
-}
-
-fn codex_source_home_for_managed_home(target_home: &Path) -> Option<PathBuf> {
-    codex_source_home_from_candidates(target_home, codex_source_home_candidates())
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
-fn codex_managed_home_config(
-    source_body: &str,
+fn codex_managed_profile_config(
     repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
     slot_key: Option<&str>,
     agent_kind: &str,
-    mcp_command: &str,
+    hooks_path: Option<&Path>,
 ) -> Result<String, String> {
-    let without_managed_conflicts = strip_codex_managed_runtime_conflicts(source_body);
-    let mut config = ensure_codex_project_trust_entry(&without_managed_conflicts, repo_path);
+    let mut config = String::new();
+    config = ensure_codex_project_trust_entry(&config, repo_path);
     config = ensure_codex_project_trust_entry(&config, write_root);
     config = append_codex_managed_permission_profile(
         config,
-        repo_path,
         write_root,
         enforcement_mode,
         slot_key,
         agent_kind,
-        mcp_command,
+        hooks_path,
     )?;
     if !config.ends_with('\n') {
         config.push('\n');
     }
     Ok(config)
-}
-
-fn strip_codex_managed_runtime_conflicts(body: &str) -> String {
-    let mut skip = false;
-    let mut kept = Vec::new();
-    for line in body.lines() {
-        if let Some(section) = toml_section_name(line) {
-            skip = codex_toml_section_is_managed_runtime_conflict(&section);
-        }
-        if !skip && codex_toml_line_is_managed_runtime_conflict(line) {
-            continue;
-        }
-        if !skip {
-            kept.push(line);
-        }
-    }
-    let mut next = kept.join("\n");
-    if body.ends_with('\n') && !next.is_empty() {
-        next.push('\n');
-    }
-    next
-}
-
-fn codex_toml_section_is_managed_runtime_conflict(section: &str) -> bool {
-    let section = section.trim().trim_matches('"').trim_matches('\'');
-    section == "mcp_servers"
-        || section.starts_with("mcp_servers.")
-        || section == "permissions"
-        || section.starts_with("permissions.")
-        || section == "sandbox_workspace_write"
-        || section.starts_with("sandbox_workspace_write.")
-        || section == "hooks"
-        || section.starts_with("hooks.")
-}
-
-fn codex_toml_line_is_managed_runtime_conflict(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    [
-        "mcp_servers",
-        "default_permissions",
-        "sandbox_mode",
-        "sandbox_workspace_write",
-        "sandbox_permissions",
-    ]
-    .iter()
-    .any(|key| {
-        trimmed
-            .strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -21634,13 +21518,12 @@ struct CodexManagedGitRoute {
 }
 
 fn append_codex_managed_permission_profile(
-    mut config: String,
-    repo_path: &Path,
+    config: String,
     write_root: &Path,
     enforcement_mode: &str,
     slot_key: Option<&str>,
     agent_kind: &str,
-    mcp_command: &str,
+    hooks_path: Option<&Path>,
 ) -> Result<String, String> {
     let slot_key = slot_key
         .map(str::trim)
@@ -21664,9 +21547,9 @@ fn append_codex_managed_permission_profile(
         ":read-only"
     };
     let profile = "diffforge-coordinated";
+    let mut config = prepend_codex_managed_root_permission_profile(config, profile);
     config.push_str(&format!(
-        "\ndefault_permissions = \"{profile}\"\n\n\
-[permissions.{profile}]\n\
+        "\n[permissions.{profile}]\n\
 description = \"Diff Forge coordinated agent filesystem policy.\"\n\
 extends = \"{parent_profile}\"\n\n\
 [permissions.{profile}.workspace_roots]\n\
@@ -21694,23 +21577,62 @@ extends = \"{parent_profile}\"\n\n\
         }
     }
 
-    config.push_str(&format!(
-        "\n[[hooks.PreToolUse]]\n\
-matcher = \"apply_patch|Edit|Write|Bash\"\n\n\
-[[hooks.PreToolUse.hooks]]\n\
-type = \"command\"\n\
-command = \"{}\"\n\
-timeout = 30\n\
-statusMessage = \"Routing Diff Forge writes\"\n",
-        toml_escape(&codex_write_guard_hook_command(
-            mcp_command,
-            &process_path_text(repo_path),
-            slot_key,
-            agent_kind,
-        ))
-    ));
+    if let Some(hooks_path) = hooks_path {
+        config.push_str(&format!(
+            "\n[core]\n\
+hooksPath = \"{}\"\n",
+            toml_escape(&process_path_text(hooks_path))
+        ));
+    }
 
     Ok(config)
+}
+
+fn codex_managed_hooks_config(
+    repo_path: &Path,
+    slot_key: Option<&str>,
+    agent_kind: &str,
+    mcp_command: &str,
+) -> Value {
+    let slot_key = slot_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "apply_patch|Edit|Write|Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": codex_write_guard_hook_command(
+                                mcp_command,
+                                &process_path_text(repo_path),
+                                slot_key,
+                                agent_kind,
+                            ),
+                            "timeout": 30,
+                            "statusMessage": "Routing Diff Forge writes"
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+fn prepend_codex_managed_root_permission_profile(config: String, profile: &str) -> String {
+    let body = config.trim_start_matches('\n');
+    let mut next = format!("default_permissions = \"{}\"\n", toml_escape(profile));
+    if !body.trim().is_empty() {
+        next.push('\n');
+        next.push_str(body);
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+    }
+    next
 }
 
 fn codex_managed_git_routes_for_direct_root(
@@ -21908,53 +21830,6 @@ fn codex_config_has_project_entry(body: &str, path: &str) -> bool {
             || section == format!("projects.'{}'", path.replace('\'', "\\'"))
             || section == format!("projects.{path}")
     })
-}
-
-fn ensure_managed_codex_home_file(source: &Path, target: &Path) -> Result<(), String> {
-    if !source.is_file() {
-        return Ok(());
-    }
-    let source_bytes = fs::read(source)
-        .map_err(|error| format!("Unable to read {}: {error}", source.display()))?;
-    if target.exists() {
-        if same_path(source, target) || bytes_file_matches(target, &source_bytes) {
-            return Ok(());
-        }
-        if target.is_dir() {
-            return Err(format!(
-                "Unable to prepare managed Codex home file {}; target is a directory.",
-                target.display()
-            ));
-        }
-        fs::remove_file(target)
-            .map_err(|error| format!("Unable to replace {}: {error}", target.display()))?;
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
-    }
-    if create_file_symlink(source, target).is_ok() {
-        return Ok(());
-    }
-    write_bytes_atomic(target, &source_bytes)
-}
-
-#[cfg(unix)]
-fn create_file_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(source, target)
-}
-
-#[cfg(windows)]
-fn create_file_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(source, target)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_file_symlink(_source: &Path, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "symlinks are unsupported on this platform",
-    ))
 }
 
 fn bytes_file_matches(path: &Path, bytes: &[u8]) -> bool {
@@ -24242,36 +24117,16 @@ APPWRITE_PROJECT_ID = "project"
     fn managed_codex_home_config_strips_native_mcp_servers() {
         let repo = init_git_repo("managed_codex_home_config");
         let worktree = repo.join(".agents").join("worktrees").join("1");
+        let hooks_path = worktree.join("diffforge.hooks.json");
         fs::create_dir_all(&worktree).unwrap();
-        let source = r#"model = "gpt-5.5"
-mcp_servers = { stale = { command = "bad" } }
 
-[projects."/tmp/existing"]
-trust_level = "trusted"
-
-[mcp_servers]
-unused = true
-
-[mcp_servers.appwrite-api]
-default_tools_approval_mode = "approve"
-command = "uvx"
-args = ["mcp-server-appwrite"]
-
-[mcp_servers.appwrite-api.env]
-APPWRITE_PROJECT_ID = "project"
-
-[plugins."browser@openai-bundled"]
-enabled = true
-"#;
-
-        let config = codex_managed_home_config(
-            source,
+        let config = codex_managed_profile_config(
             &repo,
             &worktree,
             "worktree_required",
             Some("1"),
             "codex",
-            "diffforge",
+            Some(hooks_path.as_path()),
         )
         .unwrap();
 
@@ -24279,7 +24134,7 @@ enabled = true
         assert!(!config.contains("[mcp_servers]"));
         assert!(!config.contains("[mcp_servers.appwrite-api]"));
         assert!(!config.contains("[mcp_servers.appwrite-api.env]"));
-        assert!(config.contains("[plugins.\"browser@openai-bundled\"]"));
+        assert!(!config.contains("[plugins.\"browser@openai-bundled\"]"));
         assert!(config.contains(&format!(
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",
             toml_escape(&process_path_text(&repo))
@@ -24288,6 +24143,35 @@ enabled = true
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",
             toml_escape(&process_path_text(&worktree))
         )));
+        assert!(config.contains(&format!(
+            "hooksPath = \"{}\"",
+            toml_escape(&process_path_text(&hooks_path))
+        )));
+        assert!(!config.contains("[[hooks.PreToolUse]]"));
+    }
+
+    #[test]
+    fn managed_codex_home_config_sets_permission_profile_at_document_root() {
+        let repo = init_git_repo("managed_codex_home_root_permission_profile");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        let hooks_path = worktree.join("diffforge.hooks.json");
+        fs::create_dir_all(&worktree).unwrap();
+
+        let config = codex_managed_profile_config(
+            &repo,
+            &worktree,
+            "worktree_required",
+            Some("1"),
+            "codex",
+            Some(hooks_path.as_path()),
+        )
+        .unwrap();
+
+        assert!(config.starts_with("default_permissions = \"diffforge-coordinated\"\n"));
+        assert_eq!(config.matches("default_permissions =").count(), 1);
+        assert!(!config.contains("permission_profile ="));
+        let permissions_index = config.find("[permissions.diffforge-coordinated]").unwrap();
+        assert!(permissions_index > 0);
     }
 
     #[test]
@@ -24312,36 +24196,37 @@ enabled = true
             ],
         );
 
-        let config = codex_managed_home_config(
-            "model = \"gpt-5.5\"\nsandbox_mode = \"danger-full-access\"\n",
+        let hooks_path = container.join("diffforge.hooks.json");
+        let config = codex_managed_profile_config(
             &container,
             &container,
             "bounded_direct_edit",
             Some("slot1"),
             "codex",
-            "diffforge",
+            Some(hooks_path.as_path()),
         )
         .unwrap();
+        let hooks = codex_managed_hooks_config(&container, Some("slot1"), "codex", "diffforge");
 
         assert!(config.contains("default_permissions = \"diffforge-coordinated\""));
         assert!(!config.contains("sandbox_mode ="));
         assert!(config.contains("\"nested/repo\" = \"read\""));
         assert!(config.contains("\"nested/repo/.agents/worktrees/slot1"));
         assert!(config.contains("\" = \"write\""));
-        assert!(config.contains("--diff-forge-write-guard"));
+        assert!(!config.contains("--diff-forge-write-guard"));
+        assert!(hooks.to_string().contains("--diff-forge-write-guard"));
     }
 
     #[test]
     fn managed_codex_home_config_keeps_activity_sessions_read_only() {
         let root = temp_repo("managed_codex_activity");
-        let config = codex_managed_home_config(
-            "model = \"gpt-5.5\"\n",
+        let config = codex_managed_profile_config(
             &root,
             &root,
             "activity_only",
             Some("slot1"),
             "codex",
-            "diffforge",
+            Some(root.join("diffforge.hooks.json").as_path()),
         )
         .unwrap();
 
@@ -24350,59 +24235,6 @@ enabled = true
             !config.contains("[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]")
         );
         assert!(!config.contains("\".\" = \"write\""));
-    }
-
-    #[test]
-    fn codex_home_candidates_include_windows_user_profile() {
-        let user_profile = PathBuf::from("C:/Users/DiffForge");
-        let candidates = codex_home_candidates_from_values(None, None, Some(user_profile.clone()));
-
-        assert_eq!(candidates, vec![user_profile.join(".codex")]);
-    }
-
-    #[test]
-    fn managed_codex_home_source_skips_missing_candidate_for_real_user_home() {
-        let repo = temp_repo("managed_codex_home_source_fallback");
-        let target = repo
-            .join(".agents")
-            .join("codex-home")
-            .join("coordinated")
-            .join("1");
-        let missing_codex_home = repo.join("missing-codex-home");
-        let user_codex_home = repo.join("user").join(".codex");
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(&user_codex_home).unwrap();
-        fs::write(user_codex_home.join("auth.json"), "{}\n").unwrap();
-
-        let selected = codex_source_home_from_candidates(
-            &target,
-            vec![missing_codex_home, user_codex_home.clone()],
-        );
-
-        assert_eq!(selected, Some(user_codex_home));
-    }
-
-    #[test]
-    fn managed_codex_home_source_prefers_authenticated_user_home() {
-        let repo = temp_repo("managed_codex_home_source_auth");
-        let empty_codex_home = repo.join("empty-codex-home");
-        let user_codex_home = repo.join("user").join(".codex");
-        let target = repo
-            .join(".agents")
-            .join("codex-home")
-            .join("coordinated")
-            .join("1");
-        fs::create_dir_all(&empty_codex_home).unwrap();
-        fs::create_dir_all(&user_codex_home).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        fs::write(user_codex_home.join("auth.json"), "{}\n").unwrap();
-
-        let selected = codex_source_home_from_candidates(
-            &target,
-            vec![empty_codex_home, user_codex_home.clone()],
-        );
-
-        assert_eq!(selected, Some(user_codex_home));
     }
 
     #[test]

@@ -7383,6 +7383,7 @@ mod terminal_tests {
             mcp_config_path: String::new(),
             codex_mcp_config_path: String::new(),
             codex_home_path: None,
+            codex_profile: None,
             claude_mcp_config_path: String::new(),
             mcp_command: String::new(),
             workspace_id: Some("workspace-1".to_string()),
@@ -7459,6 +7460,39 @@ mod terminal_tests {
             TerminalSessionMode::RemoteOps.file_authority(),
             "remote_unmanaged"
         );
+    }
+
+    #[test]
+    fn codex_coordination_context_uses_profile_without_private_home_env() {
+        let repo = terminal_test_repo("codex_profile_env");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let mut context = terminal_test_isolated_context(&repo, "1", &worktree, &worktree);
+        context.codex_profile = Some("diffforge-test-profile".to_string());
+        context.codex_home_path = Some("/tmp/should-not-be-used".to_string());
+
+        let env_vars = context.env_vars();
+
+        assert!(env_vars.iter().any(|(key, value)| {
+            key == "DIFFFORGE_CODEX_PROFILE" && value == "diffforge-test-profile"
+        }));
+        assert!(!env_vars.iter().any(|(key, _)| key == "CODEX_HOME"));
+    }
+
+    #[test]
+    fn codex_home_candidates_include_legacy_private_coordination_home() {
+        let repo = terminal_test_repo("codex_legacy_home_candidates");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let legacy_home = coordination::db::coordination_repo_state_root(&repo)
+            .join("codex-home")
+            .join("coordinated")
+            .join("1");
+        fs::create_dir_all(&legacy_home).unwrap();
+
+        let candidates = codex_home_candidates(&worktree.display().to_string());
+
+        assert!(candidates.iter().any(|path| path == &legacy_home));
     }
 
     #[test]
@@ -7860,6 +7894,24 @@ mod terminal_tests {
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
             "/tmp/diffforge-agent-worktree".to_string(),
         ));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_PROFILE".to_string(),
+            "diffforge-test-profile".to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("COORDINATION_WORKSPACE_ID".to_string(), "workspace-1".to_string()));
+        coordination.env_vars.push((
+            "COORDINATION_OBJECTIVE_KEY".to_string(),
+            "workspace-1".to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("COORDINATION_SLOT_KEY".to_string(), "1".to_string()));
+        coordination.env_vars.push((
+            "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS".to_string(),
+            "appwrite-api__appwrite_search_tools".to_string(),
+        ));
 
         let args = terminal_args_with_codex_mcp_identity(
             "codex",
@@ -7874,7 +7926,8 @@ mod terminal_tests {
             .any(|pair| pair == ["--ask-for-approval", "never"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--disable", "apps"]));
+            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
+        assert!(!args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--enable", "hooks"]));
@@ -7898,6 +7951,25 @@ mod terminal_tests {
         assert!(args.iter().any(|arg| {
             arg.starts_with("mcp_servers.coordination-kernel.tools.start_task.approval_mode=")
         }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.command=") }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.args=") }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg.contains("--workspace-mcp-gateway") }));
+        assert!(args.iter().any(|arg| {
+            arg.starts_with(
+                "mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__sync_manifest.approval_mode="
+            )
+        }));
+        assert!(args.iter().any(|arg| {
+            arg.starts_with(
+                "mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools.approval_mode="
+            )
+        }));
         assert!(!args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
@@ -7907,6 +7979,53 @@ mod terminal_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn codex_global_mcp_disable_args_skip_diffforge_servers() {
+        let body = r#"
+[mcp_servers.appwrite-api]
+command = "uvx"
+
+[mcp_servers.appwrite-api.env]
+APPWRITE_ENDPOINT = "https://example.test/v1"
+
+[mcp_servers.node_repl.env]
+NODE_REPL_ALLOWED = "1"
+
+[mcp_servers."foo.bar"]
+command = "foo"
+
+[mcp_servers.coordination-kernel]
+command = "diffforge"
+
+[mcp_servers.workspace-mcp-gateway]
+command = "diffforge"
+"#;
+
+        let keys = codex_global_mcp_server_keys_from_config(body);
+
+        assert_eq!(
+            keys,
+            vec![
+                "appwrite-api".to_string(),
+                "node_repl".to_string(),
+                "foo.bar".to_string()
+            ]
+        );
+        let disable_args = keys
+            .iter()
+            .map(|key| format!("mcp_servers.{}.enabled=false", terminal_toml_key_segment(key)))
+            .collect::<Vec<_>>();
+        assert!(disable_args.contains(&"mcp_servers.appwrite-api.enabled=false".to_string()));
+        assert!(disable_args.contains(&"mcp_servers.node_repl.enabled=false".to_string()));
+        assert!(disable_args.contains(&"mcp_servers.\"foo.bar\".enabled=false".to_string()));
+        assert!(!disable_args
+            .iter()
+            .any(|arg| arg.contains("coordination-kernel")));
+        assert!(!disable_args
+            .iter()
+            .any(|arg| arg.contains("workspace-mcp-gateway")));
     }
 
     #[test]
@@ -8283,11 +8402,11 @@ mod terminal_tests {
         );
 
         assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
-        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+        assert!(!args.windows(2).any(|pair| pair == ["--disable", "apps"]));
     }
 
     #[test]
-    fn codex_launch_args_do_not_duplicate_apps_disable() {
+    fn codex_launch_args_preserve_explicit_apps_disable() {
         let args = terminal_args_with_codex_mcp_identity(
             "codex",
             &["--disable".to_string(), "apps".to_string()],
@@ -8376,6 +8495,10 @@ mod terminal_tests {
             "COORDINATION_FILE_AUTHORITY".to_string(),
             "git_worktree_patch".to_string(),
         ));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_PROFILE".to_string(),
+            "diffforge-test-profile".to_string(),
+        ));
         let base = vec![
             "--ask-for-approval".to_string(),
             "on-request".to_string(),
@@ -8407,12 +8530,19 @@ mod terminal_tests {
             0
         );
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 1);
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--profile").count(),
+            1
+        );
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--enable", "hooks"]));
@@ -8442,6 +8572,10 @@ mod terminal_tests {
         coordination
             .env_vars
             .push(("COORDINATION_FILE_AUTHORITY".to_string(), "none".to_string()));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_PROFILE".to_string(),
+            "diffforge-activity-profile".to_string(),
+        ));
 
         let args = terminal_args_with_codex_mcp_identity(
             "codex",
@@ -8454,6 +8588,9 @@ mod terminal_tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--profile", "diffforge-activity-profile"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--enable", "hooks"]));

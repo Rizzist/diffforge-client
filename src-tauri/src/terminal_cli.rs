@@ -684,7 +684,6 @@ fn terminal_args_with_codex_mcp_identity(
     }
     if is_codex {
         apply_codex_terminal_display_args(&mut next);
-        apply_codex_managed_runtime_isolation_args(&mut next);
     }
     let Some(coordination) = coordination else {
         return next;
@@ -697,6 +696,7 @@ fn terminal_args_with_codex_mcp_identity(
     };
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
+    let codex_profile = env_value("DIFFFORGE_CODEX_PROFILE");
     let enforcement_mode = env_value("COORDINATION_ENFORCEMENT_MODE").unwrap_or_default();
     let file_authority = env_value("COORDINATION_FILE_AUTHORITY").unwrap_or_default();
 
@@ -733,30 +733,37 @@ fn terminal_args_with_codex_mcp_identity(
 
     if is_codex {
         let _ = (enforcement_mode.as_str(), file_authority.as_str());
-        apply_codex_coordinated_auto_approval_args(&mut next, write_root.as_deref());
+        apply_codex_coordinated_auto_approval_args(
+            &mut next,
+            write_root.as_deref(),
+            codex_profile.as_deref(),
+        );
 
-        next.push("-c".to_string());
-        next.push(format!(
-            "mcp_servers.coordination-kernel.command={}",
-            terminal_toml_string(&coordination.mcp_command)
-        ));
-
-        next.push("-c".to_string());
-        next.push(format!(
-            "mcp_servers.coordination-kernel.args={}",
-            terminal_toml_string_array(&coordination_args)
-        ));
-        next.push("-c".to_string());
-        next.push(format!(
-            "mcp_servers.coordination-kernel.default_tools_approval_mode={}",
-            terminal_toml_string("prompt")
-        ));
+        append_codex_global_mcp_disable_args(&mut next);
+        append_codex_mcp_server_config_args(
+            &mut next,
+            "coordination-kernel",
+            &coordination.mcp_command,
+            &coordination_args,
+        );
         for tool in crate::coordination::mcp::TOOL_NAMES {
-            next.push("-c".to_string());
-            next.push(format!(
-                "mcp_servers.coordination-kernel.tools.{tool}.approval_mode={}",
-                terminal_toml_string("approve")
-            ));
+            append_codex_mcp_tool_approval_arg(&mut next, "coordination-kernel", tool);
+        }
+
+        let gateway_args = terminal_workspace_gateway_args_from_coordination_args(&coordination_args);
+        append_codex_mcp_server_config_args(
+            &mut next,
+            "workspace-mcp-gateway",
+            &coordination.mcp_command,
+            &gateway_args,
+        );
+        for tool in TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS {
+            append_codex_mcp_tool_approval_arg(&mut next, "workspace-mcp-gateway", tool);
+        }
+        if let Some(value) = env_value("DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS") {
+            for tool in value.split(',').map(str::trim).filter(|tool| !tool.is_empty()) {
+                append_codex_mcp_tool_approval_arg(&mut next, "workspace-mcp-gateway", tool);
+            }
         }
         next.push("-c".to_string());
         next.push("shell_environment_policy.inherit=all".to_string());
@@ -765,6 +772,198 @@ fn terminal_args_with_codex_mcp_identity(
         apply_claude_coordinated_auto_approval_args(&mut next, coordination, &coordination_args);
     }
     next
+}
+
+const TERMINAL_DIFFFORGE_MCP_SERVERS: &[&str] =
+    &["coordination-kernel", "workspace-mcp-gateway"];
+
+const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
+    "workspace_mcp__sync_manifest",
+    "workspace_mcp__list_servers",
+    "workspace_mcp__get_server_status",
+    "workspace_mcp__get_server_config",
+    "workspace_mcp__write_env_file",
+];
+
+fn append_codex_mcp_server_config_args(
+    args: &mut Vec<String>,
+    server_key: &str,
+    command: &str,
+    server_args: &[String],
+) {
+    let key = terminal_toml_key_segment(server_key);
+    for value in [
+        (
+            format!("mcp_servers.{key}.enabled"),
+            "true".to_string(),
+        ),
+        (
+            format!("mcp_servers.{key}.command"),
+            terminal_toml_string(command),
+        ),
+        (
+            format!("mcp_servers.{key}.args"),
+            terminal_toml_string_array(server_args),
+        ),
+        (
+            format!("mcp_servers.{key}.default_tools_approval_mode"),
+            terminal_toml_string("prompt"),
+        ),
+    ] {
+        args.push("-c".to_string());
+        args.push(format!("{}={}", value.0, value.1));
+    }
+}
+
+fn append_codex_mcp_tool_approval_arg(args: &mut Vec<String>, server_key: &str, tool: &str) {
+    let server_key = terminal_toml_key_segment(server_key);
+    let tool = terminal_toml_key_segment(tool);
+    args.push("-c".to_string());
+    args.push(format!(
+        "mcp_servers.{server_key}.tools.{tool}.approval_mode={}",
+        terminal_toml_string("approve")
+    ));
+}
+
+fn append_codex_global_mcp_disable_args(args: &mut Vec<String>) {
+    let Some(path) = terminal_codex_global_config_path() else {
+        return;
+    };
+    let Ok(body) = fs::read_to_string(path) else {
+        return;
+    };
+    for server_key in codex_global_mcp_server_keys_from_config(&body) {
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{}.enabled=false",
+            terminal_toml_key_segment(&server_key)
+        ));
+    }
+}
+
+fn terminal_codex_global_config_path() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|home| home.join("config.toml"))
+}
+
+fn codex_global_mcp_server_keys_from_config(body: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for line in body.lines() {
+        let Some(section) = terminal_toml_section_name(line) else {
+            continue;
+        };
+        let Some(server_key) = terminal_codex_mcp_server_key_from_section(section) else {
+            continue;
+        };
+        if TERMINAL_DIFFFORGE_MCP_SERVERS.contains(&server_key.as_str()) {
+            continue;
+        }
+        if seen.insert(server_key.clone()) {
+            keys.push(server_key);
+        }
+    }
+    keys
+}
+
+fn terminal_toml_section_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[[") {
+        return None;
+    }
+    trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn terminal_codex_mcp_server_key_from_section(section: &str) -> Option<String> {
+    let rest = section.trim().strip_prefix("mcp_servers.")?;
+    terminal_toml_first_key_segment(rest).filter(|key| !key.trim().is_empty())
+}
+
+fn terminal_toml_first_key_segment(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    let quote = value.chars().next().filter(|quote| *quote == '"' || *quote == '\'');
+    if let Some(quote) = quote {
+        let mut key = String::new();
+        let mut escaped = false;
+        for character in value[quote.len_utf8()..].chars() {
+            if quote == '"' && escaped {
+                key.push(match character {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    other => other,
+                });
+                escaped = false;
+                continue;
+            }
+            if quote == '"' && character == '\\' {
+                escaped = true;
+                continue;
+            }
+            if character == quote {
+                return Some(key);
+            }
+            key.push(character);
+        }
+        return None;
+    }
+
+    value
+        .split('.')
+        .next()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+fn terminal_toml_key_segment(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", terminal_toml_escape(value))
+    }
+}
+
+fn terminal_coordination_arg_value(args: &[String], key: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|items| (items[0] == key).then(|| items[1].clone()))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn terminal_workspace_gateway_args_from_coordination_args(args: &[String]) -> Vec<String> {
+    let mut gateway_args = vec!["--workspace-mcp-gateway".to_string()];
+    for key in [
+        "--repo-path",
+        "--db-path",
+        "--workspace-id",
+        "--objective-key",
+        "--agent-id",
+        "--agent-slot-id",
+        "--slot-key",
+        "--session-id",
+        "--terminal-launch-epoch",
+        "--task-id",
+        "--worktree-id",
+        "--worktree-path",
+    ] {
+        if let Some(value) = terminal_coordination_arg_value(args, key) {
+            gateway_args.extend([key.to_string(), value]);
+        }
+    }
+    gateway_args
 }
 
 fn terminal_coordination_env_value(
@@ -782,24 +981,23 @@ fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
     }
 }
 
-fn apply_codex_managed_runtime_isolation_args(args: &mut Vec<String>) {
-    if !terminal_args_have_option_value(args, "--disable", "", "apps") {
-        args.push("--disable".to_string());
-        args.push("apps".to_string());
-    }
-}
-
 fn apply_codex_coordinated_auto_approval_args(
     args: &mut Vec<String>,
     write_root: Option<&str>,
+    codex_profile: Option<&str>,
 ) {
     strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
     args.push("--ask-for-approval".to_string());
     args.push("never".to_string());
+    strip_terminal_arg_option(args, "--profile", "-p", true);
+    if let Some(profile) = codex_profile.filter(|value| !value.trim().is_empty()) {
+        args.insert(0, profile.to_string());
+        args.insert(0, "--profile".to_string());
+    }
 
-    // Diff Forge coordinated Codex sessions use the app-generated CODEX_HOME
-    // permission profile. Keep older sandbox flags out of the launch args so
-    // profile read/write carveouts for container roots actually take effect.
+    // Diff Forge coordinated Codex sessions use an app-generated launch
+    // profile layered on the normal Codex home. Keep older sandbox flags out
+    // of the launch args so profile read/write carveouts actually take effect.
     strip_terminal_arg_option(args, "--sandbox", "-s", true);
     strip_terminal_arg_option(args, "--dangerously-bypass-approvals-and-sandbox", "", false);
     strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);

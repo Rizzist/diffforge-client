@@ -110,22 +110,28 @@ fn push_codex_managed_home_candidates(
     repo_root: &Path,
     slot: Option<&str>,
 ) {
-    let coordinated_root = repo_root
-        .join(".agents")
-        .join("codex-home")
-        .join("coordinated");
-    if let Some(slot) = slot.filter(|value| !value.trim().is_empty()) {
-        push_unique_path(paths, seen, coordinated_root.join(slot));
-        return;
-    }
+    for coordinated_root in [
+        repo_root
+            .join(".agents")
+            .join("codex-home")
+            .join("coordinated"),
+        coordination::db::coordination_repo_state_root(repo_root)
+            .join("codex-home")
+            .join("coordinated"),
+    ] {
+        if let Some(slot) = slot.filter(|value| !value.trim().is_empty()) {
+            push_unique_path(paths, seen, coordinated_root.join(slot));
+            continue;
+        }
 
-    let Ok(entries) = fs::read_dir(&coordinated_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            push_unique_path(paths, seen, path);
+        let Ok(entries) = fs::read_dir(&coordinated_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                push_unique_path(paths, seen, path);
+            }
         }
     }
 }

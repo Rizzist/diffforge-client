@@ -42,6 +42,8 @@ pub struct TerminalCoordinationContext {
     pub codex_mcp_config_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<String>,
     pub claude_mcp_config_path: String,
     pub mcp_command: String,
     pub workspace_id: Option<String>,
@@ -231,9 +233,9 @@ impl TerminalCoordinationContext {
         ];
 
         if self.agent_kind.to_ascii_lowercase().contains("codex") {
-            if let Some(path) = &self.codex_home_path {
-                if !path.trim().is_empty() {
-                    values.push(("CODEX_HOME".to_string(), path.clone()));
+            if let Some(profile) = &self.codex_profile {
+                if !profile.trim().is_empty() {
+                    values.push(("DIFFFORGE_CODEX_PROFILE".to_string(), profile.clone()));
                 }
             }
         }

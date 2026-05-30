@@ -8486,6 +8486,24 @@ export default function App() {
                 || providerBinding?.nativeSessionId
                 || providerBinding?.nativeSessionTitle,
             );
+            const latestTurn = thread?.latestTurn && typeof thread.latestTurn === "object"
+              ? thread.latestTurn
+              : {};
+            const effectiveLatestTurnState = String(
+              terminalGroundTruth.effectiveLatestTurnState
+                || latestTurn?.state
+                || latestTurn?.status
+                || "",
+            ).trim().toLowerCase();
+            const turnStatus = (() => {
+              if (["queued", "submitted", "pending"].includes(effectiveLatestTurnState)) return "submitted";
+              if (["running", "thinking", "reasoning", "working", "busy"].includes(effectiveLatestTurnState)) return "running";
+              if (["complete", "completed", "done", "idle"].includes(effectiveLatestTurnState)) return "completed";
+              if (["error", "failed", "failure"].includes(effectiveLatestTurnState)) return "failed";
+              if (["cancelled", "canceled"].includes(effectiveLatestTurnState)) return "cancelled";
+              if (effectiveLatestTurnState === "interrupted") return "interrupted";
+              return "";
+            })();
             const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
             const rawActivity = String(
               terminalGroundTruth.effectiveActivityStatus
@@ -8500,7 +8518,7 @@ export default function App() {
               if (liveStatus === "starting" || rawActivity === "starting") return "working";
               if (terminalGroundTruth.terminalIsPromptingUser) return "paused";
               if (["thinking", "reasoning"].includes(rawActivity)) return "thinking";
-              if (terminalGroundTruth.effectiveLatestTurnState === "running") return "thinking";
+              if (effectiveLatestTurnState === "running") return "thinking";
               if ([
                 "busy",
                 "running",
@@ -8519,21 +8537,50 @@ export default function App() {
               if (!liveTerminal && !hasSession) return "idle";
               return "idle";
             })();
+            const readiness = (() => {
+              if (status === "thinking" || status === "working") return "busy";
+              if (status === "paused") return "needs_input";
+              if (status === "error") return "error";
+              return "ready";
+            })();
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
               ? "Terminal"
               : getManagedAgentLabel(normalizedRole);
+            const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || "";
+            const paneId = terminalBinding?.paneId
+              || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole);
+            const statusSeq = Number(
+              thread?.projectionEventCount
+                || thread?.revision
+                || latestTurn?.sequence
+                || latestTurn?.seq
+                || 0,
+            ) || Date.parse(
+              thread?.updatedAt
+                || latestTurn?.updatedAt
+                || latestTurn?.completedAt
+                || latestTurn?.createdAt
+                || "",
+            ) || 0;
             return {
               agentId: normalizedRole,
               agentKind: normalizedRole,
               agentLabel,
               color,
               colorSlot,
-              paneId: terminalBinding?.paneId
-                || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole),
+              inputReady: Boolean(terminalGroundTruth.agentInputReady),
+              paneId,
+              readiness,
               sessionState: hasSession ? "session_attached" : "no_session",
               status,
+              statusSeq,
+              terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
               terminalIndex,
+              terminalInstanceId,
+              terminalLifecycle: liveTerminal || hasSession ? "open" : "closed",
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
+              turnId: latestTurn?.id || latestTurn?.turnId || "",
+              turnStatus,
             };
           })
           .filter(Boolean);
@@ -9194,12 +9241,23 @@ export default function App() {
       const backups = Array.isArray(data?.backups) ? data.backups : [];
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
       const skippedBackup = backups.find((backup) => backup?.skipped);
+      const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
+      const queuedBackupContextCount = Math.max(
+        0,
+        Number(backgroundCheckpoint?.backup_context_count || backgroundCheckpoint?.backupContextCount || data?.backup_context_count || 0),
+      );
       const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
       const filetreeLabel = preservedFiletrees === 1 ? "filetree snapshot" : "filetree snapshots";
       const backupLabel = updatedBackupCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
-      const backupMessage = updatedBackupCount > 0
-        ? `updated ${updatedBackupCount} ${backupLabel}`
-        : `skipped B2 backup${skippedBackup?.reason ? ` (${skippedBackup.reason})` : ""}`;
+      let backupMessage = `skipped B2 backup${skippedBackup?.reason ? ` (${skippedBackup.reason})` : ""}`;
+      if (backgroundCheckpoint?.queued) {
+        const queuedBackupLabel = queuedBackupContextCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
+        backupMessage = `queued ${queuedBackupContextCount || resetClientCount} ${queuedBackupLabel}`;
+      } else if (backgroundCheckpoint?.error) {
+        backupMessage = `could not queue B2 checkpoint (${backgroundCheckpoint.error})`;
+      } else if (updatedBackupCount > 0) {
+        backupMessage = `updated ${updatedBackupCount} ${backupLabel}`;
+      }
       setCloudSqliteResetMessage(
         `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}. Preserved ${preservedFiletrees} ${filetreeLabel} and ${backupMessage}.`,
       );
