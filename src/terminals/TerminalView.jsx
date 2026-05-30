@@ -4117,6 +4117,15 @@ function normalizeTodoTerminalAgentId(value) {
   return String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
 }
 
+function normalizeTodoTerminalIdentity(value) {
+  return String(value || "").trim();
+}
+
+function normalizeTodoTerminalIndex(value) {
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
 function getTodoQueueTargetAgentId(item) {
   return normalizeTodoTerminalAgentId(
     item?.targetAgentId
@@ -4125,6 +4134,81 @@ function getTodoQueueTargetAgentId(item) {
       || item?.remote_command?.target_agent_id
       || "",
   );
+}
+
+function getTodoQueueTargetTerminalId(item) {
+  return normalizeTodoTerminalIdentity(
+    item?.targetTerminalId
+      || item?.target_terminal_id
+      || item?.terminalId
+      || item?.terminal_id
+      || item?.paneId
+      || item?.pane_id
+      || item?.remoteCommand?.targetTerminalId
+      || item?.remoteCommand?.target_terminal_id
+      || item?.remoteCommand?.terminalId
+      || item?.remoteCommand?.terminal_id
+      || item?.remoteCommand?.paneId
+      || item?.remoteCommand?.pane_id
+      || item?.remote_command?.target_terminal_id
+      || item?.remote_command?.terminal_id
+      || item?.remote_command?.pane_id
+      || "",
+  );
+}
+
+function getTodoQueueTargetThreadId(item) {
+  return normalizeTodoTerminalIdentity(
+    item?.targetThreadId
+      || item?.target_thread_id
+      || item?.threadId
+      || item?.thread_id
+      || item?.remoteCommand?.targetThreadId
+      || item?.remoteCommand?.target_thread_id
+      || item?.remoteCommand?.threadId
+      || item?.remoteCommand?.thread_id
+      || item?.remote_command?.target_thread_id
+      || item?.remote_command?.thread_id
+      || "",
+  );
+}
+
+function getTodoQueueTargetTerminalIndex(item) {
+  return normalizeTodoTerminalIndex(
+    item?.targetTerminalIndex
+      ?? item?.target_terminal_index
+      ?? item?.terminalIndex
+      ?? item?.terminal_index
+      ?? item?.remoteCommand?.targetTerminalIndex
+      ?? item?.remoteCommand?.target_terminal_index
+      ?? item?.remoteCommand?.terminalIndex
+      ?? item?.remoteCommand?.terminal_index
+      ?? item?.remote_command?.target_terminal_index
+      ?? item?.remote_command?.terminal_index,
+  );
+}
+
+function todoQueueSendTargetMatchesIdentity(candidate, targetTerminalId, targetThreadId) {
+  const requestedTerminalId = normalizeTodoTerminalIdentity(targetTerminalId);
+  const requestedThreadId = normalizeTodoTerminalIdentity(targetThreadId);
+  if (!requestedTerminalId && !requestedThreadId) {
+    return true;
+  }
+  const candidateTerminalIds = [
+    candidate?.paneId,
+    candidate?.targetBinding?.paneId,
+    candidate?.targetProviderBinding?.terminalBinding?.paneId,
+    candidate?.liveTerminal?.paneId,
+    candidate?.liveTerminal?.terminalId,
+    candidate?.terminalAgent?.paneId,
+  ].map(normalizeTodoTerminalIdentity).filter(Boolean);
+  const candidateThreadIds = [
+    candidate?.targetThread?.id,
+    candidate?.liveTerminal?.threadId,
+    candidate?.terminalAgent?.threadId,
+  ].map(normalizeTodoTerminalIdentity).filter(Boolean);
+  return (!requestedTerminalId || candidateTerminalIds.includes(requestedTerminalId))
+    && (!requestedThreadId || candidateThreadIds.includes(requestedThreadId));
 }
 
 function getTodoQueueAgentAccentColor(agentId) {
@@ -4433,6 +4517,9 @@ function createTodoQueueItem(text, options = {}) {
   const workspaceId = String(options.workspaceId || specEdit?.workspaceId || "").trim();
   const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
+  const targetTerminalId = getTodoQueueTargetTerminalId(options);
+  const targetTerminalIndex = getTodoQueueTargetTerminalIndex(options);
+  const targetThreadId = getTodoQueueTargetThreadId(options);
   const remoteCommand = options.remoteCommand && typeof options.remoteCommand === "object"
     ? { ...options.remoteCommand }
     : null;
@@ -4449,6 +4536,9 @@ function createTodoQueueItem(text, options = {}) {
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
+    ...(targetTerminalId ? { targetTerminalId } : {}),
+    ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetThreadId ? { targetThreadId } : {}),
     text: normalizeTodoQueueText(text),
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -4469,6 +4559,9 @@ function normalizeTodoQueueItem(item) {
   const workspaceId = String(item.workspaceId || item.workspace_id || specEdit?.workspaceId || "").trim();
   const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
+  const targetTerminalId = getTodoQueueTargetTerminalId(item);
+  const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+  const targetThreadId = getTodoQueueTargetThreadId(item);
   const remoteCommand = item.remoteCommand && typeof item.remoteCommand === "object"
     ? { ...item.remoteCommand }
     : item.remote_command && typeof item.remote_command === "object"
@@ -4492,6 +4585,9 @@ function normalizeTodoQueueItem(item) {
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
+    ...(targetTerminalId ? { targetTerminalId } : {}),
+    ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetThreadId ? { targetThreadId } : {}),
     text,
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -6465,6 +6561,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         const note = getTodoQueueItemNote(item);
                         const hasPreview = Boolean(image || note);
                         const targetAgentId = getTodoQueueTargetAgentId(item);
+                        const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+                        const hasTerminalTarget = Number.isInteger(targetTerminalIndex)
+                          || Boolean(getTodoQueueTargetTerminalId(item))
+                          || Boolean(getTodoQueueTargetThreadId(item));
 
                         return (
                           <TodoQueueItemCard
@@ -6474,7 +6574,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             data-todo-pending={isPending ? "true" : undefined}
                             data-todo-queued={isQueued ? "true" : undefined}
                             data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
-                            data-todo-targeted={targetAgentId ? "true" : undefined}
+                            data-todo-targeted={targetAgentId || hasTerminalTarget ? "true" : undefined}
                             data-todo-cancellable={isQueued ? "true" : undefined}
                             data-todo-sending={isSending ? "true" : undefined}
                             key={item.id}
@@ -6492,9 +6592,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             style={targetAgentId ? { "--todo-agent-color": getTodoQueueAgentAccentColor(targetAgentId) } : undefined}
                             title={
                               isQueued
-                                ? targetAgentId
-                                  ? `Queued for ${item.targetAgentLabel || targetAgentId}.`
-                                  : "Queued for the next available agent."
+                                ? hasTerminalTarget
+                                  ? Number.isInteger(targetTerminalIndex)
+                                    ? `Queued for terminal ${targetTerminalIndex + 1}.`
+                                    : "Queued for the selected terminal."
+                                  : targetAgentId
+                                    ? `Queued for ${item.targetAgentLabel || targetAgentId}.`
+                                    : "Queued for the next available agent."
                                 : isSending
                                   ? "Sending to terminal."
                                   : "Drag into an agent terminal. Double-click to edit."
@@ -10287,6 +10391,9 @@ function TerminalView({
         phase: "queued",
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         targetRole: getTodoQueueTargetAgentId(item),
+        targetTerminalId: getTodoQueueTargetTerminalId(item),
+        targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+        targetThreadId: getTodoQueueTargetThreadId(item),
         workspaceId: terminalWorkspace.id,
       });
       setTodoQueueDispatchRevision((revision) => revision + 1);
@@ -10295,6 +10402,9 @@ function TerminalView({
         item: getTodoQueueItemLogSummary([item])[0] || null,
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         targetAgentId: getTodoQueueTargetAgentId(item),
+        targetTerminalId: getTodoQueueTargetTerminalId(item),
+        targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+        targetThreadId: getTodoQueueTargetThreadId(item),
         surface: "tui_todo_queue",
         workspaceId: terminalWorkspace.id,
       });
@@ -10477,28 +10587,81 @@ function TerminalView({
     }
 
     const requestedTargetAgentId = getTodoQueueTargetAgentId(queuedItem);
+    const requestedTargetTerminalId = getTodoQueueTargetTerminalId(queuedItem);
+    const requestedTargetTerminalIndex = getTodoQueueTargetTerminalIndex(queuedItem);
+    const requestedTargetThreadId = getTodoQueueTargetThreadId(queuedItem);
+    const hasExplicitTerminalTarget = Number.isInteger(requestedTargetTerminalIndex)
+      || Boolean(requestedTargetTerminalId)
+      || Boolean(requestedTargetThreadId);
     let target = null;
-    for (const terminalIndex of logicalTerminalIndexes) {
-      const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
-        allowGeneric: false,
-        requireAvailable: true,
-        reservationItemId: queuedItem.id,
-      });
-      const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);
-      if (candidate.available && (!requestedTargetAgentId || candidateRole === requestedTargetAgentId)) {
-        target = candidate;
+    if (hasExplicitTerminalTarget) {
+      const candidateIndexes = Number.isInteger(requestedTargetTerminalIndex)
+        ? [requestedTargetTerminalIndex]
+        : logicalTerminalIndexes;
+      let matchedUnavailableTarget = null;
+      for (const terminalIndex of candidateIndexes) {
+        if (!logicalTerminalIndexes.includes(terminalIndex)) {
+          continue;
+        }
+        const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
+          allowGeneric: false,
+          requireAvailable: true,
+          reservationItemId: queuedItem.id,
+        });
+        if (!todoQueueSendTargetMatchesIdentity(candidate, requestedTargetTerminalId, requestedTargetThreadId)) {
+          continue;
+        }
+        const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);
+        if (requestedTargetAgentId && candidateRole && candidateRole !== requestedTargetAgentId) {
+          matchedUnavailableTarget = {
+            ...candidate,
+            reason: "target_agent_mismatch",
+          };
+          break;
+        }
+        if (candidate.available) {
+          target = candidate;
+          break;
+        }
+        matchedUnavailableTarget = candidate;
         break;
       }
-    }
-    if (!target) {
-      logTerminalStatus("frontend.todo_queue.dispatch_wait", {
-        item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
-        reason: "no_available_terminal",
-        requestedTargetAgentId,
-        terminalCount: logicalTerminalIndexes.length,
-        workspaceId: terminalWorkspace?.id || "",
-      });
-      return;
+      if (!target) {
+        logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: matchedUnavailableTarget?.reason || "target_terminal_not_found",
+          requestedTargetAgentId,
+          requestedTargetTerminalId,
+          requestedTargetTerminalIndex: Number.isInteger(requestedTargetTerminalIndex) ? requestedTargetTerminalIndex : "",
+          requestedTargetThreadId,
+          terminalCount: logicalTerminalIndexes.length,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
+    } else {
+      for (const terminalIndex of logicalTerminalIndexes) {
+        const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
+          allowGeneric: false,
+          requireAvailable: true,
+          reservationItemId: queuedItem.id,
+        });
+        const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);
+        if (candidate.available && (!requestedTargetAgentId || candidateRole === requestedTargetAgentId)) {
+          target = candidate;
+          break;
+        }
+      }
+      if (!target) {
+        logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: "no_available_terminal",
+          requestedTargetAgentId,
+          terminalCount: logicalTerminalIndexes.length,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
     }
 
     const source = getTodoQueueItemAutoQueueSource(queuedItem);

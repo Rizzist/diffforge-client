@@ -466,6 +466,46 @@ function lastUpdatedText(value) {
   return `Updated ${Math.round(minutes / 60)} hr ago`;
 }
 
+function providerLimitKey(row = {}) {
+  return [
+    providerKey(row),
+    rowProviderAccountKey(row),
+    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+  ].join("::");
+}
+
+function providerLimitIsUnknown(row = {}) {
+  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+  const confidence = String(row?.confidence || "").toLowerCase();
+  const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
+  const hasPercent = row?.remaining_percent != null
+    || row?.remainingPercent != null
+    || row?.used_percent != null
+    || row?.usedPercent != null;
+  return source === "not_exposed"
+    || confidence === "unknown"
+    || status.includes("not exposed")
+    || (!hasPercent && row?.allowance == null && row?.used == null);
+}
+
+function mergeProviderLimits(previousLimits, nextLimits) {
+  const previousRows = Array.isArray(previousLimits) ? previousLimits : [];
+  if (!Array.isArray(nextLimits)) return previousRows;
+  if (!nextLimits.length && previousRows.length) return previousRows;
+
+  const merged = new Map();
+  previousRows.forEach((row) => merged.set(providerLimitKey(row), row));
+  nextLimits.forEach((row) => {
+    const key = providerLimitKey(row);
+    const existing = merged.get(key);
+    if (existing && !providerLimitIsUnknown(existing) && providerLimitIsUnknown(row)) {
+      return;
+    }
+    merged.set(key, row);
+  });
+  return [...merged.values()];
+}
+
 function mergeTokenomicsSummary(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
@@ -483,7 +523,7 @@ function mergeTokenomicsSummary(previous, next) {
     rollups: next.rollups || previous.rollups,
     sources: next.sources || previous.sources,
     accounts: next.accounts || previous.accounts,
-    limits: next.limits || previous.limits,
+    limits: mergeProviderLimits(previous.limits, next.limits),
     credits: next.credits || previous.credits,
   };
 }
@@ -634,6 +674,12 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
   });
 
   return tokenomicsStore.loadPromise;
+}
+
+export function startAccountTokenomicsStartupScan(accountKey = "") {
+  resetTokenomicsStoreForAccount(accountKey);
+  ensureTokenomicsProgressListener();
+  return loadTokenomicsStore({ scan: true, force: true });
 }
 
 function startTokenomicsViewPolling() {

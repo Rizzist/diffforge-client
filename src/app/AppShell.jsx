@@ -458,7 +458,7 @@ import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
-import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
+import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -823,6 +823,7 @@ const APP_THEME_OPTIONS = [
   },
 ];
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
+const WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS = 240;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -2243,6 +2244,13 @@ function isDesktopSessionExpiredError(error) {
   );
 }
 
+function isWorkspaceAlreadyDeletedError(error) {
+  const message = getErrorMessage(error, "").toLowerCase();
+
+  return message.includes("workspace not found")
+    || message.includes("not found");
+}
+
 function withTimeout(promise, timeoutMs, message) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -3635,6 +3643,8 @@ export default function App() {
   const [pendingSpecEditIntents, setPendingSpecEditIntents] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
+  const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
+  const [workspaceHydrationReady, setWorkspaceHydrationReady] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceName, setWorkspaceName] = useState("");
   const [newWorkspaceRootDraft, setNewWorkspaceRootDraft] = useState("");
@@ -3657,6 +3667,7 @@ export default function App() {
   const [workspaceSettingsError, setWorkspaceSettingsError] = useState("");
   const [workspaceSettingsMessage, setWorkspaceSettingsMessage] = useState("");
   const [workspaceSettingsModalId, setWorkspaceSettingsModalId] = useState("");
+  const [workspaceDeleteConfirmId, setWorkspaceDeleteConfirmId] = useState("");
   const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -3734,6 +3745,16 @@ export default function App() {
     workspaceTerminalRoleOptions,
     activeAgent,
   );
+  const activeWorkspaceHydrationRoot = activatedWorkspaceId
+    ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
+    : "";
+  const workspaceHydrationKey = authState === "authenticated" && workspaceState === "ready"
+    ? [
+      selectedWorkspaceId || "none",
+      activatedWorkspaceId || "none",
+      getWorkspaceRootIdentity(activeWorkspaceHydrationRoot),
+    ].join(":")
+    : "";
   const workspaceCoordinationRootEntries = useMemo(() => {
     const entries = [];
     const seen = new Set();
@@ -3769,6 +3790,43 @@ export default function App() {
   );
 
   useEffect(() => {
+    setWorkspaceHydrationReady(false);
+
+    if (!workspaceHydrationKey) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let idleId = 0;
+    const timeoutId = window.setTimeout(() => {
+      const markReady = () => {
+        if (!cancelled) {
+          setWorkspaceHydrationReady(true);
+        }
+      };
+
+      if (typeof window.requestIdleCallback === "function") {
+        idleId = window.requestIdleCallback(markReady, { timeout: 600 });
+        return;
+      }
+
+      markReady();
+    }, WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+      if (idleId && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleId);
+      }
+    };
+  }, [workspaceHydrationKey]);
+
+  useEffect(() => {
+    if (!workspaceHydrationReady) {
+      return undefined;
+    }
+
     if (!workspaceCoordinationRootEntries.length) {
       setWorkspaceCoordinationTargetsByRoot({});
       return undefined;
@@ -3803,7 +3861,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [workspaceCoordinationRootEntries, workspaceCoordinationRootKey]);
+  }, [workspaceCoordinationRootEntries, workspaceCoordinationRootKey, workspaceHydrationReady]);
 
   const workspaceNotificationRoots = useMemo(() => (
     workspaceCoordinationRootEntries.flatMap((entry) => (
@@ -3940,6 +3998,13 @@ export default function App() {
     const targets = workspaceThreadStoreTargets;
     const storeKey = workspaceThreadStoreKey;
 
+    if (!workspaceHydrationReady) {
+      workspaceThreadsHydratedKeyRef.current = "";
+      workspaceThreadsPersistenceReadyRef.current = false;
+      setWorkspaceThreadsHydratedKey("");
+      return undefined;
+    }
+
     if (!targets.length) {
       workspaceThreadsHydratedKeyRef.current = storeKey;
       workspaceThreadsPersistenceReadyRef.current = Boolean(workspaces.length === 0);
@@ -4039,6 +4104,7 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
+    workspaceHydrationReady,
     workspaces,
   ]);
 
@@ -4558,6 +4624,8 @@ export default function App() {
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     setWorkspaceSyncState("idle");
+    setWorkspaceListHydrated(false);
+    setWorkspaceHydrationReady(false);
     setWorkspaceName("");
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
@@ -4598,6 +4666,8 @@ export default function App() {
     setViewMotion("entered");
     setWorkspaceState(isPaid ? "initializing" : "billingRequired");
     setWorkspaceSyncState("idle");
+    setWorkspaceListHydrated(!isPaid);
+    setWorkspaceHydrationReady(false);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     setWorkspaceNameDraft("");
@@ -4972,12 +5042,7 @@ export default function App() {
     }
 
     if (workspaceDeactivationInFlightRef.current || workspaceSettingsState === "deleting") {
-      return;
-    }
-
-    const token = authStore.getToken();
-    if (!isSafeAuthValue(token)) {
-      expireDesktopSession("Desktop session required to delete workspace.");
+      setWorkspaceSettingsError("Workspace delete is already running.");
       return;
     }
 
@@ -4989,11 +5054,16 @@ export default function App() {
       return;
     }
 
-    const confirmation = window.prompt(
-      `Delete "${workspaceName}" from Diff Forge? This removes Diff Forge cloud/live state and local .agents metadata, but does not delete your project files.\n\nType the workspace name to continue.`,
-      "",
-    );
-    if (confirmation !== workspaceName) {
+    if (workspaceDeleteConfirmId !== targetWorkspaceId) {
+      setWorkspaceDeleteConfirmId(targetWorkspaceId);
+      setWorkspaceSettingsError("");
+      setWorkspaceSettingsMessage(`Click "Confirm delete" to remove "${workspaceName}" from Diff Forge. Project files stay on disk.`);
+      return;
+    }
+
+    const token = authStore.getToken();
+    if (!isSafeAuthValue(token)) {
+      expireDesktopSession("Desktop session required to delete workspace.");
       return;
     }
 
@@ -5001,37 +5071,59 @@ export default function App() {
     setWorkspaceSettingsState("deleting");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
     clearPreparedWorkspaceTerminals(targetWorkspaceId);
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
     setWorkspaceAgentBatchSentKey("");
 
     try {
-      await withTimeout(
-        invoke("deactivate_workspace_runtime", {
-          repoPath,
-          reason: "workspace_delete",
+      const warnings = [];
+
+      try {
+        await invoke("delete_workspace", {
+          token,
           workspaceId: targetWorkspaceId,
-        }),
-        WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
-        "Workspace runtime cleanup timed out.",
-      );
+        });
+      } catch (error) {
+        if (isDesktopSessionExpiredError(error)) {
+          throw error;
+        }
+        if (isWorkspaceAlreadyDeletedError(error)) {
+          warnings.push("Cloud workspace record was already removed.");
+        } else {
+          throw error;
+        }
+      }
+
+      try {
+        await withTimeout(
+          invoke("deactivate_workspace_runtime", {
+            repoPath,
+            reason: "workspace_delete",
+            workspaceId: targetWorkspaceId,
+          }),
+          WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
+          "Workspace runtime cleanup timed out.",
+        );
+      } catch (error) {
+        warnings.push(`Runtime cleanup warning: ${getErrorMessage(error, "Unable to stop workspace runtime cleanly.")}`);
+      }
+
+      try {
+        await invoke("cloud_mcp_delete_workspace", {
+          repoPath,
+          workspaceId: targetWorkspaceId,
+          workspaceName,
+          includeChildProjects: false,
+        });
+      } catch (error) {
+        warnings.push(`Live-state cleanup warning: ${getErrorMessage(error, "Unable to notify cloud live state.")}`);
+      }
 
       await invoke("delete_workspace_local_metadata", {
         repoPath,
-        discardDirtyWorktrees: false,
-      });
-
-      await invoke("cloud_mcp_delete_workspace", {
-        repoPath,
-        workspaceId: targetWorkspaceId,
-        workspaceName,
-        includeChildProjects: false,
-      });
-
-      await invoke("delete_workspace", {
-        token,
-        workspaceId: targetWorkspaceId,
+        discardDirtyWorktrees: true,
       });
 
       const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
@@ -5105,6 +5197,9 @@ export default function App() {
         telemetrySource: "workspace_deleted",
         telemetryWorkspaceId: targetWorkspaceId,
       });
+      setWorkspaceError(warnings.length
+        ? `Workspace deleted. ${warnings.join(" ")}`
+        : "");
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -5121,6 +5216,7 @@ export default function App() {
     expireDesktopSession,
     showView,
     updateWorkspaceLifecycleSettings,
+    workspaceDeleteConfirmId,
     workspaceSettingsState,
   ]);
 
@@ -5884,7 +5980,6 @@ export default function App() {
 
   const loadWorkspaces = useCallback(async () => {
     const token = authStore.getToken();
-    const loadStartedAt = performance.now();
 
     if (!isSafeAuthValue(token)) {
       expireDesktopSession("Desktop session required to load workspaces.");
@@ -5897,34 +5992,6 @@ export default function App() {
     try {
       const result = await invoke("list_workspaces", { token });
       const nextWorkspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
-      if (!crashRecoveryScanRef.current) {
-        crashRecoveryScanRef.current = true;
-        const localWorkspaceSettings = readWorkspaceSettings();
-        const recoveryRoots = Array.from(new Set(nextWorkspaces
-          .map((workspace) => getWorkspaceRootDirectory(localWorkspaceSettings, workspace.id))
-          .filter(Boolean)));
-        const recoveryStartedAt = performance.now();
-
-        try {
-          const recoveryReport = await invoke("terminal_recover_crashed_sessions", {
-            roots: recoveryRoots,
-          });
-          const interruptedTasks = Array.isArray(recoveryReport?.interruptedTasks)
-            ? recoveryReport.interruptedTasks
-            : [];
-
-
-          if (interruptedTasks.length > 0) {
-            setCrashRecoveryModal({
-              interruptedTasks,
-              idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted || 0,
-              finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted || 0,
-              scannedSessions: recoveryReport?.scannedSessions || 0,
-            });
-          }
-        } catch (error) {
-        }
-      }
       const currentSelectedId = selectedWorkspaceIdRef.current;
       const currentActivatedId = activatedWorkspaceIdRef.current;
       const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
@@ -5967,10 +6034,6 @@ export default function App() {
         setWorkspaceLifecycleSettings(nextLifecycleSettings);
       }
 
-
-      if (nextActivated) {
-      }
-
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId((currentSelectedId) => {
         const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId)
@@ -5982,6 +6045,36 @@ export default function App() {
       setActivatedWorkspaceId(nextActivated?.id || "");
 
       setWorkspaceSyncState("idle");
+      setWorkspaceListHydrated(true);
+
+      if (!crashRecoveryScanRef.current) {
+        crashRecoveryScanRef.current = true;
+        window.setTimeout(async () => {
+          const localWorkspaceSettings = readWorkspaceSettings();
+          const recoveryRoots = Array.from(new Set(nextWorkspaces
+            .map((workspace) => getWorkspaceRootDirectory(localWorkspaceSettings, workspace.id))
+            .filter(Boolean)));
+
+          try {
+            const recoveryReport = await invoke("terminal_recover_crashed_sessions", {
+              roots: recoveryRoots,
+            });
+            const interruptedTasks = Array.isArray(recoveryReport?.interruptedTasks)
+              ? recoveryReport.interruptedTasks
+              : [];
+
+            if (interruptedTasks.length > 0) {
+              setCrashRecoveryModal({
+                interruptedTasks,
+                idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted || 0,
+                finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted || 0,
+                scannedSessions: recoveryReport?.scannedSessions || 0,
+              });
+            }
+          } catch {
+          }
+        }, WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS);
+      }
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -5989,6 +6082,7 @@ export default function App() {
       }
 
       setWorkspaceSyncState("error");
+      setWorkspaceListHydrated(true);
       setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
     }
   }, [expireDesktopSession]);
@@ -6135,6 +6229,7 @@ export default function App() {
     setWorkspaceSettingsModalId(workspaceId);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
   }, []);
 
   const closeWorkspaceSettings = useCallback(() => {
@@ -6145,6 +6240,7 @@ export default function App() {
     setWorkspaceSettingsModalId("");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
   }, []);
 
   const saveWorkspaceSettings = useCallback(async (event) => {
@@ -7724,6 +7820,8 @@ export default function App() {
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     setWorkspaceSyncState("idle");
+    setWorkspaceListHydrated(false);
+    setWorkspaceHydrationReady(false);
     setWorkspaceRootDraft("");
     setNewWorkspaceRootDraft("");
     setWorkspaceCreateModalOpen(false);
@@ -7876,16 +7974,12 @@ export default function App() {
     };
   }, [authInitialized]);
 
-  const isStartupAgentGateBlocking = startupAgentGateState === "checking"
-    || startupAgentGateState === "choice"
-    || startupAgentGateState === "updating";
-
   useEffect(() => {
     if (
       authState !== "authenticated"
       || workspaceState !== "initializing"
       || isLaunchScreenVisible
-      || isStartupAgentGateBlocking
+      || !workspaceListHydrated
     ) {
       return undefined;
     }
@@ -7894,7 +7988,7 @@ export default function App() {
     authStore.setMessage("Workspace ready.");
 
     return undefined;
-  }, [authState, isLaunchScreenVisible, isStartupAgentGateBlocking, workspaceState]);
+  }, [authState, isLaunchScreenVisible, workspaceListHydrated, workspaceState]);
 
   useEffect(() => {
     if (authState !== "authenticated" || !isPaidUser(user) || workspaceState !== "initializing") {
@@ -8491,7 +8585,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !isPaidUser(user) || !workspaceHydrationReady) {
       return undefined;
     }
 
@@ -8589,11 +8683,12 @@ export default function App() {
     shouldShowWorkspaceSetup,
     terminalPresenceSyncKey,
     terminalPresenceWorkspaces,
+    workspaceHydrationReady,
     workspaceSyncState,
   ]);
 
   useEffect(() => {
-    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (!workspaceHydrationReady || shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
       return undefined;
     }
 
@@ -8708,6 +8803,7 @@ export default function App() {
     shouldShowWorkspaceSetup,
     workspaceMcpSyncTargetKey,
     workspaceMcpSyncTargets,
+    workspaceHydrationReady,
     workspaceSyncState,
   ]);
 
@@ -8717,6 +8813,8 @@ export default function App() {
     }
 
     let disposed = false;
+    const accountKey = user?.id || user?.email || "paid-user";
+    tokenomicsSyncCursorRef.current = "";
     const tokenomicsCursorFromSummary = (summary) => {
       const direct = typeof summary?.sync_cursor === "string" ? summary.sync_cursor.trim() : "";
       if (direct) return direct;
@@ -8734,7 +8832,7 @@ export default function App() {
       tokenomicsSyncInFlightRef.current = true;
       try {
         if (reason === "tokenomics_scan") {
-          await invoke("tokenomics_scan_usage");
+          await startAccountTokenomicsStartupScan(accountKey);
           const summary = await invoke("tokenomics_get_sync_payload");
           if (disposed) {
             return;
@@ -8748,7 +8846,7 @@ export default function App() {
           return;
         }
 
-        await invoke("tokenomics_scan_usage");
+        await startAccountTokenomicsStartupScan(accountKey);
         const summary = await invoke("tokenomics_get_sync_delta", {
           sinceUpdatedAt: tokenomicsSyncCursorRef.current || null,
         });
@@ -8791,7 +8889,7 @@ export default function App() {
   }, [authState, user]);
 
   useEffect(() => {
-    if (shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (!workspaceHydrationReady || shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
       return;
     }
 
@@ -8837,10 +8935,15 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    workspaceHydrationReady,
     workspaceSyncState,
   ]);
 
   useEffect(() => {
+    if (!workspaceHydrationReady) {
+      return;
+    }
+
     const desiredTargets = new Map();
 
     enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
@@ -8906,13 +9009,14 @@ export default function App() {
         "Shared MCP deactivation timed out.",
       ).catch(() => {});
     });
-  }, [enabledWorkspaceRuntimeDescriptors]);
+  }, [enabledWorkspaceRuntimeDescriptors, workspaceHydrationReady]);
   const isActivatedWorkspaceDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && activatedWorkspace
       && workspaceDeactivationState.workspaceId === activatedWorkspace.id,
   );
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
+    && workspaceHydrationReady
     && Boolean(activatedWorkspace)
     && workspaceThreadsHydrated
     && !isActivatedWorkspaceDeactivating
@@ -9017,6 +9121,9 @@ export default function App() {
   const isWorkspaceSettingsBusy = workspaceSettingsState === "saving"
     || isWorkspaceSettingsDeactivating
     || isWorkspaceSettingsDeleting;
+  const isWorkspaceDeleteConfirming = Boolean(
+    selectedWorkspace && workspaceDeleteConfirmId === selectedWorkspace.id,
+  );
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
 
@@ -9083,7 +9190,7 @@ export default function App() {
 
   useEffect(() => {
     const repoPath = activatedWorkspaceTerminalWorkingDirectory;
-    if (!repoPath || !activatedWorkspaceIdForGraphSync) {
+    if (!workspaceHydrationReady || !repoPath || !activatedWorkspaceIdForGraphSync) {
       return undefined;
     }
 
@@ -9153,6 +9260,7 @@ export default function App() {
     activatedWorkspaceTerminalWorkingDirectory,
     applyWorkspaceGraphSnapshot,
     setWorkspaceGraphStatus,
+    workspaceHydrationReady,
   ]);
 
   const selectedWorkspaceGraphStateKey = workspaceGraphStateKey(
@@ -9245,6 +9353,28 @@ export default function App() {
           || "",
       ).trim();
     };
+    const remoteCommandStringField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key];
+        const text = String(value || "").trim();
+        if (text) {
+          return text;
+        }
+      }
+      return "";
+    };
+    const remoteCommandIntegerField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key];
+        const number = Number.parseInt(value, 10);
+        if (Number.isInteger(number) && number >= 0) {
+          return number;
+        }
+      }
+      return null;
+    };
     const remoteCommandWorkspaceId = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const requestedWorkspaceId = String(
@@ -9292,6 +9422,26 @@ export default function App() {
               || event.payload?.targetAgentId
               || "",
           );
+          const targetTerminalId = remoteCommandStringField(event, [
+            "target_terminal_id",
+            "targetTerminalId",
+            "terminal_id",
+            "terminalId",
+            "pane_id",
+            "paneId",
+          ]);
+          const targetTerminalIndex = remoteCommandIntegerField(event, [
+            "target_terminal_index",
+            "targetTerminalIndex",
+            "terminal_index",
+            "terminalIndex",
+          ]);
+          const targetThreadId = remoteCommandStringField(event, [
+            "target_thread_id",
+            "targetThreadId",
+            "thread_id",
+            "threadId",
+          ]);
           if (!text || !workspaceId) {
             await invoke("cloud_mcp_record_remote_command_status", {
               event,
@@ -9312,10 +9462,16 @@ export default function App() {
                 remoteCommand: {
                   commandId,
                   source: event.source || "next-diffforge",
+                  targetTerminalId,
+                  targetTerminalIndex,
+                  targetThreadId,
                 },
                 source: "next-remote-control",
                 targetAgentId: agentId || "",
                 targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+                targetTerminalId,
+                targetTerminalIndex,
+                targetThreadId,
                 text,
                 workspaceId,
               },
@@ -9328,9 +9484,11 @@ export default function App() {
           await invoke("cloud_mcp_record_remote_command_status", {
             event,
             status: "queued",
-            message: agentId
-              ? `Queued for ${getManagedAgentLabel(agentId)}.`
-              : "Queued for the next available coding agent.",
+            message: Number.isInteger(targetTerminalIndex)
+              ? `Queued for terminal ${targetTerminalIndex + 1}.`
+              : agentId
+                ? `Queued for ${getManagedAgentLabel(agentId)}.`
+                : "Queued for the next available terminal.",
           }).catch(() => {});
         });
       } catch (error) {
@@ -11945,6 +12103,7 @@ export default function App() {
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
   }, [
     selectedWorkspace?.id,
     selectedWorkspace?.name,
@@ -12559,6 +12718,7 @@ export default function App() {
                       );
                       const runtimeAgentLaunchReady = Boolean(
                         workspaceState === "ready"
+                          && workspaceHydrationReady
                           && workspaceThreadsHydrated
                           && !runtimeIsDeactivating
                           && runtimeDescriptor.agentTerminalEntries.length > 0,
@@ -13511,7 +13671,13 @@ export default function App() {
                             type="button"
                           >
                             <ButtonDeleteIcon aria-hidden="true" />
-                            <span>{isWorkspaceSettingsDeleting ? "Deleting..." : "Delete from Diff Forge"}</span>
+                            <span>
+                              {isWorkspaceSettingsDeleting
+                                ? "Deleting..."
+                                : isWorkspaceDeleteConfirming
+                                  ? "Confirm delete"
+                                  : "Delete from Diff Forge"}
+                            </span>
                           </PrimaryDangerButton>
                         </WorkspaceSettingsActions>
                       </WorkspaceSettingsSection>

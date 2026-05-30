@@ -1714,6 +1714,34 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["targetDeviceId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_device_id"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetDeviceId"])),
+        "target_terminal_id": cloud_mcp_payload_text(event, &["target_terminal_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetTerminalId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminal_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminalId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["pane_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["paneId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_terminal_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetTerminalId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminal_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminalId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "pane_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "paneId"])),
+        "target_terminal_index": cloud_mcp_payload_text(event, &["target_terminal_index"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetTerminalIndex"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminal_index"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminalIndex"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_terminal_index"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetTerminalIndex"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminal_index"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminalIndex"])),
+        "target_thread_id": cloud_mcp_payload_text(event, &["target_thread_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetThreadId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["thread_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["threadId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_thread_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetThreadId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "thread_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "threadId"])),
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),

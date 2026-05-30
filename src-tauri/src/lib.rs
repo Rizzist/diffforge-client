@@ -2980,6 +2980,34 @@ mod workspace_delete_local_metadata_tests {
         assert!(worktree.exists());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn delete_workspace_local_metadata_discards_dirty_git_worktrees_when_requested() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = temp_workspace("workspace-delete-discard-dirty-worktree");
+        let worktree = root.join(".agents").join("worktrees").join("slot-1");
+        fs::create_dir_all(&worktree).unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        fs::write(worktree.join("dirty.txt"), "unsaved").unwrap();
+
+        let result = delete_workspace_local_metadata_for(root.display().to_string(), true).unwrap();
+
+        assert_eq!(result["ok"], json!(true));
+        assert!(!worktree.exists());
+        assert!(!root.join(".agents").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(target_os = "macos")]

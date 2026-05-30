@@ -123,7 +123,6 @@ import {
   TerminalParkedCancelButton,
   TerminalRestartPill,
   TerminalAgentDot,
-  TerminalModeBadge,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -11722,12 +11721,6 @@ function WorkspaceTerminal({
             data-slot={getTerminalAgentColorSlot(terminalIndex)}
             title={terminalAgentTitle}
           />
-          <TerminalModeBadge
-            data-mode="worker"
-            title={terminalAgentTitle}
-          >
-            {isGenericTerminal ? "Terminal" : agent?.label || terminalAgentKind}
-          </TerminalModeBadge>
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"

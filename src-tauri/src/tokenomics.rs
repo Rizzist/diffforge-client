@@ -2090,12 +2090,12 @@ fn tokenomics_account_hourly_sync_rollups(
                NULL AS repo_path,
                'hour' AS bucket_width,
                bucket_start,
-               0 AS input_tokens,
-               0 AS output_tokens,
-               0 AS cache_read_tokens,
-               0 AS cache_write_tokens,
+               COALESCE(SUM(input_tokens), 0) AS input_tokens,
+               COALESCE(SUM(output_tokens), 0) AS output_tokens,
+               COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                COALESCE(SUM(total_tokens), 0) AS total_tokens,
-               0 AS estimated_cost_microusd,
+               COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                COALESCE(SUM(event_count), 0) AS event_count,
                MAX(updated_at) AS updated_at
              FROM tokenomics_rollups
@@ -2889,9 +2889,9 @@ mod tokenomics_tests {
     fn tokenomics_account_sync_rollups_collapse_workspace_metadata() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
-        for (id, workspace_id, repo_path, total_tokens) in [
-            ("rollup-a", "workspace-a", "/tmp/repo-a", 5_i64),
-            ("rollup-b", "workspace-b", "/tmp/repo-b", 7_i64),
+        for (id, workspace_id, repo_path, input_tokens, output_tokens, total_tokens) in [
+            ("rollup-a", "workspace-a", "/tmp/repo-a", 2_i64, 3_i64, 5_i64),
+            ("rollup-b", "workspace-b", "/tmp/repo-b", 4_i64, 3_i64, 7_i64),
         ] {
             conn.execute(
                 "INSERT INTO tokenomics_rollups(
@@ -2900,10 +2900,10 @@ mod tokenomics_tests {
                    cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
                  ) VALUES(
                    ?1, 'openai', 'codex', NULL, 'openai:codex', ?2, ?3,
-                   'hour', 'unix-hour-test', 0, 0, 0,
-                   0, ?4, 0, 1, '2026-05-30T05:00:00Z'
+                   'hour', 'unix-hour-test', ?4, ?5, 0,
+                   0, ?6, 0, 1, '2026-05-30T05:00:00Z'
                  )",
-                rusqlite::params![id, workspace_id, repo_path, total_tokens],
+                rusqlite::params![id, workspace_id, repo_path, input_tokens, output_tokens, total_tokens],
             )
             .unwrap();
         }
@@ -2913,6 +2913,8 @@ mod tokenomics_tests {
         assert_eq!(rollups.len(), 1);
         assert!(rollups[0]["workspace_id"].is_null());
         assert!(rollups[0]["repo_path"].is_null());
+        assert_eq!(rollups[0]["input_tokens"], json!(6));
+        assert_eq!(rollups[0]["output_tokens"], json!(6));
         assert_eq!(rollups[0]["total_tokens"], json!(12));
         assert_eq!(rollups[0]["event_count"], json!(2));
     }
